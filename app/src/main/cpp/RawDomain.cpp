@@ -18,37 +18,6 @@
 
 namespace {
 
-constexpr int CFA_RGGB = 0;
-constexpr int CFA_GRBG = 1;
-constexpr int CFA_GBRG = 2;
-constexpr int CFA_BGGR = 3;
-
-int safeCfaPattern(int pattern) {
-    return pattern >= CFA_RGGB && pattern <= CFA_BGGR ? pattern : CFA_RGGB;
-}
-
-// Plane order is R, Gr, Gb, B. Black-level patterns themselves remain positional [00,10,01,11].
-int cfaPlaneAt(int pattern, int x, int y) {
-    return bncam::raw::canonicalPlaneAtMosaicSite(pattern, x, y);
-}
-
-int patternFromPlanes(const std::array<int, 4>& planes) {
-    const auto color = [](int plane) { return plane == 1 || plane == 2 ? 1 : plane; };
-    const std::array<int, 4> colors{{
-            color(planes[0]), color(planes[1]), color(planes[2]), color(planes[3])
-    }};
-    static const std::array<std::array<int, 4>, 4> patterns{{
-            {{0, 1, 1, 3}}, // RGGB
-            {{1, 0, 3, 1}}, // GRBG
-            {{1, 3, 0, 1}}, // GBRG
-            {{3, 1, 1, 0}}  // BGGR
-    }};
-    for (int pattern = 0; pattern < 4; ++pattern) {
-        if (patterns[static_cast<size_t>(pattern)] == colors) return pattern;
-    }
-    return CFA_RGGB;
-}
-
 RawChannelDistribution distribution(std::vector<float>& values) {
     RawChannelDistribution out{};
     if (values.empty()) return out;
@@ -108,25 +77,31 @@ std::string joinPath(const std::string& directory, const std::string& filename) 
     return directory + ((last == '/' || last == '\\') ? "" : "/") + filename;
 }
 
+void resolveRawCfaContractInPlace(RawDomainInfo& info) noexcept {
+    info.cfaContract = bncam::raw::resolveCfaContract(
+            info.sensorCfaPattern,
+            info.cfaOffsetX,
+            info.cfaOffsetY);
+    info.effectiveCfaPattern = info.cfaContract.effectiveBayerPattern;
+}
+
 } // namespace
 
+bool rawCfaIsStandardBayer(int cfaPattern) noexcept {
+    return bncam::raw::isStandardBayerArrangement(cfaPattern);
+}
+
 int effectiveCfaPatternAtOrigin(int sensorCfaPattern, int cfaOffsetX, int cfaOffsetY) {
-    std::array<int, 4> planes{};
-    planes[0] = cfaPlaneAt(sensorCfaPattern, cfaOffsetX, cfaOffsetY);
-    planes[1] = cfaPlaneAt(sensorCfaPattern, cfaOffsetX + 1, cfaOffsetY);
-    planes[2] = cfaPlaneAt(sensorCfaPattern, cfaOffsetX, cfaOffsetY + 1);
-    planes[3] = cfaPlaneAt(sensorCfaPattern, cfaOffsetX + 1, cfaOffsetY + 1);
-    return patternFromPlanes(planes);
+    return bncam::raw::effectiveBayerPatternAtOrigin(
+            sensorCfaPattern, cfaOffsetX, cfaOffsetY);
 }
 
 const char* rawCfaPatternName(int cfaPattern) {
-    switch (safeCfaPattern(cfaPattern)) {
-        case CFA_RGGB: return "RGGB";
-        case CFA_GRBG: return "GRBG";
-        case CFA_GBRG: return "GBRG";
-        case CFA_BGGR: return "BGGR";
-        default: return "UNKNOWN";
-    }
+    return bncam::raw::cfaArrangementName(cfaPattern);
+}
+
+const char* rawCfaContractKindName(bncam::raw::RawCfaContractKind kind) {
+    return bncam::raw::cfaContractKindName(kind);
 }
 
 const char* rawSourceFormatName(RawSourceFormat sourceFormat) {
@@ -182,10 +157,12 @@ RawNormalizedSampleView makeRawNormalizedSampleView(
     RawNormalizedSampleView view{};
     view.masterRaw16 = masterRaw16;
     view.info = requestedInfo;
-    view.info.sensorCfaPattern = safeCfaPattern(view.info.sensorCfaPattern);
-    view.info.effectiveCfaPattern = effectiveCfaPatternAtOrigin(
-            view.info.sensorCfaPattern, view.info.cfaOffsetX, view.info.cfaOffsetY);
+    resolveRawCfaContractInPlace(view.info);
 
+    if (!view.info.cfaContract.classicalBayerReconstructionAllowed) {
+        view.failureReason = "unsupported_cfa_contract_for_bayer_mosaic_normalization";
+        return view;
+    }
     if (masterRaw16 == nullptr || view.info.width <= 0 || view.info.height <= 0) {
         view.failureReason = "invalid_master_pointer_or_dimensions";
         return view;
@@ -218,12 +195,18 @@ RawNormalizedSampleView makeRawNormalizedSampleView(
 LinearFloatRaw normalizeRawForJpeg(const uint16_t* masterRaw16, const RawDomainInfo& requestedInfo) {
     LinearFloatRaw out{};
     out.info = requestedInfo;
-    out.info.sensorCfaPattern = safeCfaPattern(out.info.sensorCfaPattern);
-    out.info.effectiveCfaPattern = effectiveCfaPatternAtOrigin(
-            out.info.sensorCfaPattern,
-            out.info.cfaOffsetX,
-            out.info.cfaOffsetY
-    );
+    resolveRawCfaContractInPlace(out.info);
+
+    if (!out.info.cfaContract.classicalBayerReconstructionAllowed) {
+        out.diagnostics.failureReason = "unsupported_cfa_contract_for_bayer_mosaic_normalization";
+        RAW_DOMAIN_LOGE(
+                "RAW normalization rejected CFA arrangement=%d name=%s contract=%s reason=%s",
+                out.info.sensorCfaPattern,
+                rawCfaPatternName(out.info.sensorCfaPattern),
+                rawCfaContractKindName(out.info.cfaContract.kind),
+                out.info.cfaContract.reason);
+        return out;
+    }
 
     if (masterRaw16 == nullptr || out.info.width <= 0 || out.info.height <= 0) {
         out.diagnostics.failureReason = "invalid_master_pointer_or_dimensions";
@@ -345,7 +328,12 @@ std::string formatRawNormalizationDebug(
         << ";sourcePixelStride=" << info.sourcePixelStrideBytes
         << ";masterRowStride=" << info.masterRowStrideBytes
         << ";masterPixelStride=" << info.masterPixelStrideBytes
+        << ";cfaArrangementValue=" << info.sensorCfaPattern
         << ";cfaPatternFromCameraCharacteristics=" << rawCfaPatternName(info.sensorCfaPattern)
+        << ";cfaContractKind=" << rawCfaContractKindName(info.cfaContract.kind)
+        << ";cfaStandardBayerMosaic=" << (info.cfaContract.standardBayerMosaic ? "true" : "false")
+        << ";cfaClassicalBayerAllowed=" << (info.cfaContract.classicalBayerReconstructionAllowed ? "true" : "false")
+        << ";cfaContractReason=" << info.cfaContract.reason
         << ";effectiveCfaPatternAtBufferOrigin=" << rawCfaPatternName(info.effectiveCfaPattern)
         << ";cfaOffsetX=" << info.cfaOffsetX
         << ";cfaOffsetY=" << info.cfaOffsetY

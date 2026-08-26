@@ -7,6 +7,8 @@
 
 #include <opencv2/core.hpp>
 
+#include "RawCfaContract.h"
+
 enum class RawSourceFormat {
     RAW10 = 0,
     RAW_SENSOR = 1,
@@ -39,10 +41,12 @@ struct RawDomainInfo {
     size_t masterPixelStrideBytes = sizeof(uint16_t);
 
     // Android CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT at sensor origin.
-    int sensorCfaPattern = 0;
+    // Never coerce an unsupported/non-Bayer arrangement to RGGB.
+    int sensorCfaPattern = bncam::raw::CFA_UNSUPPORTED;
     int cfaOffsetX = 0;
     int cfaOffsetY = 0;
-    int effectiveCfaPattern = 0;
+    int effectiveCfaPattern = bncam::raw::CFA_UNSUPPORTED;
+    bncam::raw::RawCfaContract cfaContract{};
 
     std::array<int, 4> activeArray{0, 0, 0, 0};
     std::array<int, 4> cropRegion{0, 0, 0, 0};
@@ -148,8 +152,10 @@ LinearFloatRaw normalizeRawForJpeg(
         const RawDomainInfo& info
 );
 
+bool rawCfaIsStandardBayer(int cfaPattern) noexcept;
 int effectiveCfaPatternAtOrigin(int sensorCfaPattern, int cfaOffsetX, int cfaOffsetY);
 const char* rawCfaPatternName(int cfaPattern);
+const char* rawCfaContractKindName(bncam::raw::RawCfaContractKind kind);
 const char* rawSourceFormatName(RawSourceFormat sourceFormat);
 const char* rawStorageAlignmentName(RawStorageAlignment alignment);
 const char* rawSampleTransformName(RawSampleTransform transform);
