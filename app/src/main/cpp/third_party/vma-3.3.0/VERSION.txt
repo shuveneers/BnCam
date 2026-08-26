@@ -1,0 +1,4 @@
+Vulkan Memory Allocator 3.3.0
+Upstream tag: v3.3.0
+Release date: 2025-05-12
+Header destination: vk_mem_alloc.h

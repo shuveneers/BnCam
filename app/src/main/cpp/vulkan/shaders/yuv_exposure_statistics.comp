@@ -1,0 +1,74 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer PackedSamples {
+    uint samples[];
+};
+
+layout(std430, binding = 1) buffer Statistics {
+    uint stats[];
+};
+
+layout(push_constant) uniform Push {
+    uint sampleWidth;
+    uint sampleHeight;
+    uint sampleCount;
+    uint reserved;
+} pc;
+
+const uint LUMA64 = 0u;
+const uint RED64 = 64u;
+const uint GREEN64 = 128u;
+const uint BLUE64 = 192u;
+const uint SHADOW_COUNT = 256u;
+const uint HIGHLIGHT_COUNT = 257u;
+const uint SAMPLE_COUNT = 258u;
+const uint RED_CLIP_COUNT = 259u;
+const uint GREEN_CLIP_COUNT = 260u;
+const uint BLUE_CLIP_COUNT = 261u;
+const uint HIGHLIGHT_X_WEIGHTED = 262u;
+const uint HIGHLIGHT_Y_WEIGHTED = 263u;
+const uint HIGHLIGHT_WEIGHT = 264u;
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= pc.sampleCount || pc.sampleWidth == 0u || pc.sampleHeight == 0u) return;
+
+    uint packed = samples[index];
+    float y8 = float(packed & 0xffu);
+    float u = float((packed >> 8u) & 0xffu) - 128.0;
+    float v = float((packed >> 16u) & 0xffu) - 128.0;
+
+    // BT.601 limited-range YUV420, matching the existing CPU fail-safe analysis path.
+    float c = max(y8 - 16.0, 0.0);
+    float r8 = clamp((298.0 * c + 409.0 * v + 128.0) / 256.0, 0.0, 255.0);
+    float g8 = clamp((298.0 * c - 100.0 * u - 208.0 * v + 128.0) / 256.0, 0.0, 255.0);
+    float b8 = clamp((298.0 * c + 516.0 * u + 128.0) / 256.0, 0.0, 255.0);
+    float luma8 = clamp(0.2126 * r8 + 0.7152 * g8 + 0.0722 * b8, 0.0, 255.0);
+
+    uint lumaBin = min(uint(luma8 * (64.0 / 256.0)), 63u);
+    uint redBin = min(uint(r8 * (64.0 / 256.0)), 63u);
+    uint greenBin = min(uint(g8 * (64.0 / 256.0)), 63u);
+    uint blueBin = min(uint(b8 * (64.0 / 256.0)), 63u);
+    atomicAdd(stats[LUMA64 + lumaBin], 1u);
+    atomicAdd(stats[RED64 + redBin], 1u);
+    atomicAdd(stats[GREEN64 + greenBin], 1u);
+    atomicAdd(stats[BLUE64 + blueBin], 1u);
+    atomicAdd(stats[SAMPLE_COUNT], 1u);
+
+    if (luma8 < 30.0) atomicAdd(stats[SHADOW_COUNT], 1u);
+    if (r8 >= 251.0) atomicAdd(stats[RED_CLIP_COUNT], 1u);
+    if (g8 >= 251.0) atomicAdd(stats[GREEN_CLIP_COUNT], 1u);
+    if (b8 >= 251.0) atomicAdd(stats[BLUE_CLIP_COUNT], 1u);
+
+    if (luma8 > 220.0) {
+        atomicAdd(stats[HIGHLIGHT_COUNT], 1u);
+        uint weight = max(1u, uint(luma8 - 219.0));
+        uint x = index % pc.sampleWidth;
+        uint y = index / pc.sampleWidth;
+        atomicAdd(stats[HIGHLIGHT_X_WEIGHTED], x * weight);
+        atomicAdd(stats[HIGHLIGHT_Y_WEIGHTED], y * weight);
+        atomicAdd(stats[HIGHLIGHT_WEIGHT], weight);
+    }
+}

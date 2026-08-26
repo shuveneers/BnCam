@@ -1,0 +1,1126 @@
+#include "VulkanSpectraResidentToneBackend.h"
+#include "VulkanPipelineCacheRegistry.h"
+
+#ifndef BNCAM_VMA_HEADER_AVAILABLE
+#define BNCAM_VMA_HEADER_AVAILABLE 0
+#endif
+#if BNCAM_VMA_HEADER_AVAILABLE
+#include "vk_mem_alloc.h"
+#endif
+#ifndef BNCAM_SPECTRA_TONE_SHADER_AVAILABLE
+#define BNCAM_SPECTRA_TONE_SHADER_AVAILABLE 0
+#endif
+#if BNCAM_SPECTRA_TONE_SHADER_AVAILABLE
+#include "SpectraResidentToneSpirv.h"
+#endif
+
+#include "VulkanRuntime.h"
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstring>
+#include <limits>
+
+namespace bncam::vulkan {
+namespace {
+using Clock = std::chrono::steady_clock;
+float elapsedMs(Clock::time_point start) {
+    return static_cast<float>(std::chrono::duration<double, std::milli>(Clock::now() - start).count());
+}
+
+struct alignas(16) PushConstants {
+    std::uint32_t frameWidth = 0u;
+    std::uint32_t frameHeight = 0u;
+    std::uint32_t mode = 0u;
+    std::uint32_t sampleStep = 1u;
+    std::uint32_t sampleCount = 0u;
+    std::uint32_t displayOffsetFloats = 0u;
+    std::uint32_t isRawBayer = 1u;
+    std::uint32_t presenceReserved0 = 0u;
+    float exposureGain = 1.0f;
+    float rawJpegBaseVibrance = 1.0f;
+    float profileSaturation = 0.0f;
+    float profileContrast = 0.0f;
+    float profileVibrance = 0.0f;
+    float presenceReserved1 = 0.0f;
+    float shoulderStart = 0.68f;
+    float shoulderStrength = 1.0f;
+    std::uint32_t ultraHdrSourceMapWidth = 0u;
+    std::uint32_t ultraHdrSourceMapHeight = 0u;
+    std::uint32_t ultraHdrOutputMapWidth = 0u;
+    std::uint32_t ultraHdrOutputMapHeight = 0u;
+    std::uint32_t ultraHdrPackedWordsPerRow = 0u;
+    std::uint32_t outputRotationDegrees = 0u;
+    std::uint32_t portraitEnabled = 0u;
+    std::uint32_t portraitMaskWidth = 0u;
+    std::uint32_t portraitMaskHeight = 0u;
+    std::uint32_t portraitMaskRotationDegrees = 0u;
+    float portraitTargetLeft = 0.0f;
+    float portraitTargetTop = 0.0f;
+    float portraitTargetRight = 0.0f;
+    float portraitTargetBottom = 0.0f;
+};
+static_assert(sizeof(PushConstants) == 128u, "resident tone push constants mismatch");
+
+[[maybe_unused]] constexpr std::uint32_t kDisplayGridWidth = 32u;
+[[maybe_unused]] constexpr std::uint32_t kDisplayGridHeight = 24u;
+[[maybe_unused]] constexpr std::uint32_t kTelemetryWords = 8u;
+constexpr std::size_t kToneLutFloats = 4096u * 2u;
+
+} // namespace
+
+bool VulkanSpectraResidentToneBackend::productionKernelConnected() const noexcept {
+#if BNCAM_SPECTRA_TONE_SHADER_AVAILABLE
+    return !getSpectraResidentToneSpirv().empty();
+#else
+    return false;
+#endif
+}
+
+bool VulkanSpectraResidentToneBackend::ensureBufferLocked(
+        VmaAllocator allocator, std::uint64_t bytes, std::uint32_t hostAccess,
+        PersistentBuffer& buffer, bool& reallocated, std::string& failureReason) noexcept {
+#if !BNCAM_VMA_HEADER_AVAILABLE
+    (void)allocator; (void)bytes; (void)hostAccess; (void)buffer; (void)reallocated;
+    failureReason = "VMA_HEADER_NOT_AVAILABLE";
+    return false;
+#else
+    if (allocator == nullptr || bytes == 0u || bytes > std::numeric_limits<VkDeviceSize>::max()) {
+        failureReason = "INVALID_RESIDENT_TONE_BUFFER_REQUEST";
+        return false;
+    }
+    const bool mappedRequired = hostAccess != 0u;
+    if (buffer.buffer != VK_NULL_HANDLE && buffer.allocation != nullptr &&
+        buffer.capacityBytes >= bytes && (!mappedRequired || buffer.mapped != nullptr)) {
+        return true;
+    }
+    if (buffer.buffer != VK_NULL_HANDLE && buffer.allocation != nullptr) {
+        vmaDestroyBuffer(allocator_, buffer.buffer, buffer.allocation);
+        buffer = {};
+    }
+    VkBufferCreateInfo bufferInfo{};
+    bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bufferInfo.size = static_cast<VkDeviceSize>(bytes);
+    bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VmaAllocationCreateInfo allocationInfo{};
+    allocationInfo.usage = mappedRequired ? VMA_MEMORY_USAGE_AUTO_PREFER_HOST : VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+    if (mappedRequired) {
+        allocationInfo.flags = hostAccess | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    }
+    VmaAllocationInfo mappedInfo{};
+    if (vmaCreateBuffer(allocator, &bufferInfo, &allocationInfo, &buffer.buffer,
+                        &buffer.allocation, &mappedInfo) != VK_SUCCESS) {
+        failureReason = "vmaCreateBuffer_resident_tone_failed";
+        buffer = {};
+        return false;
+    }
+    buffer.mapped = mappedInfo.pMappedData;
+    buffer.capacityBytes = bytes;
+    reallocated = true;
+    ++allocationGeneration_;
+    return true;
+#endif
+}
+
+void VulkanSpectraResidentToneBackend::destroyBuffersLocked() noexcept {
+#if BNCAM_VMA_HEADER_AVAILABLE
+    if (allocator_ != nullptr) {
+        for (PersistentBuffer* b : {&workingRgb_, &compact_, &toneLut_, &readback_, &telemetry_,
+                                    &ultraHdrLuma_, &ultraHdrGainLog_, &ultraHdrGainmapPacked_, &portraitMask_, &portraitBlurRgb_,
+                                    &localToneBase_}) {
+            if (b->buffer != VK_NULL_HANDLE && b->allocation != nullptr) {
+                vmaDestroyBuffer(allocator_, b->buffer, b->allocation);
+            }
+            *b = {};
+        }
+    }
+#endif
+    residentSceneValid_ = false;
+    residentToneValid_ = false;
+    residentWidth_ = 0u;
+    residentHeight_ = 0u;
+}
+
+void VulkanSpectraResidentToneBackend::destroyLocked(VkDevice device) noexcept {
+    destroyBuffersLocked();
+    if (device != VK_NULL_HANDLE) {
+        if (queryPool_ != VK_NULL_HANDLE) vkDestroyQueryPool(device, queryPool_, nullptr);
+        if (fence_ != VK_NULL_HANDLE) vkDestroyFence(device, fence_, nullptr);
+        if (commandBuffer_ != VK_NULL_HANDLE && initializedCommandPool_ != VK_NULL_HANDLE) {
+            vkFreeCommandBuffers(device, initializedCommandPool_, 1u, &commandBuffer_);
+        }
+        if (descriptorPool_ != VK_NULL_HANDLE) vkDestroyDescriptorPool(device, descriptorPool_, nullptr);
+        if (pipeline_ != VK_NULL_HANDLE) vkDestroyPipeline(device, pipeline_, nullptr);
+        if (shaderModule_ != VK_NULL_HANDLE) vkDestroyShaderModule(device, shaderModule_, nullptr);
+        if (pipelineLayout_ != VK_NULL_HANDLE) vkDestroyPipelineLayout(device, pipelineLayout_, nullptr);
+        if (descriptorSetLayout_ != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(device, descriptorSetLayout_, nullptr);
+    }
+    descriptorSetLayout_ = VK_NULL_HANDLE;
+    pipelineLayout_ = VK_NULL_HANDLE;
+    shaderModule_ = VK_NULL_HANDLE;
+    pipeline_ = VK_NULL_HANDLE;
+    descriptorPool_ = VK_NULL_HANDLE;
+    descriptorSet_ = VK_NULL_HANDLE;
+    commandBuffer_ = VK_NULL_HANDLE;
+    fence_ = VK_NULL_HANDLE;
+    queryPool_ = VK_NULL_HANDLE;
+    initialized_ = false;
+    initializedDevice_ = VK_NULL_HANDLE;
+    initializedCommandPool_ = VK_NULL_HANDLE;
+    allocator_ = nullptr;
+}
+
+void VulkanSpectraResidentToneBackend::destroy(VkDevice device) noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    destroyLocked(device);
+}
+
+bool VulkanSpectraResidentToneBackend::initializeLocked(
+        VkDevice device, VkCommandPool commandPool, std::string& failureReason) noexcept {
+    if (initialized_) {
+        if (initializedDevice_ == device && initializedCommandPool_ == commandPool) return true;
+        failureReason = "RESIDENT_TONE_RUNTIME_OWNERSHIP_CHANGED";
+        return false;
+    }
+#if !BNCAM_SPECTRA_TONE_SHADER_AVAILABLE
+    (void)device; (void)commandPool;
+    failureReason = "RESIDENT_TONE_SHADER_NOT_COMPILED";
+    return false;
+#else
+    const auto& spirv = getSpectraResidentToneSpirv();
+    if (device == VK_NULL_HANDLE || commandPool == VK_NULL_HANDLE || spirv.empty()) {
+        failureReason = "RESIDENT_TONE_INITIALIZATION_INVALID";
+        return false;
+    }
+    VkDescriptorSetLayoutBinding bindings[11]{};
+    for (std::uint32_t i = 0u; i < 11u; ++i) {
+        bindings[i].binding = i;
+        bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[i].descriptorCount = 1u;
+        bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo dsl{};
+    dsl.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    dsl.bindingCount = 11u;
+    dsl.pBindings = bindings;
+    if (vkCreateDescriptorSetLayout(device, &dsl, nullptr, &descriptorSetLayout_) != VK_SUCCESS) {
+        failureReason = "vkCreateDescriptorSetLayout_resident_tone_failed";
+        destroyLocked(device); return false;
+    }
+    VkPushConstantRange range{};
+    range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    range.size = sizeof(PushConstants);
+    VkPipelineLayoutCreateInfo pli{};
+    pli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pli.setLayoutCount = 1u;
+    pli.pSetLayouts = &descriptorSetLayout_;
+    pli.pushConstantRangeCount = 1u;
+    pli.pPushConstantRanges = &range;
+    if (vkCreatePipelineLayout(device, &pli, nullptr, &pipelineLayout_) != VK_SUCCESS) {
+        failureReason = "vkCreatePipelineLayout_resident_tone_failed";
+        destroyLocked(device); return false;
+    }
+    VkShaderModuleCreateInfo sm{};
+    sm.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    sm.codeSize = spirv.size() * sizeof(std::uint32_t);
+    sm.pCode = spirv.data();
+    if (vkCreateShaderModule(device, &sm, nullptr, &shaderModule_) != VK_SUCCESS) {
+        failureReason = "vkCreateShaderModule_resident_tone_failed";
+        destroyLocked(device); return false;
+    }
+    VkPipelineShaderStageCreateInfo stage{};
+    stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    stage.module = shaderModule_;
+    stage.pName = "main";
+    VkComputePipelineCreateInfo cp{};
+    cp.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    cp.stage = stage;
+    cp.layout = pipelineLayout_;
+    if (VulkanPipelineCacheRegistry::createComputePipelines(device, 1u, &cp, nullptr, &pipeline_) != VK_SUCCESS) {
+        failureReason = "vkCreateComputePipelines_resident_tone_failed";
+        destroyLocked(device); return false;
+    }
+    VkDescriptorPoolSize ps{};
+    ps.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    ps.descriptorCount = 11u;
+    VkDescriptorPoolCreateInfo dpi{};
+    dpi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    dpi.maxSets = 1u;
+    dpi.poolSizeCount = 1u;
+    dpi.pPoolSizes = &ps;
+    if (vkCreateDescriptorPool(device, &dpi, nullptr, &descriptorPool_) != VK_SUCCESS) {
+        failureReason = "vkCreateDescriptorPool_resident_tone_failed";
+        destroyLocked(device); return false;
+    }
+    VkDescriptorSetAllocateInfo dsa{};
+    dsa.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    dsa.descriptorPool = descriptorPool_;
+    dsa.descriptorSetCount = 1u;
+    dsa.pSetLayouts = &descriptorSetLayout_;
+    if (vkAllocateDescriptorSets(device, &dsa, &descriptorSet_) != VK_SUCCESS) {
+        failureReason = "vkAllocateDescriptorSets_resident_tone_failed";
+        destroyLocked(device); return false;
+    }
+    VkCommandBufferAllocateInfo cb{};
+    cb.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cb.commandPool = commandPool;
+    cb.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cb.commandBufferCount = 1u;
+    if (vkAllocateCommandBuffers(device, &cb, &commandBuffer_) != VK_SUCCESS) {
+        failureReason = "vkAllocateCommandBuffers_resident_tone_failed";
+        destroyLocked(device); return false;
+    }
+    VkFenceCreateInfo fi{};
+    fi.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    if (vkCreateFence(device, &fi, nullptr, &fence_) != VK_SUCCESS) {
+        failureReason = "vkCreateFence_resident_tone_failed";
+        destroyLocked(device); return false;
+    }
+    VkQueryPoolCreateInfo qi{};
+    qi.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+    qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    qi.queryCount = 4u;
+    if (vkCreateQueryPool(device, &qi, nullptr, &queryPool_) != VK_SUCCESS) queryPool_ = VK_NULL_HANDLE;
+    initialized_ = true;
+    initializedDevice_ = device;
+    initializedCommandPool_ = commandPool;
+    failureReason.clear();
+    return true;
+#endif
+}
+
+void VulkanSpectraResidentToneBackend::updateDescriptorsLocked(
+        VkDevice device, VkBuffer inputOverride) noexcept {
+    // Bind harmless already-valid buffers for optional Ultra HDR bindings until a gainmap is
+    // actually requested. This keeps the shared scene/tone shader descriptor set valid without
+    // allocating gainmap resources for ordinary captures.
+    VkDescriptorBufferInfo infos[11]{};
+    infos[0].buffer = inputOverride != VK_NULL_HANDLE ? inputOverride : workingRgb_.buffer;
+    infos[1].buffer = workingRgb_.buffer;
+    infos[2].buffer = compact_.buffer;
+    infos[3].buffer = toneLut_.buffer;
+    infos[4].buffer = telemetry_.buffer;
+    infos[5].buffer = ultraHdrLuma_.buffer != VK_NULL_HANDLE ? ultraHdrLuma_.buffer : compact_.buffer;
+    infos[6].buffer = ultraHdrGainLog_.buffer != VK_NULL_HANDLE ? ultraHdrGainLog_.buffer : compact_.buffer;
+    infos[7].buffer = ultraHdrGainmapPacked_.buffer != VK_NULL_HANDLE ? ultraHdrGainmapPacked_.buffer : telemetry_.buffer;
+    infos[8].buffer = portraitMask_.buffer != VK_NULL_HANDLE ? portraitMask_.buffer : compact_.buffer;
+    infos[9].buffer = portraitBlurRgb_.buffer != VK_NULL_HANDLE ? portraitBlurRgb_.buffer : workingRgb_.buffer;
+    infos[10].buffer = localToneBase_.buffer != VK_NULL_HANDLE ? localToneBase_.buffer : compact_.buffer;
+    for (auto& info : infos) info.range = VK_WHOLE_SIZE;
+    VkWriteDescriptorSet writes[11]{};
+    for (std::uint32_t i = 0u; i < 11u; ++i) {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = descriptorSet_;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1u;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &infos[i];
+    }
+    vkUpdateDescriptorSets(device, 11u, writes, 0u, nullptr);
+}
+
+SpectraResidentSceneObserverResult VulkanSpectraResidentToneBackend::executeSceneObserverFromResident(
+        VkPhysicalDevice physicalDevice, VkDevice device, VkQueue computeQueue,
+        VkCommandPool commandPool, VulkanAllocatorOwner& allocatorOwner,
+        VkBuffer residentInputBuffer, std::uint64_t residentInputBytes,
+        const SpectraResidentSceneObserverRequest& request) noexcept {
+    SpectraResidentSceneObserverResult result{};
+    result.attempted = true;
+    const auto totalStart = Clock::now();
+    if (residentInputBuffer == VK_NULL_HANDLE || request.frameWidth < 3u || request.frameHeight < 3u ||
+        device == VK_NULL_HANDLE || computeQueue == VK_NULL_HANDLE || commandPool == VK_NULL_HANDLE) {
+        result.status = "GPU_SCENE_OBSERVER_INVALID_INPUT";
+        result.failureReason = "INVALID_RESIDENT_SCENE_REQUEST";
+        result.totalMs = elapsedMs(totalStart);
+        return result;
+    }
+#if !BNCAM_VMA_HEADER_AVAILABLE || !BNCAM_SPECTRA_TONE_SHADER_AVAILABLE
+    (void)physicalDevice; (void)allocatorOwner; (void)residentInputBytes;
+    result.status = "GPU_SCENE_OBSERVER_BUILD_SUPPORT_UNAVAILABLE";
+    result.failureReason = !BNCAM_VMA_HEADER_AVAILABLE ? "VMA_HEADER_NOT_AVAILABLE" : "RESIDENT_TONE_SHADER_NOT_COMPILED";
+    result.totalMs = elapsedMs(totalStart);
+    return result;
+#else
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::string failure;
+    if (!initializeLocked(device, commandPool, failure)) {
+        result.status = "GPU_SCENE_OBSERVER_INITIALIZATION_FAILED";
+        result.failureReason = failure;
+        result.totalMs = elapsedMs(totalStart);
+        return result;
+    }
+    allocator_ = allocatorOwner.handle();
+    if (allocator_ == nullptr) {
+        result.status = "GPU_SCENE_OBSERVER_ALLOCATOR_UNAVAILABLE";
+        result.failureReason = "VMA_ALLOCATOR_NOT_READY";
+        result.totalMs = elapsedMs(totalStart);
+        return result;
+    }
+    const std::uint64_t pixels = static_cast<std::uint64_t>(request.frameWidth) * request.frameHeight;
+    const std::uint64_t rgbBytes = pixels * 3u * sizeof(float);
+    const float preToneChroma444Strength = std::clamp(request.preToneChroma444Strength, 0.0f, 0.94f);
+    const bool preToneChroma444Requested = request.preToneChroma444Enabled &&
+            preToneChroma444Strength > 1.0e-4f;
+    if (residentInputBytes < rgbBytes) {
+        result.status = "GPU_SCENE_OBSERVER_RESIDENT_INPUT_TOO_SMALL";
+        result.failureReason = "RESIDENT_RGB_BYTES_BELOW_FRAME_REQUIREMENT";
+        result.totalMs = elapsedMs(totalStart);
+        return result;
+    }
+    const std::uint32_t target = std::max(1u, request.targetSampleCount);
+    result.sampleStep = static_cast<std::uint32_t>(std::max<std::uint64_t>(1u, pixels / target));
+    result.sampleCount = static_cast<std::uint32_t>((pixels + result.sampleStep - 1u) / result.sampleStep);
+    const std::uint64_t compactFloats = static_cast<std::uint64_t>(result.sampleCount) * 3u +
+            kDisplayGridWidth * kDisplayGridHeight;
+    result.compactBytes = compactFloats * sizeof(float);
+    bool reallocated = false;
+    const std::uint32_t readAccess = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
+    const std::uint32_t writeAccess = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
+    if (!ensureBufferLocked(allocator_, rgbBytes, 0u, workingRgb_, reallocated, failure) ||
+        !ensureBufferLocked(allocator_, std::max<std::uint64_t>(result.compactBytes, 16u), readAccess, compact_, reallocated, failure) ||
+        !ensureBufferLocked(allocator_, kToneLutFloats * sizeof(float), writeAccess, toneLut_, reallocated, failure) ||
+        !ensureBufferLocked(allocator_, kTelemetryWords * sizeof(std::uint32_t), readAccess, telemetry_, reallocated, failure)) {
+        result.status = "GPU_SCENE_OBSERVER_BUFFER_ALLOCATION_FAILED";
+        result.failureReason = failure;
+        result.totalMs = elapsedMs(totalStart);
+        return result;
+    }
+    result.persistentBufferReallocated = reallocated;
+    result.persistentBufferReuseHit = !reallocated;
+    result.persistentAllocationGeneration = allocationGeneration_;
+    result.persistentResidentBytes = workingRgb_.capacityBytes + compact_.capacityBytes +
+            toneLut_.capacityBytes + readback_.capacityBytes + telemetry_.capacityBytes +
+            ultraHdrLuma_.capacityBytes + ultraHdrGainLog_.capacityBytes + ultraHdrGainmapPacked_.capacityBytes +
+            portraitMask_.capacityBytes + portraitBlurRgb_.capacityBytes + localToneBase_.capacityBytes;
+    updateDescriptorsLocked(device, residentInputBuffer);
+
+    vkResetFences(device, 1u, &fence_);
+    vkResetCommandBuffer(commandBuffer_, 0u);
+    VkCommandBufferBeginInfo bi{};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkBeginCommandBuffer(commandBuffer_, &bi) != VK_SUCCESS) {
+        result.status = "GPU_SCENE_OBSERVER_COMMAND_BEGIN_FAILED";
+        result.failureReason = "vkBeginCommandBuffer_failed";
+        result.totalMs = elapsedMs(totalStart);
+        return result;
+    }
+    vkCmdFillBuffer(commandBuffer_, telemetry_.buffer, 0u, VK_WHOLE_SIZE, 0u);
+    VkBufferMemoryBarrier inputBarrier{};
+    inputBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    inputBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    inputBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    inputBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    inputBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    inputBarrier.buffer = residentInputBuffer;
+    inputBarrier.size = static_cast<VkDeviceSize>(rgbBytes);
+    VkBufferMemoryBarrier telemetryBarrier{};
+    telemetryBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    telemetryBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    telemetryBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    telemetryBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    telemetryBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    telemetryBarrier.buffer = telemetry_.buffer;
+    telemetryBarrier.size = VK_WHOLE_SIZE;
+    VkBufferMemoryBarrier initial[2]{inputBarrier, telemetryBarrier};
+    vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr, 2u, initial, 0u, nullptr);
+    if (queryPool_ != VK_NULL_HANDLE) {
+        vkCmdResetQueryPool(commandBuffer_, queryPool_, 0u, 4u);
+        vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 0u);
+    }
+    vkCmdBindPipeline(commandBuffer_, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
+    vkCmdBindDescriptorSets(commandBuffer_, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_, 0u, 1u, &descriptorSet_, 0u, nullptr);
+    PushConstants push{};
+    push.frameWidth = request.frameWidth;
+    push.frameHeight = request.frameHeight;
+    push.mode = 0u;
+    push.sampleStep = result.sampleStep;
+    push.sampleCount = result.sampleCount;
+    push.displayOffsetFloats = result.sampleCount * 3u;
+    push.presenceReserved0 = preToneChroma444Requested ? 1u : 0u;
+    push.presenceReserved1 = preToneChroma444Strength;
+    vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0u, sizeof(push), &push);
+    vkCmdDispatch(commandBuffer_, (request.frameWidth + 15u) / 16u, (request.frameHeight + 15u) / 16u, 1u);
+    if (queryPool_ != VK_NULL_HANDLE) vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 1u);
+
+    VkBufferMemoryBarrier workingBarrier{};
+    workingBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    workingBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    workingBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    workingBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    workingBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    workingBarrier.buffer = workingRgb_.buffer;
+    workingBarrier.size = static_cast<VkDeviceSize>(rgbBytes);
+    vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr, 1u, &workingBarrier, 0u, nullptr);
+    // QUALITY DELTA 0008: the 4:4:4 residual chroma regression is fused into
+    // mode 0 and reads only the immutable post-AWB/CCM input. No extra full-frame
+    // scratch allocation or in-place neighbour race is introduced.
+    if (preToneChroma444Requested) {
+        result.preToneChroma444Applied = true;
+        result.preToneChroma444Strength = preToneChroma444Strength;
+    }
+    if (queryPool_ != VK_NULL_HANDLE) vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 2u);
+    push.mode = 1u;
+    vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0u, sizeof(push), &push);
+    vkCmdDispatch(commandBuffer_, (result.sampleCount + 15u) / 16u, 1u, 1u);
+    push.mode = 2u;
+    vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0u, sizeof(push), &push);
+    vkCmdDispatch(commandBuffer_, 2u, 2u, 1u);
+    if (queryPool_ != VK_NULL_HANDLE) vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 3u);
+
+    VkBufferMemoryBarrier hostBarriers[2]{};
+    for (auto& b : hostBarriers) {
+        b.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        b.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.size = VK_WHOLE_SIZE;
+    }
+    hostBarriers[0].buffer = compact_.buffer;
+    hostBarriers[1].buffer = telemetry_.buffer;
+    vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_HOST_BIT, 0u, 0u, nullptr, 2u, hostBarriers, 0u, nullptr);
+    if (vkEndCommandBuffer(commandBuffer_) != VK_SUCCESS) {
+        result.status = "GPU_SCENE_OBSERVER_COMMAND_END_FAILED";
+        result.failureReason = "vkEndCommandBuffer_failed";
+        result.totalMs = elapsedMs(totalStart);
+        return result;
+    }
+    VkSubmitInfo si{};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1u;
+    si.pCommandBuffers = &commandBuffer_;
+    const auto waitStart = Clock::now();
+    if (vkQueueSubmit(computeQueue, 1u, &si, fence_) != VK_SUCCESS ||
+        vkWaitForFences(device, 1u, &fence_, VK_TRUE, 1'500'000'000ull) != VK_SUCCESS) {
+        VulkanRuntime::instance().markGpuStalled("SceneObserver");
+        result.status = "GPU_STALLED";
+        result.failureReason = "scene_observer_submit_or_wait_timeout";
+        result.totalMs = elapsedMs(totalStart);
+        return result;
+    }
+    result.synchronizationMs = elapsedMs(waitStart);
+    if (queryPool_ != VK_NULL_HANDLE) {
+        std::uint64_t ts[4]{};
+        if (vkGetQueryPoolResults(device, queryPool_, 0u, 4u, sizeof(ts), ts, sizeof(std::uint64_t),
+                                  VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+            VkPhysicalDeviceProperties props{};
+            vkGetPhysicalDeviceProperties(physicalDevice, &props);
+            const double ms = static_cast<double>(props.limits.timestampPeriod) / 1.0e6;
+            if (ts[1] >= ts[0]) result.highlightKernelMs = static_cast<float>((ts[1] - ts[0]) * ms);
+            if (ts[3] >= ts[2]) result.sampleKernelMs = static_cast<float>((ts[3] - ts[2]) * ms);
+        }
+    }
+    const auto readStart = Clock::now();
+    vmaInvalidateAllocation(allocator_, compact_.allocation, 0u, static_cast<VkDeviceSize>(result.compactBytes));
+    vmaInvalidateAllocation(allocator_, telemetry_.allocation, 0u, kTelemetryWords * sizeof(std::uint32_t));
+    const float* compact = static_cast<const float*>(compact_.mapped);
+    result.sampledRgb.resize(static_cast<std::size_t>(result.sampleCount) * 3u);
+    std::memcpy(result.sampledRgb.data(), compact, result.sampledRgb.size() * sizeof(float));
+    result.displayGrid.resize(kDisplayGridWidth * kDisplayGridHeight);
+    std::memcpy(result.displayGrid.data(), compact + static_cast<std::size_t>(result.sampleCount) * 3u,
+                result.displayGrid.size() * sizeof(float));
+    const auto* telemetry = static_cast<const std::uint32_t*>(telemetry_.mapped);
+    result.correctedHighlightPixels = telemetry[0];
+    result.highlightRecoveryApplied = result.correctedHighlightPixels > 0u;
+    result.compactReadbackMs = elapsedMs(readStart);
+    result.residentInputUsed = true;
+    residentSceneGeneration_++;
+    residentWidth_ = request.frameWidth;
+    residentHeight_ = request.frameHeight;
+    residentSceneValid_ = true;
+    residentToneValid_ = false;
+    result.residentSceneGeneration = residentSceneGeneration_;
+    result.success = result.sampledRgb.size() == static_cast<std::size_t>(result.sampleCount) * 3u &&
+            result.displayGrid.size() == kDisplayGridWidth * kDisplayGridHeight;
+    result.status = result.success ? "GPU_RESIDENT_HIGHLIGHT_RECOVERY_AND_SCENE_SAMPLES_READY"
+                                   : "GPU_SCENE_OBSERVER_COMPACT_READBACK_INCOMPLETE";
+    result.failureReason = result.success ? "none" : "COMPACT_SCENE_OUTPUT_SIZE_MISMATCH";
+    result.totalMs = elapsedMs(totalStart);
+    return result;
+#endif
+}
+
+SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
+        VkPhysicalDevice physicalDevice, VkDevice device, VkQueue computeQueue,
+        VkCommandPool commandPool, VulkanAllocatorOwner& allocatorOwner,
+        const SpectraResidentToneRequest& request) noexcept {
+    SpectraResidentToneResult result{};
+    result.attempted = true;
+    const auto totalStart = Clock::now();
+    if (request.frameWidth == 0u || request.frameHeight == 0u ||
+        request.toneLut == nullptr || request.toneLutFloatCount != kToneLutFloats ||
+        device == VK_NULL_HANDLE || computeQueue == VK_NULL_HANDLE || commandPool == VK_NULL_HANDLE) {
+        result.status = "GPU_TONE_INVALID_INPUT";
+        result.failureReason = "INVALID_RESIDENT_TONE_REQUEST";
+        result.totalMs = elapsedMs(totalStart);
+        return result;
+    }
+#if !BNCAM_VMA_HEADER_AVAILABLE || !BNCAM_SPECTRA_TONE_SHADER_AVAILABLE
+    (void)physicalDevice; (void)allocatorOwner;
+    result.status = "GPU_TONE_BUILD_SUPPORT_UNAVAILABLE";
+    result.failureReason = !BNCAM_VMA_HEADER_AVAILABLE ? "VMA_HEADER_NOT_AVAILABLE" : "RESIDENT_TONE_SHADER_NOT_COMPILED";
+    result.totalMs = elapsedMs(totalStart);
+    return result;
+#else
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::string failure;
+    if (!initializeLocked(device, commandPool, failure)) {
+        result.status = "GPU_TONE_INITIALIZATION_FAILED";
+        result.failureReason = failure;
+        result.totalMs = elapsedMs(totalStart);
+        return result;
+    }
+    allocator_ = allocatorOwner.handle();
+    if (allocator_ == nullptr || !residentSceneValid_ || request.residentSceneGeneration == 0u ||
+        request.residentSceneGeneration != residentSceneGeneration_ ||
+        request.frameWidth != residentWidth_ || request.frameHeight != residentHeight_) {
+        result.status = "GPU_TONE_RESIDENT_INPUT_UNAVAILABLE";
+        result.failureReason = "SCENE_GENERATION_MISMATCH";
+        result.totalMs = elapsedMs(totalStart);
+        return result;
+    }
+    const std::uint64_t pixels = static_cast<std::uint64_t>(request.frameWidth) * request.frameHeight;
+    const std::uint64_t rgbBytes = pixels * 3u * sizeof(float);
+    const auto normalizedRotation = static_cast<std::uint32_t>(
+            ((request.outputRotationDegrees % 360) + 360) % 360);
+    const bool supportedRotation = normalizedRotation == 0u || normalizedRotation == 90u ||
+            normalizedRotation == 180u || normalizedRotation == 270u;
+    const bool ultraHdrRequested = request.ultraHdrGainmapRequested && supportedRotation;
+    const auto portraitRotation = request.portraitMaskRotationDegrees % 360u;
+    const bool portraitRotationSupported = portraitRotation == 0u || portraitRotation == 90u ||
+            portraitRotation == 180u || portraitRotation == 270u;
+    const bool portraitBoundsValid = std::isfinite(request.portraitTargetLeft) &&
+            std::isfinite(request.portraitTargetTop) && std::isfinite(request.portraitTargetRight) &&
+            std::isfinite(request.portraitTargetBottom) && request.portraitTargetLeft >= 0.0f &&
+            request.portraitTargetTop >= 0.0f && request.portraitTargetRight <= 1.0f &&
+            request.portraitTargetBottom <= 1.0f && request.portraitTargetRight > request.portraitTargetLeft &&
+            request.portraitTargetBottom > request.portraitTargetTop;
+    const std::uint64_t portraitMaskPixels = static_cast<std::uint64_t>(request.portraitMaskWidth) *
+            request.portraitMaskHeight;
+    const bool portraitRequested = request.portraitEffectRequested && request.portraitMask != nullptr &&
+            request.portraitMaskWidth > 1u && request.portraitMaskHeight > 1u && portraitBoundsValid &&
+            portraitRotationSupported && request.portraitMaskFloatCount >= portraitMaskPixels;
+    result.portraitEffectRequested = request.portraitEffectRequested;
+    result.portraitStatus = request.portraitEffectRequested
+            ? (portraitRequested ? "GPU_MASK_READY" : "MASK_UNAVAILABLE_OR_INVALID")
+            : "NOT_REQUESTED";
+    const std::uint32_t sourceMapWidth = (request.frameWidth + 3u) / 4u;
+    const std::uint32_t sourceMapHeight = (request.frameHeight + 3u) / 4u;
+    const bool swapGainmapAxes = normalizedRotation == 90u || normalizedRotation == 270u;
+    const std::uint32_t outputMapWidth = swapGainmapAxes ? sourceMapHeight : sourceMapWidth;
+    const std::uint32_t outputMapHeight = swapGainmapAxes ? sourceMapWidth : sourceMapHeight;
+    const std::uint32_t packedWordsPerRow = (outputMapWidth + 3u) / 4u;
+    const std::uint64_t mapPixels = static_cast<std::uint64_t>(sourceMapWidth) * sourceMapHeight;
+    const std::uint64_t packedBytes = static_cast<std::uint64_t>(packedWordsPerRow) *
+            outputMapHeight * sizeof(std::uint32_t);
+    const bool localToneRequested = request.localToneStrength > 1.0e-4f;
+    result.localToneRequested = localToneRequested;
+    result.ultraHdrGainmapRequested = request.ultraHdrGainmapRequested;
+    if (request.ultraHdrGainmapRequested && !supportedRotation) {
+        result.ultraHdrStatus = "UNSUPPORTED_OUTPUT_ROTATION";
+    }
+    bool reallocated = false;
+    const std::uint32_t writeAccess = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
+    const std::uint32_t readAccess = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
+    if (!ensureBufferLocked(allocator_, kToneLutFloats * sizeof(float), writeAccess, toneLut_, reallocated, failure) ||
+        !ensureBufferLocked(allocator_, kTelemetryWords * sizeof(std::uint32_t), readAccess, telemetry_, reallocated, failure) ||
+        (!request.deferFullReadback && !ensureBufferLocked(allocator_, rgbBytes, readAccess, readback_, reallocated, failure)) ||
+        (ultraHdrRequested && !ensureBufferLocked(allocator_, mapPixels * sizeof(float), 0u, ultraHdrLuma_, reallocated, failure)) ||
+        (ultraHdrRequested && !ensureBufferLocked(allocator_, mapPixels * sizeof(float), 0u, ultraHdrGainLog_, reallocated, failure)) ||
+        (ultraHdrRequested && !ensureBufferLocked(allocator_, packedBytes, readAccess, ultraHdrGainmapPacked_, reallocated, failure)) ||
+        (portraitRequested && !ensureBufferLocked(allocator_, portraitMaskPixels * sizeof(float), writeAccess, portraitMask_, reallocated, failure)) ||
+        (portraitRequested && !ensureBufferLocked(allocator_, rgbBytes, 0u, portraitBlurRgb_, reallocated, failure)) ||
+        (localToneRequested && !ensureBufferLocked(allocator_, mapPixels * sizeof(float), 0u, localToneBase_, reallocated, failure))) {
+        result.status = "GPU_TONE_BUFFER_ALLOCATION_FAILED";
+        result.failureReason = failure;
+        result.totalMs = elapsedMs(totalStart);
+        return result;
+    }
+    result.persistentBufferReallocated = reallocated;
+    result.persistentBufferReuseHit = !reallocated;
+    result.persistentAllocationGeneration = allocationGeneration_;
+    result.persistentResidentBytes = workingRgb_.capacityBytes + compact_.capacityBytes +
+            toneLut_.capacityBytes + readback_.capacityBytes + telemetry_.capacityBytes +
+            ultraHdrLuma_.capacityBytes + ultraHdrGainLog_.capacityBytes + ultraHdrGainmapPacked_.capacityBytes +
+            portraitMask_.capacityBytes + portraitBlurRgb_.capacityBytes;
+    const auto uploadStart = Clock::now();
+    std::memcpy(toneLut_.mapped, request.toneLut, kToneLutFloats * sizeof(float));
+    vmaFlushAllocation(allocator_, toneLut_.allocation, 0u, kToneLutFloats * sizeof(float));
+    if (portraitRequested) {
+        const auto portraitBytes = portraitMaskPixels * sizeof(float);
+        std::memcpy(portraitMask_.mapped, request.portraitMask, static_cast<std::size_t>(portraitBytes));
+        vmaFlushAllocation(allocator_, portraitMask_.allocation, 0u, static_cast<VkDeviceSize>(portraitBytes));
+    }
+    result.lutUploadMs = elapsedMs(uploadStart);
+    updateDescriptorsLocked(device, workingRgb_.buffer);
+
+    vkResetFences(device, 1u, &fence_);
+    vkResetCommandBuffer(commandBuffer_, 0u);
+    VkCommandBufferBeginInfo bi{};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkBeginCommandBuffer(commandBuffer_, &bi) != VK_SUCCESS) {
+        result.status = "GPU_TONE_COMMAND_BEGIN_FAILED";
+        result.failureReason = "vkBeginCommandBuffer_failed";
+        result.totalMs = elapsedMs(totalStart);
+        return result;
+    }
+    VkBufferMemoryBarrier ready[2]{};
+    ready[0].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    ready[0].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    ready[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    ready[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    ready[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    ready[0].buffer = workingRgb_.buffer;
+    ready[0].size = static_cast<VkDeviceSize>(rgbBytes);
+    ready[1].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    ready[1].srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+    ready[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    ready[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    ready[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    ready[1].buffer = toneLut_.buffer;
+    ready[1].size = kToneLutFloats * sizeof(float);
+    vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr, 2u, ready, 0u, nullptr);
+    // Reset tone/gainmap/LTM telemetry while preserving scene-observer highlight recovery count [0].
+    vkCmdFillBuffer(commandBuffer_, telemetry_.buffer, sizeof(std::uint32_t),
+                    7u * sizeof(std::uint32_t), 0u);
+    if (localToneRequested) {
+        const float ltmValues[4] = {
+                std::clamp(request.localToneStrength, 0.0f, 1.0f),
+                std::clamp(request.localToneSceneKey, 0.08f, 0.20f),
+                std::clamp(request.localToneMaxLiftEv, 0.0f, 1.5f),
+                std::clamp(request.localToneMaxCompressEv, 0.0f, 1.0f)};
+        std::uint32_t ltmBits[4]{};
+        std::memcpy(ltmBits, ltmValues, sizeof(ltmBits));
+        vkCmdUpdateBuffer(commandBuffer_, telemetry_.buffer,
+                          3u * sizeof(std::uint32_t), sizeof(ltmBits), ltmBits);
+    }
+    VkBufferMemoryBarrier telemetryReady{};
+    telemetryReady.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    telemetryReady.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    telemetryReady.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    telemetryReady.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    telemetryReady.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    telemetryReady.buffer = telemetry_.buffer;
+    telemetryReady.size = VK_WHOLE_SIZE;
+    vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u,
+                         0u, nullptr, 1u, &telemetryReady, 0u, nullptr);
+
+    vkCmdBindPipeline(commandBuffer_, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
+    vkCmdBindDescriptorSets(commandBuffer_, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_, 0u,
+                            1u, &descriptorSet_, 0u, nullptr);
+    PushConstants push{};
+    push.frameWidth = request.frameWidth;
+    push.frameHeight = request.frameHeight;
+    push.isRawBayer = request.isRawBayer ? 1u : 0u;
+    push.exposureGain = request.exposureGain;
+    push.rawJpegBaseVibrance = request.rawJpegBaseVibrance;
+    push.shoulderStart = std::clamp(request.shoulderStart, 0.50f, 0.85f);
+    push.shoulderStrength = std::clamp(request.shoulderStrength, 0.50f, 2.50f);
+    push.profileSaturation = std::clamp(request.profileColorSaturation, -1.0f, 1.0f);
+    push.profileContrast = std::clamp(request.profileColorContrast, -1.0f, 1.0f);
+    push.profileVibrance = std::clamp(request.profilePresenceVibrance, -1.0f, 1.0f);
+    push.ultraHdrSourceMapWidth = sourceMapWidth;
+    push.ultraHdrSourceMapHeight = sourceMapHeight;
+    push.ultraHdrOutputMapWidth = outputMapWidth;
+    push.ultraHdrOutputMapHeight = outputMapHeight;
+    push.ultraHdrPackedWordsPerRow = packedWordsPerRow;
+    push.outputRotationDegrees = normalizedRotation;
+    push.portraitEnabled = portraitRequested ? 1u : 0u;
+    push.portraitMaskWidth = request.portraitMaskWidth;
+    push.portraitMaskHeight = request.portraitMaskHeight;
+    push.portraitMaskRotationDegrees = portraitRotation;
+    push.portraitTargetLeft = request.portraitTargetLeft;
+    push.portraitTargetTop = request.portraitTargetTop;
+    push.portraitTargetRight = request.portraitTargetRight;
+    push.portraitTargetBottom = request.portraitTargetBottom;
+
+    if (portraitRequested) {
+        // Pass 7 builds a mask-aware scene-linear background bokeh into a separate resident
+        // buffer. Pass 8 composites it back into workingRgb. This happens before Ultra HDR
+        // authority capture so SDR and HDR renditions share exactly the same portrait edges.
+        push.mode = 7u;
+        vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
+                           0u, sizeof(push), &push);
+        vkCmdDispatch(commandBuffer_, (request.frameWidth + 15u) / 16u,
+                       (request.frameHeight + 15u) / 16u, 1u);
+        VkBufferMemoryBarrier blurReady{};
+        blurReady.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        blurReady.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        blurReady.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        blurReady.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        blurReady.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        blurReady.buffer = portraitBlurRgb_.buffer;
+        blurReady.size = static_cast<VkDeviceSize>(rgbBytes);
+        vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u,
+                             0u, nullptr, 1u, &blurReady, 0u, nullptr);
+
+        push.mode = 8u;
+        vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
+                           0u, sizeof(push), &push);
+        vkCmdDispatch(commandBuffer_, (request.frameWidth + 15u) / 16u,
+                       (request.frameHeight + 15u) / 16u, 1u);
+        VkBufferMemoryBarrier portraitCompositeReady{};
+        portraitCompositeReady.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        portraitCompositeReady.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        portraitCompositeReady.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        portraitCompositeReady.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        portraitCompositeReady.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        portraitCompositeReady.buffer = workingRgb_.buffer;
+        portraitCompositeReady.size = static_cast<VkDeviceSize>(rgbBytes);
+        vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u,
+                             0u, nullptr, 1u, &portraitCompositeReady, 0u, nullptr);
+        result.portraitEffectApplied = true;
+        result.portraitStatus = "GPU_PORTRAIT_APPLIED";
+    }
+
+    if (localToneRequested) {
+        // Pass 9 builds a quarter-resolution edge-aware scene-linear luma base. The following
+        // pointwise tone pass reads this resident base and applies bounded local exposure; no
+        // full-frame CPU image or readback is introduced.
+        push.mode = 9u;
+        vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
+                           0u, sizeof(push), &push);
+        vkCmdDispatch(commandBuffer_, (sourceMapWidth + 15u) / 16u,
+                       (sourceMapHeight + 15u) / 16u, 1u);
+        VkBufferMemoryBarrier ltmBaseReady{};
+        ltmBaseReady.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        ltmBaseReady.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        ltmBaseReady.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        ltmBaseReady.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        ltmBaseReady.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        ltmBaseReady.buffer = localToneBase_.buffer;
+        ltmBaseReady.size = VK_WHOLE_SIZE;
+        vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u,
+                             0u, nullptr, 1u, &ltmBaseReady, 0u, nullptr);
+    }
+
+    if (ultraHdrRequested) {
+        // Capture quarter-resolution HDR luminance BEFORE the in-place SDR tone pass. This is the
+        // only HDR authority copy and stays on-device; no full-frame CPU/HDR copy is created.
+        push.mode = 4u;
+        vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
+                           0u, sizeof(push), &push);
+        vkCmdDispatch(commandBuffer_, (sourceMapWidth + 15u) / 16u,
+                       (sourceMapHeight + 15u) / 16u, 1u);
+        VkBufferMemoryBarrier hdrAuthorityReady{};
+        hdrAuthorityReady.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        hdrAuthorityReady.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        hdrAuthorityReady.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        hdrAuthorityReady.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        hdrAuthorityReady.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        hdrAuthorityReady.buffer = ultraHdrLuma_.buffer;
+        hdrAuthorityReady.size = VK_WHOLE_SIZE;
+        vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u,
+                             0u, nullptr, 1u, &hdrAuthorityReady, 0u, nullptr);
+    }
+
+    if (queryPool_ != VK_NULL_HANDLE) {
+        vkCmdResetQueryPool(commandBuffer_, queryPool_, 0u, 4u);
+        vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 0u);
+    }
+    push.mode = 3u;
+    vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0u, sizeof(push), &push);
+    vkCmdDispatch(commandBuffer_, (request.frameWidth + 15u) / 16u,
+                   (request.frameHeight + 15u) / 16u, 1u);
+    if (queryPool_ != VK_NULL_HANDLE) {
+        vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 1u);
+    }
+
+    if (ultraHdrRequested) {
+        VkBufferMemoryBarrier tonedRgbReady{};
+        tonedRgbReady.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        tonedRgbReady.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        tonedRgbReady.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        tonedRgbReady.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        tonedRgbReady.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        tonedRgbReady.buffer = workingRgb_.buffer;
+        tonedRgbReady.size = static_cast<VkDeviceSize>(rgbBytes);
+        vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u,
+                             0u, nullptr, 1u, &tonedRgbReady, 0u, nullptr);
+
+        // Pass 1: compare GPU-resident HDR and SDR luminance and derive per-pixel log2 gain plus
+        // a GPU atomic maximum. No CPU pixel statistics are involved.
+        push.mode = 5u;
+        vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
+                           0u, sizeof(push), &push);
+        vkCmdDispatch(commandBuffer_, (sourceMapWidth + 15u) / 16u,
+                       (sourceMapHeight + 15u) / 16u, 1u);
+        VkBufferMemoryBarrier gainReady[2]{};
+        gainReady[0].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        gainReady[0].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        gainReady[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        gainReady[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        gainReady[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        gainReady[0].buffer = ultraHdrGainLog_.buffer;
+        gainReady[0].size = VK_WHOLE_SIZE;
+        gainReady[1].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        gainReady[1].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        gainReady[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        gainReady[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        gainReady[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        gainReady[1].buffer = telemetry_.buffer;
+        gainReady[1].size = VK_WHOLE_SIZE;
+        vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u,
+                             0u, nullptr, 2u, gainReady, 0u, nullptr);
+
+        // Pass 2: normalize from the GPU-computed maximum, rotate into final JPEG orientation and
+        // pack four 8-bit gainmap pixels per uint. The mapped output is already publication-ready.
+        push.mode = 6u;
+        vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
+                           0u, sizeof(push), &push);
+        vkCmdDispatch(commandBuffer_, (packedWordsPerRow + 15u) / 16u,
+                       (outputMapHeight + 15u) / 16u, 1u);
+        VkBufferMemoryBarrier gainmapToHost{};
+        gainmapToHost.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        gainmapToHost.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        gainmapToHost.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        gainmapToHost.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        gainmapToHost.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        gainmapToHost.buffer = ultraHdrGainmapPacked_.buffer;
+        gainmapToHost.size = static_cast<VkDeviceSize>(packedBytes);
+        vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_HOST_BIT, 0u,
+                             0u, nullptr, 1u, &gainmapToHost, 0u, nullptr);
+    }
+
+    if (!request.deferFullReadback) {
+        VkBufferMemoryBarrier toTransfer{};
+        toTransfer.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        toTransfer.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        toTransfer.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        toTransfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toTransfer.buffer = workingRgb_.buffer;
+        toTransfer.size = static_cast<VkDeviceSize>(rgbBytes);
+        vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0u, 0u, nullptr, 1u, &toTransfer, 0u, nullptr);
+        VkBufferCopy copy{};
+        copy.size = static_cast<VkDeviceSize>(rgbBytes);
+        vkCmdCopyBuffer(commandBuffer_, workingRgb_.buffer, readback_.buffer, 1u, &copy);
+        VkBufferMemoryBarrier toHost{};
+        toHost.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        toHost.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        toHost.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        toHost.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toHost.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toHost.buffer = readback_.buffer;
+        toHost.size = static_cast<VkDeviceSize>(rgbBytes);
+        vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_HOST_BIT, 0u, 0u, nullptr, 1u, &toHost, 0u, nullptr);
+    }
+    VkBufferMemoryBarrier telemetryToHost{};
+    telemetryToHost.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    telemetryToHost.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    telemetryToHost.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    telemetryToHost.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    telemetryToHost.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    telemetryToHost.buffer = telemetry_.buffer;
+    telemetryToHost.size = VK_WHOLE_SIZE;
+    vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_HOST_BIT, 0u, 0u, nullptr, 1u, &telemetryToHost, 0u, nullptr);
+    if (vkEndCommandBuffer(commandBuffer_) != VK_SUCCESS) {
+        result.status = "GPU_TONE_COMMAND_END_FAILED";
+        result.failureReason = "vkEndCommandBuffer_failed";
+        result.totalMs = elapsedMs(totalStart);
+        return result;
+    }
+    VkSubmitInfo si{};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1u;
+    si.pCommandBuffers = &commandBuffer_;
+    const auto waitStart = Clock::now();
+    if (vkQueueSubmit(computeQueue, 1u, &si, fence_) != VK_SUCCESS ||
+        vkWaitForFences(device, 1u, &fence_, VK_TRUE, 3'000'000'000ull) != VK_SUCCESS) {
+        VulkanRuntime::instance().markGpuStalled("Tone");
+        result.status = "GPU_STALLED";
+        result.failureReason = "tone_submit_or_wait_timeout";
+        result.totalMs = elapsedMs(totalStart);
+        return result;
+    }
+    result.synchronizationMs = elapsedMs(waitStart);
+    if (queryPool_ != VK_NULL_HANDLE) {
+        std::uint64_t ts[2]{};
+        if (vkGetQueryPoolResults(device, queryPool_, 0u, 2u, sizeof(ts), ts, sizeof(std::uint64_t),
+                                  VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && ts[1] >= ts[0]) {
+            VkPhysicalDeviceProperties props{};
+            vkGetPhysicalDeviceProperties(physicalDevice, &props);
+            result.kernelMs = static_cast<float>((ts[1] - ts[0]) * (static_cast<double>(props.limits.timestampPeriod) / 1.0e6));
+        }
+    }
+    const auto readStart = Clock::now();
+    vmaInvalidateAllocation(allocator_, telemetry_.allocation, 0u, kTelemetryWords * sizeof(std::uint32_t));
+    const auto* telemetry = static_cast<const std::uint32_t*>(telemetry_.mapped);
+    result.highlightNeutralizeApplied = telemetry[1] > 0u;
+    result.localToneAdjustedPixels = telemetry[7];
+    result.localToneApplied = localToneRequested && result.localToneAdjustedPixels > 0u;
+    if (ultraHdrRequested) {
+        constexpr float kMeaningfulGainLog2 = 0.111031312f; // log2(1.08)
+        const float maxLog2Boost = static_cast<float>(telemetry[2]) / 65536.0f;
+        result.ultraHdrMaxContentBoost = std::exp2(std::clamp(maxLog2Boost, 0.0f, 4.0f));
+        result.ultraHdrMeaningfulHeadroom = maxLog2Boost >= kMeaningfulGainLog2;
+        result.ultraHdrGainmapWidth = outputMapWidth;
+        result.ultraHdrGainmapHeight = outputMapHeight;
+        result.ultraHdrGainmapRowStrideBytes = packedWordsPerRow * sizeof(std::uint32_t);
+        if (result.ultraHdrMeaningfulHeadroom && ultraHdrGainmapPacked_.mapped != nullptr) {
+            vmaInvalidateAllocation(allocator_, ultraHdrGainmapPacked_.allocation, 0u,
+                                    static_cast<VkDeviceSize>(packedBytes));
+            result.ultraHdrGainmapBytes.resize(static_cast<std::size_t>(packedBytes));
+            // GPU already produced final 8-bit pixels and row padding. This is an artifact
+            // transfer only; there is no CPU gainmap computation or pixel conversion.
+            std::memcpy(result.ultraHdrGainmapBytes.data(), ultraHdrGainmapPacked_.mapped,
+                        static_cast<std::size_t>(packedBytes));
+            result.ultraHdrGainmapGenerated = true;
+            result.ultraHdrStatus = "GPU_GAINMAP_READY";
+        } else {
+            result.ultraHdrStatus = result.ultraHdrMeaningfulHeadroom
+                    ? "GPU_GAINMAP_MAPPED_OUTPUT_UNAVAILABLE"
+                    : "NO_MEANINGFUL_HDR_HEADROOM";
+        }
+    } else if (!request.ultraHdrGainmapRequested) {
+        result.ultraHdrStatus = "NOT_REQUESTED";
+    }
+    if (!request.deferFullReadback) {
+        vmaInvalidateAllocation(allocator_, readback_.allocation, 0u, static_cast<VkDeviceSize>(rgbBytes));
+        result.outputRgb.resize(static_cast<std::size_t>(pixels) * 3u);
+        std::memcpy(result.outputRgb.data(), readback_.mapped, static_cast<std::size_t>(rgbBytes));
+    }
+    result.readbackMs = elapsedMs(readStart);
+    residentToneGeneration_++;
+    residentToneValid_ = true;
+    residentSceneValid_ = false;
+    result.residentToneGeneration = residentToneGeneration_;
+    result.residentInputUsed = true;
+    result.fullReadbackDeferred = request.deferFullReadback;
+    result.success = request.deferFullReadback || result.outputRgb.size() == static_cast<std::size_t>(pixels) * 3u;
+    result.status = result.success
+            ? (request.deferFullReadback ? "GPU_PRIMARY_TONE_RESIDENT_OUTPUT" : "GPU_PRIMARY_TONE_FINAL_READBACK")
+            : "GPU_TONE_READBACK_SIZE_MISMATCH";
+    result.failureReason = result.success ? "none" : "FULL_RGB_READBACK_INCOMPLETE";
+    result.totalMs = elapsedMs(totalStart);
+    return result;
+#endif
+}
+
+bool VulkanSpectraResidentToneBackend::readbackResidentOutput(
+        VkDevice device, VkQueue computeQueue, VulkanAllocatorOwner& allocatorOwner,
+        std::uint64_t generation, std::vector<float>& outputRgb,
+        std::string& failureReason) noexcept {
+#if !BNCAM_VMA_HEADER_AVAILABLE
+    (void)device; (void)computeQueue; (void)allocatorOwner; (void)generation; (void)outputRgb;
+    failureReason = "VMA_HEADER_NOT_AVAILABLE";
+    return false;
+#else
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!residentToneValid_ || generation == 0u || generation != residentToneGeneration_ ||
+        workingRgb_.buffer == VK_NULL_HANDLE || residentWidth_ == 0u || residentHeight_ == 0u ||
+        device == VK_NULL_HANDLE || computeQueue == VK_NULL_HANDLE) {
+        failureReason = "RESIDENT_TONE_GENERATION_UNAVAILABLE";
+        return false;
+    }
+    allocator_ = allocatorOwner.handle();
+    if (allocator_ == nullptr) {
+        failureReason = "AUTHORITATIVE_VMA_ALLOCATOR_NULL";
+        return false;
+    }
+    const std::uint64_t pixels = static_cast<std::uint64_t>(residentWidth_) * residentHeight_;
+    const std::uint64_t rgbBytes = pixels * 3u * sizeof(float);
+    bool reallocated = false;
+    if (!ensureBufferLocked(allocator_, rgbBytes,
+            VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
+            readback_, reallocated, failureReason)) {
+        return false;
+    }
+    vkResetFences(device, 1u, &fence_);
+    vkResetCommandBuffer(commandBuffer_, 0u);
+    VkCommandBufferBeginInfo begin{};
+    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkBeginCommandBuffer(commandBuffer_, &begin) != VK_SUCCESS) {
+        failureReason = "vkBeginCommandBuffer_tone_readback_failed";
+        return false;
+    }
+    VkBufferMemoryBarrier toTransfer{};
+    toTransfer.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    toTransfer.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    toTransfer.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    toTransfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toTransfer.buffer = workingRgb_.buffer;
+    toTransfer.size = static_cast<VkDeviceSize>(rgbBytes);
+    vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0u,
+                         0u, nullptr, 1u, &toTransfer, 0u, nullptr);
+    VkBufferCopy copy{};
+    copy.size = static_cast<VkDeviceSize>(rgbBytes);
+    vkCmdCopyBuffer(commandBuffer_, workingRgb_.buffer, readback_.buffer, 1u, &copy);
+    VkBufferMemoryBarrier toHost{};
+    toHost.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    toHost.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    toHost.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    toHost.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toHost.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toHost.buffer = readback_.buffer;
+    toHost.size = static_cast<VkDeviceSize>(rgbBytes);
+    vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_HOST_BIT, 0u,
+                         0u, nullptr, 1u, &toHost, 0u, nullptr);
+    if (vkEndCommandBuffer(commandBuffer_) != VK_SUCCESS) {
+        failureReason = "vkEndCommandBuffer_tone_readback_failed";
+        return false;
+    }
+    VkSubmitInfo submit{};
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount = 1u;
+    submit.pCommandBuffers = &commandBuffer_;
+    if (vkQueueSubmit(computeQueue, 1u, &submit, fence_) != VK_SUCCESS ||
+        vkWaitForFences(device, 1u, &fence_, VK_TRUE, 3'000'000'000ull) != VK_SUCCESS) {
+        VulkanRuntime::instance().markGpuStalled("ToneReadback");
+        failureReason = "tone_readback_queue_submit_or_wait_timeout";
+        return false;
+    }
+    vmaInvalidateAllocation(allocator_, readback_.allocation, 0u, static_cast<VkDeviceSize>(rgbBytes));
+    try {
+        outputRgb.resize(static_cast<std::size_t>(pixels) * 3u);
+    } catch (...) {
+        failureReason = "tone_readback_cpu_allocation_failed";
+        return false;
+    }
+    std::memcpy(outputRgb.data(), readback_.mapped, static_cast<std::size_t>(rgbBytes));
+    failureReason = "none";
+    return true;
+#endif
+}
+
+bool VulkanSpectraResidentToneBackend::resolveResidentOutput(
+        std::uint64_t generation, VkBuffer& buffer, std::uint64_t& bytes,
+        std::uint32_t& width, std::uint32_t& height) const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!residentToneValid_ || generation == 0u || generation != residentToneGeneration_ ||
+        workingRgb_.buffer == VK_NULL_HANDLE || residentWidth_ == 0u || residentHeight_ == 0u) {
+        return false;
+    }
+    buffer = workingRgb_.buffer;
+    width = residentWidth_;
+    height = residentHeight_;
+    bytes = static_cast<std::uint64_t>(width) * height * 3u * sizeof(float);
+    return true;
+}
+
+} // namespace bncam::vulkan

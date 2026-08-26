@@ -1,0 +1,86 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer RawInputBuffer {
+    uint inputWords[];
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer LensShadingMapBuffer {
+    float gainMap[];
+};
+
+layout(std430, set = 0, binding = 2) buffer LinearOutputBuffer {
+    float outputFloatPixels[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+    uint cfaPattern;
+    uint lsWidth;
+    uint lsHeight;
+    float whiteLevel;
+    vec4 blackLevels;
+    vec4 wbGains;
+} pc;
+
+uint getCfaChannel(uint x, uint y, uint pattern) {
+    uint xm = x & 1u;
+    uint ym = y & 1u;
+    if (pattern == 0u) { // RGGB
+        return (ym == 0u) ? ((xm == 0u) ? 0u : 1u) : ((xm == 0u) ? 2u : 3u);
+    } else if (pattern == 1u) { // GRBG
+        return (ym == 0u) ? ((xm == 0u) ? 1u : 0u) : ((xm == 0u) ? 3u : 2u);
+    } else if (pattern == 2u) { // GBRG
+        return (ym == 0u) ? ((xm == 0u) ? 1u : 3u) : ((xm == 0u) ? 0u : 2u);
+    } else { // BGGR
+        return (ym == 0u) ? ((xm == 0u) ? 3u : 1u) : ((xm == 0u) ? 2u : 0u);
+    }
+}
+
+void main() {
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    if (x >= pc.width || y >= pc.height) return;
+
+    uint pixelIdx = y * pc.width + x;
+    uint wordIdx = pixelIdx / 2u;
+    uint shift = (pixelIdx % 2u) * 16u;
+    float rawSample = float((inputWords[wordIdx] >> shift) & 0xFFFFu);
+
+    uint ch = getCfaChannel(x, y, pc.cfaPattern);
+
+    // 1. Black-level subtraction (clamp negative values only)
+    float black = (ch == 0u) ? pc.blackLevels.r : ((ch == 1u) ? pc.blackLevels.g : ((ch == 2u) ? pc.blackLevels.b : pc.blackLevels.a));
+    float val = max(0.0, rawSample - black);
+
+    // 2. White-level normalization (uncapped float range to preserve highlight headroom)
+    float range = max(1.0, pc.whiteLevel - black);
+    float normalized = val / range;
+
+    // 3. Bilinear Lens Shading Gain Map Interpolation
+    float lsGain = 1.0;
+    if (pc.lsWidth > 1u && pc.lsHeight > 1u) {
+        float u = (float(x) + 0.5) / float(pc.width) * float(pc.lsWidth - 1u);
+        float v = (float(y) + 0.5) / float(pc.height) * float(pc.lsHeight - 1u);
+        uint u0 = uint(floor(u));
+        uint v0 = uint(floor(v));
+        uint u1 = min(u0 + 1u, pc.lsWidth - 1u);
+        uint v1 = min(v0 + 1u, pc.lsHeight - 1u);
+        float fu = u - float(u0);
+        float fv = v - float(v0);
+
+        uint planeOffset = ch * (pc.lsWidth * pc.lsHeight);
+        float g00 = gainMap[planeOffset + v0 * pc.lsWidth + u0];
+        float g10 = gainMap[planeOffset + v0 * pc.lsWidth + u1];
+        float g01 = gainMap[planeOffset + v1 * pc.lsWidth + u0];
+        float g11 = gainMap[planeOffset + v1 * pc.lsWidth + u1];
+
+        lsGain = mix(mix(g00, g10, fu), mix(g01, g11, fu), fv);
+    }
+    float lsCorrected = normalized * max(0.0, lsGain);
+
+    // 4. White Balance Gain application (linear headroom preserved, no premature clamping)
+    float wbGain = (ch == 0u) ? pc.wbGains.r : ((ch == 1u) ? pc.wbGains.g : ((ch == 2u) ? pc.wbGains.b : pc.wbGains.a));
+    outputFloatPixels[pixelIdx] = lsCorrected * max(0.0, wbGain);
+}

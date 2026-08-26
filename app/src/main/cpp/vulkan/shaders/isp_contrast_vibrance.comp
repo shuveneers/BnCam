@@ -1,0 +1,42 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer InputRgbBuffer {
+    vec4 inputPixels[];
+};
+
+layout(std430, set = 0, binding = 1) buffer OutputRgbBuffer {
+    vec4 outputPixels[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+    float contrast;     // e.g. 1.05 (mid-tone contrast adjustment)
+    float vibrance;     // e.g. 0.15 (selective saturation boost for muted colors)
+    float sensorWeight; // 0.0 when phone assistance sensors disabled, bounded weight when enabled
+} pc;
+
+void main() {
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    if (x >= pc.width || y >= pc.height) return;
+
+    uint pixelIdx = y * pc.width + x;
+    vec3 rgb = inputPixels[pixelIdx].rgb;
+
+    // Midtone contrast scaling around 0.5 anchor
+    rgb = (rgb - 0.5) * pc.contrast + 0.5;
+
+    // Selective Vibrance: Boost muted colors more than already-saturated colors
+    float luma = 0.2126 * rgb.r + 0.7152 * rgb.g + 0.0722 * rgb.b;
+    float maxC = max(rgb.r, max(rgb.g, rgb.b));
+    float minC = min(rgb.r, min(rgb.g, rgb.b));
+    float sat = (maxC - minC) / max(maxC, 1e-4);
+
+    float effectiveVibrance = pc.vibrance + pc.sensorWeight * 0.05; // Sensor contribution when enabled
+    float vibranceWeight = (1.0 - sat) * effectiveVibrance;
+    rgb = mix(vec3(luma), rgb, 1.0 + vibranceWeight);
+
+    outputPixels[pixelIdx] = vec4(max(vec3(0.0), rgb), 1.0);
+}

@@ -1,0 +1,39 @@
+#version 450
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer InputBuffer {
+    uint inputWords[];
+};
+
+layout(std430, set = 0, binding = 1) buffer OutputBuffer {
+    uint outputWords[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+    uint inputRowStrideBytes;
+    uint outputRowStrideBytes;
+} pc;
+
+void main() {
+    uint pixelIdx = gl_GlobalInvocationID.x;
+    uint totalPixels = pc.width * pc.height;
+    if (pixelIdx >= totalPixels) return;
+
+    uint row = pixelIdx / pc.width;
+    uint col = pixelIdx % pc.width;
+
+    uint byteOffset = row * pc.inputRowStrideBytes + col * 2u;
+    uint wordIdx = byteOffset / 4u;
+    uint wordShift = (byteOffset % 4u) * 8u;
+
+    uint val16 = (inputWords[wordIdx] >> wordShift) & 0xFFFFu;
+
+    uint outWordIdx = pixelIdx / 2u;
+    if ((pixelIdx % 2u) == 0u) {
+        outputWords[outWordIdx] = (outputWords[outWordIdx] & 0xFFFF0000u) | (val16 & 0xFFFFu);
+    } else {
+        outputWords[outWordIdx] = (outputWords[outWordIdx] & 0x0000FFFFu) | ((val16 & 0xFFFFu) << 16u);
+    }
+}

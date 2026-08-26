@@ -1,0 +1,2 @@
+[2026-08-09 22:06:25.839] [TELEMETRY_INITIALIZED] path=/storage/emulated/0/Android/data/com.bncam/files/device_telemetry_trace.txt
+[2026-08-09 22:06:25.890] [TELEMETRY_INITIALIZED] path=/storage/emulated/0/Android/data/com.bncam/files/device_telemetry_trace.txt

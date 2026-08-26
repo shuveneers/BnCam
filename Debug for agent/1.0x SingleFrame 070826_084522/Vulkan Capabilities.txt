@@ -1,0 +1,43 @@
+VULKAN CAPABILITIES
+Schema version: 1
+Loader available: true
+Loader API version: 4210688
+Selected device: Adreno (TM) 840
+Device type: INTEGRATED_GPU
+Compute queue family: 1
+Compute queue count: 1
+VMA ready: true
+Validation layer: available=false enabled=false
+Debug utils: available=true enabled=true messenger=created
+Enabled extensions: 6
+Enabled features: 0
+Missing requirements: 3
+
+vulkan_loader: AVAILABLE | value=API 4210688 | reason=verified
+instance_api_version: SUPPORTED_BY_CORE_VERSION | value=Vulkan 1.4 | reason=created
+physical_device: AVAILABLE | value=Adreno (TM) 840 | reason=selected
+device_type: AVAILABLE | value=INTEGRATED_GPU | reason=queried
+queue_families: AVAILABLE | value=4 queue families | reason=queried
+compute_queue: ENABLED_AS_CORE_FEATURE | value=family 1 | reason=active
+command_pool: ENABLED_AS_CORE_FEATURE | value=lifecycle-persistent VkCommandPool object | reason=active
+descriptor_pool: ENABLED_AS_CORE_FEATURE | value=lifecycle-persistent VkDescriptorPool object | reason=active
+pipeline_cache: ENABLED_AS_CORE_FEATURE | value=lifecycle-persistent VkPipelineCache object | reason=disk-persistent pipeline-cache data not active
+vma_allocator: ENABLED_AS_CORE_FEATURE | value=VmaAllocator 3.3.0 | reason=active
+memory_heaps: AVAILABLE | value=15241 MB device local | reason=queried
+memory_types: AVAILABLE | value=11 memory types | reason=queried
+storage_buffers: SUPPORTED_BY_CORE_VERSION | value=max range 2147483647 bytes | reason=queried
+storage_images: SUPPORTED_BY_CORE_VERSION | value=max 2D 16384px | reason=queried
+timestamps: SUPPORTED_BY_CORE_VERSION | value=period=52.083332ns | reason=supported
+subgroups: SUPPORTED_BY_CORE_VERSION | value=subgroup ops | reason=Vulkan 1.1 core
+synchronization: SUPPORTED_BY_CORE_VERSION | value=barriers/fences | reason=Vulkan 1.2 core timeline semaphores
+descriptor_indexing: SUPPORTED_BY_CORE_VERSION | value=descriptor indexing | reason=Vulkan 1.2 core
+validation_layer: MISSING | value=VK_LAYER_KHRONOS_validation | reason=not available on system
+VK_EXT_debug_utils: ENABLED_AS_EXTENSION | value=VK_EXT_debug_utils | reason=enabled on instance
+external_memory: SUPPORTED_BY_CORE_VERSION | value=VK_KHR_external_memory | reason=promoted to Vulkan 1.1 core
+dedicated_allocation: SUPPORTED_BY_CORE_VERSION | value=VK_KHR_dedicated_allocation | reason=promoted to Vulkan 1.1 core
+external_semaphore: SUPPORTED_BY_CORE_VERSION | value=VK_KHR_external_semaphore | reason=promoted to Vulkan 1.1 core
+external_fence: SUPPORTED_BY_CORE_VERSION | value=VK_KHR_external_fence | reason=promoted to Vulkan 1.1 core
+VK_ANDROID_external_memory_android_hardware_buffer: ENABLED_AS_EXTENSION | value=VK_ANDROID_external_memory_android_hardware_buffer | reason=enabled on VkDevice; vkGetAndroidHardwareBufferPropertiesANDROID proc addr verified
+yuv_ahardwarebuffer_import: REQUIRED_LATER | value=direct YUV import | reason=Phase 3B import boundary
+raw10_ahardwarebuffer_import: REQUIRED_LATER | value=direct RAW10 import | reason=Phase 3B import boundary
+raw_sensor_ahardwarebuffer_import: REQUIRED_LATER | value=direct RAW_SENSOR import | reason=Phase 3B import boundary

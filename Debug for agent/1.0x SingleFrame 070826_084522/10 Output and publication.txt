@@ -1,0 +1,6 @@
+OUTPUT AND PUBLICATION
+======================
+dngSourcePlanned: requested=NOT_APPLICABLE; supported=false; resolved=NOT_APPLICABLE; executed=not_recorded; result=resolved_at_shutter; fallback=false; reason=dng_master_frame_count_0
+executedDngSource: requested=NOT_APPLICABLE; supported=false; resolved=NOT_APPLICABLE; executed=not_executed; result=not_applicable; fallback=false; reason=output_policy_does_not_request_dng
+publication: requested=JPEG; supported=true; resolved=FULL_SUCCESS; executed=JPEG; result=FULL_SUCCESS; fallback=false; reason=none
+thumbnailAvailable: true

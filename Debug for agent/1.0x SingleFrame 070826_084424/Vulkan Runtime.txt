@@ -1,0 +1,24 @@
+VULKAN RUNTIME
+Schema version: 1
+State: READY
+Runtime identity: bncam-vulkan-runtime-1786046650758-1
+Loader available: true
+Runtime initialized: true
+Selected device: Adreno (TM) 840
+Instance creation count: 1
+Device creation count: 1
+Initialize requests: 1
+Shutdown requests: 0
+In-flight submissions: 0
+Active production stages: 6
+
+Validation compiled in: true
+Validation requested: true
+VMA pinned version: 3.3.0
+VMA header available at build time: true
+VMA allocator ready: true
+Pipeline cache: lifecycle-persistent VkPipelineCache object (disk-persistent pipeline-cache data not active)
+Ownership scope: process/native-engine
+Camera/session ownership: forbidden
+Compose ownership: forbidden
+Production Vulkan stages: SPECTRA GPU stages connected; resident final-decision path preferred when compiled

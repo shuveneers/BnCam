@@ -1,0 +1,470 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer InputBuffer {
+    uint words[];
+} inputBuffer;
+
+layout(set = 0, binding = 1, std430) readonly buffer ToneLutBuffer {
+    uint values[];
+} toneLut;
+
+layout(set = 0, binding = 2, std430) writeonly buffer OutputBuffer {
+    uint words[];
+} outputBuffer;
+
+layout(set = 0, binding = 3, std430) readonly buffer HdrAccumulatorBuffer {
+    float values[];
+} hdrAccumulator;
+
+layout(set = 0, binding = 4, std430) readonly buffer HdrWeightBuffer {
+    float values[];
+} hdrWeights;
+
+layout(set = 0, binding = 5, std430) buffer GainLogBuffer {
+    float values[];
+} gainLog;
+
+layout(set = 0, binding = 6, std430) writeonly buffer GainmapBuffer {
+    uint words[];
+} gainmapBuffer;
+
+layout(set = 0, binding = 7, std430) buffer UltraHdrTelemetryBuffer {
+    uint values[];
+} ultraHdrTelemetry;
+
+layout(set = 0, binding = 8, std430) readonly buffer PortraitMaskBuffer {
+    float values[];
+} portraitMask;
+
+layout(push_constant) uniform PushConstants {
+    uint inputWidth;
+    uint inputHeight;
+    uint outputWidth;
+    uint outputHeight;
+    uint rotationDegrees;
+    uint outputPixelCount;
+    float wbRed;
+    float wbGreen;
+    float wbBlue;
+    float saturationControl;
+    float contrastControl;
+    float vibranceControl;
+    float profileDetailAmount;
+    float profileDetailRadius;
+    float profileDetailDetail;
+    float profileDetailMasking;
+    uint ultraHdrMode;
+    uint gainmapWidth;
+    uint gainmapHeight;
+    uint gainmapPixelCount;
+    uint portraitEnabled;
+    uint portraitMaskWidth;
+    uint portraitMaskHeight;
+    uint portraitMaskRotationDegrees;
+    float portraitTargetLeft;
+    float portraitTargetTop;
+    float portraitTargetRight;
+    float portraitTargetBottom;
+    float profileNrLumaBlend;
+    float profileNrLumaProtection;
+    float profileNrChromaBlend;
+    float profileNrChromaProtection;
+} pc;
+
+uint readByte(uint byteIndex) {
+    uint word = inputBuffer.words[byteIndex >> 2u];
+    uint shift = (byteIndex & 3u) * 8u;
+    return (word >> shift) & 0xffu;
+}
+
+uint pack4(uint b0, uint b1, uint b2, uint b3) {
+    return (b0 & 0xffu) |
+           ((b1 & 0xffu) << 8u) |
+           ((b2 & 0xffu) << 16u) |
+           ((b3 & 0xffu) << 24u);
+}
+
+uvec2 sourceCoordinate(uint outputX, uint outputY) {
+    if (pc.rotationDegrees == 90u) {
+        return uvec2(outputY, pc.inputHeight - 1u - outputX);
+    }
+    if (pc.rotationDegrees == 180u) {
+        return uvec2(pc.inputWidth - 1u - outputX, pc.inputHeight - 1u - outputY);
+    }
+    if (pc.rotationDegrees == 270u) {
+        return uvec2(pc.inputWidth - 1u - outputY, outputX);
+    }
+    return uvec2(outputX, outputY);
+}
+
+float contrastCurve(float value, float signedControl) {
+    float v = clamp(value, 0.0, 1.0);
+    float factor = exp2(clamp(signedControl, -1.0, 1.0) * 0.75);
+    if (abs(factor - 1.0) < 1.0e-4) return v;
+    if (v < 0.5) {
+        return 0.5 * pow(max(0.0, 2.0 * v), factor);
+    }
+    return 1.0 - 0.5 * pow(max(0.0, 2.0 * (1.0 - v)), factor);
+}
+
+vec3 applyProfile(vec3 rgb) {
+    float r = clamp(rgb.r * pc.wbRed, 0.0, 1.0);
+    float g = clamp(rgb.g * pc.wbGreen, 0.0, 1.0);
+    float b = clamp(rgb.b * pc.wbBlue, 0.0, 1.0);
+
+    float saturationControl = clamp(pc.saturationControl, -1.0, 1.0);
+    float contrastControl = clamp(pc.contrastControl, -1.0, 1.0);
+    float vibranceControl = clamp(pc.vibranceControl, -1.0, 1.0);
+    if (abs(saturationControl) < 1.0e-4 &&
+        abs(contrastControl) < 1.0e-4 &&
+        abs(vibranceControl) < 1.0e-4) {
+        return vec3(r, g, b);
+    }
+
+    float y = max(0.0, 0.2126 * r + 0.7152 * g + 0.0722 * b);
+    if (abs(contrastControl) >= 1.0e-4) {
+        float mappedY = contrastCurve(y, contrastControl);
+        float scale = y > 1.0e-6 ? mappedY / y : 1.0;
+        r *= scale;
+        g *= scale;
+        b *= scale;
+        y = mappedY;
+    }
+    if (abs(saturationControl) >= 1.0e-4) {
+        float saturationFactor = exp2(saturationControl * 0.85);
+        r = y + (r - y) * saturationFactor;
+        g = y + (g - y) * saturationFactor;
+        b = y + (b - y) * saturationFactor;
+    }
+    if (abs(vibranceControl) >= 1.0e-4) {
+        float maximum = max(r, max(g, b));
+        float minimum = min(r, min(g, b));
+        float currentSaturation = (maximum - minimum) / max(1.0e-4, maximum);
+        float protection = clamp(1.0 - currentSaturation, 0.0, 1.0);
+        float authority = vibranceControl >= 0.0
+            ? vibranceControl * (0.20 + 0.80 * protection)
+            : vibranceControl * (0.55 + 0.45 * protection);
+        float vibranceFactor = exp2(authority * 0.90);
+        r = y + (r - y) * vibranceFactor;
+        g = y + (g - y) * vibranceFactor;
+        b = y + (b - y) * vibranceFactor;
+    }
+    return clamp(vec3(r, g, b), vec3(0.0), vec3(1.0));
+}
+
+vec2 sourceUvForOutput(uint outputX, uint outputY) {
+    uvec2 source = sourceCoordinate(outputX, outputY);
+    return (vec2(source) + vec2(0.5)) / vec2(pc.inputWidth, pc.inputHeight);
+}
+
+vec2 portraitUprightUv(vec2 sourceUv) {
+    uint rotation = pc.portraitMaskRotationDegrees % 360u;
+    if (rotation == 90u) return vec2(1.0 - sourceUv.y, sourceUv.x);
+    if (rotation == 180u) return vec2(1.0 - sourceUv.x, 1.0 - sourceUv.y);
+    if (rotation == 270u) return vec2(sourceUv.y, 1.0 - sourceUv.x);
+    return sourceUv;
+}
+
+float portraitMaskRawAtSourceUv(vec2 sourceUv) {
+    if (pc.portraitEnabled == 0u || pc.portraitMaskWidth < 2u || pc.portraitMaskHeight < 2u) return 0.0;
+    vec2 uv = portraitUprightUv(clamp(sourceUv, vec2(0.0), vec2(1.0)));
+    vec2 lo = vec2(pc.portraitTargetLeft, pc.portraitTargetTop);
+    vec2 hi = vec2(pc.portraitTargetRight, pc.portraitTargetBottom);
+    vec2 span = max(hi - lo, vec2(1.0e-6));
+    vec2 local = (uv - lo) / span;
+    if (local.x < 0.0 || local.x > 1.0 || local.y < 0.0 || local.y > 1.0) return 0.0;
+    vec2 p = clamp(local, vec2(0.0), vec2(1.0)) *
+            vec2(float(pc.portraitMaskWidth - 1u), float(pc.portraitMaskHeight - 1u));
+    uvec2 p0 = uvec2(floor(p));
+    uvec2 p1 = min(p0 + uvec2(1u), uvec2(pc.portraitMaskWidth - 1u, pc.portraitMaskHeight - 1u));
+    vec2 f = fract(p);
+    float m00 = portraitMask.values[p0.y * pc.portraitMaskWidth + p0.x];
+    float m10 = portraitMask.values[p0.y * pc.portraitMaskWidth + p1.x];
+    float m01 = portraitMask.values[p1.y * pc.portraitMaskWidth + p0.x];
+    float m11 = portraitMask.values[p1.y * pc.portraitMaskWidth + p1.x];
+    return clamp(mix(mix(m00, m10, f.x), mix(m01, m11, f.x), f.y), 0.0, 1.0);
+}
+
+float portraitAlphaAtOutput(uint outputX, uint outputY) {
+    if (pc.portraitEnabled == 0u) return 0.0;
+    vec2 sourceUv = sourceUvForOutput(outputX, outputY);
+    vec2 dx = vec2(1.25 / float(pc.inputWidth), 0.0);
+    vec2 dy = vec2(0.0, 1.25 / float(pc.inputHeight));
+    float c = portraitMaskRawAtSourceUv(sourceUv);
+    float refined = (2.0 * c +
+            portraitMaskRawAtSourceUv(sourceUv + dx) + portraitMaskRawAtSourceUv(sourceUv - dx) +
+            portraitMaskRawAtSourceUv(sourceUv + dy) + portraitMaskRawAtSourceUv(sourceUv - dy)) / 6.0;
+    return clamp(max(smoothstep(0.16, 0.70, refined), smoothstep(0.52, 0.90, c)), 0.0, 1.0);
+}
+
+float portraitDistanceAtOutput(uint outputX, uint outputY) {
+    vec2 uv = portraitUprightUv(sourceUvForOutput(outputX, outputY));
+    vec2 lo = vec2(pc.portraitTargetLeft, pc.portraitTargetTop);
+    vec2 hi = vec2(pc.portraitTargetRight, pc.portraitTargetBottom);
+    vec2 d = max(max(lo - uv, uv - hi), vec2(0.0));
+    return length(d);
+}
+
+const vec2 kPortraitPoisson[12] = vec2[12](
+    vec2(-0.326, -0.406), vec2(-0.840, -0.074), vec2(-0.696, 0.457),
+    vec2(-0.203, 0.621), vec2(0.962, -0.195), vec2(0.473, -0.480),
+    vec2(0.519, 0.767), vec2(0.185, -0.893), vec2(0.507, 0.064),
+    vec2(0.896, 0.412), vec2(-0.322, -0.933), vec2(-0.792, -0.598)
+);
+
+float inputYAtOutput(int outputX, int outputY) {
+    uint x = uint(clamp(outputX, 0, int(pc.outputWidth) - 1));
+    uint y = uint(clamp(outputY, 0, int(pc.outputHeight) - 1));
+    uvec2 source = sourceCoordinate(x, y);
+    uint yIndex = source.y * pc.inputWidth + source.x;
+    return float(readByte(yIndex)) / 255.0;
+}
+
+float denoisedInputYAtOutput(int outputX, int outputY) {
+    float center = inputYAtOutput(outputX, outputY);
+    float blend = clamp(pc.profileNrLumaBlend, 0.0, 0.75);
+    if (blend <= 1.0e-6) return center;
+    float n = inputYAtOutput(outputX, outputY - 1);
+    float s = inputYAtOutput(outputX, outputY + 1);
+    float w = inputYAtOutput(outputX - 1, outputY);
+    float e = inputYAtOutput(outputX + 1, outputY);
+    float localMean = 0.20 * (center + n + s + w + e);
+    float structure = 0.25 * (abs(center - n) + abs(center - s) + abs(center - w) + abs(center - e));
+    float protection = clamp(pc.profileNrLumaProtection, 0.0, 1.0);
+    float structureGate = 1.0 - protection * smoothstep(0.012, 0.085, structure);
+    return clamp(mix(center, localMean, blend * structureGate), 0.0, 1.0);
+}
+
+float toneMappedYAtOutput(int outputX, int outputY) {
+    uint index = uint(clamp(roundEven(denoisedInputYAtOutput(outputX, outputY) * 255.0), 0.0, 255.0));
+    return float(toneLut.values[index] & 0xffu) / 255.0;
+}
+
+vec2 inputUvAtOutput(int outputX, int outputY) {
+    uint x = uint(clamp(outputX, 0, int(pc.outputWidth) - 1));
+    uint y = uint(clamp(outputY, 0, int(pc.outputHeight) - 1));
+    uvec2 source = sourceCoordinate(x, y);
+    uint chromaBase = pc.inputWidth * pc.inputHeight;
+    uint chromaIndex = chromaBase + (source.y >> 1u) * pc.inputWidth + (source.x >> 1u) * 2u;
+    float v = float(readByte(chromaIndex)) / 255.0;
+    float u = float(readByte(chromaIndex + 1u)) / 255.0;
+    return vec2(u, v);
+}
+
+vec2 denoisedUvAtOutput(uint outputX, uint outputY) {
+    vec2 center = inputUvAtOutput(int(outputX), int(outputY));
+    float blend = clamp(pc.profileNrChromaBlend, 0.0, 0.85);
+    if (blend <= 1.0e-6) return center;
+    vec2 n = inputUvAtOutput(int(outputX), int(outputY) - 2);
+    vec2 s = inputUvAtOutput(int(outputX), int(outputY) + 2);
+    vec2 w = inputUvAtOutput(int(outputX) - 2, int(outputY));
+    vec2 e = inputUvAtOutput(int(outputX) + 2, int(outputY));
+    vec2 localMean = 0.20 * (center + n + s + w + e);
+    float yCenter = inputYAtOutput(int(outputX), int(outputY));
+    float structure = 0.25 * (
+        abs(yCenter - inputYAtOutput(int(outputX), int(outputY) - 2)) +
+        abs(yCenter - inputYAtOutput(int(outputX), int(outputY) + 2)) +
+        abs(yCenter - inputYAtOutput(int(outputX) - 2, int(outputY))) +
+        abs(yCenter - inputYAtOutput(int(outputX) + 2, int(outputY))));
+    float protection = clamp(pc.profileNrChromaProtection, 0.0, 1.0);
+    float structureGate = 1.0 - protection * smoothstep(0.015, 0.10, structure);
+    return clamp(mix(center, localMean, blend * structureGate), vec2(0.0), vec2(1.0));
+}
+
+float profileDetailedYAtOutput(uint outputX, uint outputY) {
+    float amount = clamp(pc.profileDetailAmount, 0.0, 1.0);
+    float center = toneMappedYAtOutput(int(outputX), int(outputY));
+    if (amount <= 1.0e-6) return center;
+
+    float radius = clamp(pc.profileDetailRadius, 0.50, 3.00);
+    float detailControl = clamp(pc.profileDetailDetail, 0.0, 1.0);
+    float masking = clamp(pc.profileDetailMasking, 0.0, 1.0);
+    int stepPx = radius < 1.35 ? 1 : (radius < 2.20 ? 2 : 3);
+    float n = toneMappedYAtOutput(int(outputX), int(outputY) - stepPx);
+    float s = toneMappedYAtOutput(int(outputX), int(outputY) + stepPx);
+    float w = toneMappedYAtOutput(int(outputX) - stepPx, int(outputY));
+    float e = toneMappedYAtOutput(int(outputX) + stepPx, int(outputY));
+    float localMean = 0.25 * (n + s + w + e);
+    float highPass = center - localMean;
+    float edgeEnergy = 0.25 * (abs(center - n) + abs(center - s) + abs(center - w) + abs(center - e));
+
+    float detailGain = mix(0.72, 1.32, detailControl);
+    float edge0 = mix(0.0035, 0.018, masking);
+    float edge1 = mix(0.016, 0.060, masking);
+    float maskGate = mix(1.0, smoothstep(edge0, edge1, edgeEnergy), masking);
+    float shadowGate = smoothstep(0.025, 0.11, center);
+    float highlightGate = 1.0 - smoothstep(0.78, 0.97, center);
+    float tonalGate = mix(0.22, 1.0, shadowGate) * mix(0.38, 1.0, highlightGate);
+    float authority = 0.24 * clamp(2.25 * amount, 0.0, 2.0) * detailGain * maskGate * tonalGate;
+    float overshootGuard = clamp(0.45 + 0.55 * masking, 0.0, 1.0);
+    float cap = 0.040 * (1.0 - 0.62 * overshootGuard);
+    return clamp(center + clamp(highPass * authority, -cap, cap), 0.0, 1.0);
+}
+
+vec3 renderRgbUnblurred(uint outputX, uint outputY) {
+    uint yValue = uint(clamp(roundEven(profileDetailedYAtOutput(outputX, outputY) * 255.0), 0.0, 255.0));
+    vec2 filteredUv = denoisedUvAtOutput(outputX, outputY);
+    int u = int(clamp(roundEven(filteredUv.x * 255.0), 0.0, 255.0)) - 128;
+    int v = int(clamp(roundEven(filteredUv.y * 255.0), 0.0, 255.0)) - 128;
+    int c = max(int(yValue) - 16, 0);
+    int r8 = clamp((298 * c + 409 * v + 128) >> 8, 0, 255);
+    int g8 = clamp((298 * c - 100 * u - 208 * v + 128) >> 8, 0, 255);
+    int b8 = clamp((298 * c + 516 * u + 128) >> 8, 0, 255);
+    return applyProfile(vec3(float(r8), float(g8), float(b8)) / 255.0);
+}
+
+vec3 renderRgbPortrait(uint outputX, uint outputY) {
+    vec3 original = renderRgbUnblurred(outputX, outputY);
+    if (pc.portraitEnabled == 0u) return original;
+    float alpha = portraitAlphaAtOutput(outputX, outputY);
+    if (alpha >= 0.985) return original;
+    float minDim = max(1.0, min(float(pc.outputWidth), float(pc.outputHeight)));
+    float distanceGain = mix(0.58, 1.0, smoothstep(0.015, 0.22, portraitDistanceAtOutput(outputX, outputY)));
+    float radius = clamp(minDim * 0.0125 * distanceGain, 3.0, 30.0);
+    vec3 sum = original * (1.0 - alpha) * 0.7;
+    float weightSum = (1.0 - alpha) * 0.7;
+    for (int i = 0; i < 12; ++i) {
+        int sx = clamp(int(outputX) + int(round(kPortraitPoisson[i].x * radius)), 0, int(pc.outputWidth) - 1);
+        int sy = clamp(int(outputY) + int(round(kPortraitPoisson[i].y * radius)), 0, int(pc.outputHeight) - 1);
+        float sampleAlpha = portraitAlphaAtOutput(uint(sx), uint(sy));
+        float w = (1.0 - smoothstep(0.22, 0.68, sampleAlpha)) *
+                (1.0 - 0.24 * length(kPortraitPoisson[i]));
+        sum += renderRgbUnblurred(uint(sx), uint(sy)) * max(w, 0.0);
+        weightSum += max(w, 0.0);
+    }
+    vec3 blurred = weightSum > 1.0e-5 ? sum / weightSum : original;
+    return mix(blurred, original, alpha);
+}
+
+uvec3 renderBgr(uint outputPixelIndex) {
+    uint outputX = outputPixelIndex % pc.outputWidth;
+    uint outputY = outputPixelIndex / pc.outputWidth;
+    vec3 rgb = renderRgbPortrait(outputX, outputY);
+    return uvec3(
+        uint(clamp(roundEven(rgb.b * 255.0), 0.0, 255.0)),
+        uint(clamp(roundEven(rgb.g * 255.0), 0.0, 255.0)),
+        uint(clamp(roundEven(rgb.r * 255.0), 0.0, 255.0))
+    );
+}
+
+float hdrLumaUnblurred(uint outputX, uint outputY) {
+    uvec2 source = sourceCoordinate(outputX, outputY);
+    uint sourceIndex = source.y * pc.inputWidth + source.x;
+    float weight = max(hdrWeights.values[sourceIndex], 1.0e-6);
+    return max(0.0, hdrAccumulator.values[sourceIndex] / weight) / 255.0;
+}
+
+float hdrLumaAtOutput(uint outputX, uint outputY) {
+    float original = hdrLumaUnblurred(outputX, outputY);
+    if (pc.portraitEnabled == 0u) return original;
+    float alpha = portraitAlphaAtOutput(outputX, outputY);
+    if (alpha >= 0.985) return original;
+    float minDim = max(1.0, min(float(pc.outputWidth), float(pc.outputHeight)));
+    float distanceGain = mix(0.58, 1.0, smoothstep(0.015, 0.22, portraitDistanceAtOutput(outputX, outputY)));
+    float radius = clamp(minDim * 0.0125 * distanceGain, 3.0, 30.0);
+    float sum = original * (1.0 - alpha) * 0.7;
+    float weightSum = (1.0 - alpha) * 0.7;
+    for (int i = 0; i < 12; ++i) {
+        int sx = clamp(int(outputX) + int(round(kPortraitPoisson[i].x * radius)), 0, int(pc.outputWidth) - 1);
+        int sy = clamp(int(outputY) + int(round(kPortraitPoisson[i].y * radius)), 0, int(pc.outputHeight) - 1);
+        float sampleAlpha = portraitAlphaAtOutput(uint(sx), uint(sy));
+        float w = (1.0 - smoothstep(0.22, 0.68, sampleAlpha)) *
+                (1.0 - 0.24 * length(kPortraitPoisson[i]));
+        sum += hdrLumaUnblurred(uint(sx), uint(sy)) * max(w, 0.0);
+        weightSum += max(w, 0.0);
+    }
+    float blurred = weightSum > 1.0e-5 ? sum / weightSum : original;
+    return mix(blurred, original, alpha);
+}
+
+float sdrLumaAtOutput(uint outputX, uint outputY) {
+    uint pixelIndex = outputY * pc.outputWidth + outputX;
+    uvec3 bgr = renderBgr(pixelIndex);
+    return (0.0722 * float(bgr.x) + 0.7152 * float(bgr.y) + 0.2126 * float(bgr.z)) / 255.0;
+}
+
+float gainLogForMapPixel(uint mapPixelIndex) {
+    uint mapX = mapPixelIndex % pc.gainmapWidth;
+    uint mapY = mapPixelIndex / pc.gainmapWidth;
+    uint outputStartX = mapX * 4u;
+    uint outputStartY = mapY * 4u;
+    float hdrSum = 0.0;
+    float sdrSum = 0.0;
+    float samples = 0.0;
+    for (uint dy = 0u; dy < 4u; ++dy) {
+        uint y = outputStartY + dy;
+        if (y >= pc.outputHeight) break;
+        for (uint dx = 0u; dx < 4u; ++dx) {
+            uint x = outputStartX + dx;
+            if (x >= pc.outputWidth) break;
+            hdrSum += hdrLumaAtOutput(x, y);
+            sdrSum += sdrLumaAtOutput(x, y);
+            samples += 1.0;
+        }
+    }
+    if (samples <= 0.0) return 0.0;
+    float hdrY = hdrSum / samples;
+    float sdrY = sdrSum / samples;
+    const float offset = 1.0 / 64.0;
+    float ratio = clamp((hdrY + offset) / max(sdrY + offset, 1.0e-6), 1.0, 16.0);
+    return log2(ratio);
+}
+
+void main() {
+    uint blockIndex = gl_GlobalInvocationID.x;
+
+    if (pc.ultraHdrMode == 1u) {
+        if (pc.gainmapWidth == 0u || pc.gainmapHeight == 0u) return;
+        uint wordsPerRow = (pc.gainmapWidth + 3u) / 4u;
+        uint totalWords = wordsPerRow * pc.gainmapHeight;
+        if (blockIndex >= totalWords) return;
+        uint row = blockIndex / wordsPerRow;
+        uint wordInRow = blockIndex % wordsPerRow;
+        float maxLog = float(ultraHdrTelemetry.values[0]) / 65536.0;
+        uint packed = 0u;
+        for (uint lane = 0u; lane < 4u; ++lane) {
+            uint x = wordInRow * 4u + lane;
+            uint value = 0u;
+            if (x < pc.gainmapWidth) {
+                uint mapPixel = row * pc.gainmapWidth + x;
+                float normalized = maxLog > 1.0e-6
+                        ? clamp(gainLog.values[mapPixel] / maxLog, 0.0, 1.0)
+                        : 0.0;
+                value = uint(clamp(roundEven(normalized * 255.0), 0.0, 255.0));
+            }
+            packed |= (value & 0xffu) << (lane * 8u);
+        }
+        gainmapBuffer.words[blockIndex] = packed;
+        return;
+    }
+
+    uint firstPixel = blockIndex * 4u;
+    if (firstPixel < pc.outputPixelCount) {
+        uint bytes[12];
+        for (uint i = 0u; i < 12u; ++i) bytes[i] = 0u;
+
+        for (uint lane = 0u; lane < 4u; ++lane) {
+            uint pixelIndex = firstPixel + lane;
+            if (pixelIndex >= pc.outputPixelCount) break;
+            uvec3 bgr = renderBgr(pixelIndex);
+            uint base = lane * 3u;
+            bytes[base + 0u] = bgr.x;
+            bytes[base + 1u] = bgr.y;
+            bytes[base + 2u] = bgr.z;
+        }
+
+        uint wordBase = blockIndex * 3u;
+        outputBuffer.words[wordBase + 0u] = pack4(bytes[0], bytes[1], bytes[2], bytes[3]);
+        outputBuffer.words[wordBase + 1u] = pack4(bytes[4], bytes[5], bytes[6], bytes[7]);
+        outputBuffer.words[wordBase + 2u] = pack4(bytes[8], bytes[9], bytes[10], bytes[11]);
+    }
+
+    if (pc.gainmapPixelCount > 0u && blockIndex < pc.gainmapPixelCount) {
+        float logGain = gainLogForMapPixel(blockIndex);
+        gainLog.values[blockIndex] = logGain;
+        uint fixedLog = uint(clamp(roundEven(logGain * 65536.0), 0.0, 4.0 * 65536.0));
+        atomicMax(ultraHdrTelemetry.values[0], fixedLog);
+    }
+}

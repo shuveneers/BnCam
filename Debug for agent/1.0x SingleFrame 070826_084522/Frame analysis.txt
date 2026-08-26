@@ -1,0 +1,211 @@
+========================================================================
+BNCAM FRAME ANALYSIS
+========================================================================
+
+
+------------------------------------------------------------------------
+[1] Frame Selection Summary
+------------------------------------------------------------------------
+  Frame source:                      RAW10
+  Entries written:                   4
+  Frames accepted:                   1
+  Frames rejected:                   3
+  Selected anchor:                   Frame 1
+  Analysis source:                   RAW10 native_pixel_plus_capture_metadata_scoring
+  Score type:                        RAW10 native/proxy scoring before full per-frame Bayer metrics are exposed.
+  Delta: negative = before shutter, positive = after shutter. Scores: 0.0000 to 1.0000, higher is better.
+
+------------------------------------------------------------------------
+[2] Pruning Summary
+------------------------------------------------------------------------
+  Initial available:                 4
+  Rejected invalid:                  0
+  Rejected first frame:              0
+  Rejected stale:                    0
+  Rejected duplicates:               0
+
+------------------------------------------------------------------------
+[3] Frame Scores
+------------------------------------------------------------------------
+  Frame 1: ACCEPTED / ANCHOR
+  Delta to shutter:                  -22.618 ms
+  Overall score:                     0.7396
+  Sharpness:                         0.1160
+  Motion:                            0.8422
+  EV:                                0.6911
+  Alignability:                      0.8775
+  Sync:                              0.8115
+  Decision:                          genuine_near_zsl_highest_weighted_score_bias_balanced
+  Timestamp ns:                      1130472329287098
+  Shutter relation:                  PRE_SHUTTER
+  Exposure:                          20.000 ms
+  ISO:                               275
+  candidateTimestampNs:              1130472329287098
+  candidateDeltaMs:                  -22.618
+  candidateIso:                      275
+  candidateExposureNs:               19999985
+  candidateAeState:                  2
+  candidateAwbState:                 2
+  candidateFocusState:               4
+  candidateMetadataComplete:         true
+  candidateAgeAbsMs:                 22.618
+  candidateFreshEnoughForSelection:  true
+  candidateRejectedForStaleSelection: false
+  scoreComponentsUsed:               freshness_0.38_sensor_timestamp,motion_0.1_model=EXPOSURE_OIS_LENS_AF_V1;score=0.8421967485549133;exposureDurationScore=0.8421967485549133;oisBenefit=0.0;lensStateFactor=1.0;afStateFactor=1.0,exposure_0.07_pixel_mean_and_clipping,sharpness_0.16_sampled_pixels,clipping_0.09_sampled_pixels,alignability_0.0_proxy,ae_0.08_state,awb_0.06_state,focus_0.06_state
+  pipelineGeneration:                32
+  controlRequestEpoch:               5
+  requestProvenanceStatus:           EXACT_CAPTURE_CALLBACK_REQUEST_TAG
+  imageArrivalElapsedNs:             1130472364653577
+  metadataArrivalElapsedNs:          1130472406638890
+  pairCompleteElapsedNs:             1130472406647640
+  imageDeliveryLagMs:                35.366
+  metadataDeliveryLagMs:             77.352
+  pairCompletionLagMs:               77.361
+  timestampSource:                   REALTIME(1)
+  sensorTimestampComparableToElapsedRealtime: true
+  shutterDeltaClockDomainsComparable: true
+  preScorePruneResult:               KEPT_FOR_SCORING
+  preScorePruneReason:               NONE
+  Format:                            RAW10 / 4096 x 3072
+  Metadata valid:                    yes
+  Stale:                             no
+  Duplicate:                         no
+  Analysis source:                   native_sampled_pixels
+
+  Frame 2: REJECTED
+  Delta to shutter:                  -55.943 ms
+  Overall score:                     0.6342
+  Sharpness:                         0.1160
+  Motion:                            0.8422
+  EV:                                0.6913
+  Alignability:                      0.6970
+  Sync:                              0.5338
+  Decision:                          lower_weighted_score
+  Rejection reason:                  Lower weighted selection score
+  Timestamp ns:                      1130472295962098
+  Shutter relation:                  PRE_SHUTTER
+  Exposure:                          20.000 ms
+  ISO:                               275
+  candidateTimestampNs:              1130472295962098
+  candidateDeltaMs:                  -55.943
+  candidateIso:                      275
+  candidateExposureNs:               19999985
+  candidateAeState:                  2
+  candidateAwbState:                 2
+  candidateFocusState:               4
+  candidateMetadataComplete:         true
+  candidateAgeAbsMs:                 55.943
+  candidateFreshEnoughForSelection:  true
+  candidateRejectedForStaleSelection: false
+  scoreComponentsUsed:               freshness_0.38_sensor_timestamp,motion_0.1_model=EXPOSURE_OIS_LENS_AF_V1;score=0.8421967485549133;exposureDurationScore=0.8421967485549133;oisBenefit=0.0;lensStateFactor=1.0;afStateFactor=1.0,exposure_0.07_pixel_mean_and_clipping,sharpness_0.16_sampled_pixels,clipping_0.09_sampled_pixels,alignability_0.0_proxy,ae_0.08_state,awb_0.06_state,focus_0.06_state
+  pipelineGeneration:                32
+  controlRequestEpoch:               5
+  requestProvenanceStatus:           EXACT_CAPTURE_CALLBACK_REQUEST_TAG
+  imageArrivalElapsedNs:             1130472330299307
+  metadataArrivalElapsedNs:          1130472371625036
+  pairCompleteElapsedNs:             1130472371634775
+  imageDeliveryLagMs:                34.337
+  metadataDeliveryLagMs:             75.663
+  pairCompletionLagMs:               75.673
+  timestampSource:                   REALTIME(1)
+  sensorTimestampComparableToElapsedRealtime: true
+  shutterDeltaClockDomainsComparable: true
+  preScorePruneResult:               KEPT_FOR_SCORING
+  preScorePruneReason:               NONE
+  Format:                            RAW10 / 4096 x 3072
+  Metadata valid:                    yes
+  Stale:                             no
+  Duplicate:                         no
+  Analysis source:                   native_sampled_pixels
+
+  Frame 3: REJECTED
+  Delta to shutter:                  -89.268 ms
+  Overall score:                     0.5284
+  Sharpness:                         0.1160
+  Motion:                            0.8422
+  EV:                                0.6906
+  Alignability:                      0.5165
+  Sync:                              0.2561
+  Decision:                          lower_weighted_score
+  Rejection reason:                  Lower weighted selection score
+  Timestamp ns:                      1130472262637098
+  Shutter relation:                  PRE_SHUTTER
+  Exposure:                          20.000 ms
+  ISO:                               275
+  candidateTimestampNs:              1130472262637098
+  candidateDeltaMs:                  -89.268
+  candidateIso:                      275
+  candidateExposureNs:               19999985
+  candidateAeState:                  2
+  candidateAwbState:                 2
+  candidateFocusState:               4
+  candidateMetadataComplete:         true
+  candidateAgeAbsMs:                 89.268
+  candidateFreshEnoughForSelection:  true
+  candidateRejectedForStaleSelection: false
+  scoreComponentsUsed:               freshness_0.38_sensor_timestamp,motion_0.1_model=EXPOSURE_OIS_LENS_AF_V1;score=0.8421967485549133;exposureDurationScore=0.8421967485549133;oisBenefit=0.0;lensStateFactor=1.0;afStateFactor=1.0,exposure_0.07_pixel_mean_and_clipping,sharpness_0.16_sampled_pixels,clipping_0.09_sampled_pixels,alignability_0.0_proxy,ae_0.08_state,awb_0.06_state,focus_0.06_state
+  pipelineGeneration:                32
+  controlRequestEpoch:               5
+  requestProvenanceStatus:           EXACT_CAPTURE_CALLBACK_REQUEST_TAG
+  imageArrivalElapsedNs:             1130472298013942
+  metadataArrivalElapsedNs:          1130472334449984
+  pairCompleteElapsedNs:             1130472334459254
+  imageDeliveryLagMs:                35.377
+  metadataDeliveryLagMs:             71.813
+  pairCompletionLagMs:               71.822
+  timestampSource:                   REALTIME(1)
+  sensorTimestampComparableToElapsedRealtime: true
+  shutterDeltaClockDomainsComparable: true
+  preScorePruneResult:               KEPT_FOR_SCORING
+  preScorePruneReason:               NONE
+  Format:                            RAW10 / 4096 x 3072
+  Metadata valid:                    yes
+  Stale:                             no
+  Duplicate:                         no
+  Analysis source:                   native_sampled_pixels
+
+  Frame 4: REJECTED
+  Delta to shutter:                  -122.593 ms
+  Overall score:                     0.4311
+  Sharpness:                         0.1153
+  Motion:                            0.8422
+  EV:                                0.6910
+  Alignability:                      0.3500
+  Sync:                              0.0000
+  Decision:                          stale_while_fresh_candidate_available
+  Rejection reason:                  Rejected by shutter-relative freshness gate
+  Timestamp ns:                      1130472229312098
+  Shutter relation:                  PRE_SHUTTER
+  Exposure:                          20.000 ms
+  ISO:                               275
+  candidateTimestampNs:              1130472229312098
+  candidateDeltaMs:                  -122.593
+  candidateIso:                      275
+  candidateExposureNs:               19999985
+  candidateAeState:                  2
+  candidateAwbState:                 2
+  candidateFocusState:               4
+  candidateMetadataComplete:         true
+  candidateAgeAbsMs:                 122.593
+  candidateFreshEnoughForSelection:  false
+  candidateRejectedForStaleSelection: true
+  scoreComponentsUsed:               freshness_0.38_sensor_timestamp,motion_0.1_model=EXPOSURE_OIS_LENS_AF_V1;score=0.8421967485549133;exposureDurationScore=0.8421967485549133;oisBenefit=0.0;lensStateFactor=1.0;afStateFactor=1.0,exposure_0.07_pixel_mean_and_clipping,sharpness_0.16_sampled_pixels,clipping_0.09_sampled_pixels,alignability_0.0_proxy,ae_0.08_state,awb_0.06_state,focus_0.06_state
+  pipelineGeneration:                32
+  controlRequestEpoch:               5
+  requestProvenanceStatus:           EXACT_CAPTURE_CALLBACK_REQUEST_TAG
+  imageArrivalElapsedNs:             1130472263943577
+  metadataArrivalElapsedNs:          1130472303561807
+  pairCompleteElapsedNs:             1130472303569723
+  imageDeliveryLagMs:                34.631
+  metadataDeliveryLagMs:             74.250
+  pairCompletionLagMs:               74.258
+  timestampSource:                   REALTIME(1)
+  sensorTimestampComparableToElapsedRealtime: true
+  shutterDeltaClockDomainsComparable: true
+  preScorePruneResult:               KEPT_FOR_SCORING
+  preScorePruneReason:               NONE
+  Format:                            RAW10 / 4096 x 3072
+  Metadata valid:                    yes
+  Stale:                             yes
+  Duplicate:                         no
+  Analysis source:                   native_sampled_pixels

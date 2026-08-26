@@ -1,0 +1,842 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer InputRgb { float inputRgb[]; };
+layout(std430, binding = 1) buffer WorkingRgb { float workingRgb[]; };
+layout(std430, binding = 2) writeonly buffer CompactData { float compactData[]; };
+layout(std430, binding = 3) readonly buffer ToneLut { float toneLut[]; };
+layout(std430, binding = 4) buffer Telemetry { uint telemetry[]; };
+layout(std430, binding = 5) buffer UltraHdrLuma { float ultraHdrLuma[]; };
+layout(std430, binding = 6) buffer UltraHdrGainLog { float ultraHdrGainLog[]; };
+layout(std430, binding = 7) buffer UltraHdrGainmapPacked { uint ultraHdrGainmapPacked[]; };
+layout(std430, binding = 8) readonly buffer PortraitMask { float portraitMask[]; };
+layout(std430, binding = 9) buffer PortraitBlurRgb { float portraitBlurRgb[]; };
+layout(std430, binding = 10) buffer LocalToneBase { float localToneBase[]; };
+
+layout(push_constant) uniform Params {
+    uint frameWidth;
+    uint frameHeight;
+    uint mode;          // 0 fused pre-tone chroma 4:4:4 + highlight recovery; 1 scene samples, 2 display grid, 3 tone/vibrance
+    uint sampleStep;
+    uint sampleCount;
+    uint displayOffsetFloats;
+    uint isRawBayer;
+    uint presenceReserved0;
+    float exposureGain;
+    float rawJpegBaseVibrance;
+    float profileSaturation;
+    float profileContrast;
+    float profileVibrance;
+    float presenceReserved1;
+    float shoulderStart;
+    float shoulderStrength;
+    uint ultraHdrSourceMapWidth;
+    uint ultraHdrSourceMapHeight;
+    uint ultraHdrOutputMapWidth;
+    uint ultraHdrOutputMapHeight;
+    uint ultraHdrPackedWordsPerRow;
+    uint outputRotationDegrees;
+    uint portraitEnabled;
+    uint portraitMaskWidth;
+    uint portraitMaskHeight;
+    uint portraitMaskRotationDegrees;
+    float portraitTargetLeft;
+    float portraitTargetTop;
+    float portraitTargetRight;
+    float portraitTargetBottom;
+} pc;
+
+float clampSceneLinear(float v) {
+    if (isnan(v) || isinf(v)) return 0.0;
+    return clamp(v, 0.0, 4.0);
+}
+
+vec3 inputAt(int x, int y) {
+    int sx = clamp(x, 0, int(pc.frameWidth) - 1);
+    int sy = clamp(y, 0, int(pc.frameHeight) - 1);
+    uint base = (uint(sy) * pc.frameWidth + uint(sx)) * 3u;
+    return vec3(inputRgb[base + 0u], inputRgb[base + 1u], inputRgb[base + 2u]);
+}
+
+vec3 workingAt(int x, int y) {
+    int sx = clamp(x, 0, int(pc.frameWidth) - 1);
+    int sy = clamp(y, 0, int(pc.frameHeight) - 1);
+    uint base = (uint(sy) * pc.frameWidth + uint(sx)) * 3u;
+    return vec3(workingRgb[base + 0u], workingRgb[base + 1u], workingRgb[base + 2u]);
+}
+
+void writeWorking(uvec2 gid, vec3 v) {
+    uint base = (gid.y * pc.frameWidth + gid.x) * 3u;
+    workingRgb[base + 0u] = v.r;
+    workingRgb[base + 1u] = v.g;
+    workingRgb[base + 2u] = v.b;
+}
+
+float lumaOf(vec3 v) {
+    return 0.2126 * v.r + 0.7152 * v.g + 0.0722 * v.b;
+}
+
+float smoothstepFast(float edge0, float invRange, float value) {
+    float u = clamp((value - edge0) * invRange, 0.0, 1.0);
+    return u * u * (3.0 - 2.0 * u);
+}
+
+vec3 compressToUnitGamutPreserveLuma(vec3 rgb) {
+    // Keep in-gamut values bit-for-bit. For out-of-gamut colors, reduce chroma around the current
+    // luminance instead of clipping R/G/B independently; independent channel clipping shifts hue.
+    vec3 nonNegative = max(rgb, vec3(0.0));
+    float originalY = max(0.0, lumaOf(nonNegative));
+    if (originalY > 1.0) {
+        nonNegative *= 1.0 / max(originalY, 1.0e-6);
+    }
+
+    float y = clamp(lumaOf(nonNegative), 0.0, 1.0);
+    float maximum = max(nonNegative.r, max(nonNegative.g, nonNegative.b));
+    float minimum = min(nonNegative.r, min(nonNegative.g, nonNegative.b));
+    if (maximum <= 1.0 && minimum >= 0.0) return nonNegative;
+
+    float positiveDeviation = max(0.0, maximum - y);
+    float negativeDeviation = max(0.0, y - minimum);
+    float authority = 1.0;
+    if (positiveDeviation > 1.0e-6) {
+        authority = min(authority, (1.0 - y) / positiveDeviation);
+    }
+    if (negativeDeviation > 1.0e-6) {
+        authority = min(authority, y / negativeDeviation);
+    }
+    authority = clamp(authority, 0.0, 1.0);
+    return clamp(vec3(y) + (nonNegative - vec3(y)) * authority, vec3(0.0), vec3(1.0));
+}
+
+float profileContrastCurve(float value, float signedControl) {
+    float v = clamp(value, 0.0, 1.0);
+    float factor = exp2(clamp(signedControl, -1.0, 1.0) * 0.75);
+    if (abs(factor - 1.0) < 1.0e-4) return v;
+    if (v < 0.5) return 0.5 * pow(max(0.0, 2.0 * v), factor);
+    return 1.0 - 0.5 * pow(max(0.0, 2.0 * (1.0 - v)), factor);
+}
+
+vec3 applyProfileColor(vec3 rgb) {
+    float satControl = clamp(pc.profileSaturation, -1.0, 1.0);
+    float contrastControl = clamp(pc.profileContrast, -1.0, 1.0);
+    float y = max(0.0, lumaOf(rgb));
+
+    if (abs(contrastControl) >= 1.0e-4) {
+        float mappedY = profileContrastCurve(y, contrastControl);
+        float scale = y > 1.0e-6 ? mappedY / y : 1.0;
+        rgb *= scale;
+        y = mappedY;
+    }
+    if (pc.rawJpegBaseVibrance > 1.001) {
+        float maximum = max(rgb.r, max(rgb.g, rgb.b));
+        float minimum = min(rgb.r, min(rgb.g, rgb.b));
+        float saturation = (maximum - minimum) / max(1.0e-4, maximum);
+        float protection = clamp(1.0 - saturation, 0.0, 1.0);
+        float authority = (pc.rawJpegBaseVibrance - 1.0) * (0.25 + 0.75 * protection);
+        rgb = vec3(y) + (rgb - vec3(y)) * (1.0 + authority);
+    }
+    float vibranceControl = clamp(pc.profileVibrance, -1.0, 1.0);
+    if (abs(vibranceControl) >= 1.0e-4) {
+        float maximum = max(rgb.r, max(rgb.g, rgb.b));
+        float minimum = min(rgb.r, min(rgb.g, rgb.b));
+        float saturation = (maximum - minimum) / max(1.0e-4, maximum);
+        float protection = clamp(1.0 - saturation, 0.0, 1.0);
+        float authority = vibranceControl >= 0.0
+                ? vibranceControl * (0.20 + 0.80 * protection)
+                : vibranceControl * (0.55 + 0.45 * protection);
+        rgb = vec3(y) + (rgb - vec3(y)) * exp2(authority * 0.90);
+    }
+    if (abs(satControl) >= 1.0e-4) {
+        float factor = exp2(satControl * 0.85);
+        rgb = vec3(y) + (rgb - vec3(y)) * factor;
+    }
+    return compressToUnitGamutPreserveLuma(rgb);
+}
+
+// QUALITY DELTA 0008/0012 — full-resolution (4:4:4) GALOSH-style residual cleanup.
+// Runs on immutable post-AWB/CCM scene-linear RGB inside mode 0, before tone.
+// Neighbour support is selected ONLY by luminance; noisy chroma never gates its
+// own denoising. Chroma remains luma-preserving; Delta 0012 adds a separately gated
+// Wiener-style luma residual shrink that never uses chroma as a structure guide.
+vec3 preToneOpponent444(vec3 rgb) {
+    float y = lumaOf(rgb);
+    return vec3(y, rgb.r - y, rgb.b - y); // Y, R-Y, B-Y
+}
+
+vec3 preToneOpponent444ToRgb(vec3 opponent) {
+    float y = opponent.x;
+    float r = y + opponent.y;
+    float b = y + opponent.z;
+    float g = (y - 0.2126 * r - 0.0722 * b) / 0.7152;
+    return vec3(r, g, b);
+}
+
+vec3 preToneChroma444FromInput(uvec2 gid, vec3 centerRgb) {
+    float strength = clamp(pc.presenceReserved1, 0.0, 0.94);
+    if (pc.presenceReserved0 == 0u || strength <= 1.0e-4) return centerRgb;
+
+    vec3 center = preToneOpponent444(centerRgb);
+    // 5x5 full-resolution residual stage. The wider RAW-domain GALOSH/WHT
+    // regression remains responsible for coarse Bayer chroma before demosaic.
+    const int radius = 2;
+    float sumW = 0.0;
+    float sumY = 0.0;
+    float sumYY = 0.0;
+    vec2 sumC = vec2(0.0);
+    vec2 sumYC = vec2(0.0);
+    vec2 cMin = vec2(1.0e30);
+    vec2 cMax = vec2(-1.0e30);
+
+    // Scene-linear guide bandwidth. In dark values the absolute support stays
+    // narrow enough to protect real edges; brighter/noisier regions get more
+    // tolerance. Strength changes regression shrinkage, not chroma affinity.
+    float guideSigma = 0.008 + 0.030 * sqrt(max(0.0, center.x));
+    float inv2SigmaSq = 1.0 / max(2.0 * guideSigma * guideSigma, 1.0e-8);
+
+    for (int dy = -radius; dy <= radius; ++dy) {
+        for (int dx = -radius; dx <= radius; ++dx) {
+            vec3 neighbour = preToneOpponent444(inputAt(int(gid.x) + dx, int(gid.y) + dy));
+            float dY = neighbour.x - center.x;
+            float spatial = 1.0 / (1.0 + 0.20 * float(dx * dx + dy * dy));
+            float w = spatial * exp(-dY * dY * inv2SigmaSq);
+            sumW += w;
+            sumY += w * neighbour.x;
+            sumYY += w * neighbour.x * neighbour.x;
+            sumC += w * neighbour.yz;
+            sumYC += w * neighbour.x * neighbour.yz;
+            cMin = min(cMin, neighbour.yz);
+            cMax = max(cMax, neighbour.yz);
+        }
+    }
+
+    float invW = 1.0 / max(sumW, 1.0e-6);
+    float meanY = sumY * invW;
+    float varY = max(0.0, sumYY * invW - meanY * meanY);
+    vec2 meanC = sumC * invW;
+    vec2 meanYC = sumYC * invW;
+
+    // GALOSH-style degree-1 local regression. Larger requested chroma strength
+    // increases ridge shrinkage instead of shrinking support based on chroma.
+    float ridge = guideSigma * guideSigma * mix(0.45, 1.90, strength);
+    float denom = max(varY + ridge, 1.0e-8);
+    vec2 slope = (meanYC - meanY * meanC) / denom;
+    vec2 intercept = meanC - slope * meanY;
+    vec2 predictedC = clamp(slope * center.x + intercept, cMin, cMax);
+
+    // QUALITY DELTA 0012 — conservative GALOSH-style physical luma baseline.
+    // Do not blur Y directly. Estimate how much of the local residual variance is likely
+    // noise, then Wiener-shrink only that residual toward the luma-guided local mean.
+    // Real structure raises varY and therefore retains its center residual.
+    float lumaAuthority = clamp(0.08 + 0.28 * strength, 0.0, 0.34);
+    float brightnessRelease = mix(1.12, 0.86, smoothstep(0.10, 0.70, center.x));
+    float estimatedLumaNoiseSigma = mix(0.0025, 0.0070, strength) * brightnessRelease;
+    float estimatedLumaNoiseVar = estimatedLumaNoiseSigma * estimatedLumaNoiseSigma;
+    float wienerKeep = varY > 1.0e-10
+            ? clamp(1.0 - estimatedLumaNoiseVar / varY, 0.0, 1.0)
+            : 0.0;
+    float predictedY = meanY + wienerKeep * (center.x - meanY);
+    float structureGuard = smoothstep(2.0 * estimatedLumaNoiseVar,
+                                      14.0 * estimatedLumaNoiseVar, varY);
+    float lumaHighlightGuard = 1.0 - 0.85 * smoothstep(0.68, 1.08, center.x);
+    float lumaBlend = lumaAuthority * (1.0 - 0.80 * structureGuard) * lumaHighlightGuard;
+    float filteredY = mix(center.x, predictedY, clamp(lumaBlend, 0.0, 0.34));
+
+    float maximum = max(centerRgb.r, max(centerRgb.g, centerRgb.b));
+    float minimum = min(centerRgb.r, min(centerRgb.g, centerRgb.b));
+    float saturation = maximum > 1.0e-5 ? (maximum - minimum) / maximum : 0.0;
+    // Protect real saturated colour and highlight colour structure, but retain
+    // meaningful residual authority in noisy dark/neutral regions.
+    float saturatedColourProtection = 1.0 - 0.55 * smoothstep(0.38, 0.82, saturation);
+    float highlightProtection = 1.0 - 0.70 * smoothstep(0.72, 1.10, center.x);
+    float blend = clamp(strength * saturatedColourProtection * highlightProtection, 0.0, 0.92);
+
+    vec3 targetOpponent = vec3(filteredY, mix(center.yz, predictedC, blend));
+    vec3 targetRgb = preToneOpponent444ToRgb(targetOpponent);
+    vec3 correction = targetRgb - centerRgb;
+
+    // Apply chroma + the deliberately small Wiener luma move in one bounded vector.
+    // Stop short only when the correction would create negative scene-linear RGB; this
+    // preserves RAW highlight headroom and avoids channel clipping before tone.
+    float safeScale = 1.0;
+    for (int ch = 0; ch < 3; ++ch) {
+        if (correction[ch] < 0.0 && centerRgb[ch] + correction[ch] < 0.0) {
+            safeScale = min(safeScale, centerRgb[ch] / max(1.0e-8, -correction[ch]));
+        }
+    }
+    vec3 outRgb = centerRgb + correction * clamp(safeScale, 0.0, 1.0);
+    // Do NOT upper-clamp here: this is still scene-linear pre-tone data and
+    // highlight headroom above 1.0 must survive into recovery/tone mapping.
+    if (any(isnan(outRgb)) || any(isinf(outRgb))) return centerRgb;
+    return max(outRgb, vec3(0.0));
+}
+
+void runHighlightRecovery(uvec2 gid) {
+    if (gid.x >= pc.frameWidth || gid.y >= pc.frameHeight) return;
+    vec3 originalCenter = inputAt(int(gid.x), int(gid.y));
+    vec3 center = preToneChroma444FromInput(gid, originalCenter);
+    if (gid.x == 0u || gid.y == 0u || gid.x + 1u >= pc.frameWidth || gid.y + 1u >= pc.frameHeight) {
+        writeWorking(gid, center);
+        return;
+    }
+    float maxChannel = max(center.r, max(center.g, center.b));
+    float minChannel = min(center.r, min(center.g, center.b));
+    bool clipped = maxChannel > 0.985 || (maxChannel > 0.92 && maxChannel - minChannel > 0.28);
+    if (!clipped) {
+        writeWorking(gid, center);
+        return;
+    }
+
+    vec3 sumRatio = vec3(0.0);
+    float sumWeight = 0.0;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            if (dx == 0 && dy == 0) continue;
+            vec3 n = inputAt(int(gid.x) + dx, int(gid.y) + dy);
+            float nMax = max(n.r, max(n.g, n.b));
+            if (nMax > 0.98) continue;
+            float ny = max(1.0e-4, lumaOf(n));
+            float weight = 1.0 / (1.0 + float(dx * dx + dy * dy));
+            sumRatio += (n / ny) * weight;
+            sumWeight += weight;
+        }
+    }
+    if (sumWeight <= 1.0e-5) {
+        writeWorking(gid, center);
+        return;
+    }
+    float centerY = max(1.0e-4, lumaOf(center));
+    vec3 reconstructed = clamp(vec3(centerY) * (sumRatio / sumWeight), vec3(0.0), vec3(4.0));
+    float severityU = clamp((maxChannel - 0.90) / (1.20 - 0.90), 0.0, 1.0);
+    float severity = severityU * severityU * (3.0 - 2.0 * severityU);
+    center = mix(center, reconstructed, 0.65 * severity);
+    center = clamp(center, vec3(0.0), vec3(4.0));
+    writeWorking(gid, center);
+    atomicAdd(telemetry[0], 1u);
+}
+
+void writeSceneSample(uint sampleIndex) {
+    if (sampleIndex >= pc.sampleCount) return;
+    uint totalPixels = pc.frameWidth * pc.frameHeight;
+    uint pixelIndex = min(totalPixels - 1u, sampleIndex * max(1u, pc.sampleStep));
+    uint basePixel = pixelIndex * 3u;
+    uint base = sampleIndex * 3u;
+    compactData[base + 0u] = workingRgb[basePixel + 0u];
+    compactData[base + 1u] = workingRgb[basePixel + 1u];
+    compactData[base + 2u] = workingRgb[basePixel + 2u];
+}
+
+void writeDisplayCell(uvec2 gid) {
+    if (gid.x >= 32u || gid.y >= 24u) return;
+    uint gx = gid.x;
+    uint gy = gid.y;
+    int x0 = int(gx * pc.frameWidth / 32u);
+    int x1 = max(x0 + 1, int((gx + 1u) * pc.frameWidth / 32u));
+    int y0 = int(gy * pc.frameHeight / 24u);
+    int y1 = max(y0 + 1, int((gy + 1u) * pc.frameHeight / 24u));
+    float sum = 0.0;
+    for (int sy = 0; sy < 3; ++sy) {
+        int y = min(int(pc.frameHeight) - 1, y0 + (2 * sy + 1) * (y1 - y0) / 6);
+        for (int sx = 0; sx < 3; ++sx) {
+            int x = min(int(pc.frameWidth) - 1, x0 + (2 * sx + 1) * (x1 - x0) / 6);
+            sum += lumaOf(workingAt(x, y));
+        }
+    }
+    uint outIndex = pc.displayOffsetFloats + gy * 32u + gx;
+    compactData[outIndex] = sum / 9.0;
+}
+
+uint localToneMapWidth() { return (pc.frameWidth + 3u) / 4u; }
+uint localToneMapHeight() { return (pc.frameHeight + 3u) / 4u; }
+
+float telemetryFloat(uint index, float fallbackValue) {
+    float value = uintBitsToFloat(telemetry[index]);
+    return (isnan(value) || isinf(value)) ? fallbackValue : value;
+}
+
+const vec2 kLocalToneDirections[12] = vec2[12](
+    vec2(1.0, 0.0), vec2(-1.0, 0.0), vec2(0.0, 1.0), vec2(0.0, -1.0),
+    vec2(0.7071, 0.7071), vec2(-0.7071, 0.7071), vec2(0.7071, -0.7071), vec2(-0.7071, -0.7071),
+    vec2(0.9239, 0.3827), vec2(-0.3827, 0.9239), vec2(-0.9239, -0.3827), vec2(0.3827, -0.9239)
+);
+
+void buildLocalToneBase(uvec2 gid) {
+    uint mapWidth = localToneMapWidth();
+    uint mapHeight = localToneMapHeight();
+    if (gid.x >= mapWidth || gid.y >= mapHeight) return;
+
+    int centerX = min(int(pc.frameWidth) - 1, int(gid.x * 4u + 2u));
+    int centerY = min(int(pc.frameHeight) - 1, int(gid.y * 4u + 2u));
+    float centerLuma = max(1.0e-4, lumaOf(workingAt(centerX, centerY)) * pc.exposureGain);
+    float centerLog = log2(centerLuma + 0.003);
+    float weightedLog = centerLog * 2.25;
+    float weightSum = 2.25;
+
+    float minDim = max(1.0, min(float(pc.frameWidth), float(pc.frameHeight)));
+    float nearRadius = max(4.0, minDim / 240.0);
+    float farRadius = max(14.0, minDim / 68.0);
+    for (int i = 0; i < 12; ++i) {
+        float radius = i < 4 ? nearRadius : farRadius;
+        ivec2 offset = ivec2(round(kLocalToneDirections[i] * radius));
+        float neighborLuma = max(1.0e-4,
+                lumaOf(workingAt(centerX + offset.x, centerY + offset.y)) * pc.exposureGain);
+        float neighborLog = log2(neighborLuma + 0.003);
+        // Range weighting is the halo guard: an edge with a large luminance step contributes
+        // little to the local base even when it is spatially close.
+        float rangeWeight = exp(-1.55 * abs(neighborLog - centerLog));
+        float spatialWeight = i < 4 ? 0.78 : 0.46;
+        float weight = rangeWeight * spatialWeight;
+        weightedLog += neighborLog * weight;
+        weightSum += weight;
+    }
+    localToneBase[gid.y * mapWidth + gid.x] = max(0.0, exp2(weightedLog / max(weightSum, 1.0e-5)) - 0.003);
+}
+
+float localToneBaseAt(int x, int y) {
+    int mapWidth = int(localToneMapWidth());
+    int mapHeight = int(localToneMapHeight());
+    int sx = clamp(x, 0, mapWidth - 1);
+    int sy = clamp(y, 0, mapHeight - 1);
+    return localToneBase[uint(sy * mapWidth + sx)];
+}
+
+float sampleLocalToneBase(uvec2 gid) {
+    vec2 p = (vec2(gid) + vec2(0.5)) * 0.25 - vec2(0.5);
+    ivec2 p0 = ivec2(floor(p));
+    vec2 f = fract(p);
+    float b00 = localToneBaseAt(p0.x, p0.y);
+    float b10 = localToneBaseAt(p0.x + 1, p0.y);
+    float b01 = localToneBaseAt(p0.x, p0.y + 1);
+    float b11 = localToneBaseAt(p0.x + 1, p0.y + 1);
+    return mix(mix(b00, b10, f.x), mix(b01, b11, f.x), f.y);
+}
+
+vec3 applyLocalTone(uvec2 gid, vec3 exposedRgb) {
+    float strength = clamp(telemetryFloat(3u, 0.0), 0.0, 1.0);
+    if (strength <= 1.0e-4) return exposedRgb;
+    float sceneKey = clamp(telemetryFloat(4u, 0.155), 0.08, 0.20);
+    float maxLiftEv = clamp(telemetryFloat(5u, 0.25), 0.0, 1.5);
+    float maxCompressEv = clamp(telemetryFloat(6u, 0.15), 0.0, 1.0);
+    float centerLuma = max(1.0e-6, lumaOf(exposedRgb));
+    float localBase = max(0.006, sampleLocalToneBase(gid));
+    float requestedEv = clamp(log2(sceneKey / localBase), -maxCompressEv, maxLiftEv);
+
+    // Do not reveal black-level/noise texture as local brightness, and do not use positive LTM
+    // gain to fight the global highlight shoulder. Negative local compression remains available
+    // for broad bright regions.
+    float deepBlackGuard = smoothstep(0.014, 0.055, centerLuma);
+    float positiveHighlightGuard = 1.0 - 0.88 * smoothstep(0.48, 0.90, centerLuma);
+    // LTM should act only where the local base materially disagrees with the scene key. Without
+    // this need gate tiny positive/negative requests touched most of the frame and created haze.
+    float localNeedGate = smoothstep(0.045, 0.16, abs(requestedEv));
+    float authority = deepBlackGuard * localNeedGate *
+            (requestedEv > 0.0 ? positiveHighlightGuard : 1.0);
+    float appliedEv = requestedEv * strength * authority;
+    if (abs(appliedEv) > 0.01) atomicAdd(telemetry[7], 1u);
+    return exposedRgb * exp2(appliedEv);
+}
+
+// Troy Sobotka / Blender AgX Display Rendering Transform (DRT)
+const mat3 AGX_INSET_MATRIX = mat3(
+    0.842479062253094, 0.0423282422610123, 0.0423756549057051,
+    0.0784335999999992, 0.878468636469772, 0.0784336,
+    0.0792237451477643, 0.0791661274605434, 0.879142973793104
+);
+
+const mat3 AGX_OUTSET_MATRIX = mat3(
+    1.19687902425898, -0.0528968517594562, -0.0529716355084938,
+    -0.0980208811401368, 1.15190312990417, -0.0980434501171241,
+    -0.0990297440797205, -0.0989611768448433, 1.15107367264116
+);
+
+vec3 agxDefaultContrastApprox(vec3 x) {
+    vec3 x2 = x * x;
+    vec3 x4 = x2 * x2;
+    return + 15.5 * x4 * x2
+           - 40.14 * x4 * x
+           + 31.96 * x4
+           - 6.868 * x2 * x
+           + 0.4298 * x2
+           + 0.1191 * x
+           - 0.00232;
+}
+
+vec3 applyAgXTonemap(vec3 colorLinear) {
+    const float min_ev = -10.0;
+    const float max_ev = +6.5;
+
+    // 1. Inset matrix: rotate linear sRGB into wide-gamut AgX working space
+    vec3 val = AGX_INSET_MATRIX * max(colorLinear, vec3(1.0e-6));
+
+    // 2. Log2 encoding over 16.5 EV dynamic range
+    vec3 logVal = clamp(log2(val), min_ev, max_ev);
+    val = (logVal - min_ev) / (max_ev - min_ev);
+
+    // 3. Sigmoid contrast curve (polynomial approximation)
+    val = clamp(agxDefaultContrastApprox(val), vec3(0.0), vec3(1.0));
+
+    // 4. Outset matrix: convert back to linear display space
+    val = max(vec3(0.0), AGX_OUTSET_MATRIX * val);
+
+    // 5. AgX Balanced Black Anchor & Soft Toe:
+    // Mild pedestal subtraction (~0.005) and gentle 1.08 toe to anchor true black without crushing shadow details.
+    const float kAgxBlackPedestal = 0.005;
+    val = max(vec3(0.0), (val - vec3(kAgxBlackPedestal)) / (1.0 - kAgxBlackPedestal));
+    val = pow(val, vec3(1.08));
+
+    // 6. AgX Photographic Chroma / Saturation Restoration:
+    // AgX DRT compresses chromaticity across dynamic range to avoid clipping and hue skew.
+    // Restore natural photographic chromaticity in midtones while preserving smooth highlight rolloff.
+    float y = max(1.0e-6, lumaOf(val));
+    float maxC = max(val.r, max(val.g, val.b));
+    float minC = min(val.r, min(val.g, val.b));
+    float relChroma = (maxC - minC) / max(maxC, 0.02);
+    float shadowGate = smoothstep(0.015, 0.12, y);
+    float highlightGate = 1.0 - smoothstep(0.72, 0.96, y);
+    // Keep only a small compensation for AgX's intentional chroma compression. The previous
+    // +38% restoration stacked with RAW base vibrance and visibly re-amplified chroma clouds.
+    float satBoost = 1.0 + 0.14 * shadowGate * highlightGate *
+            (1.0 - 0.25 * smoothstep(0.30, 0.80, relChroma));
+    val = max(vec3(0.0), vec3(y) + (val - vec3(y)) * satBoost);
+
+    return val;
+}
+
+vec3 applyToneLookLut(vec3 rgb) {
+    float inputLuma = max(1.0e-6, lumaOf(rgb));
+    float lutIdxF = clamp(inputLuma * 4095.0, 0.0, 4095.0);
+    uint lutIdx = uint(lutIdxF);
+    float frac = lutIdxF - float(lutIdx);
+    uint nextIdx = min(4095u, lutIdx + 1u);
+    float curvedLuma = mix(
+            toneLut[lutIdx * 2u + 0u],
+            toneLut[nextIdx * 2u + 0u],
+            frac);
+    // Entry +1 is retained for capture diagnostics/legacy YUV use. RAW output uses the same
+    // luminance LUT that IspCore built from black/contrast/range controls + user curves.
+    float scale = curvedLuma / inputLuma;
+    return compressToUnitGamutPreserveLuma(rgb * scale);
+}
+
+vec3 neutralizeRawHighlightChroma(vec3 rgb) {
+    // RAW enters this stage after AgX + the display-linear tone LUT, so thresholds are expressed
+    // in output-linear space rather than sensor/Bayer code values. Correct only bright candidates:
+    // true purple/magenta subjects at ordinary luminance must remain untouched.
+    float y = max(1.0e-6, lumaOf(rgb));
+    float maxRGB = max(rgb.r, max(rgb.g, rgb.b));
+    float minRGB = min(rgb.r, min(rgb.g, rgb.b));
+    float rbFloor = min(rgb.r, rgb.b);
+    float greenDeficit = rbFloor - rgb.g;
+
+    bool nearWhiteCandidate = y > 0.84 && maxRGB > 0.96 && minRGB > 0.66;
+    bool magentaHighlightCandidate =
+            y > 0.74 && rbFloor > 0.90 && greenDeficit > 0.085;
+    if (!nearWhiteCandidate && !magentaHighlightCandidate) return rgb;
+
+    float whiteSeverity = nearWhiteCandidate
+            ? smoothstep(0.84, 0.98, y) * smoothstep(0.96, 1.0, maxRGB)
+            : 0.0;
+    float magentaSeverity = magentaHighlightCandidate
+            ? smoothstep(0.085, 0.24, greenDeficit) * smoothstep(0.74, 0.94, y)
+            : 0.0;
+    float authority = clamp(max(0.28 * whiteSeverity, 0.72 * magentaSeverity), 0.0, 0.82);
+    if (authority <= 1.0e-4) return rgb;
+
+    // Mixing toward the current luminance is luminance-preserving by construction. This removes
+    // the R+B / weak-G cast without brightening the highlight or changing global exposure.
+    vec3 corrected = mix(rgb, vec3(y), authority);
+    atomicAdd(telemetry[1], 1u);
+    return corrected;
+}
+
+void runTone(uvec2 gid) {
+    if (gid.x >= pc.frameWidth || gid.y >= pc.frameHeight) return;
+    uint base = (gid.y * pc.frameWidth + gid.x) * 3u;
+    vec3 rgb = vec3(workingRgb[base + 0u], workingRgb[base + 1u], workingRgb[base + 2u]);
+    rgb *= pc.exposureGain;
+    rgb = applyLocalTone(gid, rgb);
+    if (pc.isRawBayer != 0u) {
+        // Scene-linear RAW Bayer path: AgX owns scene-to-display compression. The display-linear
+        // look LUT then owns automatic black/contrast/lower-mid shaping plus every profile tone
+        // range/curve. Previously this LUT was silently skipped whenever the RAW AgX path won.
+        rgb = applyAgXTonemap(rgb);
+        rgb = applyToneLookLut(rgb);
+        rgb = neutralizeRawHighlightChroma(rgb);
+        rgb = applyProfileColor(rgb);
+    } else {
+        // YUV capture path (already ISP-tonemapped by HAL)
+        float preShoulderY = max(1.0e-6, lumaOf(rgb));
+        float maxRGB = max(rgb.r, max(rgb.g, rgb.b));
+        float minRGB = min(rgb.r, min(rgb.g, rgb.b));
+        bool nearWhiteClipped = preShoulderY > 0.82 && maxRGB > 0.95 && minRGB > 0.65;
+        bool magentaClip = rgb.r > 0.85 && rgb.b > 0.85 && rgb.g < min(rgb.r, rgb.b) - 0.10 && preShoulderY > 0.60;
+        bool neutralized = false;
+        if (nearWhiteClipped || magentaClip) {
+            float severity = clamp((maxRGB - 0.85) / 0.15, 0.0, 1.0);
+            float t = 0.5 + 0.45 * severity;
+            rgb = mix(rgb, vec3(preShoulderY), t);
+            neutralized = true;
+            atomicAdd(telemetry[1], 1u);
+        }
+
+        float postNeutralY = neutralized ? max(1.0e-6, lumaOf(rgb)) : preShoulderY;
+        float shoulderStart = clamp(pc.shoulderStart, 0.50, 0.85);
+        float shoulderStrength = clamp(pc.shoulderStrength, 0.50, 2.50);
+        float lookLuma = postNeutralY;
+        if (postNeutralY > shoulderStart) {
+            float headroom = 1.0 - shoulderStart;
+            float excess = postNeutralY - shoulderStart;
+            float mappedY = shoulderStart + headroom * excess /
+                    (excess + headroom * shoulderStrength);
+            rgb *= mappedY / postNeutralY;
+            lookLuma = mappedY;
+        }
+
+        float mappedMaximum = max(rgb.r, max(rgb.g, rgb.b));
+        if (mappedMaximum > 1.0) {
+            rgb *= 1.0 / mappedMaximum;
+            lookLuma = max(1.0e-6, lumaOf(rgb));
+        }
+
+        float lutIdxF = clamp(lookLuma * 4095.0, 0.0, 4095.0);
+        uint lutIdx = uint(lutIdxF);
+        float frac = lutIdxF - float(lutIdx);
+        uint nextIdx = min(4095u, lutIdx + 1u);
+        float curvedLuma = mix(toneLut[lutIdx * 2u + 0u], toneLut[nextIdx * 2u + 0u], frac);
+        float safeMidtoneGate = mix(toneLut[lutIdx * 2u + 1u], toneLut[nextIdx * 2u + 1u], frac);
+        rgb *= curvedLuma / max(lookLuma, 1.0e-6);
+
+        float finalLuma = curvedLuma;
+        float finalMax = max(rgb.r, max(rgb.g, rgb.b));
+        float finalMin = min(rgb.r, min(rgb.g, rgb.b));
+        float relativeChroma = (finalMax - finalMin) / max(finalMax, 0.02);
+        float requestedSaturationFactor = 1.0;
+        if (!neutralized) {
+            float shadowGate = smoothstepFast(0.08, 1.0 / (0.22 - 0.08), finalLuma);
+            float highlightGate = 1.0 - smoothstepFast(0.70, 1.0 / (0.90 - 0.70), finalLuma);
+            float colorGate = 1.0 - 0.40 * smoothstepFast(0.30, 1.0 / (0.70 - 0.30), relativeChroma);
+            requestedSaturationFactor = 1.0 + 0.05 * shadowGate * highlightGate * colorGate;
+        }
+        float positiveDeviation = max(0.0, finalMax - finalLuma);
+        float negativeDeviation = max(0.0, finalLuma - finalMin);
+        float highlightLimit = positiveDeviation > 1.0e-6 ? (1.0 - finalLuma) / positiveDeviation : requestedSaturationFactor;
+        float shadowLimit = negativeDeviation > 1.0e-6 ? finalLuma / negativeDeviation : requestedSaturationFactor;
+        float saturationFactor = max(1.0, min(requestedSaturationFactor, min(highlightLimit, shadowLimit)));
+        rgb = max(vec3(0.0), vec3(finalLuma) + (rgb - vec3(finalLuma)) * saturationFactor);
+        rgb = applyProfileColor(rgb);
+    }
+
+    workingRgb[base + 0u] = rgb.r;
+    workingRgb[base + 1u] = rgb.g;
+    workingRgb[base + 2u] = rgb.b;
+}
+
+
+
+vec2 portraitUprightUv(vec2 sourceUv) {
+    uint rotation = pc.portraitMaskRotationDegrees % 360u;
+    if (rotation == 90u) return vec2(1.0 - sourceUv.y, sourceUv.x);
+    if (rotation == 180u) return vec2(1.0 - sourceUv.x, 1.0 - sourceUv.y);
+    if (rotation == 270u) return vec2(sourceUv.y, 1.0 - sourceUv.x);
+    return sourceUv;
+}
+
+float portraitMaskRaw(vec2 sourceUv) {
+    if (pc.portraitEnabled == 0u || pc.portraitMaskWidth < 2u || pc.portraitMaskHeight < 2u) return 0.0;
+    vec2 uv = portraitUprightUv(clamp(sourceUv, vec2(0.0), vec2(1.0)));
+    vec2 boundsMin = vec2(pc.portraitTargetLeft, pc.portraitTargetTop);
+    vec2 boundsMax = vec2(pc.portraitTargetRight, pc.portraitTargetBottom);
+    vec2 span = max(boundsMax - boundsMin, vec2(1.0e-6));
+    vec2 local = (uv - boundsMin) / span;
+    if (local.x < 0.0 || local.x > 1.0 || local.y < 0.0 || local.y > 1.0) return 0.0;
+    vec2 p = clamp(local, vec2(0.0), vec2(1.0)) *
+            vec2(float(pc.portraitMaskWidth - 1u), float(pc.portraitMaskHeight - 1u));
+    uvec2 p0 = uvec2(floor(p));
+    uvec2 p1 = min(p0 + uvec2(1u), uvec2(pc.portraitMaskWidth - 1u, pc.portraitMaskHeight - 1u));
+    vec2 f = fract(p);
+    float m00 = portraitMask[p0.y * pc.portraitMaskWidth + p0.x];
+    float m10 = portraitMask[p0.y * pc.portraitMaskWidth + p1.x];
+    float m01 = portraitMask[p1.y * pc.portraitMaskWidth + p0.x];
+    float m11 = portraitMask[p1.y * pc.portraitMaskWidth + p1.x];
+    return clamp(mix(mix(m00, m10, f.x), mix(m01, m11, f.x), f.y), 0.0, 1.0);
+}
+
+float portraitAlpha(vec2 sourceUv) {
+    if (pc.portraitEnabled == 0u) return 0.0;
+    vec2 texel = vec2(1.25 / max(float(pc.frameWidth), 1.0),
+                      1.25 / max(float(pc.frameHeight), 1.0));
+    float c = portraitMaskRaw(sourceUv);
+    float sum = c * 2.0;
+    sum += portraitMaskRaw(sourceUv + vec2(texel.x, 0.0));
+    sum += portraitMaskRaw(sourceUv - vec2(texel.x, 0.0));
+    sum += portraitMaskRaw(sourceUv + vec2(0.0, texel.y));
+    sum += portraitMaskRaw(sourceUv - vec2(0.0, texel.y));
+    float refined = sum / 6.0;
+    float feathered = smoothstep(0.16, 0.70, refined);
+    float confidentCore = smoothstep(0.52, 0.90, c);
+    return clamp(max(feathered, confidentCore), 0.0, 1.0);
+}
+
+float portraitDistanceFromTarget(vec2 sourceUv) {
+    vec2 uv = portraitUprightUv(sourceUv);
+    vec2 lo = vec2(pc.portraitTargetLeft, pc.portraitTargetTop);
+    vec2 hi = vec2(pc.portraitTargetRight, pc.portraitTargetBottom);
+    vec2 d = max(max(lo - uv, uv - hi), vec2(0.0));
+    return length(d);
+}
+
+const vec2 kPortraitPoisson[12] = vec2[12](
+    vec2(-0.326, -0.406), vec2(-0.840, -0.074), vec2(-0.696, 0.457),
+    vec2(-0.203, 0.621), vec2(0.962, -0.195), vec2(0.473, -0.480),
+    vec2(0.519, 0.767), vec2(0.185, -0.893), vec2(0.507, 0.064),
+    vec2(0.896, 0.412), vec2(-0.322, -0.933), vec2(-0.792, -0.598)
+);
+
+void buildPortraitBlur(uvec2 gid) {
+    if (gid.x >= pc.frameWidth || gid.y >= pc.frameHeight) return;
+    vec2 uv = (vec2(gid) + vec2(0.5)) / vec2(pc.frameWidth, pc.frameHeight);
+    float alpha = portraitAlpha(uv);
+    vec3 original = workingAt(int(gid.x), int(gid.y));
+    uint outBase = (gid.y * pc.frameWidth + gid.x) * 3u;
+    if (alpha >= 0.985) {
+        portraitBlurRgb[outBase + 0u] = original.r;
+        portraitBlurRgb[outBase + 1u] = original.g;
+        portraitBlurRgb[outBase + 2u] = original.b;
+        return;
+    }
+    float minDim = max(1.0, min(float(pc.frameWidth), float(pc.frameHeight)));
+    float distanceGain = mix(0.58, 1.0, smoothstep(0.015, 0.22, portraitDistanceFromTarget(uv)));
+    float radiusPx = clamp(minDim * 0.0125 * distanceGain, 3.0, 30.0);
+    vec2 radiusUv = vec2(radiusPx / float(pc.frameWidth), radiusPx / float(pc.frameHeight));
+    vec3 sum = original * (1.0 - alpha) * 0.7;
+    float weightSum = (1.0 - alpha) * 0.7;
+    for (int i = 0; i < 12; ++i) {
+        vec2 sampleUv = clamp(uv + kPortraitPoisson[i] * radiusUv, vec2(0.0), vec2(1.0));
+        float sampleAlpha = portraitAlpha(sampleUv);
+        float backgroundWeight = 1.0 - smoothstep(0.22, 0.68, sampleAlpha);
+        ivec2 sp = ivec2(clamp(sampleUv * vec2(pc.frameWidth, pc.frameHeight),
+                               vec2(0.0), vec2(float(pc.frameWidth - 1u), float(pc.frameHeight - 1u))));
+        float radialWeight = 1.0 - 0.24 * length(kPortraitPoisson[i]);
+        float w = max(0.0, backgroundWeight * radialWeight);
+        sum += workingAt(sp.x, sp.y) * w;
+        weightSum += w;
+    }
+    vec3 blurred = weightSum > 1.0e-5 ? sum / weightSum : original;
+    portraitBlurRgb[outBase + 0u] = blurred.r;
+    portraitBlurRgb[outBase + 1u] = blurred.g;
+    portraitBlurRgb[outBase + 2u] = blurred.b;
+}
+
+void compositePortrait(uvec2 gid) {
+    if (gid.x >= pc.frameWidth || gid.y >= pc.frameHeight) return;
+    vec2 uv = (vec2(gid) + vec2(0.5)) / vec2(pc.frameWidth, pc.frameHeight);
+    float alpha = portraitAlpha(uv);
+    uint base = (gid.y * pc.frameWidth + gid.x) * 3u;
+    vec3 original = vec3(workingRgb[base + 0u], workingRgb[base + 1u], workingRgb[base + 2u]);
+    vec3 blurred = vec3(portraitBlurRgb[base + 0u], portraitBlurRgb[base + 1u], portraitBlurRgb[base + 2u]);
+    vec3 outRgb = mix(blurred, original, alpha);
+    workingRgb[base + 0u] = outRgb.r;
+    workingRgb[base + 1u] = outRgb.g;
+    workingRgb[base + 2u] = outRgb.b;
+}
+
+const float kUltraHdrOffset = 0.015625; // 1/64 per Android Ultra HDR guidance.
+const float kUltraHdrMaxLog2Boost = 4.0; // hard safety ceiling: 16x content boost.
+
+float ultraHdrAverageLumaFromWorking(uint mapX, uint mapY, bool applyExposure) {
+    uint x0 = mapX * 4u;
+    uint y0 = mapY * 4u;
+    float sum = 0.0;
+    uint count = 0u;
+    for (uint dy = 0u; dy < 4u; ++dy) {
+        uint y = y0 + dy;
+        if (y >= pc.frameHeight) break;
+        for (uint dx = 0u; dx < 4u; ++dx) {
+            uint x = x0 + dx;
+            if (x >= pc.frameWidth) break;
+            vec3 rgb = workingAt(int(x), int(y));
+            if (applyExposure) rgb *= pc.exposureGain;
+            sum += max(0.0, lumaOf(rgb));
+            count++;
+        }
+    }
+    return count > 0u ? sum / float(count) : 0.0;
+}
+
+void captureUltraHdrAuthority(uvec2 gid) {
+    if (gid.x >= pc.ultraHdrSourceMapWidth || gid.y >= pc.ultraHdrSourceMapHeight) return;
+    uint index = gid.y * pc.ultraHdrSourceMapWidth + gid.x;
+    ultraHdrLuma[index] = clamp(ultraHdrAverageLumaFromWorking(gid.x, gid.y, true), 0.0, 16.0);
+}
+
+void analyzeUltraHdrGain(uvec2 gid) {
+    if (gid.x >= pc.ultraHdrSourceMapWidth || gid.y >= pc.ultraHdrSourceMapHeight) return;
+    uint index = gid.y * pc.ultraHdrSourceMapWidth + gid.x;
+    float hdrY = max(0.0, ultraHdrLuma[index]);
+    float sdrY = clamp(ultraHdrAverageLumaFromWorking(gid.x, gid.y, false), 0.0, 1.0);
+    float gain = max(1.0, (hdrY + kUltraHdrOffset) / (sdrY + kUltraHdrOffset));
+    float logGain = clamp(log2(gain), 0.0, kUltraHdrMaxLog2Boost);
+    ultraHdrGainLog[index] = logGain;
+    atomicMax(telemetry[2], uint(round(logGain * 65536.0)));
+}
+
+uvec2 ultraHdrOutputToSource(uint x, uint y) {
+    uint rotation = pc.outputRotationDegrees % 360u;
+    if (rotation == 90u) {
+        return uvec2(y, pc.ultraHdrSourceMapHeight - 1u - x);
+    }
+    if (rotation == 180u) {
+        return uvec2(pc.ultraHdrSourceMapWidth - 1u - x,
+                     pc.ultraHdrSourceMapHeight - 1u - y);
+    }
+    if (rotation == 270u) {
+        return uvec2(pc.ultraHdrSourceMapWidth - 1u - y, x);
+    }
+    return uvec2(x, y);
+}
+
+void packUltraHdrGainmap(uvec2 gid) {
+    if (gid.x >= pc.ultraHdrPackedWordsPerRow || gid.y >= pc.ultraHdrOutputMapHeight) return;
+    float maxLogGain = max(float(telemetry[2]) / 65536.0, 1.0 / 65536.0);
+    uint packed = 0u;
+    for (uint lane = 0u; lane < 4u; ++lane) {
+        uint outX = gid.x * 4u + lane;
+        uint byteValue = 0u;
+        if (outX < pc.ultraHdrOutputMapWidth) {
+            uvec2 src = ultraHdrOutputToSource(outX, gid.y);
+            if (src.x < pc.ultraHdrSourceMapWidth && src.y < pc.ultraHdrSourceMapHeight) {
+                uint srcIndex = src.y * pc.ultraHdrSourceMapWidth + src.x;
+                float normalized = clamp(ultraHdrGainLog[srcIndex] / maxLogGain, 0.0, 1.0);
+                byteValue = uint(round(normalized * 255.0));
+            }
+        }
+        packed |= (byteValue & 0xffu) << (lane * 8u);
+    }
+    uint outIndex = gid.y * pc.ultraHdrPackedWordsPerRow + gid.x;
+    ultraHdrGainmapPacked[outIndex] = packed;
+}
+
+void main() {
+    uvec2 gid = gl_GlobalInvocationID.xy;
+    if (pc.mode == 0u) {
+        runHighlightRecovery(gid);
+    } else if (pc.mode == 1u) {
+        if (gid.y == 0u) writeSceneSample(gid.x);
+    } else if (pc.mode == 2u) {
+        writeDisplayCell(gid);
+    } else if (pc.mode == 3u) {
+        runTone(gid);
+    } else if (pc.mode == 4u) {
+        captureUltraHdrAuthority(gid);
+    } else if (pc.mode == 5u) {
+        analyzeUltraHdrGain(gid);
+    } else if (pc.mode == 6u) {
+        packUltraHdrGainmap(gid);
+    } else if (pc.mode == 7u) {
+        buildPortraitBlur(gid);
+    } else if (pc.mode == 8u) {
+        compositePortrait(gid);
+    } else if (pc.mode == 9u) {
+        buildLocalToneBase(gid);
+    }
+}

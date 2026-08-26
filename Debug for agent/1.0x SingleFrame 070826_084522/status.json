@@ -1,0 +1,12 @@
+{
+  "attemptId": "2-1130472351905504",
+  "state": "COMPLETED",
+  "stageReached": "CAPTURE_COMPLETED",
+  "exceptionClass": null,
+  "exceptionMessage": null,
+  "jpegPublished": true,
+  "dngPublished": false,
+  "noiseModelStarted": false,
+  "noiseModelCompleted": false,
+  "timestampMs": 1786085133887
+}

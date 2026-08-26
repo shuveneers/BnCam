@@ -1,0 +1,62 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer AnchorYuvBuffer {
+    uint anchorLumaWords[]; // Anchor Y plane words
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer SupportYuvBuffer {
+    uint supportLumaWords[]; // Support Y plane words
+};
+
+layout(std430, set = 0, binding = 2) buffer FusedYuvBuffer {
+    uint fusedLumaWords[]; // Fused Y plane words
+};
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+    int dx;
+    int dy;
+    float weight;
+    uint isFirstSupport;
+} pc;
+
+void main() {
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    if (x >= pc.width || y >= pc.height) return;
+
+    uint pixelIdx = y * pc.width + x;
+    uint wordIdx = pixelIdx / 4u;
+    uint shift = (pixelIdx % 4u) * 8u;
+
+    uint anchorY = (anchorLumaWords[wordIdx] >> shift) & 0xFFu;
+
+    if (pc.isFirstSupport == 1u) {
+        // Initialize fused luma output buffer with anchor Luma values
+        uint currentWord = fusedLumaWords[wordIdx];
+        uint mask = ~(0xFFu << shift);
+        fusedLumaWords[wordIdx] = (currentWord & mask) | (anchorY << shift);
+    }
+
+    if (pc.weight <= 0.0) return;
+
+    int sx = int(x) + pc.dx;
+    int sy = int(y) + pc.dy;
+
+    if (sx < 0 || sx >= int(pc.width) || sy < 0 || sy >= int(pc.height)) return;
+
+    uint sPixelIdx = uint(sy) * pc.width + uint(sx);
+    uint sWordIdx = sPixelIdx / 4u;
+    uint sShift = (sPixelIdx % 4u) * 8u;
+    uint supportY = (supportLumaWords[sWordIdx] >> sShift) & 0xFFu;
+
+    // Weighted Average Luma Fusion (Anchor Chroma is preserved unmodified)
+    uint currentY = (fusedLumaWords[wordIdx] >> shift) & 0xFFu;
+    uint fusedY = uint((float(currentY) + float(supportY) * pc.weight) / (1.0 + pc.weight) + 0.5);
+
+    uint currentWord = fusedLumaWords[wordIdx];
+    uint mask = ~(0xFFu << shift);
+    fusedLumaWords[wordIdx] = (currentWord & mask) | ((fusedY & 0xFFu) << shift);
+}

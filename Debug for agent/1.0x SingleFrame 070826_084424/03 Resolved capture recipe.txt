@@ -1,0 +1,10 @@
+RESOLVED CAPTURE RECIPE
+=======================
+warmBuffer.runtimeSafeMaximum: 25
+warmBuffer: requested=35; supported=25; resolved=25; executed=not_recorded; result=RUNTIME_SAFE_MAXIMUM; fallback=true; reason=RUNTIME_SAFE_MAXIMUM
+candidateCount.runtimeSafeMaximum: 25
+candidateCount: requested=3; supported=25; resolved=3; executed=not_recorded; result=AS_REQUESTED; fallback=false; reason=as_requested
+processingFrameCount.runtimeSafeMaximum: 25
+processingFrameCount: requested=3; supported=25; resolved=1; executed=not_recorded; result=SINGLE_FRAME_RESTRICTION; fallback=true; reason=SINGLE_FRAME_RESTRICTION
+dngMasterFrameCount.runtimeSafeMaximum: 25
+dngMasterFrameCount: requested=0; supported=25; resolved=0; executed=not_recorded; result=OUTPUT_NOT_APPLICABLE; fallback=false; reason=OUTPUT_NOT_APPLICABLE

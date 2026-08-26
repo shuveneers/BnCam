@@ -1,0 +1,6 @@
+ALIGNMENT
+=========
+alignment: requested=not_applicable; supported=true; resolved=not_applicable; executed=not_recorded; result=unknown; fallback=false; reason=not_applicable_single_frame
+merge_subpixel: requested=true; supported=false; resolved=unavailable; executed=not_executed; result=not_applicable; fallback=false; reason=unavailable_production_setting_preserved_only
+merge_linear_interp: requested=true; supported=false; resolved=unavailable; executed=not_executed; result=not_applicable; fallback=false; reason=unavailable_production_setting_preserved_only
+executedAlignment: requested=not_applicable; supported=true; resolved=not_applicable; executed=not_executed; result=single_frame; fallback=false; reason=single_frame_route

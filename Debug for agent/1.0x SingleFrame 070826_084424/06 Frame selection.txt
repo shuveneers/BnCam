@@ -1,0 +1,9 @@
+FRAME SELECTION
+===============
+frameSelection: requested=balanced; supported=true; resolved=balanced; executed=not_recorded; result=IMPLEMENTED; fallback=false; reason=current_capture_execution
+anchorSelection: requested=weighted_quality; supported=true; resolved=weighted_quality; executed=not_recorded; result=IMPLEMENTED; fallback=false; reason=current_capture_execution
+base_temporal_bias: requested=0.0; supported=false; resolved=unavailable; executed=not_executed; result=not_applicable; fallback=false; reason=unavailable_production_setting_preserved_only
+selection_accept_all: requested=false; supported=false; resolved=unavailable; executed=not_executed; result=not_applicable; fallback=false; reason=unavailable_production_setting_preserved_only
+selection_alignable_only: requested=true; supported=false; resolved=unavailable; executed=not_executed; result=not_applicable; fallback=false; reason=unavailable_production_setting_preserved_only
+selection_prefer_recent: requested=false; supported=false; resolved=unavailable; executed=not_executed; result=not_applicable; fallback=false; reason=unavailable_production_setting_preserved_only
+executedFrameSelection: requested=balanced; supported=true; resolved=balanced; executed=balanced; result=selected_timestamp_1130414507621889; fallback=false; reason=genuine_near_zsl_highest_weighted_score_bias_balanced

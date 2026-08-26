@@ -1,0 +1,48 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer CanonicalRawInput {
+    uint inputWords[];
+};
+layout(std430, set = 0, binding = 1) writeonly buffer NormalizedRawOutput {
+    float outputPixels[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint inputWidth;
+    uint inputHeight;
+    uint cropLeft;
+    uint cropTop;
+    uint width;
+    uint height;
+    uint phaseX;
+    uint phaseY;
+    float whiteLevel;
+    vec4 blackLevels;
+} pc;
+
+void main() {
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    if (x >= pc.width || y >= pc.height) return;
+
+    uint sourceX = x + pc.cropLeft;
+    uint sourceY = y + pc.cropTop;
+    if (sourceX >= pc.inputWidth || sourceY >= pc.inputHeight) return;
+    uint sourceIndex = sourceY * pc.inputWidth + sourceX;
+    uint outputIndex = y * pc.width + x;
+    uint word = inputWords[sourceIndex >> 1u];
+    uint shift = (sourceIndex & 1u) * 16u;
+    float raw = float((word >> shift) & 0xffffu);
+
+    uint site = (((y + pc.phaseY) & 1u) << 1u) | ((x + pc.phaseX) & 1u);
+    float black = site == 0u ? pc.blackLevels.x
+            : (site == 1u ? pc.blackLevels.y
+            : (site == 2u ? pc.blackLevels.z : pc.blackLevels.w));
+    float inverseRange = 1.0 / max(1.0, pc.whiteLevel - black);
+
+    // Exact production RawDomain::normalizeRawForJpeg semantics:
+    // black subtraction, white-range normalization and final [0,1] clamp only.
+    // No WB, lens shading, demosaic, creative tone or highlight-headroom policy belongs here.
+    outputPixels[outputIndex] = clamp((raw - black) * inverseRange, 0.0, 1.0);
+}

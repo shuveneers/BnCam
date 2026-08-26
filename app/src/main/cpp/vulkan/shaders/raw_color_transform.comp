@@ -1,0 +1,31 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer InputLinearRgbBuffer {
+    vec4 inputPixels[]; // Linear camera RGB (R, G, B, 1.0)
+};
+
+layout(std430, set = 0, binding = 1) buffer OutputWorkingRgbBuffer {
+    vec4 outputPixels[]; // Linear working RGB (R, G, B, 1.0)
+};
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+    mat3 colorTransformMatrix; // 3x3 Camera to Working Space Color Matrix
+} pc;
+
+void main() {
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    if (x >= pc.width || y >= pc.height) return;
+
+    uint pixelIdx = y * pc.width + x;
+    vec3 cameraRgb = inputPixels[pixelIdx].rgb;
+
+    // Apply 3x3 Color Matrix Transformation (linear scene-referred values preserved)
+    vec3 workingRgb = pc.colorTransformMatrix * cameraRgb;
+
+    // Clamp negative noise values while preserving positive highlight headroom (> 1.0)
+    outputPixels[pixelIdx] = vec4(max(vec3(0.0), workingRgb), 1.0);
+}

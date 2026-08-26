@@ -1,0 +1,1548 @@
+========================================================================
+BNCAM PIPELINE DEBUG
+========================================================================
+
+
+------------------------------------------------------------------------
+[1] Shot Overview
+------------------------------------------------------------------------
+  Runner:                            SingleFrameRunner
+  Selected mode:                     Single frame (Near ZSL)
+  Frame source:                      RAW10
+  Capture succeeded:                 yes
+  Hard failure:                      no
+
+------------------------------------------------------------------------
+[2] Route Truth
+------------------------------------------------------------------------
+  Requested mode:                    SINGLE_FRAME_ZSL
+  Requested mode label:              Single frame (Near ZSL)
+  Resolved route:                    CAMERA2_RAW10_WARM_BUFFER_SINGLE_FRAME
+  Actual route:                      CAMERA2_RAW10_WARM_BUFFER_SINGLE_FRAME
+  Profile ID:                        2_profile_1
+  Preferred frame setting:           RAW10
+  Debug scope:                       shot_folder_only
+
+------------------------------------------------------------------------
+[3] Camera / Lens Truth
+------------------------------------------------------------------------
+  Camera ID:                         2
+  Lens:                              1.0x
+  Physical camera ID:                not reported
+  Lens facing:                       BACK
+  Sensor orientation:                90°
+  Output rotation:                   90°
+  Metering Style:                    Matrix
+  EV Offset:                         0.0
+  AE Regions Requested:              [1435,1310,490x490,w=1000]
+  AE Regions Result:                 [1435,1310,490x490,w=1000]
+  EV Comp Requested:                 0.0
+  EV Comp Result:                    0.0
+  AE State Before Capture:           CONVERGED
+  AE State At Capture:               CONVERGED
+  Sensor Exposure Time:              19999985
+  Sensor Sensitivity:                258
+  Metering Applied to Repeating Request: exact
+  Metering Applied to Still Request: not_applicable_near_zsl_repeating_frame
+
+------------------------------------------------------------------------
+[4] Buffer / Format Truth
+------------------------------------------------------------------------
+  Buffer format:                     RAW10
+  Capture size:                      4096 x 3072
+  Output size:                       4096 x 3072
+  Buffer capacity:                   25
+  Frames buffered:                   24
+  Frames requested:                  1
+  Frames eligible:                   4
+  Frames copied to RAM:              0
+
+  Streamlined Frame Table:
+  Frame | Sharpness | Motion  | EV      | Align   | Delta (ms) | Decision Summary
+  ------------------------------------------------------------------------------
+  1   * | 0.1124    | 0.8422  | 0.6713  | 0.8487  |    -27.936 | ACCEPTED_ANCHOR / genuine_near_zsl_highest_weighted_score_bias_balanced
+  2     | 0.1124    | 0.8422  | 0.6688  | 0.6682  |    -61.261 | REJECTED / Lower weighted selection score
+  3     | 0.1122    | 0.8422  | 0.6701  | 0.4877  |    -94.586 | REJECTED / Lower weighted selection score
+  4     | 0.1110    | 0.8422  | 0.6689  | 0.3500  |   -127.911 | REJECTED / Rejected by shutter-relative freshness gate
+
+
+------------------------------------------------------------------------
+[5] Pipeline Contract
+------------------------------------------------------------------------
+  Pipeline name:                     RAW Native ISP Route
+  Buffer route:                      RAW10
+  Black level source:                SENSOR_DYNAMIC_BLACK_LEVEL
+  Black level applied yes/no:        yes
+  Black level applied domain:        RAW10
+  White level source:                SENSOR_INFO_WHITE_LEVEL
+  White level applied yes/no:        yes
+  White level applied domain:        RAW10
+  Color matrix source:               CaptureResult.COLOR_TRANSFORM
+  Color matrix applied yes/no:       yes
+  WB source:                         CaptureResult.COLOR_GAINS
+  WB applied yes/no:                 yes
+  Noise profile source:              CaptureResult.SENSOR_NOISE_PROFILE
+  Noise profile present yes/no:      yes
+  Noise profile applied yes/no:      yes
+  Applied Black Levels:              [64.0, 63.0, 60.0, 63.0]
+  Applied White Level:               1023
+  Color Matrix Values:               [identity]
+
+  Native Calibration Summary (from C++):
+    hasBlackLevel:                   yes
+    hasWhiteLevel:                   yes
+    hasColorMatrix:                  yes
+    hasWbGains:                      yes
+    hasNoiseProfile:                 yes
+    calibrationApplied:              yes
+    noiseProfileApplied:             yes
+    calibrationWarnings:             none
+
+------------------------------------------------------------------------
+[6] Effective Settings
+------------------------------------------------------------------------
+
+  Resolved ISP Settings
+    No resolved ISP settings were recorded.
+
+  Quality Config
+    No quality config was recorded.
+
+  Common Post-Render
+    No common post-render runtime mapping was recorded.
+
+  Output Encode
+    No output encode runtime mapping was recorded.
+
+------------------------------------------------------------------------
+[7] Renderer / Native Events
+------------------------------------------------------------------------
+
+  Renderer Pipeline
+  Render Time:                       26874 ms
+  JPEG Bytes:                        6774064
+  Renderer:                          NATIVE C++ HW BUFFER ENGINE
+  CFA Pattern:                       BGGR
+
+  Master RAW16 ISP Render
+  RAW_BASELINE_RENDER: source:       RAW10
+  Raw Bayer Route Type:              RAW10
+  Shared Raw Bayer Jpeg Policy Used: true
+  Raw Bayer Jpeg Render Policy:      RAW_BAYER_JPEG_RENDER
+  Actual Iso:                        258
+  Exposure Known:                    true
+  Exposure Ms:                       20
+  Low Light Scene:                   false
+  Full Raw16Saturated Pct:           0
+  Display Highlight Scene:           false
+  Outdoor Sky Scene:                 false
+  Requested Gain:                    1
+  Applied Gain:                      1
+  Gain Capped:                       false
+  Raw Render Gain Before Scene Policy: 0.401787
+  Raw Render Gain After Scene Policy: 0.401787
+  Raw Render Gain After Low Light Floor: 0.401787
+  Raw Render Gain After Highlight Policy: 1
+  Global Darkening Allowed:          false
+  Highlight Aware Sub Unity Gain Allowed: false
+  Sub Unity Scene Gain Allowed:      false
+  Bright Highlight Range Present:    true
+  Global Darkening Reason:           blocked
+  Global Darkening Blocked Reason:   full_raw16_saturation_below_0_5pct
+  Low Light Gain Floor Applied:      false
+  Low Light Gain Floor Value:        0
+  Indoor Low Light Midtone Lift Applied: false
+  Indoor Low Light Midtone Lift Amount: 0
+  Final Tone Mean Before Midtone Lift: 0
+  Final Tone Mean After Midtone Lift: 0
+  Safe Midtone Pixel Pct:            0
+  Deep Shadow Protected Pct:         0
+  Display Highlight Mask Pct:        0
+  Highlight Occupancy Pct:           0.414905
+  Highlight Protection Mode:         local
+  Local Highlight Protection Reason: isolated_recoverable_highlights
+  Global Highlight Darkening:        false
+  Outdoor Sky Confidence:            0.218814
+  Outdoor Sky Rejected Reason:       insufficient_broad_sky_coverage
+  Display Highlight Confidence:      0.0620896
+  Indoor Low Light Confidence:       0.104252
+  Scene Classification Final:        normal
+  Highlight Neutralize:              true
+  Local Highlight Recovery Applied:  true
+  Local Highlight Recovery Pixels:   12662
+  Local Highlight Recovery Reason:   local_rgb_chroma_reconstruction_on_bounded_jpeg_roi
+  Defect Correction Applied:         true
+  Defect Correction Pixels:          1
+  Defect Correction Reason:          same_cfa_outlier_replaced_by_neighbor_median
+  Green Split Correction Applied:    false
+  Green Split Even Median:           0.110515
+  Green Split Odd Median:            0.111024
+  Green Split Even Scale:            1
+  Green Split Odd Scale:             1
+  Green Split Reason:                green_split_below_threshold
+  Lens Shading Applied:              true
+  Lens Shading Reason:               metadata_lens_shading_map_applied_to_jpeg_clone
+  Lens Shading Max Gain:             3.5
+  Lens Shading Over Range Pct:       0.159756
+  Requested Demosaic Mode:           AUTO
+  Resolved Demosaic Algorithm:       MENON_2007_DDFAPD
+  Demosaic Resolve Reason:           auto_coherent_directional_detail_prefers_menon_2007
+  Effective Cfa Pattern:             BGGR
+  Cfa Origin X:                      0
+  Cfa Origin Y:                      0
+  Demosaic Output Channel Order:     RGB
+  Bilinear Available:                true
+  Malvar Available:                  true
+  Menon Available:                   true
+  Menon Refinement Used:             true
+  Fallback Occurred:                 false
+  Fallback Reason:                   none
+  Auto Scene Analysis Used:          true
+  Auto Sample Count:                 55965
+  Auto Median Signal:                0.129627
+  Auto Mean Gradient:                0.0081133
+  Auto P90Gradient:                  0.0133034
+  Auto Edge Fraction:                0.0450103
+  Auto Coherent Edge Fraction:       0.0276959
+  Auto Low Signal Fraction:          0.294613
+  Auto Signals:                      iso=258,cfaCertain=true,rawColorAudit=no_known_failure,greenPlaneAnomaly=false,motionRisk=not_available,sharpness=not_available,memoryPressureHigh=false,lastMenonTimeMs=0,edgeFraction=0.0450103,coherentEdgeFraction=0.0276959
+  Base Chroma Denoise Strength:      0.2
+  Chroma Denoise Strength:           0.257948
+  Sensor Noise Variance Formula:     S*x+O
+  Sensor Noise Variance Samples:     12582912
+  Mean Sensor Noise Variance:        7.7189e-06
+  Min Sensor Noise Variance:         1.22097e-06
+  Max Sensor Noise Variance:         2.67906e-05
+  Mean Normalized Noise Signal:      0.0907359
+  Min Normalized Noise Signal:       0
+  Max Normalized Noise Signal:       1
+  Sensor Noise Variance Multiplier:  1.41579
+  Noise Model Mode:                  Auto
+  Noise Model So Received By Cpp:    [9.2257937565618032e-05,7.9367281828604619e-07,6.6919224357898376e-05,7.8540099776106805e-07,6.6602012852023858e-05,7.8528647582943445e-07,9.8029608065712019e-05,7.9973951944632023e-07]
+  Noise Model Applied:               yes
+  Noise Model Reason:                applied_to_production_luma_and_chroma_denoise
+  Raw Shadow Diagnostics:            {lensKey=lens_v2_2_none_f99251b9e299e62dbc9e83ac6cd691a0
+  Snapshot Present:                  true
+  Source Format:                     RAW10
+  Cfa Pattern:                       3
+  Iso:                               258
+  Exposure Time Ns:                  19999985
+  Post Raw Boost:                    100
+  White Level:                       1023
+  Black Level R:                     64.0000
+  Black Level G1:                    64.0156
+  Black Level G2:                    64.0156
+  Black Level B:                     64.0000
+  Total Tile Count:                  256
+  Accepted Tile Count:               165
+  Rejected For Brightness:           42
+  Rejected For Texture:              49
+  Rejected For Clipping:             0
+  Rejected For Insufficient Pixels:  0
+  Dark Tile Confidence:              0.6445
+  Mean Near Black Before R:          106.7512
+  Mean Near Black Before G1:         147.2049
+  Mean Near Black Before G2:         147.3719
+  Mean Near Black Before B:          106.0116
+  Mean Near Black After R:           42.7512
+  Mean Near Black After G1:          83.1892
+  Mean Near Black After G2:          83.3563
+  Mean Near Black After B:           42.0116
+  Clipped Zero Pct R:                0.3212
+  Clipped Zero Pct G1:               0.0255
+  Clipped Zero Pct G2:               0.0214
+  Clipped Zero Pct B:                0.2266
+  G1Minus G2Mean:                    0.3393
+  G1Minus G2Var:                     58.0002
+  R Minus GMean:                     4.3044
+  B Minus GMean:                     3.3234
+  Row Mean Var:                      91.5532
+  Col Mean Var:                      987.1792
+  Camera S:                          [0.0001,0.0001,0.0001,0.0001]
+  Camera O:                          [0.0000,0.0000,0.0000,0.0000]
+  Effective S:                       [0.000092,0.000067,0.000067,0.000098]
+  Effective O:                       [0.000001,0.000001,0.000001,0.000001]}
+  Spectra Snapshot Hash:             0x4258b113
+  Spectra Effective Sigma At Reference Signal: 0.0032
+  Spectra Native Mode:               Auto
+  Spectra Signal Model Confidence:   1.0000}
+  Spectra Iso Adaptive:              {captureIso=258
+  Effective Iso:                     258.000000
+  Ev Above100:                       1.3674
+  Regime:                            MODERATE
+  Iso Pressure:                      0.0517
+  Model Pressure:                    0.0117
+  Combined Pressure:                 0.0217
+  Luma Authority:                    0.1369
+  Chroma Authority:                  0.1529
+  Low Freq Authority:                0.0500
+  Temporal Authority:                0.1673
+  Detail Retention Floor:            0.9614
+  Minimum Residual Ratio:            0.8722
+  Target Floor Scale:                1.0957
+  Max Linear Shift:                  0.0017}
+  Spectra Provenance:                {grid=32x24
+  Tile:                              128x128
+  Mean Predicted Raw Var:            0.000008
+  Mean Predicted Visible Var:        0.000023
+  Mean Predicted Spatial Residual Var: 0.000010
+  Mean Predicted Chroma Residual Var: 0.000013
+  Mean Residual:                     0.000032
+  Mean Chroma Residual:              0.000025
+  Mean Green Split Residual:         0.000101
+  Mean Shading Gain:                 1.715841
+  Mean Runtime Confidence:           1.000000
+  Mean Diagnostic Confidence:        0.523734
+  Total Tiles:                       768
+  Valid Tiles:                       768
+  Confidence P10:                    0.242414
+  Confidence P50:                    0.523870
+  Confidence P90:                    0.788873
+  Shading Gain P10:                  1.175234
+  Shading Gain P50:                  1.636658
+  Shading Gain P90:                  2.374117
+  Noise Budget P10:                  1.320710
+  Noise Budget P50:                  2.257024
+  Noise Budget P90:                  4.883686
+  Model Mismatch P10:                0.278170
+  Model Mismatch P50:                0.814047
+  Model Mismatch P90:                1.585900}
+  Spectra Pass0:                     {mode=auto
+  Lens Key:                          2
+  Accepted Tiles:                    165/256
+  Confidence:                        0.6445
+  Classification:                    B. General green-channel black bias
+  Apply Channel Bias:                false
+  Applied Channel Bias:              [0.0000,0.0000,0.0000,0.0000]
+  G1g2Before:                        0.0000
+  G1g2After:                         0.0000
+  Green Split Mad:                   0.0000
+  Green Split Tile Consensus:        0.7879
+  Green Split Tile Count:            165
+  Apply Row Correction:              false
+  Row Variance Before:               0.0000
+  Row Variance After:                0.0000
+  Apply Column Correction:           false
+  Col Variance Before:               0.0000
+  Col Variance After:                0.0000
+  Iso Authority:                     0.0500
+  No Regret Accepted Tiles:          0.0631
+  No Regret Rollback:                1.0000
+  Processing Time Ms:                4967.2764
+  Spectra Pass1:                     {mode=auto
+  Applied:                           true
+  Vst Residual Var:                  12.4402
+  Max Pixel Shift:                   0.8901
+  Model Confidence:                  1.000000
+  Blend Strength:                    0.1409
+  Average Wiener Gain:               0.4912
+  Edge Protected Fraction:           0.2820
+  Changed Pixel Fraction:            2.50722e-06
+  Mean Shading Authority:            1.0456
+  Anisotropic Status:                ANISOTROPIC_DETAIL_PRESERVATION_APPLIED
+  Anisotropic Applied:               true
+  Tensor Confidence P50:             0.0156
+  Tensor Coherence P50:              0.3594
+  Tensor Fallback Fraction:          0.8062}
+  Spectra Pass2:                     {mode=auto
+  Chroma Reduction Pct:              2.0448
+  Max Chroma Shift:                  0.0024
+  Multiscale Architecture:           MILESTONE_3B_ACTIVE_BAND_LIMITED_SHRINKAGE
+  Pixel Working Clone Count:         2
+  Avoided Full Frame Clone Count:    3
+  Pixel Buffer Strategy:             M8C_SHALLOW_SOURCE_ONE_WRITABLE_CLONE_PER_ACTIVE_BAND
+  Fine Plan:                         ENABLED_CONSERVATIVE_M3B_ACTIVE_BAND_KERNEL
+  Mid Plan:                          ENABLED_CONSERVATIVE_M3B_ACTIVE_BAND_KERNEL}
+  Spectra Pass3:                     {mode=auto
+  Row Banding:                       false
+  Col Banding:                       false
+  Low Freq Chroma:                   true
+  Row Energy Before:                 0.0000
+  Row Energy After:                  0.0000
+  Col Energy Before:                 0.0000
+  Col Energy After:                  0.0000
+  Max Low Freq Chroma Shift:         0.0031
+  Row Confidence:                    0.9697
+  Col Confidence:                    0.9731
+  Banding Authority:                 0.0400
+  Low Freq Confidence:               1.0000
+  Low Plan:                          ENABLED_CONSERVATIVE_M3B_ACTIVE_BAND_KERNEL}
+  Spectra No Regret P0:              {tiles=0
+  Evaluated:                         768
+  Invalid:                           0
+  Accepted:                          0
+  Partial:                           58
+  Rejected:                          710
+  Reject Oversmooth:                 0
+  Reject Detail:                     0
+  Reject Mean Drift:                 0
+  Reject No Improvement:             710
+  Mean Acceptance:                   0.0631
+  Acceptance P10:                    0.0000
+  Acceptance P50:                    0.0000
+  Acceptance P90:                    0.0000
+  Attenuated Pixel Fraction:         1.0000
+  Rollback Pixel Fraction:           1.0000
+  Mean Risk Improvement:             -0.0005
+  Mean Colour Shift:                 0.0007
+  Max Colour Shift:                  0.0035
+  Edge Preservation Score:           0.9999
+  Oversmoothing Score:               0.0000}
+  Spectra No Regret P1:              {tiles=768
+  Spectra No Regret P2:              {tiles=768
+  Spectra No Regret P3:              {tiles=768
+  Spectra Budget:                    {mode=auto
+  Target Floor:                      0.000011
+  Initial Energy:                    0.000033
+  Pass1Energy:                       0.000032
+  Pass2Energy:                       0.000032
+  Pass3Energy:                       0.000032
+  Final Remaining:                   0.000032
+  Chroma Target Floor:               0.000015
+  Initial Chroma Energy:             0.000018
+  Pass2Chroma Energy:                0.000017
+  Downstream Luma Authority:         0.971360
+  Downstream Chroma Authority:       0.910966
+  P1Skip:                            false
+  P2Skip:                            false
+  P3Skip:                            false
+  Iso Regime:                        MODERATE
+  Iso Noise Pressure:                0.021666
+  Provenance Confidence:             1.000000
+  Provenance Shading Gain:           1.715841
+  No Regret Mean Acceptance:         0.343098}
+  Spectra Residual Noise State:      {domain=FINAL_JPEG_RGB
+  Value Stage:                       FINAL_JPEG_PRE_ENCODE
+  Last Observed Stage:               JPEG_ENCODED
+  Propagation Status:                MILESTONE_7_FINAL_JPEG_RESIDUAL_STATE_MEASURED_PRE_ENCODE
+  Opponent Variance Status:          DERIVED_FROM_RGB_COVARIANCE
+  Covariance Status:                 SYMMETRIC_PSD_BOUNDED
+  Comparability Status:              FINAL_JPEG_RESIDUAL_STATE_MEASURED_PRE_ENCODE_JPEG_COMPRESSION_NOT_PROPAGATED
+  Variance Y:                        0.000034
+  Variance RG:                       0.000076
+  Variance BG:                       0.000098
+  Covariance Rg Bg:                  0.000048
+  Covariance Rgb:                    [0.000115,0.000032,0.000084,0.000032,0.000025,0.000028,0.000084,0.000028,0.000130]
+  High Frequency Budget:             0.000021
+  Mid Frequency Budget:              0.000003
+  Low Frequency Budget:              0.000021
+  Correlation Length:                0.000000
+  Directional Pattern Energy:        0.000000
+  Row Pattern Energy:                0.000000
+  Column Pattern Energy:             0.000000
+  Temporal Correlation:              0.000000
+  Independent Noise Fraction:        1.000000
+  Effective Frame Count:             1.000000
+  Motion Confidence:                 0.000000
+  Alignment Confidence:              0.000000
+  Predicted Visible Chroma Amplification: 1.878538
+  Calibration Status:                MILESTONE_2B_STAGE_OBSERVATIONS_READY_NO_AUTO_CALIBRATION
+  Post Demosaic Calibration Ready:   true
+  Post Colour Transform Calibration Ready: true
+  Measured Pre Sharpen Variance Y:   0.000171
+  Measured Pre Sharpen Variance RG:  0.000191
+  Measured Pre Sharpen Variance BG:  0.000324
+  Measured Pre Sharpen Sample Count: 256815
+  Measured Post Isp Variance Y:      0.000171
+  Measured Post Isp Variance RG:     0.000191
+  Measured Post Isp Variance BG:     0.000324
+  Measured Post Isp Sample Count:    256815}
+  Spectra Visible Chroma Architecture: MILESTONE_4_POST_TONE_OPPONENT_VISIBLE_CHROMA
+  Spectra Visible Chroma Input Stage: POST_TONE_VIBRANCE_COLOR_MANAGEMENT_LINEAR_RGB
+  Spectra Visible Chroma Output Stage: PRE_QUANTIZATION_LINEAR_RGB
+  Spectra Visible Chroma Covariance Source: SPECTRA_POST_TONE_PROPAGATED_RG_BG_COVARIANCE
+  Spectra Visible Chroma Timing Accounting: PROCESSING_INCLUDES_NEIGHBOUR_FILTER_EXCLUDES_RESIDUAL_MEASUREMENTS
+  Spectra Visible Chroma Enabled:    true
+  Spectra Visible Chroma Applied:    true
+  Spectra Visible Chroma Plan Status: VISIBLE_CHROMA_PLAN_READY
+  Spectra Visible Chroma Result Status: MILESTONE_8H_GPU_RESIDENT_VISIBLE_CHROMA_APPLIED
+  Spectra Visible Chroma Method:     OPPONENT_RG_BG_COVARIANCE_GUIDED_5X5
+  Spectra Visible Chroma No Regret Method: CONTINUOUS_NO_REGRET_2_NOISE_MEAN_COLOUR_EDGE_OVERSMOOTHING
+  Spectra Visible Chroma Model Confidence: 0.244353130
+  Spectra Visible Chroma Authority:  0.107089102
+  Spectra Visible Chroma Maximum Correction: 0.023442175
+  Spectra Visible Chroma Sigma RG:   0.008554948
+  Spectra Visible Chroma Sigma BG:   0.009767572
+  Spectra Visible Chroma Covariance Correlation: 0.561817467
+  Spectra Visible Chroma Predicted Variance RG: 0.000073187
+  Spectra Visible Chroma Predicted Variance BG: 0.000095405
+  Spectra Visible Chroma Predicted Covariance Rg Bg: 0.000046946
+  Spectra Visible Chroma Processed Pixel Count: 12582912
+  Spectra Visible Chroma Candidate Pixel Count: 96096
+  Spectra Visible Chroma Changed Pixel Count: 1
+  Spectra Visible Chroma Changed Pixel Fraction: 0.000000079
+  Spectra Visible Chroma Luma Edge Protected Pixel Count: 11737076
+  Spectra Visible Chroma Colour Edge Protected Pixel Count: 12260945
+  Spectra Visible Chroma Saturation Protected Pixel Count: 1278516
+  Spectra Visible Chroma Fully Accepted Pixel Count: 0
+  Spectra Visible Chroma Partially Accepted Pixel Count: 1
+  Spectra Visible Chroma Rejected Pixel Count: 12582911
+  Spectra Visible Chroma Fully Accepted Tile Count: 0
+  Spectra Visible Chroma Partially Accepted Tile Count: 0
+  Spectra Visible Chroma Rejected Tile Count: 0
+  Spectra Visible Chroma Evaluated Tile Count: 0
+  Spectra Visible Chroma Mean Acceptance: 0.000000000
+  Spectra Visible Chroma Acceptance P10: 0.000000000
+  Spectra Visible Chroma Acceptance P50: 0.000000000
+  Spectra Visible Chroma Acceptance P90: 0.000000000
+  Spectra Visible Chroma Mean Colour Shift: 0.000000000
+  Spectra Visible Chroma Maximum Colour Shift: 0.000000000
+  Spectra Visible Chroma Mean Noise Improvement: 0.000000000
+  Spectra Visible Chroma Edge Preservation Score: 1.000000000
+  Spectra Visible Chroma Oversmoothing Score: 0.000000000
+  Spectra Visible Chroma Input Variance RG: 0.000073187
+  Spectra Visible Chroma Input Variance BG: 0.000095405
+  Spectra Visible Chroma Input Covariance Rg Bg: 0.000046946
+  Spectra Visible Chroma Output Variance RG: 0.000000000
+  Spectra Visible Chroma Output Variance BG: 0.000000000
+  Spectra Visible Chroma Output Covariance Rg Bg: 0.000000000
+  Spectra Visible Chroma Input Residual Sample Count: 0
+  Spectra Visible Chroma Output Residual Sample Count: 0
+  Spectra Visible Chroma Processing Time Ms: 736.486145020
+  Spectra Visible Chroma Input Measurement Ms: 0
+  Spectra Visible Chroma Output Measurement Ms: 0
+  Spectra Visible Chroma Pixel Backend: VULKAN_FP32_RESIDENT_SPATIAL_NR_VISIBLE_CHROMA
+  Spectra Visible Chroma Pixel Backend Selection Reason: M8H_DEVICE_LOCAL_INTERMEDIATE_NO_CPU_SHADOW_EXECUTION
+  Spectra Visible Chroma Pixel Backend Fallback Reason: none
+  Spectra Visible Chroma Pixel Neon Compiled: false
+  Spectra Visible Chroma Pixel Simd Self Test Performed: false
+  Spectra Visible Chroma Pixel Simd Self Test Passed: false
+  Spectra Visible Chroma Pixel Simd Self Test Maximum Absolute Delta: 0.000000000
+  Spectra Visible Chroma Pixel Simd Self Test Elapsed Ms: 0.000000000
+  Spectra Visible Chroma Pixel Latency Benchmark Performed: false
+  Spectra Visible Chroma Pixel Latency Benchmark Passed: false
+  Spectra Visible Chroma Pixel Scalar Benchmark Ms: 0.000000000
+  Spectra Visible Chroma Pixel Neon Benchmark Ms: 0.000000000
+  Spectra Visible Chroma Pixel Benchmark Speedup: 0.000000000
+  Spectra Visible Chroma Opponent Vectorized Pixel Count: 12582912
+  Spectra Visible Chroma Opponent Scalar Pixel Count: 0
+  Spectra Visible Chroma Opponent Rejected Non Finite Pixel Count: 0
+  Spectra Visible Chroma Opponent Estimated Bytes Read: 156404736
+  Spectra Visible Chroma Opponent Estimated Bytes Written: 150994944
+  Spectra Visible Chroma Opponent Peak Scratch Bytes: 38440064
+  Spectra Visible Chroma Opponent Tile Count: 12
+  Spectra Visible Chroma Opponent Tile Size: 256
+  Spectra Visible Chroma Opponent Tile Build Ms: 736.486145020
+  Spectra Visible Chroma Mutex Free Tile Reduction: true
+  Spectra Visible Chroma Vulkan Opponent Kernel Connected: false
+  Spectra Visible Chroma Vulkan Opponent Attempted: false
+  Spectra Visible Chroma Vulkan Opponent Execution Succeeded: false
+  Spectra Visible Chroma Vulkan Opponent Used For Output: false
+  Spectra Visible Chroma Vulkan Opponent Timestamp Query Used: false
+  Spectra Visible Chroma Vulkan Opponent Benchmark Performed: false
+  Spectra Visible Chroma Vulkan Opponent Numerical Equivalence Passed: false
+  Spectra Visible Chroma Vulkan Opponent Device Qualification Selected: false
+  Spectra Visible Chroma Vulkan Opponent Benchmark Aborted: false
+  Spectra Visible Chroma Vulkan Opponent Memory Gate Passed: false
+  Spectra Visible Chroma Vulkan Opponent Benchmark Sample Count: 0
+  Spectra Visible Chroma Vulkan Opponent Failed Sample Count: 0
+  Spectra Visible Chroma Vulkan Opponent Current Maximum Absolute Delta: 0.000000000
+  Spectra Visible Chroma Vulkan Opponent Maximum Absolute Delta: 0.000000000
+  Spectra Visible Chroma Vulkan Opponent Current Cpu Reference Ms: 0.000000000
+  Spectra Visible Chroma Vulkan Opponent Current Cpu Vectorized Pixel Count: 0
+  Spectra Visible Chroma Vulkan Opponent Current Cpu Scalar Pixel Count: 0
+  Spectra Visible Chroma Vulkan Opponent Cpu Reference Backend: NOT_RUN
+  Spectra Visible Chroma Vulkan Opponent Cpu Reference Status: NOT_RUN
+  Spectra Visible Chroma Vulkan Opponent Current Gpu Kernel Ms: 0.000000000
+  Spectra Visible Chroma Vulkan Opponent Current Gpu Total Ms: 0.000000000
+  Spectra Visible Chroma Vulkan Opponent Current Transfer And Sync Ms: 0.000000000
+  Spectra Visible Chroma Vulkan Opponent Cpu Median Ms: 0.000000000
+  Spectra Visible Chroma Vulkan Opponent Gpu Kernel Median Ms: 0.000000000
+  Spectra Visible Chroma Vulkan Opponent Gpu Total Median Ms: 0.000000000
+  Spectra Visible Chroma Vulkan Opponent Transfer And Sync Median Ms: 0.000000000
+  Spectra Visible Chroma Vulkan Opponent Measured Speedup: 0.000000000
+  Spectra Visible Chroma Vulkan Opponent Transfer Fraction: 1.000000000
+  Spectra Visible Chroma Vulkan Opponent Qualification Overhead Ms: 0.000000000
+  Spectra Visible Chroma Vulkan Opponent Input Bytes: 0
+  Spectra Visible Chroma Vulkan Opponent Output Bytes: 0
+  Spectra Visible Chroma Vulkan Opponent Allocated Bytes: 0
+  Spectra Visible Chroma Vulkan Opponent Estimated Transient Bytes: 0
+  Spectra Visible Chroma Vulkan Opponent Maximum Transient Bytes: 0
+  Spectra Visible Chroma Vulkan Opponent Striped Mode: false
+  Spectra Visible Chroma Vulkan Opponent Strip Plan Valid: false
+  Spectra Visible Chroma Vulkan Opponent Strip Plan Status: NOT_PLANNED
+  Spectra Visible Chroma Vulkan Opponent Strip Count: 0
+  Spectra Visible Chroma Vulkan Opponent Successful Strip Count: 0
+  Spectra Visible Chroma Vulkan Opponent Target Output Rows: 0
+  Spectra Visible Chroma Vulkan Opponent Halo Rows: 0
+  Spectra Visible Chroma Vulkan Opponent Maximum Input Rows: 0
+  Spectra Visible Chroma Vulkan Opponent Assembly Ms: 0.000000000
+  Spectra Visible Chroma Vulkan Opponent Full Frame Output Bytes: 0
+  Spectra Visible Chroma Vulkan Opponent Maximum Strip Input Bytes: 0
+  Spectra Visible Chroma Vulkan Opponent Maximum Strip Output Bytes: 0
+  Spectra Visible Chroma Vulkan Opponent Persistent Buffer Reuse Observed: false
+  Spectra Visible Chroma Vulkan Opponent Persistent Buffer Reallocated: false
+  Spectra Visible Chroma Vulkan Opponent Persistent Buffer Reuse Hit Count: 0
+  Spectra Visible Chroma Vulkan Opponent Persistent Buffer Reallocation Count: 0
+  Spectra Visible Chroma Vulkan Opponent Persistent Buffer Capacity Bytes: 0
+  Spectra Visible Chroma Vulkan Opponent Persistent Resident Bytes: 0
+  Spectra Visible Chroma Vulkan Opponent Persistent Allocation Generation: 0
+  Spectra Visible Chroma Vulkan Opponent Route Key: UNSET
+  Spectra Visible Chroma Vulkan Opponent Execution Status: NOT_RUN
+  Spectra Visible Chroma Vulkan Opponent Qualification Status: NO_SAMPLES
+  Spectra Visible Chroma Vulkan Opponent Failure Reason: none
+  Spectra Visible Chroma Vulkan Candidate Kernel Connected: false
+  Spectra Visible Chroma Vulkan Candidate Attempted: false
+  Spectra Visible Chroma Vulkan Candidate Execution Succeeded: false
+  Spectra Visible Chroma Vulkan Candidate Used For Output: false
+  Spectra Visible Chroma Vulkan Candidate Timestamp Query Used: false
+  Spectra Visible Chroma Vulkan Candidate Benchmark Performed: false
+  Spectra Visible Chroma Vulkan Candidate Shader Equivalence Passed: false
+  Spectra Visible Chroma Vulkan Candidate Final Decision Compatibility Passed: false
+  Spectra Visible Chroma Vulkan Candidate Device Qualification Selected: false
+  Spectra Visible Chroma Vulkan Candidate Benchmark Aborted: false
+  Spectra Visible Chroma Vulkan Candidate Memory Gate Passed: false
+  Spectra Visible Chroma Vulkan Candidate Benchmark Sample Count: 0
+  Spectra Visible Chroma Vulkan Candidate Failed Sample Count: 0
+  Spectra Visible Chroma Vulkan Candidate Strip Count: 0
+  Spectra Visible Chroma Vulkan Candidate Successful Strip Count: 0
+  Spectra Visible Chroma Vulkan Candidate Strength: 0.000000000
+  Spectra Visible Chroma Vulkan Candidate Current Shader Maximum Absolute Delta: 0.000000000
+  Spectra Visible Chroma Vulkan Candidate Shader Maximum Absolute Delta: 0.000000000
+  Spectra Visible Chroma Vulkan Candidate Current Final Decision Maximum Absolute Delta: 0.000000000
+  Spectra Visible Chroma Vulkan Candidate Final Decision Maximum Absolute Delta: 0.000000000
+  Spectra Visible Chroma Vulkan Candidate Final Decision Compared Pixel Count: 0
+  Spectra Visible Chroma Vulkan Candidate Current Cpu Reference Ms: 0.000000000
+  Spectra Visible Chroma Vulkan Candidate Current Gpu Kernel Ms: 0.000000000
+  Spectra Visible Chroma Vulkan Candidate Current Gpu Total Ms: 0.000000000
+  Spectra Visible Chroma Vulkan Candidate Current Transfer And Sync Ms: 0.000000000
+  Spectra Visible Chroma Vulkan Candidate Cpu Median Ms: 0.000000000
+  Spectra Visible Chroma Vulkan Candidate Gpu Kernel Median Ms: 0.000000000
+  Spectra Visible Chroma Vulkan Candidate Gpu Total Median Ms: 0.000000000
+  Spectra Visible Chroma Vulkan Candidate Transfer And Sync Median Ms: 0.000000000
+  Spectra Visible Chroma Vulkan Candidate Measured Speedup: 0.000000000
+  Spectra Visible Chroma Vulkan Candidate Transfer Fraction: 1.000000000
+  Spectra Visible Chroma Vulkan Candidate Qualification Overhead Ms: 0.000000000
+  Spectra Visible Chroma Vulkan Candidate Input Bytes: 0
+  Spectra Visible Chroma Vulkan Candidate Output Bytes: 0
+  Spectra Visible Chroma Vulkan Candidate Allocated Bytes: 0
+  Spectra Visible Chroma Vulkan Candidate Estimated Transient Bytes: 0
+  Spectra Visible Chroma Vulkan Candidate Maximum Transient Bytes: 0
+  Spectra Visible Chroma Vulkan Candidate Route Key: UNSET
+  Spectra Visible Chroma Vulkan Candidate Execution Status: NOT_RUN
+  Spectra Visible Chroma Vulkan Candidate Qualification Status: NO_SAMPLES
+  Spectra Visible Chroma Vulkan Candidate Failure Reason: none
+  Spectra Visible Chroma Vulkan Candidate No Regret Execution: CPU_AUTHORITATIVE_NO_REGRET_AFTER_VULKAN_CANDIDATE
+  Spectra Visible Chroma Vulkan Resident Kernel Connected: true
+  Spectra Visible Chroma Vulkan Resident Attempted: true
+  Spectra Visible Chroma Vulkan Resident Execution Succeeded: true
+  Spectra Visible Chroma Vulkan Resident Used For Output: true
+  Spectra Visible Chroma Vulkan Resident Timestamp Query Used: true
+  Spectra Visible Chroma Vulkan Resident Cpu Fallback Used: false
+  Spectra Visible Chroma Vulkan Resident Persistent Reuse Observed: true
+  Spectra Visible Chroma Vulkan Resident Persistent Reallocated: false
+  Spectra Visible Chroma Vulkan Resident Strip Count: 12
+  Spectra Visible Chroma Vulkan Resident Successful Strip Count: 12
+  Spectra Visible Chroma Vulkan Resident Persistent Reuse Hit Count: 12
+  Spectra Visible Chroma Vulkan Resident Persistent Reallocation Count: 0
+  Spectra Visible Chroma Vulkan Resident Input Packing Ms: 6.558959007
+  Spectra Visible Chroma Vulkan Resident Spatial Kernel Ms: 200.870880127
+  Spectra Visible Chroma Vulkan Resident Visible Kernel Ms: 47.862449646
+  Spectra Visible Chroma Vulkan Resident Gpu Kernel Ms: 248.737548828
+  Spectra Visible Chroma Vulkan Resident Synchronization Ms: 259.621887207
+  Spectra Visible Chroma Vulkan Resident Readback Ms: 229.214706421
+  Spectra Visible Chroma Vulkan Resident Transfer And Sync Ms: 246.657989502
+  Spectra Visible Chroma Vulkan Resident Total Ms: 736.486145020
+  Spectra Visible Chroma Vulkan Resident Input Bytes: 156401664
+  Spectra Visible Chroma Vulkan Resident Intermediate Bytes: 153157632
+  Spectra Visible Chroma Vulkan Resident Output Bytes: 150994944
+  Spectra Visible Chroma Vulkan Resident Spatial Map Bytes: 3072
+  Spectra Visible Chroma Vulkan Resident Persistent Resident Bytes: 38440064
+  Spectra Visible Chroma Vulkan Resident Allocation Generation: 6
+  Spectra Visible Chroma Vulkan Resident Execution Status: SPECTRA_POST_DEMOSAIC_GPU_RESIDENT_CHAIN_READY
+  Spectra Visible Chroma Vulkan Resident Failure Reason: none
+  Spectra Visible Chroma Vulkan Resident Statistics Method: GPU_EXACT_COUNTS_PLUS_16X16_Q12_SAMPLES_NO_CPU_FULL_FRAME_MEASUREMENT
+  Spectra Visible Chroma Vulkan Resident Authority: GPU_SPATIAL_NR_AND_VISIBLE_CHROMA_PRIMARY_CPU_TYPED_FALLBACK_ONLY
+  Spectra Downstream Architecture:   MILESTONE_7_NOISE_AWARE_DOWNSTREAM_ISP
+  Spectra Downstream Input Stage:    POST_QUANTIZATION_8BIT_PRE_SHARPEN
+  Spectra Downstream Output Stage:   FINAL_JPEG_PRE_ENCODE
+  Spectra Downstream Result Status:  MILESTONE_7_NOISE_AWARE_DOWNSTREAM_APPLIED
+  Spectra Downstream Spectra Aware:  true
+  Spectra Downstream Enabled:        true
+  Spectra Downstream Applied:        true
+  Spectra Downstream Method:         MILESTONE_7_NOISE_AWARE_LUMA_UNSHARP
+  Spectra Downstream Plan Status:    MILESTONE_7_NOISE_AWARE_SHARPEN_ENABLED
+  Spectra Downstream Residual Source: MEASURED_PRE_SHARPEN_FALLBACK
+  Spectra Downstream Model Confidence: 0.450000000
+  Spectra Downstream Predicted Sigma Y: 0.005786126
+  Spectra Downstream Measured Sigma Y: 0.013066823
+  Spectra Downstream Sigma Y:        0.013066823
+  Spectra Downstream Luma Authority: 0.971359909
+  Spectra Downstream Detail Protection: 0.000000000
+  Spectra Downstream Global Authority: 0.196741000
+  Spectra Downstream Base Amount:    0.104999997
+  Spectra Downstream Maximum Amount: 0.020657804
+  Spectra Downstream Minimum Edge Snr: 3.412042392
+  Spectra Downstream Full Edge Snr:  7.919568887
+  Spectra Downstream Halo Protection: 0.668422849
+  Spectra Downstream Maximum Predicted Variance Gain: 1.061390695
+  Spectra Downstream Local Contrast Enabled: true
+  Spectra Downstream Local Contrast Authority: 0.009254870
+  Spectra Downstream Local Contrast Applied: true
+  Spectra Downstream Processed Pixel Count: 12582912
+  Spectra Downstream Candidate Pixel Count: 150601
+  Spectra Downstream Changed Pixel Count: 146388
+  Spectra Downstream Changed Pixel Fraction: 0.011633873
+  Spectra Downstream Noise Rejected Pixel Count: 12418042
+  Spectra Downstream Halo Protected Pixel Count: 26283
+  Spectra Downstream Local Contrast Pixel Count: 70369
+  Spectra Downstream Mean Local Authority: 0.000009647
+  Spectra Downstream Authority P10:  0.000000000
+  Spectra Downstream Authority P50:  0.000000000
+  Spectra Downstream Authority P90:  0.000000000
+  Spectra Downstream Mean Edge Snr:  0.658270836
+  Spectra Downstream Maximum Applied Amount: 0.002862712
+  Spectra Downstream Maximum Local Contrast Amount: 0.009254870
+  Spectra Downstream Input Variance Y: 0.000170742
+  Spectra Downstream Output Variance Y: 0.000170742
+  Spectra Downstream Measured Variance Gain Y: 1.000000000
+  Spectra Downstream Predicted Variance Gain Y: 1.032516360
+  Spectra Downstream Input Residual Sample Count: 256815
+  Spectra Downstream Output Residual Sample Count: 256815
+  Spectra Downstream Processing Time Ms: 740.921813965
+  Spectra Downstream Input Measurement Ms: 53.172
+  Spectra Downstream Output Measurement Ms: 52.620262146
+  Spectra Capture Integration:       {source=capture_snapshot
+  Active:                            true
+  Spectra Capture Provenance Tile Count: 768
+  Spectra Capture Provenance Valid Tile Count: 768
+  Spectra Capture Provenance Mean Diagnostic Confidence: 0.503364
+  Spectra Capture Provenance Mean Residual Energy: 3.2949e-05
+  Spectra Capture Provenance Mean Chroma Residual Energy: 2.70206e-05
+  Spectra Capture Provenance Confidence P10: 0.240235
+  Spectra Capture Provenance Confidence P50: 0.512831
+  Spectra Capture Provenance Confidence P90: 0.73751
+  Spectra Capture Provenance Shading Gain P10: 1.17523
+  Spectra Capture Provenance Shading Gain P50: 1.63666
+  Spectra Capture Provenance Shading Gain P90: 2.37412
+  Spectra Capture Provenance Noise Budget P10: 1.51735
+  Spectra Capture Provenance Noise Budget P50: 2.38126
+  Spectra Capture Provenance Noise Budget P90: 4.98023
+  Spectra Capture Provenance Model Mismatch P10: 0.416962
+  Spectra Capture Provenance Model Mismatch P50: 0.867629
+  Spectra Capture Provenance Model Mismatch P90: 1.60548
+  Spectra Final Provenance Tile Count: 768
+  Spectra Final Provenance Valid Tile Count: 768
+  Spectra Final Provenance Mean Diagnostic Confidence: 0.523734
+  Spectra Final Provenance Mean Residual Energy: 3.16822e-05
+  Spectra Final Provenance Mean Chroma Residual Energy: 2.51359e-05
+  Spectra Final Provenance Confidence P10: 0.242414
+  Spectra Final Provenance Confidence P50: 0.52387
+  Spectra Final Provenance Confidence P90: 0.788873
+  Spectra Final Provenance Shading Gain P10: 1.17523
+  Spectra Final Provenance Shading Gain P50: 1.63666
+  Spectra Final Provenance Shading Gain P90: 2.37412
+  Spectra Final Provenance Noise Budget P10: 1.32071
+  Spectra Final Provenance Noise Budget P50: 2.25702
+  Spectra Final Provenance Noise Budget P90: 4.88369
+  Spectra Final Provenance Model Mismatch P10: 0.27817
+  Spectra Final Provenance Model Mismatch P50: 0.814047
+  Spectra Final Provenance Model Mismatch P90: 1.5859
+  Spectra Pass0Applied:              false
+  Spectra Pass0Skip Reason:          no_confident_green_split_bias
+  Spectra Pass0Input Energy:         0
+  Spectra Pass0Target Floor:         7.71708e-06
+  Spectra Pass0Output Energy:        0
+  Spectra Pass0Reduction Percentage: 0
+  Spectra Pass0Maximum Correction:   0
+  Spectra Pass0Processing Time Ms:   490.696
+  Spectra Pass1Applied:              true
+  Spectra Pass1Skip Reason:          none
+  Spectra Pass1Input Energy:         3.29816e-05
+  Spectra Pass1Target Floor:         1.05692e-05
+  Spectra Pass1Output Energy:        3.19404e-05
+  Spectra Pass1Reduction Percentage: 3.15714
+  Spectra Pass1Maximum Correction:   0.890082
+  Spectra Pass1Processing Time Ms:   8403.74
+  Spectra Anisotropic Detail Architecture: MILESTONE_5_GREEN_GUIDED_STRUCTURE_TENSOR
+  Spectra Anisotropic Detail Tensor Method: COARSE_GREEN_LUMA_TENSOR_BILINEAR_MOMENT_INTERPOLATION
+  Spectra Anisotropic Detail Filter Method: VST_WIENER_DIRECTIONAL_SAME_CFA_SUPPORT
+  Spectra Anisotropic Detail Fallback Method: LOW_CONFIDENCE_ISOTROPIC_PASS1_BASELINE
+  Spectra Anisotropic Detail Timing Accounting: NESTED_IN_SPECTRA_PASS1_PROCESSING_MS
+  Spectra Anisotropic Detail Enabled: true
+  Spectra Anisotropic Detail Applied: true
+  Spectra Anisotropic Detail Status: ANISOTROPIC_DETAIL_PRESERVATION_APPLIED
+  Spectra Anisotropic Detail Evaluated Pixel Count: 12294836
+  Spectra Anisotropic Detail Valid Tensor Pixel Count: 12294836
+  Spectra Anisotropic Detail Confident Tensor Pixel Count: 2383326
+  Spectra Anisotropic Detail Fallback Pixel Count: 9911510
+  Spectra Anisotropic Detail Directional Changed Pixel Count: 2346501
+  Spectra Anisotropic Detail Cross Edge Protected Sample Count: 9201849
+  Spectra Anisotropic Detail Along Structure Supported Sample Count: 3109036
+  Spectra Anisotropic Detail Orientation0Count: 648208
+  Spectra Anisotropic Detail Orientation45Count: 285635
+  Spectra Anisotropic Detail Orientation90Count: 1210040
+  Spectra Anisotropic Detail Orientation135Count: 239443
+  Spectra Anisotropic Detail Valid Tensor Fraction: 1
+  Spectra Anisotropic Detail Confident Tensor Fraction: 0.193848
+  Spectra Anisotropic Detail Fallback Fraction: 0.806152
+  Spectra Anisotropic Detail Directional Changed Fraction: 0.190853
+  Spectra Anisotropic Detail Mean Confidence: 0.162857
+  Spectra Anisotropic Detail Confidence P10: 0.015625
+  Spectra Anisotropic Detail Confidence P50: 0.015625
+  Spectra Anisotropic Detail Confidence P90: 0.984375
+  Spectra Anisotropic Detail Mean Coherence: 0.42621
+  Spectra Anisotropic Detail Coherence P10: 0.140625
+  Spectra Anisotropic Detail Coherence P50: 0.359375
+  Spectra Anisotropic Detail Coherence P90: 0.921875
+  Spectra Anisotropic Detail Mean Directional Weight: 0.339522
+  Spectra Anisotropic Detail Mean Isotropic Authority Scale: 0.662574
+  Spectra Anisotropic Detail Mean Directional Authority Scale: 0.716752
+  Spectra Anisotropic Detail Maximum Linear Correction: 0.00731063
+  Spectra Anisotropic Detail Tensor Field Build Ms: 68.9641
+  Spectra Anisotropic Detail Directional Filter Ms: 6502.82
+  Spectra Pass2Applied:              true
+  Spectra Pass2Skip Reason:          none
+  Spectra Pass2Input Energy:         1.77932e-05
+  Spectra Pass2Target Floor:         1.45079e-05
+  Spectra Pass2Output Energy:        1.72342e-05
+  Spectra Pass2Reduction Percentage: 3.14141
+  Spectra Pass2Maximum Correction:   0.00243663
+  Spectra Pass2Processing Time Ms:   5210.02
+  Spectra Pass2Pixel Working Clone Count: 2
+  Spectra Pass2Avoided Full Frame Clone Count: 3
+  Spectra Pass2Pixel Buffer Strategy: M8C_SHALLOW_SOURCE_ONE_WRITABLE_CLONE_PER_ACTIVE_BAND
+  Spectra Pass3Applied:              true
+  Spectra Pass3Skip Reason:          none
+  Spectra Pass3Input Energy:         3.17164e-05
+  Spectra Pass3Target Floor:         1.05692e-05
+  Spectra Pass3Output Energy:        3.17162e-05
+  Spectra Pass3Reduction Percentage: 0.000458814
+  Spectra Pass3Maximum Correction:   0.0031495
+  Spectra Pass3Processing Time Ms:   4967.28
+  Spectra Chroma Bands Architecture: MILESTONE_3B_ACTIVE_BAND_LIMITED_SHRINKAGE
+  Spectra Chroma Band Energy Method: R_MINUS_GREF_B_MINUS_GREF_SAME_COLOUR_RADII_2_4_8_STRIDE16_SAMPLED
+  Spectra Chroma Band Energy Input Status: AVAILABLE_SAMPLED_PRE_DEMOSAIC_PROXY
+  Spectra Chroma Band Energy Input Sample Count: 87570
+  Spectra Chroma Band Energy Input Red Sample Count: 43770
+  Spectra Chroma Band Energy Input Blue Sample Count: 43800
+  Spectra Chroma Band Energy Input Red Blue Sample Balance: 0.999315
+  Spectra Chroma Band Energy Input Confidence: 0.999315
+  Spectra Chroma Band Energy Input Measurement Ms: 34.2636
+  Spectra Chroma Band Energy Post Pass2Status: AVAILABLE_SAMPLED_PRE_DEMOSAIC_PROXY
+  Spectra Chroma Band Energy Post Pass2Sample Count: 87570
+  Spectra Chroma Band Energy Post Pass2Red Sample Count: 43770
+  Spectra Chroma Band Energy Post Pass2Blue Sample Count: 43800
+  Spectra Chroma Band Energy Post Pass2Red Blue Sample Balance: 0.999315
+  Spectra Chroma Band Energy Post Pass2Confidence: 0.999315
+  Spectra Chroma Band Energy Post Pass2Measurement Ms: 45.7384
+  Spectra Chroma Fine Name:          FINE
+  Spectra Chroma Fine Enabled:       true
+  Spectra Chroma Fine Applied:       true
+  Spectra Chroma Fine Plan Status:   ENABLED_CONSERVATIVE_M3B_ACTIVE_BAND_KERNEL
+  Spectra Chroma Fine Result Status: ACCEPTED_BY_COMBINED_PASS2_NO_REGRET
+  Spectra Chroma Fine Kernel:        M3B_FINE_WIENER_DETAIL_RADIUS2
+  Spectra Chroma Fine Target Status: PROVISIONAL_PRE_DEMOSAIC_FLOOR_SPLIT_WITH_VISIBLE_PRESSURE_PENDING_DEVICE_CALIBRATION
+  Spectra Chroma Fine No Regret Scope: COMBINED_PASS_GATE
+  Spectra Chroma Fine Input Energy:  0.000016661
+  Spectra Chroma Fine Target Floor:  0.000014508
+  Spectra Chroma Fine Excess Energy: 0.000002153
+  Spectra Chroma Fine Required Reduction Fraction: 0.129209802
+  Spectra Chroma Fine Authority Scale: 0.656198204
+  Spectra Chroma Fine Maximum Correction Scale: 0.767623901
+  Spectra Chroma Fine Model Confidence: 0.999315083
+  Spectra Chroma Fine Visible Chroma Amplification: 2.097273588
+  Spectra Chroma Fine Evidence:      0.000000000
+  Spectra Chroma Fine Output Energy: 0.000015378
+  Spectra Chroma Fine Output Stage:  POST_M3B_FINE_PRE_MID_PRE_COMBINED_NO_REGRET
+  Spectra Chroma Fine Runtime Method: GREEN_GUIDED_FINE_WIENER_SHRINKAGE_RADIUS2
+  Spectra Chroma Fine Reduction Percentage: 7.699346542
+  Spectra Chroma Fine Coefficient Energy Before: 0.000008601
+  Spectra Chroma Fine Coefficient Energy After: 0.000007866
+  Spectra Chroma Fine Maximum Correction: 0.002436626
+  Spectra Chroma Fine Changed Pixel Fraction: 0.497276157
+  Spectra Chroma Fine Candidate Pixel Count: 6269970
+  Spectra Chroma Fine Changed Pixel Count: 6257182
+  Spectra Chroma Fine Structure Rejected Pixel Count: 4598
+  Spectra Chroma Fine Mean Noise Sigma: 0.002811404
+  Spectra Chroma Fine Mean Structure Weight: 0.744994402
+  Spectra Chroma Fine Mean Shrinkage: 0.058971826
+  Spectra Chroma Fine Shrinkage P90: 0.093750000
+  Spectra Chroma Fine Maximum Shrinkage: 0.110057652
+  Spectra Chroma Fine Processing Time Ms: 1957.350097656
+  Spectra Chroma Fine Measurement Time Ms: 45.490936279
+  Spectra Chroma Fine No Regret Mean Acceptance: 0.516912878
+  Spectra Chroma Fine No Regret Attenuated Pixel Fraction: 1.000000000
+  Spectra Chroma Mid Name:           MID
+  Spectra Chroma Mid Enabled:        true
+  Spectra Chroma Mid Applied:        true
+  Spectra Chroma Mid Plan Status:    ENABLED_CONSERVATIVE_M3B_ACTIVE_BAND_KERNEL
+  Spectra Chroma Mid Result Status:  ACCEPTED_BY_COMBINED_PASS2_NO_REGRET
+  Spectra Chroma Mid Kernel:         M3B_MID_ATROUS_RESIDUAL_RADIUS2_TO6
+  Spectra Chroma Mid Target Status:  PROVISIONAL_PRE_DEMOSAIC_FLOOR_SPLIT_WITH_VISIBLE_PRESSURE_PENDING_DEVICE_CALIBRATION
+  Spectra Chroma Mid No Regret Scope: COMBINED_PASS_GATE
+  Spectra Chroma Mid Input Energy:   0.000011045
+  Spectra Chroma Mid Target Floor:   0.000005513
+  Spectra Chroma Mid Excess Energy:  0.000005532
+  Spectra Chroma Mid Required Reduction Fraction: 0.500872433
+  Spectra Chroma Mid Authority Scale: 0.572172284
+  Spectra Chroma Mid Maximum Correction Scale: 0.821143329
+  Spectra Chroma Mid Model Confidence: 0.999315083
+  Spectra Chroma Mid Visible Chroma Amplification: 2.097273588
+  Spectra Chroma Mid Evidence:       0.000000000
+  Spectra Chroma Mid Output Energy:  0.000010764
+  Spectra Chroma Mid Output Stage:   POST_PASS2_COMBINED_NO_REGRET
+  Spectra Chroma Mid Runtime Method: GREEN_GUIDED_ATROUS_MID_SHRINKAGE_LOCAL2_TO_BROAD4_6
+  Spectra Chroma Mid Reduction Percentage: 2.544018745
+  Spectra Chroma Mid Coefficient Energy Before: 0.000018230
+  Spectra Chroma Mid Coefficient Energy After: 0.000018069
+  Spectra Chroma Mid Maximum Correction: 0.000145346
+  Spectra Chroma Mid Changed Pixel Fraction: 0.487384945
+  Spectra Chroma Mid Candidate Pixel Count: 6241378
+  Spectra Chroma Mid Changed Pixel Count: 6132722
+  Spectra Chroma Mid Structure Rejected Pixel Count: 102514
+  Spectra Chroma Mid Mean Noise Sigma: 0.002811705
+  Spectra Chroma Mid Mean Structure Weight: 0.753733516
+  Spectra Chroma Mid Mean Shrinkage: 0.042070191
+  Spectra Chroma Mid Shrinkage P90:  0.093750000
+  Spectra Chroma Mid Maximum Shrinkage: 0.092941627
+  Spectra Chroma Mid Processing Time Ms: 1406.119262695
+  Spectra Chroma Mid Measurement Time Ms: 45.988906860
+  Spectra Chroma Mid No Regret Mean Acceptance: 0.516912878
+  Spectra Chroma Mid No Regret Attenuated Pixel Fraction: 1.000000000
+  Spectra Chroma Low Name:           LOW
+  Spectra Chroma Low Enabled:        true
+  Spectra Chroma Low Applied:        true
+  Spectra Chroma Low Plan Status:    ENABLED_CONSERVATIVE_M3B_ACTIVE_BAND_KERNEL
+  Spectra Chroma Low Result Status:  ACCEPTED_BY_PASS3_NO_REGRET
+  Spectra Chroma Low Kernel:         M3B_LOW_CONTINUOUS_FIELD_SOFT_THRESHOLD
+  Spectra Chroma Low Target Status:  PROVISIONAL_PRE_DEMOSAIC_FLOOR_SPLIT_WITH_VISIBLE_PRESSURE_PENDING_DEVICE_CALIBRATION
+  Spectra Chroma Low No Regret Scope: PASS3_TILE_GATE
+  Spectra Chroma Low Input Energy:   0.000020069
+  Spectra Chroma Low Target Floor:   0.000002321
+  Spectra Chroma Low Excess Energy:  0.000017748
+  Spectra Chroma Low Required Reduction Fraction: 0.884334505
+  Spectra Chroma Low Authority Scale: 0.566952646
+  Spectra Chroma Low Maximum Correction Scale: 0.874345422
+  Spectra Chroma Low Model Confidence: 0.999315083
+  Spectra Chroma Low Visible Chroma Amplification: 2.097273588
+  Spectra Chroma Low Evidence:       1.000000000
+  Spectra Chroma Low Output Energy:  0.000020069
+  Spectra Chroma Low Output Stage:   POST_PASS3_COMBINED_NO_REGRET
+  Spectra Chroma Low Runtime Method: CONTINUOUS_LOW_FIELD_SOFT_THRESHOLD_PLUS_DIRECTIONAL_PROFILES
+  Spectra Chroma Low Reduction Percentage: 0.001323308
+  Spectra Chroma Low Coefficient Energy Before: 0.000104116
+  Spectra Chroma Low Coefficient Energy After: 0.000090775
+  Spectra Chroma Low Maximum Correction: 0.003149503
+  Spectra Chroma Low Changed Pixel Fraction: 0.476975292
+  Spectra Chroma Low Candidate Pixel Count: 6291456
+  Spectra Chroma Low Changed Pixel Count: 6001738
+  Spectra Chroma Low Structure Rejected Pixel Count: 15395
+  Spectra Chroma Low Mean Noise Sigma: 0.002437478
+  Spectra Chroma Low Mean Structure Weight: 0.809903026
+  Spectra Chroma Low Mean Shrinkage: 0.057409193
+  Spectra Chroma Low Shrinkage P90:  0.093750000
+  Spectra Chroma Low Maximum Shrinkage: 0.084674150
+  Spectra Chroma Low Processing Time Ms: 752.423889160
+  Spectra Chroma Low Measurement Time Ms: 45.158645630
+  Spectra Chroma Low No Regret Mean Acceptance: 0.063059896
+  Spectra Chroma Low No Regret Attenuated Pixel Fraction: 1.000000000
+  Spectra No Regret P0Total Tiles:   0
+  Spectra No Regret P0Evaluated Tiles: 0
+  Spectra No Regret P0Invalid Tiles: 0
+  Spectra No Regret P0Fully Accepted Tiles: 0
+  Spectra No Regret P0Partially Accepted Tiles: 0
+  Spectra No Regret P0Rejected Tiles: 0
+  Spectra No Regret P0Rejected Oversmooth: 0
+  Spectra No Regret P0Rejected Detail Loss: 0
+  Spectra No Regret P0Rejected Mean Drift: 0
+  Spectra No Regret P0Rejected No Improvement: 0
+  Spectra No Regret P0Mean Acceptance: 0
+  Spectra No Regret P0Acceptance P10: 0
+  Spectra No Regret P0Acceptance P50: 0
+  Spectra No Regret P0Acceptance P90: 0
+  Spectra No Regret P0Attenuated Pixel Fraction: 0
+  Spectra No Regret P0Mean Colour Shift: 0
+  Spectra No Regret P0Max Colour Shift: 0
+  Spectra No Regret P0Edge Preservation Score: 1
+  Spectra No Regret P0Oversmoothing Score: 0
+  Spectra No Regret P1Total Tiles:   768
+  Spectra No Regret P1Evaluated Tiles: 768
+  Spectra No Regret P1Invalid Tiles: 0
+  Spectra No Regret P1Fully Accepted Tiles: 92
+  Spectra No Regret P1Partially Accepted Tiles: 519
+  Spectra No Regret P1Rejected Tiles: 157
+  Spectra No Regret P1Rejected Oversmooth: 0
+  Spectra No Regret P1Rejected Detail Loss: 120
+  Spectra No Regret P1Rejected Mean Drift: 0
+  Spectra No Regret P1Rejected No Improvement: 0
+  Spectra No Regret P1Mean Acceptance: 0.449322
+  Spectra No Regret P1Acceptance P10: 0
+  Spectra No Regret P1Acceptance P50: 0.374312
+  Spectra No Regret P1Acceptance P90: 0.908492
+  Spectra No Regret P1Attenuated Pixel Fraction: 1
+  Spectra No Regret P1Mean Colour Shift: 1.67557e-05
+  Spectra No Regret P1Max Colour Shift: 0.000260455
+  Spectra No Regret P1Edge Preservation Score: 0.947875
+  Spectra No Regret P1Oversmoothing Score: 0
+  Spectra No Regret P2Total Tiles:   768
+  Spectra No Regret P2Evaluated Tiles: 768
+  Spectra No Regret P2Invalid Tiles: 0
+  Spectra No Regret P2Fully Accepted Tiles: 0
+  Spectra No Regret P2Partially Accepted Tiles: 707
+  Spectra No Regret P2Rejected Tiles: 61
+  Spectra No Regret P2Rejected Oversmooth: 48
+  Spectra No Regret P2Rejected Detail Loss: 0
+  Spectra No Regret P2Rejected Mean Drift: 0
+  Spectra No Regret P2Rejected No Improvement: 13
+  Spectra No Regret P2Mean Acceptance: 0.516913
+  Spectra No Regret P2Acceptance P10: 0.33151
+  Spectra No Regret P2Acceptance P50: 0.522937
+  Spectra No Regret P2Acceptance P90: 0.754576
+  Spectra No Regret P2Attenuated Pixel Fraction: 1
+  Spectra No Regret P2Mean Colour Shift: 5.86185e-06
+  Spectra No Regret P2Max Colour Shift: 2.632e-05
+  Spectra No Regret P2Edge Preservation Score: 0.984755
+  Spectra No Regret P2Oversmoothing Score: 0.0015618
+  Spectra No Regret P3Total Tiles:   768
+  Spectra No Regret P3Evaluated Tiles: 768
+  Spectra No Regret P3Invalid Tiles: 0
+  Spectra No Regret P3Fully Accepted Tiles: 0
+  Spectra No Regret P3Partially Accepted Tiles: 58
+  Spectra No Regret P3Rejected Tiles: 710
+  Spectra No Regret P3Rejected Oversmooth: 0
+  Spectra No Regret P3Rejected Detail Loss: 0
+  Spectra No Regret P3Rejected Mean Drift: 0
+  Spectra No Regret P3Rejected No Improvement: 710
+  Spectra No Regret P3Mean Acceptance: 0.0630599
+  Spectra No Regret P3Acceptance P10: 0
+  Spectra No Regret P3Acceptance P50: 0
+  Spectra No Regret P3Acceptance P90: 0
+  Spectra No Regret P3Attenuated Pixel Fraction: 1
+  Spectra No Regret P3Mean Colour Shift: 0.000742777
+  Spectra No Regret P3Max Colour Shift: 0.00350211
+  Spectra No Regret P3Edge Preservation Score: 0.999864
+  Spectra No Regret P3Oversmoothing Score: 0
+  Spectra Residual Domain:           FINAL_JPEG_RGB
+  Spectra Residual Value Stage:      FINAL_JPEG_PRE_ENCODE
+  Spectra Residual Last Observed Stage: JPEG_ENCODED
+  Spectra Residual Propagation Status: MILESTONE_7_FINAL_JPEG_RESIDUAL_STATE_MEASURED_PRE_ENCODE
+  Spectra Residual Opponent Variance Status: DERIVED_FROM_RGB_COVARIANCE
+  Spectra Residual Covariance Status: SYMMETRIC_PSD_BOUNDED
+  Spectra Residual Comparability Status: FINAL_JPEG_RESIDUAL_STATE_MEASURED_PRE_ENCODE_JPEG_COMPRESSION_NOT_PROPAGATED
+  Spectra Residual Variance Y:       3.38603e-05
+  Spectra Residual Variance RG:      7.57503e-05
+  Spectra Residual Variance BG:      9.79686e-05
+  Spectra Residual Covariance Rg Bg: 4.82276e-05
+  Spectra Residual Covariance Rgb:   [0.000115231,3.21345e-05,8.40547e-05,3.21345e-05,2.47885e-05,2.84811e-05,8.40547e-05,2.84811e-05,0.000130142]
+  Spectra Residual High Frequency Budget: 2.11471e-05
+  Spectra Residual Mid Frequency Budget: 2.7263e-06
+  Spectra Residual Low Frequency Budget: 2.11471e-05
+  Spectra Residual Correlation Length: 0
+  Spectra Residual Directional Pattern Energy: 3.65925e-09
+  Spectra Residual Row Pattern Energy: 2.84269e-09
+  Spectra Residual Column Pattern Energy: 4.47582e-09
+  Spectra Residual Temporal Correlation: 0
+  Spectra Residual Independent Noise Fraction: 1
+  Spectra Residual Effective Frame Count: 1
+  Spectra Residual Model Confidence: 0.244353
+  Spectra Residual Motion Confidence: 0
+  Spectra Residual Alignment Confidence: 0
+  Spectra Pre Demosaic Stage:        POST_LENS_SHADING_PRE_DEMOSAIC
+  Spectra Pre Demosaic Method:       CAMERA2_SO_LENS_SHADING_FIELD_SCALED_BY_MEASURED_RESIDUAL_REDUCTION
+  Spectra Pre Demosaic Status:       PROPAGATION_SEED_READY
+  Spectra Pre Demosaic Confidence:   0.471360201
+  Spectra Pre Demosaic Variance Y:   0.000013887
+  Spectra Pre Demosaic Variance RG:  0.000044423
+  Spectra Pre Demosaic Variance BG:  0.000045324
+  Spectra Pre Demosaic Covariance Rg Bg: 0.000025250
+  Spectra Pre Demosaic Covariance Rgb: [0.000019173,0.000000000,0.000000000,0.000000000,0.000025250,0.000000000,0.000000000,0.000000000,0.000020074]
+  Spectra Post Demosaic Stage:       POST_DEMOSAIC_RGB
+  Spectra Post Demosaic Method:      MENON_2007_DIRECTIONAL_EMPIRICAL_ENERGY
+  Spectra Post Demosaic Status:      PROPAGATED
+  Spectra Post Demosaic Confidence:  0.339379344
+  Spectra Post Demosaic Variance Y:  0.000017611
+  Spectra Post Demosaic Variance RG: 0.000010215
+  Spectra Post Demosaic Variance BG: 0.000010479
+  Spectra Post Demosaic Covariance Rg Bg: 0.000005352
+  Spectra Post Demosaic Covariance Rgb: [0.000018038,0.000014179,0.000013286,0.000014179,0.000020535,0.000014290,0.000013286,0.000014290,0.000018525]
+  Spectra Post Awb Stage:            POST_AWB_RGB
+  Spectra Post Awb Method:           AWB_DIAGONAL_G_SIGMA_GT
+  Spectra Post Awb Status:           PROPAGATED
+  Spectra Post Awb Confidence:       0.339379344
+  Spectra Post Awb Variance Y:       0.000027455
+  Spectra Post Awb Variance RG:      0.000039051
+  Spectra Post Awb Variance BG:      0.000029931
+  Spectra Post Awb Covariance Rg Bg: 0.000015230
+  Spectra Post Awb Covariance Rgb:   [0.000077169,0.000029326,0.000050048,0.000029326,0.000020535,0.000026026,0.000050048,0.000026026,0.000061449]
+  Spectra Post Colour Transform Stage: POST_COLOUR_MATRIX_RGB
+  Spectra Post Colour Transform Method: A_SIGMA_AT_PRE_NONNEGATIVE_CLAMP
+  Spectra Post Colour Transform Status: PROPAGATED
+  Spectra Post Colour Transform Confidence: 0.305441410
+  Spectra Post Colour Transform Variance Y: 0.000027094
+  Spectra Post Colour Transform Variance RG: 0.000067838
+  Spectra Post Colour Transform Variance BG: 0.000088433
+  Spectra Post Colour Transform Covariance Rg Bg: 0.000043515
+  Spectra Post Colour Transform Covariance Rgb: [0.000099734,0.000025448,0.000072348,0.000025448,0.000019000,0.000022385,0.000072348,0.000022385,0.000114203]
+  Spectra Post Tone Stage:           POST_TONE_CURVES_PRE_VIBRANCE
+  Spectra Post Tone Method:          SCENE_SAMPLED_LUMA_JACOBIAN_AND_CHROMA_SCALE
+  Spectra Post Tone Status:          PROPAGATED
+  Spectra Post Tone Confidence:      0.244353128
+  Spectra Post Tone Variance Y:      0.000032759
+  Spectra Post Tone Variance RG:     0.000073187
+  Spectra Post Tone Variance BG:     0.000095405
+  Spectra Post Tone Covariance Rg Bg: 0.000046946
+  Spectra Post Tone Covariance Rgb:  [0.000113346,0.000031683,0.000083485,0.000031683,0.000023208,0.000028063,0.000083485,0.000028063,0.000128324]
+  Spectra Post Visible Chroma Stage: POST_VISIBLE_CHROMA_PRE_QUANTIZATION
+  Spectra Post Visible Chroma Method: NO_REGRET_ACCEPTANCE_DERIVED_CONSERVATIVE_REDUCTION
+  Spectra Post Visible Chroma Status: PROPAGATED
+  Spectra Post Visible Chroma Confidence: 0.190595440
+  Spectra Post Visible Chroma Variance Y: 0.000032759
+  Spectra Post Visible Chroma Variance RG: 0.000073187
+  Spectra Post Visible Chroma Variance BG: 0.000095405
+  Spectra Post Visible Chroma Covariance Rg Bg: 0.000046946
+  Spectra Post Visible Chroma Covariance Rgb: [0.000113346,0.000031683,0.000083485,0.000031683,0.000023208,0.000028063,0.000083485,0.000028063,0.000128324]
+  Spectra Post Quantization Stage:   POST_QUANTIZATION_8BIT
+  Spectra Post Quantization Method:  UNIFORM_8BIT_QUANTIZATION_VARIANCE_ADDED
+  Spectra Post Quantization Status:  PROPAGATED
+  Spectra Post Quantization Confidence: 0.186783531
+  Spectra Post Quantization Variance Y: 0.000033479
+  Spectra Post Quantization Variance RG: 0.000075750
+  Spectra Post Quantization Variance BG: 0.000097969
+  Spectra Post Quantization Covariance Rg Bg: 0.000048228
+  Spectra Post Quantization Covariance Rgb: [0.000114628,0.000031683,0.000083485,0.000031683,0.000024489,0.000028063,0.000083485,0.000028063,0.000129606]
+  Spectra Final Jpeg Stage:          FINAL_JPEG_PRE_ENCODE
+  Spectra Final Jpeg Method:         MEASURED_AND_ANALYTICAL_NOISE_AWARE_LUMA_SHARPEN_GAIN
+  Spectra Final Jpeg Status:         PROPAGATED
+  Spectra Final Jpeg Confidence:     0.175576519
+  Spectra Final Jpeg Variance Y:     0.000033860
+  Spectra Final Jpeg Variance RG:    0.000075750
+  Spectra Final Jpeg Variance BG:    0.000097969
+  Spectra Final Jpeg Covariance Rg Bg: 0.000048228
+  Spectra Final Jpeg Covariance Rgb: [0.000115231,0.000032134,0.000084055,0.000032134,0.000024788,0.000028481,0.000084055,0.000028481,0.000130142]
+  Spectra Measured Post Demosaic Stage: POST_DEMOSAIC_RGB
+  Spectra Measured Post Demosaic Method: FLAT_REGION_CROSS_5_LINEAR_RGB_TILE_MEDIAN
+  Spectra Measured Post Demosaic Status: OBSERVATION_READY_NO_AUTO_CALIBRATION
+  Spectra Measured Post Demosaic Confidence: 0.934491587
+  Spectra Measured Post Demosaic Filter Energy Gain: 1.250000000
+  Spectra Measured Post Demosaic Variance Y: 0.000006074
+  Spectra Measured Post Demosaic Variance RG: 0.000000636
+  Spectra Measured Post Demosaic Variance BG: 0.000001606
+  Spectra Measured Post Demosaic Covariance Rg Bg: 0.000000736
+  Spectra Measured Post Demosaic Robust Variance Y: 0.000006369
+  Spectra Measured Post Demosaic Robust Variance RG: 0.000000744
+  Spectra Measured Post Demosaic Robust Variance BG: 0.000001822
+  Spectra Measured Post Demosaic Robust Covariance Rg Bg: 0.000000848
+  Spectra Measured Post Demosaic Variance YP10: 0.000005245
+  Spectra Measured Post Demosaic Variance YP50: 0.000006369
+  Spectra Measured Post Demosaic Variance YP90: 0.000007273
+  Spectra Measured Post Demosaic Variance RGP10: 0.000000366
+  Spectra Measured Post Demosaic Variance RGP50: 0.000000744
+  Spectra Measured Post Demosaic Variance RGP90: 0.000001340
+  Spectra Measured Post Demosaic Variance BGP10: 0.000000891
+  Spectra Measured Post Demosaic Variance BGP50: 0.000001822
+  Spectra Measured Post Demosaic Variance BGP90: 0.000003600
+  Spectra Measured Post Demosaic Structure Threshold: 0.010571370
+  Spectra Measured Post Demosaic Flat Sample Fraction: 0.533943888
+  Spectra Measured Post Demosaic Texture Contamination: 0.889397129
+  Spectra Measured Post Demosaic Candidate Sample Count: 194468
+  Spectra Measured Post Demosaic Accepted Sample Count: 103835
+  Spectra Measured Post Demosaic Valid Tile Count: 192
+  Spectra Measured Post Demosaic Total Tile Count: 192
+  Spectra Measured Post Colour Transform Stage: POST_COLOUR_MATRIX_RGB_AFTER_NONNEGATIVE_CLAMP
+  Spectra Measured Post Colour Transform Method: FLAT_REGION_CROSS_5_LINEAR_RGB_TILE_MEDIAN
+  Spectra Measured Post Colour Transform Status: OBSERVATION_READY_NO_AUTO_CALIBRATION
+  Spectra Measured Post Colour Transform Confidence: 0.978145900
+  Spectra Measured Post Colour Transform Filter Energy Gain: 1.250000000
+  Spectra Measured Post Colour Transform Variance Y: 0.000010089
+  Spectra Measured Post Colour Transform Variance RG: 0.000019497
+  Spectra Measured Post Colour Transform Variance BG: 0.000025943
+  Spectra Measured Post Colour Transform Covariance Rg Bg: 0.000019819
+  Spectra Measured Post Colour Transform Robust Variance Y: 0.000010551
+  Spectra Measured Post Colour Transform Robust Variance RG: 0.000021230
+  Spectra Measured Post Colour Transform Robust Variance BG: 0.000029031
+  Spectra Measured Post Colour Transform Robust Covariance Rg Bg: 0.000021547
+  Spectra Measured Post Colour Transform Variance YP10: 0.000008649
+  Spectra Measured Post Colour Transform Variance YP50: 0.000010551
+  Spectra Measured Post Colour Transform Variance YP90: 0.000011948
+  Spectra Measured Post Colour Transform Variance RGP10: 0.000016112
+  Spectra Measured Post Colour Transform Variance RGP50: 0.000021230
+  Spectra Measured Post Colour Transform Variance RGP90: 0.000025044
+  Spectra Measured Post Colour Transform Variance BGP10: 0.000019567
+  Spectra Measured Post Colour Transform Variance BGP50: 0.000029031
+  Spectra Measured Post Colour Transform Variance BGP90: 0.000039145
+  Spectra Measured Post Colour Transform Structure Threshold: 0.013639592
+  Spectra Measured Post Colour Transform Flat Sample Fraction: 0.539278819
+  Spectra Measured Post Colour Transform Texture Contamination: 0.264026966
+  Spectra Measured Post Colour Transform Candidate Sample Count: 194736
+  Spectra Measured Post Colour Transform Accepted Sample Count: 105017
+  Spectra Measured Post Colour Transform Valid Tile Count: 192
+  Spectra Measured Post Colour Transform Total Tile Count: 192
+  Spectra Post Demosaic Calibration Stage: POST_DEMOSAIC_RGB
+  Spectra Post Demosaic Calibration Status: READY_OBSERVATION_ONLY_NO_COEFFICIENT_UPDATE
+  Spectra Post Demosaic Calibration Ready: true
+  Spectra Post Demosaic Calibration Confidence: 0.339379344
+  Spectra Post Demosaic Calibration Measured To Predicted Y: 0.361664181
+  Spectra Post Demosaic Calibration Measured To Predicted RG: 0.072788395
+  Spectra Post Demosaic Calibration Measured To Predicted BG: 0.173826637
+  Spectra Post Demosaic Calibration Measured To Predicted Chroma: 0.123951929
+  Spectra Post Demosaic Calibration Absolute Log2Error Y: 1.467277373
+  Spectra Post Demosaic Calibration Absolute Log2Error RG: 3.780147731
+  Spectra Post Demosaic Calibration Absolute Log2Error BG: 2.524278919
+  Spectra Post Colour Transform Calibration Stage: POST_COLOUR_MATRIX_RGB_AFTER_NONNEGATIVE_CLAMP
+  Spectra Post Colour Transform Calibration Status: READY_OBSERVATION_ONLY_EXPLICIT_STAGE_BOUNDARY_NO_COEFFICIENT_UPDATE
+  Spectra Post Colour Transform Calibration Ready: true
+  Spectra Post Colour Transform Calibration Confidence: 0.229081058
+  Spectra Post Colour Transform Calibration Measured To Predicted Y: 0.389423843
+  Spectra Post Colour Transform Calibration Measured To Predicted RG: 0.312948549
+  Spectra Post Colour Transform Calibration Measured To Predicted BG: 0.328282776
+  Spectra Post Colour Transform Calibration Measured To Predicted Chroma: 0.321626089
+  Spectra Post Colour Transform Calibration Absolute Log2Error Y: 1.360586878
+  Spectra Post Colour Transform Calibration Absolute Log2Error RG: 1.676002609
+  Spectra Post Colour Transform Calibration Absolute Log2Error BG: 1.606989036
+  Spectra Calibration Status:        MILESTONE_2B_STAGE_OBSERVATIONS_READY_NO_AUTO_CALIBRATION
+  Spectra Propagation Awb Gains Rgb: [2.06836,1,1.82129]
+  Spectra Propagation Colour Matrix: [1.20312,-0.234375,0.03125,-0.0625,1.15625,-0.09375,0.0390625,-0.609375,1.57031]
+  Spectra Tone Curve Derivative Sample Count: 50132
+  Spectra Tone Curve Derivative Mean: 1.000000000
+  Spectra Tone Curve Derivative Rms: 1.000000000
+  Spectra Tone Curve Derivative P10: 1.000000000
+  Spectra Tone Curve Derivative P50: 1.000000000
+  Spectra Tone Curve Derivative P90: 1.000000000
+  Spectra Tone Curve Derivative Min: 1.000000000
+  Spectra Tone Curve Derivative Max: 1.000000000
+  Spectra Section Curve Derivative Sample Count: 50132
+  Spectra Section Curve Derivative Mean: 1.000000000
+  Spectra Section Curve Derivative Rms: 1.000000000
+  Spectra Section Curve Derivative P10: 1.000000000
+  Spectra Section Curve Derivative P50: 1.000000000
+  Spectra Section Curve Derivative P90: 1.000000000
+  Spectra Section Curve Derivative Min: 1.000000000
+  Spectra Section Curve Derivative Max: 1.000000000
+  Spectra Gamma Curve Derivative Sample Count: 50132
+  Spectra Gamma Curve Derivative Mean: 1.000000000
+  Spectra Gamma Curve Derivative Rms: 1.000000000
+  Spectra Gamma Curve Derivative P10: 1.000000000
+  Spectra Gamma Curve Derivative P50: 1.000000000
+  Spectra Gamma Curve Derivative P90: 1.000000000
+  Spectra Gamma Curve Derivative Min: 1.000000000
+  Spectra Gamma Curve Derivative Max: 1.000000000
+  Spectra Total Tone Derivative Sample Count: 50132
+  Spectra Total Tone Derivative Mean: 1.086707668
+  Spectra Total Tone Derivative Rms: 1.099595920
+  Spectra Total Tone Derivative P10: 1.014583781
+  Spectra Total Tone Derivative P50: 1.034232304
+  Spectra Total Tone Derivative P90: 1.276368303
+  Spectra Total Tone Derivative Min: 0.000000000
+  Spectra Total Tone Derivative Max: 1.863042086
+  Spectra Tone Chroma Scale Sample Count: 50132
+  Spectra Tone Chroma Scale Mean:    1.027288879
+  Spectra Tone Chroma Scale Rms:     1.038677098
+  Spectra Tone Chroma Scale P10:     0.926096580
+  Spectra Tone Chroma Scale P50:     1.063367787
+  Spectra Tone Chroma Scale P90:     1.107042241
+  Spectra Tone Chroma Scale Min:     0.000000000
+  Spectra Tone Chroma Scale Max:     1.110081890
+  Spectra Predicted Visible Chroma Amplification: 1.87854
+  Spectra Predicted Visible Variance Y: 3.27591e-05
+  Spectra Predicted Visible Variance RG: 7.31871e-05
+  Spectra Predicted Visible Variance BG: 9.54055e-05
+  Spectra Predicted Visible Covariance Rg Bg: 4.69461e-05
+  Spectra Measured Pre Sharpen Stage: POST_QUANTIZATION_8BIT_PRE_SHARPEN
+  Spectra Measured Pre Sharpen Variance Y: 0.000170742
+  Spectra Measured Pre Sharpen Variance RG: 0.000190979
+  Spectra Measured Pre Sharpen Variance BG: 0.000323729
+  Spectra Measured Pre Sharpen Covariance Rg Bg: 0.00020303
+  Spectra Measured Pre Sharpen Sample Count: 256815
+  Spectra Measured Post Isp Stage:   FINAL_JPEG_PRE_ENCODE_AFTER_SHARPEN
+  Spectra Measured Post Isp Method:  CROSS_5_HIGH_PASS_ENERGY_DIVIDED_BY_1_25
+  Spectra Measured Post Isp Status:  CONTROLLED_SCENE_PROXY_SPATIAL_CORRELATION_AND_TEXTURE_NOT_DECONVOLVED
+  Spectra Measured Post Isp Filter Energy Gain: 1.25
+  Spectra Measured Post Isp Variance Y: 0.000170742
+  Spectra Measured Post Isp Variance RG: 0.000190979
+  Spectra Measured Post Isp Variance BG: 0.000323729
+  Spectra Measured Post Isp Covariance Rg Bg: 0.00020303
+  Spectra Measured Post Isp Sample Count: 256815
+  Spectra Pass2Visible Target Ready: true
+  Spectra Pass2Visible Target Status: OBSERVATION_ONLY_NO_SKIP_AUTHORITY_MILESTONE_2
+  Spectra Pass2Visible Target Prevented Skip: false
+  Spectra Pass2Visible Target Confidence: 0.183385
+  Spectra Pass2Visible Chroma Amplification: 2.09727
+  Spectra Capture Provenance Ms:     895.65
+  Spectra Final Provenance Ms:       893.477
+  Spectra Total Processing Ms:       21161.8
+  Spectra Accounted Processing Ms:   20860.9
+  Spectra Unattributed Processing Ms: 300.898
+  Raw Isp Accounted Ms:              26032.1
+  Raw Isp Unattributed Ms:           692.27
+  Noise Model Multiplier:            1.41579
+  Spatial Noise Map Grid Width:      32
+  Spatial Noise Map Grid Height:     24
+  Spatial Noise Map Min Sigma:       0.00110498
+  Spatial Noise Map Mean Sigma:      0.00277829
+  Spatial Noise Map Max Sigma:       0.00517596
+  Noise Map Coordinate Space:        4096x3072
+  Denoise Consumer Coordinate Space: 4096x3072
+  Lens Iso Nr Mode:                  0
+  Lens Iso Nr Reference:             258
+  Lens Iso Nr Multiplier:            0.910966
+  Dynamic Iso Coefficient:           0
+  Frame Iso:                         258
+  Sensor Min Iso:                    100
+  Sensor Max Iso:                    6400
+  Sensor Max Analog Iso:             25500
+  Iso Stops:                         1.36737
+  Available Iso Stops:               7.99435
+  Normalized Iso Position:           0.171042
+  Sensor Iso Activation:             0.317334
+  Physical Noise Model Baseline:     0.283159
+  Format Specific Denoise Ceiling:   0.58
+  Available Denoise Headroom:        0.296841
+  Requested Headroom Fraction:       0
+  Requested Additional Strength:     0
+  Dynamic Iso Multiplier:            0.910966
+  Final Chroma Denoise Strength Before Clamp: 0.283159
+  Final Chroma Denoise Strength After Clamp: 0.257948
+  Ceiling Reached:                   false
+  Theoretical Saturating Coeff:      3.15125
+  Processed Pixel Count:             12763136
+  Changed Pixel Count:               32
+  Mean Abs Luma Delta:               2.46567e-05
+  Mean Abs Chroma Delta:             3.5063e-05
+  Max Luma Delta:                    0.000197075
+  Max Chroma Delta:                  0.000278717
+  Avg Neighbour Acceptance Rate:     0.173987
+  Avg Non Centre Sample Weight:      40.374
+  Avg Total Filter Weight:           84.2107
+  Avg Applied Blend:                 0
+  Edge Protected Pixel Fraction:     0.6859
+  Absolute Mean Luma Sigma:          0.00230715
+  Absolute Mean Chroma Sigma:        0.00678608
+  Effective Luma Sigma:              0.00230715
+  Effective Chroma Sigma:            0.00678608
+  Luma Range Threshold Min:          0.00207643
+  Luma Range Threshold Mean:         0.00415286
+  Luma Range Threshold Max:          0.00830572
+  Chroma Range Threshold Min:        0.00950051
+  Chroma Range Threshold Mean:       0.019001
+  Chroma Range Threshold Max:        0.0380021
+  Pre Denoise Residual Estimate:     0.00959552
+  Post Denoise Residual Estimate:    0.00959552
+  Post Sharpen Residual Estimate:    0.00959552
+  Black Anchor:                      0.01
+  Soft Black Point Anchor Applied:   0
+  Shadow Lift Applied:               0.015
+  Toe Exponent Applied:              0.92
+  Curve Stack Applied:               false
+  Tone Curve Applied:                false
+  Gamma Curve Applied:               false
+  Section Curve Applied:             false
+  Sharpen Applied:                   true
+  Sharpen Amount:                    0.00286271
+  Sharpen Reason:                    MILESTONE_7_NOISE_AWARE_DOWNSTREAM_APPLIED
+  Final Red Clipped Pct:             0.00112057
+  Final Green Clipped Pct:           0
+  Final Blue Clipped Pct:            2.38419e-05
+  Defect Correction Ms:              269.768
+  Defect Pre Scan Ms:                269.747
+  Defect Full Pass Ms:               0.019167
+  Expensive Defect Pass Skipped:     false
+  Green Split Ms:                    0.292448
+  Lens Shading Ms:                   313.777
+  Demosaic Time Ms:                  820.921
+  Demosaic Ms:                       820.921
+  Demosaic Total Ms:                 820.921
+  Bilinear Time Ms:                  0
+  Malvar Time Ms:                    0
+  Menon Time Ms:                     820.921
+  Demosaic Setup Ms:                 0.151198
+  Demosaic Kernel Ms:                782.841
+  Demosaic Finalize Ms:              37.888
+  Demosaic Input Width:              4096
+  Demosaic Input Height:             3072
+  Working Buffer Bytes Estimate:     515899392
+  Allocation Reuse:                  false
+  Demosaic Scratch Reused:           false
+  Allocated Scratch Bytes This Shot: 314572800
+  Spectra Demosaic Propagation Ms:   0.013803
+  Spectra Awb Propagation Ms:        0.005625
+  Spectra Colour Transform Propagation Ms: 0.002656
+  Spectra Tone Propagation Ms:       19.332
+  Spectra Tone Propagation Timing Mode: nested_in_toneAndVibranceMs
+  Spectra Measured Post Demosaic Residual Ms: 134.621
+  Spectra Measured Post Colour Transform Residual Ms: 126.306
+  Spectra Measured Visible Residual Ms: 52.6203
+  Spectra Propagation Math Ms:       386.093
+  Spectra Propagation Sequential Ms: 366.761
+  Awb Colour Transform Ms:           126.304
+  Awb Timing Mode:                   fused_with_colour_transform
+  Colour Transform Timing Mode:      fused_with_awb
+  Highlight Recovery Ms:             260.242
+  Tone And Vibrance Ms:              1007.4
+  Final Output Pass Ms:              861.669
+  Final Out Spatial Nr Ms:           200.871
+  Spectra Visible Chroma Processing Ms: 736.486
+  Spectra Visible Chroma Timing Mode: nested_in_finalOutputPassMs
+  Final Out Clamp Quant Ms:          113.835
+  Sharpen Ms:                        740.922
+  Spectra Downstream Propagation Ms: 0.019428
+  Output Rotate Ms:                  46.8342
+  Jpeg Encode Ms:                    55.5027
+  Total Raw Isp Core Ms:             26724.4
+  Total Raw Bayer Jpeg Isp Ms:       26724.4
+  Raw10Unpack Ms:                    27.966
+  Raw10To Master Raw16Ms:            5253.07
+  Raw10Merge Or Single Master Ms:    5253.07
+  Raw Sensor Read Ms:                0
+  Raw Sensor To Master Raw16Ms:      0
+  Raw10Shared Raw Bayer Isp Ms:      26724.4
+  Raw Sensor Shared Raw Bayer Isp Ms: 0
+  Spectra Performance Milestone:     M8F_STRIPED_PERSISTENT_VULKAN_FP32_OPPONENT
+  Spectra Performance Backend:       FUSED_TILED_SIMD
+  Spectra Performance Selection Reason: M8B_NEON_RUNTIME_EQUIVALENT_SPECTRA_ACTIVE
+  Spectra Performance Neon Compiled: true
+  Spectra Performance Simd Kernel Active: true
+  Spectra Performance Simd Validation Performed: true
+  Spectra Performance Simd Validation Passed: true
+  Spectra Performance Simd Validation Status: PASSED_RUNTIME_NEON_SCALAR_EQUIVALENCE
+  Spectra Performance Simd Validation Maximum Absolute Delta: 2.01712e-07
+  Spectra Performance Simd Validation Maximum Relative Delta: 1.89991e-08
+  Spectra Performance Simd Validation Elapsed Ms: 4.55792
+  Spectra Performance Simd Fallback Reason: NONE
+  Spectra Performance Simd Dispatch Count: 3
+  Spectra Performance Simd Vectorized Lane Count: 16479252
+  Spectra Performance Simd Rejected Non Finite Lane Count: 0
+  Spectra Performance Initial Simd Kernel Used: true
+  Spectra Performance Post Pass1Simd Kernel Used: true
+  Spectra Performance Post Pass2Simd Kernel Used: true
+  Spectra Performance Vulkan Prepared: true
+  Spectra Performance Vulkan Selected: false
+  Spectra Performance Vulkan Status: VULKAN_FP32_NOT_QUALIFIED:VULKAN_MEMORY_BUDGET_GATE_FAILED
+  Spectra Performance Device Profile Status: NOT_ENOUGH_DEVICE_SAMPLES
+  Spectra Performance Device Profile Recommendation: KEEP_CURRENT_CPU_BACKEND_PENDING_DEVICE_SAMPLES
+  Spectra Performance Device Profile Width: 0
+  Spectra Performance Device Profile Height: 0
+  Spectra Performance Device Profile Spectra Enabled: false
+  Spectra Performance Device Profile Sample Count: 0
+  Spectra Performance Device Profile Qualified Sample Count: 0
+  Spectra Performance Device Profile Warmup Discarded Count: 0
+  Spectra Performance Device Profile Ready: false
+  Spectra Performance Device Profile Median Total Isp Ms: 0
+  Spectra Performance Device Profile P95Total Isp Ms: 0
+  Spectra Performance Device Profile Median Statistics Ms: 0
+  Spectra Performance Device Profile Median Spectra Passes Ms: 0
+  Spectra Performance Device Profile Median Visible Chroma Ms: 0
+  Spectra Performance Device Profile Median Downstream Isp Ms: 0
+  Spectra Performance Device Profile First Window Median Ms: 0
+  Spectra Performance Device Profile Recent Window Median Ms: 0
+  Spectra Performance Device Profile Thermal Drift Ratio: 1
+  Spectra Performance Device Profile Coefficient Of Variation: 0
+  Spectra Performance Device Profile Confidence: 0
+  Spectra Performance Device Profile Thermal Stable: false
+  Spectra Performance Device Profile Throttling Detected: false
+  Spectra Performance Vulkan Runtime Ready: true
+  Spectra Performance Vulkan Timestamp Queries Supported: true
+  Spectra Performance Vulkan Vma Ready: true
+  Spectra Performance Vulkan Production Kernel Connected: true
+  Spectra Performance Vulkan Benchmark Performed: false
+  Spectra Performance Vulkan Benchmark Sample Count: 0
+  Spectra Performance Vulkan Numerical Equivalence Passed: false
+  Spectra Performance Vulkan Maximum Absolute Delta: 0
+  Spectra Performance Vulkan Opponent Used For Output: false
+  Spectra Performance Vulkan Opponent Route Key: UNSET
+  Spectra Performance Vulkan Opponent Qualification Status: NO_SAMPLES
+  Spectra Performance Vulkan Opponent Execution Status: NOT_RUN
+  Spectra Performance Vulkan Opponent Failure Reason: none
+  Spectra Performance Vulkan Runtime Gate Passed: true
+  Spectra Performance Vulkan Kernel Gate Passed: true
+  Spectra Performance Vulkan Benchmark Gate Passed: false
+  Spectra Performance Vulkan Numerical Gate Passed: false
+  Spectra Performance Vulkan Latency Gate Passed: false
+  Spectra Performance Vulkan Transfer Gate Passed: false
+  Spectra Performance Vulkan Thermal Gate Passed: false
+  Spectra Performance Vulkan Memory Gate Passed: false
+  Spectra Performance Vulkan Measured Speedup: 0
+  Spectra Performance Vulkan Transfer Fraction: 1
+  Spectra Performance Vulkan Minimum Required Speedup: 1.15
+  Spectra Performance Vulkan Maximum Transfer Fraction: 0.35
+  Spectra Performance Vulkan Maximum Allowed Absolute Delta: 3e-06
+  Spectra Performance Vulkan Blocked Reason: VULKAN_MEMORY_BUDGET_GATE_FAILED
+  Spectra Performance Device Qualification Ms: 2.17156
+  Spectra Performance Device Qualification Timing Accounting: POST_TOTAL_RAW_ISP_DIAGNOSTIC_OVERHEAD_NOT_IN_PIXEL_PROCESSING
+  Spectra Performance Mixed Precision Status: FP16_DISABLED_CRITICAL_MATH_FP32
+  Spectra Performance Correctness Contract: M8F_STRIPED_PERSISTENT_VULKAN_FP32_OPPONENT_AND_HARD_DEVICE_QUALIFICATION_GATES
+  Spectra Performance Fused Statistics Dispatch Count: 3
+  Spectra Performance Statistics Total Ms: 259.705
+  Spectra Performance Initial Statistics Ms: 36.408
+  Spectra Performance Post Pass1Statistics Ms: 101.673
+  Spectra Performance Post Pass2Statistics Ms: 121.625
+  Spectra Performance Initial Statistics Method: M8B_DETERMINISTIC_FUSED_TILED_NEON_REDUCTION
+  Spectra Performance Post Pass1Statistics Method: M8B_DETERMINISTIC_FUSED_TILED_NEON_REDUCTION
+  Spectra Performance Post Pass2Statistics Method: M8B_DETERMINISTIC_FUSED_TILED_NEON_REDUCTION
+  Spectra Performance Initial Tile Count: 24
+  Spectra Performance Initial Worker Count: 4
+  Spectra Performance Statistics Bytes Read: 505315968
+  Spectra Performance Statistics Bytes Written: 0
+  Spectra Performance Statistics Scratch Bytes: 2688
+  Spectra Performance Frame Bytes:   50331648
+  Spectra Performance Estimated Read Passes: 10.0397
+  Spectra Performance Known Full Frame Clone Count: 4
+  Raw Isp Pass Count:                11
+  Fused Passes Enabled:              true
+  Buffer Reuse Hit Count:            0
+  Raw Isp Working Set Estimate Bytes: 515899392
+  Color Stage Means Raw R:           0.103325
+  Color Stage Means Raw G:           0.200757
+  Color Stage Means Raw B:           0.103935
+  Color Stage Means Wb R:            0.213713
+  Color Stage Means Wb G:            0.200757
+  Color Stage Means Wb B:            0.189295
+  Color Stage Means Ccm R:           0.216003
+  Color Stage Means Ccm G:           0.201022
+  Color Stage Means Ccm B:           0.183293
+  Color Stage Means Tone R:          0.474017
+  Color Stage Means Tone G:          0.453388
+  Color Stage Means Tone B:          0.423978
+  Raw Jpeg Vibrance Applied:         false
+  Raw Jpeg Base Vibrance:            1.38
+  Raw Jpeg Effective Vibrance Mean:  0
+  Raw Jpeg Effective Vibrance Max:   0
+  Saturation Boost Applied:          false
+  Saturation Protected Highlight Pct: 0
+  Saturation Protected Neutral Pct:  0
+  Saturation Protected Shadow Pct:   0
+  Color Stage Mean Saturation Before: 0
+  Color Stage Mean Saturation After: 0
+  Low Light Midtone Vibrance Gate Mean: 0
+  Safe Midtone Saturation Boosted Pct: 0
+  Native Received Enabled:           false
+  Native Received Valid:             false
+  Native Received Cct:               0
+  Native Received Contribution Weight: 0
+  Native Applied Contribution Weight: 0
+  Native Adjustment Type:            none
+  Native Adjustment Magnitude:       0
+  Look Strength:                     1.0000
+  Legacy Raw Stack Reachable:        false
+  Yuv Untouched:                     true
+  Dng Untouched:                     true
+  Raw16Ownership:                    NATIVE_DIRECT_BUFFER_V1
+  Raw16Managed Heap Copy Count:      0
+  Raw16Managed Heap Copy Bytes:      0
+  Raw16Pre Isp Clone Eliminated:     true
+  Raw16Direct Buffer Access Ms:      0.0008
+  Raw16Direct Buffer Capacity:       25165824
+
+------------------------------------------------------------------------
+[8] Timing
+------------------------------------------------------------------------
+  Camera capture time:               2 ms
+  Render / ISP time:                 26874 ms
+  JPEG encode time:                  55 ms
+  Save time:                         78 ms
+  Debug write time:                  23 ms
+  Total processing:                  32328 ms
+
+  Timing Breakdown
+  Save Time:                         78 ms
+  Vendor tag injection write time:   35 ms
+  Debug write time:                  23 ms
+
+------------------------------------------------------------------------
+[9] Output / Recovery
+------------------------------------------------------------------------
+  JPEG created:                      yes
+  JPEG bytes:                        6774064
+  Saved output path:                 content://media/external/images/media/67321
+  DNG created:                       no
+  Fallback used:                     no

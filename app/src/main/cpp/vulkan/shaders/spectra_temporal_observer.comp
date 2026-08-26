@@ -1,0 +1,424 @@
+#version 450
+
+// Milestone 8H-D: GPU-primary temporal observer. Pixel-scale clipping/texture,
+// normalized innovation, static probability, residual covariance and signal-bin
+// aggregation stay in Vulkan. CPU only reduces compact workgroup records and
+// runs the robust WLS/Huber fit.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer AnchorBuffer { uint anchorPacked[]; } anchorBuf;
+layout(std430, binding = 1) readonly buffer SupportBuffer { uint supportPacked[]; } supportBuf;
+layout(std430, binding = 2) readonly buffer ParamsBuffer { uint words[]; } paramsBuf;
+layout(std430, binding = 3) writeonly buffer CoarseBuffer { float coarseData[]; } coarseBuf;
+layout(std430, binding = 4) writeonly buffer ObserverBuffer { float observerData[]; } observerBuf;
+layout(std430, binding = 5) writeonly buffer StaticCellBuffer { float staticCellData[]; } staticBuf;
+layout(std430, binding = 6) buffer HistogramBuffer { uint histogram[]; } histBuf;
+
+layout(push_constant) uniform Push { uint mode; } pc;
+
+const uint P_WIDTH = 0u;
+const uint P_HEIGHT = 1u;
+const uint P_SUPPORT_WIDTH = 2u;
+const uint P_SUPPORT_HEIGHT = 3u;
+const uint P_X_START = 4u;
+const uint P_X_END = 5u;
+const uint P_Y_START = 6u;
+const uint P_Y_END = 7u;
+const uint P_X_GROUPS = 8u;
+const uint P_Y_GROUPS = 9u;
+const uint P_CFA = 10u;
+const uint P_STATIC_COLS = 11u;
+const uint P_STATIC_ROWS = 12u;
+const uint P_STATIC_CELL = 13u;
+const uint P_DX = 14u;
+const uint P_DY = 15u;
+const uint P_STRICTNESS = 16u;
+const uint P_FORWARD_BACK = 17u;
+const uint P_WHITE = 18u;
+const uint P_S0 = 19u;
+const uint P_O0 = 23u;
+const uint P_BLACK0 = 27u;
+const uint P_MEAN_DELTA0 = 31u;
+const uint P_BLOCK_COUNT = 35u;
+
+const uint COARSE_STRIDE = 10u;
+const uint OBS_STRIDE = 244u;
+const uint OBS_BIN_BASE = 80u;
+const uint OBS_GLOBAL_BASE = 240u;
+const uint HIST_BINS = 1024u;
+const float HIST_MAX_Z = 8.0;
+
+// 64 lanes x 4 CFA-phase samples. 10 floats + 2 uints/sample = 12 KiB shared.
+shared float sampleF[64u * 4u * 10u];
+shared uint sampleU[64u * 4u * 2u];
+shared float cellSums[64u];
+shared uint cellCounts[64u];
+
+uint pU(uint index) { return paramsBuf.words[index]; }
+int pI(uint index) { return int(paramsBuf.words[index]); }
+float pF(uint index) { return uintBitsToFloat(paramsBuf.words[index]); }
+
+uint width() { return pU(P_WIDTH); }
+uint height() { return pU(P_HEIGHT); }
+uint supportWidth() { return pU(P_SUPPORT_WIDTH); }
+uint supportHeight() { return pU(P_SUPPORT_HEIGHT); }
+
+int cfaChannel(int x, int y) {
+    int px = x & 1;
+    int py = y & 1;
+    int cfa = int(pU(P_CFA));
+    if (cfa == 1) { // GRBG
+        if (py == 0 && px == 0) return 1;
+        if (py == 0 && px == 1) return 0;
+        if (py == 1 && px == 0) return 3;
+        return 2;
+    }
+    if (cfa == 2) { // GBRG
+        if (py == 0 && px == 0) return 1;
+        if (py == 0 && px == 1) return 3;
+        if (py == 1 && px == 0) return 0;
+        return 2;
+    }
+    if (cfa == 3) { // BGGR
+        if (py == 0 && px == 0) return 3;
+        if (py == 0 && px == 1) return 2;
+        if (py == 1 && px == 0) return 1;
+        return 0;
+    }
+    // RGGB
+    if (py == 0 && px == 0) return 0;
+    if (py == 0 && px == 1) return 1;
+    if (py == 1 && px == 0) return 2;
+    return 3;
+}
+
+int mosaicPhase(int x, int y) { return ((y & 1) << 1) | (x & 1); }
+
+float pixelBlack(int x, int y) {
+    float white = max(1.0, pF(P_WHITE));
+    return clamp(pF(P_BLACK0 + uint(mosaicPhase(x, y))), 0.0, max(0.0, white - 1.0));
+}
+
+float normalizeRaw(float rawCode, int x, int y) {
+    float black = pixelBlack(x, y);
+    float range = max(1.0, pF(P_WHITE) - black);
+    return clamp((rawCode - black) / range, 0.0, 1.0);
+}
+
+float normalizeDelta(float rawDelta, int x, int y) {
+    float black = pixelBlack(x, y);
+    return rawDelta / max(1.0, pF(P_WHITE) - black);
+}
+
+float anchorRaw(uint index) {
+    uint packed = anchorBuf.anchorPacked[index >> 1u];
+    return float((index & 1u) == 0u ? (packed & 0xffffu) : (packed >> 16u));
+}
+
+float supportRaw(uint index) {
+    uint packed = supportBuf.supportPacked[index >> 1u];
+    return float((index & 1u) == 0u ? (packed & 0xffffu) : (packed >> 16u));
+}
+
+float smooth01(float x) {
+    float t = clamp(x, 0.0, 1.0);
+    return t * t * (3.0 - 2.0 * t);
+}
+
+float staticProbability(float z, float textureConfidence) {
+    float safeZ = abs(isnan(z) || isinf(z) ? 1.0e6 : z);
+    float innovation = exp(-0.5 * (safeZ / 2.35) * (safeZ / 2.35));
+    float confidence = smooth01(textureConfidence) * smooth01(pF(P_FORWARD_BACK));
+    return clamp(innovation * confidence, 0.0, 1.0);
+}
+
+bool sampleState(int xx, int yy, out float anchorNorm, out float supportNorm,
+                 out float pairVariance, out float textureConfidence) {
+    int dx = pI(P_DX);
+    int dy = pI(P_DY);
+    int srcX = xx - dx;
+    int srcY = yy - dy;
+    if (xx - 2 < 0 || xx + 2 >= int(width()) || yy - 2 < 0 || yy + 2 >= int(height()) ||
+        srcX - 2 < 0 || srcX + 2 >= int(supportWidth()) ||
+        srcY - 2 < 0 || srcY + 2 >= int(supportHeight())) {
+        return false;
+    }
+    uint aIndex = uint(yy) * width() + uint(xx);
+    uint sIndex = uint(srcY) * supportWidth() + uint(srcX);
+    anchorNorm = normalizeRaw(anchorRaw(aIndex), xx, yy);
+    supportNorm = normalizeRaw(supportRaw(sIndex), srcX, srcY);
+    if (anchorNorm < 0.002 || anchorNorm > 0.965 || supportNorm < 0.002 || supportNorm > 0.965) {
+        return false;
+    }
+    int ch = cfaChannel(xx, yy);
+    float s = max(0.0, pF(P_S0 + uint(ch)));
+    float o = max(0.0, pF(P_O0 + uint(ch)));
+    float anchorVariance = max(1.0e-12, s * anchorNorm + o);
+    float supportVariance = max(1.0e-12, s * supportNorm + o);
+    pairVariance = anchorVariance + supportVariance;
+    float sigma = sqrt(max(anchorVariance, supportVariance));
+
+    uint row = uint(yy) * width();
+    float aHorizontal = abs(normalizeDelta(
+            anchorRaw(row + uint(xx - 2)) - anchorRaw(row + uint(xx + 2)), xx, yy));
+    float aVertical = abs(normalizeDelta(
+            anchorRaw(uint(yy - 2) * width() + uint(xx)) -
+            anchorRaw(uint(yy + 2) * width() + uint(xx)), xx, yy));
+
+    uint srow = uint(srcY) * supportWidth();
+    float sHorizontal = abs(normalizeDelta(
+            supportRaw(srow + uint(srcX - 2)) - supportRaw(srow + uint(srcX + 2)), srcX, srcY));
+    float sVertical = abs(normalizeDelta(
+            supportRaw(uint(srcY - 2) * supportWidth() + uint(srcX)) -
+            supportRaw(uint(srcY + 2) * supportWidth() + uint(srcX)), srcX, srcY));
+    float gradient = max(max(aHorizontal, aVertical), max(sHorizontal, sVertical));
+    float textureLimit = max(0.012, (5.5 - 1.5 * pF(P_STRICTNESS)) * sigma);
+    textureConfidence = clamp(1.0 - gradient / max(textureLimit, 1.0e-12), 0.0, 1.0);
+    return true;
+}
+
+void coordinatesForBlock(uint blockIndex, uint phase, out int xx, out int yy) {
+    uint xGroups = pU(P_X_GROUPS);
+    uint gx = blockIndex % xGroups;
+    uint gy = blockIndex / xGroups;
+    int x = int(pU(P_X_START) + gx * 4u);
+    int y = int(pU(P_Y_START) + gy * 4u);
+    int phaseY = int(phase >> 1u);
+    int phaseX = int(phase & 1u);
+    xx = x + phaseX;
+    yy = y + phaseY;
+}
+
+uint sfIndex(uint lane, uint phase, uint field) { return ((lane * 4u + phase) * 10u) + field; }
+uint suIndex(uint lane, uint phase, uint field) { return ((lane * 4u + phase) * 2u) + field; }
+
+void runCoarse() {
+    uint lane = gl_LocalInvocationID.x;
+    uint blockIndex = gl_GlobalInvocationID.x;
+    for (uint phase = 0u; phase < 4u; ++phase) {
+        uint fi = sfIndex(lane, phase, 0u);
+        uint ui = suIndex(lane, phase, 0u);
+        sampleU[ui] = 0u;
+        sampleU[ui + 1u] = 0u;
+        sampleF[fi] = 0.0;
+        sampleF[fi + 1u] = 0.0;
+        sampleF[fi + 2u] = 0.0;
+        if (blockIndex >= pU(P_BLOCK_COUNT)) continue;
+        int xx, yy;
+        coordinatesForBlock(blockIndex, phase, xx, yy);
+        float a, b, variance, texture;
+        bool valid = sampleState(xx, yy, a, b, variance, texture);
+        sampleU[ui] = valid ? 1u : 2u;
+        sampleU[ui + 1u] = uint(cfaChannel(xx, yy));
+        if (valid) {
+            sampleF[fi] = a - b;
+            sampleF[fi + 1u] = texture;
+            sampleF[fi + 2u] = variance;
+        }
+    }
+    barrier();
+    if (lane != 0u) return;
+
+    uint group = gl_WorkGroupID.x;
+    uint base = group * COARSE_STRIDE;
+    float rec[10];
+    for (uint i = 0u; i < 10u; ++i) rec[i] = 0.0;
+    for (uint l = 0u; l < 64u; ++l) {
+        for (uint phase = 0u; phase < 4u; ++phase) {
+            uint fi = sfIndex(l, phase, 0u);
+            uint ui = suIndex(l, phase, 0u);
+            if (sampleU[ui] == 0u) continue;
+            if (sampleU[ui] == 2u) { rec[8] += 1.0; continue; }
+            float texture = sampleF[fi + 1u];
+            if (texture <= 0.10) { rec[9] += 1.0; continue; }
+            float diff = sampleF[fi];
+            float broadGate = max(0.015, 8.0 * sqrt(max(sampleF[fi + 2u], 1.0e-12)));
+            if (abs(diff) > broadGate) continue;
+            uint ch = min(sampleU[ui + 1u], 3u);
+            rec[ch * 2u] += texture * diff;
+            rec[ch * 2u + 1u] += texture;
+        }
+    }
+    for (uint i = 0u; i < 10u; ++i) coarseBuf.coarseData[base + i] = rec[i];
+}
+
+void runObserver() {
+    uint lane = gl_LocalInvocationID.x;
+    uint blockIndex = gl_GlobalInvocationID.x;
+    for (uint phase = 0u; phase < 4u; ++phase) {
+        uint fi = sfIndex(lane, phase, 0u);
+        uint ui = suIndex(lane, phase, 0u);
+        sampleU[ui] = 0u;
+        sampleU[ui + 1u] = 0u;
+        for (uint f = 0u; f < 10u; ++f) sampleF[fi + f] = 0.0;
+        if (blockIndex >= pU(P_BLOCK_COUNT)) continue;
+        int xx, yy;
+        coordinatesForBlock(blockIndex, phase, xx, yy);
+        float a, b, variance, texture;
+        if (!sampleState(xx, yy, a, b, variance, texture)) continue;
+        uint ch = uint(cfaChannel(xx, yy));
+        float centred = (a - b) - pF(P_MEAN_DELTA0 + ch);
+        float z = centred / sqrt(max(variance, 1.0e-12));
+        float sp = staticProbability(z, texture);
+        float weight = (sp >= 0.20 && texture >= 0.25)
+                ? pow(sp, 1.5) * max(0.15, texture) : 0.0;
+
+        int dx = pI(P_DX);
+        int dy = pI(P_DY);
+        int srcX = xx - dx;
+        int srcY = yy - dy;
+        float aMean = 0.25 * (
+                normalizeRaw(anchorRaw(uint(yy) * width() + uint(xx - 2)), xx - 2, yy) +
+                normalizeRaw(anchorRaw(uint(yy) * width() + uint(xx + 2)), xx + 2, yy) +
+                normalizeRaw(anchorRaw(uint(yy - 2) * width() + uint(xx)), xx, yy - 2) +
+                normalizeRaw(anchorRaw(uint(yy + 2) * width() + uint(xx)), xx, yy + 2));
+        float bMean = 0.25 * (
+                normalizeRaw(supportRaw(uint(srcY) * supportWidth() + uint(srcX - 2)), srcX - 2, srcY) +
+                normalizeRaw(supportRaw(uint(srcY) * supportWidth() + uint(srcX + 2)), srcX + 2, srcY) +
+                normalizeRaw(supportRaw(uint(srcY - 2) * supportWidth() + uint(srcX)), srcX, srcY - 2) +
+                normalizeRaw(supportRaw(uint(srcY + 2) * supportWidth() + uint(srcX)), srcX, srcY + 2));
+
+        uint bin = min(uint(floor(a * 8.0)), 7u);
+        sampleU[ui] = 1u;
+        sampleU[ui + 1u] = ch | (bin << 8u);
+        sampleF[fi + 0u] = a;
+        sampleF[fi + 1u] = centred;
+        sampleF[fi + 2u] = z;
+        sampleF[fi + 3u] = sp;
+        sampleF[fi + 4u] = texture;
+        sampleF[fi + 5u] = weight;
+        sampleF[fi + 6u] = a - aMean;
+        sampleF[fi + 7u] = b - bMean;
+        sampleF[fi + 8u] = abs(z);
+        sampleF[fi + 9u] = variance;
+    }
+    barrier();
+    if (lane != 0u) return;
+
+    float rec[244];
+    for (uint i = 0u; i < OBS_STRIDE; ++i) rec[i] = 0.0;
+    float prevZ[4] = float[4](0.0, 0.0, 0.0, 0.0);
+    bool hasPrev[4] = bool[4](false, false, false, false);
+
+    for (uint l = 0u; l < 64u; ++l) {
+        for (uint phase = 0u; phase < 4u; ++phase) {
+            uint fi = sfIndex(l, phase, 0u);
+            uint ui = suIndex(l, phase, 0u);
+            if (sampleU[ui] == 0u) continue;
+            uint packed = sampleU[ui + 1u];
+            uint ch = min(packed & 0xffu, 3u);
+            uint bin = min((packed >> 8u) & 0xffu, 7u);
+            float a = sampleF[fi + 0u];
+            float centred = sampleF[fi + 1u];
+            float z = sampleF[fi + 2u];
+            float sp = sampleF[fi + 3u];
+            float texture = sampleF[fi + 4u];
+            float weight = sampleF[fi + 5u];
+            float residualA = sampleF[fi + 6u];
+            float residualB = sampleF[fi + 7u];
+            float absZ = sampleF[fi + 8u];
+
+            rec[OBS_GLOBAL_BASE + 0u] += 1.0;
+            uint hist = min(uint(floor(clamp(absZ / HIST_MAX_Z, 0.0, 0.999999) * float(HIST_BINS))), HIST_BINS - 1u);
+            atomicAdd(histBuf.histogram[hist], 1u);
+            if (sp < 0.20) { rec[OBS_GLOBAL_BASE + 3u] += 1.0; continue; }
+            rec[OBS_GLOBAL_BASE + 1u] += 1.0;
+            if (sp >= 0.72 && texture >= 0.35) rec[OBS_GLOBAL_BASE + 2u] += 1.0;
+            if (weight <= 0.0) continue;
+
+            uint cb = ch * 20u;
+            rec[cb + 0u] += weight;
+            rec[cb + 1u] += weight * centred;
+            rec[cb + 2u] += weight * centred * centred;
+            rec[cb + 3u] += weight * a;
+            rec[cb + 4u] += weight * z;
+            rec[cb + 5u] += weight * z * z;
+            rec[cb + 6u] += weight * residualA;
+            rec[cb + 7u] += weight * residualB;
+            rec[cb + 8u] += weight * residualA * residualA;
+            rec[cb + 9u] += weight * residualB * residualB;
+            rec[cb + 10u] += weight * residualA * residualB;
+            rec[cb + 11u] += weight;
+            rec[cb + 12u] += 1.0;
+            if (absZ > 3.5) rec[cb + 13u] += 1.0;
+            if (hasPrev[ch]) {
+                rec[cb + 14u] += weight * z * prevZ[ch];
+                rec[cb + 15u] += weight;
+            } else {
+                rec[cb + 16u] = z;
+                rec[cb + 17u] = weight;
+                rec[cb + 19u] = 1.0;
+            }
+            prevZ[ch] = z;
+            hasPrev[ch] = true;
+            rec[cb + 18u] = z;
+
+            uint bb = OBS_BIN_BASE + (ch * 8u + bin) * 5u;
+            rec[bb + 0u] += weight * centred;
+            rec[bb + 1u] += weight * centred * centred;
+            rec[bb + 2u] += weight * a;
+            rec[bb + 3u] += weight;
+            rec[bb + 4u] += 1.0;
+        }
+    }
+    uint outBase = gl_WorkGroupID.x * OBS_STRIDE;
+    for (uint i = 0u; i < OBS_STRIDE; ++i) observerBuf.observerData[outBase + i] = rec[i];
+}
+
+void runStaticCells() {
+    uint cellIndex = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;
+    uint cols = pU(P_STATIC_COLS);
+    uint rows = pU(P_STATIC_ROWS);
+    uint cellCount = cols * rows;
+    if (cellIndex >= cellCount) return;
+    uint cellSize = pU(P_STATIC_CELL);
+    uint cellX = cellIndex % cols;
+    uint cellY = cellIndex / cols;
+    uint x0 = cellX * cellSize;
+    uint y0 = cellY * cellSize;
+    uint x1 = min(x0 + cellSize, width());
+    uint y1 = min(y0 + cellSize, height());
+    uint cellPixels = (x1 - x0) * (y1 - y0);
+    float sum = 0.0;
+    uint count = 0u;
+    for (uint local = lane; local < cellPixels; local += 64u) {
+        uint cx = local % (x1 - x0);
+        uint cy = local / (x1 - x0);
+        int xx = int(x0 + cx);
+        int yy = int(y0 + cy);
+        int relX = xx - int(pU(P_X_START));
+        int relY = yy - int(pU(P_Y_START));
+        if (relX < 0 || relY < 0) continue;
+        int mx = relX & 3;
+        int my = relY & 3;
+        if (mx > 1 || my > 1) continue;
+        int baseX = xx - mx;
+        int baseY = yy - my;
+        if (baseX >= int(pU(P_X_END)) || baseY >= int(pU(P_Y_END))) continue;
+        float a, b, variance, texture;
+        if (!sampleState(xx, yy, a, b, variance, texture)) continue;
+        uint ch = uint(cfaChannel(xx, yy));
+        float centred = (a - b) - pF(P_MEAN_DELTA0 + ch);
+        float z = centred / sqrt(max(variance, 1.0e-12));
+        sum += staticProbability(z, texture);
+        count += 1u;
+    }
+    cellSums[lane] = sum;
+    cellCounts[lane] = count;
+    barrier();
+    if (lane == 0u) {
+        float total = 0.0;
+        uint totalCount = 0u;
+        for (uint i = 0u; i < 64u; ++i) { total += cellSums[i]; totalCount += cellCounts[i]; }
+        staticBuf.staticCellData[cellIndex * 2u + 0u] = total;
+        staticBuf.staticCellData[cellIndex * 2u + 1u] = float(totalCount);
+    }
+}
+
+void main() {
+    if (pc.mode == 0u) runCoarse();
+    else if (pc.mode == 1u) runObserver();
+    else if (pc.mode == 2u) runStaticCells();
+}

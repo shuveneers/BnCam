@@ -1,0 +1,4 @@
+PERFORMANCE AND THERMAL
+=======================
+thermalStateAtShutter: 0
+totalUntilPublicationMs: 11375.845413

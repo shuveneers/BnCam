@@ -1,0 +1,17 @@
+RAW_CADENCE source=RAW10 generation=9
+uniqueSourceFrames=360 uniqueProcessedFrames=359 uniqueDrawnFrames=359 actualPresentedFrames=358
+uniqueSourceFps=30.00750187546887 processingFps=30.01800229487879 presentationFps=29.993117008119736 presentationClock=EGL_DISPLAY_PRESENT_TIME_ANDROID
+advertisedMinFrameDurationMs=33.325557 requestedFpsRanges=10:30 duplicateOffers=0 duplicateOffersRejected=0
+sourceSensorIntervalsMs=count=359,mean=33.325,sd=0.000,min=33.325,p10=33.325,p50=33.325,p90=33.325,p95=33.325,p99=33.325,max=33.325
+sourceArrivalIntervalsMs=count=359,mean=33.322,sd=1.803,min=25.452,p10=31.311,p50=33.368,p90=35.178,p95=35.781,p99=38.528,max=42.482
+reportedSensorFrameDurationMs=count=358,mean=33.326,sd=0.000,min=33.326,p10=33.326,p50=33.326,p90=33.326,p95=33.326,p99=33.326,max=33.326
+exposureTimeMs=count=358,mean=20.000,sd=0.000,min=20.000,p10=20.000,p50=20.000,p90=20.000,p95=20.000,p99=20.000,max=20.000
+processingCompletionIntervalsMs=count=358,mean=33.313,sd=5.489,min=8.427,p10=28.060,p50=33.463,p90=38.205,p95=39.954,p99=48.051,max=68.169
+presentationIntervalsMs=count=357,mean=33.341,sd=5.704,min=16.585,p10=33.172,p50=33.178,p90=33.188,p95=49.757,p99=49.769,max=66.374
+rawProcessDurationMs=count=359,mean=10.243,sd=4.168,min=6.114,p10=6.928,p50=9.717,p90=12.972,p95=15.791,p99=30.565,max=41.341
+glUploadDurationMs=count=359,mean=0.723,sd=0.150,min=0.461,p10=0.560,p50=0.704,p90=0.896,p95=0.996,p99=1.164,max=1.735
+sensorToImageArrivalMs=count=360,mean=35.640,sd=1.425,min=33.774,p10=34.256,p50=35.368,p90=37.365,p95=38.331,p99=41.093,max=43.722
+sensorToVulkanCompleteMs=count=359,mean=46.639,sd=5.422,min=40.687,p10=41.791,p50=45.808,p90=51.263,p95=56.160,p99=73.532,max=81.547
+sensorToViewAcceptedMs=count=359,mean=46.672,sd=5.428,min=40.710,p10=41.812,p50=45.844,p90=51.296,p95=56.198,p99=73.565,max=81.573
+sensorToDrawSubmitMs=count=359,mean=54.759,sd=6.634,min=43.635,p10=47.016,p50=54.849,p90=60.501,p95=65.086,p99=83.907,max=89.309
+sensorToDisplayPresentMs=count=358,mean=81.284,sd=8.491,min=66.501,p10=71.972,p50=80.838,p90=89.557,p95=95.947,p99=114.324,max=115.883

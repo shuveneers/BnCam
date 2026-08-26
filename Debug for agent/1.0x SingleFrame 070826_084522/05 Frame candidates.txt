@@ -1,0 +1,3 @@
+FRAME CANDIDATES
+================
+analyzedCandidateCount: 4

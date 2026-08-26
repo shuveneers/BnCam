@@ -1,0 +1,332 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer AnchorRawBuffer { uint anchorWords[]; } anchorBuf;
+layout(std430, binding = 1) readonly buffer SupportRawBuffer { uint supportWords[]; } supportBuf;
+layout(std430, binding = 2) buffer AccumBuffer { float values[]; } accumBuf;
+layout(std430, binding = 3) buffer WeightBuffer { float values[]; } weightBuf;
+layout(std430, binding = 4) buffer WeightSqBuffer { float values[]; } weightSqBuf;
+layout(std430, binding = 5) buffer CorrelationBuffer { float values[]; } corrBuf;
+layout(std430, binding = 6) readonly buffer StaticFieldBuffer { float values[]; } staticBuf;
+layout(std430, binding = 7) readonly buffer ParamsBuffer { uint words[]; } paramsBuf;
+layout(std430, binding = 8) writeonly buffer FinalRawBuffer { uint words[]; } finalBuf;
+layout(std430, binding = 9) writeonly buffer FusionStatsBuffer { vec4 records[]; } statsBuf;
+layout(std430, binding = 10) buffer FinalStatsBuffer { uint values[]; } finalStatsBuf;
+
+layout(push_constant) uniform PushConstants { uint mode; } pc;
+
+const uint P_WIDTH = 0u;
+const uint P_HEIGHT = 1u;
+const uint P_DX = 2u;
+const uint P_DY = 3u;
+const uint P_CFA = 4u;
+const uint P_SPECTRA = 5u;
+const uint P_STATIC_COLS = 6u;
+const uint P_STATIC_ROWS = 7u;
+const uint P_STATIC_CELL = 8u;
+const uint P_SAMPLE_STRIDE = 9u;
+const uint P_SAMPLE_COLS = 10u;
+const uint P_SAMPLE_ROWS = 11u;
+const uint P_STRICTNESS = 12u;
+const uint P_WHITE = 13u;
+const uint P_SUPPORT_WEIGHT = 14u;
+const uint P_MODEL_CONFIDENCE = 15u;
+const uint P_TEMPORAL_AUTHORITY = 16u;
+const uint P_MOTION_CONFIDENCE = 17u;
+const uint P_FORWARD_BACK = 18u;
+const uint P_MEAN_CORRELATION = 19u;
+const uint P_BLACK0 = 20u;
+const uint P_S0 = 24u;
+const uint P_O0 = 28u;
+const uint P_ADAPT_S0 = 32u;
+const uint P_ADAPT_O0 = 36u;
+const uint P_HDR_ENABLED = 40u;
+const uint P_EXPOSURE_SCALE = 41u;
+const uint P_HDR_HIGHLIGHT_AUTHORITY = 42u;
+const uint P_HDR_SHADOW_AUTHORITY = 43u;
+
+uint pU(uint i) { return paramsBuf.words[i]; }
+int pI(uint i) { return int(paramsBuf.words[i]); }
+float pF(uint i) { return uintBitsToFloat(paramsBuf.words[i]); }
+uint width() { return pU(P_WIDTH); }
+uint height() { return pU(P_HEIGHT); }
+
+float anchorRaw(uint index) {
+    uint packed = anchorBuf.anchorWords[index >> 1u];
+    return float((index & 1u) == 0u ? (packed & 0xffffu) : (packed >> 16u));
+}
+
+float supportRaw(uint index) {
+    uint packed = supportBuf.supportWords[index >> 1u];
+    return float((index & 1u) == 0u ? (packed & 0xffffu) : (packed >> 16u));
+}
+
+int cfaChannel(int x, int y) {
+    int px = x & 1;
+    int py = y & 1;
+    int cfa = int(pU(P_CFA));
+    if (cfa == 1) { if (py == 0 && px == 0) return 1; if (py == 0 && px == 1) return 0; if (py == 1 && px == 0) return 3; return 2; }
+    if (cfa == 2) { if (py == 0 && px == 0) return 1; if (py == 0 && px == 1) return 3; if (py == 1 && px == 0) return 0; return 2; }
+    if (cfa == 3) { if (py == 0 && px == 0) return 3; if (py == 0 && px == 1) return 2; if (py == 1 && px == 0) return 1; return 0; }
+    if (py == 0 && px == 0) return 0; if (py == 0 && px == 1) return 1; if (py == 1 && px == 0) return 2; return 3;
+}
+
+int mosaicPhase(int x, int y) { return ((y & 1) << 1) | (x & 1); }
+float blackAt(int x, int y) { return pF(P_BLACK0 + uint(mosaicPhase(x, y))); }
+float normalizedSignal(float raw, int x, int y) {
+    float black = clamp(blackAt(x, y), 0.0, max(0.0, pF(P_WHITE) - 1.0));
+    return clamp((raw - black) / max(1.0, pF(P_WHITE) - black), 0.0, 1.0);
+}
+float smooth01(float v) { float t = clamp(v, 0.0, 1.0); return t * t * (3.0 - 2.0 * t); }
+
+float staticProbabilityAt(int x, int y) {
+    uint cols = pU(P_STATIC_COLS);
+    uint rows = pU(P_STATIC_ROWS);
+    uint cell = pU(P_STATIC_CELL);
+    if (cols == 0u || rows == 0u || cell == 0u) return 0.0;
+    float gx = (float(clamp(x, 0, int(width()) - 1)) + 0.5) / float(cell) - 0.5;
+    float gy = (float(clamp(y, 0, int(height()) - 1)) + 0.5) / float(cell) - 0.5;
+    int x0 = clamp(int(floor(gx)), 0, int(cols) - 1);
+    int y0 = clamp(int(floor(gy)), 0, int(rows) - 1);
+    int x1 = min(int(cols) - 1, x0 + 1);
+    int y1 = min(int(rows) - 1, y0 + 1);
+    float tx = clamp(gx - float(x0), 0.0, 1.0);
+    float ty = clamp(gy - float(y0), 0.0, 1.0);
+    float a = clamp(staticBuf.values[uint(y0) * cols + uint(x0)], 0.0, 1.0);
+    float b = clamp(staticBuf.values[uint(y0) * cols + uint(x1)], 0.0, 1.0);
+    float c = clamp(staticBuf.values[uint(y1) * cols + uint(x0)], 0.0, 1.0);
+    float d = clamp(staticBuf.values[uint(y1) * cols + uint(x1)], 0.0, 1.0);
+    return clamp(mix(mix(a, b, tx), mix(c, d, tx), ty), 0.0, 1.0);
+}
+
+float localFusionAuthority(float staticP) {
+    float staticAuthority = pow(clamp(staticP, 0.0, 1.0), 1.35);
+    float confidence = smooth01(pF(P_FORWARD_BACK)) * smooth01(pF(P_MODEL_CONFIDENCE)) * smooth01(pF(P_MOTION_CONFIDENCE));
+    return clamp(staticAuthority * confidence, 0.0, 1.0);
+}
+
+float referenceVariance(int ch, float signalRef) {
+    return max(1.0e-12, pF(P_S0 + uint(ch)) * signalRef + pF(P_O0 + uint(ch)));
+}
+
+void initPixel(uint x, uint y) {
+    if (x >= width() || y >= height()) return;
+    uint idx = y * width() + x;
+    float anchor = anchorRaw(idx);
+    float anchorWeight = 1.0;
+    if (pU(P_SPECTRA) != 0u) {
+        int ch = cfaChannel(int(x), int(y));
+        float signal = normalizedSignal(anchor, int(x), int(y));
+        float variance = max(1.0e-12, pF(P_S0 + uint(ch)) * signal + pF(P_O0 + uint(ch)));
+        float inv = clamp(referenceVariance(ch, 0.18) / variance, 0.25, 4.0);
+        anchorWeight = 1.0 + pF(P_MODEL_CONFIDENCE) * pF(P_TEMPORAL_AUTHORITY) * (inv - 1.0);
+    }
+    accumBuf.values[idx] = anchor * anchorWeight;
+    weightBuf.values[idx] = anchorWeight;
+    weightSqBuf.values[idx] = anchorWeight * anchorWeight;
+    corrBuf.values[idx] = 0.0;
+}
+
+bool fusePixel(uint x, uint y) {
+    if (x >= width() || y >= height()) return false;
+    int dx = pI(P_DX);
+    int dy = pI(P_DY);
+    int sx = int(x) - dx;
+    int sy = int(y) - dy;
+    if (sx < 0 || sy < 0 || sx >= int(width()) || sy >= int(height())) return false;
+    uint idx = y * width() + x;
+    uint sidx = uint(sy) * width() + uint(sx);
+    float anchor = anchorRaw(idx);
+    float supportNative = supportRaw(sidx);
+    float support = supportNative;
+    float diff = abs(anchor - supportNative);
+    float weight = pF(P_SUPPORT_WEIGHT);
+    float relativeVarianceRatio = 1.0;
+    float localStatic = 1.0;
+
+    bool hdr = pU(P_HDR_ENABLED) != 0u;
+    float exposureScale = hdr ? clamp(pF(P_EXPOSURE_SCALE), 0.0625, 16.0) : 1.0;
+    float anchorBlack = clamp(blackAt(int(x), int(y)), 0.0, max(0.0, pF(P_WHITE) - 1.0));
+    float supportBlack = clamp(blackAt(sx, sy), 0.0, max(0.0, pF(P_WHITE) - 1.0));
+    float anchorRange = max(1.0, pF(P_WHITE) - anchorBlack);
+    float supportRange = max(1.0, pF(P_WHITE) - supportBlack);
+    float anchorSignal = clamp((anchor - anchorBlack) / anchorRange, 0.0, 1.0);
+    float supportNativeSignal = clamp((supportNative - supportBlack) / supportRange, 0.0, 1.0);
+    float supportAnchorSignal = hdr ? max(0.0, supportNativeSignal / exposureScale) : supportNativeSignal;
+    bool hdrHighlightSupport = hdr && pF(P_HDR_HIGHLIGHT_AUTHORITY) > 0.5;
+    bool hdrShadowSupport = hdr && pF(P_HDR_SHADOW_AUTHORITY) > 0.5;
+    bool hdrExposureBracketSupport = hdrHighlightSupport || hdrShadowSupport;
+    bool hdrTemporalMainSupport = hdr && !hdrExposureBracketSupport;
+
+    if (hdr) {
+        // Every HDR support is normalized into anchor-referred linear sensor radiance first.
+        // Main burst frames at the same/similar exposure then behave as a temporal SNR stack.
+        // Only typed auxiliary exposures are restricted to highlight/shadow source authority.
+        support = anchorBlack + supportAnchorSignal * anchorRange;
+        diff = abs(anchorSignal - clamp(supportAnchorSignal, 0.0, 1.0)) * anchorRange;
+        float mismatch = abs(anchorSignal - clamp(supportAnchorSignal, 0.0, 1.0));
+        float ghostConfidence = exp(-20.0 * mismatch * mismatch);
+
+        if (hdrExposureBracketSupport) {
+            float highlightAuthority = pF(P_HDR_HIGHLIGHT_AUTHORITY) *
+                smooth01((anchorSignal - 0.62) / 0.30) *
+                (1.0 - smooth01((supportNativeSignal - 0.90) / 0.08));
+            float shadowAuthority = pF(P_HDR_SHADOW_AUTHORITY) *
+                (1.0 - smooth01((anchorSignal - 0.05) / 0.28)) *
+                smooth01((supportNativeSignal - 0.015) / 0.12) *
+                (1.0 - smooth01((supportNativeSignal - 0.90) / 0.08));
+            float sourceAuthority = max(highlightAuthority, shadowAuthority);
+            if (sourceAuthority < 0.01) return false;
+            weight *= sourceAuthority * ghostConfidence;
+        } else {
+            // HDR Enhanced main frames deliberately share one exposure state. They must still
+            // contribute across the normal scene domain to improve SNR. Reject clipped samples
+            // and large normalized disagreements rather than silently discarding the whole frame.
+            if (anchorSignal >= 0.992 || supportNativeSignal >= 0.992) return false;
+            float temporalMismatchGate = clamp(0.10 - 0.055 * pF(P_STRICTNESS), 0.040, 0.10);
+            if (mismatch > temporalMismatchGate) return false;
+            weight *= ghostConfidence;
+        }
+    }
+
+    if (pU(P_SPECTRA) != 0u) {
+        localStatic = staticProbabilityAt(int(x), int(y));
+        float authority = localFusionAuthority(localStatic);
+        if (authority < 0.025) return false;
+        weight *= authority;
+        int ch = cfaChannel(int(x), int(y));
+        float adaptedS = pF(P_S0 + uint(ch)) * clamp(pF(P_ADAPT_S0 + uint(ch)), 0.75, 1.25);
+        float adaptedO = pF(P_O0 + uint(ch)) * clamp(pF(P_ADAPT_O0 + uint(ch)), 0.75, 1.25);
+        // Noise is measured in each source's native exposure domain. For HDR the comparison
+        // gate is transformed to anchor code values after exposure normalization.
+        float supportVariance = max(1.0e-12, adaptedS * supportNativeSignal + adaptedO);
+        float anchorVariance = max(1.0e-12, adaptedS * anchorSignal + adaptedO);
+        relativeVarianceRatio = clamp((supportVariance / max(exposureScale * exposureScale, 1.0e-4)) / anchorVariance, 0.10, 8.0);
+        float sigmaCode = sqrt(supportVariance) * supportRange / exposureScale;
+        float robustSigma = max(3.5 * sigmaCode, 1.5);
+        float rejectGate = max(8.0 * sigmaCode, anchorRange * ((hdrExposureBracketSupport) ? 0.035 : 0.012));
+        if ((!hdr || hdrTemporalMainSupport) && diff > rejectGate) return false;
+        if (hdrExposureBracketSupport && anchorSignal < 0.90 && diff > rejectGate) return false;
+        float normalized = diff / robustSigma;
+        float robustWeight = exp(-0.5 * normalized * normalized);
+        float inv = clamp(max(1.0e-12, adaptedS * 0.15 + adaptedO) / supportVariance, 0.25, 4.0);
+        float modelWeight = 1.0 + pF(P_MODEL_CONFIDENCE) * pF(P_TEMPORAL_AUTHORITY) * (inv - 1.0);
+        weight *= robustWeight * modelWeight;
+    } else if (!hdr || hdrTemporalMainSupport) {
+        float fallbackMaxDiff = pF(P_WHITE) * clamp(
+            hdrTemporalMainSupport ? (0.10 - 0.055 * pF(P_STRICTNESS)) : (0.35 - 0.22 * pF(P_STRICTNESS)),
+            hdrTemporalMainSupport ? 0.040 : 0.08,
+            hdrTemporalMainSupport ? 0.10 : 0.35
+        );
+        if (diff > fallbackMaxDiff) return false;
+    }
+
+    if (weight < 0.01) return false;
+    accumBuf.values[idx] += support * weight;
+    weightBuf.values[idx] += weight;
+    weightSqBuf.values[idx] += weight * weight * relativeVarianceRatio;
+    if (pU(P_SPECTRA) != 0u) {
+        corrBuf.values[idx] += weight * pF(P_MEAN_CORRELATION) * localStatic;
+    }
+    return true;
+}
+
+float hdrReconstruct(float rawValue, uint pixelIndex) {
+    if (pU(P_HDR_ENABLED) == 0u) return rawValue;
+    int x = int(pixelIndex % width());
+    int y = int(pixelIndex / width());
+    float black = clamp(blackAt(x, y), 0.0, max(0.0, pF(P_WHITE) - 1.0));
+    float range = max(1.0, pF(P_WHITE) - black);
+    float signal = max(0.0, (rawValue - black) / range);
+
+    // Global reconstruction keeps black fixed and leaves normal midtones nearly unchanged.
+    // Confident underexposed sources can carry radiance > 1.0; compress only the recovered
+    // shoulder into displayable sensor-code headroom instead of clipping it away.
+    float reconstructed = signal;
+    if (signal > 0.72) {
+        reconstructed = 0.72 + 0.275 * (1.0 - exp(-(signal - 0.72) / 0.62));
+    } else if (signal < 0.30) {
+        // Mild shadow reconstruction after high-exposure source selection. Multiplicative form
+        // preserves the true black point and avoids the synthetic lifted-black HDR look.
+        float t = 1.0 - smooth01(signal / 0.30);
+        reconstructed = signal * (1.0 + 0.16 * t);
+    }
+    return black + clamp(reconstructed, 0.0, 0.995) * range;
+}
+
+void finalizeWord(uint wordIndex) {
+    uint totalPixels = width() * height();
+    uint pixel0 = wordIndex * 2u;
+    if (pixel0 >= totalPixels) return;
+    float w0 = max(1.0e-6, weightBuf.values[pixel0]);
+    float raw0 = accumBuf.values[pixel0] / w0;
+    uint v0 = uint(clamp(round(hdrReconstruct(raw0, pixel0)), 0.0, 65535.0));
+    uint v1 = 0u;
+    if (pixel0 + 1u < totalPixels) {
+        float w1 = max(1.0e-6, weightBuf.values[pixel0 + 1u]);
+        float raw1 = accumBuf.values[pixel0 + 1u] / w1;
+        v1 = uint(clamp(round(hdrReconstruct(raw1, pixel0 + 1u)), 0.0, 65535.0));
+    }
+    finalBuf.words[wordIndex] = (v0 & 0xffffu) | ((v1 & 0xffffu) << 16u);
+
+    atomicMin(finalStatsBuf.values[0], v0);
+    atomicMax(finalStatsBuf.values[1], v0);
+    if (v0 >= uint(max(1.0, pF(P_WHITE)))) atomicAdd(finalStatsBuf.values[2], 1u);
+    if (pixel0 + 1u < totalPixels) {
+        atomicMin(finalStatsBuf.values[0], v1);
+        atomicMax(finalStatsBuf.values[1], v1);
+        if (v1 >= uint(max(1.0, pF(P_WHITE)))) atomicAdd(finalStatsBuf.values[2], 1u);
+    }
+}
+
+void sampleFusionStats(uint sx, uint sy) {
+    uint sampleCols = pU(P_SAMPLE_COLS);
+    uint sampleRows = pU(P_SAMPLE_ROWS);
+    if (sx >= sampleCols || sy >= sampleRows) return;
+    uint stride = max(1u, pU(P_SAMPLE_STRIDE));
+    uint x = min(width() - 1u, sx * stride);
+    uint y = min(height() - 1u, sy * stride);
+    uint idx = y * width() + x;
+    float totalWeight = max(1.0e-6, weightBuf.values[idx]);
+    float independent = clamp(weightSqBuf.values[idx] / (totalWeight * totalWeight), 0.02, 1.0);
+    float supportWeight = max(0.0, totalWeight - 1.0);
+    if (pU(P_SPECTRA) != 0u) {
+        float anchor = anchorRaw(idx);
+        int ch = cfaChannel(int(x), int(y));
+        float signal = normalizedSignal(anchor, int(x), int(y));
+        float variance = max(1.0e-12, pF(P_S0 + uint(ch)) * signal + pF(P_O0 + uint(ch)));
+        float inv = clamp(referenceVariance(ch, 0.18) / variance, 0.25, 4.0);
+        float anchorWeight = 1.0 + pF(P_MODEL_CONFIDENCE) * pF(P_TEMPORAL_AUTHORITY) * (inv - 1.0);
+        supportWeight = max(0.0, totalWeight - anchorWeight);
+    }
+    float rho = supportWeight > 1.0e-5 ? clamp(corrBuf.values[idx] / supportWeight, 0.0, 0.95) : 0.0;
+    float localScale = clamp(independent + rho * (1.0 - independent), independent, 1.0);
+    float effective = 1.0 / max(0.02, localScale);
+    uint outIdx = sy * sampleCols + sx;
+    statsBuf.records[outIdx] = vec4(localScale, effective, supportWeight > 1.0e-5 ? 0.0 : 1.0, totalWeight);
+}
+
+shared uint workgroupContributionCount;
+
+void main() {
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    if (pc.mode == 0u) { initPixel(x, y); return; }
+    if (pc.mode == 1u) {
+        if (gl_LocalInvocationIndex == 0u) workgroupContributionCount = 0u;
+        barrier();
+        bool contributed = fusePixel(x, y);
+        if (contributed) atomicAdd(workgroupContributionCount, 1u);
+        barrier();
+        if (gl_LocalInvocationIndex == 0u && workgroupContributionCount > 0u) {
+            atomicAdd(finalStatsBuf.values[3], workgroupContributionCount);
+        }
+        return;
+    }
+    if (pc.mode == 2u) {
+        if (gl_LocalInvocationID.y != 0u || gl_GlobalInvocationID.y != 0u) return;
+        finalizeWord(x);
+        return;
+    }
+    if (pc.mode == 3u) { sampleFusionStats(x, y); return; }
+}

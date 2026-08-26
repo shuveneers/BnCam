@@ -1,0 +1,113 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer InputRgbBuffer {
+    vec4 inputPixels[];
+};
+
+layout(std430, set = 0, binding = 1) buffer OutputRgbBuffer {
+    vec4 outputPixels[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+    float sharpeningAmount; // Physical/noise-aware base amount from the ISP planner.
+    float edgeThreshold;    // Physical noise floor threshold.
+    float detailAmount;     // Lightroom Detail Amount, 0..1.
+    float detailRadius;     // Lightroom Detail Radius, 0.5..3.0.
+    float detailValue;      // Lightroom Detail, 0..1.
+    float detailMasking;    // Lightroom Detail Masking, 0..1.
+    uint spectraNoiseActive;
+} pc;
+
+float centeredDetailDelta(float value, float center, float minimum, float maximum) {
+    if (value >= center) return clamp((value - center) / max(maximum - center, 1.0e-6), 0.0, 1.0);
+    return clamp((value - center) / max(center - minimum, 1.0e-6), -1.0, 0.0);
+}
+
+float getLuma(vec3 rgb) {
+    return 0.2126 * rgb.r + 0.7152 * rgb.g + 0.0722 * rgb.b;
+}
+
+vec3 fetchPixel(int x, int y) {
+    int cx = clamp(x, 0, int(pc.width) - 1);
+    int cy = clamp(y, 0, int(pc.height) - 1);
+    return inputPixels[cy * int(pc.width) + cx].rgb;
+}
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= int(pc.width) || y >= int(pc.height)) return;
+
+    int pixelIdx = y * int(pc.width) + x;
+    vec3 centerRgb = inputPixels[pixelIdx].rgb;
+    float centerLuma = getLuma(centerRgb);
+
+    // 3x3 Luma sampling
+    float y_m1_m1 = getLuma(fetchPixel(x - 1, y - 1));
+    float y_0_m1  = getLuma(fetchPixel(x,     y - 1));
+    float y_p1_m1 = getLuma(fetchPixel(x + 1, y - 1));
+    float y_m1_0  = getLuma(fetchPixel(x - 1, y));
+    float y_p1_0  = getLuma(fetchPixel(x + 1, y));
+    float y_m1_p1 = getLuma(fetchPixel(x - 1, y + 1));
+    float y_0_p1  = getLuma(fetchPixel(x,     y + 1));
+    float y_p1_p1 = getLuma(fetchPixel(x + 1, y + 1));
+
+    float sumNeighbor3x3 = (y_m1_m1 + y_0_m1 + y_p1_m1 + y_m1_0 + y_p1_0 + y_m1_p1 + y_0_p1 + y_p1_p1);
+    float avg3x3 = sumNeighbor3x3 / 8.0;
+
+    // 5x5 Luma sampling for Mid Frequency Detail
+    float sumNeighbor5x5 = sumNeighbor3x3;
+    for (int dy = -2; dy <= 2; ++dy) {
+        for (int dx = -2; dx <= 2; ++dx) {
+            if (abs(dx) == 2 || abs(dy) == 2) {
+                sumNeighbor5x5 += getLuma(fetchPixel(x + dx, y + dy));
+            }
+        }
+    }
+    float avg5x5 = sumNeighbor5x5 / 24.0;
+
+    // Multi-frequency bands
+    float hpHigh = centerLuma - avg3x3;       // High frequency detail (micro texture)
+    float mpMid = avg3x3 - avg5x5;            // Mid frequency detail (structures)
+    float lpLow = avg5x5 - centerLuma * 0.95; // Low frequency contrast
+
+    // Sobel 3x3 gradient magnitude for edge structure confidence
+    float gx = (y_p1_m1 + 2.0 * y_p1_0 + y_p1_p1) - (y_m1_m1 + 2.0 * y_m1_0 + y_m1_p1);
+    float gy = (y_m1_p1 + 2.0 * y_0_p1 + y_p1_p1) - (y_m1_m1 + 2.0 * y_0_m1 + y_p1_m1);
+    float edgeEnergy = sqrt(gx * gx + gy * gy);
+
+    // Noise Probability vs Structure Confidence from local energy
+    float noiseThreshold = max(pc.edgeThreshold, 0.005);
+    float structureConfidence = smoothstep(noiseThreshold * 1.2, noiseThreshold * 3.5, edgeEnergy);
+    float noiseProbability = 1.0 - smoothstep(noiseThreshold * 0.5, noiseThreshold * 2.2, abs(hpHigh) + edgeEnergy * 0.4);
+
+    // Noise Gate: In regions of high noise probability, strongly suppress sharpening so removed noise is NEVER recreated!
+    float noiseGate = clamp(1.0 - 0.90 * noiseProbability, 0.05, 1.0);
+
+    float amountControl = clamp(pc.detailAmount, 0.0, 1.0);
+    float radiusDelta = centeredDetailDelta(clamp(pc.detailRadius, 0.50, 3.00), 1.0, 0.5, 3.0);
+    float textureDelta = centeredDetailDelta(clamp(pc.detailValue, 0.0, 1.0), 0.25, 0.0, 1.0);
+    float fineBias = clamp(-0.20 + 0.55 * textureDelta - 0.20 * radiusDelta, -1.0, 1.0);
+    float midBias = clamp(0.08 + 0.25 * textureDelta + 0.30 * radiusDelta, -1.0, 1.0);
+    float broadBias = clamp(0.45 * radiusDelta, -1.0, 1.0);
+    float edgeBias = clamp(-0.10 + 0.25 * textureDelta, -1.0, 1.0);
+    float fineGain = max(0.0, 1.0 + fineBias * 1.20) * noiseGate;
+    float midGain = max(0.0, 1.0 + midBias * 1.00) * noiseGate;
+    float broadGain = max(0.0, 1.0 + broadBias * 0.70);
+    float edgeGain = max(0.0, 1.0 + edgeBias * 1.40) * structureConfidence;
+
+    float combinedDelta = (hpHigh * fineGain) + (mpMid * midGain) +
+                          (lpLow * broadGain * 0.15) + (hpHigh * edgeGain);
+
+    float overshootGuard = clamp(0.45 + 0.55 * clamp(pc.detailMasking, 0.0, 1.0), 0.0, 1.0);
+    float maxOvershoot = 0.07 * (1.0 - 0.65 * overshootGuard);
+    combinedDelta = clamp(combinedDelta, -maxOvershoot, maxOvershoot);
+
+    float baseSharpenAmount = max(pc.sharpeningAmount, 0.10) * clamp(2.25 * amountControl, 0.0, 2.0);
+    vec3 sharpenedRgb = centerRgb + centerRgb * (combinedDelta * baseSharpenAmount);
+
+    outputPixels[pixelIdx] = vec4(max(vec3(0.0), sharpenedRgb), 1.0);
+}

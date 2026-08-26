@@ -1,0 +1,14 @@
+RAW_CADENCE source=RAW10 generation=3
+uniqueSourceFrames=360 uniqueProcessedFrames=359 uniqueDrawnFrames=358 actualPresentedFrames=355
+uniqueSourceFps=30.00750187546887 processingFps=30.001533216622594 presentationFps=29.918170722516507 presentationClock=EGL_DISPLAY_PRESENT_TIME_ANDROID
+advertisedMinFrameDurationMs=33.325557 requestedFpsRanges=10:30 duplicateOffers=358 duplicateOffersRejected=0
+sourceSensorIntervalsMs=count=359,mean=33.325,sd=0.000,min=33.325,p10=33.325,p50=33.325,p90=33.325,p95=33.325,p99=33.325,max=33.325
+sourceArrivalIntervalsMs=count=359,mean=33.327,sd=2.973,min=13.062,p10=31.017,p50=33.461,p90=35.637,p95=36.936,p99=39.566,max=53.570
+reportedSensorFrameDurationMs=count=358,mean=33.326,sd=0.000,min=33.326,p10=33.326,p50=33.326,p90=33.326,p95=33.326,p99=33.326,max=33.326
+exposureTimeMs=count=358,mean=30.000,sd=0.000,min=30.000,p10=30.000,p50=30.000,p90=30.000,p95=30.000,p99=30.000,max=30.000
+processingCompletionIntervalsMs=count=358,mean=33.332,sd=8.167,min=8.056,p10=27.462,p50=33.178,p90=38.651,p95=48.695,p99=63.194,max=69.999
+presentationIntervalsMs=count=354,mean=33.425,sd=10.092,min=8.297,p10=16.596,p50=33.190,p90=49.778,p95=49.792,p99=66.377,max=66.384
+rawProcessDurationMs=count=359,mean=8.698,sd=1.722,min=6.186,p10=6.808,p50=8.623,p90=10.665,p95=11.121,p99=12.079,max=27.802
+glUploadDurationMs=count=358,mean=0.658,sd=0.359,min=0.331,p10=0.428,p50=0.534,p90=1.026,p95=1.403,p99=2.131,max=2.792
+sensorToDrawSubmitMs=count=358,mean=124.377,sd=12.836,min=54.291,p10=106.062,p50=127.761,p90=134.513,p95=135.403,p99=138.578,max=143.667
+sensorToDisplayPresentMs=count=355,mean=169.974,sd=16.241,min=70.301,p10=152.844,p50=174.525,p90=181.464,p95=182.505,p99=187.100,max=197.275

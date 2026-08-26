@@ -1,0 +1,9 @@
+VULKAN VALIDATION
+Total messages: 1
+Unique messages: 1
+Dropped messages: 0
+
+[INFO] [GENERAL] VUID-BnCam-SelfTest (999999)
+BnCam Vulkan validation self-test message: callback and collector operational.
+fingerprint=6b0213f791f4bafa repeatCount=1
+  object type=1 name=BnCamVulkanInstance

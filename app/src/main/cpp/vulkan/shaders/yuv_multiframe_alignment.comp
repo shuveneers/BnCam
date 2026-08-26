@@ -1,0 +1,121 @@
+#version 450
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer AnchorLumaBuffer {
+    uint anchorWords[];
+};
+layout(std430, set = 0, binding = 1) readonly buffer SupportLumaBuffer {
+    uint supportWords[];
+};
+layout(std430, set = 0, binding = 2) writeonly buffer CandidateScoresBuffer {
+    float scores[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+    int minDx;
+    int minDy;
+    uint candidateCols;
+    uint candidateRows;
+    uint sampleStep;
+    uint border;
+} pc;
+
+shared float sA[64];
+shared float sB[64];
+shared float sAA[64];
+shared float sBB[64];
+shared float sAB[64];
+shared float sN[64];
+
+float loadAnchorByte(uint pixelIndex) {
+    uint word = anchorWords[pixelIndex >> 2u];
+    uint shift = (pixelIndex & 3u) * 8u;
+    return float((word >> shift) & 0xffu);
+}
+
+float loadSupportByte(uint pixelIndex) {
+    uint word = supportWords[pixelIndex >> 2u];
+    uint shift = (pixelIndex & 3u) * 8u;
+    return float((word >> shift) & 0xffu);
+}
+
+void main() {
+    uint candidate = gl_WorkGroupID.x;
+    uint candidateCount = pc.candidateCols * pc.candidateRows;
+    if (candidate >= candidateCount) return;
+
+    int dx = pc.minDx + int(candidate % pc.candidateCols);
+    int dy = pc.minDy + int(candidate / pc.candidateCols);
+    uint lane = gl_LocalInvocationID.x;
+
+    float sumA = 0.0;
+    float sumB = 0.0;
+    float sumAA = 0.0;
+    float sumBB = 0.0;
+    float sumAB = 0.0;
+    float count = 0.0;
+
+    uint step = max(pc.sampleStep, 1u);
+    uint x0 = pc.border;
+    uint y0 = pc.border;
+    uint x1 = pc.width > pc.border ? pc.width - pc.border : 0u;
+    uint y1 = pc.height > pc.border ? pc.height - pc.border : 0u;
+    uint cols = x1 > x0 ? ((x1 - x0 + step - 1u) / step) : 0u;
+    uint rows = y1 > y0 ? ((y1 - y0 + step - 1u) / step) : 0u;
+    uint samples = cols * rows;
+
+    for (uint sampleIndex = lane; sampleIndex < samples; sampleIndex += 64u) {
+        uint sx = sampleIndex % cols;
+        uint sy = sampleIndex / cols;
+        int x = int(x0 + sx * step);
+        int y = int(y0 + sy * step);
+        int supportX = x - dx; // OpenCV warpAffine translation convention.
+        int supportY = y - dy;
+        if (supportX < 0 || supportY < 0 || supportX >= int(pc.width) || supportY >= int(pc.height)) continue;
+        uint anchorIndex = uint(y) * pc.width + uint(x);
+        uint supportIndex = uint(supportY) * pc.width + uint(supportX);
+        float a = loadAnchorByte(anchorIndex);
+        float b = loadSupportByte(supportIndex);
+        sumA += a;
+        sumB += b;
+        sumAA += a * a;
+        sumBB += b * b;
+        sumAB += a * b;
+        count += 1.0;
+    }
+
+    sA[lane] = sumA;
+    sB[lane] = sumB;
+    sAA[lane] = sumAA;
+    sBB[lane] = sumBB;
+    sAB[lane] = sumAB;
+    sN[lane] = count;
+    barrier();
+
+    for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            sA[lane] += sA[lane + stride];
+            sB[lane] += sB[lane + stride];
+            sAA[lane] += sAA[lane + stride];
+            sBB[lane] += sBB[lane + stride];
+            sAB[lane] += sAB[lane + stride];
+            sN[lane] += sN[lane + stride];
+        }
+        barrier();
+    }
+
+    if (lane == 0u) {
+        float n = sN[0];
+        float score = -1.0;
+        if (n >= 64.0) {
+            float covariance = sAB[0] - (sA[0] * sB[0] / n);
+            float varA = max(0.0, sAA[0] - (sA[0] * sA[0] / n));
+            float varB = max(0.0, sBB[0] - (sB[0] * sB[0] / n));
+            float denom = sqrt(max(varA * varB, 1.0e-12));
+            score = denom > 0.0 ? covariance / denom : -1.0;
+        }
+        scores[candidate] = score;
+    }
+}

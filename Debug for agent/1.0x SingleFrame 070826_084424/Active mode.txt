@@ -1,0 +1,82 @@
+========================================================================
+BNCAM ACTIVE MODE DEBUG
+========================================================================
+
+
+------------------------------------------------------------------------
+[1] Mode Identity
+------------------------------------------------------------------------
+  Selected mode:                     Single frame (Near ZSL)
+  Mode family:                       Single Frame
+  Runner:                            SingleFrameRunner
+  Frame source:                      RAW10
+  Capture succeeded:                 yes
+  Debug scope:                       shot_folder_only
+
+------------------------------------------------------------------------
+[2] Route Decision
+------------------------------------------------------------------------
+  Requested mode:                    SINGLE_FRAME_ZSL
+  Resolved route:                    CAMERA2_RAW10_WARM_BUFFER_SINGLE_FRAME
+  Actual route:                      CAMERA2_RAW10_WARM_BUFFER_SINGLE_FRAME
+  Fallback used:                     no
+  Route analysis:                    RAW10 -> untouched OriginalMasterRaw16 (DNG) + JPEG-only LinearFloatRaw normalization -> demosaic/render
+
+------------------------------------------------------------------------
+[3] Frame Selection
+------------------------------------------------------------------------
+  Base position:                     Auto
+  Candidates analyzed:               4
+  Primary bias:                      BALANCED via base_bias
+  Temporal bias:                     +0.00
+  Selected anchor:                   Frame 1
+  Anchor delta to shutter:           -27.936 ms
+  Anchor timing:                     PRE_SHUTTER
+  Anchor reason:                     genuine_near_zsl_highest_weighted_score_bias_balanced
+
+  Streamlined Frame Table:
+  Frame | Sharpness | Motion  | EV      | Align   | Delta (ms) | Decision Summary
+  ------------------------------------------------------------------------------
+  1   * | 0.1124    | 0.8422  | 0.6713  | 0.8487  |    -27.936 | ACCEPTED_ANCHOR / genuine_near_zsl_highest_weighted_score_bias_balanced
+  2     | 0.1124    | 0.8422  | 0.6688  | 0.6682  |    -61.261 | REJECTED / Lower weighted selection score
+  3     | 0.1122    | 0.8422  | 0.6701  | 0.4877  |    -94.586 | REJECTED / Lower weighted selection score
+  4     | 0.1110    | 0.8422  | 0.6689  | 0.3500  |   -127.911 | REJECTED / Rejected by shutter-relative freshness gate
+
+
+------------------------------------------------------------------------
+[4] Selection Rules
+------------------------------------------------------------------------
+  Frame bias:                        BALANCED
+  Accept all frames:                 no
+  Reject duplicates:                 yes
+  Alignable only:                    no
+  Discard first frame:               no
+  Prefer recent:                     no
+  Ignore stale frames:               yes
+
+------------------------------------------------------------------------
+[5] Effective Settings
+------------------------------------------------------------------------
+
+  Lens Hardware Settings
+    No lens hardware settings were recorded.
+
+  Resolved ISP Settings
+    No resolved ISP settings were recorded.
+
+  Quality Config
+    No quality config was recorded.
+
+  Common Post-Render
+    No common post-render runtime mapping was recorded.
+
+  Output Encode
+    No output encode runtime mapping was recorded.
+
+------------------------------------------------------------------------
+[6] Processing Path
+------------------------------------------------------------------------
+  Route:                             RAW10 Bayer anchor -> native ISP -> JPEG
+  Merge domain:                      single RAW master
+  OpenCV available:                  yes
+  Analysis source:                   RAW10 native_pixel_plus_capture_metadata_scoring

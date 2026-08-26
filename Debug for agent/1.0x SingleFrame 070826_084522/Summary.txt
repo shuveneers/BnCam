@@ -1,0 +1,132 @@
+========================================================================
+BNCAM SHOT DEBUG
+========================================================================
+
+
+------------------------------------------------------------------------
+[1] Shot Overview
+------------------------------------------------------------------------
+  Shot ID:                           1.0x SingleFrame 070826_084522
+  Started:                           2026-08-07T08:45:22.596Z
+  Completed:                         2026-08-07T08:45:33.795Z
+  Capture succeeded:                 yes
+  Selected mode:                     Single frame (Near ZSL)
+  Actual runner:                     SingleFrameRunner
+  Frame source:                      RAW10
+  Fallback used:                     no
+
+------------------------------------------------------------------------
+[2] Camera / Lens Truth
+------------------------------------------------------------------------
+  Camera ID:                         2
+  Lens name:                         1.0x
+  Lens facing:                       BACK
+  Physical camera ID:                not reported
+  Sensor orientation:                90°
+  Output rotation:                   90°
+
+------------------------------------------------------------------------
+[3] Route Truth
+------------------------------------------------------------------------
+  Profile:                           Profile 1
+  Profile ID:                        2_profile_1
+  Requested mode:                    SINGLE_FRAME_ZSL
+  Requested mode label:              Single frame (Near ZSL)
+  Preferred frame setting:           RAW10
+  Resolved route:                    CAMERA2_RAW10_WARM_BUFFER_SINGLE_FRAME
+  Actual route:                      CAMERA2_RAW10_WARM_BUFFER_SINGLE_FRAME
+  Runner:                            SingleFrameRunner
+
+  Metering Validation
+  currentPipelineGeneration:         32
+  currentSubmittedControlRequestEpochAtShutter: 6
+  selectedFramePipelineGeneration:   32
+  selectedFrameControlRequestEpoch:  5
+  selectedFrameProvenanceExact:      true
+  selectedFrameProvenanceStatus:     EXACT_FRAME_REQUEST_RESULT_PROVENANCE
+  selectedRequestSubmissionType:     REPEATING
+  selectedRequestSubmissionReason:   TAP_AF_AE_REPEATING
+  selectedRequestSnapshot:           pipelineGeneration=32 controlRequestEpoch=5 submissionType=REPEATING submissionReason=TAP_AF_AE_REPEATING submittedElapsedRealtimeNs=1130471773405348 aeRegions=[(1349,1380,1839,1870,w=1000)] afRegions=[(1349,1380,1839,1870,w=1000)] controlMode=1 controlSceneMode=1 captureIntent=1 aeMode=1 aeLock=false aeExposureCompensation=0 aePrecaptureTrigger=0 aeAntibandingMode=3 afMode=1 afTrigger=0 flashMode=0 sensorSensitivityIso=250 sensorExposureTimeNs=16666667 sensorFrameDurationNs=0 lensFocusDistance=0.0 aeTargetFps=10:30 cropRegion=ImmutableRectSnapshot(left=0, top=0, right=4096, bottom=3072) zoomRatio=1.0 meteringPolicySummary=mode=Matrix;source=five_zone_evaluative;supported=true;regionCount=1;weights=[500];faceOverride=false;appliedRegionCount=1;crop=Rect(0, 0 - 4096, 3072) exposurePolicySummary=mode=AUTO;iso=auto;exposureNs=auto;isoSource=camera_ae;exposureSource=camera_ae;pendingReason=none
+  meteringRequested:                 true
+  aeRequestedRegionCount:            1
+  aeActualRegionCount:               1
+  aeRegionTruncatedByDriver:         false
+  aeCoreRegionMatched:               true
+  aeContextRegionDropped:            false
+  afRequestedRegionCount:            1
+  afActualRegionCount:               1
+  afRegionsRequiredForExact:         true
+  afRegionsMatchedForExact:          true
+  meteringAppliedExact:              true
+  meteringAppliedPartial:            false
+  meteringAppliedToSelectedFrame:    true
+  meteringAppliedStatus:             exact
+  selectedFrameSourceRequestType:    repeating
+  meteringAppliedToRepeatingRequestStatus: exact
+  meteringAppliedToStillRequestStatus: not_applicable_near_zsl_repeating_frame
+  aeValidationCoordinateSpace:       SENSOR_ACTIVE_ARRAY
+  aeActiveArraySize:                 [0,0,4096,3072]
+  aeMeteringCropRegion:              [0,0,4096,3072]
+
+------------------------------------------------------------------------
+[4] Buffer / Format Truth
+------------------------------------------------------------------------
+  Buffer format:                     RAW10
+  Capture size:                      4096 x 3072
+  Output size:                       4096 x 3072
+  Selected capture frame:            Frame 1
+
+  ImageReader / Buffer
+  imageReaderMaxImages:              27
+  configuredBufferCapacity:          25
+  ringBufferCapacity:                25
+  framesReceived:                    122
+  acquiredImageCount:                122
+  completePairCountAtShutter:        24
+  completedPairCountTotal:           121
+  ringRetainedCountAtShutter:        25
+  framesEligible:                    4
+  framesScored:                      4
+  framesRejectedStale:               0
+  framesDroppedByImageReaderMeasured: false
+  framesDroppedByImageReader:        unknown
+  imageReaderAcquireFailureCount:    0
+  imageReaderBackpressureDetected:   false
+  ringBufferOverwriteCount:          97
+  ringBufferOverwriteObserved:       true
+  ringBufferOverwriteExpected:       not_inferred_from_acquired_image_count
+  framesDroppedByRingBuffer:         100
+  completePairsOverwritten:          100
+  framesRejectedGeneration:          0
+  bufferBackpressureDetected:        false
+  oldestFrameAgeMs:                  122.6
+  newestFrameAgeMs:                  22.6
+  selectedDeltaMs:                   -22.6
+  Candidate Frames Analyzed:         4
+  Selected Anchor Rank:              1
+  Selected Anchor Timestamp:         1130472329287098
+
+------------------------------------------------------------------------
+[5] Output / Save Result
+------------------------------------------------------------------------
+  Public filename:                   IMG_BNC_20260807_084522_766.jpg
+  JPEG created:                      yes
+  JPEG bytes:                        6534720
+  Saved output path:                 content://media/external/images/media/67356
+  Save location setting:             DCIM/BnCam
+  EXIF/GPS added:                    no
+
+------------------------------------------------------------------------
+[6] Timing
+------------------------------------------------------------------------
+  Total shot time:                   11193 ms
+  Camera capture time:               0 ms
+  Render / ISP time:                 10936 ms
+  JPEG encode time:                  48 ms
+  Save time:                         76 ms
+
+------------------------------------------------------------------------
+[7] Warnings / Errors
+------------------------------------------------------------------------
+  Recorded warning count:            1
+  INFO: [Frame Source Warnings] Analysis delegated to C++ native layer (HardwareBuffer).

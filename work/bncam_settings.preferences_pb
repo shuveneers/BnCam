@@ -1,0 +1,21 @@
+
+
+slot_Main_id*2
+
+slot_Ultra wide_id*4
+
+slot_Tele_id*5
+
+slot_Front_id*1
+"
+lens_auto_assignment_version
+6
+stabilization_status*Preview stabilization active
+"
+active_profile_id*2_profile_1
++
+ profile_frame_source_2_profile_1*RAW10
+
+	vf_stream*SELECTED_BUFFER
+
+active_lens_id*2

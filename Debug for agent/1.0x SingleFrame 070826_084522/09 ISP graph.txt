@@ -1,0 +1,5 @@
+ISP EXECUTION
+=============
+demosaic: requested=Auto; supported=true; resolved=AUTO_SCENE_ADAPTIVE_NATIVE; executed=not_recorded; result=IMPLEMENTED; fallback=false; reason=auto_requires_native_scene_analysis
+computeBackend: cpu_native_opencv
+executedDemosaic: requested=Auto; supported=true; resolved=AUTO_SCENE_ADAPTIVE_NATIVE; executed=MALVAR_2004; result=jpeg_rendered; fallback=false; reason=legacy_mode

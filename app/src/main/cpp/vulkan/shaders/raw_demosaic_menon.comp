@@ -1,0 +1,70 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer LinearRawBuffer {
+    float rawPixels[];
+};
+
+layout(std430, set = 0, binding = 1) buffer LinearRgbOutputBuffer {
+    vec4 rgbOutputPixels[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+    uint cfaPattern;
+} pc;
+
+float getRawPixel(int x, int y) {
+    int cx = clamp(x, 0, int(pc.width) - 1);
+    int cy = clamp(y, 0, int(pc.height) - 1);
+    return rawPixels[cy * int(pc.width) + cx];
+}
+
+uint getCfaChannel(int x, int y, uint pattern) {
+    uint xm = uint(x) & 1u;
+    uint ym = uint(y) & 1u;
+    if (pattern == 0u) { // RGGB
+        return (ym == 0u) ? ((xm == 0u) ? 0u : 1u) : ((xm == 0u) ? 2u : 3u);
+    } else if (pattern == 1u) { // GRBG
+        return (ym == 0u) ? ((xm == 0u) ? 1u : 0u) : ((xm == 0u) ? 3u : 2u);
+    } else if (pattern == 2u) { // GBRG
+        return (ym == 0u) ? ((xm == 0u) ? 1u : 3u) : ((xm == 0u) ? 0u : 2u);
+    } else { // BGGR
+        return (ym == 0u) ? ((xm == 0u) ? 3u : 1u) : ((xm == 0u) ? 2u : 0u);
+    }
+}
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= int(pc.width) || y >= int(pc.height)) return;
+
+    uint ch = getCfaChannel(x, y, pc.cfaPattern);
+    float C = getRawPixel(x, y);
+
+    // Menon Demosaicing (Directional DDFAPD adaptive directional interpolation)
+    float dH = abs(getRawPixel(x-1, y) - getRawPixel(x+1, y)) + abs(2.0*C - getRawPixel(x-2, y) - getRawPixel(x+2, y));
+    float dV = abs(getRawPixel(x, y-1) - getRawPixel(x, y+1)) + abs(2.0*C - getRawPixel(x, y-2) - getRawPixel(x, y+2));
+
+    float gH = (getRawPixel(x-1, y) + getRawPixel(x+1, y))*0.5 + (2.0*C - getRawPixel(x-2, y) - getRawPixel(x+2, y))*0.25;
+    float gV = (getRawPixel(x, y-1) + getRawPixel(x, y+1))*0.5 + (2.0*C - getRawPixel(x, y-2) - getRawPixel(x, y+2))*0.25;
+
+    float g = (dH < dV) ? gH : gV;
+    float r = 0.0, b = 0.0;
+
+    if (ch == 0u) { // Red
+        r = C;
+        b = (getRawPixel(x-1,y-1)+getRawPixel(x+1,y-1)+getRawPixel(x-1,y+1)+getRawPixel(x+1,y+1))*0.25;
+    } else if (ch == 1u || ch == 2u) { // Green
+        g = C;
+        r = (getRawPixel(x-1,y) + getRawPixel(x+1,y))*0.5;
+        b = (getRawPixel(x,y-1) + getRawPixel(x,y+1))*0.5;
+    } else { // Blue
+        b = C;
+        r = (getRawPixel(x-1,y-1)+getRawPixel(x+1,y-1)+getRawPixel(x-1,y+1)+getRawPixel(x+1,y+1))*0.25;
+    }
+
+    uint pixelIdx = uint(y) * pc.width + uint(x);
+    rgbOutputPixels[pixelIdx] = vec4(r, g, b, 1.0);
+}

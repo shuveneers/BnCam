@@ -1,0 +1,66 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer InputRgbBuffer {
+    vec4 inputPixels[]; // Rendered RGBA float pixels (width x height)
+};
+
+layout(std430, set = 0, binding = 1) buffer OutputBgrBuffer {
+    uint outputBgrWords[]; // Quantized 8-bit BGR byte packed array for JPEG encoder
+};
+
+layout(push_constant) uniform PushConstants {
+    uint inputWidth;
+    uint inputHeight;
+    uint cropX;
+    uint cropY;
+    uint cropWidth;
+    uint cropHeight;
+    uint outputWidth;  // Rotated output width
+    uint outputHeight; // Rotated output height
+    uint rotation;     // 0 = 0 deg, 1 = 90 deg, 2 = 180 deg, 3 = 270 deg
+} pc;
+
+void main() {
+    uint outX = gl_GlobalInvocationID.x;
+    uint outY = gl_GlobalInvocationID.y;
+    if (outX >= pc.outputWidth || outY >= pc.outputHeight) return;
+
+    // Inverse Rotation Mapping: Map target rotated output (outX, outY) to cropped input (srcLocalX, srcLocalY)
+    uint srcLocalX = outX;
+    uint srcLocalY = outY;
+
+    if (pc.rotation == 1u) { // 90 degrees clockwise
+        srcLocalX = outY;
+        srcLocalY = pc.cropHeight - 1u - outX;
+    } else if (pc.rotation == 2u) { // 180 degrees
+        srcLocalX = pc.cropWidth - 1u - outX;
+        srcLocalY = pc.cropHeight - 1u - outY;
+    } else if (pc.rotation == 3u) { // 270 degrees clockwise
+        srcLocalX = pc.cropWidth - 1u - outY;
+        srcLocalY = outX;
+    }
+
+    uint srcX = clamp(pc.cropX + srcLocalX, 0u, pc.inputWidth - 1u);
+    uint srcY = clamp(pc.cropY + srcLocalY, 0u, pc.inputHeight - 1u);
+
+    uint srcIdx = srcY * pc.inputWidth + srcX;
+    vec3 rgb = clamp(inputPixels[srcIdx].rgb, 0.0, 1.0);
+
+    // Quantize 0.0-1.0 float to 0-255 uint8 BGR
+    uint b = uint(rgb.b * 255.0 + 0.5);
+    uint g = uint(rgb.g * 255.0 + 0.5);
+    uint r = uint(rgb.r * 255.0 + 0.5);
+
+    // Pack into 3 bytes BGR per pixel
+    uint outByteOffset = (outY * pc.outputWidth + outX) * 3u;
+    uint wordIdx = outByteOffset / 4u;
+    uint shift = (outByteOffset % 4u) * 8u;
+
+    // Pack B, G, R byte components atomically into uint32 word
+    uint bgrPacked = (b & 0xFFu) | ((g & 0xFFu) << 8u) | ((r & 0xFFu) << 16u);
+
+    uint currentWord = outputBgrWords[wordIdx];
+    uint mask = ~(0xFFFFFFu << shift);
+    outputBgrWords[wordIdx] = (currentWord & mask) | (bgrPacked << shift);
+}

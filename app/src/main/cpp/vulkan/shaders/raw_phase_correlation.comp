@@ -1,0 +1,84 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer AnchorRawBuffer {
+    uint anchorWords[]; // Canonical uint16 anchor RAW
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer SupportRawBuffer {
+    uint supportWords[]; // Canonical uint16 support RAW
+};
+
+layout(std430, set = 0, binding = 2) buffer MotionResultBuffer {
+    float resultScalar[4]; // [0]=dx, [1]=dy, [2]=response, [3]=accepted (1.0 or 0.0)
+};
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+    uint maxShift;
+    uint cfaPattern;
+} pc;
+
+float getRawSample(uint wordIdx, uint shift) {
+    return float((anchorWords[wordIdx] >> shift) & 0xFFFFu);
+}
+
+float getSupportSample(uint wordIdx, uint shift) {
+    return float((supportWords[wordIdx] >> shift) & 0xFFFFu);
+}
+
+void main() {
+    // Single workgroup phase correlation alignment estimator on downsampled grid
+    if (gl_GlobalInvocationID.x > 0u || gl_GlobalInvocationID.y > 0u) return;
+
+    int w = int(pc.width);
+    int h = int(pc.height);
+    float bestDx = 0.0;
+    float bestDy = 0.0;
+    float minSad = 1e12;
+
+    int maxS = int(pc.maxShift);
+    int step = 2; // CFA parity step = 2 pixels to preserve Bayer pattern
+
+    // Sub-sampled grid Phase Correlation search with CFA parity constraint
+    for (int dy = -maxS; dy <= maxS; dy += step) {
+        for (int dx = -maxS; dx <= maxS; dx += step) {
+            float sad = 0.0;
+            int count = 0;
+
+            for (int y = 64; y < h - 64; y += 32) {
+                int sy = y + dy;
+                if (sy < 0 || sy >= h) continue;
+
+                for (int x = 64; x < w - 64; x += 32) {
+                    int sx = x + dx;
+                    if (sx < 0 || sx >= w) continue;
+
+                    uint aIdx = uint(y * w + x);
+                    uint sIdx = uint(sy * w + sx);
+
+                    float aVal = float((anchorWords[aIdx / 2u] >> ((aIdx % 2u) * 16u)) & 0xFFFFu);
+                    float sVal = float((supportWords[sIdx / 2u] >> ((sIdx % 2u) * 16u)) & 0xFFFFu);
+
+                    sad += abs(aVal - sVal);
+                    count++;
+                }
+            }
+
+            if (count > 0 && sad < minSad) {
+                minSad = sad;
+                bestDx = float(dx);
+                bestDy = float(dy);
+            }
+        }
+    }
+
+    float confidence = (minSad < 1e10) ? max(0.0, 1.0 - (minSad / 1e6)) : 0.0;
+    bool accepted = confidence >= 0.35;
+
+    resultScalar[0] = bestDx;
+    resultScalar[1] = bestDy;
+    resultScalar[2] = confidence;
+    resultScalar[3] = accepted ? 1.0 : 0.0;
+}

@@ -1,0 +1,298 @@
+#version 450
+
+// SPECTRA 2 Milestone 8H-I
+// Resident JPEG-only Bayer finalization. The expensive full-frame correction path remains on
+// Vulkan between Pass 3 and demosaic. CPU authority is limited to the compact G1/G2 median
+// evidence decision. Correction is permitted only after paired 2x2 G samples prove a
+// spatially consistent 1%-12% split; scene-dependent median differences do not qualify.
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer SourceBuffer { float sourceMosaic[]; };
+layout(std430, binding = 1) buffer OutputBuffer { float outputMosaic[]; };
+layout(std430, binding = 2) buffer GreenSamples { vec4 greenSamples[]; };
+layout(std430, binding = 3) buffer TelemetryBuffer { uint telemetry[]; };
+layout(std430, binding = 4) readonly buffer LensBuffer { float lensShading[]; };
+
+// Exact per-workgroup telemetry reduction for the full-frame finalize pass.
+// The previous implementation issued several globally contended atomics per pixel,
+// including an unconditional atomicMax, which can serialize tens of millions of
+// invocations on mobile GPUs. Keep exact counters while reducing global atomics
+// to at most five operations per 16x16 workgroup.
+shared uvec4 finalizeCounts[256];
+shared uint finalizeMaxGainBits[256];
+
+layout(push_constant) uniform Params {
+    uint frameWidth;
+    uint frameHeight;
+    uint effectiveCfaPattern;
+    uint sensorCfaPattern;
+    int cfaOffsetX;
+    int cfaOffsetY;
+    uint mode; // 0 compact green sampling, 1 full Bayer finalization, 2 auto-scene samples
+    uint xStep;
+    uint yStep;
+    uint sampleColumns;
+    uint sampleRows;
+    uint lensColumns;
+    uint lensRows;
+    uint lensEnabled;
+    float baseDefectThreshold;
+    float greenEvenScale;
+    float greenOddScale;
+    float padding0;
+    uint noiseModelEnabled;
+    float s0;
+    float s1;
+    float s2;
+    float s3;
+    float o0;
+    float o1;
+    float o2;
+    float o3;
+} pc;
+
+bool finite1(float v) { return !(isnan(v) || isinf(v)); }
+uint linearIndex(int x, int y) { return uint(y) * pc.frameWidth + uint(x); }
+float sceneClamp(float v) { return finite1(v) ? clamp(v, 0.0, 4.0) : 0.0; }
+
+int cfaChannel4(uint pattern, int x, int y) {
+    int xm = x & 1;
+    int ym = y & 1;
+    uint p = min(pattern, 3u);
+    if (p == 0u) return ym == 0 ? (xm == 0 ? 0 : 1) : (xm == 0 ? 2 : 3); // RGGB
+    if (p == 1u) return ym == 0 ? (xm == 0 ? 1 : 0) : (xm == 0 ? 3 : 2); // GRBG
+    if (p == 2u) return ym == 0 ? (xm == 0 ? 1 : 3) : (xm == 0 ? 0 : 2); // GBRG
+    return ym == 0 ? (xm == 0 ? 3 : 1) : (xm == 0 ? 2 : 0); // BGGR
+}
+
+// BnCam S/O arrays are canonical [R, Gr, Gb, B], unlike Camera2 lens-shading
+// channels which are [R, Geven, Godd, B]. Keep these mappings intentionally separate.
+int noiseChannel4(uint pattern, int x, int y) {
+    int xm = x & 1;
+    int ym = y & 1;
+    uint p = min(pattern, 3u);
+    if (p == 0u) return ym == 0 ? (xm == 0 ? 0 : 1) : (xm == 0 ? 2 : 3); // RGGB
+    if (p == 1u) return ym == 0 ? (xm == 0 ? 1 : 0) : (xm == 0 ? 3 : 2); // GRBG
+    if (p == 2u) return ym == 0 ? (xm == 0 ? 2 : 3) : (xm == 0 ? 0 : 1); // GBRG
+    return ym == 0 ? (xm == 0 ? 3 : 2) : (xm == 0 ? 1 : 0); // BGGR
+}
+
+float noiseS(int ch) {
+    return ch == 0 ? pc.s0 : (ch == 1 ? pc.s1 : (ch == 2 ? pc.s2 : pc.s3));
+}
+float noiseO(int ch) {
+    return ch == 0 ? pc.o0 : (ch == 1 ? pc.o1 : (ch == 2 ? pc.o2 : pc.o3));
+}
+float predictedNoiseSigma(float signal, int ch) {
+    if (pc.noiseModelEnabled == 0u) return 0.0;
+    float s = max(0.0, noiseS(ch));
+    float o = max(0.0, noiseO(ch));
+    return sqrt(max(0.0, s * clamp(signal, 0.0, 1.0) + o));
+}
+
+float sourceAt(int x, int y) {
+    x = clamp(x, 0, int(pc.frameWidth) - 1);
+    y = clamp(y, 0, int(pc.frameHeight) - 1);
+    return sourceMosaic[linearIndex(x, y)];
+}
+
+void sort8(inout float v[8]) {
+    for (int i = 1; i < 8; ++i) {
+        float key = v[i];
+        int j = i - 1;
+        while (j >= 0 && v[j] > key) {
+            v[j + 1] = v[j];
+            --j;
+        }
+        v[j + 1] = key;
+    }
+}
+
+float defectCorrectedAt(int x, int y, float center, out bool corrected) {
+    corrected = false;
+    if (x < 2 || y < 2 || x >= int(pc.frameWidth) - 2 || y >= int(pc.frameHeight) - 2) {
+        return center;
+    }
+    float n0 = sourceAt(x - 2, y);
+    float n1 = sourceAt(x + 2, y);
+    float n2 = sourceAt(x, y - 2);
+    float n3 = sourceAt(x, y + 2);
+    float neighbourMin = min(min(n0, n1), min(n2, n3));
+    float neighbourMax = max(max(n0, n1), max(n2, n3));
+    int noiseChannel = noiseChannel4(pc.effectiveCfaPattern, x, y);
+    float localSignal = 0.5 * (neighbourMin + neighbourMax);
+    float noiseFloor = 5.0 * predictedNoiseSigma(localSignal, noiseChannel);
+    float preThreshold = max(max(pc.baseDefectThreshold,
+                                 3.0 * max(0.006, neighbourMax - neighbourMin)),
+                             noiseFloor);
+    bool preHot = center > 0.20 && center > neighbourMax + preThreshold;
+    bool preCold = center < 0.04 && neighbourMin > 0.10 && neighbourMin - center > preThreshold;
+    if (!preHot && !preCold) return center;
+
+    float neighbours[8];
+    neighbours[0] = n0; neighbours[1] = n1; neighbours[2] = n2; neighbours[3] = n3;
+    neighbours[4] = sourceAt(x - 2, y - 2);
+    neighbours[5] = sourceAt(x + 2, y - 2);
+    neighbours[6] = sourceAt(x - 2, y + 2);
+    neighbours[7] = sourceAt(x + 2, y + 2);
+    sort8(neighbours);
+    float median = 0.5 * (neighbours[3] + neighbours[4]);
+    float spread = max(0.006, neighbours[6] - neighbours[1]);
+    float finalNoiseFloor = 6.0 * predictedNoiseSigma(median, noiseChannel);
+    float threshold = max(max(pc.baseDefectThreshold, spread * 4.0), finalNoiseFloor);
+    bool hot = center > 0.20 && center > median + threshold;
+    bool cold = center < 0.04 && median > 0.10 && median - center > threshold;
+    if (hot || cold) {
+        corrected = true;
+        return median;
+    }
+    return center;
+}
+
+float safeLensGain(float value) {
+    return finite1(value) ? clamp(value, 0.25, 3.5) : 1.0;
+}
+
+float lensGainAt(int channel, int x, int y) {
+    if (pc.lensEnabled == 0u || pc.lensColumns == 0u || pc.lensRows == 0u) return 1.0;
+    float cf = pc.frameWidth > 1u
+        ? float(x) * float(pc.lensColumns - 1u) / float(pc.frameWidth - 1u) : 0.0;
+    float rf = pc.frameHeight > 1u
+        ? float(y) * float(pc.lensRows - 1u) / float(pc.frameHeight - 1u) : 0.0;
+    int c0 = clamp(int(floor(cf)), 0, int(pc.lensColumns) - 1);
+    int r0 = clamp(int(floor(rf)), 0, int(pc.lensRows) - 1);
+    int c1 = min(c0 + 1, int(pc.lensColumns) - 1);
+    int r1 = min(r0 + 1, int(pc.lensRows) - 1);
+    float tx = clamp(cf - float(c0), 0.0, 1.0);
+    float ty = clamp(rf - float(r0), 0.0, 1.0);
+    uint stride = pc.lensColumns * 4u;
+    int ch = clamp(channel, 0, 3);
+    float g00 = safeLensGain(lensShading[uint(r0) * stride + uint(c0 * 4 + ch)]);
+    float g10 = safeLensGain(lensShading[uint(r0) * stride + uint(c1 * 4 + ch)]);
+    float g01 = safeLensGain(lensShading[uint(r1) * stride + uint(c0 * 4 + ch)]);
+    float g11 = safeLensGain(lensShading[uint(r1) * stride + uint(c1 * 4 + ch)]);
+    return safeLensGain(mix(mix(g00, g10, tx), mix(g01, g11, tx), ty));
+}
+
+void sampleGreen() {
+    uvec2 gid = gl_GlobalInvocationID.xy;
+    if (gid.x >= pc.sampleColumns || gid.y >= pc.sampleRows) return;
+    uint sampleIndex = gid.y * pc.sampleColumns + gid.x;
+    greenSamples[sampleIndex] = vec4(0.0);
+    int x = int(gid.x * pc.xStep);
+    int y = int(gid.y * pc.yStep);
+    if (x < 0 || y < 0 || x + 1 >= int(pc.frameWidth) || y + 1 >= int(pc.frameHeight)) return;
+    float g1 = 0.0, g2 = 0.0;
+    float v1 = 0.0, v2 = 0.0;
+    for (int dy = 0; dy < 2; ++dy) {
+        for (int dx = 0; dx < 2; ++dx) {
+            int ch = cfaChannel4(pc.effectiveCfaPattern, x + dx, y + dy);
+            float value = sourceAt(x + dx, y + dy);
+            if (!finite1(value)) continue;
+            if (ch == 1) { g1 = value; v1 = 1.0; }
+            else if (ch == 2) { g2 = value; v2 = 1.0; }
+        }
+    }
+    greenSamples[sampleIndex] = vec4(g1, g2, v1, v2);
+}
+
+
+float outputAt(int x, int y) {
+    x = clamp(x, 0, int(pc.frameWidth) - 1);
+    y = clamp(y, 0, int(pc.frameHeight) - 1);
+    return outputMosaic[linearIndex(x, y)];
+}
+
+bool coherentSameSign(float center, float a, float b) {
+    return center * a > 0.0 && center * b > 0.0 &&
+           abs(a) >= 0.015 && abs(b) >= 0.015;
+}
+
+void sampleAutoScene() {
+    uvec2 gid = gl_GlobalInvocationID.xy;
+    if (gid.x >= pc.sampleColumns || gid.y >= pc.sampleRows) return;
+    uint sampleIndex = gid.y * pc.sampleColumns + gid.x;
+    greenSamples[sampleIndex] = vec4(0.0);
+    int x = 4 + int(gid.x * pc.xStep);
+    int y = 4 + int(gid.y * pc.yStep);
+    if (x >= int(pc.frameWidth) - 4 || y >= int(pc.frameHeight) - 4) return;
+    float center = outputAt(x, y);
+    float signedDx = 0.5 * (outputAt(x + 2, y) - outputAt(x - 2, y));
+    float signedDy = 0.5 * (outputAt(x, y + 2) - outputAt(x, y - 2));
+    float dx = abs(signedDx);
+    float dy = abs(signedDy);
+    float gradient = max(dx, dy);
+    bool isCoherent = false;
+    if (dx >= 0.030 && dx > 1.5 * dy + 0.005) {
+        float above = 0.5 * (outputAt(x + 2, y - 2) - outputAt(x - 2, y - 2));
+        float below = 0.5 * (outputAt(x + 2, y + 2) - outputAt(x - 2, y + 2));
+        isCoherent = coherentSameSign(signedDx, above, below);
+    } else if (dy >= 0.030 && dy > 1.5 * dx + 0.005) {
+        float left = 0.5 * (outputAt(x - 2, y + 2) - outputAt(x - 2, y - 2));
+        float right = 0.5 * (outputAt(x + 2, y + 2) - outputAt(x + 2, y - 2));
+        isCoherent = coherentSameSign(signedDy, left, right);
+    }
+    greenSamples[sampleIndex] = vec4(center, gradient, isCoherent ? 1.0 : 0.0,
+                                     center < 0.060 ? 1.0 : 0.0);
+}
+
+void finalizePixel() {
+    uvec2 gid = gl_GlobalInvocationID.xy;
+    uint lane = gl_LocalInvocationIndex;
+    bool inFrame = gid.x < pc.frameWidth && gid.y < pc.frameHeight;
+
+    uvec4 localCounts = uvec4(0u);
+    uint localMaxGainBits = floatBitsToUint(1.0);
+
+    if (inFrame) {
+        int x = int(gid.x), y = int(gid.y);
+        uint index = linearIndex(x, y);
+        float original = sourceMosaic[index];
+        if (finite1(original) && original >= 1.0) localCounts.x = 1u;
+
+        bool defectCorrected = false;
+        float value = defectCorrectedAt(x, y, original, defectCorrected);
+        if (defectCorrected) localCounts.y = 1u;
+
+        int effectiveChannel = cfaChannel4(pc.effectiveCfaPattern, x, y);
+        if (effectiveChannel == 1) value = sceneClamp(value * pc.greenEvenScale);
+        else if (effectiveChannel == 2) value = sceneClamp(value * pc.greenOddScale);
+
+        int sensorChannel = cfaChannel4(
+            pc.sensorCfaPattern, x + pc.cfaOffsetX, y + pc.cfaOffsetY);
+        float gain = lensGainAt(sensorChannel, x, y);
+        if (gain > 1.001) localCounts.z = 1u;
+        localMaxGainBits = floatBitsToUint(gain);
+        value = sceneClamp(value * gain);
+        if (value > 1.0) localCounts.w = 1u;
+        outputMosaic[index] = value;
+    }
+
+    finalizeCounts[lane] = localCounts;
+    finalizeMaxGainBits[lane] = localMaxGainBits;
+    barrier();
+
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            finalizeCounts[lane] += finalizeCounts[lane + stride];
+            finalizeMaxGainBits[lane] = max(
+                finalizeMaxGainBits[lane], finalizeMaxGainBits[lane + stride]);
+        }
+        barrier();
+    }
+
+    if (lane == 0u) {
+        uvec4 counts = finalizeCounts[0];
+        if (counts.x != 0u) atomicAdd(telemetry[0], counts.x);
+        if (counts.y != 0u) atomicAdd(telemetry[1], counts.y);
+        if (counts.z != 0u) atomicAdd(telemetry[2], counts.z);
+        if (counts.w != 0u) atomicAdd(telemetry[3], counts.w);
+        atomicMax(telemetry[4], finalizeMaxGainBits[0]);
+    }
+}
+
+void main() {
+    if (pc.mode == 0u) sampleGreen();
+    else if (pc.mode == 1u) finalizePixel();
+    else sampleAutoScene();
+}

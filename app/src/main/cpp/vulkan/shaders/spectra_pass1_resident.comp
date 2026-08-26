@@ -1,0 +1,1254 @@
+#version 450
+
+// SPECTRA 2 Milestone 8H-B
+// GPU-primary pre-demosaic Pass 1. The shader preserves the established VST
+// Wiener + anisotropic same-CFA estimator and executes the per-pixel No-Regret
+// blend without a candidate-frame CPU readback.
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer SourceBuffer { float sourceMosaic[]; };
+layout(std430, binding = 1) buffer CandidateBuffer { float candidateMosaic[]; };
+layout(std430, binding = 2) readonly buffer TensorBuffer { vec4 tensorCells[]; };
+layout(std430, binding = 3) readonly buffer LensBuffer { float lensShading[]; };
+
+struct TileStats {
+    vec4 meanSignal;
+    vec4 metrics; // residualEnergy, structureEnergy, sampleCount, populatedChannels
+};
+layout(std430, binding = 4) buffer TileStatsBuffer { TileStats tileStats[]; };
+layout(std430, binding = 5) readonly buffer AcceptanceBuffer { float acceptance[]; };
+layout(std430, binding = 6) buffer TelemetryBuffer { uint telemetry[]; };
+layout(std430, binding = 7) buffer ObservationBuffer { vec4 observation[]; };
+
+shared vec4 reduceA[256];
+shared vec4 reduceB[256];
+
+layout(push_constant) uniform Push {
+    uint frameWidth;
+    uint frameHeight;
+    uint cfaPattern;
+    uint mode; // 0=Pass1 candidate, 1=after tile stats, 2=No-Regret blend, 5=Pass0 candidate
+    uint tensorColumns;
+    uint tensorRows;
+    uint tensorStep;
+    uint lensColumns;
+    uint lensRows;
+    uint gridCols;
+    uint gridRows;
+    uint tileWidth;
+    uint tileHeight;
+    float s0;
+    float s1;
+    float s2;
+    float s3;
+    float o0;
+    float o1;
+    float o2;
+    float o3;
+    float blendStrength;
+    float maxPixelShift;
+    float isoAuthority;
+    float greenS;
+    float greenO;
+    float modelConfidence;
+    uint observationOffset;
+    float combinedNoisePressure;
+} pc;
+
+const float PI = 3.14159265358979323846;
+const float SQRT2 = 1.4142135623730951;
+
+bool finite1(float v) { return !(isnan(v) || isinf(v)); }
+float saturate(float v) { return clamp(v, 0.0, 1.0); }
+float smoothstepSpectra(float edge0, float edge1, float value) {
+    if (!finite1(value) || !(edge1 > edge0)) return 0.0;
+    float t = clamp((value - edge0) / (edge1 - edge0), 0.0, 1.0);
+    return t * t * (3.0 - 2.0 * t);
+}
+
+struct MultiscaleContextDecision {
+    float coherentStructureZ;
+    float stochasticFineEvidence;
+    float edgeProtection;
+    float flatContext;
+    float denoiseAuthorityScale;
+    float broadMixScale;
+};
+
+struct MultiscaleResidualConsensusDecision {
+    float contextAgreement;
+    float centerOutlierEvidence;
+    float persistentStructureProtection;
+    float midWeight;
+    float coarseWeight;
+    float contextMix;
+};
+
+struct CfaSurfaceClassification {
+    float dispersionTextureEvidence;
+    float coherentTextureEvidence;
+    float directionalTextureEvidence;
+    float textureConfidence;
+    float flatConfidence;
+    float authorityScale;
+    float contextMixScale;
+};
+
+CfaSurfaceClassification resolveCfaSurfaceClassification(
+        float normalizedMad, float coherentStructureZ, float tensorConfidence,
+        float combinedNoisePressure, float modelConfidence) {
+    CfaSurfaceClassification outValue;
+    float confidence = clamp(finite1(modelConfidence) ? modelConfidence : 0.0, 0.0, 1.0);
+    float uncertainty = 1.0 + 0.30 * (1.0 - confidence);
+    float mad = max(0.0, finite1(normalizedMad) ? normalizedMad : 4.0) / uncertainty;
+    float coherentStructure = max(0.0, finite1(coherentStructureZ) ? coherentStructureZ : 4.0) / uncertainty;
+    float tensor = clamp(finite1(tensorConfidence) ? tensorConfidence : 0.0, 0.0, 1.0);
+    float noise = clamp(finite1(combinedNoisePressure) ? combinedNoisePressure : 0.0, 0.0, 1.0);
+    outValue.dispersionTextureEvidence = smoothstepSpectra(1.55, 2.60, mad);
+    outValue.coherentTextureEvidence = smoothstepSpectra(1.45, 3.80, coherentStructure);
+    outValue.directionalTextureEvidence = clamp(
+        tensor * smoothstepSpectra(0.90, 2.60, coherentStructure), 0.0, 1.0);
+    outValue.textureConfidence = clamp(max(
+        outValue.coherentTextureEvidence,
+        max(0.90 * outValue.dispersionTextureEvidence,
+            0.85 * outValue.directionalTextureEvidence)), 0.0, 1.0);
+    outValue.flatConfidence = clamp(
+        (1.0 - outValue.dispersionTextureEvidence) *
+        (1.0 - 0.88 * outValue.coherentTextureEvidence) *
+        (1.0 - 0.55 * outValue.directionalTextureEvidence), 0.0, 1.0);
+    outValue.authorityScale = clamp(
+        1.0 + (0.18 + 0.12 * noise) * outValue.flatConfidence -
+        0.30 * outValue.textureConfidence, 0.58, 1.30);
+    outValue.contextMixScale = clamp(
+        0.88 + 0.27 * outValue.flatConfidence -
+        0.25 * outValue.textureConfidence, 0.65, 1.15);
+    return outValue;
+}
+
+MultiscaleResidualConsensusDecision resolveMultiscaleResidualConsensus(
+        float centerToFineResidualZ, float midCoarseDisagreementZ,
+        float persistentStructureZ, float flatContext,
+        float combinedNoisePressure, float modelConfidence) {
+    MultiscaleResidualConsensusDecision outValue;
+    float confidence = clamp(finite1(modelConfidence) ? modelConfidence : 0.0, 0.0, 1.0);
+    float uncertaintyEnvelope = 1.0 + 0.30 * (1.0 - confidence);
+    float centerResidual = max(0.0, finite1(centerToFineResidualZ) ? centerToFineResidualZ : 0.0) /
+            uncertaintyEnvelope;
+    float disagreement = max(0.0, finite1(midCoarseDisagreementZ) ? midCoarseDisagreementZ : 8.0) /
+            uncertaintyEnvelope;
+    float persistentStructure = max(0.0, finite1(persistentStructureZ) ? persistentStructureZ : 8.0) /
+            uncertaintyEnvelope;
+    float flatContextWeight = clamp(finite1(flatContext) ? flatContext : 0.0, 0.0, 1.0);
+    float noise = clamp(finite1(combinedNoisePressure) ? combinedNoisePressure : 0.0, 0.0, 1.0);
+
+    outValue.contextAgreement = 1.0 - smoothstepSpectra(0.70, 2.35, disagreement);
+    outValue.centerOutlierEvidence = smoothstepSpectra(0.55, 2.65, centerResidual);
+    outValue.persistentStructureProtection = smoothstepSpectra(1.55, 4.15, persistentStructure);
+    outValue.coarseWeight = clamp(0.22 + 0.20 * noise, 0.22, 0.42);
+    outValue.midWeight = 1.0 - outValue.coarseWeight;
+
+    float contextualNeed = (0.18 + 0.44 * noise) *
+            outValue.contextAgreement *
+            outValue.centerOutlierEvidence *
+            (0.22 + 0.78 * flatContextWeight);
+    float structureGuard = 1.0 - 0.92 * outValue.persistentStructureProtection;
+    outValue.contextMix = clamp(
+            contextualNeed * max(0.0, structureGuard),
+            0.0, 0.62);
+    return outValue;
+}
+
+MultiscaleContextDecision resolveMultiscaleContext(
+        float fineStructureZ, float coarseStructureZ,
+        float combinedNoisePressure, float modelConfidence) {
+    MultiscaleContextDecision outValue;
+    float confidence = clamp(finite1(modelConfidence) ? modelConfidence : 0.0, 0.0, 1.0);
+    float uncertaintyEnvelope = 1.0 + 0.30 * (1.0 - confidence);
+    float fine = max(0.0, finite1(fineStructureZ) ? fineStructureZ : 0.0) / uncertaintyEnvelope;
+    float coarse = max(0.0, finite1(coarseStructureZ) ? coarseStructureZ : 0.0) / uncertaintyEnvelope;
+    float noise = clamp(finite1(combinedNoisePressure) ? combinedNoisePressure : 0.0, 0.0, 1.0);
+    float crossScaleAgreement = sqrt(max(0.0, fine * coarse));
+    outValue.coherentStructureZ = max(min(fine, coarse), 0.78 * crossScaleAgreement);
+    outValue.stochasticFineEvidence = max(0.0, fine - 0.72 * coarse);
+    float stochasticRelease = smoothstepSpectra(1.15, 3.25, outValue.stochasticFineEvidence) *
+            (1.0 - smoothstepSpectra(1.45, 3.40, coarse));
+    float coherentProtection = smoothstepSpectra(1.55, 4.20, outValue.coherentStructureZ);
+    outValue.edgeProtection = clamp(
+            coherentProtection * (0.72 + 0.28 * confidence), 0.0, 1.0);
+    float flatMetric = max(outValue.coherentStructureZ, 0.82 * coarse);
+    outValue.flatContext = 1.0 - smoothstepSpectra(1.30, 3.20, flatMetric);
+    outValue.denoiseAuthorityScale = clamp(
+            0.90 +
+            0.30 * outValue.flatContext * (0.55 + 0.45 * noise) +
+            0.16 * stochasticRelease * (0.50 + 0.50 * noise) -
+            0.62 * outValue.edgeProtection,
+            0.22, 1.32);
+    outValue.broadMixScale = clamp(
+            0.82 + 0.42 * outValue.flatContext * (0.45 + 0.55 * noise) +
+            0.14 * stochasticRelease,
+            0.72, 1.28);
+    return outValue;
+}
+
+uint linearIndex(int x, int y) {
+    return uint(y) * pc.frameWidth + uint(x);
+}
+
+int cfaChannel(int x, int y) {
+    int xm = x & 1;
+    int ym = y & 1;
+    if (pc.cfaPattern == 0u) return ym == 0 ? (xm == 0 ? 0 : 1) : (xm == 0 ? 2 : 3); // RGGB
+    if (pc.cfaPattern == 1u) return ym == 0 ? (xm == 0 ? 1 : 0) : (xm == 0 ? 3 : 2); // GRBG
+    if (pc.cfaPattern == 2u) return ym == 0 ? (xm == 0 ? 1 : 3) : (xm == 0 ? 0 : 2); // GBRG
+    return ym == 0 ? (xm == 0 ? 3 : 1) : (xm == 0 ? 2 : 0); // BGGR
+}
+
+float channelS(int ch) {
+    if (ch == 0) return pc.s0;
+    if (ch == 1) return pc.s1;
+    if (ch == 2) return pc.s2;
+    return pc.s3;
+}
+float channelO(int ch) {
+    if (ch == 0) return pc.o0;
+    if (ch == 1) return pc.o1;
+    if (ch == 2) return pc.o2;
+    return pc.o3;
+}
+
+float rawAt(int x, int y) {
+    x = clamp(x, 0, int(pc.frameWidth) - 1);
+    y = clamp(y, 0, int(pc.frameHeight) - 1);
+    return sourceMosaic[linearIndex(x, y)];
+}
+float candidateAt(int x, int y) {
+    x = clamp(x, 0, int(pc.frameWidth) - 1);
+    y = clamp(y, 0, int(pc.frameHeight) - 1);
+    return candidateMosaic[linearIndex(x, y)];
+}
+
+float greenGuideAt(int x, int y) {
+    x = clamp(x, 0, int(pc.frameWidth) - 1);
+    y = clamp(y, 0, int(pc.frameHeight) - 1);
+    int ch = cfaChannel(x, y);
+    if (ch == 1 || ch == 2) return rawAt(x, y);
+    const ivec2 offsets[4] = ivec2[4](
+        ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1)
+    );
+    float sum = 0.0;
+    int count = 0;
+    for (int i = 0; i < 4; ++i) {
+        int sx = clamp(x + offsets[i].x, 0, int(pc.frameWidth) - 1);
+        int sy = clamp(y + offsets[i].y, 0, int(pc.frameHeight) - 1);
+        int nc = cfaChannel(sx, sy);
+        if (nc == 1 || nc == 2) {
+            sum += rawAt(sx, sy);
+            count++;
+        }
+    }
+    return count > 0 ? sum / float(count) : rawAt(x, y);
+}
+
+bool vstValid(float S, float O) {
+    return finite1(S) && finite1(O) && S > 1.0e-12 && O >= 0.0;
+}
+bool vstValidDomain(float x, float S, float O) {
+    return vstValid(S, O) && finite1(x) && (S * x + O + 0.375 * S * S) > 1.0e-6;
+}
+float forwardVst(float x, float S, float O) {
+    float arg = S * x + O + 0.375 * S * S;
+    return (2.0 / S) * sqrt(max(arg, 1.0e-20));
+}
+float inverseVst(float y, float S, float O) {
+    float sy2 = 0.5 * S * y;
+    return (sy2 * sy2 - O - 0.375 * S * S) / S;
+}
+
+float lensGainAt(int channel, int x, int y) {
+    if (pc.lensColumns == 0u || pc.lensRows == 0u) return 1.0;
+    float colF = pc.frameWidth > 1u
+        ? float(x) * float(pc.lensColumns - 1u) / float(pc.frameWidth - 1u) : 0.0;
+    float rowF = pc.frameHeight > 1u
+        ? float(y) * float(pc.lensRows - 1u) / float(pc.frameHeight - 1u) : 0.0;
+    int c0 = clamp(int(floor(colF)), 0, int(pc.lensColumns) - 1);
+    int r0 = clamp(int(floor(rowF)), 0, int(pc.lensRows) - 1);
+    int c1 = min(c0 + 1, int(pc.lensColumns) - 1);
+    int r1 = min(r0 + 1, int(pc.lensRows) - 1);
+    float tx = clamp(colF - float(c0), 0.0, 1.0);
+    float ty = clamp(rowF - float(r0), 0.0, 1.0);
+    int ch = clamp(channel, 0, 3);
+    uint stride = pc.lensColumns * 4u;
+    float g00 = clamp(lensShading[uint(r0) * stride + uint(c0 * 4 + ch)], 0.25, 3.5);
+    float g10 = clamp(lensShading[uint(r0) * stride + uint(c1 * 4 + ch)], 0.25, 3.5);
+    float g01 = clamp(lensShading[uint(r1) * stride + uint(c0 * 4 + ch)], 0.25, 3.5);
+    float g11 = clamp(lensShading[uint(r1) * stride + uint(c1 * 4 + ch)], 0.25, 3.5);
+    float top = mix(g00, g10, tx);
+    float bottom = mix(g01, g11, tx);
+    return clamp(mix(top, bottom, ty), 0.25, 3.5);
+}
+
+struct TensorEstimate {
+    bool valid;
+    bool confident;
+    float coherence;
+    float confidence;
+    float normalX;
+    float normalY;
+    float tangentX;
+    float tangentY;
+    float tangentDegrees;
+};
+
+TensorEstimate tensorFromMoments(float jxx, float jxy, float jyy, float gradientNoiseVariance) {
+    TensorEstimate t;
+    t.valid = false;
+    t.confident = false;
+    t.coherence = 0.0;
+    t.confidence = 0.0;
+    t.normalX = 1.0;
+    t.normalY = 0.0;
+    t.tangentX = 0.0;
+    t.tangentY = 1.0;
+    t.tangentDegrees = 90.0;
+    if (!finite1(jxx) || !finite1(jxy) || !finite1(jyy) || !finite1(gradientNoiseVariance)) return t;
+    jxx = max(0.0, jxx);
+    jyy = max(0.0, jyy);
+    float trace = jxx + jyy;
+    float disc = sqrt(max(0.0, (jxx - jyy) * (jxx - jyy) + 4.0 * jxy * jxy));
+    float lambdaMajor = 0.5 * (trace + disc);
+    t.coherence = trace > 1.0e-12 ? clamp(disc / trace, 0.0, 1.0) : 0.0;
+    float normalizedEnergy = lambdaMajor / max(1.0e-10, gradientNoiseVariance);
+    float energyConfidence = smoothstepSpectra(0.70, 5.00, normalizedEnergy);
+    float coherenceConfidence = smoothstepSpectra(0.08, 0.72, t.coherence);
+    t.confidence = clamp(energyConfidence * coherenceConfidence, 0.0, 1.0);
+    float nx = jxy;
+    float ny = lambdaMajor - jxx;
+    if (abs(nx) + abs(ny) < 1.0e-8) {
+        nx = lambdaMajor - jyy;
+        ny = jxy;
+    }
+    float n = sqrt(nx * nx + ny * ny);
+    if (n > 1.0e-8) {
+        t.normalX = nx / n;
+        t.normalY = ny / n;
+    } else if (jxx >= jyy) {
+        t.normalX = 1.0; t.normalY = 0.0;
+    } else {
+        t.normalX = 0.0; t.normalY = 1.0;
+    }
+    t.tangentX = -t.normalY;
+    t.tangentY = t.normalX;
+    float degrees = atan(t.tangentY, t.tangentX) * (180.0 / PI);
+    if (degrees < 0.0) degrees += 180.0;
+    if (degrees >= 180.0) degrees -= 180.0;
+    t.tangentDegrees = degrees;
+    t.valid = finite1(t.confidence) && finite1(t.tangentDegrees);
+    t.confident = t.valid && t.confidence >= 0.12;
+    return t;
+}
+
+TensorEstimate tensorAt(int x, int y) {
+    TensorEstimate fallback = tensorFromMoments(0.0, 0.0, 0.0, 1.0);
+    if (pc.tensorColumns < 2u || pc.tensorRows < 2u || pc.tensorStep == 0u) return fallback;
+    float fx = clamp(float(x) / float(pc.tensorStep), 0.0, float(pc.tensorColumns - 1u));
+    float fy = clamp(float(y) / float(pc.tensorStep), 0.0, float(pc.tensorRows - 1u));
+    int x0 = min(int(pc.tensorColumns) - 2, int(floor(fx)));
+    int y0 = min(int(pc.tensorRows) - 2, int(floor(fy)));
+    int x1 = x0 + 1;
+    int y1 = y0 + 1;
+    float tx = clamp(fx - float(x0), 0.0, 1.0);
+    float ty = clamp(fy - float(y0), 0.0, 1.0);
+    vec4 a = tensorCells[uint(y0) * pc.tensorColumns + uint(x0)];
+    vec4 b = tensorCells[uint(y0) * pc.tensorColumns + uint(x1)];
+    vec4 c = tensorCells[uint(y1) * pc.tensorColumns + uint(x0)];
+    vec4 d = tensorCells[uint(y1) * pc.tensorColumns + uint(x1)];
+    vec4 m = mix(mix(a, b, tx), mix(c, d, tx), ty);
+    return tensorFromMoments(m.x, m.y, m.z, m.w);
+}
+
+struct DirectionalDecision {
+    float weight;
+    float alongProjection;
+    float acrossProjection;
+    bool crossEdgeProtected;
+    bool alongStructureSupported;
+};
+DirectionalDecision directionalWeight(TensorEstimate t, float dx, float dy, float guideDeltaSigma) {
+    DirectionalDecision d;
+    d.weight = 1.0;
+    d.alongProjection = 0.0;
+    d.acrossProjection = 0.0;
+    d.crossEdgeProtected = false;
+    d.alongStructureSupported = false;
+    if (!t.confident || !finite1(dx) || !finite1(dy)) return d;
+    float distance = max(1.0e-6, sqrt(dx * dx + dy * dy));
+    d.alongProjection = abs(dx * t.tangentX + dy * t.tangentY) / distance;
+    d.acrossProjection = abs(dx * t.normalX + dy * t.normalY) / distance;
+    float strength = t.confidence * (0.35 + 0.65 * t.coherence);
+    float crossPenalty = exp(-3.25 * strength * d.acrossProjection * d.acrossProjection);
+    float alongSupport = 0.88 + 0.34 * strength * d.alongProjection * d.alongProjection;
+    float excess = max(0.0, abs(finite1(guideDeltaSigma) ? guideDeltaSigma : 8.0) - 1.25);
+    float guideWeight = exp(-0.22 * excess * excess);
+    d.weight = clamp(crossPenalty * alongSupport * guideWeight, 0.04, 1.22);
+    d.crossEdgeProtected = d.acrossProjection > 0.70 && d.weight < 0.55;
+    d.alongStructureSupported = d.alongProjection > 0.70 && d.weight > 0.82;
+    return d;
+}
+
+float finalAuthorityScale(TensorEstimate t, float edgeProtection) {
+    float edge = saturate(edgeProtection);
+    float isotropic = clamp(1.0 - 0.90 * edge, 0.10, 1.0);
+    if (!t.confident) return isotropic;
+    float directionalFloor = clamp(0.26 + 0.48 * t.confidence + 0.16 * t.coherence, 0.26, 0.78);
+    float directional = max(isotropic, directionalFloor);
+    return clamp(mix(isotropic, directional, t.confidence), isotropic, 0.78);
+}
+
+int orientationBin(float degrees) {
+    if (!finite1(degrees)) return 0;
+    if (degrees < 0.0) degrees += 180.0;
+    if (degrees >= 180.0) degrees -= 180.0;
+    if (degrees < 22.5 || degrees >= 157.5) return 0;
+    if (degrees < 67.5) return 1;
+    if (degrees < 112.5) return 2;
+    return 3;
+}
+
+void sort9(inout float a[9]) {
+    for (int i = 1; i < 9; ++i) {
+        float key = a[i];
+        int j = i - 1;
+        while (j >= 0 && a[j] > key) {
+            a[j + 1] = a[j];
+            --j;
+        }
+        a[j + 1] = key;
+    }
+}
+void sort5(inout float a[5]) {
+    for (int i = 1; i < 5; ++i) {
+        float key = a[i];
+        int j = i - 1;
+        while (j >= 0 && a[j] > key) {
+            a[j + 1] = a[j];
+            --j;
+        }
+        a[j + 1] = key;
+    }
+}
+
+void sort8(inout float a[8]) {
+    for (int i = 1; i < 8; ++i) {
+        float key = a[i];
+        int j = i - 1;
+        while (j >= 0 && a[j] > key) {
+            a[j + 1] = a[j];
+            --j;
+        }
+        a[j + 1] = key;
+    }
+}
+
+struct SameCfaRingEstimate {
+    bool valid;
+    float target;
+    float structureZ;
+};
+
+
+float firmRetainedCoefficient(float coefficient, float lowThreshold, float highThreshold) {
+    float magnitude = abs(coefficient);
+    lowThreshold = max(0.0, lowThreshold);
+    highThreshold = max(lowThreshold + 1.0e-4, highThreshold);
+    if (magnitude <= lowThreshold) return 0.0;
+    if (magnitude >= highThreshold) return coefficient;
+    float t = smoothstepSpectra(lowThreshold, highThreshold, magnitude);
+    return coefficient * t;
+}
+
+struct ProfiledMultibandDecision {
+    float target;
+    float mixWeight;
+    float retainedFineRatio;
+    float coherentDetailGain;
+};
+
+// Independent darktable-inspired *principle*, not source code: after the calibrated
+// Poisson-Gaussian VST has approximately equalised sensor noise, split same-CFA
+// detail into fine/mid/coarse Laplacian-like bands and shrink each band by its
+// statistical significance.  Firm retention leaves strong coefficients untouched
+// instead of paying the constant bias of soft thresholding.  A tiny coherent-detail
+// restitution is allowed only for strong, tensor-supported structure.
+ProfiledMultibandDecision resolveProfiledMultiband(
+        float center, float fineLow, float midLow, float coarseLow,
+        float flatContext, float edgeProtection,
+        CfaSurfaceClassification surfaceClass, TensorEstimate tensor,
+        float combinedNoisePressure, float modelConfidence) {
+    ProfiledMultibandDecision d;
+    d.target = center;
+    d.mixWeight = 0.0;
+    d.retainedFineRatio = 1.0;
+    d.coherentDetailGain = 1.0;
+    if (!finite1(center) || !finite1(fineLow) || !finite1(midLow) || !finite1(coarseLow)) return d;
+
+    float noise = saturate(combinedNoisePressure);
+    float confidence = saturate(modelConfidence);
+    float flatness = saturate(flatContext);
+    float texture = saturate(surfaceClass.textureConfidence);
+    float edge = saturate(edgeProtection);
+
+    // VST sensel noise is approximately unit sigma.  The coarser bands are
+    // differences between already-averaged estimates and therefore use smaller
+    // thresholds than the center-vs-fine band.
+    float thresholdScale = clamp(
+            0.86 + 0.48 * flatness + 0.18 * noise - 0.24 * texture + 0.10 * (1.0 - confidence),
+            0.62, 1.48);
+    float fineLowT = mix(1.10, 1.72, noise) * thresholdScale;
+    float fineHighT = mix(3.05, 3.85, noise) * (0.92 + 0.18 * thresholdScale);
+    float midLowT = mix(0.66, 1.02, noise) * thresholdScale;
+    float midHighT = mix(2.05, 2.78, noise) * (0.92 + 0.16 * thresholdScale);
+    float coarseLowT = mix(0.42, 0.72, noise) * thresholdScale;
+    float coarseHighT = mix(1.62, 2.28, noise) * (0.94 + 0.14 * thresholdScale);
+
+    float fineDetail = center - fineLow;
+    float midDetail = fineLow - midLow;
+    float coarseDetail = midLow - coarseLow;
+    float retainedFine = firmRetainedCoefficient(fineDetail, fineLowT, fineHighT);
+    float retainedMid = firmRetainedCoefficient(midDetail, midLowT, midHighT);
+    float retainedCoarse = firmRetainedCoefficient(coarseDetail, coarseLowT, coarseHighT);
+
+    // "Crispy" here means restoring only structure that is demonstrably above
+    // the noise model.  This is not generic sharpening: isolated/noise-like high
+    // frequency coefficients do not receive gain.
+    float tensorStructure = tensor.confident
+            ? saturate(tensor.confidence * (0.45 + 0.55 * tensor.coherence)) : 0.0;
+    float strongFine = smoothstepSpectra(3.10, 5.80, abs(fineDetail));
+    float coherentSupport = max(edge, tensorStructure) * (1.0 - 0.70 * flatness);
+    float detailGain = 1.0 + 0.065 * strongFine * coherentSupport * confidence;
+    retainedFine *= detailGain;
+
+    float target = coarseLow + retainedCoarse + retainedMid + retainedFine;
+    if (!finite1(target)) return d;
+
+    // Flat/noise-dominant regions may use most of the profiled estimate.  Coherent
+    // structure and classified texture rapidly reduce the mix, leaving the existing
+    // anisotropic Wiener estimator / No-Regret gates authoritative at edges.
+    float mixWeight = (0.26 + 0.62 * noise) * (0.30 + 0.70 * flatness) *
+            (1.0 - 0.80 * edge) * (1.0 - 0.68 * texture) * (0.72 + 0.28 * confidence);
+    mixWeight = clamp(mixWeight, 0.0, 0.88);
+    if (texture > 0.78) mixWeight = min(mixWeight, 0.18);
+    if (edge > 0.82) mixWeight = min(mixWeight, 0.12);
+
+    d.target = target;
+    d.mixWeight = mixWeight;
+    d.retainedFineRatio = abs(fineDetail) > 1.0e-5
+            ? clamp(abs(retainedFine) / abs(fineDetail), 0.0, 1.20) : 1.0;
+    d.coherentDetailGain = detailGain;
+    return d;
+}
+
+
+struct ProfiledPatchConsensusDecision {
+    bool valid;
+    float target;
+    float mixWeight;
+    float effectiveSupport;
+    float posteriorRetainedRatio;
+    float gradientGuard;
+};
+
+// Independent NLM/patch-consensus principle for the *physical* single-frame
+// baseline.  Similarity is evaluated in the variance-stabilised domain where a
+// difference of two independent sensor-noise samples has expected variance ~=2.
+// Only flat/noise-dominant CFA regions gain meaningful authority, so this is not
+// a spatial blur over edges or texture.
+ProfiledPatchConsensusDecision resolveProfiledPatchConsensus(
+        int x, int y, float S, float O, float centerVst,
+        float flatContext, float edgeProtection, CfaSurfaceClassification surfaceClass,
+        float combinedNoisePressure, float modelConfidence) {
+    ProfiledPatchConsensusDecision d;
+    d.valid = false;
+    d.target = centerVst;
+    d.mixWeight = 0.0;
+    d.effectiveSupport = 1.0;
+    d.posteriorRetainedRatio = 1.0;
+    d.gradientGuard = 1.0;
+
+    float noise = saturate(combinedNoisePressure);
+    float confidence = saturate(modelConfidence);
+    float flatness = saturate(flatContext);
+    float edge = saturate(edgeProtection);
+    float texture = saturate(surfaceClass.textureConfidence);
+
+    // Global sensor-noise pressure is intentionally conservative at low ISO, but
+    // locally underexposed shadows can still have poor SNR because the signal sits
+    // only a few predicted sigma above the black/noise floor. Promote those pixels
+    // into the same profiled patch-posterior only when the local S/O model proves
+    // the SNR is low; flatness/edge/texture gates below still protect real detail.
+    float centerRaw = max(0.0, rawAt(x, y));
+    float centerSigma = sqrt(max(1.0e-12, S * centerRaw + O));
+    float localSnr = centerRaw / max(centerSigma, 1.0e-6);
+    float shadowNoisePressure = 1.0 - smoothstepSpectra(4.25, 9.50, localSnr);
+    float effectiveNoise = max(noise, 0.42 * shadowNoisePressure);
+
+    if (effectiveNoise < 0.16 || confidence < 0.10 || flatness < 0.42 ||
+            edge > 0.78 || texture > 0.78) return d;
+
+    const ivec2 patchOffsets[5] = ivec2[5](
+        ivec2(0,0), ivec2(-2,0), ivec2(2,0), ivec2(0,-2), ivec2(0,2));
+    const ivec2 candidateOffsets[8] = ivec2[8](
+        ivec2(-4,0), ivec2(4,0), ivec2(0,-4), ivec2(0,4),
+        ivec2(-4,-4), ivec2(4,4), ivec2(4,-4), ivec2(-4,4));
+
+    float weighted = centerVst;
+    float weightSum = 1.0;
+    float nonLocalSupport = 0.0;
+    float axisLeft = centerVst;
+    float axisRight = centerVst;
+    float axisUp = centerVst;
+    float axisDown = centerVst;
+    bool axisLeftValid = false;
+    bool axisRightValid = false;
+    bool axisUpValid = false;
+    bool axisDownValid = false;
+    // High physical noise tolerates a slightly broader patch distance.  The
+    // subtraction of the expected variance prevents random noise itself from
+    // making identical underlying patches appear dissimilar.
+    float bandwidth = mix(0.88, 1.52, effectiveNoise) * (0.86 + 0.14 * confidence);
+    float bandwidth2 = max(0.25, bandwidth * bandwidth);
+
+    for (int i = 0; i < 8; ++i) {
+        float patchDistance = 0.0;
+        bool validPatch = true;
+        for (int j = 0; j < 5; ++j) {
+            ivec2 aPos = ivec2(x, y) + patchOffsets[j];
+            ivec2 bPos = ivec2(x, y) + candidateOffsets[i] + patchOffsets[j];
+            float aRaw = rawAt(aPos.x, aPos.y);
+            float bRaw = rawAt(bPos.x, bPos.y);
+            if (!vstValidDomain(aRaw, S, O) || !vstValidDomain(bRaw, S, O)) {
+                validPatch = false;
+                break;
+            }
+            float delta = forwardVst(aRaw, S, O) - forwardVst(bRaw, S, O);
+            patchDistance += delta * delta;
+        }
+        if (!validPatch) continue;
+        float meanDistance = patchDistance * 0.20;
+        float excessDistance = max(0.0, meanDistance - 2.0);
+        float weight = exp(-excessDistance / bandwidth2);
+        if (weight < 0.035 || !finite1(weight)) continue;
+        float candidateRaw = rawAt(x + candidateOffsets[i].x, y + candidateOffsets[i].y);
+        float candidateVst = forwardVst(candidateRaw, S, O);
+        if (i == 0) { axisLeft = candidateVst; axisLeftValid = true; }
+        else if (i == 1) { axisRight = candidateVst; axisRightValid = true; }
+        else if (i == 2) { axisUp = candidateVst; axisUpValid = true; }
+        else if (i == 3) { axisDown = candidateVst; axisDownValid = true; }
+        weighted += weight * candidateVst;
+        weightSum += weight;
+        nonLocalSupport += weight;
+    }
+
+    if (nonLocalSupport < 1.20 || weightSum <= 1.0e-6) return d;
+    float consensus = weighted / weightSum;
+    if (!finite1(consensus)) return d;
+
+    // A reliable patch consensus lets us distinguish stochastic center-pixel noise
+    // from structure in the same variance-stabilised units used by the sensor model.
+    // Noise-like center residuals collapse toward the consensus; coefficients that
+    // are several sigma away retain their full amplitude. This is deliberately a
+    // posterior shrink, not a generic blur or contrast reduction.
+    float centerResidual = centerVst - consensus;
+    float residualMagnitude = abs(centerResidual);
+    float lowThreshold = 1.08 + 0.44 * flatness + 0.18 * effectiveNoise;
+    float highThreshold = 3.05 + 0.55 * (1.0 - texture) + 0.20 * (1.0 - edge);
+    float retainedResidual = firmRetainedCoefficient(
+            centerResidual, lowThreshold, max(lowThreshold + 0.75, highThreshold));
+    float posteriorTarget = consensus + retainedResidual;
+    if (!finite1(posteriorTarget)) return d;
+
+    // Protect genuine low-frequency luminance ramps. A flat local texture classifier
+    // alone cannot distinguish a smooth wall gradient from a perfectly constant wall,
+    // so opposing same-CFA candidates provide an independent gradient-in-sigma guard.
+    float gradientZ = 0.0;
+    if (axisLeftValid && axisRightValid) gradientZ = max(gradientZ, abs(axisLeft - axisRight) * 0.70710678);
+    if (axisUpValid && axisDownValid) gradientZ = max(gradientZ, abs(axisUp - axisDown) * 0.70710678);
+    float gradientGuard = 1.0 - smoothstepSpectra(1.30, 2.85, gradientZ);
+
+    float flatGate = smoothstepSpectra(0.44, 0.86, flatness);
+    float noiseGate = smoothstepSpectra(0.16, 0.72, effectiveNoise);
+    float structureGuard = (1.0 - 0.92 * edge) * (1.0 - 0.84 * texture);
+    float supportGate = smoothstepSpectra(1.20, 4.80, nonLocalSupport);
+    float mixWeight = flatGate * noiseGate * structureGuard * supportGate *
+            confidence * mix(0.64, 0.92, effectiveNoise) * gradientGuard;
+
+    // Once the posterior has already preserved >sigma structure, flat/high-support
+    // regions may use a stronger clean target without lowering the global detail floor.
+    float retainedRatio = residualMagnitude > 1.0e-5
+            ? clamp(abs(retainedResidual) / residualMagnitude, 0.0, 1.0) : 1.0;
+    float hardCleanEvidence = (1.0 - retainedRatio) * flatGate * supportGate * noiseGate * gradientGuard;
+    mixWeight = max(mixWeight, hardCleanEvidence * mix(0.70, 0.93, effectiveNoise) * confidence);
+    mixWeight = clamp(mixWeight, 0.0, 0.93);
+    if (mixWeight <= 0.03) return d;
+
+    d.valid = true;
+    d.target = posteriorTarget;
+    d.mixWeight = mixWeight;
+    d.effectiveSupport = weightSum;
+    d.posteriorRetainedRatio = retainedRatio;
+    d.gradientGuard = gradientGuard;
+    return d;
+}
+
+SameCfaRingEstimate sameCfaRingEstimate(int x, int y, int radius, float S, float O) {
+    SameCfaRingEstimate outValue;
+    outValue.valid = false;
+    outValue.target = 0.0;
+    outValue.structureZ = 8.0;
+    const ivec2 unitOffsets[8] = ivec2[8](
+        ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1),
+        ivec2(-1, -1), ivec2(1, 1), ivec2(1, -1), ivec2(-1, 1));
+    float ring[8];
+    for (int i = 0; i < 8; ++i) {
+        ivec2 offset = unitOffsets[i] * radius;
+        float raw = rawAt(x + offset.x, y + offset.y);
+        if (!vstValidDomain(raw, S, O)) return outValue;
+        ring[i] = forwardVst(raw, S, O);
+    }
+
+    float sortedRing[8];
+    for (int i = 0; i < 8; ++i) sortedRing[i] = ring[i];
+    sort8(sortedRing);
+    float ringMedian = 0.5 * (sortedRing[3] + sortedRing[4]);
+    float weightedSum = 0.0;
+    float weightSum = 0.0;
+    for (int i = 0; i < 8; ++i) {
+        float delta = ring[i] - ringMedian;
+        float weight = 1.0 / (1.0 + 0.20 * delta * delta);
+        weightedSum += weight * ring[i];
+        weightSum += weight;
+    }
+    if (weightSum <= 1.0e-6) return outValue;
+
+    outValue.target = weightedSum / weightSum;
+    outValue.structureZ = max(
+        max(abs(ring[0] - ring[1]), abs(ring[2] - ring[3])),
+        max(abs(ring[4] - ring[5]), abs(ring[6] - ring[7]))) / SQRT2;
+    outValue.valid = finite1(outValue.target) && finite1(outValue.structureZ);
+    return outValue;
+}
+
+void pass1Pixel() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= int(pc.frameWidth) || y >= int(pc.frameHeight)) return;
+    uint index = linearIndex(x, y);
+    float original = sourceMosaic[index];
+    if (x < 8 || y < 8 || x >= int(pc.frameWidth) - 8 || y >= int(pc.frameHeight) - 8) {
+        candidateMosaic[index] = original;
+        return;
+    }
+    int ch = cfaChannel(x, y);
+    float S = channelS(ch);
+    float O = channelO(ch);
+    if (!vstValid(S, O)) {
+        candidateMosaic[index] = original;
+        return;
+    }
+
+    const ivec2 offsets[9] = ivec2[9](
+        ivec2(0,0), ivec2(-2,-2), ivec2(0,-2), ivec2(2,-2),
+        ivec2(-2,0), ivec2(2,0), ivec2(-2,2), ivec2(0,2), ivec2(2,2)
+    );
+    float samples[9];
+    float vst[9];
+    for (int i = 0; i < 9; ++i) {
+        samples[i] = rawAt(x + offsets[i].x, y + offsets[i].y);
+        if (!vstValidDomain(samples[i], S, O)) {
+            candidateMosaic[index] = original;
+            return;
+        }
+        vst[i] = forwardVst(samples[i], S, O);
+    }
+    float sorted[9];
+    for (int i = 0; i < 9; ++i) sorted[i] = vst[i];
+    sort9(sorted);
+    float median = sorted[4];
+    float center = vst[0];
+    float madSamples[9];
+    for (int i = 0; i < 9; ++i) madSamples[i] = abs(vst[i] - median);
+    sort9(madSamples);
+    const float expectedNineSampleGaussianMad = 0.58601043;
+    float normalizedMad = madSamples[4] / expectedNineSampleGaussianMad;
+
+    TensorEstimate tensor = tensorAt(x, y);
+    if (tensor.valid) {
+        atomicAdd(telemetry[3], 1u);
+        uint cb = uint(clamp(int(floor(saturate(tensor.confidence) * 32.0)), 0, 31));
+        uint hb = uint(clamp(int(floor(saturate(tensor.coherence) * 32.0)), 0, 31));
+        atomicAdd(telemetry[16u + cb], 1u);
+        atomicAdd(telemetry[48u + hb], 1u);
+    }
+    if (tensor.confident) {
+        atomicAdd(telemetry[4], 1u);
+        atomicAdd(telemetry[9u + uint(orientationBin(tensor.tangentDegrees))], 1u);
+    } else {
+        atomicAdd(telemetry[5], 1u);
+    }
+
+    float centerGreen = greenGuideAt(x, y);
+    float greenSigma = sqrt(max(1.0e-12, pc.greenS * max(0.0, centerGreen) + pc.greenO));
+
+    // SPECTRA Context Fusion: classify local structure in units of the physical
+    // noise model, not in raw gradient units. In VST space one sensel has unit
+    // noise variance, so an opposite-pair difference has sigma=sqrt(2). The
+    // green scaffold is normalized from its actual S/O variance. This prevents
+    // stochastic low-light CFA noise from protecting itself as an "edge".
+    float sameCfaHorizontalZ = abs(vst[4] - vst[5]) / SQRT2;
+    float sameCfaVerticalZ = abs(vst[2] - vst[7]) / SQRT2;
+    float sameCfaStructureZ = max(sameCfaHorizontalZ, sameCfaVerticalZ);
+    float greenLeft = greenGuideAt(x - 2, y);
+    float greenRight = greenGuideAt(x + 2, y);
+    float greenUp = greenGuideAt(x, y - 2);
+    float greenDown = greenGuideAt(x, y + 2);
+    float greenHorizontalSigma = sqrt(max(1.0e-12,
+            pc.greenS * max(0.0, greenLeft) + pc.greenO +
+            pc.greenS * max(0.0, greenRight) + pc.greenO));
+    float greenVerticalSigma = sqrt(max(1.0e-12,
+            pc.greenS * max(0.0, greenUp) + pc.greenO +
+            pc.greenS * max(0.0, greenDown) + pc.greenO));
+    float greenStructureZ = max(
+            abs(greenLeft - greenRight) / max(1.0e-6, greenHorizontalSigma),
+            abs(greenUp - greenDown) / max(1.0e-6, greenVerticalSigma));
+    float contextStructureZ = max(sameCfaStructureZ, 0.85 * greenStructureZ);
+
+    float coarseRawLeft = rawAt(x - 4, y);
+    float coarseRawRight = rawAt(x + 4, y);
+    float coarseRawUp = rawAt(x, y - 4);
+    float coarseRawDown = rawAt(x, y + 4);
+    float coarseSameCfaStructureZ = 0.0;
+    if (vstValidDomain(coarseRawLeft, S, O) && vstValidDomain(coarseRawRight, S, O) &&
+        vstValidDomain(coarseRawUp, S, O) && vstValidDomain(coarseRawDown, S, O)) {
+        coarseSameCfaStructureZ = max(
+                abs(forwardVst(coarseRawLeft, S, O) - forwardVst(coarseRawRight, S, O)) / SQRT2,
+                abs(forwardVst(coarseRawUp, S, O) - forwardVst(coarseRawDown, S, O)) / SQRT2);
+    }
+    float coarseGreenLeft = greenGuideAt(x - 4, y);
+    float coarseGreenRight = greenGuideAt(x + 4, y);
+    float coarseGreenUp = greenGuideAt(x, y - 4);
+    float coarseGreenDown = greenGuideAt(x, y + 4);
+    float coarseGreenHorizontalSigma = sqrt(max(1.0e-12,
+            pc.greenS * max(0.0, coarseGreenLeft) + pc.greenO +
+            pc.greenS * max(0.0, coarseGreenRight) + pc.greenO));
+    float coarseGreenVerticalSigma = sqrt(max(1.0e-12,
+            pc.greenS * max(0.0, coarseGreenUp) + pc.greenO +
+            pc.greenS * max(0.0, coarseGreenDown) + pc.greenO));
+    float coarseGreenStructureZ = max(
+            abs(coarseGreenLeft - coarseGreenRight) / max(1.0e-6, coarseGreenHorizontalSigma),
+            abs(coarseGreenUp - coarseGreenDown) / max(1.0e-6, coarseGreenVerticalSigma));
+    float coarseStructureZ = max(coarseSameCfaStructureZ, 0.85 * coarseGreenStructureZ);
+    MultiscaleContextDecision multiscaleContext = resolveMultiscaleContext(
+            contextStructureZ, coarseStructureZ, pc.combinedNoisePressure, pc.modelConfidence);
+    CfaSurfaceClassification surfaceClass = resolveCfaSurfaceClassification(
+            normalizedMad, multiscaleContext.coherentStructureZ, tensor.confidence,
+            pc.combinedNoisePressure, pc.modelConfidence);
+    float flatContext = clamp(
+            0.62 * multiscaleContext.flatContext + 0.38 * surfaceClass.flatConfidence -
+            0.45 * surfaceClass.textureConfidence, 0.0, 1.0);
+
+    float weightedSum = 0.0;
+    float weightSum = 0.0;
+    for (int i = 1; i < 9; ++i) {
+        float distance = vst[i] - median;
+        float robustWeight = 1.0 / (1.0 + 0.25 * distance * distance);
+        float neighbourGreen = greenGuideAt(x + offsets[i].x, y + offsets[i].y);
+        float guideDeltaSigma = (neighbourGreen - centerGreen) / max(1.0e-6, greenSigma);
+        DirectionalDecision direction = directionalWeight(
+            tensor, float(offsets[i].x), float(offsets[i].y), guideDeltaSigma);
+        float weight = robustWeight * direction.weight;
+        weightedSum += weight * vst[i];
+        weightSum += weight;
+        if (tensor.confident) {
+            if (direction.crossEdgeProtected) atomicAdd(telemetry[7], 1u);
+            if (direction.alongStructureSupported) atomicAdd(telemetry[8], 1u);
+        }
+    }
+    if (weightSum <= 1.0e-6) {
+        candidateMosaic[index] = original;
+        return;
+    }
+    float localMean = weightedSum / weightSum;
+    float varianceSum = 0.0;
+    for (int i = 1; i < 9; ++i) {
+        float delta = vst[i] - localMean;
+        varianceSum += delta * delta;
+    }
+    float localVariance = varianceSum / 7.0;
+    float signalVariance = max(0.0, localVariance - 1.0);
+    float wienerGain = signalVariance / (signalVariance + 1.0);
+    float target = localMean + wienerGain * (center - localMean);
+
+    float impulseScore = abs(center - median);
+    if (impulseScore > 3.0) {
+        float impulseAuthority = smoothstepSpectra(3.0, 6.0, impulseScore);
+        target += impulseAuthority * (median - target);
+    }
+
+    // SPECTRA Multiscale Residual Consensus. Unlike the previous radius-4
+    // broad median, this stage requires two wider same-CFA estimates to agree
+    // before they may steer the fine Wiener solution. That makes the wider
+    // context a denoising signal, not merely an edge classifier, while avoiding
+    // a free-standing blur across gradients or coherent texture.
+    SameCfaRingEstimate midRing = sameCfaRingEstimate(x, y, 4, S, O);
+    SameCfaRingEstimate coarseRing = sameCfaRingEstimate(x, y, 8, S, O);
+    if (midRing.valid && coarseRing.valid) {
+        float persistentStructureZ = max(
+                multiscaleContext.coherentStructureZ,
+                0.75 * min(midRing.structureZ, coarseRing.structureZ));
+        MultiscaleResidualConsensusDecision residualConsensus =
+                resolveMultiscaleResidualConsensus(
+                    abs(center - target),
+                    abs(midRing.target - coarseRing.target),
+                    persistentStructureZ,
+                    flatContext,
+                    pc.combinedNoisePressure,
+                    pc.modelConfidence);
+        float contextualTarget = residualConsensus.midWeight * midRing.target +
+                residualConsensus.coarseWeight * coarseRing.target;
+        target = mix(target, contextualTarget,
+                     clamp(residualConsensus.contextMix * surfaceClass.contextMixScale, 0.0, 0.62));
+
+        ProfiledMultibandDecision profiled = resolveProfiledMultiband(
+                center, localMean, midRing.target, coarseRing.target,
+                flatContext, multiscaleContext.edgeProtection,
+                surfaceClass, tensor, pc.combinedNoisePressure, pc.modelConfidence);
+        target = mix(target, profiled.target, profiled.mixWeight);
+        if (profiled.mixWeight > 0.05) atomicAdd(telemetry[84], 1u);
+        if (profiled.retainedFineRatio < 0.50) atomicAdd(telemetry[85], 1u);
+        if (profiled.coherentDetailGain > 1.01) atomicAdd(telemetry[86], 1u);
+    }
+
+    ProfiledPatchConsensusDecision patchConsensus = resolveProfiledPatchConsensus(
+            x, y, S, O, center, flatContext, multiscaleContext.edgeProtection,
+            surfaceClass, pc.combinedNoisePressure, pc.modelConfidence);
+    if (patchConsensus.valid) {
+        target = mix(target, patchConsensus.target, patchConsensus.mixWeight);
+        atomicAdd(telemetry[87], 1u);
+        if (patchConsensus.mixWeight >= 0.50) atomicAdd(telemetry[88], 1u);
+        if (patchConsensus.posteriorRetainedRatio <= 0.25) atomicAdd(telemetry[89], 1u);
+        if (patchConsensus.gradientGuard <= 0.35) atomicAdd(telemetry[90], 1u);
+    }
+
+    float edgeProtection = multiscaleContext.edgeProtection;
+    float authorityScale = finalAuthorityScale(tensor, edgeProtection);
+    float lensGain = lensGainAt(ch, x, y);
+    float shadingAuthority = clamp(0.90 + 0.20 * (lensGain - 1.0), 0.90, 1.38);
+    float isolatedNoiseEvidence = smoothstepSpectra(0.55, 2.75, impulseScore) * flatContext;
+    float contextBoost = mix(0.90, 1.34, flatContext * (0.70 + 0.30 * isolatedNoiseEvidence));
+    float authority = min(1.35, pc.blendStrength * shadingAuthority * authorityScale *
+                          contextBoost * multiscaleContext.denoiseAuthorityScale *
+                          surfaceClass.authorityScale);
+    if (edgeProtection > 0.70 || (tensor.confident && authorityScale < 0.45)) atomicAdd(telemetry[2], 1u);
+    if (flatContext > 0.70) atomicAdd(telemetry[81], 1u);
+    if (edgeProtection > 0.70) atomicAdd(telemetry[82], 1u);
+    if (contextBoost > 1.15) atomicAdd(telemetry[83], 1u);
+
+    float boundedVstDelta = clamp((target - center) * authority, -pc.maxPixelShift, pc.maxPixelShift);
+    float candidate = inverseVst(center + boundedVstDelta, S, O);
+    if (!finite1(candidate)) {
+        candidateMosaic[index] = original;
+        return;
+    }
+    float localSigma = sqrt(max(1.0e-12, S * max(0.0, samples[0]) + O));
+    float edgeShiftGuard = tensor.confident ? clamp(0.82 + 0.18 * tensor.confidence, 0.82, 1.0) : 1.0;
+    float contextShiftGuard = mix(1.12, 0.78, edgeProtection);
+    float maxLinearShift = clamp((1.25 + 1.85 * pc.isoAuthority) * localSigma * shadingAuthority *
+                                 edgeShiftGuard * contextShiftGuard, 1.0e-5, 0.028);
+    float appliedDelta = clamp(candidate - samples[0], -maxLinearShift, maxLinearShift);
+    candidateMosaic[index] = samples[0] + appliedDelta;
+    atomicAdd(telemetry[0], 1u);
+    if (abs(appliedDelta) > 1.0e-7) {
+        atomicAdd(telemetry[1], 1u);
+        if (tensor.confident) atomicAdd(telemetry[6], 1u);
+    }
+    atomicMax(telemetry[13], floatBitsToUint(abs(appliedDelta)));
+}
+
+
+void pass0Pixel() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= int(pc.frameWidth) || y >= int(pc.frameHeight)) return;
+    uint index = linearIndex(x, y);
+    float original = sourceMosaic[index];
+    if (!finite1(original)) {
+        candidateMosaic[index] = original;
+        return;
+    }
+    int ch = cfaChannel(x, y);
+    float bias = ch == 0 ? pc.s0 : (ch == 1 ? pc.s1 : (ch == 2 ? pc.s2 : pc.s3));
+    candidateMosaic[index] = original + bias;
+    atomicAdd(telemetry[0], 1u);
+    if (abs(bias) > 1.0e-12) atomicAdd(telemetry[1], 1u);
+    atomicMax(telemetry[13], floatBitsToUint(abs(bias)));
+}
+
+void collectAfterTileStats() {
+    uint tileIndex = gl_GlobalInvocationID.x;
+    uint tileCount = pc.gridCols * pc.gridRows;
+    if (tileIndex >= tileCount || pc.gridCols == 0u || pc.gridRows == 0u) return;
+    uint gx = tileIndex % pc.gridCols;
+    uint gy = tileIndex / pc.gridCols;
+    int y0 = max(4, int(gy * pc.tileHeight));
+    int y1 = min(int(pc.frameHeight) - 4, int((gy + 1u) * pc.tileHeight));
+    int x0 = max(4, int(gx * pc.tileWidth));
+    int x1 = min(int(pc.frameWidth) - 4, int((gx + 1u) * pc.tileWidth));
+    if (x1 <= x0 || y1 <= y0) {
+        tileStats[tileIndex].meanSignal = vec4(0.0);
+        tileStats[tileIndex].metrics = vec4(0.0);
+        return;
+    }
+    int baseY = y0 + ((y0 & 1) != 0 ? 1 : 0);
+    int baseX = x0 + ((x0 & 1) != 0 ? 1 : 0);
+    vec4 signalSum = vec4(0.0);
+    uvec4 signalCount = uvec4(0u);
+    float residualSum = 0.0;
+    float structureSum = 0.0;
+    uint sampleCount = 0u;
+    for (int y = baseY; y < y1; y += 4) {
+        for (int x = baseX; x < x1; x += 4) {
+            for (int py = 0; py < 2; ++py) {
+                int yy = y + py;
+                if (yy >= y1) continue;
+                for (int px = 0; px < 2; ++px) {
+                    int xx = x + px;
+                    if (xx >= x1) continue;
+                    int ch = cfaChannel(xx, yy);
+                    float center = candidateAt(xx, yy);
+                    float left = candidateAt(xx - 2, yy);
+                    float right = candidateAt(xx + 2, yy);
+                    float up = candidateAt(xx, yy - 2);
+                    float down = candidateAt(xx, yy + 2);
+                    if (!finite1(center) || !finite1(left) || !finite1(right) || !finite1(up) || !finite1(down)) continue;
+                    float signal = clamp(center, 0.0, 1.0);
+                    signalSum[ch] += signal;
+                    signalCount[ch]++;
+                    float neighbourMean = 0.25 * (left + right + up + down);
+                    float residual = center - neighbourMean;
+                    residualSum += residual * residual;
+                    float structure = 0.5 * (abs(left - right) + abs(up - down));
+                    structureSum += structure * structure;
+                    sampleCount++;
+                }
+            }
+        }
+    }
+    vec4 meanSignal = vec4(0.0);
+    uint populated = 0u;
+    for (int ch = 0; ch < 4; ++ch) {
+        if (signalCount[ch] > 0u) {
+            meanSignal[ch] = signalSum[ch] / float(signalCount[ch]);
+            populated++;
+        }
+    }
+    float residualEnergy = sampleCount > 0u ? residualSum / float(sampleCount) : 0.0;
+    float structureEnergy = sampleCount > 0u ? structureSum / float(sampleCount) : 0.0;
+    tileStats[tileIndex].meanSignal = meanSignal;
+    tileStats[tileIndex].metrics = vec4(residualEnergy, structureEnergy, float(sampleCount), float(populated));
+}
+
+void noRegretBlend() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= int(pc.frameWidth) || y >= int(pc.frameHeight)) return;
+    uint index = linearIndex(x, y);
+    if (pc.gridCols == 0u || pc.gridRows == 0u || pc.tileWidth == 0u || pc.tileHeight == 0u) {
+        candidateMosaic[index] = sourceMosaic[index];
+        return;
+    }
+    float gy = (float(y) + 0.5) / float(max(pc.tileHeight, 1u)) - 0.5;
+    int gy0 = clamp(int(floor(gy)), 0, int(pc.gridRows) - 1);
+    int gy1 = min(gy0 + 1, int(pc.gridRows) - 1);
+    float ty = clamp(gy - float(gy0), 0.0, 1.0);
+    float gx = (float(x) + 0.5) / float(max(pc.tileWidth, 1u)) - 0.5;
+    int gx0 = clamp(int(floor(gx)), 0, int(pc.gridCols) - 1);
+    int gx1 = min(gx0 + 1, int(pc.gridCols) - 1);
+    float tx = clamp(gx - float(gx0), 0.0, 1.0);
+    float a00 = acceptance[uint(gy0) * pc.gridCols + uint(gx0)];
+    float a10 = acceptance[uint(gy0) * pc.gridCols + uint(gx1)];
+    float a01 = acceptance[uint(gy1) * pc.gridCols + uint(gx0)];
+    float a11 = acceptance[uint(gy1) * pc.gridCols + uint(gx1)];
+    float weight = clamp(mix(mix(a00, a10, tx), mix(a01, a11, tx), ty), 0.0, 1.0);
+    float before = sourceMosaic[index];
+    float proposed = candidateMosaic[index];
+    // In-place finalisation is safe: mode 2 reads and writes only the same pixel.
+    // Keeping the final mosaic in the device-local candidate buffer avoids a third
+    // full-frame allocation and prepares direct hand-off to Pass 2.
+    candidateMosaic[index] = before + weight * (proposed - before);
+    if (weight < 0.999) atomicAdd(telemetry[80], 1u);
+}
+
+
+float finalAt(int x, int y) {
+    x = clamp(x, 0, int(pc.frameWidth) - 1);
+    y = clamp(y, 0, int(pc.frameHeight) - 1);
+    return candidateMosaic[linearIndex(x, y)];
+}
+
+float finalGreenReference(int x, int y) {
+    return 0.25 * (finalAt(x, y - 1) + finalAt(x, y + 1) +
+                   finalAt(x - 1, y) + finalAt(x + 1, y));
+}
+
+float finalChromaResidual(int x, int y) {
+    return finalAt(x, y) - finalGreenReference(x, y);
+}
+
+float finalCrossMeanResidual(int x, int y, int radius) {
+    return 0.25 * (finalChromaResidual(x - radius, y) +
+                   finalChromaResidual(x + radius, y) +
+                   finalChromaResidual(x, y - radius) +
+                   finalChromaResidual(x, y + radius));
+}
+
+void reduceObservation(
+        vec4 a, vec4 b, uint recordStride, uint recordOffset, bool writeSecond
+) {
+    uint lid = gl_LocalInvocationIndex;
+    reduceA[lid] = a;
+    reduceB[lid] = b;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (lid < stride) {
+            reduceA[lid] += reduceA[lid + stride];
+            reduceB[lid] += reduceB[lid + stride];
+        }
+        barrier();
+    }
+    if (lid == 0u) {
+        uint groupIndex = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+        uint base = pc.observationOffset + recordStride * groupIndex + recordOffset;
+        observation[base] = reduceA[0];
+        if (writeSecond) observation[base + 1u] = reduceB[0];
+    }
+}
+
+// Exact M8A sampling geometry, but reduced per workgroup on GPU. The CPU receives
+// only a few thousand vec4 partials instead of a full-resolution mosaic.
+void collectRawObservation() {
+    int baseX = 2 + int(gl_GlobalInvocationID.x) * 4;
+    int baseY = 2 + int(gl_GlobalInvocationID.y) * 4;
+    vec4 sums = vec4(0.0); // residualSq, residualCount, chromaSq, chromaCount
+    if (baseX < int(pc.frameWidth) - 3 && baseY < int(pc.frameHeight) - 3) {
+        for (int dy = 0; dy < 2; ++dy) {
+            int y = baseY + dy;
+            for (int dx = 0; dx < 2; ++dx) {
+                int x = baseX + dx;
+                float center = finalAt(x, y);
+                float neighbourMean = 0.25 * (finalAt(x, y - 2) + finalAt(x, y + 2) +
+                                               finalAt(x - 2, y) + finalAt(x + 2, y));
+                if (finite1(center) && finite1(neighbourMean)) {
+                    float d = center - neighbourMean;
+                    sums.x += d * d;
+                    sums.y += 1.0;
+                }
+            }
+        }
+    }
+    // M8A chroma sampling is offset by one pixel (3 mod 4). Reuse the same lane
+    // index with that offset so both metrics are sampled deterministically.
+    int chromaX = 3 + int(gl_GlobalInvocationID.x) * 4;
+    int chromaY = 3 + int(gl_GlobalInvocationID.y) * 4;
+    if (chromaX < int(pc.frameWidth) - 3 && chromaY < int(pc.frameHeight) - 3) {
+        for (int dy = 0; dy < 2; ++dy) {
+            int y = chromaY + dy;
+            for (int dx = 0; dx < 2; ++dx) {
+                int x = chromaX + dx;
+                int ch = cfaChannel(x, y);
+                if (ch != 0 && ch != 3) continue;
+                float center = finalChromaResidual(x, y);
+                float neighbourMean = 0.25 * (finalChromaResidual(x - 2, y) +
+                                               finalChromaResidual(x + 2, y) +
+                                               finalChromaResidual(x, y - 2) +
+                                               finalChromaResidual(x, y + 2));
+                if (finite1(center) && finite1(neighbourMean)) {
+                    float d = center - neighbourMean;
+                    sums.z += d * d;
+                    sums.w += 1.0;
+                }
+            }
+        }
+    }
+    reduceObservation(sums, vec4(0.0), 1u, 0u, false);
+}
+
+// Exact sampled chroma-band proxy used by the CPU reference (stride 16, 2x2 CFA
+// phases). Four vec4 partials preserve aggregate plus separate red/blue band energy for deterministic CPU reduction.
+void collectChromaBandObservation() {
+    int baseX = 9 + int(gl_GlobalInvocationID.x) * 16;
+    int baseY = 9 + int(gl_GlobalInvocationID.y) * 16;
+    vec4 a = vec4(0.0); // aggregate fineSq, midSq, lowSq, rowSq
+    vec4 b = vec4(0.0); // aggregate colSq, samples, redCount, blueCount
+    vec4 redBands = vec4(0.0);  // red fineSq, midSq, lowSq, reserved
+    vec4 blueBands = vec4(0.0); // blue fineSq, midSq, lowSq, reserved
+    if (baseX < int(pc.frameWidth) - 10 && baseY < int(pc.frameHeight) - 10) {
+        for (int phaseY = 0; phaseY < 2; ++phaseY) {
+            for (int phaseX = 0; phaseX < 2; ++phaseX) {
+                int x = baseX + phaseX;
+                int y = baseY + phaseY;
+                int ch = cfaChannel(x, y);
+                if (ch != 0 && ch != 3) continue;
+                float centerGreen = finalGreenReference(x, y);
+                float horizontalStructure = abs(finalGreenReference(x + 2, y) - finalGreenReference(x - 2, y));
+                float verticalStructure = abs(finalGreenReference(x, y + 2) - finalGreenReference(x, y - 2));
+                float normalizedStructure = (horizontalStructure + verticalStructure) /
+                        max(0.02, abs(centerGreen));
+                if (!finite1(centerGreen) || !finite1(normalizedStructure) || normalizedStructure > 0.28) continue;
+                float center = finalChromaResidual(x, y);
+                float local = finalCrossMeanResidual(x, y, 2);
+                float middle = finalCrossMeanResidual(x, y, 4);
+                float broad = finalCrossMeanResidual(x, y, 8);
+                float rowBefore = finalChromaResidual(x, y - 8);
+                float rowAfter = finalChromaResidual(x, y + 8);
+                float colBefore = finalChromaResidual(x - 8, y);
+                float colAfter = finalChromaResidual(x + 8, y);
+                if (!finite1(center) || !finite1(local) || !finite1(middle) || !finite1(broad) ||
+                    !finite1(rowBefore) || !finite1(rowAfter) || !finite1(colBefore) || !finite1(colAfter)) continue;
+                float fine = center - local;
+                float mid = local - middle;
+                float low = middle - broad;
+                float rowPattern = 0.5 * (rowBefore - rowAfter);
+                float colPattern = 0.5 * (colBefore - colAfter);
+                vec3 bandSq = vec3(fine * fine, mid * mid, low * low);
+                a += vec4(bandSq, rowPattern * rowPattern);
+                b.x += colPattern * colPattern;
+                b.y += 1.0;
+                if (ch == 0) {
+                    b.z += 1.0;
+                    redBands.xyz += bandSq;
+                } else {
+                    b.w += 1.0;
+                    blueBands.xyz += bandSq;
+                }
+            }
+        }
+    }
+    reduceObservation(a, b, 4u, 0u, true);
+    reduceObservation(redBands, blueBands, 4u, 2u, true);
+}
+
+void main() {
+    if (pc.mode == 0u) {
+        pass1Pixel();
+    } else if (pc.mode == 1u) {
+        // Statistics dispatch is 1-D; local_size_y is still 16 so only y==0 participates.
+        if (gl_GlobalInvocationID.y == 0u) collectAfterTileStats();
+    } else if (pc.mode == 2u) {
+        noRegretBlend();
+    } else if (pc.mode == 3u) {
+        collectRawObservation();
+    } else if (pc.mode == 4u) {
+        collectChromaBandObservation();
+    } else if (pc.mode == 5u) {
+        pass0Pixel();
+    }
+}

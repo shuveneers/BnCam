@@ -1,0 +1,105 @@
+#version 450
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer InputBytesBuffer {
+    uint inputWords[];
+};
+
+layout(std430, set = 0, binding = 1) buffer CanonicalRawBuffer {
+    uint outputWords[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint sourceWidth;
+    uint sourceHeight;
+    uint outputWidth;
+    uint outputHeight;
+    uint inputRowStrideBytes;
+    uint inputPixelStrideBytes;
+    uint cropLeft;
+    uint cropTop;
+    uint sourceFormat; // 0 = RAW10, 1 = little-endian RAW_SENSOR
+    uint nativeWhite;
+    uint payloadWhite;
+    uint nativeBlack0;
+    uint nativeBlack1;
+    uint nativeBlack2;
+    uint nativeBlack3;
+    uint payloadBlack0;
+    uint payloadBlack1;
+    uint payloadBlack2;
+    uint payloadBlack3;
+} pc;
+
+uint readByte(uint byteIndex) {
+    return (inputWords[byteIndex / 4u] >> ((byteIndex & 3u) * 8u)) & 0xFFu;
+}
+
+uint readRaw10(uint sourceX, uint sourceY) {
+    uint groupIndex = sourceX / 4u;
+    uint lane = sourceX & 3u;
+    uint base = sourceY * pc.inputRowStrideBytes + groupIndex * 5u;
+    uint high = readByte(base + lane);
+    uint packedLow = readByte(base + 4u);
+    return (high << 2u) | ((packedLow >> (lane * 2u)) & 0x03u);
+}
+
+uint readRawSensor(uint sourceX, uint sourceY) {
+    uint offset = sourceY * pc.inputRowStrideBytes + sourceX * pc.inputPixelStrideBytes;
+    return readByte(offset) | (readByte(offset + 1u) << 8u);
+}
+
+uint nativeBlackFor(uint x, uint y) {
+    uint index = ((y & 1u) << 1u) | (x & 1u);
+    if (index == 0u) return pc.nativeBlack0;
+    if (index == 1u) return pc.nativeBlack1;
+    if (index == 2u) return pc.nativeBlack2;
+    return pc.nativeBlack3;
+}
+
+uint payloadBlackFor(uint x, uint y) {
+    uint index = ((y & 1u) << 1u) | (x & 1u);
+    if (index == 0u) return pc.payloadBlack0;
+    if (index == 1u) return pc.payloadBlack1;
+    if (index == 2u) return pc.payloadBlack2;
+    return pc.payloadBlack3;
+}
+
+uint mapToPayload(uint raw, uint localX, uint localY) {
+    uint nativeBlack = nativeBlackFor(localX, localY);
+    uint payloadBlack = payloadBlackFor(localX, localY);
+    bool identity = pc.nativeWhite == pc.payloadWhite && nativeBlack == payloadBlack;
+    if (identity) return min(raw, pc.payloadWhite);
+
+    float nativeRange = float(max(1u, pc.nativeWhite - nativeBlack));
+    float payloadRange = float(max(1u, pc.payloadWhite - payloadBlack));
+    float normalized = (float(raw) - float(nativeBlack)) / nativeRange;
+    float mapped = float(payloadBlack) + normalized * payloadRange;
+    return uint(clamp(floor(mapped + 0.5), 0.0, float(pc.payloadWhite)));
+}
+
+uint decodePixel(uint localPixelIndex) {
+    uint localX = localPixelIndex % pc.outputWidth;
+    uint localY = localPixelIndex / pc.outputWidth;
+    uint sourceX = pc.cropLeft + localX;
+    uint sourceY = pc.cropTop + localY;
+    uint raw = pc.sourceFormat == 0u
+        ? readRaw10(sourceX, sourceY)
+        : readRawSensor(sourceX, sourceY);
+    return mapToPayload(raw, localX, localY) & 0xFFFFu;
+}
+
+void main() {
+    uint wordIndex = gl_GlobalInvocationID.x;
+    uint totalPixels = pc.outputWidth * pc.outputHeight;
+    uint totalWords = (totalPixels + 1u) / 2u;
+    if (wordIndex >= totalWords) return;
+
+    uint pixel0 = wordIndex * 2u;
+    uint lo = decodePixel(pixel0);
+    uint hi = 0u;
+    if (pixel0 + 1u < totalPixels) {
+        hi = decodePixel(pixel0 + 1u) << 16u;
+    }
+    outputWords[wordIndex] = lo | hi;
+}

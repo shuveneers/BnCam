@@ -1,0 +1,186 @@
+#version 450
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer AnchorRawBuffer { uint anchorWords[]; } anchorBuf;
+layout(std430, binding = 1) readonly buffer SupportRawBuffer { uint supportWords[]; } supportBuf;
+layout(std430, binding = 2) buffer ScoreBuffer { vec4 scores[]; } scoreBuf;
+layout(std430, binding = 3) writeonly buffer BestResultBuffer { vec4 bestResult[]; } resultBuf;
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+    int centerDx;
+    int centerDy;
+    uint searchRadius;
+    uint shiftStep;
+    uint sampleStep;
+    uint candidateCols;
+    uint candidateRows;
+    uint maxShift;
+    float whiteLevel;
+    float black0;
+    float black1;
+    float black2;
+    float black3;
+    uint mode;
+} pc;
+
+shared float sumA[64];
+shared float sumB[64];
+shared float sumAA[64];
+shared float sumBB[64];
+shared float sumAB[64];
+shared float sampleCount[64];
+shared float reduceResponse[64];
+shared uint reduceIndex[64];
+
+float anchorRaw(uint index) {
+    uint packed = anchorBuf.anchorWords[index >> 1u];
+    return float((index & 1u) == 0u ? (packed & 0xffffu) : (packed >> 16u));
+}
+
+float supportRaw(uint index) {
+    uint packed = supportBuf.supportWords[index >> 1u];
+    return float((index & 1u) == 0u ? (packed & 0xffffu) : (packed >> 16u));
+}
+
+float phaseBlack(int x, int y) {
+    int phase = ((y & 1) << 1) | (x & 1);
+    if (phase == 0) return pc.black0;
+    if (phase == 1) return pc.black1;
+    if (phase == 2) return pc.black2;
+    return pc.black3;
+}
+
+float normalizedAnchor(int x, int y) {
+    uint idx = uint(y) * pc.width + uint(x);
+    float black = phaseBlack(x, y);
+    float range = max(1.0, pc.whiteLevel - black);
+    return clamp((anchorRaw(idx) - black) / range, 0.0, 1.0);
+}
+
+float normalizedSupport(int x, int y) {
+    uint idx = uint(y) * pc.width + uint(x);
+    float black = phaseBlack(x, y);
+    float range = max(1.0, pc.whiteLevel - black);
+    return clamp((supportRaw(idx) - black) / range, 0.0, 1.0);
+}
+
+void reduceBestCandidate() {
+    uint lane = gl_LocalInvocationID.x;
+    uint candidateCount = pc.candidateCols * pc.candidateRows;
+    float best = -1.0;
+    uint bestIndex = 0u;
+    for (uint i = lane; i < candidateCount; i += 64u) {
+        vec4 score = scoreBuf.scores[i];
+        if (isnan(score.z) || isinf(score.z) || score.w < 64.0) continue;
+        if (score.z > best) {
+            best = score.z;
+            bestIndex = i;
+        }
+    }
+    reduceResponse[lane] = best;
+    reduceIndex[lane] = bestIndex;
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+        if (lane < stride && reduceResponse[lane + stride] > reduceResponse[lane]) {
+            reduceResponse[lane] = reduceResponse[lane + stride];
+            reduceIndex[lane] = reduceIndex[lane + stride];
+        }
+        barrier();
+    }
+    if (lane == 0u) {
+        resultBuf.bestResult[0] = reduceResponse[0] >= 0.0
+                ? scoreBuf.scores[reduceIndex[0]]
+                : vec4(0.0, 0.0, 0.0, 0.0);
+    }
+}
+
+void scoreCandidate() {
+    uint candidate = gl_WorkGroupID.x;
+    uint candidateCount = pc.candidateCols * pc.candidateRows;
+    if (candidate >= candidateCount) return;
+
+    uint cx = candidate % pc.candidateCols;
+    uint cy = candidate / pc.candidateCols;
+    int startDx = pc.centerDx - int(pc.searchRadius);
+    int startDy = pc.centerDy - int(pc.searchRadius);
+    int dx = startDx + int(cx * pc.shiftStep);
+    int dy = startDy + int(cy * pc.shiftStep);
+
+    uint lane = gl_LocalInvocationID.x;
+    float a = 0.0;
+    float b = 0.0;
+    float aa = 0.0;
+    float bb = 0.0;
+    float ab = 0.0;
+    float n = 0.0;
+
+    bool shiftValid = abs(dx) <= int(pc.maxShift) && abs(dy) <= int(pc.maxShift) &&
+            ((dx & 1) == 0) && ((dy & 1) == 0);
+    if (shiftValid) {
+        uint step = max(4u, pc.sampleStep);
+        uint xCount = max(1u, (pc.width + step - 1u) / step);
+        uint yCount = max(1u, (pc.height + step - 1u) / step);
+        uint totalSamples = xCount * yCount;
+        for (uint sampleIndex = lane; sampleIndex < totalSamples; sampleIndex += 64u) {
+            int x = int((sampleIndex % xCount) * step + step / 2u);
+            int y = int((sampleIndex / xCount) * step + step / 2u);
+            if (x < 4 || y < 4 || x >= int(pc.width) - 4 || y >= int(pc.height) - 4) continue;
+            int sx = x - dx;
+            int sy = y - dy;
+            if (sx < 4 || sy < 4 || sx >= int(pc.width) - 4 || sy >= int(pc.height) - 4) continue;
+            float av = normalizedAnchor(x, y);
+            float bv = normalizedSupport(sx, sy);
+            a += av;
+            b += bv;
+            aa += av * av;
+            bb += bv * bv;
+            ab += av * bv;
+            n += 1.0;
+        }
+    }
+
+    sumA[lane] = a;
+    sumB[lane] = b;
+    sumAA[lane] = aa;
+    sumBB[lane] = bb;
+    sumAB[lane] = ab;
+    sampleCount[lane] = n;
+    barrier();
+
+    for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            sumA[lane] += sumA[lane + stride];
+            sumB[lane] += sumB[lane + stride];
+            sumAA[lane] += sumAA[lane + stride];
+            sumBB[lane] += sumBB[lane + stride];
+            sumAB[lane] += sumAB[lane + stride];
+            sampleCount[lane] += sampleCount[lane + stride];
+        }
+        barrier();
+    }
+
+    if (lane == 0u) {
+        float response = 0.0;
+        float count = sampleCount[0];
+        if (shiftValid && count >= 64.0) {
+            float meanA = sumA[0] / count;
+            float meanB = sumB[0] / count;
+            float varA = max(0.0, sumAA[0] - count * meanA * meanA);
+            float varB = max(0.0, sumBB[0] - count * meanB * meanB);
+            float cov = sumAB[0] - count * meanA * meanB;
+            float denom = sqrt(max(1.0e-12, varA * varB));
+            response = clamp(cov / denom, 0.0, 1.0);
+        }
+        scoreBuf.scores[candidate] = vec4(float(dx), float(dy), response, count);
+    }
+}
+
+void main() {
+    if (pc.mode == 1u) {
+        if (gl_WorkGroupID.x == 0u) reduceBestCandidate();
+        return;
+    }
+    scoreCandidate();
+}

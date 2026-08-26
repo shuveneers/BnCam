@@ -1,0 +1,4 @@
+FUSION
+======
+fusion: requested=anchor_only; supported=true; resolved=anchor_only; executed=not_recorded; result=IMPLEMENTED; fallback=false; reason=single_frame_has_no_multi_frame_fusion
+executedFusion: requested=anchor_only; supported=true; resolved=not_applicable; executed=not_executed; result=one_frame; fallback=false; reason=single_frame_route

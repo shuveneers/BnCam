@@ -1,0 +1,109 @@
+#version 450
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer AnchorLumaBuffer { uint anchorWords[]; };
+layout(std430, set = 0, binding = 1) readonly buffer SupportLumaBuffer { uint supportWords[]; };
+layout(std430, set = 0, binding = 2) buffer AccumulatorBuffer { float accumulator[]; };
+layout(std430, set = 0, binding = 3) writeonly buffer FusedLumaBuffer { uint fusedWords[]; };
+layout(std430, set = 0, binding = 4) buffer WeightBuffer { float weights[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+    float dx;
+    float dy;
+    uint mode;       // 0=init anchor, 1=accumulate aligned support, 2=final pack
+    uint frameCount; // retained for diagnostics/non-HDR compatibility
+    float exposureScaleToAnchor;
+    uint computationalHdr;
+} pc;
+
+float smooth01(float value) { float t = clamp(value, 0.0, 1.0); return t * t * (3.0 - 2.0 * t); }
+
+float loadAnchor(uint pixelIndex) {
+    uint word = anchorWords[pixelIndex >> 2u];
+    uint shift = (pixelIndex & 3u) * 8u;
+    return float((word >> shift) & 0xffu);
+}
+float loadSupport(uint x, uint y) {
+    uint pixelIndex = y * pc.width + x;
+    uint word = supportWords[pixelIndex >> 2u];
+    uint shift = (pixelIndex & 3u) * 8u;
+    return float((word >> shift) & 0xffu);
+}
+float sampleSupportBilinear(float x, float y) {
+    float clampedX = clamp(x, 0.0, float(pc.width - 1u));
+    float clampedY = clamp(y, 0.0, float(pc.height - 1u));
+    uint x0 = uint(floor(clampedX)); uint y0 = uint(floor(clampedY));
+    uint x1 = min(x0 + 1u, pc.width - 1u); uint y1 = min(y0 + 1u, pc.height - 1u);
+    float fx = clampedX - float(x0); float fy = clampedY - float(y0);
+    return mix(mix(loadSupport(x0, y0), loadSupport(x1, y0), fx),
+               mix(loadSupport(x0, y1), loadSupport(x1, y1), fx), fy);
+}
+
+float hdrReconstruct(float luma) {
+    float signal = max(0.0, luma / 255.0);
+    if (signal > 0.72) return (0.72 + 0.275 * (1.0 - exp(-(signal - 0.72) / 0.62))) * 255.0;
+    if (signal < 0.30) {
+        float t = 1.0 - smooth01(signal / 0.30);
+        return signal * (1.0 + 0.14 * t) * 255.0;
+    }
+    return signal * 255.0;
+}
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    uint pixelCount = pc.width * pc.height;
+
+    if (pc.mode == 0u) {
+        if (index >= pixelCount) return;
+        accumulator[index] = loadAnchor(index);
+        weights[index] = 1.0;
+        return;
+    }
+
+    if (pc.mode == 1u) {
+        if (index >= pixelCount) return;
+        uint x = index % pc.width; uint y = index / pc.width;
+        float anchor = loadAnchor(index) / 255.0;
+        float supportNative = sampleSupportBilinear(float(x) - pc.dx, float(y) - pc.dy) / 255.0;
+        float mapped = supportNative;
+        float authority = 1.0;
+        if (pc.computationalHdr != 0u) {
+            float scale = clamp(pc.exposureScaleToAnchor, 0.0625, 16.0);
+            mapped = max(0.0, supportNative / scale);
+            float highlightAuthority = (scale < 0.85 ? 1.0 : 0.0) *
+                smooth01((anchor - 0.62) / 0.30) * (1.0 - smooth01((supportNative - 0.90) / 0.08));
+            float shadowAuthority = (scale > 1.15 ? 1.0 : 0.0) *
+                (1.0 - smooth01((anchor - 0.05) / 0.28)) * smooth01((supportNative - 0.02) / 0.12) *
+                (1.0 - smooth01((supportNative - 0.90) / 0.08));
+            authority = max(highlightAuthority, shadowAuthority);
+            float mismatch = abs(anchor - clamp(mapped, 0.0, 1.0));
+            // Do not exempt clipped highlights from local mismatch rejection. Correctly
+            // exposure-normalized highlight detail maps back toward the clipped anchor, while
+            // displaced/moving detail loses authority instead of producing a bright ghost.
+            float ghostConfidence = exp(-18.0 * mismatch * mismatch);
+            authority *= ghostConfidence;
+            if (authority < 0.01) return;
+        }
+        accumulator[index] += mapped * 255.0 * authority;
+        weights[index] += authority;
+        return;
+    }
+
+    if (pc.mode == 2u) {
+        uint wordIndex = index;
+        uint pixelBase = wordIndex * 4u;
+        if (pixelBase >= pixelCount) return;
+        uint packed = 0u;
+        for (uint lane = 0u; lane < 4u; ++lane) {
+            uint pixelIndex = pixelBase + lane;
+            if (pixelIndex >= pixelCount) break;
+            float merged = accumulator[pixelIndex] / max(weights[pixelIndex], 1.0e-6);
+            if (pc.computationalHdr != 0u) merged = hdrReconstruct(merged);
+            uint value = uint(clamp(floor(merged + 0.5), 0.0, 255.0));
+            packed |= (value & 0xffu) << (lane * 8u);
+        }
+        fusedWords[wordIndex] = packed;
+    }
+}

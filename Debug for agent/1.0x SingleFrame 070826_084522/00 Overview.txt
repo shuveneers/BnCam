@@ -1,0 +1,7 @@
+OVERVIEW
+========
+captureId: 1.0x SingleFrame 070826_084522
+profileId: 2_profile_1
+profileHash: 293418ae713bbee9bf97bd0a2e044a335f2ffa151be9055983581fc0e5b90333
+frameSource: RAW10
+captureMode: SINGLE

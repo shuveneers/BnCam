@@ -1,0 +1,65 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer AnchorRawBuffer {
+    uint anchorWords[]; // Canonical uint16 anchor RAW
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer SupportRawBuffer {
+    uint supportWords[]; // Canonical uint16 support RAW
+};
+
+layout(std430, set = 0, binding = 2) buffer FusedOutputRawBuffer {
+    uint fusedWords[]; // Canonical uint16 fused RAW
+};
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+    int dx; // Shift dx
+    int dy; // Shift dy
+    float robustWeight; // Support frame weight (0.0 to 1.0)
+    uint isFirstSupport; // 1 = initialize fused output from anchor, 0 = accumulate
+} pc;
+
+void main() {
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    if (x >= pc.width || y >= pc.height) return;
+
+    uint pixelIdx = y * pc.width + x;
+    uint wordIdx = pixelIdx / 2u;
+    uint shift = (pixelIdx % 2u) * 16u;
+
+    uint anchorVal = (anchorWords[wordIdx] >> shift) & 0xFFFFu;
+
+    if (pc.isFirstSupport == 1u) {
+        // Initialize fused buffer with anchor frame pixel values
+        uint currentWord = fusedWords[wordIdx];
+        uint mask = ~(0xFFFFu << shift);
+        fusedWords[wordIdx] = (currentWord & mask) | (anchorVal << shift);
+    }
+
+    if (pc.robustWeight <= 0.0) return;
+
+    int sx = int(x) + pc.dx;
+    int sy = int(y) + pc.dy;
+
+    if (sx < 0 || sx >= int(pc.width) || sy < 0 || sy >= int(pc.height)) return;
+
+    uint sPixelIdx = uint(sy) * pc.width + uint(sx);
+    uint sWordIdx = sPixelIdx / 2u;
+    uint sShift = (sPixelIdx % 2u) * 16u;
+    uint supportVal = (supportWords[sWordIdx] >> sShift) & 0xFFFFu;
+
+    // Outlier Rejection: Local difference threshold for Robust Mean Fusion
+    float diff = abs(float(anchorVal) - float(supportVal));
+    if (diff < 128.0) { // Local difference within robust threshold
+        uint currentVal = (fusedWords[wordIdx] >> shift) & 0xFFFFu;
+        uint fusedVal = uint((float(currentVal) + float(supportVal) * pc.robustWeight) / (1.0 + pc.robustWeight) + 0.5);
+
+        uint currentWord = fusedWords[wordIdx];
+        uint mask = ~(0xFFFFu << shift);
+        fusedWords[wordIdx] = (currentWord & mask) | ((fusedVal & 0xFFFFu) << shift);
+    }
+}

@@ -1,0 +1,968 @@
+diff --git a/app/src/main/cpp/IspCore.cpp b/app/src/main/cpp/IspCore.cpp
+index 3c04369..24fda66 100644
+--- a/app/src/main/cpp/IspCore.cpp
++++ b/app/src/main/cpp/IspCore.cpp
+@@ -702,15 +702,9 @@ RawDenoiseDebug applyDefaultRawDenoise(cv::Mat& rgb16, const IspFrameMetadata& m
+         debug.reason = "invalid_rgb16";
+         return debug;
+     }
+-    if (!debug.usesSensorNoiseProfile && meta.captureSensitivityIso < 800) {
+-        debug.reason = "noise_profile_missing_low_iso";
+-        debug.iso = std::max(0, meta.captureSensitivityIso);
+-        return debug;
+-    }
+-
+     const auto start = IspClock::now();
+     const float isoStops = std::max(0.0f, std::log2(std::max(100.0f, static_cast<float>(debug.iso)) / 400.0f));
+-    float profileBoost = debug.usesSensorNoiseProfile ? 1.0f : 0.65f;
++    float profileBoost = debug.usesSensorNoiseProfile ? 1.0f : 0.58f;
+     if (debug.usesSensorNoiseProfile && meta.calibration.noiseProfilePairCount > 0) {
+         float maxSlope = 0.0f;
+         float maxOffset = 0.0f;
+@@ -723,8 +717,22 @@ RawDenoiseDebug applyDefaultRawDenoise(cv::Mat& rgb16, const IspFrameMetadata& m
+         profileBoost = 0.85f + 0.35f * noiseHint;
+     }
+ 
+-    debug.lumaStrength = std::clamp((0.004f + 0.003f * isoStops) * profileBoost, 0.003f, 0.018f);
+-    debug.chromaStrength = std::clamp((0.018f + 0.010f * isoStops) * profileBoost, 0.014f, 0.055f);
++    // Always run a conservative post-demosaic pass for RAW JPEG. Chroma receives the stronger
++    // treatment, especially for packed RAW10; luma remains a lightly blended 3x3 bilateral so
++    // edge detail is retained. SENSOR_NOISE_PROFILE and ISO continue to control both strengths.
++    debug.lumaStrength = std::clamp(
++            (0.0035f + 0.0025f * isoStops) * profileBoost,
++            0.0025f,
++            0.015f
++    );
++    const float chromaBase = meta.isRaw10 ? 0.026f : 0.020f;
++    const float chromaPerStop = meta.isRaw10 ? 0.012f : 0.009f;
++    const float chromaMaximum = meta.isRaw10 ? 0.075f : 0.060f;
++    debug.chromaStrength = std::clamp(
++            (chromaBase + chromaPerStop * isoStops) * profileBoost,
++            meta.isRaw10 ? 0.018f : 0.014f,
++            chromaMaximum
++    );
+ 
+     cv::Mat rgb32f;
+     rgb16.convertTo(rgb32f, CV_32F, 1.0 / 65535.0);
+@@ -754,7 +762,9 @@ RawDenoiseDebug applyDefaultRawDenoise(cv::Mat& rgb16, const IspFrameMetadata& m
+     rgb32f.convertTo(rgb16, CV_16U, 65535.0);
+ 
+     debug.applied = true;
+-    debug.reason = debug.usesSensorNoiseProfile ? "sensor_noise_profile_single_frame_default" : "iso_single_frame_default";
++    debug.reason = debug.usesSensorNoiseProfile
++            ? (meta.isRaw10 ? "raw10_sensor_profile_chroma_priority" : "raw_sensor_profile_chroma_priority")
++            : (meta.isRaw10 ? "raw10_iso_fallback_chroma_priority" : "raw_sensor_iso_fallback_chroma_priority");
+     debug.elapsedMs = elapsedMs(start);
+     return debug;
+ }
+@@ -1744,11 +1754,20 @@ std::vector<uint8_t> IspCore::demosaicAndEncodeJpeg(
+     const size_t nCm = colorMatrixSamples.size();
+     float p50CmLuma = cmLumaSamples.empty() ? 0.1f : cmLumaSamples[std::clamp<size_t>(static_cast<size_t>(nCm * 0.50f), 0, nCm - 1)];
+     float p25CmLuma = cmLumaSamples.empty() ? 0.05f : cmLumaSamples[std::clamp<size_t>(static_cast<size_t>(nCm * 0.25f), 0, nCm - 1)];
++    float p35CmLuma = cmLumaSamples.empty() ? 0.075f : cmLumaSamples[std::clamp<size_t>(static_cast<size_t>(nCm * 0.35f), 0, nCm - 1)];
++    float p60CmLuma = cmLumaSamples.empty() ? 0.14f : cmLumaSamples[std::clamp<size_t>(static_cast<size_t>(nCm * 0.60f), 0, nCm - 1)];
+     float p75CmLuma = cmLumaSamples.empty() ? 0.2f : cmLumaSamples[std::clamp<size_t>(static_cast<size_t>(nCm * 0.75f), 0, nCm - 1)];
+     float p95CmLuma = cmLumaSamples.empty() ? 0.5f : cmLumaSamples[std::clamp<size_t>(static_cast<size_t>(nCm * 0.95f), 0, nCm - 1)];
+     float p99CmLuma = cmLumaSamples.empty() ? 0.8f : cmLumaSamples[std::clamp<size_t>(static_cast<size_t>(nCm * 0.99f), 0, nCm - 1)];
+     float p99_5Cm = colorMatrixSamples.empty() ? 1.0f : colorMatrixSamples[std::clamp<size_t>(static_cast<size_t>(nCm * 0.995f), 0, nCm - 1)];
+     float p99Cm = colorMatrixSamples.empty() ? 1.0f : colorMatrixSamples[std::clamp<size_t>(static_cast<size_t>(nCm * 0.99f), 0, nCm - 1)];
++    const float exposureMidLuma = std::max(
++            0.001f,
++            0.20f * p35CmLuma + 0.35f * p50CmLuma + 0.45f * p60CmLuma
++    );
++    const float highlightToMidRatio = p95CmLuma / exposureMidLuma;
++    const bool brightHighDrDistribution = p95CmLuma > 0.20f && highlightToMidRatio > 3.5f;
++    const float targetP50Linear = brightHighDrDistribution ? 0.125f : 0.145f;
+ 
+     // Detect genuinely dark scenes: low midtones AND low highlights
+     // These scenes should NOT be over-lifted by the shadow floor
+@@ -1759,19 +1778,12 @@ std::vector<uint8_t> IspCore::demosaicAndEncodeJpeg(
+ 
+     // === CALCULATE ADAPTIVE RESCUE GAIN AND HIGHLIGHT CLIPPING CAP ===
+     // 1. Noise risk cap based on capture ISO
+-    float noiseRiskCap = 8.0f;
++    float noiseRiskCap = meta.isRaw10 ? 3.80f : 4.00f;
+     int captureIso = meta.captureSensitivityIso;
+-    if (captureIso < 400) {
+-        noiseRiskCap = 32.0f;
+-    } else if (captureIso < 800) {
+-        noiseRiskCap = 24.0f;
+-    } else if (captureIso < 1600) {
+-        noiseRiskCap = 16.0f;
+-    } else if (captureIso < 3200) {
+-        noiseRiskCap = 12.0f;
+-    } else {
+-        noiseRiskCap = 8.0f;
+-    }
++    if (captureIso >= 3200) noiseRiskCap -= 0.55f;
++    else if (captureIso >= 1600) noiseRiskCap -= 0.35f;
++    else if (captureIso >= 800) noiseRiskCap -= 0.15f;
++    noiseRiskCap = std::clamp(noiseRiskCap, meta.isRaw10 ? 3.20f : 3.40f, 4.20f);
+ 
+     // 2. Highlight/Clipping cap using post-rolloff counting helper on colorMatrixSamples
+     auto countProjectedClipping = [](const std::vector<float>& samples, float gain) -> float {
+@@ -1787,22 +1799,22 @@ std::vector<uint8_t> IspCore::demosaicAndEncodeJpeg(
+         return (clippedCount * 100.0f) / samples.size();
+     };
+ 
+-    float highlightClippingCap = 8.0f;
+-    for (float g = 8.0f; g <= 32.0f; g += 0.2f) {
++    float highlightClippingCap = 0.50f;
++    for (float g = 0.50f; g <= noiseRiskCap; g += 0.05f) {
+         float clipPct = countProjectedClipping(colorMatrixSamples, g);
+-        if (clipPct <= 10.0f) {
++        if (clipPct <= 0.50f) {
+             highlightClippingCap = g;
+         } else {
+             break;
+         }
+     }
+ 
+-    float maxAllowedGain = 8.0f;
++    float maxAllowedGain = noiseRiskCap;
+     if (!sceneIsGenuinelyDark) {
+         maxAllowedGain = std::min(noiseRiskCap, highlightClippingCap);
+-        maxAllowedGain = std::clamp(maxAllowedGain, 8.0f, 32.0f);
++        maxAllowedGain = std::clamp(maxAllowedGain, 0.50f, noiseRiskCap);
+     } else {
+-        maxAllowedGain = 8.0f;
++        maxAllowedGain = std::min(noiseRiskCap, meta.isRaw10 ? 3.20f : 3.40f);
+     }
+ 
+     // === DUAL-CONSTRAINED EXPOSURE SOLVER ===
+@@ -1838,13 +1850,20 @@ std::vector<uint8_t> IspCore::demosaicAndEncodeJpeg(
+ 
+     if (!colorMatrixSamples.empty()) {
+         // Constraint 1: MIDTONE TARGETING
+-        // Target: p50 luma after exposure should land around 0.18 (photographic middle gray)
+-        // This ensures the bulk of the image is properly exposed
+-        const float targetP50 = 0.18f;
+-        if (p50CmLuma > 0.001f) {
+-            gainFromMidtones = targetP50 / p50CmLuma;
++        // Use the trimmed mid-distribution rather than forcing the global median to 0.18.
++        // GTM/LTM perform the display mapping; global gain only establishes a clean linear base.
++        if (exposureMidLuma > 0.001f) {
++            gainFromMidtones = targetP50Linear / exposureMidLuma;
+             // Don't let midtone targeting go below the ISO base or above maxAllowedGain
+-            gainFromMidtones = std::clamp(gainFromMidtones, std::max(1.0f, baseGain * 0.5f), maxAllowedGain);
++            const float minimumGlobalGain = std::min(
++                    maxAllowedGain,
++                    std::max(0.50f, baseGain * 0.5f)
++            );
++            gainFromMidtones = std::clamp(
++                    gainFromMidtones,
++                    minimumGlobalGain,
++                    maxAllowedGain
++            );
+         } else {
+             gainFromMidtones = baseGain;
+         }
+@@ -1873,7 +1892,7 @@ std::vector<uint8_t> IspCore::demosaicAndEncodeJpeg(
+             // Shadow floor: minimum gain to keep p50 acceptable
+             // For genuinely dark scenes, don't over-lift (floor at 1.0)
+             // For high-DR scenes, protect midtones (floor at minimumAcceptableP50 / p50)
+-            const float minimumAcceptableP50 = 0.12f;
++            const float minimumAcceptableP50 = brightHighDrDistribution ? 0.085f : 0.10f;
+             if (sceneIsGenuinelyDark) {
+                 shadowFloorGain = std::max(baseGain * 0.8f, 1.0f);
+             } else {
+@@ -2188,8 +2207,7 @@ std::vector<uint8_t> IspCore::demosaicAndEncodeJpeg(
+     );
+     const bool colorCastRisk = greenSplitWbDelta > 0.05f || greenSplitBlackDelta > 25.0f;
+ 
+-    const float targetP50Linear = 0.18f;
+-    const float requiredGainForTargetP50 = targetP50Linear / std::max(0.0001f, p50CmLuma);
++    const float requiredGainForTargetP50 = targetP50Linear / exposureMidLuma;
+     const bool gainCapHit = (requiredGainForTargetP50 > maxAllowedGain) && (exposureGain >= maxAllowedGain - 0.05f);
+     const float p50TargetMissRatio = expStats.p50 / targetP50Linear;
+     const float finalDisplayTargetP50 = cpuSrgbEncode(toneDebug.gtmDisplayTargetP50);
+@@ -2429,10 +2447,12 @@ std::vector<uint8_t> IspCore::demosaicAndEncodeJpeg(
+             << ";p99.5CmMax=" << fmt(p99_5Cm)
+             << ";p99CmMax=" << fmt(p99Cm)
+             // --- Target Miss and Soft Black Anchor Diagnostics ---
+-            << ";targetP50Linear=" << fmt(0.18f)
+-            << ";requiredGainForTargetP50=" << fmt(0.18f / std::max(0.0001f, p50CmLuma))
++            << ";targetP50Linear=" << fmt(targetP50Linear)
++            << ";exposureMidLuma=" << fmt(exposureMidLuma)
++            << ";brightHighDrDistribution=" << (brightHighDrDistribution ? "true" : "false")
++            << ";requiredGainForTargetP50=" << fmt(requiredGainForTargetP50)
+             << ";gainCapHit=" << (gainCapHit ? "true" : "false")
+-            << ";p50TargetMissRatio=" << fmt(expStats.p50 / 0.18f)
++            << ";p50TargetMissRatio=" << fmt(p50TargetMissRatio)
+             << ";p50AfterSoftBlackAnchor=" << fmt(p50AfterSoftBlackAnchor)
+             << ";softBlackAnchorLossRatio=" << fmt(softBlackAnchorLossRatio)
+             << ";softBlackPointAnchorValue=" << fmt(softBlackPointAnchorValue)
+diff --git a/app/src/main/cpp/IspCore.h b/app/src/main/cpp/IspCore.h
+index 52695bc..8e576fd 100644
+--- a/app/src/main/cpp/IspCore.h
++++ b/app/src/main/cpp/IspCore.h
+@@ -94,8 +94,8 @@ public:
+             std::string& logStr
+     );
+ 
+-    // Correctness-reset renderer shared by RAW10 and RAW_SENSOR JPEG only. This deliberately
+-    // bypasses the computational RAW tone/recovery stack below.
++    // Emergency-only renderer for a failed full RAW JPEG render. Normal RAW10/RAW_SENSOR JPEG
++    // capture must use the LinearFloatRaw demosaicAndEncodeJpeg overload below.
+     static std::vector<uint8_t> renderRawBaselineJpeg(
+             const LinearFloatRaw& workingRaw,
+             const IspFrameMetadata& meta,
+diff --git a/app/src/main/cpp/native-lib.cpp b/app/src/main/cpp/native-lib.cpp
+index 9a0b680..3a5885e 100644
+--- a/app/src/main/cpp/native-lib.cpp
++++ b/app/src/main/cpp/native-lib.cpp
+@@ -1203,6 +1203,15 @@ Java_com_bncam_core_engine_ImageUtils_renderJpegFromMasterNative(
+     std::vector<uint8_t> jpegData;
+     std::string failureReason = "none";
+     std::string masterIspDebug;
++    bool rawFullRendererSucceeded = false;
++    bool rawEmergencyFallbackUsed = false;
++    bool rawFullToneMapperRan = false;
++    bool rawLtmRan = false;
++    bool rawGtmRan = false;
++    bool rawDenoiseRan = false;
++    bool rawOutlierCorrectionRan = false;
++    bool rawHighlightRepairRan = false;
++    bool rawFeedbackCorrectionRan = false;
+     bool jpegCloneRaw16StatsComputed = false;
+     int jpegCloneRaw16Min = 0;
+     double jpegCloneRaw16Mean = 0.0;
+@@ -1349,7 +1358,8 @@ Java_com_bncam_core_engine_ImageUtils_renderJpegFromMasterNative(
+                 rawDomainInfo.cfaOffsetX,
+                 rawDomainInfo.cfaOffsetY
+         );
+-        // Baseline reset intentionally has no intermediate dump stages.
++        // Developer intermediate dumps remain disabled for the normal full renderer unless an
++        // explicit debug request enables them. This setting affects only the JPEG working copy.
+         rawDomainInfo.debugDumpsEnabled = false;
+         rawDomainInfo.debugDumpDirectory.clear();
+         meta.rawJpegDebugDumpsEnabled = false;
+@@ -1364,13 +1374,46 @@ Java_com_bncam_core_engine_ImageUtils_renderJpegFromMasterNative(
+         bayer16Isp.release();
+ 
+         stageStart = NativeClock::now();
+-        jpegData = IspCore::renderRawBaselineJpeg(
++        jpegData = IspCore::demosaicAndEncodeJpeg(
+                 workingRaw,
+                 meta,
+                 qualityConfig,
+                 &masterIspDebug,
+                 rotationDegrees
+         );
++        rawFullRendererSucceeded = !jpegData.empty() &&
++                masterIspDebug.find("rawJpegRender=ok") != std::string::npos;
++        rawFullToneMapperRan = masterIspDebug.find("jpegAppliedToneCurve=true") != std::string::npos;
++        rawLtmRan = masterIspDebug.find("ltmApplied=true") != std::string::npos;
++        rawGtmRan = masterIspDebug.find("gtmApplied=true") != std::string::npos;
++        rawDenoiseRan = masterIspDebug.find("rawDenoiseApplied=true") != std::string::npos &&
++                masterIspDebug.find("rawPostDemosaicDenoiseApplied=true") != std::string::npos;
++        rawOutlierCorrectionRan =
++                masterIspDebug.find("bayerOutlierCorrectionApplied=true") != std::string::npos;
++        rawHighlightRepairRan =
++                masterIspDebug.find("singleFramePartialHighlightRepairApplied=true") != std::string::npos;
++        rawFeedbackCorrectionRan =
++                masterIspDebug.find("rawToneFeedbackCorrectionApplied=true") != std::string::npos;
++
++        if (!rawFullRendererSucceeded) {
++            const std::string fullRendererFailureDebug = masterIspDebug;
++            std::string fallbackDebug;
++            LOGE(
++                    "RAW_FULL_RENDER_FAILED: source=%s; activating explicit emergency baseline fallback",
++                    routeLabel.c_str()
++            );
++            jpegData = IspCore::renderRawBaselineJpeg(
++                    workingRaw,
++                    meta,
++                    qualityConfig,
++                    &fallbackDebug,
++                    rotationDegrees
++            );
++            rawEmergencyFallbackUsed = true;
++            masterIspDebug = "RAW_JPEG_EMERGENCY_FALLBACK: used=true;reason=full_renderer_failed";
++            masterIspDebug += ";fullRendererFailure=" + fullRendererFailureDebug;
++            masterIspDebug += ";fallbackRenderer=" + fallbackDebug;
++        }
+         rawJpegRenderCallOuterMs = nativeElapsedMs(stageStart);
+         if (!masterIspDebug.empty()) {
+             failureReason = failureReason + ";" + masterIspDebug;
+@@ -1405,15 +1448,29 @@ Java_com_bncam_core_engine_ImageUtils_renderJpegFromMasterNative(
+           << ";canonicalMasterCreated=true"
+           << ";masterType=DNG_COMPATIBLE_RAW16"
+           << ";jpegRenderSource=JPEG_WORKING_LINEAR_RAW_DERIVED_FROM_READ_ONLY_MASTER"
+-          << ";jpegRenderPath=RAW_DOMAIN_NORMALIZE_BASELINE_DEMOSAIC_WB_CCM_P50_EXPOSURE_SOFT_ROLLOFF_SRGB"
+-          << ";rawBaselineRendererEnabled=true"
+-          << ";rawLegacyConstrainedExposureBypassed=true"
+-          << ";rawLtmBypassed=true"
+-          << ";rawGtmBypassed=true"
+-          << ";rawFeedbackRerenderBypassed=true"
+-          << ";rawRepairBypassed=true"
+-          << ";rawDenoiseBypassed=true"
+-          << ";rawOutlierCorrectionBypassed=true"
++          << ";jpegRenderPath=" << (rawEmergencyFallbackUsed
++                  ? "RAW_EMERGENCY_BASELINE_FALLBACK"
++                  : "RAW_DOMAIN_NORMALIZE_FULL_DEMOSAIC_DENOISE_WB_CCM_CONSTRAINED_EXPOSURE_LTM_GTM_SRGB")
++          << ";rawJpegRenderer=" << (rawEmergencyFallbackUsed
++                  ? "EMERGENCY_BASELINE_FALLBACK"
++                  : "FULL_RAW_TONE_PIPELINE")
++          << ";rawFullRendererSucceeded=" << (rawFullRendererSucceeded ? "true" : "false")
++          << ";rawEmergencyFallbackUsed=" << (rawEmergencyFallbackUsed ? "true" : "false")
++          << ";rawBaselineRendererEnabled=" << (rawEmergencyFallbackUsed ? "true" : "false")
++          << ";rawLegacyConstrainedExposureBypassed=" << (rawEmergencyFallbackUsed ? "true" : "false")
++          << ";rawFullToneMapperRan=" << (rawFullToneMapperRan ? "true" : "false")
++          << ";rawLtmBypassed=" << (rawEmergencyFallbackUsed ? "true" : "false")
++          << ";rawLtmRan=" << (rawLtmRan ? "true" : "false")
++          << ";rawGtmBypassed=" << (rawEmergencyFallbackUsed ? "true" : "false")
++          << ";rawGtmRan=" << (rawGtmRan ? "true" : "false")
++          << ";rawFeedbackRerenderBypassed=" << (rawEmergencyFallbackUsed ? "true" : "false")
++          << ";rawFeedbackCorrectionRan=" << (rawFeedbackCorrectionRan ? "true" : "false")
++          << ";rawRepairBypassed=" << (rawEmergencyFallbackUsed ? "true" : "false")
++          << ";rawHighlightRepairRan=" << (rawHighlightRepairRan ? "true" : "false")
++          << ";rawDenoiseBypassed=" << (rawEmergencyFallbackUsed ? "true" : "false")
++          << ";rawDenoiseRan=" << (rawDenoiseRan ? "true" : "false")
++          << ";rawOutlierCorrectionBypassed=" << (rawEmergencyFallbackUsed ? "true" : "false")
++          << ";rawOutlierCorrectionRan=" << (rawOutlierCorrectionRan ? "true" : "false")
+           << ";raw10SeparateNormalizationUsed=" << (isRaw10 == JNI_TRUE ? "true" : "false")
+           << ";rawSensorSeparateNormalizationUsed=" << (isRaw10 == JNI_TRUE ? "false" : "true")
+           << ";dngExportSource=ORIGINAL_MASTER_RAW16_UNTOUCHED"
+diff --git a/app/src/main/java/com/bncam/core/buffer/FrameRingBuffer.kt b/app/src/main/java/com/bncam/core/buffer/FrameRingBuffer.kt
+index c8c084d..1652431 100644
+--- a/app/src/main/java/com/bncam/core/buffer/FrameRingBuffer.kt
++++ b/app/src/main/java/com/bncam/core/buffer/FrameRingBuffer.kt
+@@ -129,7 +129,11 @@ class FrameRingBuffer(private var capacity: Int = 50) {
+     @Synchronized fun completeFrameCount(): Int = buffer.count { it.timestamp != 0L && it.hardwareBuffer != null && it.metadata != null }
+ 
+     @Synchronized
+-    fun freshMetadataCompleteFrameCount(referenceTimestampNs: Long, freshnessWindowMs: Double): Int {
++    fun freshMetadataCompleteFrameCount(
++        referenceTimestampNs: Long,
++        freshnessWindowMs: Double,
++        notBeforeTimestampNs: Long = 0L
++    ): Int {
+         return buffer.count { pair ->
+             val metadata = pair.metadata
+             val timestampNs = metadata?.get(CaptureResult.SENSOR_TIMESTAMP) ?: pair.timestamp
+@@ -146,6 +150,7 @@ class FrameRingBuffer(private var capacity: Int = 50) {
+                 aeState != null &&
+                 awbState != null &&
+                 afState != null &&
++                timestampNs >= notBeforeTimestampNs &&
+                 kotlin.math.abs(referenceTimestampNs - timestampNs) / 1_000_000.0 <= freshnessWindowMs
+         }
+     }
+diff --git a/app/src/main/java/com/bncam/core/engine/BnCameraManager.kt b/app/src/main/java/com/bncam/core/engine/BnCameraManager.kt
+index fefc840..865f351 100644
+--- a/app/src/main/java/com/bncam/core/engine/BnCameraManager.kt
++++ b/app/src/main/java/com/bncam/core/engine/BnCameraManager.kt
+@@ -105,6 +105,23 @@ private data class PendingPipelineResetRequest(
+     val reason: String
+ )
+ 
++data class TapAeDebugSnapshot(
++    val maxAeRegions: Int,
++    val maxAfRegions: Int,
++    val maxAwbRegions: Int,
++    val requestedAeRegionCount: Int,
++    val actualAeRegionCount: Int,
++    val requestedRegionMatchedExactly: Boolean,
++    val regionConfirmed: Boolean,
++    val holdActive: Boolean,
++    val pendingAtCapture: Boolean,
++    val settled: Boolean,
++    val timedOut: Boolean,
++    val settleWaitMs: Long,
++    val settleStatus: String,
++    val settleSensorTimestampNs: Long
++)
++
+ 
+ private data class VendorOperationModeProbeState(
+     val lensId: String,
+@@ -245,6 +262,26 @@ class BnCameraManager(private val context: Context) {
+     private val _isAeAfLocked = MutableStateFlow(false)
+     val isAeAfLocked = _isAeAfLocked.asStateFlow()
+ 
++    // A tap AE region is a temporary metering intent, not an AE/AF lock. Keep it independently
++    // until the UI resets focus so Matrix/default policy and face priority cannot erase it.
++    @Volatile private var tapAeHoldActive = false
++    @Volatile private var tapAePending = false
++    @Volatile private var tapAeRegionConfirmed = false
++    @Volatile private var tapAeSettled = false
++    @Volatile private var tapAeTimedOut = false
++    @Volatile private var tapAeRequestedRegions: Array<MeteringRectangle>? = null
++    @Volatile private var tapAeLastActualRegions: Array<MeteringRectangle>? = null
++    @Volatile private var tapAeRequestedRegionMatchedExactly = false
++    @Volatile private var tapAeStartedMs = 0L
++    @Volatile private var tapAeRegionDeadlineMs = 0L
++    @Volatile private var tapAeSettleDeadlineMs = 0L
++    @Volatile private var tapAeSettleWaitMs = 0L
++    @Volatile private var tapAeSettleStatus = "inactive"
++    @Volatile private var tapAeSettleSensorTimestampNs = 0L
++    @Volatile private var tapAeMaxRegionsAe = -1
++    @Volatile private var tapAeMaxRegionsAf = -1
++    @Volatile private var tapAeMaxRegionsAwb = -1
++
+     val cameraState = MutableStateFlow(CameraEngineState.CAMERA_STARTING)
+ 
+     private val _liveHistogram = MutableStateFlow<List<Float>>(List(16) { 0f })
+@@ -287,6 +324,127 @@ class BnCameraManager(private val context: Context) {
+         }
+     }
+ 
++    private fun meteringRegionsMatchExactly(
++        requested: Array<MeteringRectangle>?,
++        actual: Array<MeteringRectangle>?
++    ): Boolean {
++        if (requested == null || actual == null || requested.size != actual.size) return false
++        return requested.indices.all { index ->
++            requested[index].rect == actual[index].rect &&
++                    requested[index].meteringWeight == actual[index].meteringWeight
++        }
++    }
++
++    private fun clearTapAeHold(status: String) {
++        tapAeHoldActive = false
++        tapAePending = false
++        tapAeRegionConfirmed = false
++        tapAeSettled = false
++        tapAeTimedOut = false
++        tapAeRequestedRegions = null
++        tapAeLastActualRegions = null
++        tapAeRequestedRegionMatchedExactly = false
++        tapAeStartedMs = 0L
++        tapAeRegionDeadlineMs = 0L
++        tapAeSettleDeadlineMs = 0L
++        tapAeSettleWaitMs = 0L
++        tapAeSettleStatus = status
++        tapAeSettleSensorTimestampNs = 0L
++    }
++
++    private fun observeTapAeRepeatingResult(
++        request: CaptureRequest,
++        result: TotalCaptureResult
++    ) {
++        if (!tapAeHoldActive || !tapAePending) return
++        // The START request initiates precapture. Confirmation and convergence must come from the
++        // IDLE repeating stream because that is the source used by near-ZSL RAW selection.
++        if (request.get(CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER) ==
++            CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER_START
++        ) return
++
++        val expected = tapAeRequestedRegions ?: return
++        val actual = result.get(CaptureResult.CONTROL_AE_REGIONS)
++        tapAeLastActualRegions = actual?.copyOf()
++        val exactMatch = meteringRegionsMatchExactly(expected, actual)
++        tapAeRequestedRegionMatchedExactly = exactMatch
++        if (exactMatch) {
++            tapAeRegionConfirmed = true
++            tapAeSettleStatus = "region_confirmed_waiting_for_ae"
++        }
++
++        val nowMs = android.os.SystemClock.elapsedRealtime()
++        val regionPhaseComplete = tapAeRegionConfirmed || nowMs >= tapAeRegionDeadlineMs
++        if (!tapAeRegionConfirmed && regionPhaseComplete) {
++            tapAeSettleStatus = "region_confirmation_timeout_waiting_for_ae"
++        }
++        val aeState = result.get(CaptureResult.CONTROL_AE_STATE)
++        val aeStable = aeState == CaptureResult.CONTROL_AE_STATE_CONVERGED ||
++                aeState == CaptureResult.CONTROL_AE_STATE_FLASH_REQUIRED
++        val sensorTimestampNs = result.get(CaptureResult.SENSOR_TIMESTAMP)
++            ?: android.os.SystemClock.elapsedRealtimeNanos()
++
++        if (regionPhaseComplete && aeStable) {
++            tapAePending = false
++            tapAeSettled = true
++            tapAeTimedOut = !tapAeRegionConfirmed
++            tapAeSettleWaitMs = (nowMs - tapAeStartedMs).coerceAtLeast(0L)
++            tapAeSettleSensorTimestampNs = sensorTimestampNs
++            tapAeSettleStatus = if (tapAeRegionConfirmed) {
++                "settled_exact_region_ae_converged"
++            } else {
++                "settled_after_region_confirmation_timeout"
++            }
++            Log.i(
++                tag,
++                "TAP_AE_SETTLED status=$tapAeSettleStatus waitMs=$tapAeSettleWaitMs " +
++                        "requested=${expected.size} actual=${actual?.size ?: 0} exact=$exactMatch aeState=$aeState"
++            )
++        } else if (nowMs >= tapAeSettleDeadlineMs) {
++            tapAePending = false
++            tapAeSettled = false
++            tapAeTimedOut = true
++            tapAeSettleWaitMs = (nowMs - tapAeStartedMs).coerceAtLeast(0L)
++            tapAeSettleSensorTimestampNs = sensorTimestampNs
++            tapAeSettleStatus = "timeout_ae_not_converged"
++            Log.w(
++                tag,
++                "TAP_AE_SETTLE_TIMEOUT waitMs=$tapAeSettleWaitMs requested=${expected.size} " +
++                        "actual=${actual?.size ?: 0} exact=$exactMatch aeState=$aeState"
++            )
++        }
++    }
++
++    private fun snapshotTapAeDebug(cameraId: String): TapAeDebugSnapshot {
++        try {
++            val chars = cameraManager.getCameraCharacteristics(cameraId)
++            tapAeMaxRegionsAe = chars.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE) ?: 0
++            tapAeMaxRegionsAf = chars.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AF) ?: 0
++            tapAeMaxRegionsAwb = chars.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AWB) ?: 0
++        } catch (_: Exception) {
++            // Preserve the capability values captured at tap time.
++        }
++        return TapAeDebugSnapshot(
++            maxAeRegions = tapAeMaxRegionsAe,
++            maxAfRegions = tapAeMaxRegionsAf,
++            maxAwbRegions = tapAeMaxRegionsAwb,
++            requestedAeRegionCount = tapAeRequestedRegions?.size ?: 0,
++            actualAeRegionCount = tapAeLastActualRegions?.size ?: 0,
++            requestedRegionMatchedExactly = tapAeRequestedRegionMatchedExactly,
++            regionConfirmed = tapAeRegionConfirmed,
++            holdActive = tapAeHoldActive,
++            pendingAtCapture = tapAePending,
++            settled = tapAeSettled,
++            timedOut = tapAeTimedOut,
++            settleWaitMs = tapAeSettleWaitMs,
++            settleStatus = tapAeSettleStatus,
++            settleSensorTimestampNs = tapAeSettleSensorTimestampNs
++        )
++    }
++
++    private fun isRawNearZslFormat(format: Int): Boolean =
++        format == ImageFormat.RAW10 || format == ImageFormat.RAW_SENSOR
++
+     private fun calculateHistogram(image: android.media.Image) {
+         try {
+             val yBuffer = image.planes[0].buffer
+@@ -1111,12 +1269,23 @@ class BnCameraManager(private val context: Context) {
+         if (sessionConfiguredGeneration != pipelineGeneration) {
+             return "SESSION_GENERATION_NOT_CONFIGURED expectedGeneration=$pipelineGeneration configuredGeneration=$sessionConfiguredGeneration expected=$expectedSource"
+         }
++        if ((expectedSource == "RAW10" || expectedSource == "RAW_SENSOR") && tapAePending) {
++            val waitedMs = (android.os.SystemClock.elapsedRealtime() - tapAeStartedMs)
++                .coerceAtLeast(0L)
++            return "TAP_AE_SETTLE_PENDING expected=$expectedSource waitMs=$waitedMs " +
++                    "status=$tapAeSettleStatus regionConfirmed=$tapAeRegionConfirmed"
++        }
+ 
+         val requiredWarmFrames = minimumWarmFrames.coerceAtLeast(1)
+         val freshnessWindowMs = if (expectedSource == "RAW_SENSOR") 500.0 else 350.0
+         val freshCompleteFrames = ringBuffer.freshMetadataCompleteFrameCount(
+             referenceTimestampNs = android.os.SystemClock.elapsedRealtimeNanos(),
+-            freshnessWindowMs = freshnessWindowMs
++            freshnessWindowMs = freshnessWindowMs,
++            notBeforeTimestampNs = if (expectedSource == "RAW10" || expectedSource == "RAW_SENSOR") {
++                tapAeSettleSensorTimestampNs
++            } else {
++                0L
++            }
+         )
+ 
+         if (freshCompleteFrames < requiredWarmFrames) {
+@@ -2060,6 +2229,7 @@ class BnCameraManager(private val context: Context) {
+                         val aeState = result.get(CaptureResult.CONTROL_AE_STATE) ?: -1
+                         lastAfState = afState
+                         lastAeState = aeState
++                        observeTapAeRepeatingResult(request, result)
+ 
+                         val expTime = result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 0L
+                         val sensitivity = result.get(CaptureResult.SENSOR_SENSITIVITY) ?: 0
+@@ -2091,10 +2261,24 @@ class BnCameraManager(private val context: Context) {
+                             val requiredFreshFrames = if (activeZslFormat == ImageFormat.RAW_SENSOR) 2 else 3
+                             val freshCompleteFrames = ringBuffer.freshMetadataCompleteFrameCount(
+                                 referenceTimestampNs = android.os.SystemClock.elapsedRealtimeNanos(),
+-                                freshnessWindowMs = freshnessWindowMs
++                                freshnessWindowMs = freshnessWindowMs,
++                                notBeforeTimestampNs = if (isRawNearZslFormat(activeZslFormat)) {
++                                    tapAeSettleSensorTimestampNs
++                                } else {
++                                    0L
++                                }
+                             )
+-                            if (freshCompleteFrames >= requiredFreshFrames) {
++                            val tapAeReadyForRaw = !isRawNearZslFormat(activeZslFormat) ||
++                                    !tapAePending
++                            if (freshCompleteFrames >= requiredFreshFrames &&
++                                tapAeReadyForRaw &&
++                                cameraState.value != CameraEngineState.CAPTURING
++                            ) {
+                                 cameraState.value = CameraEngineState.CAPTURE_READY
++                            } else if (!tapAeReadyForRaw &&
++                                cameraState.value == CameraEngineState.CAPTURE_READY
++                            ) {
++                                cameraState.value = CameraEngineState.BUFFER_READY
+                             }
+                         }
+ 
+@@ -2145,7 +2329,15 @@ class BnCameraManager(private val context: Context) {
+ 
+                                         currentCaptureRequest?.let { builder ->
+                                             // Pas focus priority toe indien ingeschakeld
+-                                            if (focusPriority) {
++                                            val facePriorityChars = cameraManager
++                                                .getCameraCharacteristics(camera.id)
++                                            val maxAfRegions = facePriorityChars.get(
++                                                CameraCharacteristics.CONTROL_MAX_REGIONS_AF
++                                            ) ?: 0
++                                            val maxAeRegions = facePriorityChars.get(
++                                                CameraCharacteristics.CONTROL_MAX_REGIONS_AE
++                                            ) ?: 0
++                                            if (focusPriority && maxAfRegions > 0) {
+                                                 builder.set(
+                                                     CaptureRequest.CONTROL_AF_REGIONS,
+                                                     arrayOf(meteringRegion)
+@@ -2153,7 +2345,7 @@ class BnCameraManager(private val context: Context) {
+                                             }
+ 
+                                             // Pas AE priority toe indien ingeschakeld (Spotlight effect)
+-                                            if (aePriority) {
++                                            if (aePriority && !tapAeHoldActive && maxAeRegions > 0) {
+                                                 builder.set(
+                                                     CaptureRequest.CONTROL_AE_REGIONS,
+                                                     arrayOf(meteringRegion)
+@@ -2312,6 +2504,7 @@ class BnCameraManager(private val context: Context) {
+         }
+ 
+     fun closeCamera() {
++        clearTapAeHold("camera_closed")
+         synchronized(pipelineLock) {
+             pipelineGeneration++
+             isPipelineResetting = false
+@@ -2387,8 +2580,10 @@ class BnCameraManager(private val context: Context) {
+             val activeArray = chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE) ?: return
+             val cropRegion = builder.get(CaptureRequest.SCALER_CROP_REGION) ?: activeArray
+ 
+-            // Als we in een Tap-to-Focus hold zitten, mag de base policy de AE regions niet overschrijven
+-            val hasManualAeRegion = _isAeAfLocked.value && builder.get(CaptureRequest.CONTROL_AE_REGIONS) != null
++            // Tap AE hold is independent from AE/AF lock. Matrix/default and style updates must
++            // preserve the capability-adapted manual region until the tap hold is explicitly reset.
++            val hasManualAeRegion = (tapAeHoldActive || _isAeAfLocked.value) &&
++                    builder.get(CaptureRequest.CONTROL_AE_REGIONS) != null
+ 
+             var targetRegion: Array<MeteringRectangle>? = null
+             var styleBias = 0.0f
+@@ -2458,8 +2653,14 @@ class BnCameraManager(private val context: Context) {
+                 }
+             }
+ 
++            val maxAeRegions = chars.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE) ?: 0
++            val capabilityAdaptedTargetRegion = if (maxAeRegions > 0) {
++                targetRegion?.take(maxAeRegions)?.toTypedArray()
++            } else {
++                null
++            }
+             if (!hasManualAeRegion) {
+-                builder.set(CaptureRequest.CONTROL_AE_REGIONS, targetRegion)
++                builder.set(CaptureRequest.CONTROL_AE_REGIONS, capabilityAdaptedTargetRegion)
+             }
+ 
+             // Apply EV Compensation (manual slider offset + style bias)
+@@ -2473,7 +2674,7 @@ class BnCameraManager(private val context: Context) {
+                     steps.coerceIn(evRange.lower, evRange.upper)
+                 )
+             }
+-            Log.d(tag, "applyMeteringStyle style=$currentMeteringStyle liveHighDr=$liveHighDrRisk lastHighDr=$lastShotVerdictHighDrRisk styleBias=$styleBias manualEv=$currentEvOffset finalEv=$totalEv AE_REGIONS=${targetRegion?.size ?: 0}")
++            Log.d(tag, "applyMeteringStyle style=$currentMeteringStyle liveHighDr=$liveHighDrRisk lastHighDr=$lastShotVerdictHighDrRisk styleBias=$styleBias manualEv=$currentEvOffset finalEv=$totalEv AE_REGIONS=${builder.get(CaptureRequest.CONTROL_AE_REGIONS)?.size ?: 0} tapAeHold=$tapAeHoldActive")
+         }
+ 
+         fun setExposure(exposureEV: Float, cameraId: String) {
+@@ -2642,6 +2843,7 @@ class BnCameraManager(private val context: Context) {
+         val handler = backgroundHandler ?: return
+         try {
+             _isAeAfLocked.value = false
++            clearTapAeHold("continuous_af_reset")
+             isTorchActive = false // Torch gaat uit
+ 
+             request.set(CaptureRequest.CONTROL_AF_REGIONS, null)
+@@ -2772,22 +2974,60 @@ class BnCameraManager(private val context: Context) {
+                 MeteringRectangle(coreRect, MeteringRectangle.METERING_WEIGHT_MAX)
+             val contextMetering =
+                 MeteringRectangle(contextRect, MeteringRectangle.METERING_WEIGHT_MAX / 2)
+-            val meteringRegions = arrayOf(coreMetering, contextMetering)
++            val candidateRegions = arrayOf(coreMetering, contextMetering)
++
++            // Adapt the request before it reaches the HAL. In particular, a max-AE-regions=1
++            // device receives only the core region, so the driver never has to truncate context.
++            tapAeMaxRegionsAe = chars.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE) ?: 0
++            tapAeMaxRegionsAf = chars.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AF) ?: 0
++            tapAeMaxRegionsAwb = chars.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AWB) ?: 0
++            val afRegions = if (tapAeMaxRegionsAf > 0) {
++                candidateRegions.take(min(candidateRegions.size, tapAeMaxRegionsAf)).toTypedArray()
++            } else {
++                null
++            }
++            val aeRegions = if (recalculateAe && tapAeMaxRegionsAe > 0) {
++                candidateRegions.take(min(candidateRegions.size, tapAeMaxRegionsAe)).toTypedArray()
++            } else {
++                null
++            }
+ 
+             // --- HARDWARE AANSTUREN ---
+ 
+-            // Focus regio altijd zetten
+-            request.set(CaptureRequest.CONTROL_AF_REGIONS, meteringRegions)
++            request.set(CaptureRequest.CONTROL_AF_REGIONS, afRegions)
+ 
+             // AE regio (belichting) alleen herberekenen als de setting aan staat
+-            if (recalculateAe) {
+-                request.set(CaptureRequest.CONTROL_AE_REGIONS, meteringRegions)
++            if (aeRegions != null) {
++                request.set(CaptureRequest.CONTROL_AE_REGIONS, aeRegions)
++                val nowMs = android.os.SystemClock.elapsedRealtime()
++                tapAeHoldActive = true
++                tapAePending = true
++                tapAeRegionConfirmed = false
++                tapAeSettled = false
++                tapAeTimedOut = false
++                tapAeRequestedRegions = aeRegions.copyOf()
++                tapAeLastActualRegions = null
++                tapAeRequestedRegionMatchedExactly = false
++                tapAeStartedMs = nowMs
++                tapAeRegionDeadlineMs = nowMs + 750L
++                tapAeSettleDeadlineMs = nowMs + 2200L
++                tapAeSettleWaitMs = 0L
++                tapAeSettleStatus = "awaiting_repeating_region_confirmation"
++                tapAeSettleSensorTimestampNs = 0L
++                if (isRawNearZslFormat(activeZslFormat) &&
++                    cameraState.value == CameraEngineState.CAPTURE_READY
++                ) {
++                    cameraState.value = CameraEngineState.BUFFER_READY
++                }
+                 // HARDWARE FIX: Dwing de belichtingsmeter om NU opnieuw te rekenen voor dit gebied
+                 request.set(
+                     CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER,
+                     CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER_START
+                 )
+             } else {
++                clearTapAeHold(
++                    if (recalculateAe) "unsupported_max_ae_regions_zero" else "tap_ae_disabled"
++                )
+                 request.set(CaptureRequest.CONTROL_AE_REGIONS, null) // Blijf globaal meten
+             }
+ 
+@@ -2805,12 +3045,6 @@ class BnCameraManager(private val context: Context) {
+                 isTorchActive = false
+             }
+ 
+-            // 6. Vuur de Laser/PDAF trigger af
+-            request.set(
+-                CaptureRequest.CONTROL_AF_TRIGGER,
+-                CaptureRequest.CONTROL_AF_TRIGGER_START
+-            )
+-
+             // 6. Vuur de Laser/PDAF trigger af
+             request.set(
+                 CaptureRequest.CONTROL_AF_TRIGGER,
+@@ -2823,7 +3057,7 @@ class BnCameraManager(private val context: Context) {
+                 CaptureRequest.CONTROL_AF_TRIGGER,
+                 CaptureRequest.CONTROL_AF_TRIGGER_IDLE
+             )
+-            if (recalculateAe) {
++            if (aeRegions != null) {
+                 request.set(
+                     CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER,
+                     CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER_IDLE
+@@ -2833,10 +3067,13 @@ class BnCameraManager(private val context: Context) {
+             session.setRepeatingRequest(request.build(), captureCallback, handler)
+             Log.d(
+                 tag,
+-                "Tap-to-Focus applied. AE Region active: $recalculateAe, Focus Center: [$centerX, $centerY]"
++                "Tap-to-Focus applied recalculateAe=$recalculateAe center=[$centerX,$centerY] " +
++                        "maxAe=$tapAeMaxRegionsAe maxAf=$tapAeMaxRegionsAf maxAwb=$tapAeMaxRegionsAwb " +
++                        "requestedAe=${aeRegions?.size ?: 0} requestedAf=${afRegions?.size ?: 0}"
+             )
+ 
+         } catch (e: Exception) {
++            clearTapAeHold("tap_request_failed")
+             Log.e(tag, "Fout bij Multi-Region Tap-to-Focus", e)
+         }
+     }
+@@ -3600,6 +3837,7 @@ class BnCameraManager(private val context: Context) {
+             // LIVE UPDATE: We negeren de strategy van het oude 'activeProfile' object uit de UI,
+             // en gebruiken de actuele stand die vóór RAW_SENSOR acquisition is geladen.
+             val executionProfile = activeProfile.copy(captureStrategy = liveCaptureStrategy)
++            val tapAeDebug = snapshotTapAeDebug(activeLens.id)
+ 
+             val outputUri = when (liveCaptureStrategy) {
+ 
+@@ -3618,7 +3856,8 @@ class BnCameraManager(private val context: Context) {
+                         evOffset = currentEvOffset,
+                         requestedAeRegions = currentCaptureRequest?.get(CaptureRequest.CONTROL_AE_REGIONS),
+                         requestedEvComp = currentCaptureRequest?.get(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION)?.toFloat() ?: 0f,
+-                        aeStateBeforeCapture = lastAeState
++                        aeStateBeforeCapture = lastAeState,
++                        tapAeDebug = tapAeDebug
+                     )
+                 }
+ 
+@@ -3636,7 +3875,8 @@ class BnCameraManager(private val context: Context) {
+                         evOffset = currentEvOffset,
+                         requestedAeRegions = currentCaptureRequest?.get(CaptureRequest.CONTROL_AE_REGIONS),
+                         requestedEvComp = currentCaptureRequest?.get(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION)?.toFloat() ?: 0f,
+-                        aeStateBeforeCapture = lastAeState
++                        aeStateBeforeCapture = lastAeState,
++                        tapAeDebug = tapAeDebug
+                     )
+                 }
+ 
+diff --git a/app/src/main/java/com/bncam/core/runners/MultiFrameRunner.kt b/app/src/main/java/com/bncam/core/runners/MultiFrameRunner.kt
+index 2a64196..b135e63 100644
+--- a/app/src/main/java/com/bncam/core/runners/MultiFrameRunner.kt
++++ b/app/src/main/java/com/bncam/core/runners/MultiFrameRunner.kt
+@@ -18,6 +18,7 @@ import com.bncam.core.debug.FrameAnalysisDebugEntry
+ import com.bncam.core.debug.ShotLogger
+ import com.bncam.core.engine.ImageUtils
+ import com.bncam.core.engine.LensInfo
++import com.bncam.core.engine.TapAeDebugSnapshot
+ import com.bncam.core.isp.raw10.DngWriter
+ import com.bncam.core.isp.raw.MasterRawFrame
+ import com.bncam.core.isp.raw.RawMasterBuilder
+@@ -71,7 +72,8 @@ class MultiFrameRunner(
+         evOffset: Float,
+         requestedAeRegions: Array<android.hardware.camera2.params.MeteringRectangle>?,
+         requestedEvComp: Float,
+-        aeStateBeforeCapture: Int?
++        aeStateBeforeCapture: Int?,
++        tapAeDebug: TapAeDebugSnapshot
+     ): Uri? = withContext(Dispatchers.IO) {
+ 
+         val totalStartTimeMs = System.currentTimeMillis()
+@@ -179,7 +181,18 @@ class MultiFrameRunner(
+         // 1. HAAL DE BURST UIT DE BUFFER
+         // ==========================================
+         val framesInBuffer = ringBuffer.getLatestCompleteFrames(50).size
+-        val burstFrames = ringBuffer.takeLatestCompleteFrames(requestFrames)
++        val takenFrames = ringBuffer.takeLatestCompleteFrames(requestFrames)
++        val burstFrames = if (
++            (activeZslFormat == ImageFormat.RAW10 || activeZslFormat == ImageFormat.RAW_SENSOR) &&
++            tapAeDebug.settleSensorTimestampNs > 0L
++        ) {
++            val eligible = takenFrames.filter { it.timestamp >= tapAeDebug.settleSensorTimestampNs }
++            takenFrames.filter { it.timestamp < tapAeDebug.settleSensorTimestampNs }
++                .forEach { it.close() }
++            eligible
++        } else {
++            takenFrames
++        }
+ 
+         val oldestFrame = burstFrames.minByOrNull { it.timestamp }
+         val oldestFrameAgeMs = if (oldestFrame != null) (shutterTimestampNs - oldestFrame.timestamp) / 1_000_000.0 else 0.0
+@@ -742,6 +755,13 @@ class MultiFrameRunner(
+             val meteringAppliedToStillRequestStatus =
+                 if (selectedFrameSourceRequestType == "still") meteringAppliedStatus
+                 else "not_applicable_near_zsl_repeating_frame"
++            val selectedNearZslTimestampNs = anchorMetadata.get(CaptureResult.SENSOR_TIMESTAMP) ?: 0L
++            val selectedNearZslFrameAfterTapAeSettle = when {
++                activeZslFormat != ImageFormat.RAW10 &&
++                        activeZslFormat != ImageFormat.RAW_SENSOR -> "not_applicable_yuv"
++                tapAeDebug.settleSensorTimestampNs <= 0L -> "not_applicable_no_completed_tap_ae"
++                else -> (selectedNearZslTimestampNs >= tapAeDebug.settleSensorTimestampNs).toString()
++            }
+ 
+             // Recording Metering Validation details
+             shotLogger.recordPipelineEvent("Metering Validation", "meteringRequested", meteringRequested.toString())
+@@ -757,6 +777,22 @@ class MultiFrameRunner(
+             shotLogger.recordPipelineEvent("Metering Validation", "selectedFrameSourceRequestType", selectedFrameSourceRequestType)
+             shotLogger.recordPipelineEvent("Metering Validation", "meteringAppliedToRepeatingRequestStatus", meteringAppliedToRepeatingRequestStatus)
+             shotLogger.recordPipelineEvent("Metering Validation", "meteringAppliedToStillRequestStatus", meteringAppliedToStillRequestStatus)
++            shotLogger.recordPipelineEvent("Tap AE Settle", "tapAeMaxRegionsAe", tapAeDebug.maxAeRegions.toString())
++            shotLogger.recordPipelineEvent("Tap AE Settle", "tapAeMaxRegionsAf", tapAeDebug.maxAfRegions.toString())
++            shotLogger.recordPipelineEvent("Tap AE Settle", "tapAeMaxRegionsAwb", tapAeDebug.maxAwbRegions.toString())
++            shotLogger.recordPipelineEvent("Tap AE Settle", "tapAeRequestedRegionCountAfterCapabilityAdaptation", tapAeDebug.requestedAeRegionCount.toString())
++            shotLogger.recordPipelineEvent("Tap AE Settle", "tapAeActualRegionCountAtSettle", tapAeDebug.actualAeRegionCount.toString())
++            shotLogger.recordPipelineEvent("Tap AE Settle", "tapAeRequestedRegionMatchedExactly", tapAeDebug.requestedRegionMatchedExactly.toString())
++            shotLogger.recordPipelineEvent("Tap AE Settle", "tapAeRegionConfirmed", tapAeDebug.regionConfirmed.toString())
++            shotLogger.recordPipelineEvent("Tap AE Settle", "tapAeHoldActiveAtCapture", tapAeDebug.holdActive.toString())
++            shotLogger.recordPipelineEvent("Tap AE Settle", "tapAePendingAtCapture", tapAeDebug.pendingAtCapture.toString())
++            shotLogger.recordPipelineEvent("Tap AE Settle", "tapAeSettled", tapAeDebug.settled.toString())
++            shotLogger.recordPipelineEvent("Tap AE Settle", "tapAeTimedOut", tapAeDebug.timedOut.toString())
++            shotLogger.recordPipelineEvent("Tap AE Settle", "tapAeSettleWaitMs", tapAeDebug.settleWaitMs.toString())
++            shotLogger.recordPipelineEvent("Tap AE Settle", "tapAeSettleStatus", tapAeDebug.settleStatus)
++            shotLogger.recordPipelineEvent("Tap AE Settle", "tapAeSettleSensorTimestampNs", tapAeDebug.settleSensorTimestampNs.toString())
++            shotLogger.recordPipelineEvent("Tap AE Settle", "selectedNearZslFrameTimestampNs", selectedNearZslTimestampNs.toString())
++            shotLogger.recordPipelineEvent("Tap AE Settle", "selectedNearZslFrameAfterTapAeSettle", selectedNearZslFrameAfterTapAeSettle)
+ 
+             val activeArrayVal = chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+             val cropRegionVal = anchorMetadata?.get(CaptureResult.SCALER_CROP_REGION)
+diff --git a/app/src/main/java/com/bncam/core/runners/SingleFrameRunner.kt b/app/src/main/java/com/bncam/core/runners/SingleFrameRunner.kt
+index 6d499d3..33b6093 100644
+--- a/app/src/main/java/com/bncam/core/runners/SingleFrameRunner.kt
++++ b/app/src/main/java/com/bncam/core/runners/SingleFrameRunner.kt
+@@ -26,6 +26,7 @@ import com.bncam.core.debug.ShotLogger
+ import com.bncam.core.engine.CaptureStrategy
+ import com.bncam.core.engine.ImageUtils
+ import com.bncam.core.engine.LensInfo
++import com.bncam.core.engine.TapAeDebugSnapshot
+ import com.bncam.core.engine.WatermarkConfig
+ import com.bncam.core.engine.WatermarkEngine
+ import com.bncam.core.isp.raw10.DngWriter
+@@ -261,7 +262,8 @@ class SingleFrameRunner(
+         evOffset: Float,
+         requestedAeRegions: Array<android.hardware.camera2.params.MeteringRectangle>?,
+         requestedEvComp: Float,
+-        aeStateBeforeCapture: Int?
++        aeStateBeforeCapture: Int?,
++        tapAeDebug: TapAeDebugSnapshot
+     ): Uri? = withContext(Dispatchers.IO) {
+ 
+         val settingsRepo = SettingsRepository(context)
+@@ -524,9 +526,23 @@ class SingleFrameRunner(
+             )
+         }
+ 
++        val selectionCandidates = if (
++            (activeZslFormat == ImageFormat.RAW10 || activeZslFormat == ImageFormat.RAW_SENSOR) &&
++            tapAeDebug.settleSensorTimestampNs > 0L
++        ) {
++            evaluated.filter { it.timestampNs >= tapAeDebug.settleSensorTimestampNs }
++        } else {
++            evaluated
++        }
++        if (selectionCandidates.isEmpty()) {
++            Log.e(tag, "No RAW near-ZSL candidate exists after tap-AE settle timestamp")
++            closeTakenFrames()
++            return@withContext null
++        }
++
+         val selectionFreshnessWindowMs = if (activeZslFormat == ImageFormat.RAW_SENSOR) 500.0 else 350.0
+         val selectionResult = FrameSelectionEngine.selectBestCandidate(
+-            candidates = evaluated,
++            candidates = selectionCandidates,
+             freshnessWindowMs = selectionFreshnessWindowMs
+         )
+         val winningCandidate = selectionResult.selected.candidate
+@@ -1197,6 +1213,13 @@ class SingleFrameRunner(
+                 val meteringAppliedToStillRequestStatus =
+                     if (selectedFrameSourceRequestType == "still") meteringAppliedStatus
+                     else "not_applicable_near_zsl_repeating_frame"
++                val selectedNearZslFrameAfterTapAeSettle = when {
++                    activeZslFormat != ImageFormat.RAW10 &&
++                            activeZslFormat != ImageFormat.RAW_SENSOR -> "not_applicable_yuv"
++                    tapAeDebug.settleSensorTimestampNs <= 0L -> "not_applicable_no_completed_tap_ae"
++                    else -> (winningCandidate.timestampNs >=
++                            tapAeDebug.settleSensorTimestampNs).toString()
++                }
+ 
+                 // Recording Metering Validation details
+                 shotLogger.recordPipelineEvent("Metering Validation", "meteringRequested", meteringRequested.toString())
+@@ -1212,6 +1235,22 @@ class SingleFrameRunner(
+                 shotLogger.recordPipelineEvent("Metering Validation", "selectedFrameSourceRequestType", selectedFrameSourceRequestType)
+                 shotLogger.recordPipelineEvent("Metering Validation", "meteringAppliedToRepeatingRequestStatus", meteringAppliedToRepeatingRequestStatus)
+                 shotLogger.recordPipelineEvent("Metering Validation", "meteringAppliedToStillRequestStatus", meteringAppliedToStillRequestStatus)
++                shotLogger.recordPipelineEvent("Tap AE Settle", "tapAeMaxRegionsAe", tapAeDebug.maxAeRegions.toString())
++                shotLogger.recordPipelineEvent("Tap AE Settle", "tapAeMaxRegionsAf", tapAeDebug.maxAfRegions.toString())
++                shotLogger.recordPipelineEvent("Tap AE Settle", "tapAeMaxRegionsAwb", tapAeDebug.maxAwbRegions.toString())
++                shotLogger.recordPipelineEvent("Tap AE Settle", "tapAeRequestedRegionCountAfterCapabilityAdaptation", tapAeDebug.requestedAeRegionCount.toString())
++                shotLogger.recordPipelineEvent("Tap AE Settle", "tapAeActualRegionCountAtSettle", tapAeDebug.actualAeRegionCount.toString())
++                shotLogger.recordPipelineEvent("Tap AE Settle", "tapAeRequestedRegionMatchedExactly", tapAeDebug.requestedRegionMatchedExactly.toString())
++                shotLogger.recordPipelineEvent("Tap AE Settle", "tapAeRegionConfirmed", tapAeDebug.regionConfirmed.toString())
++                shotLogger.recordPipelineEvent("Tap AE Settle", "tapAeHoldActiveAtCapture", tapAeDebug.holdActive.toString())
++                shotLogger.recordPipelineEvent("Tap AE Settle", "tapAePendingAtCapture", tapAeDebug.pendingAtCapture.toString())
++                shotLogger.recordPipelineEvent("Tap AE Settle", "tapAeSettled", tapAeDebug.settled.toString())
++                shotLogger.recordPipelineEvent("Tap AE Settle", "tapAeTimedOut", tapAeDebug.timedOut.toString())
++                shotLogger.recordPipelineEvent("Tap AE Settle", "tapAeSettleWaitMs", tapAeDebug.settleWaitMs.toString())
++                shotLogger.recordPipelineEvent("Tap AE Settle", "tapAeSettleStatus", tapAeDebug.settleStatus)
++                shotLogger.recordPipelineEvent("Tap AE Settle", "tapAeSettleSensorTimestampNs", tapAeDebug.settleSensorTimestampNs.toString())
++                shotLogger.recordPipelineEvent("Tap AE Settle", "selectedNearZslFrameTimestampNs", winningCandidate.timestampNs.toString())
++                shotLogger.recordPipelineEvent("Tap AE Settle", "selectedNearZslFrameAfterTapAeSettle", selectedNearZslFrameAfterTapAeSettle)
+ 
+                 val activeArrayVal = chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+                 val cropRegionVal = captureMetadata?.get(CaptureResult.SCALER_CROP_REGION)

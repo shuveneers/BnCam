@@ -1,0 +1,51 @@
+#version 450
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer InputBuffer {
+    uint inputBytes[];
+};
+
+layout(std430, set = 0, binding = 1) buffer OutputBuffer {
+    uint outputWords[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+    uint inputRowStrideBytes;
+    uint outputRowStrideBytes;
+} pc;
+
+uint readByte(uint byteIndex) {
+    return (inputBytes[byteIndex / 4u] >> ((byteIndex % 4u) * 8u)) & 0xFFu;
+}
+
+uint readRaw10(uint pixelIndex) {
+    uint row = pixelIndex / pc.width;
+    uint col = pixelIndex % pc.width;
+    uint groupIdx = col / 4u;
+    uint lane = col % 4u;
+    uint baseByteIdx = row * pc.inputRowStrideBytes + groupIdx * 5u;
+    uint high = readByte(baseByteIdx + lane);
+    uint packedLow = readByte(baseByteIdx + 4u);
+    // Android RAW10: byte 4 packs P3,P2,P1,P0 from MSB to LSB, so P0 starts at bit 0.
+    return (high << 2u) | ((packedLow >> (lane * 2u)) & 0x03u);
+}
+
+void main() {
+    // One invocation owns one complete 32-bit output word (two RAW16 samples). The previous
+    // pixel-per-invocation read/modify/write scheme allowed adjacent invocations to race on the
+    // same storage-buffer word.
+    uint outWordIdx = gl_GlobalInvocationID.x;
+    uint totalPixels = pc.width * pc.height;
+    uint totalWords = (totalPixels + 1u) / 2u;
+    if (outWordIdx >= totalWords) return;
+
+    uint pixel0 = outWordIdx * 2u;
+    uint lo = readRaw10(pixel0) & 0xFFFFu;
+    uint hi = 0u;
+    if (pixel0 + 1u < totalPixels) {
+        hi = (readRaw10(pixel0 + 1u) & 0xFFFFu) << 16u;
+    }
+    outputWords[outWordIdx] = lo | hi;
+}

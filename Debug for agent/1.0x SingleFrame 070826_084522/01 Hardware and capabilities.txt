@@ -1,0 +1,7 @@
+HARDWARE AND CAPABILITIES
+=========================
+logicalCameraId: 0
+physicalCameraId: 2
+hardwareOverrideFingerprint: 72d7ffbdcbf9f7ba8e6b864536fb5502d43a811bb33631e34f6c8f502b12e7c8
+frame_source: requested=RAW10; supported=true; resolved=RAW10; executed=not_recorded; result=resolved_at_shutter; fallback=false; reason=active_imagereader_contract_verified
+output_policy: requested=JPEG; supported=true; resolved=JPEG; executed=not_recorded; result=resolved_at_shutter; fallback=false; reason=as_requested
