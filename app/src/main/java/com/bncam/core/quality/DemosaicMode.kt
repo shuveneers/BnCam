@@ -7,12 +7,13 @@ enum class DemosaicMode(
     val displayName: String,
     val available: Boolean
 ) {
-    // Internal enum symbols retain their legacy names for binary/source compatibility while
-    // bridge values 1/2/3 now represent the BnCam Inspired product algorithms below.
+    // Internal enum symbols retain legacy names for persisted-profile/source compatibility.
+    // Product bridge identities are 1=Malvar, 2=AMaZE Inspired (pending canonical AMaZE),
+    // 3=Neural JDD. Auto remains the transition selector until final Auto Hybrid hysteresis lands.
     AUTO(0, "Auto", true),
-    NORMAL(1, "Malvar Inspired", true),
-    QUALITY(2, "AMAZE Inspired", true),
-    BILINEAR(3, "RCD Inspired", true);
+    NORMAL(1, "Malvar", true),
+    QUALITY(2, "AMaZE Inspired", true),
+    BILINEAR(3, "Neural JDD", true);
 
     companion object {
         const val PROFILE_KEY = "demosaic_mode"
@@ -20,7 +21,7 @@ enum class DemosaicMode(
         // Product default is deliberately noise-robust. RCD and AMAZE remain available for
         // profiles that prioritise edge/detail reconstruction; Auto stays the fourth UI choice.
         val DEFAULT: DemosaicMode = NORMAL
-        val USER_ORDER: List<DemosaicMode> = listOf(NORMAL, BILINEAR, QUALITY, AUTO)
+        val USER_ORDER: List<DemosaicMode> = listOf(NORMAL, QUALITY, BILINEAR, AUTO)
 
         /**
          * Parses both the new product names and all legacy persisted values.
@@ -42,7 +43,8 @@ enum class DemosaicMode(
                 "QUALITY", "MENON", "MENON_2007", "MENON 2007",
                 "MENON_2007_DDFAPD", "AMAZE", "AMAZE_INSPIRED", "AMAZE INSPIRED" -> QUALITY
 
-                "BILINEAR", "RCD", "RCD_INSPIRED", "RCD INSPIRED" -> BILINEAR
+                "BILINEAR", "RCD", "RCD_INSPIRED", "RCD INSPIRED",
+                "NEURAL_JDD", "NEURAL JDD", "NEURALJDD" -> BILINEAR
                 else -> null
             }
         }
@@ -61,7 +63,7 @@ enum class DemosaicMode(
                 BILINEAR -> DemosaicSelection(
                     requestedMode = BILINEAR,
                     resolvedAlgorithm = ResolvedDemosaicAlgorithm.RCD_INSPIRED,
-                    resolveReason = "legacy_slot_3_forces_rcd_inspired",
+                    resolveReason = "legacy_slot_3_executes_neural_jdd",
                     fallbackOccurred = false,
                     fallbackReason = "none"
                 )
@@ -108,7 +110,7 @@ data class DemosaicSelection(
     private val requestedDebugName: String
         get() = when (requestedMode) {
             DemosaicMode.AUTO -> "AUTO"
-            DemosaicMode.BILINEAR -> "RCD_INSPIRED"
+            DemosaicMode.BILINEAR -> "NEURAL_JDD"
             DemosaicMode.NORMAL -> "MALVAR_INSPIRED"
             DemosaicMode.QUALITY -> "AMAZE_INSPIRED"
         }
@@ -116,10 +118,11 @@ data class DemosaicSelection(
     val debugPairs: List<Pair<String, String>>
         get() = listOf(
             "requestedDemosaicMode" to requestedDebugName,
-            "resolvedDemosaicAlgorithm" to resolvedAlgorithm.name,
+            "resolvedDemosaicAlgorithm" to if (resolvedAlgorithm == ResolvedDemosaicAlgorithm.RCD_INSPIRED) "NEURAL_JDD" else resolvedAlgorithm.name,
             "demosaicResolveReason" to resolveReason,
-            "malvarInspiredAvailable" to "true",
-            "rcdInspiredAvailable" to "true",
+            "malvar2004Available" to "true",
+            "neuralJddAvailable" to "true",
+            "rcdInspiredAvailable" to "false",
             "amazeInspiredAvailable" to "true",
             "legacyBilinearProductAvailable" to "false",
             "legacyMenonProductAvailable" to "false",

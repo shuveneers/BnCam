@@ -377,7 +377,7 @@ SpectraResidentDemosaicResult VulkanSpectraResidentDemosaicBackend::executeInter
     const auto totalStart = Clock::now();
     if (request.algorithm == SpectraGpuDemosaicAlgorithm::MENON_2007) {
         result.cpuFallbackRequired = true;
-        result.status = "GPU_DEMOSAIC_MENON_TYPED_FALLBACK_PENDING_RCD_AMAZE_MIGRATION";
+        result.status = "GPU_DEMOSAIC_MENON_TYPED_FALLBACK_LEGACY_REFERENCE_ONLY";
         result.failureReason = "MENON_2007_NOT_PORTED_LONG_TERM_ALGORITHM_REPLACEMENT_PLANNED";
         result.totalMs = elapsedMs(totalStart);
         return result;
@@ -549,7 +549,7 @@ SpectraResidentDemosaicResult VulkanSpectraResidentDemosaicBackend::executeInter
         case SpectraGpuDemosaicAlgorithm::BILINEAR:
             push.mode = 0u;
             break;
-        case SpectraGpuDemosaicAlgorithm::RCD_INSPIRED:
+        case SpectraGpuDemosaicAlgorithm::NEURAL_JDD:
             push.mode = 2u;
             break;
         case SpectraGpuDemosaicAlgorithm::AMAZE_INSPIRED:
@@ -665,8 +665,8 @@ SpectraResidentDemosaicResult VulkanSpectraResidentDemosaicBackend::executeInter
     result.residentDemosaicGeneration = residentDemosaicGeneration_;
     const char* algorithmStatus = request.algorithm == SpectraGpuDemosaicAlgorithm::BILINEAR
             ? "BILINEAR"
-            : (request.algorithm == SpectraGpuDemosaicAlgorithm::RCD_INSPIRED
-                    ? "RCD_INSPIRED"
+            : (request.algorithm == SpectraGpuDemosaicAlgorithm::NEURAL_JDD
+                    ? "NEURAL_JDD"
                     : (request.algorithm == SpectraGpuDemosaicAlgorithm::AMAZE_INSPIRED
                             ? "AMAZE_INSPIRED"
                             : "MALVAR_2004"));

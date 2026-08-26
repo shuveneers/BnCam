@@ -14,7 +14,7 @@ layout(push_constant) uniform Params {
     uint frameWidth;
     uint frameHeight;
     uint cfaPattern;
-    uint mode; // 0 bilinear, 1 Malvar Inspired, 2 RCD Inspired, 3 AWB+CCM, 4 residual, 5 AMAZE Inspired
+    uint mode; // 0 bilinear, 1 Malvar 2004 (pure MHC), 2 Neural JDD, 3 AWB+CCM, 4 residual, 5 AMAZE Inspired
     float wbR;
     float wbG;
     float wbB;
@@ -29,8 +29,8 @@ layout(push_constant) uniform Params {
     uint residualColumns;
     uint residualRows;
     uint padding4;
-    // Delta 25+ evidence contract. Malvar/RCD/AMAZE Inspired consume it only in reconstructed
-    // R/B chroma paths; sampled CFA values and each algorithm's green/luma reconstruction stay unchanged.
+    // Delta 25+ evidence contract. Pure Malvar 2004 ignores it; adaptive RCD/AMAZE
+    // may consume it in reconstructed R/B chroma paths. Sampled CFA values remain authoritative.
     // Demosaic modes: immutable CFA evidence contract. Mode 3 (AWB+CCM) reuses
     // cfaEvidence0.xy for bounded pre-WB R-G/B-G cleanup maxima after demosaic is complete.
     vec4 cfaEvidence0; // demosaic: available/common/structure/fine; mode3: localBlendR/localBlendB/cloudReady/cloudMaxAbs
@@ -154,48 +154,10 @@ vec3 bilinearAt(int x, int y) {
     return vec3(finiteLinear(r), finiteLinear(g), finiteLinear(b));
 }
 
-float malvarChromaRisk(uint channel) {
-    if (pc.cfaEvidence0.x < 0.5 || (channel != 0u && channel != 2u)) return 0.0;
-    float bandPressure = clamp(
-            0.30 * pc.cfaEvidence0.w +
-            0.40 * pc.cfaEvidence1.x +
-            0.30 * pc.cfaEvidence1.y,
-            0.0, 1.0);
-    float opponentPressure = channel == 0u ? pc.cfaEvidence1.z : pc.cfaEvidence1.w;
-    float structureRelief = 1.0 - 0.45 * clamp(pc.cfaEvidence0.z, 0.0, 1.0);
-    return clamp((0.70 * bandPressure + 0.30 * clamp(opponentPressure, 0.0, 1.0)) *
-                 structureRelief, 0.0, 1.0);
-}
 
-float malvarRobustMissingColor(int x, int y, uint channel) {
-    uint centerColor = cfaColorAt(pc.cfaPattern, x, y);
-    if (centerColor == channel) return sampleClamped(x, y);
-    if (centerColor == 1u) {
-        bool horizontalRed = cfaColorAt(pc.cfaPattern, x - 1, y) == 0u;
-        bool horizontal = channel == 0u ? horizontalRed : !horizontalRed;
-        return horizontal
-                ? 0.5 * (sampleClamped(x - 1, y) + sampleClamped(x + 1, y))
-                : 0.5 * (sampleClamped(x, y - 1) + sampleClamped(x, y + 1));
-    }
-    return 0.25 * (sampleClamped(x - 1, y - 1) + sampleClamped(x + 1, y - 1) +
-                   sampleClamped(x - 1, y + 1) + sampleClamped(x + 1, y + 1));
-}
 
-float malvarStabilizeMissingColor(int x, int y, uint channel, float baseline, float chromaRisk) {
-    if (cfaColorAt(pc.cfaPattern, x, y) == channel || chromaRisk <= 0.0) return baseline;
-    float robust = malvarRobustMissingColor(x, y, channel);
-    float risk = clamp(chromaRisk, 0.0, 1.0);
-    float blend = 0.14 * risk;
-    float sigma = demosaicNoiseSigmaChroma();
-    if (sigma > 1.0e-6) {
-        float z = abs(baseline - robust) / sigma;
-        float noiseLike = 1.0 - smoothstep(1.50, 4.00, z);
-        float noiseSupport = max(demosaicNoisePressure(), smoothstep(7.5e-4, 6.0e-3, sigma));
-        blend += 0.12 * risk * noiseLike * noiseSupport;
-    }
-    return finiteLinear(mix(baseline, robust, clamp(blend, 0.0, 0.26)));
-}
 
+// Pure deterministic Malvar-He-Cutler 2004. No CFA-evidence/noise authority in this route.
 vec3 malvarAt(int x, int y) {
     const float scale = 0.125;
     uint color = cfaColorAt(pc.cfaPattern, x, y);
@@ -226,160 +188,69 @@ vec3 malvarAt(int x, int y) {
         r = horizontalRed ? chromaH : chromaV;
         b = horizontalRed ? chromaV : chromaH;
     }
-    r = malvarStabilizeMissingColor(x, y, 0u, r, malvarChromaRisk(0u));
-    b = malvarStabilizeMissingColor(x, y, 2u, b, malvarChromaRisk(2u));
     return vec3(finiteLinear(r), finiteLinear(g), finiteLinear(b));
 }
 
 
-float rcdLowPass(int x, int y) {
-    float corners = sampleClamped(x - 1, y - 1) + sampleClamped(x + 1, y - 1) +
-                    sampleClamped(x - 1, y + 1) + sampleClamped(x + 1, y + 1);
-    float axial = sampleClamped(x - 1, y) + sampleClamped(x + 1, y) +
-                  sampleClamped(x, y - 1) + sampleClamped(x, y + 1);
-    return (4.0 * sampleClamped(x, y) + 2.0 * axial + corners) * (1.0 / 16.0);
-}
 
-float rcdRatioGreen(float adjacentGreen, float centerLowPass, float farLowPass) {
-    const float epsilon = 1.0e-5;
-    float denominator = centerLowPass + farLowPass;
-    if (abs(denominator) < epsilon) denominator = denominator < 0.0 ? -epsilon : epsilon;
-    float correction = clamp((centerLowPass - farLowPass) / denominator, -0.75, 0.75);
-    float sigma = demosaicNoiseSigmaY();
-    if (sigma > 1.0e-7) {
-        float localSignal = abs(centerLowPass) + abs(farLowPass);
-        correction *= smoothstep(2.5 * sigma, 8.0 * sigma, localSignal);
-    }
-    return finiteLinear(adjacentGreen * (1.0 + correction));
-}
 
-float rcdWeight(float gradient) {
-    float sigma = demosaicNoiseSigmaY();
-    float support = max(demosaicNoisePressure(), smoothstep(7.5e-4, 6.0e-3, demosaicNoiseSigmaChroma()));
-    float debiasedGradient = max(0.0, gradient - 1.25 * sigma);
-    float adaptiveFloor = max(2.0e-4, 0.70 * sigma * support);
-    float stabilized = adaptiveFloor + debiasedGradient;
-    return 1.0 / max(1.0e-12, stabilized * stabilized);
-}
 
 // Delta 26: only RCD missing-chroma interpolation consumes the Delta-25 CFA evidence.
 // Green reconstruction remains identical to Delta 25.
-float rcdNoiseAwareChromaRisk(uint channel) {
-    if (pc.cfaEvidence0.x < 0.5 || (channel != 0u && channel != 2u)) return 0.0;
-    float bandPressure = clamp(0.45 * pc.cfaEvidence0.w +
-                               0.35 * pc.cfaEvidence1.x +
-                               0.20 * pc.cfaEvidence1.y, 0.0, 1.0);
-    float opponentPressure = channel == 0u ? pc.cfaEvidence1.z : pc.cfaEvidence1.w;
-    float structureRelief = 1.0 - 0.35 * clamp(pc.cfaEvidence0.z, 0.0, 1.0);
-    return clamp((0.65 * bandPressure + 0.35 * clamp(opponentPressure, 0.0, 1.0)) *
-                 structureRelief, 0.0, 1.0);
-}
 
-float rcdChromaWeight(float gradient, float chromaRisk) {
-    float risk = clamp(chromaRisk, 0.0, 1.0);
-    float sigma = demosaicNoiseSigmaChroma();
-    float support = max(demosaicNoisePressure(), smoothstep(7.5e-4, 6.0e-3, sigma));
-    float floorValue = max(2.0e-4 + 4.0e-4 * risk, 0.65 * sigma * support);
-    float debiasedGradient = max(0.0, gradient - 1.10 * sigma);
-    float stabilized = floorValue + debiasedGradient;
-    return 1.0 / max(1.0e-12, stabilized * stabilized);
-}
 
-float rcdGreenAt(int x, int y) {
-    int sx = safeCoord(x, int(pc.frameWidth));
-    int sy = safeCoord(y, int(pc.frameHeight));
-    if (cfaColorAt(pc.cfaPattern, sx, sy) == 1u) return sampleClamped(sx, sy);
 
-    float centerLp = rcdLowPass(sx, sy);
-    float west = rcdRatioGreen(sampleClamped(sx - 1, sy), centerLp, rcdLowPass(sx - 2, sy));
-    float east = rcdRatioGreen(sampleClamped(sx + 1, sy), centerLp, rcdLowPass(sx + 2, sy));
-    float north = rcdRatioGreen(sampleClamped(sx, sy - 1), centerLp, rcdLowPass(sx, sy - 2));
-    float south = rcdRatioGreen(sampleClamped(sx, sy + 1), centerLp, rcdLowPass(sx, sy + 2));
-    float hGradient = abs(rcdLowPass(sx - 2, sy) - rcdLowPass(sx + 2, sy)) +
-                      0.5 * abs(sampleClamped(sx - 1, sy) - sampleClamped(sx + 1, sy));
-    float vGradient = abs(rcdLowPass(sx, sy - 2) - rcdLowPass(sx, sy + 2)) +
-                      0.5 * abs(sampleClamped(sx, sy - 1) - sampleClamped(sx, sy + 1));
-    float wH = rcdWeight(hGradient);
-    float wV = rcdWeight(vGradient);
-    float green = (wH * 0.5 * (west + east) + wV * 0.5 * (north + south)) / max(1.0e-8, wH + wV);
-    float localMin = min(min(sampleClamped(sx - 1, sy), sampleClamped(sx + 1, sy)),
-                         min(sampleClamped(sx, sy - 1), sampleClamped(sx, sy + 1)));
-    float localMax = max(max(sampleClamped(sx - 1, sy), sampleClamped(sx + 1, sy)),
-                         max(sampleClamped(sx, sy - 1), sampleClamped(sx, sy + 1)));
-    float guard = 0.10 * max(1.0e-5, localMax - localMin);
-    return finiteLinear(clamp(green, localMin - guard, localMax + guard));
-}
 
-float rcdAxialColor(int x, int y, uint channel, bool horizontal, float centerGreen) {
-    float chromaRisk = rcdNoiseAwareChromaRisk(channel);
-    int dx = horizontal ? 1 : 0;
-    int dy = horizontal ? 0 : 1;
-    int x0 = safeCoord(x - dx, int(pc.frameWidth));
-    int y0 = safeCoord(y - dy, int(pc.frameHeight));
-    int x1 = safeCoord(x + dx, int(pc.frameWidth));
-    int y1 = safeCoord(y + dy, int(pc.frameHeight));
-    float g0 = rcdGreenAt(x0, y0);
-    float g1 = rcdGreenAt(x1, y1);
-    bool valid0 = cfaColorAt(pc.cfaPattern, x0, y0) == channel;
-    bool valid1 = cfaColorAt(pc.cfaPattern, x1, y1) == channel;
-    float d0 = valid0 ? sampleClamped(x0, y0) - g0 : 0.0;
-    float d1 = valid1 ? sampleClamped(x1, y1) - g1 : 0.0;
-    float w0 = rcdChromaWeight(abs(centerGreen - g0), chromaRisk);
-    float w1 = rcdChromaWeight(abs(centerGreen - g1), chromaRisk);
-    float weightedDifference = (w0 * d0 + w1 * d1) / max(1.0e-8, w0 + w1);
-    float robustDifference = valid0 && valid1 ? 0.5 * (d0 + d1) : weightedDifference;
-    float robustBlend = 0.18 * clamp(chromaRisk, 0.0, 1.0);
-    float difference = mix(weightedDifference, robustDifference, robustBlend);
-    return finiteLinear(centerGreen + difference);
-}
 
-float rcdDiagonalColor(int x, int y, uint channel, float centerGreen) {
-    float chromaRisk = rcdNoiseAwareChromaRisk(channel);
-    ivec2 offsets[4] = ivec2[4](ivec2(-1, -1), ivec2(1, -1), ivec2(-1, 1), ivec2(1, 1));
-    float weightedDifference = 0.0;
-    float totalWeight = 0.0;
-    float simpleDifference = 0.0;
-    float validDifferenceCount = 0.0;
-    for (int i = 0; i < 4; ++i) {
-        int sx = safeCoord(x + offsets[i].x, int(pc.frameWidth));
-        int sy = safeCoord(y + offsets[i].y, int(pc.frameHeight));
-        if (cfaColorAt(pc.cfaPattern, sx, sy) != channel) continue;
-        float neighborGreen = rcdGreenAt(sx, sy);
-        float difference = sampleClamped(sx, sy) - neighborGreen;
-        float weight = rcdChromaWeight(abs(centerGreen - neighborGreen), chromaRisk);
-        weightedDifference += weight * difference;
-        totalWeight += weight;
-        simpleDifference += difference;
-        validDifferenceCount += 1.0;
+
+
+// Phase 5 / Delta 0046 Neural JDD.
+// Trained residual MLP: 25 noisy CFA samples + 4 local site-phase bits + 4 Bayer-pattern bits
+// + physical chroma sigma -> clean linear RGB residual over pure MHC. The model was trained
+// offline on procedural edge/texture/neutral/highlight CFA patches with signal-dependent noise.
+const float JDD_W1[408] = float[408](-0.0928661227f, 0.10916017f, -0.238949358f, -0.0604118295f, 0.207512796f, -0.00767328823f, 0.254315972f, -0.0180336256f, -0.0494986288f, 0.0659962893f, -0.0283330623f, -0.142683506f, -0.396805942f, -0.0285489745f, -0.116507046f, 0.0931306556f, 0.101455189f, -0.143013462f, 0.216083124f, -0.0251789205f, 0.0807221457f, 0.109874688f, -0.195306703f, -0.012569583f, 0.0306663383f, -0.0513127595f, -0.0325186029f, -0.0301862024f, -0.0610652976f, 0.10733857f, 0.118664987f, 0.113264292f, 0.0795431659f, -0.10312029f, -0.138926074f, -0.191692695f, -0.00101127452f, -0.0674677417f, -0.16891402f, -0.0341617242f, -0.103100382f, -0.00664762547f, -0.175070331f, -0.0787464678f, -0.1972339f, -0.0338668711f, -0.0851230547f, -0.0958462134f, -0.149915531f, -0.10437578f, 0.0542901605f, -0.182549953f, -0.265950173f, -0.0356127694f, 0.0904997811f, -0.141720384f, -0.0549052469f, -0.164148062f, -0.269566089f, 0.084892489f, -0.0971458405f, -0.0962903574f, -0.062292669f, 0.109595917f, -0.0311488584f, -0.0486766621f, -0.115253985f, -0.134903044f, 0.0601956621f, -0.0292681698f, -0.0285296086f, 0.107363336f, -0.0727240443f, -0.110215858f, -0.125127792f, 0.0146010742f, 0.0449813716f, 0.0221866537f, 0.0401432104f, 0.118900895f, 0.105982684f, -0.0768436641f, 0.0275965631f, -0.00263665197f, 0.11019145f, 0.000872922246f, -0.20780848f, -0.0326646008f, -0.095708169f, 0.143741921f, 0.105393745f, -0.0406399257f, 0.11784099f, 0.0510801934f, -0.191790968f, -0.236248508f, 0.0990952551f, -0.20522204f, 0.158076048f, 0.257456303f, -0.00620082021f, 0.0603837036f, 0.135538265f, 0.174235642f, 0.118650444f, -0.104419231f, 0.117234312f, -0.114433296f, 0.0505344011f, 0.0286034923f, 0.0431653485f, -0.0881662816f, -0.033247821f, 0.0935470909f, -0.295339316f, -0.161413223f, -0.0492220335f, 0.157386139f, 0.194932297f, 0.0356586874f, -0.0876860619f, 0.0473982133f, 0.0349830426f, 0.0118048955f, 0.153121024f, -0.0852743983f, -0.0643285215f, 0.111785471f, 0.154188231f, 0.17338644f, 0.0797946453f, 0.0668631867f, 0.0743797943f, 0.118677683f, 0.165537134f, 0.0271670986f, 0.0266915336f, -0.0214544833f, 0.0355853103f, 0.176658139f, 0.0671810582f, -0.114977039f, -0.028515894f, 0.021565266f, 0.0668076426f, 0.151432335f, 0.0286767371f, -0.104376554f, -0.152225703f, -0.126531437f, 0.0297278315f, 0.143506184f, 0.019611286f, -0.140320063f, 0.0642113388f, 0.104110129f, 0.00347098522f, 0.101011015f, 0.142636105f, -0.105138965f, -0.13455236f, -0.0063259704f, 0.0162820928f, 0.0925038159f, -0.0505435243f, 0.228240818f, 0.0856750533f, -0.0293188617f, 0.0716777891f, -0.0282753054f, 0.141061559f, 0.169938266f, 0.00681541255f, 0.140973151f, -0.0186571386f, -0.0600880757f, -0.0259827171f, -0.083770752f, -0.0278905332f, 0.0375873893f, -0.148526028f, 0.122804739f, 0.350582838f, -0.0814388022f, 0.0402062051f, -0.0563317649f, 0.139530972f, 0.0578514971f, 0.0674994886f, 0.117542781f, -0.110628016f, 0.0136356605f, -0.0577855371f, -0.0589623712f, 0.169605404f, -0.100477897f, 0.101632141f, 0.111083128f, 0.0636828393f, -0.101134129f, -0.0523922741f, 0.0614592098f, 0.08254987f, 0.0947658569f, 0.11102882f, -0.00486064143f, -0.0404011831f, -0.025486201f, -0.0216523129f, 0.0256209522f, -0.0995875448f, 0.0716724396f, 0.0585664697f, 0.0380796902f, 0.108427554f, -0.0737647116f, -0.382444352f, 0.071577616f, 0.0874552578f, -0.0327545367f, 0.0620120876f, -0.0469963253f, 0.0369513147f, -0.098791413f, 0.0834170356f, -0.077535145f, 0.0899046063f, 0.0810909718f, 0.129054591f, 0.0931189731f, 0.107107237f, 0.12638016f, 0.158385321f, 0.00977887306f, 0.10788314f, 0.0229688399f, 0.0182863101f, 0.0651890337f, -0.0717743337f, -0.0621241443f, -0.228488684f, -0.0971744135f, 0.0655497089f, -0.0742739812f, 0.0892728269f, 0.0435669608f, 0.0287747905f, 0.119719163f, 0.0676535815f, 0.13872841f, 0.319145769f, 0.191060886f, -0.0233782399f, -0.0455576479f, -0.145598903f, 0.0268988684f, 0.148111403f, 0.00483703008f, 0.125541389f, 0.0555013902f, -0.10036511f, 0.153132856f, 0.0428292528f, -0.0596763678f, 0.0298281368f, 0.0609674975f, 0.0592361502f, -0.0530377775f, 0.084694095f, 0.0511066057f, 0.0604663789f, 0.283638269f, 0.134019032f, -0.0847409293f, -0.0316614993f, 0.0152074462f, 0.0257237796f, 0.0278955419f, 0.00290633948f, -0.0347232856f, 0.0946291536f, -0.0772126764f, -0.0466119051f, 0.15684557f, -0.346014529f, -0.16651623f, 0.0131949978f, 0.0124328732f, 0.000429959706f, 0.0346952416f, -0.0687672198f, -0.0790166259f, 0.0785065144f, 0.0153815215f, 0.118022904f, 0.146132603f, 0.143321857f, 0.00563500961f, 0.102027513f, 0.0511785634f, 0.0252255537f, -0.0239846781f, -0.00812616292f, -0.0154695287f, 0.126051232f, -0.0437272638f, 0.178552032f, 0.0606499687f, 0.0158017278f, -0.0649905205f, 0.00459715864f, 0.0576665662f, -0.0927422941f, 0.172102481f, 0.201549739f, -0.161805347f, -0.145533144f, -0.00948355347f, 0.296731532f, -0.124715023f, -0.233811781f, 0.0988643989f, 0.117695779f, 0.132205993f, 0.0871664882f, -0.152428597f, -0.0116556492f, -0.15765132f, 0.1314165f, 0.0725957602f, -0.0548560768f, 0.0846773461f, -0.00739104161f, 0.0223399699f, 0.00413030246f, 0.0707634836f, 0.103595711f, -0.018675033f, 0.0208058823f, -0.0261062849f, 0.100504346f, -0.0953970701f, 0.0423405357f, 0.100512587f, -0.0166537538f, 0.157729194f, -0.00550914789f, -0.00609438214f, -0.0781863332f, -0.0235939659f, 0.0979483053f, 0.214899644f, -0.352786958f, -0.122097641f, -0.0356345102f, -0.128209576f, 0.141480148f, 0.0366234854f, 0.0208767876f, 0.0272588339f, -0.0679647028f, -0.0736162663f, 0.186442718f, 0.00697210524f, 0.0947807208f, 0.120640077f, 0.0845200568f, 0.143694773f, 0.109220609f, 0.0370308049f, 0.0139392f, 0.0207370017f, 0.0733739957f, 0.0757325217f, -0.0796956345f, 0.119190373f, 0.297559887f, 0.0917179361f, 0.0164918657f, -0.0614689589f, -0.062392801f, -0.0301177576f, 0.154257521f, -0.00328074628f, 0.067839101f, -0.072865814f, -0.368222505f, 0.0399011895f, 0.225670353f, 0.0232249591f, -0.0857454017f, 0.13792856f, 0.111400187f, 0.011676508f, -0.116799161f, 0.0217915811f, 0.0429730751f, 0.0351492725f, -0.0248814616f, -0.0441440046f, 0.0229848083f, -0.0263831168f, 0.0222023726f, -0.0414843783f, -0.0314963497f, 0.0376022421f, -0.0369355418f, -0.00213426934f);
+const float JDD_B1[12] = float[12](-0.0907577574f, -0.0136039555f, 0.148919001f, -0.0723823607f, 0.14720057f, 0.14671877f, -0.0096257031f, 0.0337827019f, 0.105173327f, 0.169392183f, -0.0817636475f, 0.139122486f);
+const float JDD_W2[72] = float[72](-0.103514411f, 0.047433462f, -0.247533128f, 0.264679104f, -0.133033425f, -0.136831149f, 0.327432662f, 0.131608948f, -0.0423758402f, -0.203955725f, 0.239104256f, 0.338449836f, 0.18405202f, -0.0842768401f, -0.0238215793f, 0.179175064f, -0.1293464f, -0.121941373f, -0.307522476f, 0.203424945f, -0.180065691f, -0.0471665561f, -0.0772997439f, -0.0154307475f, -0.00364749692f, -0.102746598f, 0.410243005f, -0.263332367f, -0.125623628f, 0.0616468303f, -0.172535732f, 0.0610383861f, -0.388825864f, 0.371797025f, -0.411792308f, -0.186399654f, -0.146006927f, -0.0288793165f, 0.190026447f, 0.326169282f, 0.261626303f, -0.188895881f, 0.310918331f, -0.122360215f, 0.0568748116f, -0.211843997f, 0.00269979704f, 0.257225037f, 0.0983521715f, -0.0620359406f, -0.182363674f, -0.0641381592f, -0.226181865f, 0.204294756f, -0.335459203f, 0.19748123f, -0.18967554f, 0.305927843f, -0.284944087f, -0.00728392927f, -0.209574923f, -0.294038236f, 0.108530991f, -0.181929171f, 0.152649224f, 0.322765917f, -0.26518485f, 0.0500246473f, -0.0568175912f, 0.111095481f, -0.335752726f, -0.318841666f);
+const float JDD_B2[6] = float[6](0.0668660626f, -0.146059602f, -0.115928359f, -0.0153510207f, 0.170746446f, 0.102797613f);
+const float JDD_W3[18] = float[18](0.139109358f, 0.0242330916f, -0.293121904f, 0.207865596f, -0.100197829f, -0.135519683f, 0.074903354f, 0.00169213093f, 0.187972188f, 0.0709970519f, -0.0378903039f, -0.0848642215f, 0.139481008f, -0.00834472291f, -0.295376927f, 0.208003417f, -0.101541586f, -0.137124583f);
+const float JDD_B3[3] = float[3](-0.00903598685f, -0.00150470249f, -0.00986603275f);
+
+vec3 neuralJddAt(int x, int y) {
+    float features[34];
+    for (int i = 0; i < 34; ++i) features[i] = 0.0;
+    int featureIndex = 0;
+    for (int dy = -2; dy <= 2; ++dy) {
+        for (int dx = -2; dx <= 2; ++dx) {
+            features[featureIndex++] = sampleClamped(x + dx, y + dy);
+        }
     }
-    float directionalDifference = weightedDifference / max(1.0e-8, totalWeight);
-    float robustDifference = validDifferenceCount > 0.0
-        ? simpleDifference / validDifferenceCount : directionalDifference;
-    float robustBlend = 0.18 * clamp(chromaRisk, 0.0, 1.0);
-    float difference = mix(directionalDifference, robustDifference, robustBlend);
-    return finiteLinear(centerGreen + difference);
-}
+    int sitePhase = ((y & 1) << 1) | (x & 1);
+    features[25 + sitePhase] = 1.0;
+    features[29 + int(min(pc.cfaPattern, 3u))] = 1.0;
+    features[33] = clamp(demosaicNoiseSigmaChroma(), 0.0, 0.05);
 
-vec3 rcdAt(int x, int y) {
-    uint color = cfaColorAt(pc.cfaPattern, x, y);
-    float sampled = sampleClamped(x, y);
-    float g = rcdGreenAt(x, y);
-    float r;
-    float b;
-    if (color == 0u) {
-        r = sampled;
-        b = rcdDiagonalColor(x, y, 2u, g);
-    } else if (color == 2u) {
-        b = sampled;
-        r = rcdDiagonalColor(x, y, 0u, g);
-    } else {
-        bool horizontalRed = cfaColorAt(pc.cfaPattern, x - 1, y) == 0u;
-        r = rcdAxialColor(x, y, 0u, horizontalRed, g);
-        b = rcdAxialColor(x, y, 2u, !horizontalRed, g);
+    float hidden1[12];
+    for (int i = 0; i < 12; ++i) {
+        float sum = JDD_B1[i];
+        for (int j = 0; j < 34; ++j) sum += JDD_W1[i * 34 + j] * features[j];
+        hidden1[i] = max(0.0, sum);
     }
-    return vec3(finiteLinear(r), finiteLinear(g), finiteLinear(b));
+    float hidden2[6];
+    for (int i = 0; i < 6; ++i) {
+        float sum = JDD_B2[i];
+        for (int j = 0; j < 12; ++j) sum += JDD_W2[i * 12 + j] * hidden1[j];
+        hidden2[i] = max(0.0, sum);
+    }
+    vec3 residual = vec3(JDD_B3[0], JDD_B3[1], JDD_B3[2]);
+    for (int channel = 0; channel < 3; ++channel) {
+        float sum = residual[channel];
+        for (int j = 0; j < 6; ++j) sum += JDD_W3[channel * 6 + j] * hidden2[j];
+        residual[channel] = clamp(sum, -0.25, 0.25);
+    }
+    vec3 baseline = malvarAt(x, y);
+    vec3 value = baseline + residual;
+    return vec3(finiteLinear(value.r), finiteLinear(value.g), finiteLinear(value.b));
 }
-
 
 float amazeWeight(float gradient) {
     float sigma = demosaicNoiseSigmaY();
@@ -743,7 +614,7 @@ void main() {
         int y = int(gid.y);
         vec3 rgb = pc.mode == 0u ? bilinearAt(x, y) :
                    (pc.mode == 1u ? malvarAt(x, y) :
-                   (pc.mode == 2u ? rcdAt(x, y) : amazeAt(x, y)));
+                   (pc.mode == 2u ? neuralJddAt(x, y) : amazeAt(x, y)));
         uint index = (gid.y * pc.frameWidth + gid.x) * 3u;
         outputRgb[index + 0u] = rgb.r;
         outputRgb[index + 1u] = rgb.g;

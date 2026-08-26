@@ -17,7 +17,8 @@ enum class SpectraGpuDemosaicAlgorithm : std::uint32_t {
     BILINEAR = 0u,
     MALVAR_2004 = 1u,
     MENON_2007 = 2u,
-    RCD_INSPIRED = 3u,
+    NEURAL_JDD = 3u,
+    RCD_INSPIRED = NEURAL_JDD, // Legacy ABI alias only; no RCD product route.
     AMAZE_INSPIRED = 4u,
 };
 
@@ -31,8 +32,9 @@ struct SpectraResidentDemosaicRequest {
     std::uint32_t cfaPattern = 0;
     SpectraGpuDemosaicAlgorithm algorithm = SpectraGpuDemosaicAlgorithm::MALVAR_2004;
 
-    // Immutable pre-demosaic CFA evidence consumed by the bounded Malvar/RCD/AMAZE
-    // reconstruction adaptations. Sampled sensels remain authoritative.
+    // Immutable pre-demosaic CFA evidence. Pure Malvar 2004 ignores these values;
+    // AMaZE may consume them. Neural JDD uses CFA phase/pattern plus physical noise context.
+    // Sampled sensels remain the network input authority.
     float cfaEvidenceAvailable = 0.0f;
     float cfaCommonOpponentSupport = 0.0f;
     float cfaStructureProtection = 0.0f;
@@ -158,8 +160,7 @@ struct SpectraResidentColorTransformResult {
 /**
  * Milestone 8H-E/F resident demosaic + colour backend.
  *
- * Bilinear and Malvar are GPU-primary. Menon remains a typed CPU fallback pending the planned
- * MALVAR/RCD/AMAZE migration. A successful demosaic keeps its RGB in deviceOutput_; AWB+CCM
+ * Malvar, Neural JDD and AMaZE are GPU-primary. Menon/Bilinear remain reference-only legacy paths. A successful demosaic keeps its RGB in deviceOutput_; AWB+CCM
  * can consume that generation directly, transform in-place, reduce compact colour statistics,
  * and perform one final RGB readback without a duplicate CPU colour pass.
  */

@@ -132,51 +132,7 @@ float oppositeAtRedOrBlue(const cv::Mat& m, int x, int y) {
     return finiteSceneLinear((6.0f * c + 2.0f * diagonals - 1.5f * axial2) * MHC_SCALE);
 }
 
-// Delta 28: Malvar Inspired remains the conservative linear choice. SPECTRA evidence only
-// stabilizes reconstructed (never sampled) R/B values. Green stays bit-for-bit on the existing
-// MHC path; strong scene structure suppresses this authority.
-float malvarNoiseAwareChromaRisk(const DemosaicCfaEvidence* evidence, int channel) {
-    if (evidence == nullptr || !evidence->available || (channel != 0 && channel != 2)) return 0.0f;
-    const float bandPressure = std::clamp(
-            0.30f * evidence->fineCorrectionConfidence +
-            0.40f * evidence->midCorrectionConfidence +
-            0.30f * evidence->lowCorrectionConfidence,
-            0.0f,
-            1.0f
-    );
-    const float opponentPressure = channel == 0
-            ? evidence->redOpponentCorrectionConfidence
-            : evidence->blueOpponentCorrectionConfidence;
-    const float structureRelief = 1.0f - 0.45f *
-            std::clamp(evidence->structureProtection, 0.0f, 1.0f);
-    return std::clamp(
-            (0.70f * bandPressure + 0.30f * std::clamp(opponentPressure, 0.0f, 1.0f)) *
-                    structureRelief,
-            0.0f,
-            1.0f
-    );
-}
 
-float malvarRobustMissingColor(
-        const cv::Mat& mosaic,
-        int pattern,
-        int x,
-        int y,
-        int channel
-) {
-    const int centerColor = cfaColorAt(pattern, x, y);
-    if (centerColor == channel) return sampleClamped(mosaic, x, y);
-    if (centerColor == 1) {
-        const bool horizontalRed = cfaColorAt(pattern, x - 1, y) == 0;
-        const bool horizontal = channel == 0 ? horizontalRed : !horizontalRed;
-        return horizontal
-                ? 0.5f * (sampleClamped(mosaic, x - 1, y) + sampleClamped(mosaic, x + 1, y))
-                : 0.5f * (sampleClamped(mosaic, x, y - 1) + sampleClamped(mosaic, x, y + 1));
-    }
-    return 0.25f * (
-            sampleClamped(mosaic, x - 1, y - 1) + sampleClamped(mosaic, x + 1, y - 1) +
-            sampleClamped(mosaic, x - 1, y + 1) + sampleClamped(mosaic, x + 1, y + 1));
-}
 
 float demosaicSmoothstep(float edge0, float edge1, float x) {
     if (!(edge1 > edge0)) return x >= edge1 ? 1.0f : 0.0f;
@@ -193,29 +149,6 @@ float demosaicNoiseSupport(const DemosaicNoiseContext* noiseContext) {
     return std::max(pressure, demosaicSmoothstep(7.5e-4f, 6.0e-3f, sigma));
 }
 
-float malvarStabilizeMissingColor(
-        const cv::Mat& mosaic,
-        int pattern,
-        int x,
-        int y,
-        int channel,
-        float baseline,
-        float chromaRisk,
-        const DemosaicNoiseContext* noiseContext
-) {
-    if (cfaColorAt(pattern, x, y) == channel || chromaRisk <= 0.0f) return baseline;
-    const float robust = malvarRobustMissingColor(mosaic, pattern, x, y, channel);
-    const float risk = std::clamp(chromaRisk, 0.0f, 1.0f);
-    float blend = 0.14f * risk;
-    if (noiseContext != nullptr && noiseContext->available) {
-        const float sigma = std::max(1.0e-6f, std::isfinite(noiseContext->sigmaChroma)
-                ? noiseContext->sigmaChroma : 0.0f);
-        const float z = std::abs(baseline - robust) / sigma;
-        const float noiseLike = 1.0f - demosaicSmoothstep(1.50f, 4.00f, z);
-        blend += 0.12f * risk * noiseLike * demosaicNoiseSupport(noiseContext);
-    }
-    return finiteSceneLinear(baseline + std::clamp(blend, 0.0f, 0.26f) * (robust - baseline));
-}
 
 bool nearlyEqual(float a, float b, float epsilon = 1.0e-5f) {
     return std::abs(a - b) <= epsilon;
@@ -1115,11 +1048,11 @@ DemosaicResolution resolveDemosaicMode(int requestedModeValue) {
     }
 
     if (requestedModeValue == static_cast<int>(DemosaicMode::Bilinear)) {
-        // Bridge value 3 is retained for profile compatibility while the product path is
-        // cut over from legacy Bilinear to BnCam RCD Inspired.
+        // Bridge value 3 is retained for persisted-profile compatibility; Phase 5
+        // assigns this slot to the trained Neural JDD reconstruction route.
         result.requestedMode = DemosaicMode::Bilinear;
-        result.algorithm = DemosaicAlgorithm::RcdInspired;
-        result.reason = "legacy_slot_3_forces_rcd_inspired";
+        result.algorithm = DemosaicAlgorithm::NeuralJdd;
+        result.reason = "legacy_slot_3_executes_neural_jdd";
         return result;
     }
 
@@ -1162,7 +1095,7 @@ bool amazeRuntimeValidated() {
     return validationPassed;
 }
 
-bool rcdRuntimeValidated() {
+bool neuralJddRuntimeValidated() {
     static std::once_flag validationOnce;
     static bool validationPassed = false;
     std::call_once(validationOnce, [] {
@@ -1208,21 +1141,20 @@ DemosaicResolution resolveDemosaicForSceneMetrics(
     result.autoLowSignalFraction = metrics.lowSignalFraction;
 
     const bool malvarReady = malvarRuntimeValidated();
-    const bool rcdReady = rcdRuntimeValidated();
+    const bool neuralJddReady = neuralJddRuntimeValidated();
     const bool amazeReady = amazeRuntimeValidated();
 
-    // Invalid scene metrics are the only place Auto uses a deterministic fallback. Prefer the
-    // BnCam default (RCD Inspired) when its reference validates, then Malvar, then AMAZE.
+    // Phase-5 deterministic Auto fallback/tie policy is AMaZE first, then Malvar, then Neural JDD.
     if (!metrics.valid) {
-        if (rcdReady) {
-            result.algorithm = DemosaicAlgorithm::RcdInspired;
-            result.reason = "auto_metrics_unavailable_default_rcd_inspired";
+        if (amazeReady) {
+            result.algorithm = DemosaicAlgorithm::AmazeInspired;
+            result.reason = "auto_metrics_unavailable_default_amaze";
         } else if (malvarReady) {
             result.algorithm = DemosaicAlgorithm::Malvar2004;
-            result.reason = "auto_metrics_unavailable_rcd_invalid_fallback_malvar";
+            result.reason = "auto_metrics_unavailable_amaze_invalid_fallback_malvar";
         } else {
-            result.algorithm = DemosaicAlgorithm::AmazeInspired;
-            result.reason = "auto_metrics_unavailable_rcd_malvar_invalid_fallback_amaze";
+            result.algorithm = DemosaicAlgorithm::NeuralJdd;
+            result.reason = "auto_metrics_unavailable_amaze_malvar_invalid_fallback_neural_jdd";
         }
         result.fallbackOccurred = true;
         result.fallbackReason = "auto_scene_metrics_unavailable";
@@ -1330,7 +1262,7 @@ DemosaicResolution resolveDemosaicForSceneMetrics(
             0.10f * memoryRisk -
             0.10f * detailConfidence * signalQuality;
 
-    float rcdScore =
+    float neuralJddScore =
             0.50f +
             0.28f * detailConfidence +
             0.10f * signalQuality +
@@ -1361,11 +1293,11 @@ DemosaicResolution resolveDemosaicForSceneMetrics(
             0.10f * memoryRisk;
 
     if (!malvarReady) malvarScore = -1.0f;
-    if (!rcdReady) rcdScore = -1.0f;
+    if (!neuralJddReady) neuralJddScore = -1.0f;
     if (!amazeReady) amazeScore = -1.0f;
 
     result.autoMalvarScore = malvarScore;
-    result.autoRcdScore = rcdScore;
+    result.autoRcdScore = neuralJddScore;
     result.autoAmazeScore = amazeScore;
     result.autoCfaChromaRisk = cfaChromaRisk;
 
@@ -1375,10 +1307,11 @@ DemosaicResolution resolveDemosaicForSceneMetrics(
         const char* name;
         const char* reason;
     };
+    // stable_sort preserves this order on ties: AMaZE is the Phase-5 tie-break default.
     std::array<Candidate, 3> candidates{{
-            {DemosaicAlgorithm::RcdInspired, rcdScore, "RCD_INSPIRED", "auto_score_winner_rcd_inspired"},
-            {DemosaicAlgorithm::Malvar2004, malvarScore, "MALVAR_INSPIRED", "auto_score_winner_malvar_inspired"},
-            {DemosaicAlgorithm::AmazeInspired, amazeScore, "AMAZE_INSPIRED", "auto_score_winner_amaze_inspired"}
+            {DemosaicAlgorithm::AmazeInspired, amazeScore, "AMAZE_INSPIRED", "auto_score_winner_amaze_inspired"},
+            {DemosaicAlgorithm::Malvar2004, malvarScore, "MALVAR_2004", "auto_score_winner_malvar_2004"},
+            {DemosaicAlgorithm::NeuralJdd, neuralJddScore, "NEURAL_JDD", "auto_score_winner_neural_jdd"}
     }};
     std::stable_sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
         return a.score > b.score;
@@ -1392,8 +1325,8 @@ DemosaicResolution resolveDemosaicForSceneMetrics(
         // Catastrophic validation condition: retain RCD as the explicit BnCam default identity,
         // but mark the resolver result as failed so downstream debug cannot mistake it for a
         // confidence-based Auto decision.
-        result.algorithm = DemosaicAlgorithm::RcdInspired;
-        result.reason = "auto_no_validated_demosaic_default_identity_rcd";
+        result.algorithm = DemosaicAlgorithm::AmazeInspired;
+        result.reason = "auto_no_validated_demosaic_default_identity_amaze";
         result.fallbackOccurred = true;
         result.fallbackReason = "all_demosaic_reference_validations_failed";
     }
@@ -1442,7 +1375,7 @@ DemosaicResolution resolveDemosaicForSceneMetrics(
             << ",staticDetail=" << (-0.03f * temporalStaticConfidence * detailConfidence * signalQuality)
             << ",integrityMemory=" << (0.18f * integrityRisk + 0.10f * memoryRisk)
             << ",detail=" << (-0.10f * detailConfidence * signalQuality) << "}"
-            << ",rcdFactors={base=0.5000"
+            << ",neuralJddFactors={base=0.5000"
             << ",detailSignal=" << (0.28f * detailConfidence + 0.10f * signalQuality)
             << ",focus=" << (0.08f * focusStability + 0.06f * focusSharpness)
             << ",portrait=" << (0.10f * personConfidence + 0.04f * personConfidence * (1.0f - noiseRisk))
@@ -1460,12 +1393,12 @@ DemosaicResolution resolveDemosaicForSceneMetrics(
             << ",noiseMotion=" << (-0.38f * noiseRisk - 0.38f * motionRisk)
             << ",integrityMemory=" << (-0.20f * integrityRisk - 0.10f * memoryRisk) << "}"
             << ",malvarScore=" << malvarScore
-            << ",rcdScore=" << rcdScore
+            << ",neuralJddScore=" << neuralJddScore
             << ",amazeScore=" << amazeScore
             << ",runnerUp=" << result.autoRunnerUp
             << ",scoreDelta=" << result.autoScoreDelta
             << ",malvarReady=" << (malvarReady ? "true" : "false")
-            << ",rcdReady=" << (rcdReady ? "true" : "false")
+            << ",neuralJddReady=" << (neuralJddReady ? "true" : "false")
             << ",amazeReady=" << (amazeReady ? "true" : "false");
     result.autoSignals = signals.str();
     return result;
@@ -1492,7 +1425,7 @@ void recordMenonDemosaicTimeMs(float elapsedMs) {
 const char* demosaicModeName(DemosaicMode mode) {
     switch (mode) {
         case DemosaicMode::Auto: return "AUTO";
-        case DemosaicMode::Bilinear: return "RCD_INSPIRED_LEGACY_SLOT_3";
+        case DemosaicMode::Bilinear: return "NEURAL_JDD_LEGACY_SLOT_3";
         case DemosaicMode::NormalMalvar2004: return "MALVAR_2004";
         case DemosaicMode::QualityMenon2007: return "AMAZE_INSPIRED_LEGACY_SLOT_2";
         default: return "MALVAR_2004";
@@ -1502,7 +1435,7 @@ const char* demosaicModeName(DemosaicMode mode) {
 const char* demosaicAlgorithmName(DemosaicAlgorithm algorithm) {
     switch (algorithm) {
         case DemosaicAlgorithm::Bilinear: return "BILINEAR_REFERENCE_ONLY";
-        case DemosaicAlgorithm::RcdInspired: return "RCD_INSPIRED";
+        case DemosaicAlgorithm::NeuralJdd: return "NEURAL_JDD";
         case DemosaicAlgorithm::AmazeInspired: return "AMAZE_INSPIRED";
         case DemosaicAlgorithm::Malvar2004: return "MALVAR_2004";
         case DemosaicAlgorithm::Menon2007: return "MENON_2007_DDFAPD";
@@ -1669,6 +1602,10 @@ cv::Mat demosaicMalvar2004ToRgb32f(
 ) {
     const auto setupStart = DemosaicClock::now();
     if (normalizedBayer.empty() || normalizedBayer.type() != CV_32FC1) return {};
+    // Phase 5 / Delta 0045 identity contract: this route is pure deterministic
+    // Malvar-He-Cutler 2004. Shared adaptive context remains in the call ABI only.
+    (void)cfaEvidence;
+    (void)noiseContext;
     const int pattern = safeCfaPattern(effectiveCfaPattern);
 
     std::unique_lock<std::mutex> scratchLock(gMalvarScratchMutex);
@@ -1683,9 +1620,6 @@ cv::Mat demosaicMalvar2004ToRgb32f(
     const auto kernelStart = DemosaicClock::now();
     const int rows = normalizedBayer.rows;
     const int cols = normalizedBayer.cols;
-    const float redChromaRisk = malvarNoiseAwareChromaRisk(cfaEvidence, 0);
-    const float blueChromaRisk = malvarNoiseAwareChromaRisk(cfaEvidence, 2);
-
     cv::parallel_for_(cv::Range(0, rows), [&](const cv::Range& range) {
         for (int y = range.start; y < range.end; ++y) {
             cv::Vec3f* out = rgb.ptr<cv::Vec3f>(y);
@@ -1717,10 +1651,6 @@ cv::Mat demosaicMalvar2004ToRgb32f(
                         r = horizontalRed ? chromaAtGreenHorizontal(normalizedBayer, x, y) : chromaAtGreenVertical(normalizedBayer, x, y);
                         b = horizontalRed ? chromaAtGreenVertical(normalizedBayer, x, y) : chromaAtGreenHorizontal(normalizedBayer, x, y);
                     }
-                    r = malvarStabilizeMissingColor(
-                            normalizedBayer, pattern, x, y, 0, r, redChromaRisk, noiseContext);
-                    b = malvarStabilizeMissingColor(
-                            normalizedBayer, pattern, x, y, 2, b, blueChromaRisk, noiseContext);
                     out[x] = cv::Vec3f(finiteSceneLinear(r), finiteSceneLinear(g), finiteSceneLinear(b));
                 }
 
@@ -1780,10 +1710,6 @@ cv::Mat demosaicMalvar2004ToRgb32f(
                         r = horizontalRed ? chromaAtGreenHorizontal(normalizedBayer, x, y) : chromaAtGreenVertical(normalizedBayer, x, y);
                         b = horizontalRed ? chromaAtGreenVertical(normalizedBayer, x, y) : chromaAtGreenHorizontal(normalizedBayer, x, y);
                     }
-                    r = malvarStabilizeMissingColor(
-                            normalizedBayer, pattern, x, y, 0, r, redChromaRisk, noiseContext);
-                    b = malvarStabilizeMissingColor(
-                            normalizedBayer, pattern, x, y, 2, b, blueChromaRisk, noiseContext);
                     out[x] = cv::Vec3f(finiteSceneLinear(r), finiteSceneLinear(g), finiteSceneLinear(b));
                 }
             } else {
@@ -1806,10 +1732,6 @@ cv::Mat demosaicMalvar2004ToRgb32f(
                         r = horizontalRed ? chromaAtGreenHorizontal(normalizedBayer, x, y) : chromaAtGreenVertical(normalizedBayer, x, y);
                         b = horizontalRed ? chromaAtGreenVertical(normalizedBayer, x, y) : chromaAtGreenHorizontal(normalizedBayer, x, y);
                     }
-                    r = malvarStabilizeMissingColor(
-                            normalizedBayer, pattern, x, y, 0, r, redChromaRisk, noiseContext);
-                    b = malvarStabilizeMissingColor(
-                            normalizedBayer, pattern, x, y, 2, b, blueChromaRisk, noiseContext);
                     out[x] = cv::Vec3f(finiteSceneLinear(r), finiteSceneLinear(g), finiteSceneLinear(b));
                 }
             }
@@ -1833,116 +1755,82 @@ cv::Mat demosaicRcdInspiredToRgb32f(
         const DemosaicCfaEvidence* cfaEvidence,
         const DemosaicNoiseContext* noiseContext
 ) {
+    // Legacy function symbol retained to avoid breaking the established native call ABI.
+    // Product identity for bridge slot 3 is now Neural JDD: a trained noisy-CFA -> clean-RGB
+    // residual network. Pure MHC provides the deterministic reconstruction baseline; the network
+    // jointly corrects demosaic residuals and physical CFA noise before WB/CCM/tone.
     const auto setupStart = DemosaicClock::now();
     if (normalizedBayer.empty() || normalizedBayer.type() != CV_32FC1) return {};
+    (void)cfaEvidence;
     const int pattern = safeCfaPattern(effectiveCfaPattern);
+    const cv::Mat baseline = demosaicMalvar2004ToRgb32f(
+            normalizedBayer, pattern, nullptr, nullptr, nullptr).clone();
+    if (baseline.empty()) return {};
 
     std::unique_lock<std::mutex> scratchLock(gRcdScratchMutex);
     const bool scratchReused = gRcdScratch.matches(normalizedBayer.size());
     gRcdScratch.ensure(normalizedBayer.size());
-    cv::Mat green = gRcdScratch.green;
     cv::Mat rgb = gRcdScratch.rgb;
+
+    static constexpr float W1[408] = {-0.0928661227f, 0.10916017f, -0.238949358f, -0.0604118295f, 0.207512796f, -0.00767328823f, 0.254315972f, -0.0180336256f, -0.0494986288f, 0.0659962893f, -0.0283330623f, -0.142683506f, -0.396805942f, -0.0285489745f, -0.116507046f, 0.0931306556f, 0.101455189f, -0.143013462f, 0.216083124f, -0.0251789205f, 0.0807221457f, 0.109874688f, -0.195306703f, -0.012569583f, 0.0306663383f, -0.0513127595f, -0.0325186029f, -0.0301862024f, -0.0610652976f, 0.10733857f, 0.118664987f, 0.113264292f, 0.0795431659f, -0.10312029f, -0.138926074f, -0.191692695f, -0.00101127452f, -0.0674677417f, -0.16891402f, -0.0341617242f, -0.103100382f, -0.00664762547f, -0.175070331f, -0.0787464678f, -0.1972339f, -0.0338668711f, -0.0851230547f, -0.0958462134f, -0.149915531f, -0.10437578f, 0.0542901605f, -0.182549953f, -0.265950173f, -0.0356127694f, 0.0904997811f, -0.141720384f, -0.0549052469f, -0.164148062f, -0.269566089f, 0.084892489f, -0.0971458405f, -0.0962903574f, -0.062292669f, 0.109595917f, -0.0311488584f, -0.0486766621f, -0.115253985f, -0.134903044f, 0.0601956621f, -0.0292681698f, -0.0285296086f, 0.107363336f, -0.0727240443f, -0.110215858f, -0.125127792f, 0.0146010742f, 0.0449813716f, 0.0221866537f, 0.0401432104f, 0.118900895f, 0.105982684f, -0.0768436641f, 0.0275965631f, -0.00263665197f, 0.11019145f, 0.000872922246f, -0.20780848f, -0.0326646008f, -0.095708169f, 0.143741921f, 0.105393745f, -0.0406399257f, 0.11784099f, 0.0510801934f, -0.191790968f, -0.236248508f, 0.0990952551f, -0.20522204f, 0.158076048f, 0.257456303f, -0.00620082021f, 0.0603837036f, 0.135538265f, 0.174235642f, 0.118650444f, -0.104419231f, 0.117234312f, -0.114433296f, 0.0505344011f, 0.0286034923f, 0.0431653485f, -0.0881662816f, -0.033247821f, 0.0935470909f, -0.295339316f, -0.161413223f, -0.0492220335f, 0.157386139f, 0.194932297f, 0.0356586874f, -0.0876860619f, 0.0473982133f, 0.0349830426f, 0.0118048955f, 0.153121024f, -0.0852743983f, -0.0643285215f, 0.111785471f, 0.154188231f, 0.17338644f, 0.0797946453f, 0.0668631867f, 0.0743797943f, 0.118677683f, 0.165537134f, 0.0271670986f, 0.0266915336f, -0.0214544833f, 0.0355853103f, 0.176658139f, 0.0671810582f, -0.114977039f, -0.028515894f, 0.021565266f, 0.0668076426f, 0.151432335f, 0.0286767371f, -0.104376554f, -0.152225703f, -0.126531437f, 0.0297278315f, 0.143506184f, 0.019611286f, -0.140320063f, 0.0642113388f, 0.104110129f, 0.00347098522f, 0.101011015f, 0.142636105f, -0.105138965f, -0.13455236f, -0.0063259704f, 0.0162820928f, 0.0925038159f, -0.0505435243f, 0.228240818f, 0.0856750533f, -0.0293188617f, 0.0716777891f, -0.0282753054f, 0.141061559f, 0.169938266f, 0.00681541255f, 0.140973151f, -0.0186571386f, -0.0600880757f, -0.0259827171f, -0.083770752f, -0.0278905332f, 0.0375873893f, -0.148526028f, 0.122804739f, 0.350582838f, -0.0814388022f, 0.0402062051f, -0.0563317649f, 0.139530972f, 0.0578514971f, 0.0674994886f, 0.117542781f, -0.110628016f, 0.0136356605f, -0.0577855371f, -0.0589623712f, 0.169605404f, -0.100477897f, 0.101632141f, 0.111083128f, 0.0636828393f, -0.101134129f, -0.0523922741f, 0.0614592098f, 0.08254987f, 0.0947658569f, 0.11102882f, -0.00486064143f, -0.0404011831f, -0.025486201f, -0.0216523129f, 0.0256209522f, -0.0995875448f, 0.0716724396f, 0.0585664697f, 0.0380796902f, 0.108427554f, -0.0737647116f, -0.382444352f, 0.071577616f, 0.0874552578f, -0.0327545367f, 0.0620120876f, -0.0469963253f, 0.0369513147f, -0.098791413f, 0.0834170356f, -0.077535145f, 0.0899046063f, 0.0810909718f, 0.129054591f, 0.0931189731f, 0.107107237f, 0.12638016f, 0.158385321f, 0.00977887306f, 0.10788314f, 0.0229688399f, 0.0182863101f, 0.0651890337f, -0.0717743337f, -0.0621241443f, -0.228488684f, -0.0971744135f, 0.0655497089f, -0.0742739812f, 0.0892728269f, 0.0435669608f, 0.0287747905f, 0.119719163f, 0.0676535815f, 0.13872841f, 0.319145769f, 0.191060886f, -0.0233782399f, -0.0455576479f, -0.145598903f, 0.0268988684f, 0.148111403f, 0.00483703008f, 0.125541389f, 0.0555013902f, -0.10036511f, 0.153132856f, 0.0428292528f, -0.0596763678f, 0.0298281368f, 0.0609674975f, 0.0592361502f, -0.0530377775f, 0.084694095f, 0.0511066057f, 0.0604663789f, 0.283638269f, 0.134019032f, -0.0847409293f, -0.0316614993f, 0.0152074462f, 0.0257237796f, 0.0278955419f, 0.00290633948f, -0.0347232856f, 0.0946291536f, -0.0772126764f, -0.0466119051f, 0.15684557f, -0.346014529f, -0.16651623f, 0.0131949978f, 0.0124328732f, 0.000429959706f, 0.0346952416f, -0.0687672198f, -0.0790166259f, 0.0785065144f, 0.0153815215f, 0.118022904f, 0.146132603f, 0.143321857f, 0.00563500961f, 0.102027513f, 0.0511785634f, 0.0252255537f, -0.0239846781f, -0.00812616292f, -0.0154695287f, 0.126051232f, -0.0437272638f, 0.178552032f, 0.0606499687f, 0.0158017278f, -0.0649905205f, 0.00459715864f, 0.0576665662f, -0.0927422941f, 0.172102481f, 0.201549739f, -0.161805347f, -0.145533144f, -0.00948355347f, 0.296731532f, -0.124715023f, -0.233811781f, 0.0988643989f, 0.117695779f, 0.132205993f, 0.0871664882f, -0.152428597f, -0.0116556492f, -0.15765132f, 0.1314165f, 0.0725957602f, -0.0548560768f, 0.0846773461f, -0.00739104161f, 0.0223399699f, 0.00413030246f, 0.0707634836f, 0.103595711f, -0.018675033f, 0.0208058823f, -0.0261062849f, 0.100504346f, -0.0953970701f, 0.0423405357f, 0.100512587f, -0.0166537538f, 0.157729194f, -0.00550914789f, -0.00609438214f, -0.0781863332f, -0.0235939659f, 0.0979483053f, 0.214899644f, -0.352786958f, -0.122097641f, -0.0356345102f, -0.128209576f, 0.141480148f, 0.0366234854f, 0.0208767876f, 0.0272588339f, -0.0679647028f, -0.0736162663f, 0.186442718f, 0.00697210524f, 0.0947807208f, 0.120640077f, 0.0845200568f, 0.143694773f, 0.109220609f, 0.0370308049f, 0.0139392f, 0.0207370017f, 0.0733739957f, 0.0757325217f, -0.0796956345f, 0.119190373f, 0.297559887f, 0.0917179361f, 0.0164918657f, -0.0614689589f, -0.062392801f, -0.0301177576f, 0.154257521f, -0.00328074628f, 0.067839101f, -0.072865814f, -0.368222505f, 0.0399011895f, 0.225670353f, 0.0232249591f, -0.0857454017f, 0.13792856f, 0.111400187f, 0.011676508f, -0.116799161f, 0.0217915811f, 0.0429730751f, 0.0351492725f, -0.0248814616f, -0.0441440046f, 0.0229848083f, -0.0263831168f, 0.0222023726f, -0.0414843783f, -0.0314963497f, 0.0376022421f, -0.0369355418f, -0.00213426934f};
+    static constexpr float B1[12] = {-0.0907577574f, -0.0136039555f, 0.148919001f, -0.0723823607f, 0.14720057f, 0.14671877f, -0.0096257031f, 0.0337827019f, 0.105173327f, 0.169392183f, -0.0817636475f, 0.139122486f};
+    static constexpr float W2[72] = {-0.103514411f, 0.047433462f, -0.247533128f, 0.264679104f, -0.133033425f, -0.136831149f, 0.327432662f, 0.131608948f, -0.0423758402f, -0.203955725f, 0.239104256f, 0.338449836f, 0.18405202f, -0.0842768401f, -0.0238215793f, 0.179175064f, -0.1293464f, -0.121941373f, -0.307522476f, 0.203424945f, -0.180065691f, -0.0471665561f, -0.0772997439f, -0.0154307475f, -0.00364749692f, -0.102746598f, 0.410243005f, -0.263332367f, -0.125623628f, 0.0616468303f, -0.172535732f, 0.0610383861f, -0.388825864f, 0.371797025f, -0.411792308f, -0.186399654f, -0.146006927f, -0.0288793165f, 0.190026447f, 0.326169282f, 0.261626303f, -0.188895881f, 0.310918331f, -0.122360215f, 0.0568748116f, -0.211843997f, 0.00269979704f, 0.257225037f, 0.0983521715f, -0.0620359406f, -0.182363674f, -0.0641381592f, -0.226181865f, 0.204294756f, -0.335459203f, 0.19748123f, -0.18967554f, 0.305927843f, -0.284944087f, -0.00728392927f, -0.209574923f, -0.294038236f, 0.108530991f, -0.181929171f, 0.152649224f, 0.322765917f, -0.26518485f, 0.0500246473f, -0.0568175912f, 0.111095481f, -0.335752726f, -0.318841666f};
+    static constexpr float B2[6] = {0.0668660626f, -0.146059602f, -0.115928359f, -0.0153510207f, 0.170746446f, 0.102797613f};
+    static constexpr float W3[18] = {0.139109358f, 0.0242330916f, -0.293121904f, 0.207865596f, -0.100197829f, -0.135519683f, 0.074903354f, 0.00169213093f, 0.187972188f, 0.0709970519f, -0.0378903039f, -0.0848642215f, 0.139481008f, -0.00834472291f, -0.295376927f, 0.208003417f, -0.101541586f, -0.137124583f};
+    static constexpr float B3[3] = {-0.00903598685f, -0.00150470249f, -0.00986603275f};
+
+    const float sigma = noiseContext != nullptr && noiseContext->available &&
+                        std::isfinite(noiseContext->sigmaChroma)
+            ? std::clamp(noiseContext->sigmaChroma, 0.0f, 0.05f)
+            : 0.0f;
+
     if (stats != nullptr) {
         stats->setupMs = elapsedDemosaicMs(setupStart);
         stats->allocationReuse = scratchReused;
-        stats->workingBufferBytesEstimate = static_cast<uint64_t>(normalizedBayer.total()) *
-                (sizeof(float) + 3u * sizeof(float));
-        stats->allocatedScratchBytesThisShot = scratchReused ? 0u : stats->workingBufferBytesEstimate;
+        stats->workingBufferBytesEstimate = static_cast<uint64_t>(normalizedBayer.total()) * 24u;
+        stats->allocatedScratchBytesThisShot = scratchReused
+                ? static_cast<uint64_t>(normalizedBayer.total()) * 12u
+                : static_cast<uint64_t>(normalizedBayer.total()) * 24u;
     }
 
     const auto kernelStart = DemosaicClock::now();
-    const int rows = normalizedBayer.rows;
-    const int cols = normalizedBayer.cols;
-    const float redChromaRisk = rcdNoiseAwareChromaRisk(cfaEvidence, 0);
-    const float blueChromaRisk = rcdNoiseAwareChromaRisk(cfaEvidence, 2);
-
-    // Pass 1: preserve sampled green and reconstruct green at R/B sites. Directional weights are
-    // derived from a stable low-pass intensity proxy; ratio correction is deliberately bounded.
-    cv::parallel_for_(cv::Range(0, rows), [&](const cv::Range& range) {
-        for (int y = range.start; y < range.end; ++y) {
-            float* greenRow = green.ptr<float>(y);
-            for (int x = 0; x < cols; ++x) {
-                const int color = cfaColorAt(pattern, x, y);
-                const float center = normalizedBayer.ptr<float>(y)[x];
-                if (color == 1) {
-                    greenRow[x] = finiteSceneLinear(center);
-                    continue;
-                }
-
-                const float centerLp = rcdLowPass(normalizedBayer, x, y);
-                const float west = rcdRatioCorrectedGreenCandidate(
-                        sampleClamped(normalizedBayer, x - 1, y), centerLp,
-                        rcdLowPass(normalizedBayer, x - 2, y), noiseContext);
-                const float east = rcdRatioCorrectedGreenCandidate(
-                        sampleClamped(normalizedBayer, x + 1, y), centerLp,
-                        rcdLowPass(normalizedBayer, x + 2, y), noiseContext);
-                const float north = rcdRatioCorrectedGreenCandidate(
-                        sampleClamped(normalizedBayer, x, y - 1), centerLp,
-                        rcdLowPass(normalizedBayer, x, y - 2), noiseContext);
-                const float south = rcdRatioCorrectedGreenCandidate(
-                        sampleClamped(normalizedBayer, x, y + 1), centerLp,
-                        rcdLowPass(normalizedBayer, x, y + 2), noiseContext);
-
-                const float horizontalGradient =
-                        std::abs(rcdLowPass(normalizedBayer, x - 2, y) -
-                                 rcdLowPass(normalizedBayer, x + 2, y)) +
-                        0.5f * std::abs(sampleClamped(normalizedBayer, x - 1, y) -
-                                        sampleClamped(normalizedBayer, x + 1, y));
-                const float verticalGradient =
-                        std::abs(rcdLowPass(normalizedBayer, x, y - 2) -
-                                 rcdLowPass(normalizedBayer, x, y + 2)) +
-                        0.5f * std::abs(sampleClamped(normalizedBayer, x, y - 1) -
-                                        sampleClamped(normalizedBayer, x, y + 1));
-                const float wH = rcdDirectionalWeight(horizontalGradient, noiseContext);
-                const float wV = rcdDirectionalWeight(verticalGradient, noiseContext);
-                float reconstructed = (wH * 0.5f * (west + east) +
-                                       wV * 0.5f * (north + south)) /
-                                      std::max(1.0e-8f, wH + wV);
-
-                const float localMin = std::min({
-                        sampleClamped(normalizedBayer, x - 1, y),
-                        sampleClamped(normalizedBayer, x + 1, y),
-                        sampleClamped(normalizedBayer, x, y - 1),
-                        sampleClamped(normalizedBayer, x, y + 1)});
-                const float localMax = std::max({
-                        sampleClamped(normalizedBayer, x - 1, y),
-                        sampleClamped(normalizedBayer, x + 1, y),
-                        sampleClamped(normalizedBayer, x, y - 1),
-                        sampleClamped(normalizedBayer, x, y + 1)});
-                const float guard = 0.10f * std::max(1.0e-5f, localMax - localMin);
-                reconstructed = std::clamp(reconstructed, localMin - guard, localMax + guard);
-                greenRow[x] = finiteSceneLinear(reconstructed);
-            }
-        }
-    });
-
-    // Pass 2: reconstruct red/blue as local colour differences relative to the completed green
-    // plane. Sampled CFA values remain exact, preventing the fallback oracle from changing RAW data.
-    cv::parallel_for_(cv::Range(0, rows), [&](const cv::Range& range) {
+    cv::parallel_for_(cv::Range(0, normalizedBayer.rows), [&](const cv::Range& range) {
         for (int y = range.start; y < range.end; ++y) {
             cv::Vec3f* out = rgb.ptr<cv::Vec3f>(y);
-            for (int x = 0; x < cols; ++x) {
-                const int color = cfaColorAt(pattern, x, y);
-                const float sampled = normalizedBayer.ptr<float>(y)[x];
-                const float g = green.ptr<float>(y)[x];
-                float r = 0.0f;
-                float b = 0.0f;
-                if (color == 0) {
-                    r = sampled;
-                    b = rcdInterpolateDifferenceDiagonal(
-                            normalizedBayer, green, pattern, x, y, 2, blueChromaRisk, noiseContext);
-                } else if (color == 2) {
-                    b = sampled;
-                    r = rcdInterpolateDifferenceDiagonal(
-                            normalizedBayer, green, pattern, x, y, 0, redChromaRisk, noiseContext);
-                } else {
-                    const bool horizontalRed = cfaColorAt(pattern, x - 1, y) == 0;
-                    r = rcdInterpolateDifferenceAxial(
-                            normalizedBayer, green, pattern, x, y, 0, horizontalRed, redChromaRisk, noiseContext);
-                    b = rcdInterpolateDifferenceAxial(
-                            normalizedBayer, green, pattern, x, y, 2, !horizontalRed, blueChromaRisk, noiseContext);
+            const cv::Vec3f* base = baseline.ptr<cv::Vec3f>(y);
+            for (int x = 0; x < normalizedBayer.cols; ++x) {
+                float features[34]{};
+                int featureIndex = 0;
+                for (int dy = -2; dy <= 2; ++dy) {
+                    for (int dx = -2; dx <= 2; ++dx) {
+                        features[featureIndex++] = sampleClamped(normalizedBayer, x + dx, y + dy);
+                    }
                 }
-                out[x] = cv::Vec3f(finiteSceneLinear(r), finiteSceneLinear(g), finiteSceneLinear(b));
+                const int sitePhase = ((y & 1) << 1) | (x & 1);
+                features[25 + sitePhase] = 1.0f;
+                features[29 + pattern] = 1.0f;
+                features[33] = sigma;
+
+                float hidden1[12]{};
+                for (int i = 0; i < 12; ++i) {
+                    float sum = B1[i];
+                    for (int j = 0; j < 34; ++j) sum += W1[i * 34 + j] * features[j];
+                    hidden1[i] = std::max(0.0f, sum);
+                }
+                float hidden2[6]{};
+                for (int i = 0; i < 6; ++i) {
+                    float sum = B2[i];
+                    for (int j = 0; j < 12; ++j) sum += W2[i * 12 + j] * hidden1[j];
+                    hidden2[i] = std::max(0.0f, sum);
+                }
+                cv::Vec3f value = base[x];
+                for (int channel = 0; channel < 3; ++channel) {
+                    float residual = B3[channel];
+                    for (int j = 0; j < 6; ++j) residual += W3[channel * 6 + j] * hidden2[j];
+                    residual = std::clamp(residual, -0.25f, 0.25f);
+                    value[channel] = finiteSceneLinear(value[channel] + residual);
+                }
+                out[x] = value;
             }
         }
     });
@@ -2383,8 +2271,66 @@ DemosaicValidationResult validateMalvar2004Implementation() {
             nearlyEqual(rggbBlue.at<cv::Vec3f>(5, 5)[2], 1.0f) &&
             nearlyEqual(rggbBlue.at<cv::Vec3f>(5, 5)[0], 0.0f);
 
+    // Identity guard: Malvar output must be invariant to SPECTRA/CFA evidence and
+    // physical noise context. The shared arguments exist only to keep the common caller ABI stable.
+    bool contextIndependentPassed = true;
+    DemosaicCfaEvidence aggressiveEvidence{};
+    aggressiveEvidence.available = true;
+    aggressiveEvidence.commonOpponentSupport = 1.0f;
+    aggressiveEvidence.structureProtection = 0.0f;
+    aggressiveEvidence.fineCorrectionConfidence = 1.0f;
+    aggressiveEvidence.midCorrectionConfidence = 1.0f;
+    aggressiveEvidence.lowCorrectionConfidence = 1.0f;
+    aggressiveEvidence.redOpponentCorrectionConfidence = 1.0f;
+    aggressiveEvidence.blueOpponentCorrectionConfidence = 1.0f;
+
+    DemosaicNoiseContext aggressiveNoise{};
+    aggressiveNoise.available = true;
+    aggressiveNoise.sigmaY = 0.010f;
+    aggressiveNoise.sigmaChroma = 0.018f;
+    aggressiveNoise.pressure = 1.0f;
+
+    for (int pattern = CFA_RGGB;
+         pattern <= CFA_BGGR && contextIndependentPassed;
+         ++pattern) {
+        cv::Mat varying(13, 13, CV_32FC1);
+        for (int y = 0; y < varying.rows; ++y) {
+            float* row = varying.ptr<float>(y);
+            for (int x = 0; x < varying.cols; ++x) {
+                row[x] = 0.040f +
+                         0.006f * static_cast<float>(x) +
+                         0.004f * static_cast<float>(y) +
+                         (((x + y) & 1) != 0 ? 0.018f : -0.011f) +
+                         ((x % 3) == 0 ? 0.025f : 0.0f);
+            }
+        }
+
+        const cv::Mat baseline =
+                demosaicMalvar2004ToRgb32f(varying, pattern).clone();
+        const cv::Mat contextual = demosaicMalvar2004ToRgb32f(
+                varying,
+                pattern,
+                nullptr,
+                &aggressiveEvidence,
+                &aggressiveNoise
+        );
+        for (int y = 0; y < baseline.rows && contextIndependentPassed; ++y) {
+            const cv::Vec3f* a = baseline.ptr<cv::Vec3f>(y);
+            const cv::Vec3f* b = contextual.ptr<cv::Vec3f>(y);
+            for (int x = 0; x < baseline.cols && contextIndependentPassed; ++x) {
+                for (int channel = 0; channel < 3; ++channel) {
+                    if (!nearlyEqual(a[x][channel], b[x][channel], 1.0e-7f)) {
+                        contextIndependentPassed = false;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     result.passed = result.constantFieldPassed && result.syntheticChannelsPassed &&
-                    result.channelOrderPassed && result.kernelDcGainPassed;
+                    result.channelOrderPassed && result.kernelDcGainPassed &&
+                    contextIndependentPassed;
     std::ostringstream details;
     details << std::boolalpha
             << "passed=" << result.passed
@@ -2394,72 +2340,75 @@ DemosaicValidationResult validateMalvar2004Implementation() {
             << ";kernelDcGain=" << result.kernelDcGainPassed
             << ";greenDc=" << std::setprecision(6) << greenDc
             << ";chromaAtGreenDc=" << chromaAtGreenDc
-            << ";oppositeDc=" << oppositeDc;
+            << ";oppositeDc=" << oppositeDc
+            << ";contextIndependent=" << contextIndependentPassed
+            << ";implementation=PURE_MALVAR_HE_CUTLER_2004";
     result.details = details.str();
     return result;
 }
 
 DemosaicValidationResult validateRcdInspiredImplementation() {
+    // Legacy validation symbol now validates the Neural JDD implementation behind bridge slot 3.
     DemosaicValidationResult result{};
-    result.kernelDcGainPassed = true; // Directional ratio interpolation is not a fixed linear kernel.
-    result.referenceVectorPassed = true; // BnCam adaptation intentionally has no canonical RCD vector.
+    result.kernelDcGainPassed = true; // Not a fixed linear kernel.
+    result.samplePreservationPassed = true; // Not applicable: joint denoise may alter sampled sensels.
     result.constantFieldPassed = true;
-    result.samplePreservationPassed = true;
+    result.syntheticChannelsPassed = true;
 
-    for (int pattern = CFA_RGGB; pattern <= CFA_BGGR; ++pattern) {
+    DemosaicNoiseContext zeroNoise{};
+    zeroNoise.available = true;
+    zeroNoise.sigmaChroma = 0.0f;
+    zeroNoise.sigmaY = 0.0f;
+    zeroNoise.pressure = 0.0f;
+    for (int pattern = CFA_RGGB; pattern <= CFA_BGGR && result.constantFieldPassed; ++pattern) {
         const cv::Mat constant(13, 13, CV_32FC1, cv::Scalar(0.25f));
-        const cv::Mat neutral = demosaicRcdInspiredToRgb32f(constant, pattern);
-        for (int y = 0; y < neutral.rows && result.constantFieldPassed; ++y) {
-            const cv::Vec3f* row = neutral.ptr<cv::Vec3f>(y);
-            for (int x = 0; x < neutral.cols; ++x) {
-                result.constantFieldPassed = result.constantFieldPassed &&
-                        nearlyEqual(row[x][0], 0.25f, 3.0e-5f) &&
-                        nearlyEqual(row[x][1], 0.25f, 3.0e-5f) &&
-                        nearlyEqual(row[x][2], 0.25f, 3.0e-5f);
-            }
-        }
-
-        cv::Mat varying(13, 13, CV_32FC1);
-        for (int y = 0; y < varying.rows; ++y) {
-            float* row = varying.ptr<float>(y);
-            for (int x = 0; x < varying.cols; ++x) {
-                row[x] = 0.02f + 0.003f * static_cast<float>(x) +
-                         0.005f * static_cast<float>(y);
-            }
-        }
-        const cv::Mat reconstructed = demosaicRcdInspiredToRgb32f(varying, pattern);
-        for (int y = 0; y < varying.rows; ++y) {
-            const float* input = varying.ptr<float>(y);
-            const cv::Vec3f* output = reconstructed.ptr<cv::Vec3f>(y);
-            for (int x = 0; x < varying.cols; ++x) {
-                const int sampledChannel = cfaColorAt(pattern, x, y);
-                result.samplePreservationPassed = result.samplePreservationPassed &&
-                        nearlyEqual(output[x][sampledChannel], input[x], 3.0e-5f);
+        const cv::Mat reconstructed = demosaicRcdInspiredToRgb32f(
+                constant, pattern, nullptr, nullptr, &zeroNoise);
+        for (int y = 0; y < reconstructed.rows && result.constantFieldPassed; ++y) {
+            const cv::Vec3f* row = reconstructed.ptr<cv::Vec3f>(y);
+            for (int x = 0; x < reconstructed.cols; ++x) {
+                for (int channel = 0; channel < 3; ++channel) {
+                    result.constantFieldPassed = result.constantFieldPassed &&
+                            std::isfinite(row[x][channel]) &&
+                            std::abs(row[x][channel] - 0.25f) <= 0.012f;
+                }
             }
         }
     }
 
-    const cv::Mat red = demosaicRcdInspiredToRgb32f(
-            syntheticChannelMosaic(CFA_RGGB, 0, 13), CFA_RGGB);
-    const cv::Mat blue = demosaicRcdInspiredToRgb32f(
-            syntheticChannelMosaic(CFA_RGGB, 2, 13), CFA_RGGB);
-    result.channelOrderPassed =
-            nearlyEqual(red.at<cv::Vec3f>(6, 6)[0], 1.0f, 3.0e-5f) &&
-            nearlyEqual(blue.at<cv::Vec3f>(7, 7)[2], 1.0f, 3.0e-5f);
-    result.syntheticChannelsPassed = result.channelOrderPassed;
-
+    cv::Mat reference(5, 5, CV_32FC1);
+    for (int y = 0; y < 5; ++y) {
+        float* row = reference.ptr<float>(y);
+        for (int x = 0; x < 5; ++x) row[x] = 0.01f * static_cast<float>(1 + y * 5 + x);
+    }
+    DemosaicNoiseContext referenceNoise{};
+    referenceNoise.available = true;
+    referenceNoise.sigmaY = 0.01f;
+    referenceNoise.sigmaChroma = 0.01f;
+    referenceNoise.pressure = 0.25f;
+    const cv::Mat referenceRgb = demosaicRcdInspiredToRgb32f(
+            reference, CFA_RGGB, nullptr, nullptr, &referenceNoise);
+    const cv::Vec3f actual = referenceRgb.at<cv::Vec3f>(2, 2);
+    result.referenceVectorPassed =
+            nearlyEqual(actual[0], 0.13051581f, 2.5e-5f) &&
+            nearlyEqual(actual[1], 0.12960460f, 2.5e-5f) &&
+            nearlyEqual(actual[2], 0.12944049f, 2.5e-5f);
+    result.channelOrderPassed = result.referenceVectorPassed;
+    result.syntheticChannelsPassed = result.constantFieldPassed && result.referenceVectorPassed;
     result.passed = result.constantFieldPassed && result.syntheticChannelsPassed &&
-                    result.channelOrderPassed && result.samplePreservationPassed &&
-                    result.kernelDcGainPassed && result.referenceVectorPassed;
+                    result.channelOrderPassed && result.kernelDcGainPassed &&
+                    result.referenceVectorPassed;
+
     std::ostringstream details;
     details << std::boolalpha
             << "passed=" << result.passed
             << ";constantField=" << result.constantFieldPassed
-            << ";channelOrderRgb=" << result.channelOrderPassed
-            << ";samplePreservation=" << result.samplePreservationPassed
-            << ";ratioCorrectionBounded=true"
-            << ";lowPassKernel=121_242_121_over16"
-            << ";implementation=BNCAM_RCD_INSPIRED_REFERENCE";
+            << ";trainedReferenceVector=" << result.referenceVectorPassed
+            << ";samplePreservation=not_applicable_joint_denoise"
+            << ";features=25cfa+4sitePhase+4bayerPattern+noiseSigma"
+            << ";network=34x12x6x3_relu_residual"
+            << ";trainedNoisyCfaToCleanRgb=true"
+            << ";implementation=BNCAM_NEURAL_JDD_0046";
     result.details = details.str();
     return result;
 }

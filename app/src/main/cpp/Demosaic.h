@@ -15,7 +15,8 @@ enum class DemosaicAlgorithm : int {
     Malvar2004 = 0,
     Menon2007 = 1,
     Bilinear = 2, // Legacy/reference-only; no longer used by product bridge slot 3.
-    RcdInspired = 3,
+    NeuralJdd = 3,
+    RcdInspired = NeuralJdd, // Legacy ABI alias; product identity is Neural JDD.
     AmazeInspired = 4
 };
 
@@ -34,7 +35,7 @@ struct DemosaicResolution {
     float autoCoherentEdgeFraction = 0.0f;
     float autoLowSignalFraction = 0.0f;
     float autoMalvarScore = 0.0f;
-    float autoRcdScore = 0.0f;
+    float autoRcdScore = 0.0f; // Legacy storage field; Phase 5 stores Neural-JDD score here.
     float autoAmazeScore = 0.0f;
     float autoCfaChromaRisk = 0.0f;
     float autoScoreDelta = 0.0f;
@@ -93,9 +94,9 @@ struct AutoDemosaicContext {
 };
 
 /**
- * Compact immutable SPECTRA CFA evidence handed to the active BnCam demosaics.
- * Introduced as wiring in Delta 25; Malvar/RCD/AMAZE Inspired now consume this contract only
- * through their bounded algorithm-specific chroma adaptations.
+ * Compact immutable SPECTRA CFA evidence handed to reconstruction routes that opt into it.
+ * Pure Malvar-He-Cutler 2004 intentionally ignores this contract; adaptive routes may consume
+ * it through their bounded algorithm-specific chroma adaptations.
  */
 struct DemosaicCfaEvidence {
     bool available = false;
@@ -162,6 +163,8 @@ cv::Mat demosaicBilinearToRgb32f(
         int effectiveCfaPattern,
         DemosaicRunStats* stats = nullptr
 );
+// Pure Malvar-He-Cutler 2004. Adaptive evidence/noise arguments are retained only for
+// common call-site compatibility and must not influence this route's output.
 cv::Mat demosaicMalvar2004ToRgb32f(
         const cv::Mat& normalizedBayer,
         int effectiveCfaPattern,
@@ -169,8 +172,8 @@ cv::Mat demosaicMalvar2004ToRgb32f(
         const DemosaicCfaEvidence* cfaEvidence = nullptr,
         const DemosaicNoiseContext* noiseContext = nullptr
 );
-// BnCam RCD-inspired reference/fallback implementation. The production path is intended
-// to execute on Vulkan; this CPU implementation provides deterministic fallback and validation.
+// Neural JDD CPU fallback/validation behind the legacy RCD symbol. Production execution is
+// Vulkan-primary; the old symbol remains only to preserve existing native call-site ABI.
 cv::Mat demosaicRcdInspiredToRgb32f(
         const cv::Mat& normalizedBayer,
         int effectiveCfaPattern,
