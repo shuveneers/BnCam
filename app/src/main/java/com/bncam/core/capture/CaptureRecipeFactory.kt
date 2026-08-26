@@ -146,7 +146,7 @@ object CaptureRecipeFactory {
             requestedId = demosaicSelection.requestedMode.displayName,
             requestedAvailability = MethodAvailability.IMPLEMENTED,
             supported = true,
-            resolvedId = demosaicSelection.resolvedAlgorithm.name,
+            resolvedId = demosaicSelection.resolvedDebugName,
             fallback = demosaicSelection.fallbackOccurred,
             reason = if (demosaicSelection.fallbackOccurred) {
                 demosaicSelection.fallbackReason

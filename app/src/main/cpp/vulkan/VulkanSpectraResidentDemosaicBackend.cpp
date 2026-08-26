@@ -300,8 +300,9 @@ bool VulkanSpectraResidentDemosaicBackend::initializeLocked(
     VkQueryPoolCreateInfo queryInfo{};
     queryInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
     queryInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
-    // Two timestamp pairs: primary image kernel and compact residual extraction kernel.
-    queryInfo.queryCount = 4u;
+    // AMaZE uses two primary image passes plus compact residual extraction.
+    // Six slots leave one spare while retaining the existing color-transform timestamp layout.
+    queryInfo.queryCount = 6u;
     // Timestamp queries are optional observability. Failure must not disable the kernel.
     if (vkCreateQueryPool(device, &queryInfo, nullptr, &queryPool_) != VK_SUCCESS) queryPool_ = VK_NULL_HANDLE;
     initialized_ = true;
@@ -312,13 +313,13 @@ bool VulkanSpectraResidentDemosaicBackend::initializeLocked(
 #endif
 }
 
-void VulkanSpectraResidentDemosaicBackend::updateDescriptorSetLocked(VkDevice device, VkBuffer inputOverride) noexcept {
+void VulkanSpectraResidentDemosaicBackend::updateDescriptorSetLocked(VkDevice device, VkBuffer inputOverride, VkBuffer scratchOverride) noexcept {
     VkDescriptorBufferInfo infos[6]{};
     infos[0].buffer = inputOverride != VK_NULL_HANDLE ? inputOverride : deviceInput_.buffer;
     infos[1].buffer = deviceOutput_.buffer;
-    // AWB/CCM is pointwise, therefore binding 2 may safely alias binding 1 and transform
-    // the resident demosaic RGB in-place before the final readback.
-    infos[2].buffer = deviceOutput_.buffer;
+    // Binding 2 normally aliases the resident output for pointwise AWB+CCM. During AMaZE
+    // demosaic it is rebound to rgbUpload_ and becomes the persistent green/Nyquist guide.
+    infos[2].buffer = scratchOverride != VK_NULL_HANDLE ? scratchOverride : deviceOutput_.buffer;
     infos[3].buffer = colorStatistics_.buffer;
     infos[4].buffer = residualCandidates_.buffer;
     infos[5].buffer = cloudCorrectionMap_.buffer;
@@ -448,6 +449,8 @@ SpectraResidentDemosaicResult VulkanSpectraResidentDemosaicBackend::executeInter
         !ensureBufferLocked(allocator, outputBytes, readAccess, outputReadback_, reallocated, failure) ||
         !ensureBufferLocked(allocator, inputBytes, 0u, deviceInput_, reallocated, failure) ||
         !ensureBufferLocked(allocator, outputBytes, 0u, deviceOutput_, reallocated, failure) ||
+        (request.algorithm == SpectraGpuDemosaicAlgorithm::AMAZE &&
+         !ensureBufferLocked(allocator, outputBytes, 0u, rgbUpload_, reallocated, failure)) ||
         !ensureBufferLocked(allocator, statisticsBytes, readAccess, colorStatistics_, reallocated, failure) ||
         !ensureBufferLocked(allocator, 16u, writeAccess, cloudCorrectionMap_, reallocated, failure) ||
         !ensureBufferLocked(allocator, std::max<std::uint64_t>(24u, residualSampling.bytes),
@@ -462,11 +465,15 @@ SpectraResidentDemosaicResult VulkanSpectraResidentDemosaicBackend::executeInter
     result.persistentBufferReuseHit = !reallocated;
     result.persistentAllocationGeneration = allocationGeneration_;
     result.persistentResidentBytes = inputStaging_.capacityBytes + outputReadback_.capacityBytes +
-            deviceInput_.capacityBytes + deviceOutput_.capacityBytes + colorStatistics_.capacityBytes +
-            cloudCorrectionMap_.capacityBytes + residualCandidates_.capacityBytes;
-    // Rebind every demosaic submission because binding 0 may alternate between
-    // an internal upload buffer and an opaque resident Pass-3 buffer.
-    updateDescriptorSetLocked(device, residentInput ? residentInputBuffer : VK_NULL_HANDLE);
+            deviceInput_.capacityBytes + deviceOutput_.capacityBytes + rgbUpload_.capacityBytes +
+            colorStatistics_.capacityBytes + cloudCorrectionMap_.capacityBytes + residualCandidates_.capacityBytes;
+    // Rebind every demosaic submission because binding 0 may alternate between an internal
+    // upload buffer and an opaque resident Pass-3 buffer. AMaZE additionally binds a dedicated
+    // resident guide scratch at binding 2; other algorithms retain the in-place color alias.
+    updateDescriptorSetLocked(
+            device,
+            residentInput ? residentInputBuffer : VK_NULL_HANDLE,
+            request.algorithm == SpectraGpuDemosaicAlgorithm::AMAZE ? rgbUpload_.buffer : VK_NULL_HANDLE);
 
     const auto packStart = Clock::now();
     if (!residentInput) {
@@ -520,7 +527,7 @@ SpectraResidentDemosaicResult VulkanSpectraResidentDemosaicBackend::executeInter
     }
 
     if (queryPool_ != VK_NULL_HANDLE) {
-        vkCmdResetQueryPool(commandBuffer_, queryPool_, 0u, 4u);
+        vkCmdResetQueryPool(commandBuffer_, queryPool_, 0u, 6u);
         vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 0u);
         result.timestampQueryUsed = true;
     }
@@ -552,7 +559,7 @@ SpectraResidentDemosaicResult VulkanSpectraResidentDemosaicBackend::executeInter
         case SpectraGpuDemosaicAlgorithm::NEURAL_JDD:
             push.mode = 2u;
             break;
-        case SpectraGpuDemosaicAlgorithm::AMAZE_INSPIRED:
+        case SpectraGpuDemosaicAlgorithm::AMAZE:
             push.mode = 5u;
             break;
         case SpectraGpuDemosaicAlgorithm::MALVAR_2004:
@@ -563,7 +570,31 @@ SpectraResidentDemosaicResult VulkanSpectraResidentDemosaicBackend::executeInter
     vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0u, sizeof(push), &push);
     vkCmdDispatch(commandBuffer_, (request.frameWidth + 15u) / 16u, (request.frameHeight + 15u) / 16u, 1u);
     if (queryPool_ != VK_NULL_HANDLE) {
+        // Slot 1 always marks the end of the first primary pass. For Malvar/Neural JDD this is
+        // the complete reconstruction; for AMaZE it is the end of the green/Nyquist guide pass.
         vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 1u);
+    }
+    if (request.algorithm == SpectraGpuDemosaicAlgorithm::AMAZE) {
+        VkBufferMemoryBarrier guideBarrier{};
+        guideBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        guideBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        guideBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        guideBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        guideBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        guideBarrier.buffer = rgbUpload_.buffer;
+        guideBarrier.size = VK_WHOLE_SIZE;
+        vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr,
+                             1u, &guideBarrier, 0u, nullptr);
+        push.mode = 6u;
+        vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0u, sizeof(push), &push);
+        vkCmdDispatch(commandBuffer_, (request.frameWidth + 15u) / 16u,
+                      (request.frameHeight + 15u) / 16u, 1u);
+        if (queryPool_ != VK_NULL_HANDLE) {
+            vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 2u);
+        }
+    } else if (queryPool_ != VK_NULL_HANDLE) {
+        vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 2u);
     }
     // Keep the full RGB device-resident. Only the compact residual candidate field is
     // generated/read back here, so AWB+CCM can consume deviceOutput_ without a ~150 MB roundtrip.
@@ -583,12 +614,12 @@ SpectraResidentDemosaicResult VulkanSpectraResidentDemosaicBackend::executeInter
     push.residualRows = residualSampling.rows;
     vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0u, sizeof(push), &push);
     if (queryPool_ != VK_NULL_HANDLE) {
-        vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 2u);
+        vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 3u);
     }
     vkCmdDispatch(commandBuffer_, (residualSampling.columns + 15u) / 16u,
                   (residualSampling.rows + 15u) / 16u, 1u);
     if (queryPool_ != VK_NULL_HANDLE) {
-        vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 3u);
+        vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 4u);
     }
     VkBufferMemoryBarrier residualBarrier{};
     residualBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
@@ -627,18 +658,26 @@ SpectraResidentDemosaicResult VulkanSpectraResidentDemosaicBackend::executeInter
         result.totalMs = elapsedMs(totalStart); return result;
     }
     if (queryPool_ != VK_NULL_HANDLE) {
-        std::uint64_t timestamps[4]{0u, 0u, 0u, 0u};
-        if (vkGetQueryPoolResults(device, queryPool_, 0u, 4u, sizeof(timestamps), timestamps,
-                                  sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS &&
-            timestamps[1] >= timestamps[0]) {
+        std::uint64_t timestamps[5]{0u, 0u, 0u, 0u, 0u};
+        if (vkGetQueryPoolResults(device, queryPool_, 0u, 5u, sizeof(timestamps), timestamps,
+                                  sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
             VkPhysicalDeviceProperties properties{};
             vkGetPhysicalDeviceProperties(physicalDevice, &properties);
             const double timestampMs = static_cast<double>(properties.limits.timestampPeriod) / 1.0e6;
-            result.kernelMs = static_cast<float>(
-                    static_cast<double>(timestamps[1] - timestamps[0]) * timestampMs);
-            if (timestamps[3] >= timestamps[2]) {
+            if (request.algorithm == SpectraGpuDemosaicAlgorithm::AMAZE &&
+                timestamps[1] >= timestamps[0] && timestamps[2] >= timestamps[1]) {
+                result.amazeGreenPassMs = static_cast<float>(
+                        static_cast<double>(timestamps[1] - timestamps[0]) * timestampMs);
+                result.amazeReconstructPassMs = static_cast<float>(
+                        static_cast<double>(timestamps[2] - timestamps[1]) * timestampMs);
+                result.kernelMs = result.amazeGreenPassMs + result.amazeReconstructPassMs;
+            } else if (timestamps[1] >= timestamps[0]) {
+                result.kernelMs = static_cast<float>(
+                        static_cast<double>(timestamps[1] - timestamps[0]) * timestampMs);
+            }
+            if (timestamps[4] >= timestamps[3]) {
                 result.residualKernelMs = static_cast<float>(
-                        static_cast<double>(timestamps[3] - timestamps[2]) * timestampMs);
+                        static_cast<double>(timestamps[4] - timestamps[3]) * timestampMs);
             }
         }
     }
@@ -667,8 +706,8 @@ SpectraResidentDemosaicResult VulkanSpectraResidentDemosaicBackend::executeInter
             ? "BILINEAR"
             : (request.algorithm == SpectraGpuDemosaicAlgorithm::NEURAL_JDD
                     ? "NEURAL_JDD"
-                    : (request.algorithm == SpectraGpuDemosaicAlgorithm::AMAZE_INSPIRED
-                            ? "AMAZE_INSPIRED"
+                    : (request.algorithm == SpectraGpuDemosaicAlgorithm::AMAZE
+                            ? "AMAZE"
                             : "MALVAR_2004"));
     result.status = std::string(residentInput ? "GPU_RESIDENT_INPUT_PRIMARY_" : "GPU_PRIMARY_") +
             algorithmStatus;
@@ -786,7 +825,7 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
         result.cloudCorrectionMapBytes = cloudMapBytes;
     }
     vmaFlushAllocation(allocator, cloudCorrectionMap_.allocation, 0u, static_cast<VkDeviceSize>(cloudMapBytes));
-    if (reallocated || !descriptorBindingsInitialized_) updateDescriptorSetLocked(device);
+    updateDescriptorSetLocked(device);
 
     bool useResident = residentInputUsable;
     if (!useResident) {

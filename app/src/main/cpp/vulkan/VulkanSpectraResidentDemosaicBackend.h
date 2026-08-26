@@ -19,7 +19,8 @@ enum class SpectraGpuDemosaicAlgorithm : std::uint32_t {
     MENON_2007 = 2u,
     NEURAL_JDD = 3u,
     RCD_INSPIRED = NEURAL_JDD, // Legacy ABI alias only; no RCD product route.
-    AMAZE_INSPIRED = 4u,
+    AMAZE = 4u,
+    AMAZE_INSPIRED = AMAZE, // Legacy source alias only; product identity is AMaZE.
 };
 
 struct SpectraResidentDemosaicRequest {
@@ -76,6 +77,8 @@ struct SpectraResidentDemosaicResult {
     float inputPackingMs = 0.0f;
     float uploadMs = 0.0f;
     float kernelMs = 0.0f;
+    float amazeGreenPassMs = 0.0f;
+    float amazeReconstructPassMs = 0.0f;
     float residualKernelMs = 0.0f;
     float readbackMs = 0.0f;
     float synchronizationMs = 0.0f;
@@ -226,7 +229,8 @@ private:
     bool ensureBufferLocked(VmaAllocator allocator, std::uint64_t bytes,
                             std::uint32_t hostAccess, PersistentBuffer& buffer,
                             bool& reallocated, std::string& failureReason) noexcept;
-    void updateDescriptorSetLocked(VkDevice device, VkBuffer inputOverride = VK_NULL_HANDLE) noexcept;
+    void updateDescriptorSetLocked(VkDevice device, VkBuffer inputOverride = VK_NULL_HANDLE,
+                                   VkBuffer scratchOverride = VK_NULL_HANDLE) noexcept;
     SpectraResidentDemosaicResult executeInternal(
             VkPhysicalDevice physicalDevice,
             VkDevice device,
@@ -258,7 +262,8 @@ private:
     PersistentBuffer outputReadback_;
     PersistentBuffer deviceInput_;
     PersistentBuffer deviceOutput_;
-    // Lazy allocation only when a non-resident CPU RGB fallback must be uploaded.
+    // Reused by two mutually exclusive roles: CPU RGB upload for typed fallback, or
+    // AMaZE resident guide scratch (green, Nyquist score, reserved) during demosaic.
     PersistentBuffer rgbUpload_;
     // Twelve float sums per 16x16 workgroup: raw/WB/CCM means plus cloud-correction telemetry.
     PersistentBuffer colorStatistics_;

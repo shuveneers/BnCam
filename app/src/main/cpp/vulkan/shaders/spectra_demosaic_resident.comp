@@ -4,7 +4,7 @@ layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
 layout(std430, binding = 0) readonly buffer InputMosaic { float inputMosaic[]; };
 layout(std430, binding = 1) buffer DemosaicRgb { float outputRgb[]; };
-layout(std430, binding = 2) writeonly buffer ColorRgb { float colorRgb[]; };
+layout(std430, binding = 2) buffer ColorRgb { float colorRgb[]; };
 layout(std430, binding = 3) writeonly buffer ColorStats { float colorStats[]; };
 layout(std430, binding = 4) writeonly buffer ResidualCandidates { float residualCandidates[]; };
 // Delta 46 transport-only binding. Record = (R-G correction, B-G correction, valid, reserved).
@@ -14,7 +14,7 @@ layout(push_constant) uniform Params {
     uint frameWidth;
     uint frameHeight;
     uint cfaPattern;
-    uint mode; // 0 bilinear, 1 Malvar 2004 (pure MHC), 2 Neural JDD, 3 AWB+CCM, 4 residual, 5 AMAZE Inspired
+    uint mode; // 0 bilinear, 1 Malvar, 2 Neural JDD, 3 AWB+CCM, 4 residual, 5 AMaZE guide, 6 AMaZE reconstruct
     float wbR;
     float wbG;
     float wbB;
@@ -252,167 +252,249 @@ vec3 neuralJddAt(int x, int y) {
     return vec3(finiteLinear(value.r), finiteLinear(value.g), finiteLinear(value.b));
 }
 
-float amazeWeight(float gradient) {
-    float sigma = demosaicNoiseSigmaY();
-    float support = max(demosaicNoisePressure(), smoothstep(7.5e-4, 6.0e-3, demosaicNoiseSigmaChroma()));
-    float debiasedGradient = max(0.0, gradient - 1.10 * sigma);
-    float adaptiveFloor = max(1.5e-4, 0.55 * sigma * support);
-    float stabilized = adaptiveFloor + debiasedGradient;
-    return 1.0 / max(1.0e-12, stabilized * stabilized);
-}
+float amazeSigmaY() { return demosaicNoiseSigmaY(); }
+float amazeSigmaChroma() { return demosaicNoiseSigmaChroma(); }
 
 float amazeRetainHighOrderDetail(float term) {
-    float sigma = demosaicNoiseSigmaY();
-    if (sigma <= 1.0e-6) return term;
-    float z = abs(term) / sigma;
-    return term * smoothstep(1.25, 3.75, z);
+    float sigma = amazeSigmaY();
+    if (sigma <= 1.0e-7) return term;
+    float z = abs(term) / max(1.0e-6, sigma);
+    float t = clamp((z - 1.25) / 2.50, 0.0, 1.0);
+    float retention = t * t * (3.0 - 2.0 * t);
+    return term * retention;
 }
 
 float amazeChromaRisk(uint channel) {
     if (pc.cfaEvidence0.x < 0.5 || (channel != 0u && channel != 2u)) return 0.0;
-    float bandPressure = clamp(
-            0.55 * pc.cfaEvidence0.w +
-            0.30 * pc.cfaEvidence1.x +
-            0.15 * pc.cfaEvidence1.y,
-            0.0, 1.0);
-    float opponentPressure = channel == 0u ? pc.cfaEvidence1.z : pc.cfaEvidence1.w;
-    float structureRelief = 1.0 - 0.30 * clamp(pc.cfaEvidence0.z, 0.0, 1.0);
-    return clamp((0.60 * bandPressure + 0.40 * clamp(opponentPressure, 0.0, 1.0)) *
-                 structureRelief, 0.0, 1.0);
+    float band = clamp(0.55 * pc.cfaEvidence0.w + 0.30 * pc.cfaEvidence1.x +
+                       0.15 * pc.cfaEvidence1.y, 0.0, 1.0);
+    float opponent = channel == 0u ? pc.cfaEvidence1.z : pc.cfaEvidence1.w;
+    float relief = 1.0 - 0.30 * clamp(pc.cfaEvidence0.z, 0.0, 1.0);
+    return clamp((0.60 * band + 0.40 * clamp(opponent, 0.0, 1.0)) * relief, 0.0, 1.0);
 }
 
-float amazeChromaWeight(float gradient, float chromaRisk) {
-    float risk = clamp(chromaRisk, 0.0, 1.0);
-    float sigma = demosaicNoiseSigmaChroma();
-    float support = max(demosaicNoisePressure(), smoothstep(7.5e-4, 6.0e-3, sigma));
-    float floorValue = max(1.5e-4 + 5.0e-4 * risk, 0.60 * sigma * support);
-    float debiasedGradient = max(0.0, gradient - 1.00 * sigma);
-    float stabilized = floorValue + debiasedGradient;
-    return 1.0 / max(1.0e-12, stabilized * stabilized);
+float amazeAdaptiveOneSided(float center, float adjacentGreen, float farSame, float ha) {
+    const float eps = 1.0e-5;
+    if (center * farSame <= 0.0 || abs(farSame) <= eps) return ha;
+    float ratio = center / farSame;
+    if (!(ratio > 0.20 && ratio < 5.00) || isnan(ratio) || isinf(ratio)) return ha;
+    float geometric = adjacentGreen * sqrt(max(0.0, ratio));
+    float logDistance = abs(log2(max(ratio, eps)));
+    float t = clamp((logDistance - 0.45) / 0.80, 0.0, 1.0);
+    float reliability = 1.0 - t * t * (3.0 - 2.0 * t);
+    return finiteLinear(ha + 0.45 * reliability * (geometric - ha));
 }
 
-float amazeGreenAt(int x, int y) {
-    int sx = safeCoord(x, int(pc.frameWidth));
-    int sy = safeCoord(y, int(pc.frameHeight));
-    if (cfaColorAt(pc.cfaPattern, sx, sy) == 1u) return sampleClamped(sx, sy);
-
-    float center = sampleClamped(sx, sy);
-    float left = sampleClamped(sx - 1, sy);
-    float right = sampleClamped(sx + 1, sy);
-    float up = sampleClamped(sx, sy - 1);
-    float down = sampleClamped(sx, sy + 1);
-    float left2 = sampleClamped(sx - 2, sy);
-    float right2 = sampleClamped(sx + 2, sy);
-    float up2 = sampleClamped(sx, sy - 2);
-    float down2 = sampleClamped(sx, sy + 2);
-
-    float hSecond = 2.0 * center - left2 - right2;
-    float vSecond = 2.0 * center - up2 - down2;
-    float hCandidate = 0.5 * (left + right) + 0.25 * amazeRetainHighOrderDetail(hSecond);
-    float vCandidate = 0.5 * (up + down) + 0.25 * amazeRetainHighOrderDetail(vSecond);
-    float hGradient = abs(left - right) + abs(2.0 * center - left2 - right2) +
-                      0.5 * (abs(left2 - left) + abs(right2 - right));
-    float vGradient = abs(up - down) + abs(2.0 * center - up2 - down2) +
-                      0.5 * (abs(up2 - up) + abs(down2 - down));
-    float wH = amazeWeight(hGradient);
-    float wV = amazeWeight(vGradient);
-    float green = (wH * hCandidate + wV * vCandidate) / max(1.0e-8, wH + wV);
-
-    float diagonalEnergy = abs(sampleClamped(sx - 1, sy - 1) - sampleClamped(sx + 1, sy + 1)) +
-                           abs(sampleClamped(sx + 1, sy - 1) - sampleClamped(sx - 1, sy + 1));
-    float gradientSum = hGradient + vGradient + 1.0e-6;
-    float anisotropy = abs(hGradient - vGradient) / gradientSum;
-    if (diagonalEnergy > 1.10 * gradientSum && anisotropy < 0.18) {
-        green = 0.75 * green + 0.25 * malvarAt(sx, sy).g;
-    }
-
-    float localMin = min(min(left, right), min(up, down));
-    float localMax = max(max(left, right), max(up, down));
-    float guard = 0.15 * max(1.0e-5, localMax - localMin);
-    return finiteLinear(clamp(green, localMin - guard, localMax + guard));
-}
-
-float amazeAxialColor(int x, int y, uint channel, bool horizontal, float centerGreen) {
-    float risk = amazeChromaRisk(channel);
+vec2 amazeAxisGuide(int x, int y, bool horizontal) {
     int dx = horizontal ? 1 : 0;
     int dy = horizontal ? 0 : 1;
-    int x0 = safeCoord(x - dx, int(pc.frameWidth));
-    int y0 = safeCoord(y - dy, int(pc.frameHeight));
-    int x1 = safeCoord(x + dx, int(pc.frameWidth));
-    int y1 = safeCoord(y + dy, int(pc.frameHeight));
-    float g0 = amazeGreenAt(x0, y0);
-    float g1 = amazeGreenAt(x1, y1);
-    float d0 = cfaColorAt(pc.cfaPattern, x0, y0) == channel ? sampleClamped(x0, y0) - g0 : 0.0;
-    float d1 = cfaColorAt(pc.cfaPattern, x1, y1) == channel ? sampleClamped(x1, y1) - g1 : 0.0;
-    float differenceDisagreement = abs(d0 - d1);
-    float disagreementWeight = 0.35 + 0.20 * risk;
-    float w0 = amazeChromaWeight(abs(centerGreen - g0) + disagreementWeight * differenceDisagreement, risk);
-    float w1 = amazeChromaWeight(abs(centerGreen - g1) + disagreementWeight * differenceDisagreement, risk);
-    float directionalDifference = (w0 * d0 + w1 * d1) / max(1.0e-8, w0 + w1);
-    bool bothSamplesValid = cfaColorAt(pc.cfaPattern, x0, y0) == channel &&
-                            cfaColorAt(pc.cfaPattern, x1, y1) == channel;
-    float robustDifference = bothSamplesValid ? 0.5 * (d0 + d1) : directionalDifference;
-    float robustBlend = 0.22 * risk;
-    float difference = directionalDifference + robustBlend * (robustDifference - directionalDifference);
-    return finiteLinear(centerGreen + difference);
+    float center = sampleClamped(x, y);
+    float n = sampleClamped(x - dx, y - dy);
+    float p = sampleClamped(x + dx, y + dy);
+    float fn = sampleClamped(x - 2 * dx, y - 2 * dy);
+    float fp = sampleClamped(x + 2 * dx, y + 2 * dy);
+    float curvature = amazeRetainHighOrderDetail(2.0 * center - fn - fp);
+    float ha = 0.5 * (n + p) + 0.25 * curvature;
+    float han = n + 0.5 * amazeRetainHighOrderDetail(center - fn);
+    float hap = p + 0.5 * amazeRetainHighOrderDetail(center - fp);
+    float an = amazeAdaptiveOneSided(center, n, fn, han);
+    float ap = amazeAdaptiveOneSided(center, p, fp, hap);
+    float sigma = amazeSigmaY();
+    float costN = max(1.0e-5, abs(n - p) + abs(center - fn) +
+                      0.5 * abs(n - sampleClamped(x - 3 * dx, y - 3 * dy)) - 1.10 * sigma);
+    float costP = max(1.0e-5, abs(n - p) + abs(center - fp) +
+                      0.5 * abs(p - sampleClamped(x + 3 * dx, y + 3 * dy)) - 1.10 * sigma);
+    float wn = 1.0 / (costN * costN + 1.0e-10);
+    float wp = 1.0 / (costP * costP + 1.0e-10);
+    float adaptive = (wn * an + wp * ap) / max(1.0e-8, wn + wp);
+    float texture = abs(fn - fp) + abs(n - p);
+    float t = clamp((texture - (0.015 + 2.0 * sigma)) /
+                    max(1.0e-6, (0.080 + 8.0 * sigma) - (0.015 + 2.0 * sigma)), 0.0, 1.0);
+    float adaptiveAuthority = 1.0 - t * t * (3.0 - 2.0 * t);
+    float g = finiteLinear(ha + 0.55 * adaptiveAuthority * (adaptive - ha));
+    float cost = max(1.0e-5, abs(n - p) + 0.65 * abs(curvature) +
+                     0.35 * abs(fn - fp) - 0.90 * sigma);
+    return vec2(g, cost);
 }
 
-float amazeDiagonalColor(int x, int y, uint channel, float centerGreen) {
-    ivec2 offsets[4] = ivec2[4](ivec2(-1, -1), ivec2(1, -1), ivec2(-1, 1), ivec2(1, 1));
-    float risk = amazeChromaRisk(channel);
-    float disagreementWeight = 0.30 + 0.25 * risk;
-    float weightedDifference = 0.0;
-    float totalWeight = 0.0;
-    float simpleDifference = 0.0;
-    float validDifferenceCount = 0.0;
-    for (int i = 0; i < 4; ++i) {
-        int sx = safeCoord(x + offsets[i].x, int(pc.frameWidth));
-        int sy = safeCoord(y + offsets[i].y, int(pc.frameHeight));
-        if (cfaColorAt(pc.cfaPattern, sx, sy) != channel) continue;
-        float neighborGreen = amazeGreenAt(sx, sy);
-        float difference = sampleClamped(sx, sy) - neighborGreen;
-        int ox = safeCoord(x - offsets[i].x, int(pc.frameWidth));
-        int oy = safeCoord(y - offsets[i].y, int(pc.frameHeight));
-        float oppositeGreen = amazeGreenAt(ox, oy);
-        float oppositeDifference = cfaColorAt(pc.cfaPattern, ox, oy) == channel
-                ? sampleClamped(ox, oy) - oppositeGreen : difference;
-        float gradient = abs(centerGreen - neighborGreen) +
-                         disagreementWeight * abs(difference - oppositeDifference);
-        float weight = amazeChromaWeight(gradient, risk);
-        weightedDifference += weight * difference;
-        totalWeight += weight;
-        simpleDifference += difference;
-        validDifferenceCount += 1.0;
-    }
-    float directionalDifference = weightedDifference / max(1.0e-8, totalWeight);
-    float robustDifference = validDifferenceCount > 0.0
-            ? simpleDifference / validDifferenceCount
-            : directionalDifference;
-    float robustBlend = 0.22 * risk;
-    float difference = directionalDifference + robustBlend * (robustDifference - directionalDifference);
-    return finiteLinear(centerGreen + difference);
+float amazeNyquistPreScore(int x, int y) {
+    float c = sampleClamped(x, y);
+    float h2 = abs(2.0 * c - sampleClamped(x - 2, y) - sampleClamped(x + 2, y));
+    float v2 = abs(2.0 * c - sampleClamped(x, y - 2) - sampleClamped(x, y + 2));
+    float h1 = abs(sampleClamped(x - 1, y) - sampleClamped(x + 1, y));
+    float v1 = abs(sampleClamped(x, y - 1) - sampleClamped(x, y + 1));
+    float d1 = abs(sampleClamped(x - 1, y - 1) - sampleClamped(x + 1, y + 1));
+    float d2 = abs(sampleClamped(x + 1, y - 1) - sampleClamped(x - 1, y + 1));
+    float axial = h2 + v2 + 0.50 * (h1 + v1);
+    float anisotropy = abs((h2 + 0.5 * h1) - (v2 + 0.5 * v1)) /
+                       max(1.0e-6, h2 + v2 + 0.5 * (h1 + v1));
+    float isotropy = 1.0 - clamp(anisotropy, 0.0, 1.0);
+    float sigma = amazeSigmaY();
+    float energy = axial + 0.45 * (d1 + d2);
+    float e0 = 0.004 + 3.0 * sigma;
+    float e1 = 0.035 + 12.0 * sigma;
+    float et = clamp((energy - e0) / max(1.0e-6, e1 - e0), 0.0, 1.0);
+    float energyGate = et * et * (3.0 - 2.0 * et);
+    float it = clamp((isotropy - 0.35) / 0.47, 0.0, 1.0);
+    float isotropyGate = it * it * (3.0 - 2.0 * it);
+    return clamp(energyGate * isotropyGate, 0.0, 1.0);
 }
 
-vec3 amazeAt(int x, int y) {
+void amazeGuidePass(int x, int y) {
+    uint idx = uint(y) * pc.frameWidth + uint(x);
+    uint base = idx * 3u;
     uint color = cfaColorAt(pc.cfaPattern, x, y);
-    float sampled = sampleClamped(x, y);
-    float g = amazeGreenAt(x, y);
-    float r;
-    float b;
-    if (color == 0u) {
-        r = sampled;
-        b = amazeDiagonalColor(x, y, 2u, g);
-    } else if (color == 2u) {
-        b = sampled;
-        r = amazeDiagonalColor(x, y, 0u, g);
+    float green;
+    if (color == 1u) {
+        green = sampleClamped(x, y);
     } else {
-        bool horizontalRed = cfaColorAt(pc.cfaPattern, x - 1, y) == 0u;
-        r = amazeAxialColor(x, y, 0u, horizontalRed, g);
-        b = amazeAxialColor(x, y, 2u, !horizontalRed, g);
+        vec2 h = amazeAxisGuide(x, y, true);
+        vec2 v = amazeAxisGuide(x, y, false);
+        float wh = 1.0 / (h.y * h.y + 1.0e-10);
+        float wv = 1.0 / (v.y * v.y + 1.0e-10);
+        green = (wh * h.x + wv * v.x) / max(1.0e-8, wh + wv);
+        float nyq = amazeNyquistPreScore(x, y);
+        green += 0.25 * nyq * (0.5 * (h.x + v.x) - green);
+        float left = sampleClamped(x - 1, y);
+        float right = sampleClamped(x + 1, y);
+        float up = sampleClamped(x, y - 1);
+        float down = sampleClamped(x, y + 1);
+        float lo = min(min(left, right), min(up, down));
+        float hi = max(max(left, right), max(up, down));
+        float guard = max(3.0 * amazeSigmaY(), 0.18 * max(1.0e-5, hi - lo));
+        green = clamp(green, lo - guard, hi + guard);
     }
-    return vec3(finiteLinear(r), finiteLinear(g), finiteLinear(b));
+    colorRgb[base + 0u] = finiteLinear(green);
+    colorRgb[base + 1u] = amazeNyquistPreScore(x, y);
+    colorRgb[base + 2u] = 0.0;
 }
 
+float amazeGuideGreen(int x, int y) {
+    int sx = safeCoord(x, int(pc.frameWidth));
+    int sy = safeCoord(y, int(pc.frameHeight));
+    return colorRgb[(uint(sy) * pc.frameWidth + uint(sx)) * 3u + 0u];
+}
+
+float amazeGuideNyquist(int x, int y) {
+    int sx = safeCoord(x, int(pc.frameWidth));
+    int sy = safeCoord(y, int(pc.frameHeight));
+    return clamp(colorRgb[(uint(sy) * pc.frameWidth + uint(sx)) * 3u + 1u], 0.0, 1.0);
+}
+
+float amazeSmoothedNyquist(int x, int y) {
+    return clamp(0.50 * amazeGuideNyquist(x, y) + 0.125 * (
+            amazeGuideNyquist(x - 2, y) + amazeGuideNyquist(x + 2, y) +
+            amazeGuideNyquist(x, y - 2) + amazeGuideNyquist(x, y + 2)), 0.0, 1.0);
+}
+
+bool amazeDifferenceAt(int x, int y, uint channel, out float difference) {
+    int sx = safeCoord(x, int(pc.frameWidth));
+    int sy = safeCoord(y, int(pc.frameHeight));
+    if (cfaColorAt(pc.cfaPattern, sx, sy) != channel) return false;
+    difference = sampleClamped(sx, sy) - amazeGuideGreen(sx, sy);
+    return !(isnan(difference) || isinf(difference));
+}
+
+float amazeChromaWeight(float greenDelta, float disagreement, float risk) {
+    float sigma = amazeSigmaChroma();
+    float gradient = max(0.0, greenDelta + (0.30 + 0.25 * risk) * disagreement - sigma);
+    float floorValue = max(1.5e-4 + 5.0e-4 * risk, 0.60 * sigma);
+    float v = floorValue + gradient;
+    return 1.0 / max(1.0e-12, v * v);
+}
+
+float amazeClamp4(float value, vec4 samples) {
+    float lo = min(min(samples.x, samples.y), min(samples.z, samples.w));
+    float hi = max(max(samples.x, samples.y), max(samples.z, samples.w));
+    float guard = max(3.0 * amazeSigmaChroma(), 0.18 * max(1.0e-6, hi - lo));
+    return clamp(value, lo - guard, hi + guard);
+}
+
+float amazeAxialDifference(int x, int y, uint channel, bool horizontal) {
+    int dx = horizontal ? 1 : 0;
+    int dy = horizontal ? 0 : 1;
+    float dm=0.0, dp=0.0, dm3=0.0, dp3=0.0;
+    bool vm = amazeDifferenceAt(x - dx, y - dy, channel, dm);
+    bool vp = amazeDifferenceAt(x + dx, y + dy, channel, dp);
+    if (!vm && vp) dm = dp;
+    if (!vp && vm) dp = dm;
+    if (!vm && !vp) return 0.0;
+    if (!amazeDifferenceAt(x - 3 * dx, y - 3 * dy, channel, dm3)) dm3 = dm;
+    if (!amazeDifferenceAt(x + 3 * dx, y + 3 * dy, channel, dp3)) dp3 = dp;
+    float gc = amazeGuideGreen(x, y);
+    float gm = amazeGuideGreen(x - dx, y - dy);
+    float gp = amazeGuideGreen(x + dx, y + dy);
+    float risk = amazeChromaRisk(channel);
+    float disagreement = abs(dm - dp);
+    float wm = amazeChromaWeight(abs(gc - gm), disagreement, risk);
+    float wp = amazeChromaWeight(abs(gc - gp), disagreement, risk);
+    float nearEstimate = (wm * dm + wp * dp) / max(1.0e-8, wm + wp);
+    float highOrder = (-dm3 + 9.0 * dm + 9.0 * dp - dp3) * (1.0 / 16.0);
+    float sigma = amazeSigmaChroma();
+    float tex = abs(gm - gp) + disagreement;
+    float t = clamp((tex - (0.010 + 2.0 * sigma)) /
+                    max(1.0e-6, (0.060 + 8.0 * sigma) - (0.010 + 2.0 * sigma)), 0.0, 1.0);
+    float smoothAuthority = 1.0 - t * t * (3.0 - 2.0 * t);
+    float d = nearEstimate + 0.30 * smoothAuthority * (1.0 - risk) * (highOrder - nearEstimate);
+    float area = 0.375 * (dm + dp) + 0.125 * (dm3 + dp3);
+    d += 0.68 * amazeSmoothedNyquist(x, y) * (area - d);
+    return amazeClamp4(d, vec4(dm, dp, dm3, dp3));
+}
+
+float amazeDiagonalDifference(int x, int y, uint channel) {
+    float dNW=0.0,dNE=0.0,dSW=0.0,dSE=0.0;
+    bool vNW=amazeDifferenceAt(x-1,y-1,channel,dNW);
+    bool vNE=amazeDifferenceAt(x+1,y-1,channel,dNE);
+    bool vSW=amazeDifferenceAt(x-1,y+1,channel,dSW);
+    bool vSE=amazeDifferenceAt(x+1,y+1,channel,dSE);
+    float mean = 0.0; float count = 0.0;
+    if(vNW){mean+=dNW;count+=1.0;} if(vNE){mean+=dNE;count+=1.0;}
+    if(vSW){mean+=dSW;count+=1.0;} if(vSE){mean+=dSE;count+=1.0;}
+    if(count<0.5) return 0.0;
+    mean/=count;
+    if(!vNW)dNW=mean; if(!vNE)dNE=mean; if(!vSW)dSW=mean; if(!vSE)dSE=mean;
+    float fNW=dNW,fNE=dNE,fSW=dSW,fSE=dSE;
+    if(!amazeDifferenceAt(x-3,y-3,channel,fNW))fNW=dNW;
+    if(!amazeDifferenceAt(x+3,y-3,channel,fNE))fNE=dNE;
+    if(!amazeDifferenceAt(x-3,y+3,channel,fSW))fSW=dSW;
+    if(!amazeDifferenceAt(x+3,y+3,channel,fSE))fSE=dSE;
+    float diagA=0.5*(dNW+dSE), diagB=0.5*(dNE+dSW);
+    float gNW=amazeGuideGreen(x-1,y-1),gNE=amazeGuideGreen(x+1,y-1);
+    float gSW=amazeGuideGreen(x-1,y+1),gSE=amazeGuideGreen(x+1,y+1);
+    float risk=amazeChromaRisk(channel); float disagreement=abs(diagA-diagB);
+    float wA=amazeChromaWeight(abs(gNW-gSE),disagreement,risk);
+    float wB=amazeChromaWeight(abs(gNE-gSW),disagreement,risk);
+    float d=(wA*diagA+wB*diagB)/max(1.0e-8,wA+wB);
+    float highA=(-fNW+9.0*dNW+9.0*dSE-fSE)*(1.0/16.0);
+    float highB=(-fNE+9.0*dNE+9.0*dSW-fSW)*(1.0/16.0);
+    float sigma=amazeSigmaChroma();
+    float tex=abs(gNW-gSE)+abs(gNE-gSW)+disagreement;
+    float t=clamp((tex-(0.012+2.0*sigma))/max(1.0e-6,(0.070+8.0*sigma)-(0.012+2.0*sigma)),0.0,1.0);
+    float smoothAuthority=1.0-t*t*(3.0-2.0*t);
+    float high=(wA*highA+wB*highB)/max(1.0e-8,wA+wB);
+    d+=0.24*smoothAuthority*(1.0-risk)*(high-d);
+    float area=0.1875*(dNW+dNE+dSW+dSE)+0.0625*(fNW+fNE+fSW+fSE);
+    d+=0.72*amazeSmoothedNyquist(x,y)*(area-d);
+    float nearClamp=amazeClamp4(d,vec4(dNW,dNE,dSW,dSE));
+    float farLo=min(min(fNW,fNE),min(fSW,fSE));
+    float farHi=max(max(fNW,fNE),max(fSW,fSE));
+    float guard=max(3.0*amazeSigmaChroma(),0.18*max(1.0e-6,farHi-farLo));
+    return clamp(nearClamp,farLo-guard,farHi+guard);
+}
+
+vec3 amazeReconstructAt(int x, int y) {
+    uint color=cfaColorAt(pc.cfaPattern,x,y);
+    float g=amazeGuideGreen(x,y);
+    float r=g,b=g;
+    if(color==0u){ r=sampleClamped(x,y); b=g+amazeDiagonalDifference(x,y,2u); }
+    else if(color==2u){ b=sampleClamped(x,y); r=g+amazeDiagonalDifference(x,y,0u); }
+    else {
+        bool horizontalRed=cfaColorAt(pc.cfaPattern,x-1,y)==0u;
+        r=g+amazeAxialDifference(x,y,0u,horizontalRed);
+        b=g+amazeAxialDifference(x,y,2u,!horizontalRed);
+    }
+    return vec3(finiteLinear(r),finiteLinear(g),finiteLinear(b));
+}
 
 vec3 residentRgbAt(int x, int y) {
     int sx = clamp(x, 0, int(pc.frameWidth) - 1);
@@ -608,13 +690,28 @@ void main() {
     bool inside = gid.x < pc.frameWidth && gid.y < pc.frameHeight;
     uint localIndex = gl_LocalInvocationIndex;
 
-    if (pc.mode < 3u || pc.mode == 5u) {
+    if (pc.mode == 5u) {
+        if (!inside) return;
+        amazeGuidePass(int(gid.x), int(gid.y));
+        return;
+    }
+
+    if (pc.mode == 6u) {
+        if (!inside) return;
+        vec3 rgb = amazeReconstructAt(int(gid.x), int(gid.y));
+        uint index = (gid.y * pc.frameWidth + gid.x) * 3u;
+        outputRgb[index + 0u] = rgb.r;
+        outputRgb[index + 1u] = rgb.g;
+        outputRgb[index + 2u] = rgb.b;
+        return;
+    }
+
+    if (pc.mode < 3u) {
         if (!inside) return;
         int x = int(gid.x);
         int y = int(gid.y);
         vec3 rgb = pc.mode == 0u ? bilinearAt(x, y) :
-                   (pc.mode == 1u ? malvarAt(x, y) :
-                   (pc.mode == 2u ? neuralJddAt(x, y) : amazeAt(x, y)));
+                   (pc.mode == 1u ? malvarAt(x, y) : neuralJddAt(x, y));
         uint index = (gid.y * pc.frameWidth + gid.x) * 3u;
         outputRgb[index + 0u] = rgb.r;
         outputRgb[index + 1u] = rgb.g;

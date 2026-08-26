@@ -8,26 +8,25 @@ enum class DemosaicMode(
     val available: Boolean
 ) {
     // Internal enum symbols retain legacy names for persisted-profile/source compatibility.
-    // Product bridge identities are 1=Malvar, 2=AMaZE Inspired (pending canonical AMaZE),
+    // Product bridge identities are 1=Malvar, 2=AMaZE,
     // 3=Neural JDD. Auto remains the transition selector until final Auto Hybrid hysteresis lands.
     AUTO(0, "Auto", true),
     NORMAL(1, "Malvar", true),
-    QUALITY(2, "AMaZE Inspired", true),
+    QUALITY(2, "AMaZE", true),
     BILINEAR(3, "Neural JDD", true);
 
     companion object {
         const val PROFILE_KEY = "demosaic_mode"
 
-        // Product default is deliberately noise-robust. RCD and AMAZE remain available for
-        // profiles that prioritise edge/detail reconstruction; Auto stays the fourth UI choice.
+        // Product default remains the deterministic Malvar path. AMaZE and Neural JDD are
+        // explicit alternatives; Auto stays the fourth UI choice until Auto Hybrid lands.
         val DEFAULT: DemosaicMode = NORMAL
         val USER_ORDER: List<DemosaicMode> = listOf(NORMAL, QUALITY, BILINEAR, AUTO)
 
         /**
          * Parses both the new product names and all legacy persisted values.
          * Legacy slot semantics intentionally migrate with their bridge value:
-         * NORMAL/Malvar -> Malvar Inspired, QUALITY/Menon -> AMAZE Inspired,
-         * BILINEAR -> RCD Inspired.
+         * NORMAL/Malvar -> Malvar, QUALITY/Menon -> AMaZE, BILINEAR/RCD -> Neural JDD.
          */
         fun fromPersisted(value: String?): DemosaicMode? {
             val trimmed = value?.trim().orEmpty()
@@ -56,7 +55,7 @@ enum class DemosaicMode(
                 QUALITY -> DemosaicSelection(
                     requestedMode = QUALITY,
                     resolvedAlgorithm = ResolvedDemosaicAlgorithm.AMAZE_INSPIRED,
-                    resolveReason = "legacy_slot_2_forces_amaze_inspired",
+                    resolveReason = "legacy_slot_2_forces_amaze",
                     fallbackOccurred = false,
                     fallbackReason = "none"
                 )
@@ -77,16 +76,16 @@ enum class DemosaicMode(
                 NORMAL -> DemosaicSelection(
                     requestedMode = NORMAL,
                     resolvedAlgorithm = ResolvedDemosaicAlgorithm.MALVAR_INSPIRED,
-                    resolveReason = "normal_mode_forces_malvar_inspired",
+                    resolveReason = "normal_mode_forces_malvar_2004",
                     fallbackOccurred = false,
                     fallbackReason = "none"
                 )
                 null -> DemosaicSelection(
                     requestedMode = DEFAULT,
                     resolvedAlgorithm = ResolvedDemosaicAlgorithm.MALVAR_INSPIRED,
-                    resolveReason = "default_malvar_inspired_noise_robust",
+                    resolveReason = "default_malvar_2004_noise_robust",
                     fallbackOccurred = invalidRequested,
-                    fallbackReason = if (invalidRequested) "invalid_profile_value_defaulted_malvar_inspired" else "none"
+                    fallbackReason = if (invalidRequested) "invalid_profile_value_defaulted_malvar_2004" else "none"
                 )
             }
         }
@@ -107,23 +106,32 @@ data class DemosaicSelection(
     val fallbackOccurred: Boolean,
     val fallbackReason: String
 ) {
+    val resolvedDebugName: String
+        get() = when (resolvedAlgorithm) {
+            ResolvedDemosaicAlgorithm.MALVAR_INSPIRED -> "MALVAR_2004"
+            ResolvedDemosaicAlgorithm.RCD_INSPIRED -> "NEURAL_JDD"
+            ResolvedDemosaicAlgorithm.AMAZE_INSPIRED -> "AMAZE"
+            ResolvedDemosaicAlgorithm.AUTO_SCENE_ADAPTIVE_NATIVE -> "AUTO"
+        }
+
     private val requestedDebugName: String
         get() = when (requestedMode) {
             DemosaicMode.AUTO -> "AUTO"
             DemosaicMode.BILINEAR -> "NEURAL_JDD"
-            DemosaicMode.NORMAL -> "MALVAR_INSPIRED"
-            DemosaicMode.QUALITY -> "AMAZE_INSPIRED"
+            DemosaicMode.NORMAL -> "MALVAR"
+            DemosaicMode.QUALITY -> "AMAZE"
         }
 
     val debugPairs: List<Pair<String, String>>
         get() = listOf(
             "requestedDemosaicMode" to requestedDebugName,
-            "resolvedDemosaicAlgorithm" to if (resolvedAlgorithm == ResolvedDemosaicAlgorithm.RCD_INSPIRED) "NEURAL_JDD" else resolvedAlgorithm.name,
+            "resolvedDemosaicAlgorithm" to resolvedDebugName,
             "demosaicResolveReason" to resolveReason,
             "malvar2004Available" to "true",
             "neuralJddAvailable" to "true",
             "rcdInspiredAvailable" to "false",
-            "amazeInspiredAvailable" to "true",
+            "amazeAvailable" to "true",
+            "amazeInspiredAvailable" to "false",
             "legacyBilinearProductAvailable" to "false",
             "legacyMenonProductAvailable" to "false",
             "fallbackOccurred" to fallbackOccurred.toString(),

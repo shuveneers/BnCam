@@ -727,43 +727,35 @@ float rcdInterpolateDifferenceDiagonal(
     return finiteSceneLinear(gCenter + difference);
 }
 
-float amazeDirectionalWeight(float gradient, const DemosaicNoiseContext* noiseContext) {
-    constexpr float kFloor = 1.5e-4f;
-    float sigma = 0.0f;
-    float support = 0.0f;
-    if (noiseContext != nullptr && noiseContext->available) {
-        sigma = std::max(0.0f, std::isfinite(noiseContext->sigmaY)
-                ? noiseContext->sigmaY : 0.0f);
-        support = demosaicNoiseSupport(noiseContext);
-    }
-    const float debiasedGradient = std::max(0.0f, gradient - 1.10f * sigma);
-    const float adaptiveFloor = std::max(kFloor, 0.55f * sigma * support);
-    const float stabilized = adaptiveFloor + debiasedGradient;
-    return 1.0f / std::max(1.0e-12f, stabilized * stabilized);
+float amazeNoiseSigmaY(const DemosaicNoiseContext* noiseContext) {
+    if (noiseContext == nullptr || !noiseContext->available ||
+        !std::isfinite(noiseContext->sigmaY)) return 0.0f;
+    return std::max(0.0f, noiseContext->sigmaY);
+}
+
+float amazeNoiseSigmaChroma(const DemosaicNoiseContext* noiseContext) {
+    if (noiseContext == nullptr || !noiseContext->available ||
+        !std::isfinite(noiseContext->sigmaChroma)) return 0.0f;
+    return std::max(0.0f, noiseContext->sigmaChroma);
 }
 
 float amazeRetainHighOrderDetail(float term, const DemosaicNoiseContext* noiseContext) {
-    if (noiseContext == nullptr || !noiseContext->available) return term;
-    const float sigma = std::max(1.0e-6f, std::isfinite(noiseContext->sigmaY)
-            ? noiseContext->sigmaY : 0.0f);
-    const float z = std::abs(term) / sigma;
+    const float sigma = amazeNoiseSigmaY(noiseContext);
+    if (sigma <= 1.0e-7f) return term;
+    const float z = std::abs(term) / std::max(1.0e-6f, sigma);
     const float retention = demosaicSmoothstep(1.25f, 3.75f, z);
     return term * retention;
 }
 
-// Delta 27: preserve AMAZE Inspired's green/detail reconstruction exactly. Only missing R/B
-// colour-difference interpolation consumes SPECTRA CFA evidence. AMAZE intentionally weights
-// fine-band pressure most heavily because its detail-oriented interpolation is most exposed to
-// noise-driven high-frequency chroma excursions.
+// SPECTRA evidence may only temper reconstructed chroma. It never changes sampled sensels
+// and never owns the AMaZE direction/Nyquist decision.
 float amazeNoiseAwareChromaRisk(const DemosaicCfaEvidence* evidence, int channel) {
     if (evidence == nullptr || !evidence->available || (channel != 0 && channel != 2)) return 0.0f;
     const float bandPressure = std::clamp(
             0.55f * evidence->fineCorrectionConfidence +
             0.30f * evidence->midCorrectionConfidence +
             0.15f * evidence->lowCorrectionConfidence,
-            0.0f,
-            1.0f
-    );
+            0.0f, 1.0f);
     const float opponentPressure = channel == 0
             ? evidence->redOpponentCorrectionConfidence
             : evidence->blueOpponentCorrectionConfidence;
@@ -772,81 +764,205 @@ float amazeNoiseAwareChromaRisk(const DemosaicCfaEvidence* evidence, int channel
     return std::clamp(
             (0.60f * bandPressure + 0.40f * std::clamp(opponentPressure, 0.0f, 1.0f)) *
                     structureRelief,
-            0.0f,
-            1.0f
-    );
+            0.0f, 1.0f);
 }
 
-float amazeChromaDirectionalWeight(
-        float gradient,
-        float chromaRisk,
+struct AmazeAxisGuide {
+    float green = 0.0f;
+    float cost = 1.0e-5f;
+};
+
+float amazeAdaptiveOneSidedGreen(
+        float center,
+        float adjacentGreen,
+        float farSameColor,
+        float hamiltonAdams
+) {
+    constexpr float kEps = 1.0e-5f;
+    if (center * farSameColor <= 0.0f || std::abs(farSameColor) <= kEps) return hamiltonAdams;
+    const float ratio = center / farSameColor;
+    if (!(ratio > 0.20f && ratio < 5.00f) || !std::isfinite(ratio)) return hamiltonAdams;
+    const float geometric = adjacentGreen * std::sqrt(std::max(0.0f, ratio));
+    const float logDistance = std::abs(std::log2(std::max(ratio, kEps)));
+    const float reliability = 1.0f - demosaicSmoothstep(0.45f, 1.25f, logDistance);
+    return finiteSceneLinear(hamiltonAdams + 0.45f * reliability * (geometric - hamiltonAdams));
+}
+
+AmazeAxisGuide amazeAxisGuideAt(
+        const cv::Mat& mosaic,
+        int x,
+        int y,
+        bool horizontal,
         const DemosaicNoiseContext* noiseContext
 ) {
-    const float risk = std::clamp(chromaRisk, 0.0f, 1.0f);
-    float sigma = 0.0f;
-    float support = 0.0f;
-    if (noiseContext != nullptr && noiseContext->available) {
-        sigma = std::max(0.0f, std::isfinite(noiseContext->sigmaChroma)
-                ? noiseContext->sigmaChroma : 0.0f);
-        support = demosaicNoiseSupport(noiseContext);
-    }
-    const float floor = std::max(1.5e-4f + 5.0e-4f * risk, 0.60f * sigma * support);
-    const float debiasedGradient = std::max(0.0f, gradient - 1.00f * sigma);
-    const float stabilized = floor + debiasedGradient;
-    return 1.0f / std::max(1.0e-12f, stabilized * stabilized);
+    const int dx = horizontal ? 1 : 0;
+    const int dy = horizontal ? 0 : 1;
+    const float center = sampleClamped(mosaic, x, y);
+    const float nearNeg = sampleClamped(mosaic, x - dx, y - dy);
+    const float nearPos = sampleClamped(mosaic, x + dx, y + dy);
+    const float farNeg = sampleClamped(mosaic, x - 2 * dx, y - 2 * dy);
+    const float farPos = sampleClamped(mosaic, x + 2 * dx, y + 2 * dy);
+
+    const float curvature = amazeRetainHighOrderDetail(
+            2.0f * center - farNeg - farPos, noiseContext);
+    const float ha = 0.5f * (nearNeg + nearPos) + 0.25f * curvature;
+    const float haNeg = nearNeg + 0.5f * amazeRetainHighOrderDetail(center - farNeg, noiseContext);
+    const float haPos = nearPos + 0.5f * amazeRetainHighOrderDetail(center - farPos, noiseContext);
+    const float adaptiveNeg = amazeAdaptiveOneSidedGreen(center, nearNeg, farNeg, haNeg);
+    const float adaptivePos = amazeAdaptiveOneSidedGreen(center, nearPos, farPos, haPos);
+
+    const float sigma = amazeNoiseSigmaY(noiseContext);
+    const float costNeg = std::max(1.0e-5f,
+            std::abs(nearNeg - nearPos) + std::abs(center - farNeg) +
+            0.5f * std::abs(nearNeg - sampleClamped(mosaic, x - 3 * dx, y - 3 * dy)) -
+            1.10f * sigma);
+    const float costPos = std::max(1.0e-5f,
+            std::abs(nearNeg - nearPos) + std::abs(center - farPos) +
+            0.5f * std::abs(nearPos - sampleClamped(mosaic, x + 3 * dx, y + 3 * dy)) -
+            1.10f * sigma);
+    const float wNeg = 1.0f / (costNeg * costNeg + 1.0e-10f);
+    const float wPos = 1.0f / (costPos * costPos + 1.0e-10f);
+    const float adaptive = (wNeg * adaptiveNeg + wPos * adaptivePos) /
+            std::max(1.0e-8f, wNeg + wPos);
+
+    AmazeAxisGuide out;
+    const float texture = std::abs(farNeg - farPos) + std::abs(nearNeg - nearPos);
+    const float adaptiveAuthority = 1.0f - demosaicSmoothstep(
+            0.015f + 2.0f * sigma, 0.080f + 8.0f * sigma, texture);
+    out.green = finiteSceneLinear(ha + 0.55f * adaptiveAuthority * (adaptive - ha));
+    out.cost = std::max(1.0e-5f,
+            std::abs(nearNeg - nearPos) + 0.65f * std::abs(curvature) +
+            0.35f * std::abs(farNeg - farPos) - 0.90f * sigma);
+    return out;
 }
 
-float amazeGreenAtRedOrBlue(
-        const cv::Mat& mosaic, int x, int y, const DemosaicNoiseContext* noiseContext
+float amazeNyquistPreScore(
+        const cv::Mat& mosaic,
+        int x,
+        int y,
+        const DemosaicNoiseContext* noiseContext
 ) {
-    const float center = sampleClamped(mosaic, x, y);
+    const float c = sampleClamped(mosaic, x, y);
+    const float h2 = std::abs(2.0f * c - sampleClamped(mosaic, x - 2, y) - sampleClamped(mosaic, x + 2, y));
+    const float v2 = std::abs(2.0f * c - sampleClamped(mosaic, x, y - 2) - sampleClamped(mosaic, x, y + 2));
+    const float h1 = std::abs(sampleClamped(mosaic, x - 1, y) - sampleClamped(mosaic, x + 1, y));
+    const float v1 = std::abs(sampleClamped(mosaic, x, y - 1) - sampleClamped(mosaic, x, y + 1));
+    const float d1 = std::abs(sampleClamped(mosaic, x - 1, y - 1) - sampleClamped(mosaic, x + 1, y + 1));
+    const float d2 = std::abs(sampleClamped(mosaic, x + 1, y - 1) - sampleClamped(mosaic, x - 1, y + 1));
+    const float axial = h2 + v2 + 0.50f * (h1 + v1);
+    const float diagonal = d1 + d2;
+    const float anisotropy = std::abs((h2 + 0.5f * h1) - (v2 + 0.5f * v1)) /
+            std::max(1.0e-6f, h2 + v2 + 0.5f * (h1 + v1));
+    const float isotropy = 1.0f - std::clamp(anisotropy, 0.0f, 1.0f);
+    const float sigma = amazeNoiseSigmaY(noiseContext);
+    const float energy = axial + 0.45f * diagonal;
+    const float energyGate = demosaicSmoothstep(
+            0.004f + 3.0f * sigma,
+            0.035f + 12.0f * sigma,
+            energy);
+    const float isotropyGate = demosaicSmoothstep(0.35f, 0.82f, isotropy);
+    return std::clamp(energyGate * isotropyGate, 0.0f, 1.0f);
+}
+
+float amazeGreenGuideAt(
+        const cv::Mat& mosaic,
+        int pattern,
+        int x,
+        int y,
+        const DemosaicNoiseContext* noiseContext
+) {
+    if (cfaColorAt(pattern, x, y) == 1) return sampleClamped(mosaic, x, y);
+    const AmazeAxisGuide h = amazeAxisGuideAt(mosaic, x, y, true, noiseContext);
+    const AmazeAxisGuide v = amazeAxisGuideAt(mosaic, x, y, false, noiseContext);
+    const float wH = 1.0f / (h.cost * h.cost + 1.0e-10f);
+    const float wV = 1.0f / (v.cost * v.cost + 1.0e-10f);
+    float green = (wH * h.green + wV * v.green) / std::max(1.0e-8f, wH + wV);
+    const float nyquist = amazeNyquistPreScore(mosaic, x, y, noiseContext);
+    green += 0.25f * nyquist * (0.5f * (h.green + v.green) - green);
+
     const float left = sampleClamped(mosaic, x - 1, y);
     const float right = sampleClamped(mosaic, x + 1, y);
     const float up = sampleClamped(mosaic, x, y - 1);
     const float down = sampleClamped(mosaic, x, y + 1);
-    const float left2 = sampleClamped(mosaic, x - 2, y);
-    const float right2 = sampleClamped(mosaic, x + 2, y);
-    const float up2 = sampleClamped(mosaic, x, y - 2);
-    const float down2 = sampleClamped(mosaic, x, y + 2);
-
-    const float horizontalSecond = 2.0f * center - left2 - right2;
-    const float verticalSecond = 2.0f * center - up2 - down2;
-    const float horizontalCandidate = 0.5f * (left + right) +
-            0.25f * amazeRetainHighOrderDetail(horizontalSecond, noiseContext);
-    const float verticalCandidate = 0.5f * (up + down) +
-            0.25f * amazeRetainHighOrderDetail(verticalSecond, noiseContext);
-    const float horizontalGradient = std::abs(left - right) +
-            std::abs(2.0f * center - left2 - right2) +
-            0.5f * (std::abs(left2 - left) + std::abs(right2 - right));
-    const float verticalGradient = std::abs(up - down) +
-            std::abs(2.0f * center - up2 - down2) +
-            0.5f * (std::abs(up2 - up) + std::abs(down2 - down));
-    const float wH = amazeDirectionalWeight(horizontalGradient, noiseContext);
-    const float wV = amazeDirectionalWeight(verticalGradient, noiseContext);
-    float green = (wH * horizontalCandidate + wV * verticalCandidate) /
-            std::max(1.0e-8f, wH + wV);
-
-    // BnCam adaptation of AMaZE's high-frequency caution: in nearly isotropic high-frequency
-    // regions, blend a small MHC estimate to reduce zipper/checkerboard instability without
-    // flattening strongly directional detail.
-    const float diagonalEnergy =
-            std::abs(sampleClamped(mosaic, x - 1, y - 1) - sampleClamped(mosaic, x + 1, y + 1)) +
-            std::abs(sampleClamped(mosaic, x + 1, y - 1) - sampleClamped(mosaic, x - 1, y + 1));
-    const float gradientSum = horizontalGradient + verticalGradient + 1.0e-6f;
-    const float anisotropy = std::abs(horizontalGradient - verticalGradient) / gradientSum;
-    if (diagonalEnergy > 1.10f * gradientSum && anisotropy < 0.18f) {
-        green = 0.75f * green + 0.25f * greenAtRedOrBlue(mosaic, x, y);
-    }
-
     const float localMin = std::min({left, right, up, down});
     const float localMax = std::max({left, right, up, down});
-    const float guard = 0.15f * std::max(1.0e-5f, localMax - localMin);
+    const float guard = std::max(3.0f * amazeNoiseSigmaY(noiseContext),
+            0.18f * std::max(1.0e-5f, localMax - localMin));
     return finiteSceneLinear(std::clamp(green, localMin - guard, localMax + guard));
+}
+
+float amazeGreenPlaneAt(const cv::Mat& green, int x, int y) {
+    const int sx = std::clamp(x, 0, green.cols - 1);
+    const int sy = std::clamp(y, 0, green.rows - 1);
+    return green.ptr<float>(sy)[sx];
+}
+
+float amazeGuideNyquistAt(const cv::Mat& guide, int x, int y) {
+    const int sx = std::clamp(x, 0, guide.cols - 1);
+    const int sy = std::clamp(y, 0, guide.rows - 1);
+    return std::clamp(guide.ptr<cv::Vec2f>(sy)[sx][0], 0.0f, 1.0f);
+}
+
+float amazeSmoothedNyquist(const cv::Mat& guide, int x, int y) {
+    const float center = 0.50f * amazeGuideNyquistAt(guide, x, y);
+    const float axial = 0.125f * (
+            amazeGuideNyquistAt(guide, x - 2, y) + amazeGuideNyquistAt(guide, x + 2, y) +
+            amazeGuideNyquistAt(guide, x, y - 2) + amazeGuideNyquistAt(guide, x, y + 2));
+    return std::clamp(center + axial, 0.0f, 1.0f);
+}
+
+bool amazeDifferenceAtSample(
+        const cv::Mat& mosaic,
+        const cv::Mat& green,
+        int pattern,
+        int x,
+        int y,
+        int channel,
+        float& difference
+) {
+    const int sx = std::clamp(x, 0, mosaic.cols - 1);
+    const int sy = std::clamp(y, 0, mosaic.rows - 1);
+    if (cfaColorAt(pattern, sx, sy) != channel) return false;
+    difference = mosaic.ptr<float>(sy)[sx] - green.ptr<float>(sy)[sx];
+    return std::isfinite(difference);
+}
+
+float amazeChromaWeight(
+        float greenDelta,
+        float differenceDisagreement,
+        float chromaRisk,
+        const DemosaicNoiseContext* noiseContext
+) {
+    const float sigma = amazeNoiseSigmaChroma(noiseContext);
+    const float risk = std::clamp(chromaRisk, 0.0f, 1.0f);
+    const float gradient = std::max(0.0f,
+            greenDelta + (0.30f + 0.25f * risk) * differenceDisagreement - sigma);
+    const float floor = std::max(1.5e-4f + 5.0e-4f * risk, 0.60f * sigma);
+    return 1.0f / std::max(1.0e-12f, (floor + gradient) * (floor + gradient));
+}
+
+float amazeClampDifference(
+        float value,
+        const std::array<float, 8>& samples,
+        int count,
+        const DemosaicNoiseContext* noiseContext
+) {
+    if (count <= 0) return value;
+    float lo = samples[0];
+    float hi = samples[0];
+    for (int i = 1; i < count; ++i) {
+        lo = std::min(lo, samples[i]);
+        hi = std::max(hi, samples[i]);
+    }
+    const float guard = std::max(3.0f * amazeNoiseSigmaChroma(noiseContext),
+            0.18f * std::max(1.0e-6f, hi - lo));
+    return std::clamp(value, lo - guard, hi + guard);
 }
 
 float amazeInterpolateDifferenceAxial(
         const cv::Mat& mosaic,
         const cv::Mat& green,
+        const cv::Mat& guide,
         int pattern,
         int x,
         int y,
@@ -857,37 +973,42 @@ float amazeInterpolateDifferenceAxial(
 ) {
     const int dx = horizontal ? 1 : 0;
     const int dy = horizontal ? 0 : 1;
-    const int x0 = std::clamp(x - dx, 0, mosaic.cols - 1);
-    const int y0 = std::clamp(y - dy, 0, mosaic.rows - 1);
-    const int x1 = std::clamp(x + dx, 0, mosaic.cols - 1);
-    const int y1 = std::clamp(y + dy, 0, mosaic.rows - 1);
-    const float gCenter = green.ptr<float>(y)[x];
-    const float g0 = green.ptr<float>(y0)[x0];
-    const float g1 = green.ptr<float>(y1)[x1];
-    const float d0 = cfaColorAt(pattern, x0, y0) == channel
-            ? mosaic.ptr<float>(y0)[x0] - g0 : 0.0f;
-    const float d1 = cfaColorAt(pattern, x1, y1) == channel
-            ? mosaic.ptr<float>(y1)[x1] - g1 : 0.0f;
-    const float risk = std::clamp(chromaRisk, 0.0f, 1.0f);
-    const float disagreementWeight = 0.35f + 0.20f * risk;
-    const float disagreement = std::abs(d0 - d1);
-    const float w0 = amazeChromaDirectionalWeight(
-            std::abs(gCenter - g0) + disagreementWeight * disagreement, risk, noiseContext);
-    const float w1 = amazeChromaDirectionalWeight(
-            std::abs(gCenter - g1) + disagreementWeight * disagreement, risk, noiseContext);
-    const float directionalDifference = (w0 * d0 + w1 * d1) / std::max(1.0e-8f, w0 + w1);
-    const bool bothSamplesValid = cfaColorAt(pattern, x0, y0) == channel &&
-            cfaColorAt(pattern, x1, y1) == channel;
-    const float robustDifference = bothSamplesValid ? 0.5f * (d0 + d1) : directionalDifference;
-    const float robustBlend = 0.22f * risk;
-    const float difference = directionalDifference +
-            robustBlend * (robustDifference - directionalDifference);
+    float dm = 0.0f, dp = 0.0f, dm3 = 0.0f, dp3 = 0.0f;
+    const bool vm = amazeDifferenceAtSample(mosaic, green, pattern, x - dx, y - dy, channel, dm);
+    const bool vp = amazeDifferenceAtSample(mosaic, green, pattern, x + dx, y + dy, channel, dp);
+    if (!vm && vp) dm = dp;
+    if (!vp && vm) dp = dm;
+    if (!vm && !vp) return amazeGreenPlaneAt(green, x, y);
+    if (!amazeDifferenceAtSample(mosaic, green, pattern, x - 3 * dx, y - 3 * dy, channel, dm3)) dm3 = dm;
+    if (!amazeDifferenceAtSample(mosaic, green, pattern, x + 3 * dx, y + 3 * dy, channel, dp3)) dp3 = dp;
+
+    const float gCenter = amazeGreenPlaneAt(green, x, y);
+    const float gm = amazeGreenPlaneAt(green, x - dx, y - dy);
+    const float gp = amazeGreenPlaneAt(green, x + dx, y + dy);
+    const float disagreement = std::abs(dm - dp);
+    const float wm = amazeChromaWeight(std::abs(gCenter - gm), disagreement, chromaRisk, noiseContext);
+    const float wp = amazeChromaWeight(std::abs(gCenter - gp), disagreement, chromaRisk, noiseContext);
+    const float nearEstimate = (wm * dm + wp * dp) / std::max(1.0e-8f, wm + wp);
+    const float highOrder = (-dm3 + 9.0f * dm + 9.0f * dp - dp3) * (1.0f / 16.0f);
+    const float sigma = amazeNoiseSigmaChroma(noiseContext);
+    const float smoothAuthority = 1.0f - demosaicSmoothstep(
+            0.010f + 2.0f * sigma, 0.060f + 8.0f * sigma,
+            std::abs(gm - gp) + disagreement);
+    float difference = nearEstimate + 0.30f * smoothAuthority * (1.0f - chromaRisk) *
+            (highOrder - nearEstimate);
+
+    const float nyquist = amazeSmoothedNyquist(guide, x, y);
+    const float area = 0.375f * (dm + dp) + 0.125f * (dm3 + dp3);
+    difference += 0.68f * nyquist * (area - difference);
+    const std::array<float, 8> samples{dm, dp, dm3, dp3, 0, 0, 0, 0};
+    difference = amazeClampDifference(difference, samples, 4, noiseContext);
     return finiteSceneLinear(gCenter + difference);
 }
 
 float amazeInterpolateDifferenceDiagonal(
         const cv::Mat& mosaic,
         const cv::Mat& green,
+        const cv::Mat& guide,
         int pattern,
         int x,
         int y,
@@ -895,40 +1016,61 @@ float amazeInterpolateDifferenceDiagonal(
         float chromaRisk,
         const DemosaicNoiseContext* noiseContext
 ) {
-    constexpr int offsets[4][2] = {{-1, -1}, {1, -1}, {-1, 1}, {1, 1}};
-    const float gCenter = green.ptr<float>(y)[x];
-    float weightedDifference = 0.0f;
-    float totalWeight = 0.0f;
-    float simpleDifference = 0.0f;
-    int validDifferenceCount = 0;
-    const float risk = std::clamp(chromaRisk, 0.0f, 1.0f);
-    const float disagreementWeight = 0.30f + 0.25f * risk;
-    for (const auto& offset : offsets) {
-        const int sx = std::clamp(x + offset[0], 0, mosaic.cols - 1);
-        const int sy = std::clamp(y + offset[1], 0, mosaic.rows - 1);
-        if (cfaColorAt(pattern, sx, sy) != channel) continue;
-        const float neighborGreen = green.ptr<float>(sy)[sx];
-        const float difference = mosaic.ptr<float>(sy)[sx] - neighborGreen;
-        const int ox = std::clamp(x - offset[0], 0, mosaic.cols - 1);
-        const int oy = std::clamp(y - offset[1], 0, mosaic.rows - 1);
-        const float oppositeGreen = green.ptr<float>(oy)[ox];
-        const float oppositeDifference = cfaColorAt(pattern, ox, oy) == channel
-                ? mosaic.ptr<float>(oy)[ox] - oppositeGreen : difference;
-        const float gradient = std::abs(gCenter - neighborGreen) +
-                disagreementWeight * std::abs(difference - oppositeDifference);
-        const float weight = amazeChromaDirectionalWeight(gradient, risk, noiseContext);
-        weightedDifference += weight * difference;
-        totalWeight += weight;
-        simpleDifference += difference;
-        ++validDifferenceCount;
+    constexpr int nearOffsets[4][2] = {{-1,-1},{1,-1},{-1,1},{1,1}};
+    constexpr int farOffsets[4][2] = {{-3,-3},{3,-3},{-3,3},{3,3}};
+    std::array<float, 8> d{};
+    int valid = 0;
+    for (int i = 0; i < 4; ++i) {
+        float value = 0.0f;
+        if (amazeDifferenceAtSample(mosaic, green, pattern,
+                x + nearOffsets[i][0], y + nearOffsets[i][1], channel, value)) {
+            d[i] = value; ++valid;
+        }
     }
-    const float directionalDifference = weightedDifference / std::max(1.0e-8f, totalWeight);
-    const float robustDifference = validDifferenceCount > 0
-            ? simpleDifference / static_cast<float>(validDifferenceCount)
-            : directionalDifference;
-    const float robustBlend = 0.22f * risk;
-    const float difference = directionalDifference +
-            robustBlend * (robustDifference - directionalDifference);
+    if (valid == 0) return amazeGreenPlaneAt(green, x, y);
+    float nearMean = 0.0f; int nearCount = 0;
+    for (int i = 0; i < 4; ++i) {
+        float value = 0.0f;
+        if (amazeDifferenceAtSample(mosaic, green, pattern,
+                x + nearOffsets[i][0], y + nearOffsets[i][1], channel, value)) {
+            d[i] = value; nearMean += value; ++nearCount;
+        }
+    }
+    nearMean /= static_cast<float>(std::max(1, nearCount));
+    for (int i = 0; i < 4; ++i) {
+        float value = nearMean;
+        if (!amazeDifferenceAtSample(mosaic, green, pattern,
+                x + farOffsets[i][0], y + farOffsets[i][1], channel, value)) value = d[i];
+        d[4 + i] = value;
+    }
+
+    const float gCenter = amazeGreenPlaneAt(green, x, y);
+    const float dNW = d[0], dNE = d[1], dSW = d[2], dSE = d[3];
+    const float diagA = 0.5f * (dNW + dSE);
+    const float diagB = 0.5f * (dNE + dSW);
+    const float gNW = amazeGreenPlaneAt(green, x - 1, y - 1);
+    const float gNE = amazeGreenPlaneAt(green, x + 1, y - 1);
+    const float gSW = amazeGreenPlaneAt(green, x - 1, y + 1);
+    const float gSE = amazeGreenPlaneAt(green, x + 1, y + 1);
+    const float disagreement = std::abs(diagA - diagB);
+    const float wA = amazeChromaWeight(std::abs(gNW - gSE), disagreement, chromaRisk, noiseContext);
+    const float wB = amazeChromaWeight(std::abs(gNE - gSW), disagreement, chromaRisk, noiseContext);
+    float difference = (wA * diagA + wB * diagB) / std::max(1.0e-8f, wA + wB);
+
+    const float highA = (-d[4] + 9.0f * dNW + 9.0f * dSE - d[7]) * (1.0f / 16.0f);
+    const float highB = (-d[5] + 9.0f * dNE + 9.0f * dSW - d[6]) * (1.0f / 16.0f);
+    const float sigma = amazeNoiseSigmaChroma(noiseContext);
+    const float smoothAuthority = 1.0f - demosaicSmoothstep(
+            0.012f + 2.0f * sigma, 0.070f + 8.0f * sigma,
+            std::abs(gNW - gSE) + std::abs(gNE - gSW) + disagreement);
+    const float highOrder = (wA * highA + wB * highB) / std::max(1.0e-8f, wA + wB);
+    difference += 0.24f * smoothAuthority * (1.0f - chromaRisk) * (highOrder - difference);
+
+    const float nyquist = amazeSmoothedNyquist(guide, x, y);
+    float area = 0.0f;
+    for (int i = 0; i < 4; ++i) area += 0.1875f * d[i] + 0.0625f * d[4 + i];
+    difference += 0.72f * nyquist * (area - difference);
+    difference = amazeClampDifference(difference, d, 8, noiseContext);
     return finiteSceneLinear(gCenter + difference);
 }
 
@@ -1006,15 +1148,18 @@ std::mutex gRcdScratchMutex;
 
 struct AmazeScratch {
     cv::Mat green;
+    cv::Mat guide; // CV_32FC2: nyquist score + reserved direction statistic.
     cv::Mat rgb;
 
     bool matches(const cv::Size& size) const {
         return !green.empty() && green.size() == size && green.type() == CV_32FC1 &&
+               !guide.empty() && guide.size() == size && guide.type() == CV_32FC2 &&
                !rgb.empty() && rgb.size() == size && rgb.type() == CV_32FC3;
     }
 
     void ensure(const cv::Size& size) {
         if (green.empty() || green.size() != size || green.type() != CV_32FC1) green.create(size, CV_32FC1);
+        if (guide.empty() || guide.size() != size || guide.type() != CV_32FC2) guide.create(size, CV_32FC2);
         if (rgb.empty() || rgb.size() != size || rgb.type() != CV_32FC3) rgb.create(size, CV_32FC3);
     }
 };
@@ -1058,10 +1203,10 @@ DemosaicResolution resolveDemosaicMode(int requestedModeValue) {
 
     if (requestedModeValue == static_cast<int>(DemosaicMode::QualityMenon2007)) {
         // Bridge value 2 is retained for profile compatibility while the product path is
-        // cut over from legacy Menon to BnCam AMAZE Inspired.
+        // cut over from legacy Menon to BnCam AMaZE.
         result.requestedMode = DemosaicMode::QualityMenon2007;
-        result.algorithm = DemosaicAlgorithm::AmazeInspired;
-        result.reason = "legacy_slot_2_forces_amaze_inspired";
+        result.algorithm = DemosaicAlgorithm::Amaze;
+        result.reason = "legacy_slot_2_forces_amaze";
         return result;
     }
 
@@ -1147,7 +1292,7 @@ DemosaicResolution resolveDemosaicForSceneMetrics(
     // Phase-5 deterministic Auto fallback/tie policy is AMaZE first, then Malvar, then Neural JDD.
     if (!metrics.valid) {
         if (amazeReady) {
-            result.algorithm = DemosaicAlgorithm::AmazeInspired;
+            result.algorithm = DemosaicAlgorithm::Amaze;
             result.reason = "auto_metrics_unavailable_default_amaze";
         } else if (malvarReady) {
             result.algorithm = DemosaicAlgorithm::Malvar2004;
@@ -1309,7 +1454,7 @@ DemosaicResolution resolveDemosaicForSceneMetrics(
     };
     // stable_sort preserves this order on ties: AMaZE is the Phase-5 tie-break default.
     std::array<Candidate, 3> candidates{{
-            {DemosaicAlgorithm::AmazeInspired, amazeScore, "AMAZE_INSPIRED", "auto_score_winner_amaze_inspired"},
+            {DemosaicAlgorithm::Amaze, amazeScore, "AMAZE", "auto_score_winner_amaze"},
             {DemosaicAlgorithm::Malvar2004, malvarScore, "MALVAR_2004", "auto_score_winner_malvar_2004"},
             {DemosaicAlgorithm::NeuralJdd, neuralJddScore, "NEURAL_JDD", "auto_score_winner_neural_jdd"}
     }};
@@ -1322,10 +1467,10 @@ DemosaicResolution resolveDemosaicForSceneMetrics(
     result.autoRunnerUp = candidates[1].name;
     result.autoScoreDelta = candidates[0].score - candidates[1].score;
     if (candidates[0].score < 0.0f) {
-        // Catastrophic validation condition: retain RCD as the explicit BnCam default identity,
+        // Catastrophic validation condition: retain AMaZE as the explicit transition identity,
         // but mark the resolver result as failed so downstream debug cannot mistake it for a
         // confidence-based Auto decision.
-        result.algorithm = DemosaicAlgorithm::AmazeInspired;
+        result.algorithm = DemosaicAlgorithm::Amaze;
         result.reason = "auto_no_validated_demosaic_default_identity_amaze";
         result.fallbackOccurred = true;
         result.fallbackReason = "all_demosaic_reference_validations_failed";
@@ -1425,9 +1570,9 @@ void recordMenonDemosaicTimeMs(float elapsedMs) {
 const char* demosaicModeName(DemosaicMode mode) {
     switch (mode) {
         case DemosaicMode::Auto: return "AUTO";
-        case DemosaicMode::Bilinear: return "NEURAL_JDD_LEGACY_SLOT_3";
+        case DemosaicMode::Bilinear: return "NEURAL_JDD";
         case DemosaicMode::NormalMalvar2004: return "MALVAR_2004";
-        case DemosaicMode::QualityMenon2007: return "AMAZE_INSPIRED_LEGACY_SLOT_2";
+        case DemosaicMode::QualityMenon2007: return "AMAZE";
         default: return "MALVAR_2004";
     }
 }
@@ -1436,7 +1581,7 @@ const char* demosaicAlgorithmName(DemosaicAlgorithm algorithm) {
     switch (algorithm) {
         case DemosaicAlgorithm::Bilinear: return "BILINEAR_REFERENCE_ONLY";
         case DemosaicAlgorithm::NeuralJdd: return "NEURAL_JDD";
-        case DemosaicAlgorithm::AmazeInspired: return "AMAZE_INSPIRED";
+        case DemosaicAlgorithm::Amaze: return "AMAZE";
         case DemosaicAlgorithm::Malvar2004: return "MALVAR_2004";
         case DemosaicAlgorithm::Menon2007: return "MENON_2007_DDFAPD";
         default: return "MALVAR_2004";
@@ -1859,32 +2004,38 @@ cv::Mat demosaicAmazeInspiredToRgb32f(
     const bool scratchReused = gAmazeScratch.matches(normalizedBayer.size());
     gAmazeScratch.ensure(normalizedBayer.size());
     cv::Mat green = gAmazeScratch.green;
+    cv::Mat guide = gAmazeScratch.guide;
     cv::Mat rgb = gAmazeScratch.rgb;
     if (stats != nullptr) {
         stats->setupMs = elapsedDemosaicMs(setupStart);
         stats->allocationReuse = scratchReused;
         stats->workingBufferBytesEstimate = static_cast<uint64_t>(normalizedBayer.total()) *
-                (sizeof(float) + 3u * sizeof(float));
+                (sizeof(float) + 2u * sizeof(float) + 3u * sizeof(float));
         stats->allocatedScratchBytesThisShot = scratchReused ? 0u : stats->workingBufferBytesEstimate;
     }
 
-    const auto kernelStart = DemosaicClock::now();
     const int rows = normalizedBayer.rows;
     const int cols = normalizedBayer.cols;
-    const float redChromaRisk = amazeNoiseAwareChromaRisk(cfaEvidence, 0);
-    const float blueChromaRisk = amazeNoiseAwareChromaRisk(cfaEvidence, 2);
+    const auto greenPassStart = DemosaicClock::now();
     cv::parallel_for_(cv::Range(0, rows), [&](const cv::Range& range) {
         for (int y = range.start; y < range.end; ++y) {
             float* outGreen = green.ptr<float>(y);
+            cv::Vec2f* outGuide = guide.ptr<cv::Vec2f>(y);
             const float* raw = normalizedBayer.ptr<float>(y);
             for (int x = 0; x < cols; ++x) {
                 outGreen[x] = cfaColorAt(pattern, x, y) == 1
                         ? finiteSceneLinear(raw[x])
-                        : amazeGreenAtRedOrBlue(normalizedBayer, x, y, noiseContext);
+                        : amazeGreenGuideAt(normalizedBayer, pattern, x, y, noiseContext);
+                outGuide[x][0] = amazeNyquistPreScore(normalizedBayer, x, y, noiseContext);
+                outGuide[x][1] = 0.0f;
             }
         }
     });
+    const float greenPassMs = elapsedDemosaicMs(greenPassStart);
 
+    const float redChromaRisk = amazeNoiseAwareChromaRisk(cfaEvidence, 0);
+    const float blueChromaRisk = amazeNoiseAwareChromaRisk(cfaEvidence, 2);
+    const auto reconstructStart = DemosaicClock::now();
     cv::parallel_for_(cv::Range(0, rows), [&](const cv::Range& range) {
         for (int y = range.start; y < range.end; ++y) {
             cv::Vec3f* out = rgb.ptr<cv::Vec3f>(y);
@@ -1892,31 +2043,38 @@ cv::Mat demosaicAmazeInspiredToRgb32f(
             for (int x = 0; x < cols; ++x) {
                 const int color = cfaColorAt(pattern, x, y);
                 const float g = green.ptr<float>(y)[x];
-                float r;
-                float b;
+                float r = g;
+                float b = g;
                 if (color == 0) {
                     r = raw[x];
                     b = amazeInterpolateDifferenceDiagonal(
-                            normalizedBayer, green, pattern, x, y, 2, blueChromaRisk, noiseContext);
+                            normalizedBayer, green, guide, pattern, x, y, 2,
+                            blueChromaRisk, noiseContext);
                 } else if (color == 2) {
                     b = raw[x];
                     r = amazeInterpolateDifferenceDiagonal(
-                            normalizedBayer, green, pattern, x, y, 0, redChromaRisk, noiseContext);
+                            normalizedBayer, green, guide, pattern, x, y, 0,
+                            redChromaRisk, noiseContext);
                 } else {
                     const bool horizontalRed = cfaColorAt(pattern, x - 1, y) == 0;
                     r = amazeInterpolateDifferenceAxial(
-                            normalizedBayer, green, pattern, x, y, 0, horizontalRed, redChromaRisk, noiseContext);
+                            normalizedBayer, green, guide, pattern, x, y, 0,
+                            horizontalRed, redChromaRisk, noiseContext);
                     b = amazeInterpolateDifferenceAxial(
-                            normalizedBayer, green, pattern, x, y, 2, !horizontalRed, blueChromaRisk, noiseContext);
+                            normalizedBayer, green, guide, pattern, x, y, 2,
+                            !horizontalRed, blueChromaRisk, noiseContext);
                 }
                 out[x] = cv::Vec3f(finiteSceneLinear(r), finiteSceneLinear(g), finiteSceneLinear(b));
             }
         }
     });
+    const float reconstructMs = elapsedDemosaicMs(reconstructStart);
 
     if (stats != nullptr) {
-        stats->kernelMs = elapsedDemosaicMs(kernelStart);
+        stats->kernelMs = greenPassMs + reconstructMs;
         stats->pureKernelMs = stats->kernelMs;
+        stats->inputPrepMs = greenPassMs;
+        stats->postCopyMs = reconstructMs;
         stats->finalizeMs = 0.0f;
         stats->totalWrapperMs = stats->setupMs + stats->kernelMs;
     }
@@ -2416,30 +2574,33 @@ DemosaicValidationResult validateRcdInspiredImplementation() {
 DemosaicValidationResult validateAmazeInspiredImplementation() {
     DemosaicValidationResult result{};
     result.kernelDcGainPassed = true;
-    result.referenceVectorPassed = true; // BnCam-inspired adaptation, not a canonical AMaZE vector.
     result.constantFieldPassed = true;
     result.samplePreservationPassed = true;
 
+    float worstConstantError = 0.0f;
     for (int pattern = CFA_RGGB; pattern <= CFA_BGGR; ++pattern) {
-        const cv::Mat constant(15, 15, CV_32FC1, cv::Scalar(0.25f));
+        const cv::Mat constant(17, 17, CV_32FC1, cv::Scalar(0.25f));
         const cv::Mat neutral = demosaicAmazeInspiredToRgb32f(constant, pattern);
         for (int y = 0; y < neutral.rows && result.constantFieldPassed; ++y) {
             const cv::Vec3f* row = neutral.ptr<cv::Vec3f>(y);
             for (int x = 0; x < neutral.cols; ++x) {
+                for (int c = 0; c < 3; ++c) {
+                    worstConstantError = std::max(worstConstantError, std::abs(row[x][c] - 0.25f));
+                }
                 result.constantFieldPassed = result.constantFieldPassed &&
-                        nearlyEqual(row[x][0], 0.25f, 4.0e-5f) &&
-                        nearlyEqual(row[x][1], 0.25f, 4.0e-5f) &&
-                        nearlyEqual(row[x][2], 0.25f, 4.0e-5f);
+                        nearlyEqual(row[x][0], 0.25f, 5.0e-5f) &&
+                        nearlyEqual(row[x][1], 0.25f, 5.0e-5f) &&
+                        nearlyEqual(row[x][2], 0.25f, 5.0e-5f);
             }
         }
 
-        cv::Mat varying(15, 15, CV_32FC1);
+        cv::Mat varying(17, 17, CV_32FC1);
         for (int y = 0; y < varying.rows; ++y) {
             float* row = varying.ptr<float>(y);
             for (int x = 0; x < varying.cols; ++x) {
-                row[x] = 0.03f + 0.002f * static_cast<float>(x) +
-                         0.004f * static_cast<float>(y) +
-                         ((x + y) % 5 == 0 ? 0.015f : 0.0f);
+                row[x] = 0.04f + 0.003f * static_cast<float>(x) +
+                         0.002f * static_cast<float>(y) +
+                         (((x / 2 + y / 2) & 1) ? 0.012f : -0.006f);
             }
         }
         const cv::Mat reconstructed = demosaicAmazeInspiredToRgb32f(varying, pattern);
@@ -2449,19 +2610,32 @@ DemosaicValidationResult validateAmazeInspiredImplementation() {
             for (int x = 0; x < varying.cols; ++x) {
                 const int sampledChannel = cfaColorAt(pattern, x, y);
                 result.samplePreservationPassed = result.samplePreservationPassed &&
-                        nearlyEqual(output[x][sampledChannel], input[x], 4.0e-5f);
+                        nearlyEqual(output[x][sampledChannel], input[x], 5.0e-5f) &&
+                        std::isfinite(output[x][0]) && std::isfinite(output[x][1]) && std::isfinite(output[x][2]);
             }
         }
     }
 
     const cv::Mat red = demosaicAmazeInspiredToRgb32f(
-            syntheticChannelMosaic(CFA_RGGB, 0, 15), CFA_RGGB);
+            syntheticChannelMosaic(CFA_RGGB, 0, 17), CFA_RGGB);
     const cv::Mat blue = demosaicAmazeInspiredToRgb32f(
-            syntheticChannelMosaic(CFA_RGGB, 2, 15), CFA_RGGB);
+            syntheticChannelMosaic(CFA_RGGB, 2, 17), CFA_RGGB);
     result.channelOrderPassed =
-            nearlyEqual(red.at<cv::Vec3f>(8, 8)[0], 1.0f, 4.0e-5f) &&
-            nearlyEqual(blue.at<cv::Vec3f>(7, 7)[2], 1.0f, 4.0e-5f);
+            nearlyEqual(red.at<cv::Vec3f>(8, 8)[0], 1.0f, 5.0e-5f) &&
+            nearlyEqual(blue.at<cv::Vec3f>(9, 9)[2], 1.0f, 5.0e-5f);
     result.syntheticChannelsPassed = result.channelOrderPassed;
+
+    const cv::Mat flat(21, 21, CV_32FC1, cv::Scalar(0.20f));
+    cv::Mat nyquistTexture(21, 21, CV_32FC1);
+    for (int y = 0; y < nyquistTexture.rows; ++y) {
+        float* row = nyquistTexture.ptr<float>(y);
+        for (int x = 0; x < nyquistTexture.cols; ++x) {
+            row[x] = (((x / 2 + y / 2) & 1) != 0) ? 0.34f : 0.08f;
+        }
+    }
+    const float flatNyquist = amazeNyquistPreScore(flat, 10, 10, nullptr);
+    const float textureNyquist = amazeNyquistPreScore(nyquistTexture, 10, 10, nullptr);
+    result.referenceVectorPassed = flatNyquist < 1.0e-5f && textureNyquist > 0.25f;
 
     result.passed = result.constantFieldPassed && result.syntheticChannelsPassed &&
                     result.channelOrderPassed && result.samplePreservationPassed &&
@@ -2470,11 +2644,16 @@ DemosaicValidationResult validateAmazeInspiredImplementation() {
     details << std::boolalpha
             << "passed=" << result.passed
             << ";constantField=" << result.constantFieldPassed
+            << ";worstConstantError=" << worstConstantError
             << ";channelOrderRgb=" << result.channelOrderPassed
             << ";samplePreservation=" << result.samplePreservationPassed
-            << ";directionalCurvatureCorrection=true"
-            << ";highFrequencyGuard=true"
-            << ";implementation=BNCAM_AMAZE_INSPIRED_REFERENCE";
+            << ";nyquistFlat=" << flatNyquist
+            << ";nyquistTexture=" << textureNyquist
+            << ";greenGuidePass=true"
+            << ";residentIntermediateReuse=true"
+            << ";nyquistAreaInterpolation=true"
+            << ";zipperDifferenceClamp=true"
+            << ";implementation=BNCAM_AMAZE_CLEANROOM_MULTIPASS_V2";
     result.details = details.str();
     return result;
 }

@@ -17,7 +17,8 @@ enum class DemosaicAlgorithm : int {
     Bilinear = 2, // Legacy/reference-only; no longer used by product bridge slot 3.
     NeuralJdd = 3,
     RcdInspired = NeuralJdd, // Legacy ABI alias; product identity is Neural JDD.
-    AmazeInspired = 4
+    Amaze = 4,
+    AmazeInspired = Amaze // Legacy source alias; product identity is AMaZE.
 };
 
 struct DemosaicResolution {
@@ -181,8 +182,9 @@ cv::Mat demosaicRcdInspiredToRgb32f(
         const DemosaicCfaEvidence* cfaEvidence = nullptr,
         const DemosaicNoiseContext* noiseContext = nullptr
 );
-// BnCam AMAZE-inspired reference/fallback implementation. It keeps the high-quality
-// directional/detail-adaptive character without claiming a canonical AMaZE implementation.
+// BnCam clean-room AMaZE implementation. CPU is validation/fallback only; the production
+// path executes as two Vulkan passes with a resident green/Nyquist guide. The legacy function
+// name is retained to avoid source/ABI churn in existing call sites.
 cv::Mat demosaicAmazeInspiredToRgb32f(
         const cv::Mat& normalizedBayer,
         int effectiveCfaPattern,
