@@ -21,6 +21,7 @@ enum class SpectraGpuDemosaicAlgorithm : std::uint32_t {
     RCD_INSPIRED = NEURAL_JDD, // Legacy ABI alias only; no RCD product route.
     AMAZE = 4u,
     AMAZE_INSPIRED = AMAZE, // Legacy source alias only; product identity is AMaZE.
+    AUTO_HYBRID = 5u,
 };
 
 struct SpectraResidentDemosaicRequest {
@@ -51,6 +52,12 @@ struct SpectraResidentDemosaicRequest {
     float noiseSigmaY = 0.0f;
     float noiseSigmaChroma = 0.0f;
     float noisePressure = 0.0f;
+
+    // Delta 0048: scene-level soft priors. AUTO_HYBRID combines them with local
+    // structure/Nyquist/chroma/noise evidence; they are never hard route selectors.
+    float autoMalvarPrior = 1.0f / 3.0f;
+    float autoNeuralJddPrior = 1.0f / 3.0f;
+    float autoAmazePrior = 1.0f / 3.0f;
 };
 
 struct SpectraResidentDemosaicResult {
@@ -79,6 +86,8 @@ struct SpectraResidentDemosaicResult {
     float kernelMs = 0.0f;
     float amazeGreenPassMs = 0.0f;
     float amazeReconstructPassMs = 0.0f;
+    float autoHybridGuidePassMs = 0.0f;
+    float autoHybridBlendPassMs = 0.0f;
     float residualKernelMs = 0.0f;
     float readbackMs = 0.0f;
     float synchronizationMs = 0.0f;
@@ -163,7 +172,7 @@ struct SpectraResidentColorTransformResult {
 /**
  * Milestone 8H-E/F resident demosaic + colour backend.
  *
- * Malvar, Neural JDD and AMaZE are GPU-primary. Menon/Bilinear remain reference-only legacy paths. A successful demosaic keeps its RGB in deviceOutput_; AWB+CCM
+ * Malvar, Neural JDD, AMaZE and Auto Hybrid are GPU-primary. Menon/Bilinear remain reference-only legacy paths. A successful demosaic keeps its RGB in deviceOutput_; AWB+CCM
  * can consume that generation directly, transform in-place, reduce compact colour statistics,
  * and perform one final RGB readback without a duplicate CPU colour pass.
  */
@@ -262,8 +271,8 @@ private:
     PersistentBuffer outputReadback_;
     PersistentBuffer deviceInput_;
     PersistentBuffer deviceOutput_;
-    // Reused by two mutually exclusive roles: CPU RGB upload for typed fallback, or
-    // AMaZE resident guide scratch (green, Nyquist score, reserved) during demosaic.
+    // Reused by mutually exclusive roles: CPU RGB upload for typed fallback, AMaZE resident
+    // guide scratch, or Auto-Hybrid guide scratch (green, Nyquist score, local structure).
     PersistentBuffer rgbUpload_;
     // Twelve float sums per 16x16 workgroup: raw/WB/CCM means plus cloud-correction telemetry.
     PersistentBuffer colorStatistics_;

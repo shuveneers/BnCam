@@ -40,6 +40,13 @@ struct DemosaicResolution {
     float autoAmazeScore = 0.0f;
     float autoCfaChromaRisk = 0.0f;
     float autoScoreDelta = 0.0f;
+    // Delta 0048: Auto no longer resolves to one whole-frame reconstruction. The scene-level
+    // scores become soft global priors for a region-aware GPU blend. algorithm remains the
+    // dominant single-route candidate only as an explicit CPU failure fallback/noise proxy.
+    bool autoHybridExecution = false;
+    float autoMalvarPrior = 0.0f;
+    float autoNeuralJddPrior = 0.0f;
+    float autoAmazePrior = 0.0f;
     std::string autoRunnerUp = "not_used";
     std::string autoSignals = "not_used";
 };

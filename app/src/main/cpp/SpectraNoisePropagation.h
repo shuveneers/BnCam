@@ -398,6 +398,42 @@ inline NoiseState propagateDemosaic(
     return output;
 }
 
+inline NoiseState propagateAutoHybridDemosaic(
+        const NoiseState& input,
+        double malvarPrior,
+        double neuralJddPrior,
+        double amazePrior,
+        std::string stage = "POST_DEMOSAIC_RGB"
+) {
+    double wm = finite(malvarPrior) ? std::max(0.0, malvarPrior) : 0.0;
+    double wn = finite(neuralJddPrior) ? std::max(0.0, neuralJddPrior) : 0.0;
+    double wa = finite(amazePrior) ? std::max(0.0, amazePrior) : 0.0;
+    const double sum = wm + wn + wa;
+    if (sum > 1.0e-12) {
+        wm /= sum; wn /= sum; wa /= sum;
+    } else {
+        wm = wn = wa = 1.0 / 3.0;
+    }
+    const auto malvar = demosaicNoiseTransferMatrix(DemosaicModel::Malvar2004);
+    // The legacy RcdInspired noise slot is currently the conservative calibrated proxy for
+    // the Neural-JDD product route. Measured post-demosaic residuals remain authoritative.
+    const auto neural = demosaicNoiseTransferMatrix(DemosaicModel::RcdInspired);
+    const auto amaze = demosaicNoiseTransferMatrix(DemosaicModel::AmazeInspired);
+    std::array<double, 9> blended{};
+    for (std::size_t i = 0; i < blended.size(); ++i) {
+        // Amplitude-domain convex envelope. Local Auto-Hybrid weights vary spatially, so this
+        // scene-prior estimate deliberately carries lower confidence than a fixed reconstruction.
+        blended[i] = wm * malvar[i] + wn * neural[i] + wa * amaze[i];
+    }
+    return propagateLinear(
+            input,
+            blended,
+            std::move(stage),
+            "AUTO_HYBRID_PRIOR_WEIGHTED_LOCAL_BLEND_ENERGY_PROXY",
+            0.58
+    );
+}
+
 inline NoiseState propagateOpponentGains(
         const NoiseState& input,
         double yGain,

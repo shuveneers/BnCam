@@ -14,7 +14,7 @@ layout(push_constant) uniform Params {
     uint frameWidth;
     uint frameHeight;
     uint cfaPattern;
-    uint mode; // 0 bilinear, 1 Malvar, 2 Neural JDD, 3 AWB+CCM, 4 residual, 5 AMaZE guide, 6 AMaZE reconstruct
+    uint mode; // 0 bilinear, 1 Malvar, 2 Neural JDD, 3 AWB+CCM, 4 residual, 5/6 AMaZE, 7/8 Auto Hybrid
     float wbR;
     float wbG;
     float wbB;
@@ -215,7 +215,7 @@ const float JDD_B2[6] = float[6](0.0668660626f, -0.146059602f, -0.115928359f, -0
 const float JDD_W3[18] = float[18](0.139109358f, 0.0242330916f, -0.293121904f, 0.207865596f, -0.100197829f, -0.135519683f, 0.074903354f, 0.00169213093f, 0.187972188f, 0.0709970519f, -0.0378903039f, -0.0848642215f, 0.139481008f, -0.00834472291f, -0.295376927f, 0.208003417f, -0.101541586f, -0.137124583f);
 const float JDD_B3[3] = float[3](-0.00903598685f, -0.00150470249f, -0.00986603275f);
 
-vec3 neuralJddAt(int x, int y) {
+vec3 neuralJddResidualAt(int x, int y) {
     float features[34];
     for (int i = 0; i < 34; ++i) features[i] = 0.0;
     int featureIndex = 0;
@@ -247,8 +247,13 @@ vec3 neuralJddAt(int x, int y) {
         for (int j = 0; j < 6; ++j) sum += JDD_W3[channel * 6 + j] * hidden2[j];
         residual[channel] = clamp(sum, -0.25, 0.25);
     }
+    return vec3(finiteLinear(residual.r), finiteLinear(residual.g), finiteLinear(residual.b));
+
+}
+
+vec3 neuralJddAt(int x, int y) {
     vec3 baseline = malvarAt(x, y);
-    vec3 value = baseline + residual;
+    vec3 value = baseline + neuralJddResidualAt(x, y);
     return vec3(finiteLinear(value.r), finiteLinear(value.g), finiteLinear(value.b));
 }
 
@@ -344,6 +349,7 @@ void amazeGuidePass(int x, int y) {
     uint idx = uint(y) * pc.frameWidth + uint(x);
     uint base = idx * 3u;
     uint color = cfaColorAt(pc.cfaPattern, x, y);
+    float nyq = amazeNyquistPreScore(x, y);
     float green;
     if (color == 1u) {
         green = sampleClamped(x, y);
@@ -353,7 +359,6 @@ void amazeGuidePass(int x, int y) {
         float wh = 1.0 / (h.y * h.y + 1.0e-10);
         float wv = 1.0 / (v.y * v.y + 1.0e-10);
         green = (wh * h.x + wv * v.x) / max(1.0e-8, wh + wv);
-        float nyq = amazeNyquistPreScore(x, y);
         green += 0.25 * nyq * (0.5 * (h.x + v.x) - green);
         float left = sampleClamped(x - 1, y);
         float right = sampleClamped(x + 1, y);
@@ -364,9 +369,18 @@ void amazeGuidePass(int x, int y) {
         float guard = max(3.0 * amazeSigmaY(), 0.18 * max(1.0e-5, hi - lo));
         green = clamp(green, lo - guard, hi + guard);
     }
+    float gx = abs(sampleClamped(x + 1, y) - sampleClamped(x - 1, y));
+    float gy = abs(sampleClamped(x, y + 1) - sampleClamped(x, y - 1));
+    float gd1 = abs(sampleClamped(x + 1, y + 1) - sampleClamped(x - 1, y - 1));
+    float gd2 = abs(sampleClamped(x + 1, y - 1) - sampleClamped(x - 1, y + 1));
+    float sigma = amazeSigmaY();
+    float structureRaw = 0.40 * max(gx, gy) + 0.25 * min(gx, gy) + 0.175 * (gd1 + gd2);
+    float structureLo = 0.012 + 2.5 * sigma;
+    float structureHi = 0.095 + 9.0 * sigma;
+    float structure = smoothstep(structureLo, max(structureLo + 1.0e-5, structureHi), structureRaw);
     colorRgb[base + 0u] = finiteLinear(green);
-    colorRgb[base + 1u] = amazeNyquistPreScore(x, y);
-    colorRgb[base + 2u] = 0.0;
+    colorRgb[base + 1u] = nyq;
+    colorRgb[base + 2u] = clamp(structure, 0.0, 1.0);
 }
 
 float amazeGuideGreen(int x, int y) {
@@ -385,6 +399,18 @@ float amazeSmoothedNyquist(int x, int y) {
     return clamp(0.50 * amazeGuideNyquist(x, y) + 0.125 * (
             amazeGuideNyquist(x - 2, y) + amazeGuideNyquist(x + 2, y) +
             amazeGuideNyquist(x, y - 2) + amazeGuideNyquist(x, y + 2)), 0.0, 1.0);
+}
+
+float amazeGuideStructure(int x, int y) {
+    int sx = safeCoord(x, int(pc.frameWidth));
+    int sy = safeCoord(y, int(pc.frameHeight));
+    return clamp(colorRgb[(uint(sy) * pc.frameWidth + uint(sx)) * 3u + 2u], 0.0, 1.0);
+}
+
+float autoHybridSmoothedStructure(int x, int y) {
+    return clamp(0.50 * amazeGuideStructure(x, y) + 0.125 * (
+            amazeGuideStructure(x - 2, y) + amazeGuideStructure(x + 2, y) +
+            amazeGuideStructure(x, y - 2) + amazeGuideStructure(x, y + 2)), 0.0, 1.0);
 }
 
 bool amazeDifferenceAt(int x, int y, uint channel, out float difference) {
@@ -495,6 +521,57 @@ vec3 amazeReconstructAt(int x, int y) {
     }
     return vec3(finiteLinear(r),finiteLinear(g),finiteLinear(b));
 }
+
+vec3 autoHybridGlobalPrior() {
+    vec3 prior = max(vec3(pc.ccm0, pc.ccm1, pc.ccm2), vec3(0.0));
+    float sum = prior.r + prior.g + prior.b;
+    return sum > 1.0e-6 ? prior / sum : vec3(1.0 / 3.0);
+}
+
+float autoHybridSecondLargest(vec3 v) {
+    float hi = max(v.r, max(v.g, v.b));
+    float lo = min(v.r, min(v.g, v.b));
+    return v.r + v.g + v.b - hi - lo;
+}
+
+vec3 autoHybridAt(int x, int y) {
+    vec3 prior = autoHybridGlobalPrior();
+    float structure = autoHybridSmoothedStructure(x, y);
+    float nyquist = amazeSmoothedNyquist(x, y);
+    float noise = demosaicNoisePressure();
+    float chromaRisk = 0.5 * (amazeChromaRisk(0u) + amazeChromaRisk(2u));
+    float center = clamp(sampleClamped(x, y), 0.0, 1.0);
+    float lowSignal = 1.0 - smoothstep(0.035, 0.18, center);
+
+    // Local evidence modifies, but never replaces, the global prior. Malvar is the stable
+    // anchor, Neural JDD receives authority in noisy/chroma-risk regions, and AMaZE receives
+    // authority on coherent high-frequency/Nyquist structure when noise pressure is controlled.
+    float malvar = prior.r * (0.86 + 0.30 * noise + 0.16 * chromaRisk +
+                              0.10 * lowSignal + 0.08 * (1.0 - structure));
+    float neural = prior.g * (0.78 + 0.62 * noise + 0.24 * chromaRisk +
+                              0.16 * lowSignal + 0.10 * structure - 0.18 * nyquist);
+    float amaze = prior.b * (0.74 + 0.58 * structure + 0.72 * nyquist -
+                             0.42 * noise - 0.18 * chromaRisk - 0.08 * lowSignal);
+    vec3 weights = max(vec3(malvar, neural, amaze), vec3(0.015));
+    weights /= max(1.0e-6, weights.r + weights.g + weights.b);
+
+    // Spatial confidence regularization: structure/Nyquist are already 5-point smoothed. This
+    // dominance dead-band pulls near-ties toward the scene prior, suppressing patch boundaries
+    // and winner flicker without creating a hard regional selector.
+    float top = max(weights.r, max(weights.g, weights.b));
+    float second = autoHybridSecondLargest(weights);
+    float nearTie = 1.0 - smoothstep(0.045, 0.16, top - second);
+    weights = mix(weights, prior, 0.35 * nearTie);
+    weights = max(weights, 0.035 * prior);
+    weights /= max(1.0e-6, weights.r + weights.g + weights.b);
+
+    vec3 malvarRgb = malvarAt(x, y);
+    vec3 neuralRgb = malvarRgb + neuralJddResidualAt(x, y);
+    vec3 amazeRgb = amazeReconstructAt(x, y);
+    vec3 value = weights.r * malvarRgb + weights.g * neuralRgb + weights.b * amazeRgb;
+    return vec3(finiteLinear(value.r), finiteLinear(value.g), finiteLinear(value.b));
+}
+
 
 vec3 residentRgbAt(int x, int y) {
     int sx = clamp(x, 0, int(pc.frameWidth) - 1);
@@ -699,6 +776,22 @@ void main() {
     if (pc.mode == 6u) {
         if (!inside) return;
         vec3 rgb = amazeReconstructAt(int(gid.x), int(gid.y));
+        uint index = (gid.y * pc.frameWidth + gid.x) * 3u;
+        outputRgb[index + 0u] = rgb.r;
+        outputRgb[index + 1u] = rgb.g;
+        outputRgb[index + 2u] = rgb.b;
+        return;
+    }
+
+    if (pc.mode == 7u) {
+        if (!inside) return;
+        amazeGuidePass(int(gid.x), int(gid.y));
+        return;
+    }
+
+    if (pc.mode == 8u) {
+        if (!inside) return;
+        vec3 rgb = autoHybridAt(int(gid.x), int(gid.y));
         uint index = (gid.y * pc.frameWidth + gid.x) * 3u;
         outputRgb[index + 0u] = rgb.r;
         outputRgb[index + 1u] = rgb.g;

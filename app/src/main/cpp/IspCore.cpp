@@ -14705,7 +14705,12 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         request.noiseSigmaY = demosaicNoiseContext.sigmaY;
         request.noiseSigmaChroma = demosaicNoiseContext.sigmaChroma;
         request.noisePressure = demosaicNoiseContext.pressure;
-        switch (demosaicResolution.algorithm) {
+        request.autoMalvarPrior = demosaicResolution.autoMalvarPrior;
+        request.autoNeuralJddPrior = demosaicResolution.autoNeuralJddPrior;
+        request.autoAmazePrior = demosaicResolution.autoAmazePrior;
+        if (demosaicResolution.autoHybridExecution) {
+            request.algorithm = bncam::vulkan::SpectraGpuDemosaicAlgorithm::AUTO_HYBRID;
+        } else switch (demosaicResolution.algorithm) {
             case DemosaicAlgorithm::RcdInspired:
                 request.algorithm = bncam::vulkan::SpectraGpuDemosaicAlgorithm::RCD_INSPIRED;
                 break;
@@ -14760,15 +14765,26 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         linearRgb = runCpuDemosaicFallback();
     }
     const float demosaicMs = elapsedMs(demosaicStart);
+    const bool autoHybridUsedForOutput = demosaicResolution.autoHybridExecution && vulkanDemosaicResident;
+    if (demosaicResolution.autoHybridExecution && !autoHybridUsedForOutput) {
+        demosaicResolution.fallbackOccurred = true;
+        demosaicResolution.fallbackReason = "auto_hybrid_gpu_failed_typed_single_route_cpu_fallback";
+    }
     if (demosaicResolution.algorithm == DemosaicAlgorithm::Menon2007 && !vulkanDemosaic.gpuUsedForOutput) {
         recordMenonDemosaicTimeMs(demosaicMs);
     }
     const auto demosaicPropagationStart = IspClock::now();
-    residualNoiseState.postDemosaic = bncam::spectra2::propagateDemosaic(
-            residualNoiseState.preDemosaic,
-            resolvedDemosaicNoiseModel(demosaicResolution.algorithm),
-            "POST_DEMOSAIC_RGB"
-    );
+    residualNoiseState.postDemosaic = autoHybridUsedForOutput
+            ? bncam::spectra2::propagateAutoHybridDemosaic(
+                    residualNoiseState.preDemosaic,
+                    demosaicResolution.autoMalvarPrior,
+                    demosaicResolution.autoNeuralJddPrior,
+                    demosaicResolution.autoAmazePrior,
+                    "POST_DEMOSAIC_RGB")
+            : bncam::spectra2::propagateDemosaic(
+                    residualNoiseState.preDemosaic,
+                    resolvedDemosaicNoiseModel(demosaicResolution.algorithm),
+                    "POST_DEMOSAIC_RGB");
     residualNoiseState.demosaicPropagationMs = elapsedMs(demosaicPropagationStart);
     const auto measuredPostDemosaicStart = IspClock::now();
     residualNoiseState.measuredPostDemosaic = vulkanDemosaicResident
@@ -18278,23 +18294,24 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; rawFinalizePersistentReuseHit=" << (vulkanRawFinalize.persistentBufferReuseHit ? "true" : "false")
             << "; rawFinalizePersistentReallocated=" << (vulkanRawFinalize.persistentBufferReallocated ? "true" : "false")
             << "; requestedDemosaicMode=" << demosaicModeName(demosaicResolution.requestedMode)
-            << "; resolvedDemosaicAlgorithm=" << demosaicAlgorithmName(demosaicResolution.algorithm)
+            << "; resolvedDemosaicAlgorithm="
+            << (autoHybridUsedForOutput ? "AUTO_HYBRID" : demosaicAlgorithmName(demosaicResolution.algorithm))
             << "; demosaicCfaEvidenceContract="
             << (!demosaicCfaEvidence.available
                     ? "EVIDENCE_UNAVAILABLE"
-                    : demosaicResolution.algorithm == DemosaicAlgorithm::RcdInspired
-                            ? (demosaicNoiseContext.available
-                                    ? "RCD_OPPONENT_NOISE_SIGNIFICANCE_V2_ACTIVE"
-                                    : "RCD_OPPONENT_STABILIZATION_V1_ACTIVE")
-                            : demosaicResolution.algorithm == DemosaicAlgorithm::AmazeInspired
+                    : autoHybridUsedForOutput
+                            ? "AUTO_HYBRID_LOCAL_STRUCTURE_NYQUIST_CHROMA_NOISE_ACTIVE"
+                            : demosaicResolution.algorithm == DemosaicAlgorithm::RcdInspired
                                     ? (demosaicNoiseContext.available
-                                            ? "AMAZE_OPPONENT_NOISE_SIGNIFICANCE_V2_ACTIVE"
-                                            : "AMAZE_OPPONENT_STABILIZATION_V1_ACTIVE")
-                                    : demosaicResolution.algorithm == DemosaicAlgorithm::Malvar2004
+                                            ? "NEURAL_JDD_PHYSICAL_NOISE_CONTEXT_ACTIVE"
+                                            : "NEURAL_JDD_CFA_CONTEXT_ACTIVE")
+                                    : demosaicResolution.algorithm == DemosaicAlgorithm::AmazeInspired
                                             ? (demosaicNoiseContext.available
-                                                    ? "MALVAR_OPPONENT_NOISE_SIGNIFICANCE_V2_ACTIVE"
-                                                    : "MALVAR_OPPONENT_STABILIZATION_V1_ACTIVE")
-                                            : "WIRED_NO_RECONSTRUCTION_AUTHORITY_FOR_SELECTED_ALGORITHM")
+                                                    ? "AMAZE_OPPONENT_NOISE_SIGNIFICANCE_V2_ACTIVE"
+                                                    : "AMAZE_OPPONENT_STABILIZATION_V1_ACTIVE")
+                                            : demosaicResolution.algorithm == DemosaicAlgorithm::Malvar2004
+                                                    ? "PURE_MALVAR_HE_CUTLER_2004"
+                                                    : "WIRED_NO_RECONSTRUCTION_AUTHORITY_FOR_SELECTED_ALGORITHM")
             << "; demosaicCfaEvidenceSource="
             << (demosaicPhysicalEvidenceActive
                     ? "PHYSICAL_SINGLE_FRAME_SO"
@@ -18361,6 +18378,11 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; autoCfaChromaRisk=" << demosaicResolution.autoCfaChromaRisk
             << "; autoRunnerUp=" << demosaicResolution.autoRunnerUp
             << "; autoScoreDelta=" << demosaicResolution.autoScoreDelta
+            << "; autoHybridExecutionRequested=" << (demosaicResolution.autoHybridExecution ? "true" : "false")
+            << "; autoHybridUsedForOutput=" << (autoHybridUsedForOutput ? "true" : "false")
+            << "; autoMalvarPrior=" << demosaicResolution.autoMalvarPrior
+            << "; autoNeuralJddPrior=" << demosaicResolution.autoNeuralJddPrior
+            << "; autoAmazePrior=" << demosaicResolution.autoAmazePrior
             << "; autoSignals=" << demosaicResolution.autoSignals
             << "; baseChromaDenoiseStrength=" << baseChromaNrStrength
             << "; physicalChromaModelDriven=" << (physicalChromaBasePlan.modelDriven ? "true" : "false")
@@ -19280,6 +19302,10 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; vulkanDemosaicInputPackingMs=" << vulkanDemosaic.inputPackingMs
             << "; vulkanDemosaicUploadMs=" << vulkanDemosaic.uploadMs
             << "; vulkanDemosaicKernelMs=" << vulkanDemosaic.kernelMs
+            << "; vulkanDemosaicAmazeGuideMs=" << vulkanDemosaic.amazeGreenPassMs
+            << "; vulkanDemosaicAmazeReconstructMs=" << vulkanDemosaic.amazeReconstructPassMs
+            << "; vulkanDemosaicAutoHybridGuideMs=" << vulkanDemosaic.autoHybridGuidePassMs
+            << "; vulkanDemosaicAutoHybridBlendMs=" << vulkanDemosaic.autoHybridBlendPassMs
             << "; vulkanDemosaicResidualKernelMs=" << vulkanDemosaic.residualKernelMs
             << "; vulkanDemosaicReadbackMs=" << vulkanDemosaic.readbackMs
             << "; vulkanDemosaicFullReadbackDeferred="

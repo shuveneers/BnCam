@@ -9,8 +9,8 @@ enum class DemosaicMode(
 ) {
     // Internal enum symbols retain legacy names for persisted-profile/source compatibility.
     // Product bridge identities are 1=Malvar, 2=AMaZE,
-    // 3=Neural JDD. Auto remains the transition selector until final Auto Hybrid hysteresis lands.
-    AUTO(0, "Auto", true),
+    // 3=Neural JDD. Auto is the final region-aware GPU Auto Hybrid route.
+    AUTO(0, "Auto Hybrid", true),
     NORMAL(1, "Malvar", true),
     QUALITY(2, "AMaZE", true),
     BILINEAR(3, "Neural JDD", true);
@@ -19,7 +19,7 @@ enum class DemosaicMode(
         const val PROFILE_KEY = "demosaic_mode"
 
         // Product default remains the deterministic Malvar path. AMaZE and Neural JDD are
-        // explicit alternatives; Auto stays the fourth UI choice until Auto Hybrid lands.
+        // explicit alternatives; Auto Hybrid stays the fourth UI choice.
         val DEFAULT: DemosaicMode = NORMAL
         val USER_ORDER: List<DemosaicMode> = listOf(NORMAL, QUALITY, BILINEAR, AUTO)
 
@@ -35,7 +35,7 @@ enum class DemosaicMode(
                 return entries.firstOrNull { it.bridgeValue == persistedId }
             }
             return when (trimmed.uppercase(Locale.US)) {
-                "AUTO" -> AUTO
+                "AUTO", "AUTO_HYBRID", "AUTO HYBRID", "AUTOHYBRID" -> AUTO
                 "NORMAL", "MALVAR", "MALVAR_2004", "MALVAR 2004",
                 "MALVAR_INSPIRED", "MALVAR INSPIRED" -> NORMAL
 
@@ -69,7 +69,7 @@ enum class DemosaicMode(
                 AUTO -> DemosaicSelection(
                     requestedMode = AUTO,
                     resolvedAlgorithm = ResolvedDemosaicAlgorithm.AUTO_SCENE_ADAPTIVE_NATIVE,
-                    resolveReason = "auto_requires_native_scene_analysis",
+                    resolveReason = "auto_hybrid_requires_native_scene_analysis",
                     fallbackOccurred = false,
                     fallbackReason = "none"
                 )
@@ -111,12 +111,12 @@ data class DemosaicSelection(
             ResolvedDemosaicAlgorithm.MALVAR_INSPIRED -> "MALVAR_2004"
             ResolvedDemosaicAlgorithm.RCD_INSPIRED -> "NEURAL_JDD"
             ResolvedDemosaicAlgorithm.AMAZE_INSPIRED -> "AMAZE"
-            ResolvedDemosaicAlgorithm.AUTO_SCENE_ADAPTIVE_NATIVE -> "AUTO"
+            ResolvedDemosaicAlgorithm.AUTO_SCENE_ADAPTIVE_NATIVE -> "AUTO_HYBRID"
         }
 
     private val requestedDebugName: String
         get() = when (requestedMode) {
-            DemosaicMode.AUTO -> "AUTO"
+            DemosaicMode.AUTO -> "AUTO_HYBRID"
             DemosaicMode.BILINEAR -> "NEURAL_JDD"
             DemosaicMode.NORMAL -> "MALVAR"
             DemosaicMode.QUALITY -> "AMAZE"

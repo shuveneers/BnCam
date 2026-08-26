@@ -1212,7 +1212,7 @@ DemosaicResolution resolveDemosaicMode(int requestedModeValue) {
 
     if (requestedModeValue == static_cast<int>(DemosaicMode::Auto)) {
         result.requestedMode = DemosaicMode::Auto;
-        result.reason = "auto_pending_scene_analysis";
+        result.reason = "auto_hybrid_pending_scene_analysis";
         return result;
     }
 
@@ -1463,7 +1463,6 @@ DemosaicResolution resolveDemosaicForSceneMetrics(
     });
 
     result.algorithm = candidates[0].algorithm;
-    result.reason = candidates[0].reason;
     result.autoRunnerUp = candidates[1].name;
     result.autoScoreDelta = candidates[0].score - candidates[1].score;
     if (candidates[0].score < 0.0f) {
@@ -1474,6 +1473,40 @@ DemosaicResolution resolveDemosaicForSceneMetrics(
         result.reason = "auto_no_validated_demosaic_default_identity_amaze";
         result.fallbackOccurred = true;
         result.fallbackReason = "all_demosaic_reference_validations_failed";
+    } else if (malvarReady && neuralJddReady && amazeReady) {
+        // Delta 0048: scene analysis is now only a global prior. The production Vulkan path
+        // resolves locally between all three validated reconstructions and blends them softly.
+        // A bounded temperature and floor keep every route available to local evidence instead
+        // of turning the prior back into a disguised whole-frame hard selector.
+        const float maxScore = std::max({malvarScore, neuralJddScore, amazeScore});
+        constexpr float kPriorTemperature = 0.30f;
+        const auto priorExp = [&](float score) {
+            return std::exp(std::clamp((score - maxScore) / kPriorTemperature, -12.0f, 0.0f));
+        };
+        float malvarPrior = priorExp(malvarScore);
+        float neuralPrior = priorExp(neuralJddScore);
+        float amazePrior = priorExp(amazeScore);
+        const float initialSum = std::max(1.0e-6f, malvarPrior + neuralPrior + amazePrior);
+        malvarPrior /= initialSum;
+        neuralPrior /= initialSum;
+        amazePrior /= initialSum;
+        constexpr float kPriorFloor = 0.08f;
+        malvarPrior = std::max(kPriorFloor, malvarPrior);
+        neuralPrior = std::max(kPriorFloor, neuralPrior);
+        amazePrior = std::max(kPriorFloor, amazePrior);
+        const float flooredSum = malvarPrior + neuralPrior + amazePrior;
+        result.autoMalvarPrior = malvarPrior / flooredSum;
+        result.autoNeuralJddPrior = neuralPrior / flooredSum;
+        result.autoAmazePrior = amazePrior / flooredSum;
+        result.autoHybridExecution = true;
+        result.reason = "auto_hybrid_region_aware_gpu";
+    } else {
+        // Validation degradation remains explicit and deterministic. Do not mix a route whose
+        // implementation validator failed; the dominant validated candidate becomes the typed
+        // single-route fallback.
+        result.reason = candidates[0].reason;
+        result.fallbackOccurred = true;
+        result.fallbackReason = "auto_hybrid_requires_all_three_validated_routes";
     }
 
     std::ostringstream signals;
@@ -1542,6 +1575,10 @@ DemosaicResolution resolveDemosaicForSceneMetrics(
             << ",amazeScore=" << amazeScore
             << ",runnerUp=" << result.autoRunnerUp
             << ",scoreDelta=" << result.autoScoreDelta
+            << ",autoHybridExecution=" << (result.autoHybridExecution ? "true" : "false")
+            << ",autoMalvarPrior=" << result.autoMalvarPrior
+            << ",autoNeuralJddPrior=" << result.autoNeuralJddPrior
+            << ",autoAmazePrior=" << result.autoAmazePrior
             << ",malvarReady=" << (malvarReady ? "true" : "false")
             << ",neuralJddReady=" << (neuralJddReady ? "true" : "false")
             << ",amazeReady=" << (amazeReady ? "true" : "false");
@@ -1569,7 +1606,7 @@ void recordMenonDemosaicTimeMs(float elapsedMs) {
 
 const char* demosaicModeName(DemosaicMode mode) {
     switch (mode) {
-        case DemosaicMode::Auto: return "AUTO";
+        case DemosaicMode::Auto: return "AUTO_HYBRID";
         case DemosaicMode::Bilinear: return "NEURAL_JDD";
         case DemosaicMode::NormalMalvar2004: return "MALVAR_2004";
         case DemosaicMode::QualityMenon2007: return "AMAZE";
@@ -2616,10 +2653,14 @@ DemosaicValidationResult validateAmazeInspiredImplementation() {
         }
     }
 
+    // The AMaZE CPU reference intentionally reuses one process-wide scratch RGB buffer.
+    // Validation needs two snapshots at the same time, so detach each result before invoking
+    // the next reconstruction. Without clone(), the blue probe overwrites the red probe and
+    // creates a false runtime-validation failure even though the reconstruction itself is valid.
     const cv::Mat red = demosaicAmazeInspiredToRgb32f(
-            syntheticChannelMosaic(CFA_RGGB, 0, 17), CFA_RGGB);
+            syntheticChannelMosaic(CFA_RGGB, 0, 17), CFA_RGGB).clone();
     const cv::Mat blue = demosaicAmazeInspiredToRgb32f(
-            syntheticChannelMosaic(CFA_RGGB, 2, 17), CFA_RGGB);
+            syntheticChannelMosaic(CFA_RGGB, 2, 17), CFA_RGGB).clone();
     result.channelOrderPassed =
             nearlyEqual(red.at<cv::Vec3f>(8, 8)[0], 1.0f, 5.0e-5f) &&
             nearlyEqual(blue.at<cv::Vec3f>(9, 9)[2], 1.0f, 5.0e-5f);
