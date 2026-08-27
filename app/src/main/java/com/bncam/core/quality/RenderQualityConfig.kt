@@ -949,32 +949,17 @@ data class RenderQualityConfig(
             )
         }
 
-        private fun neutralNormalizedMatrix(values: FloatArray): FloatArray? {
-            if (values.size != 9 || values.any { !it.isFinite() }) return null
-            val rowSums = FloatArray(3) { row ->
-                values[row * 3] + values[row * 3 + 1] + values[row * 3 + 2]
-            }
-            if (rowSums.any { !it.isFinite() || kotlin.math.abs(it) < 0.0001f }) return null
-            val meanRowSum = rowSums.average().toFloat()
-            if (!meanRowSum.isFinite() || kotlin.math.abs(meanRowSum) < 0.0001f) return null
-            val normalized = values.copyOf()
-            for (row in 0..2) {
-                val scale = meanRowSum / rowSums[row]
-                for (column in 0..2) {
-                    normalized[row * 3 + column] *= scale
-                }
-            }
-            return normalized
-        }
-
         private fun addMatrixCandidate(
             target: MutableList<ColorMatrixCandidate>,
             source: String,
             values: FloatArray?,
             construction: String
         ) {
-            val normalized = values?.let { neutralNormalizedMatrix(it) } ?: return
-            target.add(ColorMatrixCandidate(source = source, values = normalized, construction = construction))
+            val preserved = values
+                ?.takeIf { it.size == 9 && it.all { value -> value.isFinite() } }
+                ?.copyOf()
+                ?: return
+            target.add(ColorMatrixCandidate(source = source, values = preserved, construction = construction))
         }
 
 
@@ -1012,7 +997,7 @@ data class RenderQualityConfig(
                     target = candidates,
                     source = "CaptureResult.COLOR_CORRECTION_TRANSFORM",
                     values = colorSpaceTransformToArray(transform),
-                    construction = "capture_result_direct_neutral_normalized"
+                    construction = "capture_result_direct_phase8_preserved"
                 )
             }
 
@@ -1076,7 +1061,7 @@ data class RenderQualityConfig(
                     values = candidate.values,
                     fromMetadata = true,
                     source = candidate.source,
-                    note = "Validated adaptive matrix accepted; construction=${candidate.construction}; mode=$normalizedMode; validationScore=${String.format(Locale.US, "%.4f", validation.score)}; sourcePriority=${colorMatrixSourcePriority(candidate.source)}.",
+                    note = "Validated matrix accepted without row normalization; construction=${candidate.construction}; mode=$normalizedMode; validationScore=${String.format(Locale.US, "%.4f", validation.score)}; sourcePriority=${colorMatrixSourcePriority(candidate.source)}.",
                     validationPassed = true,
                     rejectReason = "none",
                     identityFallbackUsed = false

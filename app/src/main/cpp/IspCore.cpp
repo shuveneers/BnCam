@@ -11,6 +11,9 @@
 #include "SpectraPhysicalBaselineNr.h"
 #include "SingleFrameRawDenoisePolicy.h"
 #include "SpectraPostDemosaicResidualNr.h"
+#include "SpectraResidualChromaArtifact.h"
+#include "PhysicalAwbEstimator.h"
+#include "SensorColorScienceV2.h"
 #include "SpectraMultiscaleContext.h"
 #include "SpectraMultiscaleResidualConsensus.h"
 #include "SpectraMultiscaleChromaContext.h"
@@ -1420,6 +1423,55 @@ bncam::spectra2::ResidualObservation finalizeLinearResidualCandidates(
         observation.status = "OBSERVATION_READY_NO_AUTO_CALIBRATION";
     }
     return observation;
+}
+
+std::vector<bncam::awb::LinearOpponentSample> phase7AwbSamplesFromCpuFailureRgb(
+        const cv::Mat& rgb32f
+) {
+    std::vector<bncam::awb::LinearOpponentSample> samples;
+    if (rgb32f.empty() || rgb32f.type() != CV_32FC3 ||
+        rgb32f.cols < 5 || rgb32f.rows < 5) return samples;
+
+    constexpr size_t targetSamples = 180000u;
+    const size_t interiorPixels = static_cast<size_t>(rgb32f.cols - 4) *
+            static_cast<size_t>(rgb32f.rows - 4);
+    const int stride = std::max(1, static_cast<int>(std::floor(std::sqrt(
+            static_cast<double>(interiorPixels) / static_cast<double>(targetSamples)))));
+    samples.reserve(std::min(targetSamples, interiorPixels));
+    const auto opponent = [](const cv::Vec3f& pixel) -> std::array<double, 3> {
+        const double r = static_cast<double>(pixel[0]);
+        const double g = static_cast<double>(pixel[1]);
+        const double b = static_cast<double>(pixel[2]);
+        return {0.2126 * r + 0.7152 * g + 0.0722 * b, r - g, b - g};
+    };
+    for (int y = 2; y < rgb32f.rows - 2; y += stride) {
+        for (int x = 2; x < rgb32f.cols - 2; x += stride) {
+            const auto center = opponent(rgb32f.at<cv::Vec3f>(y, x));
+            const auto left = opponent(rgb32f.at<cv::Vec3f>(y, x - 1));
+            const auto right = opponent(rgb32f.at<cv::Vec3f>(y, x + 1));
+            const auto up = opponent(rgb32f.at<cv::Vec3f>(y - 1, x));
+            const auto down = opponent(rgb32f.at<cv::Vec3f>(y + 1, x));
+            if (!std::isfinite(center[0]) || !std::isfinite(center[1]) ||
+                !std::isfinite(center[2])) continue;
+            const double maxLumaDelta = std::max({
+                    std::abs(center[0] - left[0]), std::abs(center[0] - right[0]),
+                    std::abs(center[0] - up[0]), std::abs(center[0] - down[0])});
+            const double maxChromaDelta = std::max({
+                    std::abs(center[1] - left[1]), std::abs(center[1] - right[1]),
+                    std::abs(center[1] - up[1]), std::abs(center[1] - down[1]),
+                    std::abs(center[2] - left[2]), std::abs(center[2] - right[2]),
+                    std::abs(center[2] - up[2]), std::abs(center[2] - down[2])});
+            const double structure = std::max(maxLumaDelta, 0.45 * maxChromaDelta);
+            const int tileX = std::clamp(x * bncam::awb::kAwbTileColumns /
+                    std::max(1, rgb32f.cols), 0, bncam::awb::kAwbTileColumns - 1);
+            const int tileY = std::clamp(y * bncam::awb::kAwbTileRows /
+                    std::max(1, rgb32f.rows), 0, bncam::awb::kAwbTileRows - 1);
+            samples.push_back({
+                    center[0], center[1], center[2], structure,
+                    tileY * bncam::awb::kAwbTileColumns + tileX});
+        }
+    }
+    return samples;
 }
 
 bncam::spectra2::ResidualObservation measureLinearResidualGpuCandidates(
@@ -14656,32 +14708,53 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             demosaicPhysicalSigmaChroma,
             demosaicPhysicalNoisePressure
     };
+    const bncam::phase6::ResidualChromaArtifactPlan phase6ResidualChromaPlan =
+            bncam::phase6::resolveResidualChromaArtifactPlan(
+                    demosaicNoiseContext.available,
+                    demosaicNoiseContext.sigmaY,
+                    demosaicNoiseContext.sigmaChroma,
+                    demosaicNoiseContext.pressure);
+    bncam::phase6::ResidualChromaArtifactTelemetry phase6CpuTelemetry{};
+    bool phase6CpuFallbackApplied = false;
 
     const auto runCpuDemosaicFallback = [&]() -> cv::Mat {
         // Failure-only materialization path. Normal Vulkan execution never runs these full-frame
-        // CPU RAW corrections in parallel with the resident finalizer.
+        // CPU RAW corrections in parallel with the resident finalizer. Phase-6 parity is applied
+        // to this CPU reference only when the GPU reconstruction path itself has failed.
         runCpuRawFinalize();
+        cv::Mat cpuRgb;
         switch (demosaicResolution.algorithm) {
             case DemosaicAlgorithm::RcdInspired:
-                return demosaicRcdInspiredToRgb32f(
+                cpuRgb = demosaicRcdInspiredToRgb32f(
                         jpegRaw.mosaic, jpegRaw.info.effectiveCfaPattern, &demosaicRunStats,
                         &demosaicExecutionCfaEvidence, &demosaicNoiseContext);
+                break;
             case DemosaicAlgorithm::AmazeInspired:
-                return demosaicAmazeInspiredToRgb32f(
+                cpuRgb = demosaicAmazeInspiredToRgb32f(
                         jpegRaw.mosaic, jpegRaw.info.effectiveCfaPattern, &demosaicRunStats,
                         &demosaicExecutionCfaEvidence, &demosaicNoiseContext);
+                break;
             case DemosaicAlgorithm::Bilinear:
-                return demosaicBilinearToRgb32f(
+                cpuRgb = demosaicBilinearToRgb32f(
                         jpegRaw.mosaic, jpegRaw.info.effectiveCfaPattern, &demosaicRunStats);
+                break;
             case DemosaicAlgorithm::Menon2007:
-                return demosaicMenon2007ToRgb32f(
+                cpuRgb = demosaicMenon2007ToRgb32f(
                         jpegRaw.mosaic, jpegRaw.info.effectiveCfaPattern, &demosaicRunStats);
+                break;
             case DemosaicAlgorithm::Malvar2004:
             default:
-                return demosaicMalvar2004ToRgb32f(
+                cpuRgb = demosaicMalvar2004ToRgb32f(
                         jpegRaw.mosaic, jpegRaw.info.effectiveCfaPattern, &demosaicRunStats,
                         &demosaicExecutionCfaEvidence, &demosaicNoiseContext);
+                break;
         }
+        if (phase6ResidualChromaPlan.enabled && !cpuRgb.empty()) {
+            bncam::phase6::applyResidualChromaArtifactCpu(
+                    cpuRgb, phase6ResidualChromaPlan, &phase6CpuTelemetry);
+            phase6CpuFallbackApplied = true;
+        }
+        return cpuRgb;
     };
     {
         bncam::vulkan::SpectraResidentDemosaicRequest request{};
@@ -14705,6 +14778,9 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         request.noiseSigmaY = demosaicNoiseContext.sigmaY;
         request.noiseSigmaChroma = demosaicNoiseContext.sigmaChroma;
         request.noisePressure = demosaicNoiseContext.pressure;
+        request.phase6ResidualChromaEnabled = phase6ResidualChromaPlan.enabled;
+        request.phase6MaximumBlend = phase6ResidualChromaPlan.maximumBlend;
+        request.phase6MaximumCorrection = phase6ResidualChromaPlan.maximumCorrection;
         request.autoMalvarPrior = demosaicResolution.autoMalvarPrior;
         request.autoNeuralJddPrior = demosaicResolution.autoNeuralJddPrior;
         request.autoAmazePrior = demosaicResolution.autoAmazePrior;
@@ -14927,8 +15003,11 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                 "INSUFFICIENT_POST_DEMOSAIC_FIELD_SUPPORT";
     }
 
-    // Android WB gains are made relative to their green reference, never max-normalized. This
-    // preserves green/midtone luminance while applying the metadata chromatic balance once.
+    // Phase 7: Camera2 AWB metadata is an anchor/prior, not the final WB answer. Normalize it
+    // relative to green exactly once, then allow the optional bounded phone CCT signal to shape
+    // that prior before scene evidence is evaluated. No full-resolution CPU scan is introduced:
+    // normal Vulkan execution reuses the compact post-demosaic GPU sample grid already read back
+    // for residual observability. CPU sampling exists only on the typed demosaic failure route.
     const float wbMetadata[4] = {
             safeWbGain(meta.calibration.effectiveWbGains[0]),
             safeWbGain(meta.calibration.effectiveWbGains[1]),
@@ -14936,7 +15015,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             safeWbGain(meta.calibration.effectiveWbGains[3])
     };
     const float greenReference = std::max(1.0e-4f, 0.5f * (wbMetadata[1] + wbMetadata[2]));
-    float wbRgb[3] = {
+    float wbPriorRgb[3] = {
             wbMetadata[0] / greenReference,
             1.0f,
             wbMetadata[3] / greenReference
@@ -14949,19 +15028,43 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     const float rawContributionWeight = std::clamp(meta.auxContributionWeight, 0.0f, 0.15f);
     if (meta.phoneAssistanceSensorsEnabled && meta.auxSensorValid && rawContributionWeight > 0.001f &&
         meta.auxCctKelvin >= 1500.0f && meta.auxCctKelvin <= 12000.0f) {
-        
-        // CCT illuminant adjustment ratio relative to 5500K daylight standard
         const float cctRatio = std::clamp(5500.0f / meta.auxCctKelvin, 0.60f, 1.80f);
         const float sensorWbRScale = 1.0f + (cctRatio - 1.0f) * 0.15f * rawContributionWeight;
         const float sensorWbBScale = 1.0f + (1.0f / cctRatio - 1.0f) * 0.15f * rawContributionWeight;
-        
-        wbRgb[0] *= std::clamp(sensorWbRScale, 0.85f, 1.15f);
-        wbRgb[2] *= std::clamp(sensorWbBScale, 0.85f, 1.15f);
-
+        wbPriorRgb[0] *= std::clamp(sensorWbRScale, 0.85f, 1.15f);
+        wbPriorRgb[2] *= std::clamp(sensorWbBScale, 0.85f, 1.15f);
         nativeAppliedContributionWeight = rawContributionWeight;
-        nativeAdjustmentType = "bounded_cct_illuminant_prior_wb_scale";
+        nativeAdjustmentType = "bounded_cct_prior_shaping_before_phase7_awb";
         nativeAdjustmentMagnitude = std::abs(cctRatio - 1.0f) * 0.15f * rawContributionWeight;
     }
+
+    const auto phase7AwbStart = IspClock::now();
+    std::vector<bncam::awb::LinearOpponentSample> phase7AwbSamples;
+    std::string phase7AwbSampleSource;
+    if (vulkanDemosaicResident) {
+        phase7AwbSamples = bncam::awb::decodeGpuResidualCandidates(vulkanDemosaic.residualCandidates);
+        phase7AwbSampleSource = phase7AwbSamples.empty()
+                ? "GPU_COMPACT_UNAVAILABLE_PRIOR_ONLY"
+                : "GPU_COMPACT_POST_DEMOSAIC";
+    } else {
+        phase7AwbSamples = phase7AwbSamplesFromCpuFailureRgb(linearRgb);
+        phase7AwbSampleSource = phase7AwbSamples.empty()
+                ? "CPU_FAILURE_REFERENCE_UNAVAILABLE_PRIOR_ONLY"
+                : "CPU_FAILURE_REFERENCE_SPARSE";
+    }
+    bncam::awb::Estimate phase7AwbEstimate = bncam::awb::resolve(
+            phase7AwbSamples,
+            {static_cast<double>(wbPriorRgb[0]), 1.0, static_cast<double>(wbPriorRgb[2])},
+            static_cast<double>(demosaicNoiseContext.sigmaY));
+    if (!vulkanDemosaicResident) {
+        phase7AwbEstimate.method = "PHYSICAL_AWB_CPU_FAILURE_REFERENCE_GRAY_WORLD_V1";
+    }
+    float wbRgb[3] = {
+            static_cast<float>(phase7AwbEstimate.finalGainsRgb[0]),
+            1.0f,
+            static_cast<float>(phase7AwbEstimate.finalGainsRgb[2])
+    };
+    const float phase7AwbEstimatorMs = elapsedMs(phase7AwbStart);
 
     const float* ccm = meta.calibration.effectiveColorMatrix;
 
@@ -15116,7 +15219,45 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
              preWbChromaCleanupProposedBlendB > 1.0e-4f);
     // Do not pay four extra neighbour reads per pixel for negligible corrections. A uniform
     // 1% maximum-blend threshold keeps clean scenes on the legacy AWB+CCM fast path.
+    const bool phase6ResidualChromaUsedForOutput =
+            vulkanDemosaic.phase6ResidualChromaUsedForOutput || phase6CpuFallbackApplied;
+    const bool phase6ResidualChromaGpuUsed = vulkanDemosaic.phase6ResidualChromaUsedForOutput;
+    const std::uint64_t phase6ProcessedPixels = phase6CpuFallbackApplied
+            ? phase6CpuTelemetry.processedPixels : vulkanDemosaic.phase6ProcessedPixels;
+    const std::uint64_t phase6CandidatePixels = phase6CpuFallbackApplied
+            ? phase6CpuTelemetry.candidatePixels : vulkanDemosaic.phase6CandidatePixels;
+    const std::uint64_t phase6IsolatedOutlierPixels = phase6CpuFallbackApplied
+            ? phase6CpuTelemetry.isolatedOutlierPixels : vulkanDemosaic.phase6IsolatedOutlierPixels;
+    const std::uint64_t phase6ZipperPixels = phase6CpuFallbackApplied
+            ? phase6CpuTelemetry.zipperPixels : vulkanDemosaic.phase6ZipperPixels;
+    const std::uint64_t phase6EdgeProtectedPixels = phase6CpuFallbackApplied
+            ? phase6CpuTelemetry.edgeProtectedPixels : vulkanDemosaic.phase6EdgeProtectedPixels;
+    const std::uint64_t phase6SaturatedDetailProtectedPixels = phase6CpuFallbackApplied
+            ? phase6CpuTelemetry.saturatedDetailProtectedPixels
+            : vulkanDemosaic.phase6SaturatedDetailProtectedPixels;
+    const double phase6MeanAbsCorrectionRG = phase6CpuFallbackApplied
+            ? (phase6CandidatePixels > 0u
+                    ? phase6CpuTelemetry.sumAbsCorrectionRG / static_cast<double>(phase6CandidatePixels)
+                    : 0.0)
+            : vulkanDemosaic.phase6MeanAbsCorrectionRG;
+    const double phase6MeanAbsCorrectionBG = phase6CpuFallbackApplied
+            ? (phase6CandidatePixels > 0u
+                    ? phase6CpuTelemetry.sumAbsCorrectionBG / static_cast<double>(phase6CandidatePixels)
+                    : 0.0)
+            : vulkanDemosaic.phase6MeanAbsCorrectionBG;
+    const float phase6MaximumAbsoluteCorrection = phase6CpuFallbackApplied
+            ? phase6CpuTelemetry.maximumAbsoluteCorrection
+            : vulkanDemosaic.phase6MaximumAbsoluteCorrection;
+    const double phase6CandidateFraction = phase6ProcessedPixels > 0u
+            ? static_cast<double>(phase6CandidatePixels) / static_cast<double>(phase6ProcessedPixels)
+            : 0.0;
+    const char* phase6ExecutionBackend = phase6ResidualChromaGpuUsed
+            ? "VULKAN_RESIDENT_TWO_PASS"
+            : (phase6CpuFallbackApplied
+                    ? "CPU_FAILURE_REFERENCE"
+                    : (phase6ResidualChromaPlan.enabled ? "PLANNED_NOT_USED" : "DISABLED_NO_PHYSICAL_AUTHORITY"));
     const bool preWbChromaCleanupExecutionReady = preWbChromaCleanupPlanReady &&
+            !phase6ResidualChromaUsedForOutput &&
             std::max(preWbChromaCleanupProposedBlendR, preWbChromaCleanupProposedBlendB) >= 0.010f;
     const float preWbChromaCleanupAppliedBlendR = preWbChromaCleanupExecutionReady
             ? preWbChromaCleanupProposedBlendR : 0.0f;
@@ -15132,6 +15273,15 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     const float preWbNoiseModelEffectiveBlendB =
             0.50f * preWbChromaCleanupAppliedBlendB;
     bncam::spectra2::NoiseState preWbNoiseState = residualNoiseState.postDemosaic;
+    if (phase6ResidualChromaUsedForOutput) {
+        // Phase 6 is selective and nonlinear: only topology-supported opponent outliers are
+        // changed. Giving it a whole-frame variance reduction would understate uncertainty and
+        // could make downstream residual NR too aggressive. Preserve the covariance verbatim and
+        // advance only the provenance/stage label.
+        preWbNoiseState.stage = "POST_PHASE6_RESIDUAL_CHROMA_RGB";
+        preWbNoiseState.method = "SELECTIVE_NONLINEAR_ARTIFACT_CORRECTION_NO_VARIANCE_CREDIT";
+        preWbNoiseState.status = "PROPAGATED_CONSERVATIVE_NO_VARIANCE_CREDIT";
+    }
     if (preWbChromaCleanupExecutionReady) {
         const std::array<double, 9> preWbNoiseTransform{
                 1.0 - static_cast<double>(preWbNoiseModelEffectiveBlendR),
@@ -15501,6 +15651,15 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     const double ccmMeanR = ccmRSum / totalPixelsD;
     const double ccmMeanG = ccmGSum / totalPixelsD;
     const double ccmMeanB = ccmBSum / totalPixelsD;
+
+    // Phase 8 neutral color-science validation is deliberately sampled at the output of
+    // AWB + sensor->linear-sRGB CCM, before highlight heuristics, tone, hidden RAW presentation
+    // vibrance, profile color controls or output encoding. Reuse existing compact statistics;
+    // do not add a full-frame readback just to validate color.
+    const bncam::color::MatrixAudit phase8ColorMatrixAudit =
+            bncam::color::auditLinearSrgbMatrix(ccm);
+    const bncam::color::PrePresentationSceneAudit phase8PrePresentationSceneAudit =
+            bncam::color::auditPrePresentationSceneMean(ccmMeanR, ccmMeanG, ccmMeanB);
 
     // Failure-only CPU materialization. The normal 8H-J path stays device-resident from
     // demosaic through highlight recovery and scene observation. If the new Vulkan stage fails,
@@ -16819,10 +16978,12 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
 
     const double varGRawRep = (varGrRaw + varGbRaw) * 0.5;
 
-    // Per-channel linear gains up to linear RGB
-    const float gR = meta.calibration.effectiveWbGains[0] * exposureGain;
-    const float gG = meta.calibration.effectiveWbGains[1] * exposureGain;
-    const float gB = meta.calibration.effectiveWbGains[2] * exposureGain;
+    // Per-channel linear gains up to final linear RGB. Phase 7 owns the actual AWB gains;
+    // using the Camera2 metadata anchor again here would make downstream physical NR reason
+    // about a different colour/noise transform than the pixels that were actually rendered.
+    const float gR = wbRgb[0] * exposureGain;
+    const float gG = wbRgb[1] * exposureGain;
+    const float gB = wbRgb[2] * exposureGain;
 
     const double varRLinear = varRRaw * static_cast<double>(gR * gR);
     const double varGLinear = varGRawRep * static_cast<double>(gG * gG);
@@ -18323,6 +18484,30 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; demosaicNoiseSigmaY=" << demosaicNoiseContext.sigmaY
             << "; demosaicNoiseSigmaChroma=" << demosaicNoiseContext.sigmaChroma
             << "; demosaicNoisePressure=" << demosaicNoiseContext.pressure
+            << "; phase6ResidualChromaPlanEnabled=" << (phase6ResidualChromaPlan.enabled ? "true" : "false")
+            << "; phase6ResidualChromaPlanStatus=" << phase6ResidualChromaPlan.status
+            << "; phase6ResidualChromaAuthority=PHYSICAL_SIGMA_TOPOLOGY_ONLY"
+            << "; phase6ResidualChromaLumaMutation=false"
+            << "; phase6ResidualChromaBandOwner=LOCAL_DEMOSAIC_ARTIFACT_TOPOLOGY"
+            << "; phase6ResidualChromaLowFrequencyCloudOwner=UNCHANGED_SEPARATE_OWNER"
+            << "; phase6ResidualChromaNoisePropagation=CONSERVATIVE_NO_VARIANCE_CREDIT"
+            << "; phase6ResidualChromaRequested=" << (phase6ResidualChromaPlan.enabled ? "true" : "false")
+            << "; phase6ResidualChromaUsedForOutput=" << (phase6ResidualChromaUsedForOutput ? "true" : "false")
+            << "; phase6ResidualChromaExecutionBackend=" << phase6ExecutionBackend
+            << "; phase6ResidualChromaGpuUsed=" << (phase6ResidualChromaGpuUsed ? "true" : "false")
+            << "; phase6ResidualChromaCpuFallbackUsed=" << (phase6CpuFallbackApplied ? "true" : "false")
+            << "; phase6ClassifyPassMs=" << vulkanDemosaic.phase6ClassifyPassMs
+            << "; phase6CorrectPassMs=" << vulkanDemosaic.phase6CorrectPassMs
+            << "; phase6ProcessedPixels=" << phase6ProcessedPixels
+            << "; phase6CandidatePixels=" << phase6CandidatePixels
+            << "; phase6CandidateFraction=" << phase6CandidateFraction
+            << "; phase6IsolatedOutlierPixels=" << phase6IsolatedOutlierPixels
+            << "; phase6ZipperPixels=" << phase6ZipperPixels
+            << "; phase6EdgeProtectedPixels=" << phase6EdgeProtectedPixels
+            << "; phase6SaturatedDetailProtectedPixels=" << phase6SaturatedDetailProtectedPixels
+            << "; phase6MeanAbsCorrectionRG=" << phase6MeanAbsCorrectionRG
+            << "; phase6MeanAbsCorrectionBG=" << phase6MeanAbsCorrectionBG
+            << "; phase6MaximumAbsoluteCorrection=" << phase6MaximumAbsoluteCorrection
             << "; demosaicCfaStructureProtection=" << demosaicCfaEvidence.structureProtection
             << "; demosaicCfaRedOpponentConfidence="
             << demosaicCfaEvidence.redOpponentCorrectionConfidence
@@ -18937,6 +19122,8 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << preWbChromaCleanupProposedBlendB
             << "; spectraPreWbChromaCleanupExecutionReady="
             << (preWbChromaCleanupExecutionReady ? "true" : "false")
+            << "; spectraPreWbChromaCleanupSuppressedByPhase6="
+            << ((preWbChromaCleanupPlanReady && phase6ResidualChromaUsedForOutput) ? "true" : "false")
             << "; spectraPreWbChromaCleanupAppliedBlendR="
             << preWbChromaCleanupAppliedBlendR
             << "; spectraPreWbChromaCleanupAppliedBlendB="
@@ -19328,8 +19515,43 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; spectraMeasuredVisibleResidualMs=" << residualNoiseState.measuredVisibleResidualMs
             << "; spectraPropagationMathMs=" << spectraPropagationMathMs
             << "; spectraPropagationSequentialMs=" << spectraPropagationSequentialMs
+            << "; phase7AwbEstimatorMs=" << phase7AwbEstimatorMs
+            << "; phase7AwbSampleSource=" << phase7AwbSampleSource
+            << "; phase7AwbStatus=" << phase7AwbEstimate.status
+            << "; phase7AwbMethod=" << phase7AwbEstimate.method
+            << "; phase7AwbPriorValid=" << (phase7AwbEstimate.priorValid ? "true" : "false")
+            << "; phase7AwbDataReady=" << (phase7AwbEstimate.dataReady ? "true" : "false")
+            << "; phase7AwbMixedIllumination="
+            << (phase7AwbEstimate.mixedIllumination ? "true" : "false")
+            << "; phase7AwbCandidateSamples=" << phase7AwbEstimate.candidateSampleCount
+            << "; phase7AwbExposureValidSamples=" << phase7AwbEstimate.exposureValidSampleCount
+            << "; phase7AwbAcceptedSamples=" << phase7AwbEstimate.acceptedSampleCount
+            << "; phase7AwbValidTiles=" << phase7AwbEstimate.validTileCount
+            << "; phase7AwbDarkFloor=" << phase7AwbEstimate.darkFloor
+            << "; phase7AwbHighlightCeiling=" << phase7AwbEstimate.highlightCeiling
+            << "; phase7AwbNeutralSupport=" << phase7AwbEstimate.neutralSupport
+            << "; phase7AwbSampleSupport=" << phase7AwbEstimate.sampleSupport
+            << "; phase7AwbTileSupport=" << phase7AwbEstimate.tileSupport
+            << "; phase7AwbMixedLightScore=" << phase7AwbEstimate.mixedLightScore
+            << "; phase7AwbLogGainMadR=" << phase7AwbEstimate.logGainMadR
+            << "; phase7AwbLogGainMadB=" << phase7AwbEstimate.logGainMadB
+            << "; phase7AwbLogGainSpanR=" << phase7AwbEstimate.logGainSpanR
+            << "; phase7AwbLogGainSpanB=" << phase7AwbEstimate.logGainSpanB
+            << "; phase7AwbPriorDisagreement=" << phase7AwbEstimate.priorDisagreement
+            << "; phase7AwbConfidence=" << phase7AwbEstimate.confidence
+            << "; phase7AwbDataAuthority=" << phase7AwbEstimate.dataAuthority
+            << "; phase7AwbPriorRgb=[" << phase7AwbEstimate.priorGainsRgb[0] << ","
+            << phase7AwbEstimate.priorGainsRgb[1] << "," << phase7AwbEstimate.priorGainsRgb[2] << "]"
+            << "; phase7AwbDataRgb=[" << phase7AwbEstimate.dataGainsRgb[0] << ","
+            << phase7AwbEstimate.dataGainsRgb[1] << "," << phase7AwbEstimate.dataGainsRgb[2] << "]"
+            << "; phase7AwbFinalRgb=[" << phase7AwbEstimate.finalGainsRgb[0] << ","
+            << phase7AwbEstimate.finalGainsRgb[1] << "," << phase7AwbEstimate.finalGainsRgb[2] << "]"
+            << "; phase7AwbDarkRejectedFraction=" << phase7AwbEstimate.darkRejectedFraction
+            << "; phase7AwbHighlightRejectedFraction=" << phase7AwbEstimate.highlightRejectedFraction
+            << "; phase7AwbInvalidRejectedFraction=" << phase7AwbEstimate.invalidRejectedFraction
+            << "; phase7AwbChromaticRejectedFraction=" << phase7AwbEstimate.chromaticRejectedFraction
             << "; awbColourTransformMs=" << awbColourTransformMs
-            << "; awbTimingMode=fused_with_colour_transform"
+            << "; awbTimingMode=phase7_compact_estimator_then_fused_vulkan_colour_transform"
             << "; colourTransformTimingMode=fused_with_awb"
             << "; vulkanAwbCcmAttempted=" << (vulkanColorTransform.attempted ? "true" : "false")
             << "; vulkanAwbCcmExecutionSucceeded=" << (vulkanColorTransform.success ? "true" : "false")
@@ -19666,6 +19888,26 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; colorStageMeansCcmR=" << ccmMeanR
             << "; colorStageMeansCcmG=" << ccmMeanG
             << "; colorStageMeansCcmB=" << ccmMeanB
+            << "; phase8ColorValidationDomain=POST_AWB_CCM_LINEAR_SRGB_PRE_PRESENTATION"
+            << "; phase8ColorValidationFullFrameReadback=false"
+            << "; phase8PresentationVibranceExcluded=true"
+            << "; phase8ProfileColorControlsExcluded=true"
+            << "; phase8ToneExcluded=true"
+            << "; phase8EffectiveCcmFinite="
+            << (phase8ColorMatrixAudit.finite ? "true" : "false")
+            << "; phase8EffectiveCcmDeterminant=" << phase8ColorMatrixAudit.determinant
+            << "; phase8EffectiveCcmMaxAbsCoefficient="
+            << phase8ColorMatrixAudit.maxAbsCoefficient
+            << "; phase8EffectiveCcmNeutralAxisR=" << phase8ColorMatrixAudit.neutralAxis[0]
+            << "; phase8EffectiveCcmNeutralAxisG=" << phase8ColorMatrixAudit.neutralAxis[1]
+            << "; phase8EffectiveCcmNeutralAxisB=" << phase8ColorMatrixAudit.neutralAxis[2]
+            << "; phase8EffectiveCcmNeutralAxisMean=" << phase8ColorMatrixAudit.neutralAxisMean
+            << "; phase8EffectiveCcmNeutralAxisSpread="
+            << phase8ColorMatrixAudit.neutralAxisSpread
+            << "; phase8PrePresentationSceneMeanFinite="
+            << (phase8PrePresentationSceneAudit.finite ? "true" : "false")
+            << "; phase8PrePresentationSceneMeanRgbSpread="
+            << phase8PrePresentationSceneAudit.normalizedRgbSpread
             << "; colorStageMeansToneR=" << toneMeanR
             << "; colorStageMeansToneG=" << toneMeanG
             << "; colorStageMeansToneB=" << toneMeanB
@@ -19690,6 +19932,11 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; nativeAppliedContributionWeight=" << nativeAppliedContributionWeight
             << "; nativeAdjustmentType=" << nativeAdjustmentType
             << "; nativeAdjustmentMagnitude=" << nativeAdjustmentMagnitude
+            << "; camera2AwbAnchorR=" << phase7AwbEstimate.priorGainsRgb[0]
+            << "; camera2AwbAnchorB=" << phase7AwbEstimate.priorGainsRgb[2]
+            << "; phase7FinalWbR=" << wbRgb[0]
+            << "; phase7FinalWbG=" << wbRgb[1]
+            << "; phase7FinalWbB=" << wbRgb[2]
             << "; cfaPattern=" << workingRaw.info.effectiveCfaPattern
             << "; lookStrength=1.0000"
             << "; legacyRawStackReachable=false"

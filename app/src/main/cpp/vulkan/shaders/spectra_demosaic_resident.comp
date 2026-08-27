@@ -14,7 +14,7 @@ layout(push_constant) uniform Params {
     uint frameWidth;
     uint frameHeight;
     uint cfaPattern;
-    uint mode; // 0 bilinear, 1 Malvar, 2 Neural JDD, 3 AWB+CCM, 4 residual, 5/6 AMaZE, 7/8 Auto Hybrid
+    uint mode; // 0 bilinear, 1 Malvar, 2 Neural JDD, 3 AWB+CCM, 4 residual, 5/6 AMaZE, 7/8 Auto Hybrid, 9/10 Phase6
     float wbR;
     float wbG;
     float wbB;
@@ -587,6 +587,205 @@ vec3 opponentAtRgb(vec3 pixel) {
             pixel.b - pixel.g);
 }
 
+// Phase 6: physically significant residual chroma artifact classifier. This is deliberately
+// topology-specific: it never averages green/luma and never treats saturation alone as noise.
+struct Phase6Decision {
+    float correction;
+    float isolated;
+    float zipper;
+    float edgeProtected;
+    float saturatedProtected;
+};
+
+float phase6Median4(float a, float b, float c, float d) {
+    float lo0 = min(a, b);
+    float hi0 = max(a, b);
+    float lo1 = min(c, d);
+    float hi1 = max(c, d);
+    return 0.5 * (max(lo0, lo1) + min(hi0, hi1));
+}
+
+Phase6Decision phase6ClassifyChannel(
+        float center, float n0, float n1, float n2, float n3,
+        float n4, float n5, float n6, float n7,
+        float centerGreen, float g0, float g1, float g2, float g3,
+        float g4, float g5, float g6, float g7) {
+    Phase6Decision d;
+    d.correction = 0.0;
+    d.isolated = 0.0;
+    d.zipper = 0.0;
+    d.edgeProtected = 0.0;
+    d.saturatedProtected = 0.0;
+
+    float sigma = max(demosaicNoiseSigmaChroma(), 2.5e-5);
+    float sigmaY = max(demosaicNoiseSigmaY(), 2.5e-5);
+    float target = phase6Median4(n0, n1, n2, n3);
+    float localMin = min(min(min(n0, n1), min(n2, n3)), min(min(n4, n5), min(n6, n7)));
+    float localMax = max(max(max(n0, n1), max(n2, n3)), max(max(n4, n5), max(n6, n7)));
+    float delta = center - target;
+    float outsideEnvelope = center < localMin ? center - localMin :
+                            (center > localMax ? center - localMax : 0.0);
+
+    float supportTolerance = 2.35 * sigma + 0.045 * abs(center) + 7.5e-4;
+    float supportCount = 0.0;
+    supportCount += abs(n0 - center) <= supportTolerance ? 1.0 : 0.0;
+    supportCount += abs(n1 - center) <= supportTolerance ? 1.0 : 0.0;
+    supportCount += abs(n2 - center) <= supportTolerance ? 1.0 : 0.0;
+    supportCount += abs(n3 - center) <= supportTolerance ? 1.0 : 0.0;
+    supportCount += abs(n4 - center) <= supportTolerance ? 1.0 : 0.0;
+    supportCount += abs(n5 - center) <= supportTolerance ? 1.0 : 0.0;
+    supportCount += abs(n6 - center) <= supportTolerance ? 1.0 : 0.0;
+    supportCount += abs(n7 - center) <= supportTolerance ? 1.0 : 0.0;
+
+    float horizontalSecond = abs(n0 - 2.0 * center + n1);
+    float verticalSecond = abs(n2 - 2.0 * center + n3);
+    float zipperMetric = max(horizontalSecond, verticalSecond);
+    float axialSpan = max(max(n0, n1), max(n2, n3)) - min(min(n0, n1), min(n2, n3));
+
+    float maximumGreenDelta = max(max(max(abs(g0 - centerGreen), abs(g1 - centerGreen)),
+                                      max(abs(g2 - centerGreen), abs(g3 - centerGreen))),
+                                  max(max(abs(g4 - centerGreen), abs(g5 - centerGreen)),
+                                      max(abs(g6 - centerGreen), abs(g7 - centerGreen))));
+    float structure = smoothstep(2.0 * sigmaY + 0.004, 7.0 * sigmaY + 0.055, maximumGreenDelta);
+    float directionalSupport = min(min(abs(center - n0), abs(center - n1)),
+                                   min(abs(center - n2), abs(center - n3)));
+    float directionalTolerance = 2.75 * sigma + 0.035 * abs(center) + 7.5e-4;
+    bool coherentColourSupport = supportCount >= 2.0 || directionalSupport <= directionalTolerance;
+    bool edgeProtected = coherentColourSupport && (axialSpan > 2.0 * sigma || structure > 0.20);
+    bool saturatedProtected = abs(center) >= max(0.075, 6.0 * sigma) && supportCount >= 2.0;
+
+    float isolatedScore = 1.0 - smoothstep(0.75, 2.75, supportCount);
+    float residualScore = smoothstep(2.0 * sigma, 5.5 * sigma + 0.002, abs(delta));
+    float overshootScore = smoothstep(1.35 * sigma, 4.0 * sigma + 0.0015, abs(outsideEnvelope));
+    float zipperScore = smoothstep(2.5 * sigma + 0.30 * axialSpan,
+                                   6.0 * sigma + 0.70 * axialSpan + 0.002,
+                                   zipperMetric) * isolatedScore;
+
+    d.isolated = isolatedScore > 0.62 && max(residualScore, overshootScore) > 0.35 ? 1.0 : 0.0;
+    d.zipper = zipperScore > 0.38 ? 1.0 : 0.0;
+    d.edgeProtected = edgeProtected ? 1.0 : 0.0;
+    d.saturatedProtected = saturatedProtected ? 1.0 : 0.0;
+
+    float confidence = max(overshootScore, max(zipperScore, residualScore * isolatedScore));
+    if (edgeProtected) confidence *= 0.10 + 0.22 * overshootScore;
+    if (saturatedProtected) confidence *= 0.08;
+    if (coherentColourSupport) confidence *= 1.0 - 0.45 * structure;
+    confidence = clamp(confidence, 0.0, clamp(pc.ccm3, 0.0, 0.95));
+    if (confidence < 0.015) return d;
+
+    float correctionCap = min(clamp(pc.ccm4, 0.0, 0.15),
+                              0.006 + 6.0 * sigma + 0.045 * abs(target));
+    d.correction = clamp(delta, -correctionCap, correctionCap) * confidence;
+    return d;
+}
+
+void phase6ClassifyAndStore(uvec2 gid, bool inside) {
+    uint localIndex = gl_LocalInvocationIndex;
+    float processed = 0.0;
+    float candidate = 0.0;
+    float isolated = 0.0;
+    float zipper = 0.0;
+    float edgeProtected = 0.0;
+    float saturatedProtected = 0.0;
+    float absCorrectionRg = 0.0;
+    float absCorrectionBg = 0.0;
+    float maxCorrection = 0.0;
+
+    if (inside) {
+        int x = int(gid.x);
+        int y = int(gid.y);
+        uint scratchBase = (gid.y * pc.frameWidth + gid.x) * 2u;
+        colorRgb[scratchBase + 0u] = 0.0;
+        colorRgb[scratchBase + 1u] = 0.0;
+        processed = 1.0;
+        if (x > 0 && y > 0 && x < int(pc.frameWidth) - 1 && y < int(pc.frameHeight) - 1) {
+            vec3 c = residentRgbAt(x, y);
+            vec3 p0 = residentRgbAt(x - 1, y);
+            vec3 p1 = residentRgbAt(x + 1, y);
+            vec3 p2 = residentRgbAt(x, y - 1);
+            vec3 p3 = residentRgbAt(x, y + 1);
+            vec3 p4 = residentRgbAt(x - 1, y - 1);
+            vec3 p5 = residentRgbAt(x + 1, y - 1);
+            vec3 p6 = residentRgbAt(x - 1, y + 1);
+            vec3 p7 = residentRgbAt(x + 1, y + 1);
+            float rg = c.r - c.g;
+            float bg = c.b - c.g;
+            Phase6Decision dr = phase6ClassifyChannel(
+                    rg, p0.r-p0.g, p1.r-p1.g, p2.r-p2.g, p3.r-p3.g,
+                    p4.r-p4.g, p5.r-p5.g, p6.r-p6.g, p7.r-p7.g,
+                    c.g, p0.g, p1.g, p2.g, p3.g, p4.g, p5.g, p6.g, p7.g);
+            Phase6Decision db = phase6ClassifyChannel(
+                    bg, p0.b-p0.g, p1.b-p1.g, p2.b-p2.g, p3.b-p3.g,
+                    p4.b-p4.g, p5.b-p5.g, p6.b-p6.g, p7.b-p7.g,
+                    c.g, p0.g, p1.g, p2.g, p3.g, p4.g, p5.g, p6.g, p7.g);
+            colorRgb[scratchBase + 0u] = dr.correction;
+            colorRgb[scratchBase + 1u] = db.correction;
+            absCorrectionRg = abs(dr.correction);
+            absCorrectionBg = abs(db.correction);
+            maxCorrection = max(absCorrectionRg, absCorrectionBg);
+            candidate = maxCorrection > 1.0e-7 ? 1.0 : 0.0;
+            isolated = max(dr.isolated, db.isolated);
+            zipper = max(dr.zipper, db.zipper);
+            edgeProtected = max(dr.edgeProtected, db.edgeProtected);
+            saturatedProtected = max(dr.saturatedProtected, db.saturatedProtected);
+        }
+    }
+
+    // Compact per-workgroup telemetry; host reduces only ~frame/256 records, never full RGB.
+    sumRawR[localIndex] = processed;
+    sumRawG[localIndex] = candidate;
+    sumRawB[localIndex] = isolated;
+    sumWbR[localIndex] = zipper;
+    sumWbG[localIndex] = edgeProtected;
+    sumWbB[localIndex] = saturatedProtected;
+    sumCcmR[localIndex] = absCorrectionRg;
+    sumCcmG[localIndex] = absCorrectionBg;
+    sumCcmB[localIndex] = maxCorrection;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (localIndex < stride) {
+            uint other = localIndex + stride;
+            sumRawR[localIndex] += sumRawR[other];
+            sumRawG[localIndex] += sumRawG[other];
+            sumRawB[localIndex] += sumRawB[other];
+            sumWbR[localIndex] += sumWbR[other];
+            sumWbG[localIndex] += sumWbG[other];
+            sumWbB[localIndex] += sumWbB[other];
+            sumCcmR[localIndex] += sumCcmR[other];
+            sumCcmG[localIndex] += sumCcmG[other];
+            sumCcmB[localIndex] = max(sumCcmB[localIndex], sumCcmB[other]);
+        }
+        barrier();
+    }
+    if (localIndex == 0u) {
+        uint groupsX = (pc.frameWidth + 15u) / 16u;
+        uint groupIndex = gl_WorkGroupID.y * groupsX + gl_WorkGroupID.x;
+        uint base = groupIndex * 9u;
+        colorStats[base + 0u] = sumRawR[0];
+        colorStats[base + 1u] = sumRawG[0];
+        colorStats[base + 2u] = sumRawB[0];
+        colorStats[base + 3u] = sumWbR[0];
+        colorStats[base + 4u] = sumWbG[0];
+        colorStats[base + 5u] = sumWbB[0];
+        colorStats[base + 6u] = sumCcmR[0];
+        colorStats[base + 7u] = sumCcmG[0];
+        colorStats[base + 8u] = sumCcmB[0];
+    }
+}
+
+void phase6ApplyCorrection(uvec2 gid) {
+    if (gid.x >= pc.frameWidth || gid.y >= pc.frameHeight) return;
+    uint pixelIndex = gid.y * pc.frameWidth + gid.x;
+    uint rgbBase = pixelIndex * 3u;
+    uint scratchBase = pixelIndex * 2u;
+    float correctionRg = colorRgb[scratchBase + 0u];
+    float correctionBg = colorRgb[scratchBase + 1u];
+    vec3 center = vec3(outputRgb[rgbBase + 0u], outputRgb[rgbBase + 1u], outputRgb[rgbBase + 2u]);
+    outputRgb[rgbBase + 0u] = finiteLinear(center.r - correctionRg);
+    outputRgb[rgbBase + 1u] = center.g; // strict green/luma-anchor preservation
+    outputRgb[rgbBase + 2u] = finiteLinear(center.b - correctionBg);
+}
+
 // Delta 47: spatially varying low-frequency opponent correction. The map is already
 // median-centred and risk/authority bounded on CPU. The shader adds only local structural
 // safeguards; green is never changed by this correction.
@@ -766,6 +965,15 @@ void main() {
 
     bool inside = gid.x < pc.frameWidth && gid.y < pc.frameHeight;
     uint localIndex = gl_LocalInvocationIndex;
+
+    if (pc.mode == 9u) {
+        phase6ClassifyAndStore(gid, inside);
+        return;
+    }
+    if (pc.mode == 10u) {
+        phase6ApplyCorrection(gid);
+        return;
+    }
 
     if (pc.mode == 5u) {
         if (!inside) return;

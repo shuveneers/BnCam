@@ -53,6 +53,13 @@ struct SpectraResidentDemosaicRequest {
     float noiseSigmaChroma = 0.0f;
     float noisePressure = 0.0f;
 
+    // Phase 6: topology-gated post-demosaic opponent cleanup. This is not generic NR: it
+    // may only shrink physically significant isolated/zipper/overshoot chroma residuals.
+    // Green/luma reconstruction is never mutated and the route is disabled without physical sigma.
+    bool phase6ResidualChromaEnabled = false;
+    float phase6MaximumBlend = 0.92f;
+    float phase6MaximumCorrection = 0.12f;
+
     // Delta 0048: scene-level soft priors. AUTO_HYBRID combines them with local
     // structure/Nyquist/chroma/noise evidence; they are never hard route selectors.
     float autoMalvarPrior = 1.0f / 3.0f;
@@ -88,6 +95,19 @@ struct SpectraResidentDemosaicResult {
     float amazeReconstructPassMs = 0.0f;
     float autoHybridGuidePassMs = 0.0f;
     float autoHybridBlendPassMs = 0.0f;
+    bool phase6ResidualChromaRequested = false;
+    bool phase6ResidualChromaUsedForOutput = false;
+    float phase6ClassifyPassMs = 0.0f;
+    float phase6CorrectPassMs = 0.0f;
+    std::uint64_t phase6ProcessedPixels = 0u;
+    std::uint64_t phase6CandidatePixels = 0u;
+    std::uint64_t phase6IsolatedOutlierPixels = 0u;
+    std::uint64_t phase6ZipperPixels = 0u;
+    std::uint64_t phase6EdgeProtectedPixels = 0u;
+    std::uint64_t phase6SaturatedDetailProtectedPixels = 0u;
+    double phase6MeanAbsCorrectionRG = 0.0;
+    double phase6MeanAbsCorrectionBG = 0.0;
+    float phase6MaximumAbsoluteCorrection = 0.0f;
     float residualKernelMs = 0.0f;
     float readbackMs = 0.0f;
     float synchronizationMs = 0.0f;
@@ -271,8 +291,8 @@ private:
     PersistentBuffer outputReadback_;
     PersistentBuffer deviceInput_;
     PersistentBuffer deviceOutput_;
-    // Reused by mutually exclusive roles: CPU RGB upload for typed fallback, AMaZE resident
-    // guide scratch, or Auto-Hybrid guide scratch (green, Nyquist score, local structure).
+    // Reused by mutually exclusive roles: CPU RGB upload for typed fallback, AMaZE/Auto-Hybrid
+    // guide scratch, or Phase-6 vec2-per-pixel residual correction scratch (RG/BG only).
     PersistentBuffer rgbUpload_;
     // Twelve float sums per 16x16 workgroup: raw/WB/CCM means plus cloud-correction telemetry.
     PersistentBuffer colorStatistics_;

@@ -25,6 +25,11 @@ private fun FloatArray.matrixRowSums(): FloatArray? = if (size == 9) {
     null
 }
 
+private fun matrixMaxAbsDelta(a: FloatArray?, b: FloatArray?): Float {
+    if (a == null || b == null || a.size != 9 || b.size != 9) return 0.0f
+    return a.indices.maxOf { index -> abs(a[index] - b[index]) }
+}
+
 private val IDENTITY_3X3 = floatArrayOf(
     1f, 0f, 0f,
     0f, 1f, 0f,
@@ -97,11 +102,13 @@ data class BaseSensorCalibration(
 
     val warnings: List<String>,
 
-    // Phase 1 color-truth instrumentation. The processing path continues to use
-    // baseColorMatrix exactly as before; these fields only preserve what metadata supplied
-    // before BnCam's existing neutral row normalization changed it.
+    // Color-truth provenance. Phase 8 keeps the camera-provided matrix unmodified for
+    // production and retains the retired row-normalized form only as a diagnostic counterfactual.
     val baseColorMatrixPreNormalization: FloatArray? = null,
-    val baseColorMatrixNeutralNormalizationApplied: Boolean = false
+    val baseColorMatrixNeutralNormalizationApplied: Boolean = false,
+    // Phase 8 diagnostic only: reproduces the retired row-normalized matrix for objective
+    // A/B telemetry. It is never selected for production rendering.
+    val baseColorMatrixLegacyNeutralNormalized: FloatArray? = null
 )
 
 data class LensOverrideLayer(
@@ -214,14 +221,25 @@ data class FinalSensorCalibration(
         pairs.add("Identity Fallback Used" to effectiveColorMatrixIdentityFallbackUsed.toString())
         pairs.add("Color Matrix Reject Reason" to effectiveColorMatrixRejectReason)
         pairs.add("Color Matrix Values" to (effectiveColorMatrix?.formatArray5() ?: "missing"))
-        pairs.add("Color Matrix Metadata Pre-Normalization Values" to
+        pairs.add("Color Matrix Original Metadata Values" to
                 (base.baseColorMatrixPreNormalization?.formatArray5() ?: "missing"))
         pairs.add("Color Matrix Neutral Row Normalization Applied" to
                 base.baseColorMatrixNeutralNormalizationApplied.toString())
-        pairs.add("Color Matrix Pre-Normalization Row Sums" to
+        pairs.add("Color Matrix Original Row Sums" to
                 (base.baseColorMatrixPreNormalization?.matrixRowSums()?.formatArray5() ?: "missing"))
         pairs.add("Color Matrix Effective Row Sums" to
                 (effectiveColorMatrix?.matrixRowSums()?.formatArray5() ?: "missing"))
+        pairs.add("Color Matrix Legacy Row-Normalized Counterfactual" to
+                (base.baseColorMatrixLegacyNeutralNormalized?.formatArray5() ?: "missing"))
+        pairs.add("Color Matrix Legacy Counterfactual Row Sums" to
+                (base.baseColorMatrixLegacyNeutralNormalized?.matrixRowSums()?.formatArray5() ?: "missing"))
+        pairs.add("Color Matrix Legacy Counterfactual Max Abs Delta" to
+                matrixMaxAbsDelta(
+                    base.baseColorMatrixPreNormalization,
+                    base.baseColorMatrixLegacyNeutralNormalized
+                ).format6())
+        pairs.add("Color Matrix Production Contract" to
+                "Camera2 direct transform preserved; no BnCam row normalization")
         pairs.add("Color Matrix Applied To" to colorMatrixAppliedTo())
 
         pairs.add("WB Source" to effectiveWbSource)
@@ -681,7 +699,8 @@ object SensorCalibrationResolver {
             baseColorMatrixNote = colorMatrix.note,
             warnings = warnings.distinct(),
             baseColorMatrixPreNormalization = colorMatrix.preNormalizationValues?.copyOf(),
-            baseColorMatrixNeutralNormalizationApplied = colorMatrix.neutralNormalizationApplied
+            baseColorMatrixNeutralNormalizationApplied = colorMatrix.neutralNormalizationApplied,
+            baseColorMatrixLegacyNeutralNormalized = colorMatrix.legacyNeutralNormalizedValues?.copyOf()
         )
     }
 
@@ -1118,7 +1137,8 @@ object SensorCalibrationResolver {
         val rejectReason: String,
         val note: String,
         val preNormalizationValues: FloatArray?,
-        val neutralNormalizationApplied: Boolean
+        val neutralNormalizationApplied: Boolean,
+        val legacyNeutralNormalizedValues: FloatArray?
     )
 
     private data class MatrixCandidate(
@@ -1129,8 +1149,45 @@ object SensorCalibrationResolver {
         val declaredOutputSpace: String,
         val xyzToSrgbApplied: Boolean,
         val chromaticAdaptationApplied: Boolean,
+        val deviceCalibrationApplied: Boolean,
         val sourcePriority: Int
     )
+
+    private data class ForwardMatrixCandidateResolution(
+        val values: FloatArray?,
+        val deviceCalibrationApplied: Boolean,
+        val calibrationLabel: String
+    )
+
+    private fun resolveForwardMatrixCandidate(
+        characteristics: CameraCharacteristics,
+        forwardKey: CameraCharacteristics.Key<ColorSpaceTransform>,
+        calibrationKey: CameraCharacteristics.Key<ColorSpaceTransform>
+    ): ForwardMatrixCandidateResolution {
+        val forward = characteristics.get(forwardKey)?.let { colorSpaceTransformToArray(it) }
+            ?: return ForwardMatrixCandidateResolution(null, false, "forward_matrix_missing")
+        val calibration = characteristics.get(calibrationKey)?.let { colorSpaceTransformToArray(it) }
+        val actualSensorToReference = when {
+            calibration == null -> IDENTITY_3X3.copyOf()
+            else -> invert3x3(calibration)
+                ?: return ForwardMatrixCandidateResolution(null, false, "calibration_transform_noninvertible")
+        }
+        val referenceToXyzD50 = multiply3x3(forward, actualSensorToReference)
+            ?: return ForwardMatrixCandidateResolution(null, calibration != null, "matrix_multiply_failed")
+        val linearSrgb = multiply3x3(
+            RawColorTransformEngine.xyzD50ToLinearSrgbMatrix(),
+            referenceToXyzD50
+        )
+        return ForwardMatrixCandidateResolution(
+            values = linearSrgb,
+            deviceCalibrationApplied = calibration != null,
+            calibrationLabel = if (calibration != null) {
+                "inverse_device_calibration_applied"
+            } else {
+                "calibration_transform_missing_identity_reference_assumption"
+            }
+        )
+    }
 
     private fun resolveColorCorrectionMatrix(
         characteristics: CameraCharacteristics,
@@ -1140,128 +1197,124 @@ object SensorCalibrationResolver {
         val rejected = mutableListOf<String>()
         val candidates = mutableListOf<MatrixCandidate>()
 
-        // 1. CaptureResult.COLOR_CORRECTION_TRANSFORM (Direct sensor RGB to linear sRGB, no XYZ->sRGB)
+        // Camera2 defines this result as the actual sensor-RGB -> output linear-sRGB transform.
+        // Phase 8 therefore validates and preserves it exactly; no BnCam row normalization,
+        // XYZ conversion or chromatic adaptation is applied on top of it.
         candidates.add(MatrixCandidate(
             source = "CaptureResult.COLOR_CORRECTION_TRANSFORM -> linear_sRGB",
-            values = captureResult?.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)?.let { colorSpaceTransformToArray(it) },
-            note = "capture_result_sensor_rgb_to_linear_srgb_direct",
-            declaredInputSpace = "sensor_RGB",
-            declaredOutputSpace = "linear_sRGB",
+            values = captureResult?.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)
+                ?.let { colorSpaceTransformToArray(it) },
+            note = "capture_result_sensor_rgb_to_linear_srgb_direct_phase8_preserved",
+            declaredInputSpace = "actual_sensor_RGB_after_WB",
+            declaredOutputSpace = "linear_sRGB_D65",
             xyzToSrgbApplied = false,
             chromaticAdaptationApplied = false,
+            deviceCalibrationApplied = false,
             sourcePriority = 1
         ))
 
-        // 2. CameraCharacteristics.SENSOR_FORWARD_MATRIX2 (Reference sensor to XYZ D50, requires XYZ->sRGB)
+        // ForwardMatrix is defined in reference-sensor space. Convert actual device-sensor RGB
+        // back to the reference sensor with inverse(SENSOR_CALIBRATION_TRANSFORM), then apply
+        // ForwardMatrix -> XYZ D50 -> Bradford D65 -> linear sRGB.
+        val forward2 = resolveForwardMatrixCandidate(
+            characteristics,
+            CameraCharacteristics.SENSOR_FORWARD_MATRIX2,
+            CameraCharacteristics.SENSOR_CALIBRATION_TRANSFORM2
+        )
         candidates.add(MatrixCandidate(
-            source = "CameraCharacteristics.SENSOR_FORWARD_MATRIX2 -> XYZ_D50 -> Bradford_D65 -> linear_sRGB",
-            values = characteristics.get(CameraCharacteristics.SENSOR_FORWARD_MATRIX2)?.let {
-                multiply3x3(RawColorTransformEngine.xyzD50ToLinearSrgbMatrix(), colorSpaceTransformToArray(it))
-            },
-            note = "forward_matrix2_xyz_d50_bradford_d65_to_srgb",
-            declaredInputSpace = "reference_sensor_RGB",
-            declaredOutputSpace = "CIE_XYZ_D50",
+            source = "inverse(SENSOR_CALIBRATION_TRANSFORM2) -> SENSOR_FORWARD_MATRIX2 -> XYZ_D50 -> Bradford_D65 -> linear_sRGB",
+            values = forward2.values,
+            note = "forward_matrix2_${forward2.calibrationLabel}_xyz_d50_bradford_d65_to_srgb",
+            declaredInputSpace = "actual_sensor_RGB_after_WB",
+            declaredOutputSpace = "linear_sRGB_D65",
             xyzToSrgbApplied = true,
             chromaticAdaptationApplied = true,
+            deviceCalibrationApplied = forward2.deviceCalibrationApplied,
             sourcePriority = 2
         ))
 
-        // 3. CameraCharacteristics.SENSOR_FORWARD_MATRIX1
+        val forward1 = resolveForwardMatrixCandidate(
+            characteristics,
+            CameraCharacteristics.SENSOR_FORWARD_MATRIX1,
+            CameraCharacteristics.SENSOR_CALIBRATION_TRANSFORM1
+        )
         candidates.add(MatrixCandidate(
-            source = "CameraCharacteristics.SENSOR_FORWARD_MATRIX1 -> XYZ_D50 -> Bradford_D65 -> linear_sRGB",
-            values = characteristics.get(CameraCharacteristics.SENSOR_FORWARD_MATRIX1)?.let {
-                multiply3x3(RawColorTransformEngine.xyzD50ToLinearSrgbMatrix(), colorSpaceTransformToArray(it))
-            },
-            note = "forward_matrix1_xyz_d50_bradford_d65_to_srgb",
-            declaredInputSpace = "reference_sensor_RGB",
-            declaredOutputSpace = "CIE_XYZ_D50",
+            source = "inverse(SENSOR_CALIBRATION_TRANSFORM1) -> SENSOR_FORWARD_MATRIX1 -> XYZ_D50 -> Bradford_D65 -> linear_sRGB",
+            values = forward1.values,
+            note = "forward_matrix1_${forward1.calibrationLabel}_xyz_d50_bradford_d65_to_srgb",
+            declaredInputSpace = "actual_sensor_RGB_after_WB",
+            declaredOutputSpace = "linear_sRGB_D65",
             xyzToSrgbApplied = true,
             chromaticAdaptationApplied = true,
+            deviceCalibrationApplied = forward1.deviceCalibrationApplied,
             sourcePriority = 3
         ))
 
-        // 4. inverse(CameraCharacteristics.SENSOR_COLOR_TRANSFORM2)
-        candidates.add(MatrixCandidate(
-            source = "inverse(CameraCharacteristics.SENSOR_COLOR_TRANSFORM2) -> XYZ -> linear_sRGB",
-            values = characteristics.get(CameraCharacteristics.SENSOR_COLOR_TRANSFORM2)?.let { invert3x3(colorSpaceTransformToArray(it)) }?.let { multiply3x3(xyzToSrgbD65Matrix(), it) },
-            note = "inverse_color_transform2_xyz_to_srgb",
-            declaredInputSpace = "reference_sensor_RGB",
-            declaredOutputSpace = "CIE_XYZ",
-            xyzToSrgbApplied = true,
-            chromaticAdaptationApplied = false,
-            sourcePriority = 4
-        ))
-
-        // 5. inverse(CameraCharacteristics.SENSOR_COLOR_TRANSFORM1)
-        candidates.add(MatrixCandidate(
-            source = "inverse(CameraCharacteristics.SENSOR_COLOR_TRANSFORM1) -> XYZ -> linear_sRGB",
-            values = characteristics.get(CameraCharacteristics.SENSOR_COLOR_TRANSFORM1)?.let { invert3x3(colorSpaceTransformToArray(it)) }?.let { multiply3x3(xyzToSrgbD65Matrix(), it) },
-            note = "inverse_color_transform1_xyz_to_srgb",
-            declaredInputSpace = "reference_sensor_RGB",
-            declaredOutputSpace = "CIE_XYZ",
-            xyzToSrgbApplied = true,
-            chromaticAdaptationApplied = false,
-            sourcePriority = 5
-        ))
+        // The old inverse(SENSOR_COLOR_TRANSFORM) fallbacks were not complete actual-sensor
+        // transforms: ColorTransform maps XYZ -> reference sensor, so using its inverse without
+        // the device calibration transform and illuminant adaptation is not a truthful substitute.
+        // Android couples reference illuminants with ForwardMatrix metadata; if neither the direct
+        // per-frame transform nor a valid ForwardMatrix route exists, use the explicit controlled
+        // fallback instead of silently applying a partially specified matrix.
 
         for (candidate in candidates) {
             val values = candidate.values
             if (values == null) continue
 
-            // --- DETAILED VALIDATION METRICS ---
-            val rowSums = FloatArray(3) { row -> values[row * 3] + values[row * 3 + 1] + values[row * 3 + 2] }
+            val rowSums = FloatArray(3) { row ->
+                values[row * 3] + values[row * 3 + 1] + values[row * 3 + 2]
+            }
             val det = values[0] * (values[4] * values[8] - values[5] * values[7]) -
-                      values[1] * (values[3] * values[8] - values[5] * values[6]) +
-                      values[2] * (values[3] * values[7] - values[4] * values[6])
+                    values[1] * (values[3] * values[8] - values[5] * values[6]) +
+                    values[2] * (values[3] * values[7] - values[4] * values[6])
             val neutralGray = FloatArray(3) { row -> rowSums[row] * 0.5f }
-            val expectedOne = FloatArray(3) { row -> rowSums[row] }
             val clippingRisk = rowSums.maxOrNull() ?: 1.0f
 
-            // Log detailed candidate parameters
-            Log.i("SensorCalibration", "Auditing matrix candidate [${candidate.source}]: " +
-                    "inputSpace=${candidate.declaredInputSpace}, outputSpace=${candidate.declaredOutputSpace}, " +
-                    "xyzToSrgbApplied=${candidate.xyzToSrgbApplied}, chromaticAdaptationApplied=${candidate.chromaticAdaptationApplied}, " +
-                    "priority=${candidate.sourcePriority}, determinant=${String.format(Locale.US, "%.4f", det)}, " +
-                    "rowSums=[${rowSums.joinToString(", ")}], neutralGray=[${neutralGray.joinToString(", ")}], " +
-                    "expectedOne=[${expectedOne.joinToString(", ")}], clippingRisk=${String.format(Locale.US, "%.2f", clippingRisk)}")
+            Log.i(
+                "SensorCalibration",
+                "Phase8 matrix candidate [${candidate.source}]: " +
+                        "inputSpace=${candidate.declaredInputSpace}, outputSpace=${candidate.declaredOutputSpace}, " +
+                        "xyzToSrgbApplied=${candidate.xyzToSrgbApplied}, " +
+                        "chromaticAdaptationApplied=${candidate.chromaticAdaptationApplied}, " +
+                        "deviceCalibrationApplied=${candidate.deviceCalibrationApplied}, " +
+                        "priority=${candidate.sourcePriority}, determinant=${String.format(Locale.US, "%.4f", det)}, " +
+                        "rowSums=[${rowSums.joinToString(", ")}], neutralGray=[${neutralGray.joinToString(", ")}], " +
+                        "clippingRisk=${String.format(Locale.US, "%.2f", clippingRisk)}"
+            )
 
-            // --- AUDITOR WARNING CHECKS ---
             if (candidate.source.contains("COLOR_CORRECTION_TRANSFORM") && candidate.xyzToSrgbApplied) {
-                warnings.add("ERROR: CaptureResult.COLOR_CORRECTION_TRANSFORM must not be multiplied by XYZ->sRGB matrix")
+                warnings.add("ERROR: CaptureResult.COLOR_CORRECTION_TRANSFORM must not be multiplied by XYZ->sRGB")
+                continue
             }
-            if (candidate.source.contains("FORWARD") && !candidate.xyzToSrgbApplied) {
-                warnings.add("ERROR: Forward matrix in XYZ space applied directly as sRGB matrix")
-            }
-            if (candidate.source.contains("COLOR_CORRECTION_TRANSFORM") && candidate.declaredOutputSpace.contains("XYZ")) {
-                warnings.add("ERROR: sRGB matrix processed with XYZ->sRGB transformation")
-            }
-            if (!candidate.chromaticAdaptationApplied && candidate.declaredOutputSpace.contains("D50")) {
-                warnings.add("DEBUG_WARNING: D50->D65 chromatic adaptation ignored; using D65 approximation for forward matrix")
-            }
-
-            val normalized = neutralNormalizedMatrix(values)
-            if (normalized == null) {
-                rejected.add("${candidate.source}: normalization failed")
+            if (candidate.source.contains("SENSOR_FORWARD_MATRIX") && !candidate.xyzToSrgbApplied) {
+                warnings.add("ERROR: ForwardMatrix must leave XYZ D50 through an explicit output transform")
                 continue
             }
 
-            val validation = validateColorMatrix(normalized)
+            val validation = validateColorMatrix(values)
             if (validation.first) {
+                val legacyCounterfactual = legacyNeutralNormalizedMatrix(values)
                 return MatrixResolution(
-                    values = normalized,
+                    values = values.copyOf(),
                     source = candidate.source,
                     applied = true,
                     identityFallbackUsed = false,
                     rejectReason = "none",
-                    note = "validated metadata matrix accepted; ${candidate.note}; validationScore=${validation.second.format5()}",
+                    note = "Phase8 validated matrix accepted without row normalization; ${candidate.note}; " +
+                            "validationScore=${validation.second.format5()}",
                     preNormalizationValues = values.copyOf(),
-                    neutralNormalizationApplied = true
+                    neutralNormalizationApplied = false,
+                    legacyNeutralNormalizedValues = legacyCounterfactual
                 )
             }
             rejected.add("${candidate.source}: ${validation.third}")
         }
 
-        val reason = if (rejected.isEmpty()) "No usable camera color metadata matrix was present" else rejected.joinToString(" | ")
+        val reason = if (rejected.isEmpty()) {
+            "No usable standards-complete camera color metadata matrix was present"
+        } else {
+            rejected.joinToString(" | ")
+        }
         warnings.add("Identity matrix fallback used: $reason")
         return MatrixResolution(
             values = IDENTITY_3X3.copyOf(),
@@ -1269,9 +1322,10 @@ object SensorCalibrationResolver {
             applied = false,
             identityFallbackUsed = true,
             rejectReason = reason,
-            note = "Identity fallback used only because no valid metadata matrix was available",
+            note = "Identity fallback used only because no valid direct/ForwardMatrix color transform was available",
             preNormalizationValues = null,
-            neutralNormalizationApplied = false
+            neutralNormalizationApplied = false,
+            legacyNeutralNormalizedValues = null
         )
     }
 
@@ -1330,7 +1384,7 @@ object SensorCalibrationResolver {
         )
     }
 
-    private fun neutralNormalizedMatrix(values: FloatArray): FloatArray? {
+    private fun legacyNeutralNormalizedMatrix(values: FloatArray): FloatArray? {
         if (values.size != 9 || values.any { !it.isFinite() }) return null
         val rowSums = FloatArray(3) { row -> values[row * 3] + values[row * 3 + 1] + values[row * 3 + 2] }
         if (rowSums.any { !it.isFinite() || abs(it) < 0.0001f }) return null
@@ -1366,6 +1420,7 @@ object SensorCalibrationResolver {
         val score = negativeEnergy * 0.08f + abs(maxAbs - 1.0f) * 0.04f
         return Triple(true, score, "valid")
     }
+
 
     fun cfaName(cfa: Int): String = when (cfa) {
         CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT_RGGB -> "RGGB"
