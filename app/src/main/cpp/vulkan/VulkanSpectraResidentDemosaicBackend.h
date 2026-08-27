@@ -175,6 +175,19 @@ struct SpectraResidentColorTransformResult {
     std::array<double, 3> rawMean{0.0, 0.0, 0.0};
     std::array<double, 3> wbMean{0.0, 0.0, 0.0};
     std::array<double, 3> ccmMean{0.0, 0.0, 0.0};
+    // Phase 9 compact classification/protection telemetry from the same resident AWB+CCM pass.
+    std::uint64_t phase9SensorClipCandidatePixels = 0u;
+    std::uint64_t phase9SingleChannelSensorClipPixels = 0u;
+    std::uint64_t phase9MultiChannelSensorClipPixels = 0u;
+    std::uint64_t phase9WbAboveUnityWithoutSensorClipPixels = 0u;
+    std::uint64_t phase9CcmNegativeExcursionPixels = 0u;
+    std::uint64_t phase9ColorConfidenceAppliedPixels = 0u;
+    std::uint64_t phase9GamutCompressedPixels = 0u;
+    std::uint64_t phase9LegacyMagentaRiskPixels = 0u;
+    std::uint64_t phase9ProtectedMagentaRiskPixels = 0u;
+    std::uint64_t phase9SceneLinearOverUnityPixels = 0u;
+    std::uint64_t phase9FullySensorClippedPixels = 0u;
+    std::uint64_t phase9PartialColorConfidencePixels = 0u;
     float inputPackingMs = 0.0f;
     float kernelMs = 0.0f;
     float residualKernelMs = 0.0f;
@@ -296,6 +309,10 @@ private:
     PersistentBuffer rgbUpload_;
     // Twelve float sums per 16x16 workgroup: raw/WB/CCM means plus cloud-correction telemetry.
     PersistentBuffer colorStatistics_;
+    // Phase 9: twelve uint counters only; no full-frame clipping/gamut evidence readback.
+    // Delta 0061 counter[5] is clipping-aware confidence chroma reduction; counter[11]
+    // is partial-confidence population. No neighbour reconstruction owns RAW highlights.
+    PersistentBuffer colorTelemetry_;
     // Delta 46: compact 16x12 vec4 map: correctionRG, correctionBG, valid, reserved.
     PersistentBuffer cloudCorrectionMap_;
     // Six floats per sampled residual point; host-visible because the CPU only performs the

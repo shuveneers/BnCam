@@ -167,12 +167,15 @@ inline ChromaCloudCorrectionPlan buildChromaCloudCorrectionPlan(
             1.0f + 0.15f * plan.redWbGainPressure + 0.10f * plan.redCcmGainPressure;
     const float blueDownstreamAuthorityBoost =
             1.0f + 0.15f * plan.blueWbGainPressure + 0.10f * plan.blueCcmGainPressure;
+    // Delta 0062: device evidence shows the supported 1x coherent cloud survives while
+    // downstream WB/CCM predicts ~7-9x visibility amplification. Increase only this already
+    // evidenced low-frequency owner; local demosaic topology remains Phase-6-owned.
     plan.redAuthority = std::clamp(
-            0.18f * plan.riskEvidence * redSupport * structureRelief * redDownstreamAuthorityBoost,
-            0.0f, 0.20f);
+            0.24f * plan.riskEvidence * redSupport * structureRelief * redDownstreamAuthorityBoost,
+            0.0f, 0.26f);
     plan.blueAuthority = std::clamp(
-            0.18f * plan.riskEvidence * blueSupport * structureRelief * blueDownstreamAuthorityBoost,
-            0.0f, 0.20f);
+            0.24f * plan.riskEvidence * blueSupport * structureRelief * blueDownstreamAuthorityBoost,
+            0.0f, 0.26f);
     // Never propose a tile correction larger than half of the measured residual RMS, with
     // an absolute normalized-linear ceiling as an additional fail-safe.
     plan.maxAbsoluteCorrection = std::min(0.010f, 0.50f * residualRms);
@@ -247,8 +250,8 @@ inline ChromaCloudCorrectionPlan buildChromaCloudCorrectionPlan(
         const float shadowT = std::clamp((0.18f - tileLuma) / (0.18f - 0.055f), 0.0f, 1.0f);
         const float shadowGate = shadowT * shadowT * (3.0f - 2.0f * shadowT);
         const float shadowAuthorityBoost = 1.0f + 0.25f * shadowGate;
-        const float localRedAuthority = std::min(0.24f, plan.redAuthority * shadowAuthorityBoost);
-        const float localBlueAuthority = std::min(0.24f, plan.blueAuthority * shadowAuthorityBoost);
+        const float localRedAuthority = std::min(0.30f, plan.redAuthority * shadowAuthorityBoost);
+        const float localBlueAuthority = std::min(0.30f, plan.blueAuthority * shadowAuthorityBoost);
         if (shadowAuthorityBoost > 1.0001f &&
                 (localRedAuthority > plan.redAuthority + 1.0e-7f ||
                  localBlueAuthority > plan.blueAuthority + 1.0e-7f)) {

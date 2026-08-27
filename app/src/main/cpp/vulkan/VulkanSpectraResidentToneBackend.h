@@ -21,6 +21,10 @@ struct SpectraResidentSceneObserverRequest {
     // Disabled is bit-identical and requires no extra full-frame scratch.
     bool preToneChroma444Enabled = false;
     float preToneChroma444Strength = 0.0f;
+    // Phase 9 Delta 0063: measured physical-noise and WB+CCM amplification evidence
+    // for the resident 16x16 tile chroma model. No ISO/format heuristic is passed.
+    float preToneChromaNoisePressure = 0.0f;
+    float preToneChromaWbCcmPressure = 0.0f;
 };
 
 struct SpectraResidentSceneObserverResult {
@@ -29,10 +33,21 @@ struct SpectraResidentSceneObserverResult {
     bool residentInputUsed = false;
     bool persistentBufferReuseHit = false;
     bool persistentBufferReallocated = false;
+    // Phase 9 moved RAW highlight reconstruction upstream into AWB+CCM. Retained as
+    // compatibility/debug fields; the scene observer no longer mutates highlights and these stay zero.
     bool highlightRecoveryApplied = false;
     std::uint64_t correctedHighlightPixels = 0;
     bool preToneChroma444Applied = false;
     float preToneChroma444Strength = 0.0f;
+    bool preToneChromaTileScanApplied = false;
+    std::uint64_t preToneChromaTilesScanned = 0u;
+    std::uint64_t preToneChromaEligibleTiles = 0u;
+    std::uint64_t preToneChromaCorrectedPixels = 0u;
+    std::uint64_t preToneChromaDetailProtectedPixels = 0u;
+    std::uint64_t preToneChromaStructuredTiles = 0u;
+    float preToneChromaMeanNoisePressure = 0.0f;
+    float preToneChromaMeanResidualSigma = 0.0f;
+    float preToneChromaMaxCorrection = 0.0f;
     std::uint32_t sampleStep = 1u;
     std::uint32_t sampleCount = 0u;
     std::vector<float> sampledRgb;  // tightly packed R,G,B triples
@@ -131,8 +146,8 @@ struct SpectraResidentToneResult {
  * Milestone 8H-J resident post-colour scene/tone backend.
  *
  * The backend consumes the post-CCM device buffer owned by the resident demosaic backend.
- * Local highlight recovery, compact scene sampling and the complete pointwise tone/vibrance/
- * profile-colour loop execute on Vulkan. Only compact scene samples cross to the CPU before
+ * Upstream Phase-9-protected RGB, pre-tone 4:4:4 cleanup, compact scene sampling and the
+ * complete pointwise tone/vibrance/profile-colour loop execute on Vulkan. Only compact scene samples cross to the CPU before
  * the exposure governor. The tone result can remain resident for the next post-demosaic stage.
  */
 class VulkanSpectraResidentToneBackend final {

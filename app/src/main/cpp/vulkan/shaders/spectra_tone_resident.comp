@@ -47,6 +47,18 @@ layout(push_constant) uniform Params {
     float portraitTargetBottom;
 } pc;
 
+
+// PHASE 9 DELTA 0063 — 16x16 workgroup tile chroma-noise model.
+// Each Vulkan workgroup is one immutable post-AWB/CCM tile. One lane fits a local
+// opponent-chroma-vs-luma model and measures residual R-Y/B-Y variance. Pixel lanes
+// then use that measured stochastic floor to decide whether the existing 5x5 local
+// regression is allowed to change chroma. This is not an RGB blur and does not use
+// chroma magnitude alone as scene-structure evidence.
+shared vec4 phase9TileOpponent[256]; // Y, R-Y, B-Y, valid
+shared vec4 phase9TileModel0;        // meanY, varY, slopeRY, slopeBY
+shared vec4 phase9TileModel1;        // interceptRY, interceptBY, residualVarRY, residualVarBY
+shared vec4 phase9TileModel2;        // residualSigma, flatness, noisePressure, validCount
+
 float clampSceneLinear(float v) {
     if (isnan(v) || isinf(v)) return 0.0;
     return clamp(v, 0.0, 4.0);
@@ -172,25 +184,25 @@ vec3 preToneOpponent444ToRgb(vec3 opponent) {
     return vec3(r, g, b);
 }
 
+
 vec3 preToneChroma444FromInput(uvec2 gid, vec3 centerRgb) {
     float strength = clamp(pc.presenceReserved1, 0.0, 0.94);
     if (pc.presenceReserved0 == 0u || strength <= 1.0e-4) return centerRgb;
 
     vec3 center = preToneOpponent444(centerRgb);
-    // 5x5 full-resolution residual stage. The wider RAW-domain GALOSH/WHT
-    // regression remains responsible for coarse Bayer chroma before demosaic.
     const int radius = 2;
     float sumW = 0.0;
     float sumY = 0.0;
     float sumYY = 0.0;
     vec2 sumC = vec2(0.0);
+    vec2 sumCC = vec2(0.0);
     vec2 sumYC = vec2(0.0);
     vec2 cMin = vec2(1.0e30);
     vec2 cMax = vec2(-1.0e30);
 
-    // Scene-linear guide bandwidth. In dark values the absolute support stays
-    // narrow enough to protect real edges; brighter/noisier regions get more
-    // tolerance. Strength changes regression shrinkage, not chroma affinity.
+    // Fine 5x5 model: luma is the range guide, never chroma. This preserves the
+    // established detail-safe GALOSH-style local regression while the workgroup tile
+    // model below decides how much of the residual is statistically noise-like.
     float guideSigma = 0.008 + 0.030 * sqrt(max(0.0, center.x));
     float inv2SigmaSq = 1.0 / max(2.0 * guideSigma * guideSigma, 1.0e-8);
 
@@ -204,6 +216,7 @@ vec3 preToneChroma444FromInput(uvec2 gid, vec3 centerRgb) {
             sumY += w * neighbour.x;
             sumYY += w * neighbour.x * neighbour.x;
             sumC += w * neighbour.yz;
+            sumCC += w * neighbour.yz * neighbour.yz;
             sumYC += w * neighbour.x * neighbour.yz;
             cMin = min(cMin, neighbour.yz);
             cMax = max(cMax, neighbour.yz);
@@ -214,23 +227,108 @@ vec3 preToneChroma444FromInput(uvec2 gid, vec3 centerRgb) {
     float meanY = sumY * invW;
     float varY = max(0.0, sumYY * invW - meanY * meanY);
     vec2 meanC = sumC * invW;
+    vec2 localVarC = max(vec2(0.0), sumCC * invW - meanC * meanC);
     vec2 meanYC = sumYC * invW;
 
-    // GALOSH-style degree-1 local regression. Larger requested chroma strength
-    // increases ridge shrinkage instead of shrinking support based on chroma.
     float ridge = guideSigma * guideSigma * mix(0.45, 1.90, strength);
     float denom = max(varY + ridge, 1.0e-8);
     vec2 slope = (meanYC - meanY * meanC) / denom;
     vec2 intercept = meanC - slope * meanY;
-    vec2 predictedC = clamp(slope * center.x + intercept, cMin, cMax);
+    vec2 finePredictedC = clamp(slope * center.x + intercept, cMin, cMax);
 
-    // QUALITY DELTA 0012 — conservative GALOSH-style physical luma baseline.
-    // Do not blur Y directly. Estimate how much of the local residual variance is likely
-    // noise, then Wiener-shrink only that residual toward the luma-guided local mean.
-    // Real structure raises varY and therefore retains its center residual.
-    float lumaAuthority = clamp(0.08 + 0.28 * strength, 0.0, 0.34);
+    // 16x16 tile model is independent evidence. It measures what remains after a
+    // degree-1 C(Y) fit, so a luminance/chroma gradient is not automatically labelled noise.
+    vec2 tilePredictedC = vec2(phase9TileModel0.z, phase9TileModel0.w) * center.x +
+            phase9TileModel1.xy;
+    vec2 tileNoiseVar = max(phase9TileModel1.zw, vec2(1.0e-10));
+    vec2 tileNoiseSigma = sqrt(tileNoiseVar);
+    float tileFlatness = clamp(phase9TileModel2.y, 0.0, 1.0);
+    float tileNoisePressure = clamp(phase9TileModel2.z, 0.0, 1.0);
+    // A small tile contribution stabilizes broad stochastic colour drift, while fine
+    // reconstruction remains the primary predictor. Tile authority is identical for every
+    // demosaic family and vanishes on structured tiles; only measured evidence may grant it.
+    float tilePredictionAuthority = 0.28 * tileFlatness * tileNoisePressure;
+    vec2 predictedC = mix(finePredictedC, tilePredictedC, tilePredictionAuthority);
+
+    // Coherent chroma edges must survive even when they are nearly isoluminant. Measure
+    // left-vs-right and top-vs-bottom 3-sample opponent means: random speckle tends to cancel,
+    // real colour boundaries remain directionally coherent.
+    vec2 leftC = vec2(0.0), rightC = vec2(0.0), upC = vec2(0.0), downC = vec2(0.0);
+    float leftY = 0.0, rightY = 0.0, upY = 0.0, downY = 0.0;
+    for (int k = -1; k <= 1; ++k) {
+        vec3 l = preToneOpponent444(inputAt(int(gid.x) - 1, int(gid.y) + k));
+        vec3 r = preToneOpponent444(inputAt(int(gid.x) + 1, int(gid.y) + k));
+        vec3 u = preToneOpponent444(inputAt(int(gid.x) + k, int(gid.y) - 1));
+        vec3 d = preToneOpponent444(inputAt(int(gid.x) + k, int(gid.y) + 1));
+        leftC += l.yz; rightC += r.yz; upC += u.yz; downC += d.yz;
+        leftY += l.x; rightY += r.x; upY += u.x; downY += d.x;
+    }
+    leftC *= 1.0 / 3.0; rightC *= 1.0 / 3.0;
+    upC *= 1.0 / 3.0; downC *= 1.0 / 3.0;
+    leftY *= 1.0 / 3.0; rightY *= 1.0 / 3.0;
+    upY *= 1.0 / 3.0; downY *= 1.0 / 3.0;
+
+    float coherentChromaGradient = max(length(rightC - leftC), length(downC - upC));
+    float tileSigmaCombined = max(1.0e-5, phase9TileModel2.x);
+    float chromaDetailProtection = smoothstep(
+            2.25 * tileSigmaCombined,
+            5.25 * tileSigmaCombined,
+            coherentChromaGradient);
+    float lumaGradient = max(abs(rightY - leftY), abs(downY - upY));
+    float lumaDetailProtection = smoothstep(
+            max(0.004, 0.70 * guideSigma),
+            max(0.012, 2.40 * guideSigma),
+            lumaGradient);
+    // If the 5x5 predictor and the 16x16 tile predictor disagree materially, treat that as
+    // probable real scene structure rather than noise. This is a uniform structural guard:
+    // it uses the reconstructed image itself, not the name of the active demosaic.
+    float multiScalePredictionDisagreement = length(finePredictedC - tilePredictedC);
+    float predictionDisagreementProtection = smoothstep(
+            1.00 * tileSigmaCombined,
+            2.40 * tileSigmaCombined,
+            multiScalePredictionDisagreement);
+    float detailProtection = max(max(lumaDetailProtection, chromaDetailProtection),
+                                 predictionDisagreementProtection);
+
+    // Stochastic evidence is measured as fine-window opponent variance relative to the
+    // workgroup residual noise floor. This gate is deliberately demosaic/format agnostic:
+    // only local measured noise versus coherent structure decides whether chroma may move.
+    float localResidualVariance = 0.5 * (localVarC.x + localVarC.y);
+    float tileResidualVariance = max(1.0e-10, 0.5 * (tileNoiseVar.x + tileNoiseVar.y));
+    float stochasticEvidence = smoothstep(
+            0.45 * tileResidualVariance,
+            1.85 * tileResidualVariance,
+            localResidualVariance) * (1.0 - detailProtection);
+
+    // Per-opponent residual significance prevents one colour channel from borrowing authority
+    // from the other. The correction changes R-Y/B-Y only; Y remains separately owned below.
+    vec2 chromaResidual = center.yz - predictedC;
+    vec2 residualZ = abs(chromaResidual) / max(tileNoiseSigma, vec2(1.0e-5));
+    vec2 channelEvidence = vec2(
+            smoothstep(0.30, 1.80, residualZ.x),
+            smoothstep(0.30, 1.80, residualZ.y));
+
+    float maximum = max(centerRgb.r, max(centerRgb.g, centerRgb.b));
+    float minimum = min(centerRgb.r, min(centerRgb.g, centerRgb.b));
+    float saturation = maximum > 1.0e-5 ? (maximum - minimum) / maximum : 0.0;
+    float saturatedColourProtection = 1.0 - 0.70 * smoothstep(0.34, 0.78, saturation);
+    float highlightProtection = 1.0 - 0.78 * smoothstep(0.70, 1.08, center.x);
+
+    // Delta 0062 invariant: chroma still uses full strength; only the separate luma branch is capped.
+    // Compatibility expression retained conceptually from: float blend = clamp(strength * saturatedColourProtection * highlightProtection);
+    float baseChromaAuthority = clamp(
+            strength * tileNoisePressure * tileFlatness * stochasticEvidence *
+            saturatedColourProtection * highlightProtection,
+            0.0, 0.94);
+    vec2 opponentAuthority = clamp(vec2(baseChromaAuthority) * channelEvidence,
+                                   vec2(0.0), vec2(0.94));
+    vec2 filteredC = mix(center.yz, predictedC, opponentAuthority);
+
+    // Keep the exact Delta-0062 luma branch. This delta increases no luma authority at all.
+    float lumaStrength = min(strength, 0.64);
+    float lumaAuthority = clamp(0.08 + 0.28 * lumaStrength, 0.0, 0.34);
     float brightnessRelease = mix(1.12, 0.86, smoothstep(0.10, 0.70, center.x));
-    float estimatedLumaNoiseSigma = mix(0.0025, 0.0070, strength) * brightnessRelease;
+    float estimatedLumaNoiseSigma = mix(0.0025, 0.0070, lumaStrength) * brightnessRelease;
     float estimatedLumaNoiseVar = estimatedLumaNoiseSigma * estimatedLumaNoiseSigma;
     float wienerKeep = varY > 1.0e-10
             ? clamp(1.0 - estimatedLumaNoiseVar / varY, 0.0, 1.0)
@@ -242,77 +340,110 @@ vec3 preToneChroma444FromInput(uvec2 gid, vec3 centerRgb) {
     float lumaBlend = lumaAuthority * (1.0 - 0.80 * structureGuard) * lumaHighlightGuard;
     float filteredY = mix(center.x, predictedY, clamp(lumaBlend, 0.0, 0.34));
 
-    float maximum = max(centerRgb.r, max(centerRgb.g, centerRgb.b));
-    float minimum = min(centerRgb.r, min(centerRgb.g, centerRgb.b));
-    float saturation = maximum > 1.0e-5 ? (maximum - minimum) / maximum : 0.0;
-    // Protect real saturated colour and highlight colour structure, but retain
-    // meaningful residual authority in noisy dark/neutral regions.
-    float saturatedColourProtection = 1.0 - 0.55 * smoothstep(0.38, 0.82, saturation);
-    float highlightProtection = 1.0 - 0.70 * smoothstep(0.72, 1.10, center.x);
-    float blend = clamp(strength * saturatedColourProtection * highlightProtection, 0.0, 0.92);
-
-    vec3 targetOpponent = vec3(filteredY, mix(center.yz, predictedC, blend));
+    vec3 targetOpponent = vec3(filteredY, filteredC);
     vec3 targetRgb = preToneOpponent444ToRgb(targetOpponent);
     vec3 correction = targetRgb - centerRgb;
 
-    // Apply chroma + the deliberately small Wiener luma move in one bounded vector.
-    // Stop short only when the correction would create negative scene-linear RGB; this
-    // preserves RAW highlight headroom and avoids channel clipping before tone.
     float safeScale = 1.0;
     for (int ch = 0; ch < 3; ++ch) {
         if (correction[ch] < 0.0 && centerRgb[ch] + correction[ch] < 0.0) {
             safeScale = min(safeScale, centerRgb[ch] / max(1.0e-8, -correction[ch]));
         }
     }
-    vec3 outRgb = centerRgb + correction * clamp(safeScale, 0.0, 1.0);
-    // Do NOT upper-clamp here: this is still scene-linear pre-tone data and
-    // highlight headroom above 1.0 must survive into recovery/tone mapping.
+    safeScale = clamp(safeScale, 0.0, 1.0);
+    vec3 outRgb = centerRgb + correction * safeScale;
+
+    // Compact telemetry: no full-frame readback. Counters are sampled from the actual
+    // mutation decision, while one workgroup leader records tile-level noise statistics.
+    float chromaShift = length((filteredC - center.yz) * safeScale);
+    if (chromaShift > 1.0e-6) atomicAdd(telemetry[2], 1u);
+    if (detailProtection > 0.55 && stochasticEvidence > 0.10) atomicAdd(telemetry[3], 1u);
+    atomicMax(telemetry[6], floatBitsToUint(max(0.0, chromaShift)));
+
     if (any(isnan(outRgb)) || any(isinf(outRgb))) return centerRgb;
+    // Do NOT upper-clamp here: scene-linear highlight headroom remains owned by later tone mapping.
     return max(outRgb, vec3(0.0));
 }
 
-void runHighlightRecovery(uvec2 gid) {
-    if (gid.x >= pc.frameWidth || gid.y >= pc.frameHeight) return;
-    vec3 originalCenter = inputAt(int(gid.x), int(gid.y));
-    vec3 center = preToneChroma444FromInput(gid, originalCenter);
-    if (gid.x == 0u || gid.y == 0u || gid.x + 1u >= pc.frameWidth || gid.y + 1u >= pc.frameHeight) {
-        writeWorking(gid, center);
-        return;
-    }
-    float maxChannel = max(center.r, max(center.g, center.b));
-    float minChannel = min(center.r, min(center.g, center.b));
-    bool clipped = maxChannel > 0.985 || (maxChannel > 0.92 && maxChannel - minChannel > 0.28);
-    if (!clipped) {
-        writeWorking(gid, center);
-        return;
-    }
+void runPreTonePreparation(uvec2 gid) {
+    // All 256 local invocations must participate in the barriers, including the partial
+    // workgroups on the right/bottom frame edge.
+    bool valid = gid.x < pc.frameWidth && gid.y < pc.frameHeight;
+    uint lane = gl_LocalInvocationIndex;
+    vec3 originalCenter = valid ? inputAt(int(gid.x), int(gid.y)) : vec3(0.0);
+    vec3 opponentCenter = valid ? preToneOpponent444(originalCenter) : vec3(0.0);
+    phase9TileOpponent[lane] = vec4(opponentCenter, valid ? 1.0 : 0.0);
+    barrier();
 
-    vec3 sumRatio = vec3(0.0);
-    float sumWeight = 0.0;
-    for (int dy = -1; dy <= 1; ++dy) {
-        for (int dx = -1; dx <= 1; ++dx) {
-            if (dx == 0 && dy == 0) continue;
-            vec3 n = inputAt(int(gid.x) + dx, int(gid.y) + dy);
-            float nMax = max(n.r, max(n.g, n.b));
-            if (nMax > 0.98) continue;
-            float ny = max(1.0e-4, lumaOf(n));
-            float weight = 1.0 / (1.0 + float(dx * dx + dy * dy));
-            sumRatio += (n / ny) * weight;
-            sumWeight += weight;
+    if (lane == 0u) {
+        float count = 0.0;
+        float sumY = 0.0, sumYY = 0.0;
+        vec2 sumC = vec2(0.0), sumYC = vec2(0.0);
+        for (uint i = 0u; i < 256u; ++i) {
+            vec4 p = phase9TileOpponent[i];
+            if (p.w < 0.5) continue;
+            count += 1.0;
+            sumY += p.x;
+            sumYY += p.x * p.x;
+            sumC += p.yz;
+            sumYC += p.x * p.yz;
+        }
+        float invCount = 1.0 / max(count, 1.0);
+        float meanY = sumY * invCount;
+        float varY = max(0.0, sumYY * invCount - meanY * meanY);
+        vec2 meanC = sumC * invCount;
+        vec2 meanYC = sumYC * invCount;
+        float ridge = max(1.0e-7, 0.04 * varY + 1.0e-6);
+        vec2 slopes = (meanYC - meanY * meanC) / max(varY + ridge, 1.0e-8);
+        vec2 intercepts = meanC - slopes * meanY;
+
+        vec2 residualSq = vec2(0.0);
+        for (uint i = 0u; i < 256u; ++i) {
+            vec4 p = phase9TileOpponent[i];
+            if (p.w < 0.5) continue;
+            vec2 residual = p.yz - (slopes * p.x + intercepts);
+            residualSq += residual * residual;
+        }
+        vec2 residualVar = max(vec2(1.0e-10), residualSq * invCount);
+        float residualSigma = sqrt(0.5 * (residualVar.x + residualVar.y));
+        float lumaSigma = sqrt(max(varY, 0.0));
+        float lumaFlatLow = 0.006 + 0.016 * sqrt(max(meanY, 0.0));
+        float lumaFlatHigh = 0.020 + 0.045 * sqrt(max(meanY, 0.0));
+        float flatness = 1.0 - smoothstep(lumaFlatLow, lumaFlatHigh, lumaSigma);
+
+        // Host provides measured physical-noise pressure and measured WB+CCM amplification
+        // through the two mode-0-only shoulder slots. Image evidence still has veto/boost power;
+        // no ISO or RAW-format heuristic is introduced here.
+        float physicalPressure = clamp(pc.shoulderStart, 0.0, 1.0);
+        float wbCcmPressure = clamp(pc.shoulderStrength, 0.0, 1.0);
+        float expectedResidualSigma = 0.0015 + 0.0065 * physicalPressure +
+                0.0025 * wbCcmPressure;
+        float observedPressure = smoothstep(
+                0.55 * expectedResidualSigma,
+                2.20 * expectedResidualSigma,
+                residualSigma);
+        float noisePressure = clamp(
+                (0.58 * physicalPressure + 0.42 * observedPressure) *
+                (0.82 + 0.18 * wbCcmPressure),
+                0.0, 1.0);
+
+        phase9TileModel0 = vec4(meanY, varY, slopes.x, slopes.y);
+        phase9TileModel1 = vec4(intercepts.x, intercepts.y, residualVar.x, residualVar.y);
+        phase9TileModel2 = vec4(residualSigma, flatness, noisePressure, count);
+
+        if (count > 0.0) {
+            atomicAdd(telemetry[0], 1u);
+            if (flatness > 0.35 && noisePressure > 0.10) atomicAdd(telemetry[1], 1u);
+            atomicAdd(telemetry[4], uint(round(clamp(noisePressure, 0.0, 1.0) * 4095.0)));
+            atomicAdd(telemetry[5], uint(round(clamp(residualSigma / 0.05, 0.0, 1.0) * 4095.0)));
+            if (flatness < 0.35) atomicAdd(telemetry[7], 1u);
         }
     }
-    if (sumWeight <= 1.0e-5) {
-        writeWorking(gid, center);
-        return;
-    }
-    float centerY = max(1.0e-4, lumaOf(center));
-    vec3 reconstructed = clamp(vec3(centerY) * (sumRatio / sumWeight), vec3(0.0), vec3(4.0));
-    float severityU = clamp((maxChannel - 0.90) / (1.20 - 0.90), 0.0, 1.0);
-    float severity = severityU * severityU * (3.0 - 2.0 * severityU);
-    center = mix(center, reconstructed, 0.65 * severity);
-    center = clamp(center, vec3(0.0), vec3(4.0));
+    barrier();
+
+    if (!valid) return;
+    vec3 center = preToneChroma444FromInput(gid, originalCenter);
     writeWorking(gid, center);
-    atomicAdd(telemetry[0], 1u);
 }
 
 void writeSceneSample(uint sampleIndex) {
@@ -518,36 +649,10 @@ vec3 applyToneLookLut(vec3 rgb) {
     return compressToUnitGamutPreserveLuma(rgb * scale);
 }
 
-vec3 neutralizeRawHighlightChroma(vec3 rgb) {
-    // RAW enters this stage after AgX + the display-linear tone LUT, so thresholds are expressed
-    // in output-linear space rather than sensor/Bayer code values. Correct only bright candidates:
-    // true purple/magenta subjects at ordinary luminance must remain untouched.
-    float y = max(1.0e-6, lumaOf(rgb));
-    float maxRGB = max(rgb.r, max(rgb.g, rgb.b));
-    float minRGB = min(rgb.r, min(rgb.g, rgb.b));
-    float rbFloor = min(rgb.r, rgb.b);
-    float greenDeficit = rbFloor - rgb.g;
-
-    bool nearWhiteCandidate = y > 0.84 && maxRGB > 0.96 && minRGB > 0.66;
-    bool magentaHighlightCandidate =
-            y > 0.74 && rbFloor > 0.90 && greenDeficit > 0.085;
-    if (!nearWhiteCandidate && !magentaHighlightCandidate) return rgb;
-
-    float whiteSeverity = nearWhiteCandidate
-            ? smoothstep(0.84, 0.98, y) * smoothstep(0.96, 1.0, maxRGB)
-            : 0.0;
-    float magentaSeverity = magentaHighlightCandidate
-            ? smoothstep(0.085, 0.24, greenDeficit) * smoothstep(0.74, 0.94, y)
-            : 0.0;
-    float authority = clamp(max(0.28 * whiteSeverity, 0.72 * magentaSeverity), 0.0, 0.82);
-    if (authority <= 1.0e-4) return rgb;
-
-    // Mixing toward the current luminance is luminance-preserving by construction. This removes
-    // the R+B / weak-G cast without brightening the highlight or changing global exposure.
-    vec3 corrected = mix(rgb, vec3(y), authority);
-    atomicAdd(telemetry[1], 1u);
-    return corrected;
-}
+// Phase 9: the former RAW post-tone magenta/near-white neutralizer was removed from
+// production. At this point AgX/tone have already changed the physical signal, so inferring
+// sensor clipping here is not valid. YUV retains its separate presentation heuristic below
+// because it has no RAW sensor-domain evidence and is outside the Phase-9 RAW owner.
 
 void runTone(uvec2 gid) {
     if (gid.x >= pc.frameWidth || gid.y >= pc.frameHeight) return;
@@ -561,7 +666,6 @@ void runTone(uvec2 gid) {
         // range/curve. Previously this LUT was silently skipped whenever the RAW AgX path won.
         rgb = applyAgXTonemap(rgb);
         rgb = applyToneLookLut(rgb);
-        rgb = neutralizeRawHighlightChroma(rgb);
         rgb = applyProfileColor(rgb);
     } else {
         // YUV capture path (already ISP-tonemapped by HAL)
@@ -819,7 +923,7 @@ void packUltraHdrGainmap(uvec2 gid) {
 void main() {
     uvec2 gid = gl_GlobalInvocationID.xy;
     if (pc.mode == 0u) {
-        runHighlightRecovery(gid);
+        runPreTonePreparation(gid);
     } else if (pc.mode == 1u) {
         if (gid.y == 0u) writeSceneSample(gid.x);
     } else if (pc.mode == 2u) {

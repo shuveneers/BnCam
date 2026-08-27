@@ -9,12 +9,14 @@ layout(std430, binding = 3) writeonly buffer ColorStats { float colorStats[]; };
 layout(std430, binding = 4) writeonly buffer ResidualCandidates { float residualCandidates[]; };
 // Delta 46 transport-only binding. Record = (R-G correction, B-G correction, valid, reserved).
 layout(std430, binding = 5) readonly buffer CloudCorrectionMap { vec4 cloudCorrectionMap[]; };
+// Phase 9 compact counters. Per-pixel clipping/gamut evidence stays resident on GPU.
+layout(std430, binding = 6) buffer ColorTelemetry { uint colorTelemetry[]; };
 
 layout(push_constant) uniform Params {
     uint frameWidth;
     uint frameHeight;
     uint cfaPattern;
-    uint mode; // 0 bilinear, 1 Malvar, 2 Neural JDD, 3 AWB+CCM, 4 residual, 5/6 AMaZE, 7/8 Auto Hybrid, 9/10 Phase6
+    uint mode;          // Phase 9: mode 4 reads demosaic RGB; mode 11 reads post-colour RGB. // 0 bilinear, 1 Malvar, 2 Neural JDD, 3 AWB+CCM, 4 residual, 5/6 AMaZE, 7/8 Auto Hybrid, 9/10 Phase6
     float wbR;
     float wbG;
     float wbB;
@@ -580,6 +582,91 @@ vec3 residentRgbAt(int x, int y) {
     return vec3(outputRgb[index + 0u], outputRgb[index + 1u], outputRgb[index + 2u]);
 }
 
+vec3 colorRgbAt(int x, int y) {
+    int sx = clamp(x, 0, int(pc.frameWidth) - 1);
+    int sy = clamp(y, 0, int(pc.frameHeight) - 1);
+    uint index = (uint(sy) * pc.frameWidth + uint(sx)) * 3u;
+    return vec3(colorRgb[index + 0u], colorRgb[index + 1u], colorRgb[index + 2u]);
+}
+
+const float PHASE9_SENSOR_CLIP_THRESHOLD = 0.985; // hard-clip telemetry threshold only
+const float PHASE9_COLOR_CONFIDENCE_START = 0.960;
+const float PHASE9_COLOR_CONFIDENCE_ZERO = 0.995;
+
+uint phase9SensorClipMask(vec3 raw) {
+    uint mask = 0u;
+    if (raw.r >= PHASE9_SENSOR_CLIP_THRESHOLD) mask |= 1u;
+    if (raw.g >= PHASE9_SENSOR_CLIP_THRESHOLD) mask |= 2u;
+    if (raw.b >= PHASE9_SENSOR_CLIP_THRESHOLD) mask |= 4u;
+    return mask;
+}
+
+int phase9BitCount3(uint mask) {
+    return int((mask & 1u) != 0u) + int((mask & 2u) != 0u) + int((mask & 4u) != 0u);
+}
+
+float phase9Luma(vec3 rgb) {
+    return 0.2126 * rgb.r + 0.7152 * rgb.g + 0.0722 * rgb.b;
+}
+
+bool phase9MagentaRisk(vec3 rgb) {
+    float maximum = max(rgb.r, max(rgb.g, rgb.b));
+    if (!(maximum > 0.35)) return false;
+    float rbFloor = min(rgb.r, rgb.b);
+    float greenDeficit = rbFloor - rgb.g;
+    float relativeDeficit = greenDeficit / max(maximum, 1.0e-5);
+    return phase9Luma(rgb) > 0.30 && rbFloor > 0.62 * maximum && relativeDeficit > 0.085;
+}
+
+float phase9ColorConfidence(vec3 raw, uint hardClipMask) {
+    if (any(isnan(raw)) || any(isinf(raw))) return 0.0;
+    float peak = max(raw.r, max(raw.g, raw.b));
+    float pressure = smoothstep(PHASE9_COLOR_CONFIDENCE_START,
+                                PHASE9_COLOR_CONFIDENCE_ZERO, peak);
+    // Once every sensor/demosaic channel is already at the hard ceiling, no measured
+    // channel ratio remains trustworthy. Do not let WB manufacture chroma from [1,1,1].
+    if (phase9BitCount3(hardClipMask) == 3) return 0.0;
+    return clamp(1.0 - pressure, 0.0, 1.0);
+}
+
+vec3 phase9ApplyClippingAwareHighlightColor(
+        vec3 postCcmLinearRgb, float colorConfidence, out bool applied) {
+    applied = false;
+    if (any(isnan(postCcmLinearRgb)) || any(isinf(postCcmLinearRgb))) return vec3(0.0);
+    float confidence = clamp(colorConfidence, 0.0, 1.0);
+    if (confidence >= 0.999999) return postCcmLinearRgb;
+    float y = phase9Luma(postCcmLinearRgb);
+    vec3 safeRgb = mix(vec3(y), postCcmLinearRgb, confidence);
+    applied = any(greaterThan(abs(safeRgb - postCcmLinearRgb), vec3(1.0e-7)));
+    // No upper clamp: neutral highlights above 1.0 remain valid scene-linear headroom.
+    return safeRgb;
+}
+
+vec3 phase9ProtectSignedCcmLowerGamut(vec3 signedRgb, out bool excursion, out bool applied) {
+    excursion = min(signedRgb.r, min(signedRgb.g, signedRgb.b)) < -1.0e-6;
+    applied = false;
+    if (!excursion || any(isnan(signedRgb)) || any(isinf(signedRgb))) {
+        if (any(isnan(signedRgb)) || any(isinf(signedRgb))) {
+            applied = true;
+            return vec3(0.0);
+        }
+        // Scene-linear headroom >1 is deliberately preserved for the later tone owner.
+        return signedRgb;
+    }
+    float y = phase9Luma(signedRgb);
+    if (!(y > 1.0e-7)) {
+        applied = true;
+        return vec3(0.0);
+    }
+    float minimum = min(signedRgb.r, min(signedRgb.g, signedRgb.b));
+    float chromaScale = clamp(y / max(y - minimum, 1.0e-8), 0.0, 1.0);
+    vec3 protectedRgb = vec3(y) + (signedRgb - vec3(y)) * chromaScale;
+    // Only numerical lower-bound cleanup; no upper/output clamp belongs to Phase 9.
+    protectedRgb = max(protectedRgb, vec3(0.0));
+    applied = true;
+    return protectedRgb;
+}
+
 vec3 opponentAtRgb(vec3 pixel) {
     return vec3(
             0.2126 * pixel.r + 0.7152 * pixel.g + 0.0722 * pixel.b,
@@ -903,7 +990,7 @@ bool finiteBoundedRgb(vec3 pixel) {
            all(greaterThan(pixel, vec3(-0.05))) && all(lessThan(pixel, vec3(0.98)));
 }
 
-void writeResidualCandidate(uvec2 sampleGid) {
+void writeResidualCandidate(uvec2 sampleGid, bool postColourDomain) {
     if (sampleGid.x >= pc.residualColumns || sampleGid.y >= pc.residualRows) return;
     uint sampleIndex = sampleGid.y * pc.residualColumns + sampleGid.x;
     uint base = sampleIndex * 8u;
@@ -920,11 +1007,15 @@ void writeResidualCandidate(uvec2 sampleGid) {
     int y = 2 + int(sampleGid.y * pc.residualStride);
     if (x >= int(pc.frameWidth) - 2 || y >= int(pc.frameHeight) - 2) return;
 
-    vec3 centerPixel = residentRgbAt(x, y);
-    vec3 leftPixel = residentRgbAt(x - 1, y);
-    vec3 rightPixel = residentRgbAt(x + 1, y);
-    vec3 upPixel = residentRgbAt(x, y - 1);
-    vec3 downPixel = residentRgbAt(x, y + 1);
+    // Mode 4 is the immutable post-demosaic observation and MUST read outputRgb.
+    // Mode 11 is the post-AWB/CCM observation and reads colorRgb. AMaZE/AUTO_HYBRID
+    // use colorRgb as guide/Phase-6 scratch during demosaic, so collapsing these domains
+    // silently turns guide data into fake chroma residual evidence.
+    vec3 centerPixel = postColourDomain ? colorRgbAt(x, y) : residentRgbAt(x, y);
+    vec3 leftPixel = postColourDomain ? colorRgbAt(x - 1, y) : residentRgbAt(x - 1, y);
+    vec3 rightPixel = postColourDomain ? colorRgbAt(x + 1, y) : residentRgbAt(x + 1, y);
+    vec3 upPixel = postColourDomain ? colorRgbAt(x, y - 1) : residentRgbAt(x, y - 1);
+    vec3 downPixel = postColourDomain ? colorRgbAt(x, y + 1) : residentRgbAt(x, y + 1);
     if (!finiteBoundedRgb(centerPixel) || !finiteBoundedRgb(leftPixel) ||
         !finiteBoundedRgb(rightPixel) || !finiteBoundedRgb(upPixel) ||
         !finiteBoundedRgb(downPixel)) return;
@@ -959,7 +1050,11 @@ void writeResidualCandidate(uvec2 sampleGid) {
 void main() {
     uvec2 gid = gl_GlobalInvocationID.xy;
     if (pc.mode == 4u) {
-        writeResidualCandidate(gid);
+        writeResidualCandidate(gid, false); // POST_DEMOSAIC_RGB: outputRgb is authoritative.
+        return;
+    }
+    if (pc.mode == 11u) {
+        writeResidualCandidate(gid, true); // POST_COLOUR_TRANSFORM_RGB: colorRgb is authoritative.
         return;
     }
 
@@ -1027,20 +1122,65 @@ void main() {
     if (inside) {
         uint index = (gid.y * pc.frameWidth + gid.x) * 3u;
         vec3 rawInput = vec3(outputRgb[index + 0u], outputRgb[index + 1u], outputRgb[index + 2u]);
-        raw = rawInput; // Preserve legacy pre-WB statistics on the demosaic output itself.
+        raw = rawInput; // Immutable pre-WB sensor-domain/demosaic RGB for classification and stats.
+        uint sensorClipMask = phase9SensorClipMask(rawInput);
+        int sensorClipChannels = phase9BitCount3(sensorClipMask);
+        float colorConfidence = phase9ColorConfidence(rawInput, sensorClipMask);
+        bool confidenceCandidate = colorConfidence < 0.999999;
+        if (confidenceCandidate) atomicAdd(colorTelemetry[0], 1u);
+        if (sensorClipChannels == 1) atomicAdd(colorTelemetry[1], 1u);
+        if (sensorClipChannels >= 2) atomicAdd(colorTelemetry[2], 1u);
+        if (sensorClipChannels == 3) atomicAdd(colorTelemetry[10], 1u);
+        if (colorConfidence > 1.0e-6 && colorConfidence < 0.999999) {
+            atomicAdd(colorTelemetry[11], 1u);
+        }
+
         vec3 locallyStabilized = preWbOpponentStabilize(int(gid.x), int(gid.y), rawInput);
         vec3 rawForWb = preWbCloudCorrect(int(gid.x), int(gid.y), locallyStabilized);
         cloudAppliedOpponent = vec2(
                 rawForWb.r - locallyStabilized.r,
                 rawForWb.b - locallyStabilized.b);
-        wb = rawForWb * vec3(pc.wbR, pc.wbG, pc.wbB);
-        ccm = max(vec3(0.0), vec3(
-                pc.ccm0 * wb.r + pc.ccm1 * wb.g + pc.ccm2 * wb.b,
-                pc.ccm3 * wb.r + pc.ccm4 * wb.g + pc.ccm5 * wb.b,
-                pc.ccm6 * wb.r + pc.ccm7 * wb.g + pc.ccm8 * wb.b));
-        colorRgb[index + 0u] = finiteLinear(ccm.r);
-        colorRgb[index + 1u] = finiteLinear(ccm.g);
-        colorRgb[index + 2u] = finiteLinear(ccm.b);
+
+        // Counterfactual only: distinguishes WB-induced over-unity and old post-CCM magenta risk
+        // from actual sensor-domain clipping. Neither condition is treated as lost sensor data.
+        vec3 legacyWb = rawForWb * vec3(pc.wbR, pc.wbG, pc.wbB);
+        if (sensorClipChannels == 0 && any(greaterThan(legacyWb, vec3(1.0)))) {
+            atomicAdd(colorTelemetry[3], 1u);
+        }
+        vec3 legacySignedCcm = vec3(
+                pc.ccm0 * legacyWb.r + pc.ccm1 * legacyWb.g + pc.ccm2 * legacyWb.b,
+                pc.ccm3 * legacyWb.r + pc.ccm4 * legacyWb.g + pc.ccm5 * legacyWb.b,
+                pc.ccm6 * legacyWb.r + pc.ccm7 * legacyWb.g + pc.ccm8 * legacyWb.b);
+        // Keep Phase-7/8 compact means on their previously verified domain. Production pixels use
+        // the Phase-9 protected path below, but these diagnostics remain pre-Phase9 counterfactuals.
+        wb = legacyWb;
+        ccm = max(legacySignedCcm, vec3(0.0));
+        if (phase9MagentaRisk(ccm)) atomicAdd(colorTelemetry[7], 1u);
+
+        // ClippingAwareHighlightColor: WB and the camera matrix operate normally. The only
+        // safety action is a post-CCM, scene-linear chroma confidence mix derived strictly
+        // from immutable pre-WB ceiling evidence. This cannot change luminance or exposure.
+        vec3 signedCcm = legacySignedCcm;
+        bool originalCcmExcursion = min(signedCcm.r, min(signedCcm.g, signedCcm.b)) < -1.0e-6;
+        if (originalCcmExcursion) atomicAdd(colorTelemetry[4], 1u);
+        bool confidenceApplied = false;
+        vec3 confidenceSafeCcm = phase9ApplyClippingAwareHighlightColor(
+                signedCcm, colorConfidence, confidenceApplied);
+        if (confidenceApplied) atomicAdd(colorTelemetry[5], 1u);
+
+        bool ccmExcursion = false;
+        bool gamutCompressed = false;
+        vec3 protectedCcm = phase9ProtectSignedCcmLowerGamut(
+                confidenceSafeCcm, ccmExcursion, gamutCompressed);
+        // counter[4] deliberately records the original signed CCM excursion above, before
+        // clipping-confidence safety can reduce chroma and hide that diagnostic distinction.
+        if (gamutCompressed) atomicAdd(colorTelemetry[6], 1u);
+        if (phase9MagentaRisk(protectedCcm)) atomicAdd(colorTelemetry[8], 1u);
+        if (max(protectedCcm.r, max(protectedCcm.g, protectedCcm.b)) > 1.0) atomicAdd(colorTelemetry[9], 1u);
+
+        colorRgb[index + 0u] = finiteLinear(protectedCcm.r);
+        colorRgb[index + 1u] = finiteLinear(protectedCcm.g);
+        colorRgb[index + 2u] = finiteLinear(protectedCcm.b);
     }
 
     sumRawR[localIndex] = inside ? raw.r : 0.0;

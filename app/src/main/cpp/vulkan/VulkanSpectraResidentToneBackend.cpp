@@ -443,6 +443,11 @@ SpectraResidentSceneObserverResult VulkanSpectraResidentToneBackend::executeScen
     push.displayOffsetFloats = result.sampleCount * 3u;
     push.presenceReserved0 = preToneChroma444Requested ? 1u : 0u;
     push.presenceReserved1 = preToneChroma444Strength;
+    // Mode 0 owns no tone shoulder. Reuse these two existing push slots only for
+    // measured physical-noise and WB+CCM amplification evidence. Delta 0066 removes
+    // all demosaic-family / RAW-format authority heuristics from Phase 9.
+    push.shoulderStart = std::clamp(request.preToneChromaNoisePressure, 0.0f, 1.0f);
+    push.shoulderStrength = std::clamp(request.preToneChromaWbCcmPressure, 0.0f, 1.0f);
     vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0u, sizeof(push), &push);
     vkCmdDispatch(commandBuffer_, (request.frameWidth + 15u) / 16u, (request.frameHeight + 15u) / 16u, 1u);
     if (queryPool_ != VK_NULL_HANDLE) vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 1u);
@@ -457,9 +462,9 @@ SpectraResidentSceneObserverResult VulkanSpectraResidentToneBackend::executeScen
     workingBarrier.size = static_cast<VkDeviceSize>(rgbBytes);
     vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr, 1u, &workingBarrier, 0u, nullptr);
-    // QUALITY DELTA 0008: the 4:4:4 residual chroma regression is fused into
-    // mode 0 and reads only the immutable post-AWB/CCM input. No extra full-frame
-    // scratch allocation or in-place neighbour race is introduced.
+    // Phase 9: mode 0 is no longer a highlight-recovery owner. It keeps the existing physical
+    // 4:4:4 pre-tone cleanup fused against the immutable Phase-9-protected post-AWB/CCM input;
+    // no extra full-frame scratch allocation or in-place neighbour race is introduced.
     if (preToneChroma444Requested) {
         result.preToneChroma444Applied = true;
         result.preToneChroma444Strength = preToneChroma444Strength;
@@ -527,8 +532,29 @@ SpectraResidentSceneObserverResult VulkanSpectraResidentToneBackend::executeScen
     std::memcpy(result.displayGrid.data(), compact + static_cast<std::size_t>(result.sampleCount) * 3u,
                 result.displayGrid.size() * sizeof(float));
     const auto* telemetry = static_cast<const std::uint32_t*>(telemetry_.mapped);
-    result.correctedHighlightPixels = telemetry[0];
-    result.highlightRecoveryApplied = result.correctedHighlightPixels > 0u;
+    // Phase 9 Delta 0063: mode-0 telemetry is compact tile/chroma evidence only.
+    // No full-frame debug surface crosses to the CPU.
+    result.correctedHighlightPixels = 0u;
+    result.highlightRecoveryApplied = false;
+    result.preToneChromaTilesScanned = telemetry[0];
+    result.preToneChromaEligibleTiles = telemetry[1];
+    result.preToneChromaCorrectedPixels = telemetry[2];
+    result.preToneChromaDetailProtectedPixels = telemetry[3];
+    result.preToneChromaStructuredTiles = telemetry[7];
+    result.preToneChromaTileScanApplied = preToneChroma444Requested && telemetry[0] > 0u;
+    if (telemetry[0] > 0u) {
+        const float invTiles = 1.0f / static_cast<float>(telemetry[0]);
+        result.preToneChromaMeanNoisePressure =
+                static_cast<float>(telemetry[4]) * invTiles / 4095.0f;
+        result.preToneChromaMeanResidualSigma =
+                0.05f * static_cast<float>(telemetry[5]) * invTiles / 4095.0f;
+    }
+    float preToneChromaMaxCorrection = 0.0f;
+    std::memcpy(&preToneChromaMaxCorrection, &telemetry[6], sizeof(preToneChromaMaxCorrection));
+    result.preToneChromaMaxCorrection =
+            std::isfinite(preToneChromaMaxCorrection) && preToneChromaMaxCorrection >= 0.0f
+                    ? preToneChromaMaxCorrection
+                    : 0.0f;
     result.compactReadbackMs = elapsedMs(readStart);
     result.residentInputUsed = true;
     residentSceneGeneration_++;
@@ -539,7 +565,7 @@ SpectraResidentSceneObserverResult VulkanSpectraResidentToneBackend::executeScen
     result.residentSceneGeneration = residentSceneGeneration_;
     result.success = result.sampledRgb.size() == static_cast<std::size_t>(result.sampleCount) * 3u &&
             result.displayGrid.size() == kDisplayGridWidth * kDisplayGridHeight;
-    result.status = result.success ? "GPU_RESIDENT_HIGHLIGHT_RECOVERY_AND_SCENE_SAMPLES_READY"
+    result.status = result.success ? "GPU_RESIDENT_PRETONE_PREPARATION_AND_SCENE_SAMPLES_READY"
                                    : "GPU_SCENE_OBSERVER_COMPACT_READBACK_INCOMPLETE";
     result.failureReason = result.success ? "none" : "COMPACT_SCENE_OUTPUT_SIZE_MISMATCH";
     result.totalMs = elapsedMs(totalStart);
@@ -689,7 +715,8 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
     ready[1].size = kToneLutFloats * sizeof(float);
     vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr, 2u, ready, 0u, nullptr);
-    // Reset tone/gainmap/LTM telemetry while preserving scene-observer highlight recovery count [0].
+    // Reset tone/gainmap/LTM telemetry while preserving scene-observer mode-0 tile count [0].
+    // Phase 9 retired the former highlight-recovery meaning of telemetry[0].
     vkCmdFillBuffer(commandBuffer_, telemetry_.buffer, sizeof(std::uint32_t),
                     7u * sizeof(std::uint32_t), 0u);
     if (localToneRequested) {

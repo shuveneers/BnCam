@@ -144,7 +144,7 @@ void VulkanSpectraResidentDemosaicBackend::destroyBuffersLocked() noexcept {
 #if BNCAM_VMA_HEADER_AVAILABLE
     if (allocator_ != nullptr) {
         for (PersistentBuffer* buffer : {&inputStaging_, &outputReadback_, &deviceInput_, &deviceOutput_,
-                                         &rgbUpload_, &colorStatistics_, &cloudCorrectionMap_, &residualCandidates_}) {
+                                         &rgbUpload_, &colorStatistics_, &colorTelemetry_, &cloudCorrectionMap_, &residualCandidates_}) {
             if (buffer->buffer != VK_NULL_HANDLE && buffer->allocation != nullptr) {
                 vmaDestroyBuffer(allocator_, buffer->buffer, buffer->allocation);
             }
@@ -212,8 +212,8 @@ bool VulkanSpectraResidentDemosaicBackend::initializeLocked(
         failureReason = "RESIDENT_DEMOSAIC_INITIALIZATION_INPUT_INVALID";
         return false;
     }
-    VkDescriptorSetLayoutBinding bindings[6]{};
-    for (std::uint32_t i = 0; i < 6u; ++i) {
+    VkDescriptorSetLayoutBinding bindings[7]{};
+    for (std::uint32_t i = 0; i < 7u; ++i) {
         bindings[i].binding = i;
         bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         bindings[i].descriptorCount = 1u;
@@ -221,7 +221,7 @@ bool VulkanSpectraResidentDemosaicBackend::initializeLocked(
     }
     VkDescriptorSetLayoutCreateInfo descriptorInfo{};
     descriptorInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    descriptorInfo.bindingCount = 6u;
+    descriptorInfo.bindingCount = 7u;
     descriptorInfo.pBindings = bindings;
     if (vkCreateDescriptorSetLayout(device, &descriptorInfo, nullptr, &descriptorSetLayout_) != VK_SUCCESS) {
         failureReason = "vkCreateDescriptorSetLayout_resident_demosaic_failed";
@@ -263,7 +263,7 @@ bool VulkanSpectraResidentDemosaicBackend::initializeLocked(
     }
     VkDescriptorPoolSize poolSize{};
     poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    poolSize.descriptorCount = 6u;
+    poolSize.descriptorCount = 7u;
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolInfo.maxSets = 1u;
@@ -314,18 +314,20 @@ bool VulkanSpectraResidentDemosaicBackend::initializeLocked(
 }
 
 void VulkanSpectraResidentDemosaicBackend::updateDescriptorSetLocked(VkDevice device, VkBuffer inputOverride, VkBuffer scratchOverride) noexcept {
-    VkDescriptorBufferInfo infos[6]{};
+    VkDescriptorBufferInfo infos[7]{};
     infos[0].buffer = inputOverride != VK_NULL_HANDLE ? inputOverride : deviceInput_.buffer;
     infos[1].buffer = deviceOutput_.buffer;
-    // Binding 2 normally aliases the resident output for pointwise AWB+CCM. During AMaZE/Auto Hybrid
-    // demosaic it is rebound to rgbUpload_ and becomes the persistent green/Nyquist/structure guide.
+    // Binding 2 aliases output only for demosaic modes that do not need scratch. AMaZE/Auto Hybrid
+    // use rgbUpload_ as their guide; Phase 9 AWB+CCM also binds rgbUpload_ as a distinct protected
+    // output so binding 1 remains immutable pre-WB neighbour evidence.
     infos[2].buffer = scratchOverride != VK_NULL_HANDLE ? scratchOverride : deviceOutput_.buffer;
     infos[3].buffer = colorStatistics_.buffer;
     infos[4].buffer = residualCandidates_.buffer;
     infos[5].buffer = cloudCorrectionMap_.buffer;
+    infos[6].buffer = colorTelemetry_.buffer;
     for (auto& info : infos) info.range = VK_WHOLE_SIZE;
-    VkWriteDescriptorSet writes[6]{};
-    for (std::uint32_t i = 0; i < 6u; ++i) {
+    VkWriteDescriptorSet writes[7]{};
+    for (std::uint32_t i = 0; i < 7u; ++i) {
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].dstSet = descriptorSet_;
         writes[i].dstBinding = i;
@@ -333,7 +335,7 @@ void VulkanSpectraResidentDemosaicBackend::updateDescriptorSetLocked(VkDevice de
         writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         writes[i].pBufferInfo = &infos[i];
     }
-    vkUpdateDescriptorSets(device, 6u, writes, 0u, nullptr);
+    vkUpdateDescriptorSets(device, 7u, writes, 0u, nullptr);
     descriptorBindingsInitialized_ = true;
 }
 
@@ -463,6 +465,7 @@ SpectraResidentDemosaicResult VulkanSpectraResidentDemosaicBackend::executeInter
          !ensureBufferLocked(allocator, requiredScratchBytes,
                  0u, rgbUpload_, reallocated, failure)) ||
         !ensureBufferLocked(allocator, statisticsBytes, readAccess, colorStatistics_, reallocated, failure) ||
+        !ensureBufferLocked(allocator, 12u * sizeof(std::uint32_t), readAccess, colorTelemetry_, reallocated, failure) ||
         !ensureBufferLocked(allocator, 16u, writeAccess, cloudCorrectionMap_, reallocated, failure) ||
         !ensureBufferLocked(allocator, std::max<std::uint64_t>(24u, residualSampling.bytes),
                             readAccess, residualCandidates_, reallocated, failure)) {
@@ -477,7 +480,8 @@ SpectraResidentDemosaicResult VulkanSpectraResidentDemosaicBackend::executeInter
     result.persistentAllocationGeneration = allocationGeneration_;
     result.persistentResidentBytes = inputStaging_.capacityBytes + outputReadback_.capacityBytes +
             deviceInput_.capacityBytes + deviceOutput_.capacityBytes + rgbUpload_.capacityBytes +
-            colorStatistics_.capacityBytes + cloudCorrectionMap_.capacityBytes + residualCandidates_.capacityBytes;
+            colorStatistics_.capacityBytes + colorTelemetry_.capacityBytes +
+            cloudCorrectionMap_.capacityBytes + residualCandidates_.capacityBytes;
     // Rebind every demosaic submission because binding 0 may alternate between an internal
     // upload buffer and an opaque resident Pass-3 buffer. AMaZE and Auto Hybrid bind the same
     // dedicated resident guide scratch at binding 2; other algorithms retain the color alias.
@@ -939,7 +943,8 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
     result.residualSampleStride = residualSampling.stride;
     result.residualSampleColumns = residualSampling.columns;
     result.residualSampleRows = residualSampling.rows;
-    result.compactStatisticsBytes = statisticsBytes + residualSampling.bytes;
+    result.compactStatisticsBytes = statisticsBytes + residualSampling.bytes +
+            12u * sizeof(std::uint32_t);
 
     const bool residentInputUsable = residentDemosaicValid_ &&
             request.residentDemosaicGeneration != 0u &&
@@ -950,15 +955,17 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
     const std::uint32_t writeAccess = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
     const std::uint32_t readAccess = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
     if (!ensureBufferLocked(allocator, sizeof(float), 0u, deviceInput_, reallocated, failure) ||
+        (!residentInputUsable &&
+         !ensureBufferLocked(allocator, rgbBytes, writeAccess, inputStaging_, reallocated, failure)) ||
         !ensureBufferLocked(allocator, rgbBytes, 0u, deviceOutput_, reallocated, failure) ||
+        !ensureBufferLocked(allocator, rgbBytes, 0u, rgbUpload_, reallocated, failure) ||
         (!request.deferFullReadback &&
          !ensureBufferLocked(allocator, rgbBytes, readAccess, outputReadback_, reallocated, failure)) ||
         !ensureBufferLocked(allocator, statisticsBytes, readAccess, colorStatistics_, reallocated, failure) ||
+        !ensureBufferLocked(allocator, 12u * sizeof(std::uint32_t), readAccess, colorTelemetry_, reallocated, failure) ||
         !ensureBufferLocked(allocator, cloudMapBytes, writeAccess, cloudCorrectionMap_, reallocated, failure) ||
         !ensureBufferLocked(allocator, std::max<std::uint64_t>(24u, residualSampling.bytes),
-                            readAccess, residualCandidates_, reallocated, failure) ||
-        (!residentInputUsable &&
-         !ensureBufferLocked(allocator, rgbBytes, writeAccess, rgbUpload_, reallocated, failure))) {
+                            readAccess, residualCandidates_, reallocated, failure)) {
         result.status = "GPU_COLOR_TRANSFORM_BUFFER_ALLOCATION_FAILED";
         result.failureReason = failure;
         result.totalMs = elapsedMs(totalStart);
@@ -969,7 +976,8 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
     result.persistentAllocationGeneration = allocationGeneration_;
     result.persistentResidentBytes = inputStaging_.capacityBytes + outputReadback_.capacityBytes +
             deviceInput_.capacityBytes + deviceOutput_.capacityBytes + rgbUpload_.capacityBytes +
-            colorStatistics_.capacityBytes + cloudCorrectionMap_.capacityBytes + residualCandidates_.capacityBytes;
+            colorStatistics_.capacityBytes + colorTelemetry_.capacityBytes +
+            cloudCorrectionMap_.capacityBytes + residualCandidates_.capacityBytes;
 
     // Upload the compact 16x12 opponent cloud field consumed by mode-3 pre-WB correction.
     float* cloudPacked = static_cast<float*>(cloudCorrectionMap_.mapped);
@@ -986,7 +994,8 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
         result.cloudCorrectionMapBytes = cloudMapBytes;
     }
     vmaFlushAllocation(allocator, cloudCorrectionMap_.allocation, 0u, static_cast<VkDeviceSize>(cloudMapBytes));
-    updateDescriptorSetLocked(device);
+    // Phase 9: immutable pre-WB RGB at binding 1, protected post-CCM output at binding 2.
+    updateDescriptorSetLocked(device, VK_NULL_HANDLE, rgbUpload_.buffer);
 
     bool useResident = residentInputUsable;
     if (!useResident) {
@@ -997,7 +1006,7 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
             return result;
         }
         const auto packStart = Clock::now();
-        float* packed = static_cast<float*>(rgbUpload_.mapped);
+        float* packed = static_cast<float*>(inputStaging_.mapped);
         const std::size_t tightRowFloats = static_cast<std::size_t>(request.frameWidth) * 3u;
         for (std::uint32_t y = 0; y < request.frameHeight; ++y) {
             std::memcpy(packed + static_cast<std::size_t>(y) * tightRowFloats,
@@ -1005,7 +1014,7 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
                         tightRowFloats * sizeof(float));
         }
         result.inputPackingMs = elapsedMs(packStart);
-        vmaFlushAllocation(allocator, rgbUpload_.allocation, 0u, static_cast<VkDeviceSize>(rgbBytes));
+        vmaFlushAllocation(allocator, inputStaging_.allocation, 0u, static_cast<VkDeviceSize>(rgbBytes));
         result.cpuRgbUploadUsed = true;
     } else {
         result.residentInputUsed = true;
@@ -1025,7 +1034,7 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
     if (!useResident) {
         VkBufferCopy copy{};
         copy.size = static_cast<VkDeviceSize>(rgbBytes);
-        vkCmdCopyBuffer(commandBuffer_, rgbUpload_.buffer, deviceOutput_.buffer, 1u, &copy);
+        vkCmdCopyBuffer(commandBuffer_, inputStaging_.buffer, deviceOutput_.buffer, 1u, &copy);
         VkBufferMemoryBarrier barrier{};
         barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
         barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -1037,6 +1046,19 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
         vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_TRANSFER_BIT,
                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr, 1u, &barrier, 0u, nullptr);
     }
+    vkCmdFillBuffer(commandBuffer_, colorTelemetry_.buffer, 0u,
+                    12u * sizeof(std::uint32_t), 0u);
+    VkBufferMemoryBarrier phase9TelemetryClear{};
+    phase9TelemetryClear.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    phase9TelemetryClear.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    phase9TelemetryClear.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    phase9TelemetryClear.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    phase9TelemetryClear.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    phase9TelemetryClear.buffer = colorTelemetry_.buffer;
+    phase9TelemetryClear.size = 12u * sizeof(std::uint32_t);
+    vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr,
+                         1u, &phase9TelemetryClear, 0u, nullptr);
     if (cloudMapContractValid) {
         VkBufferMemoryBarrier cloudHostToShader{};
         cloudHostToShader.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
@@ -1087,7 +1109,7 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
     if (queryPool_ != VK_NULL_HANDLE) {
         vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 1u);
     }
-    // AWB+CCM writes deviceOutput_ in place. Before the one unavoidable downstream RGB
+    // Phase 9 AWB+CCM writes rgbUpload_ while deviceOutput_ stays immutable pre-WB source. Before the one unavoidable downstream RGB
     // readback, generate the post-colour residual observation on GPU as compact candidates.
     VkBufferMemoryBarrier colorToResidual{};
     colorToResidual.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
@@ -1095,12 +1117,12 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
     colorToResidual.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
     colorToResidual.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     colorToResidual.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    colorToResidual.buffer = deviceOutput_.buffer;
+    colorToResidual.buffer = rgbUpload_.buffer;
     colorToResidual.size = VK_WHOLE_SIZE;
     vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr,
                          1u, &colorToResidual, 0u, nullptr);
-    push.mode = 4u;
+    push.mode = 11u; // Phase 9: post-colour residual domain reads colorRgb.
     push.residualStride = residualSampling.stride;
     push.residualColumns = residualSampling.columns;
     push.residualRows = residualSampling.rows;
@@ -1114,7 +1136,7 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
         vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 3u);
     }
 
-    VkBufferMemoryBarrier barriers[3]{};
+    VkBufferMemoryBarrier barriers[4]{};
     barriers[0].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
     barriers[0].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     barriers[0].dstAccessMask = request.deferFullReadback
@@ -1122,7 +1144,7 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
             : VK_ACCESS_TRANSFER_READ_BIT;
     barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barriers[0].buffer = deviceOutput_.buffer;
+    barriers[0].buffer = rgbUpload_.buffer;
     barriers[0].size = VK_WHOLE_SIZE;
     barriers[1].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
     barriers[1].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -1138,15 +1160,22 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
     barriers[2].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barriers[2].buffer = residualCandidates_.buffer;
     barriers[2].size = VK_WHOLE_SIZE;
+    barriers[3].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    barriers[3].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barriers[3].dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    barriers[3].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barriers[3].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barriers[3].buffer = colorTelemetry_.buffer;
+    barriers[3].size = 12u * sizeof(std::uint32_t);
     const VkPipelineStageFlags colorDestinationStage = request.deferFullReadback
             ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT
             : VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT;
     vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                         colorDestinationStage, 0u, 0u, nullptr, 3u, barriers, 0u, nullptr);
+                         colorDestinationStage, 0u, 0u, nullptr, 4u, barriers, 0u, nullptr);
     if (!request.deferFullReadback) {
         VkBufferCopy colorCopy{};
         colorCopy.size = static_cast<VkDeviceSize>(rgbBytes);
-        vkCmdCopyBuffer(commandBuffer_, deviceOutput_.buffer, outputReadback_.buffer, 1u, &colorCopy);
+        vkCmdCopyBuffer(commandBuffer_, rgbUpload_.buffer, outputReadback_.buffer, 1u, &colorCopy);
     }
     if (vkEndCommandBuffer(commandBuffer_) != VK_SUCCESS) {
         result.status = "GPU_COLOR_TRANSFORM_COMMAND_END_FAILED";
@@ -1196,6 +1225,8 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
         vmaInvalidateAllocation(allocator, outputReadback_.allocation, 0u, static_cast<VkDeviceSize>(rgbBytes));
     }
     vmaInvalidateAllocation(allocator, colorStatistics_.allocation, 0u, static_cast<VkDeviceSize>(statisticsBytes));
+    vmaInvalidateAllocation(allocator, colorTelemetry_.allocation, 0u,
+                            12u * sizeof(std::uint32_t));
     if (residualSampling.bytes > 0u) {
         vmaInvalidateAllocation(allocator, residualCandidates_.allocation, 0u,
                                 static_cast<VkDeviceSize>(residualSampling.bytes));
@@ -1225,11 +1256,27 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
     result.cloudMeanAbsCorrectionRG = sums[9] * inversePixels;
     result.cloudMeanAbsCorrectionBG = sums[10] * inversePixels;
     result.cloudAffectedPixelFraction = std::clamp(sums[11] * inversePixels, 0.0, 1.0);
+    const auto* phase9 = static_cast<const std::uint32_t*>(colorTelemetry_.mapped);
+    result.phase9SensorClipCandidatePixels = phase9[0];
+    result.phase9SingleChannelSensorClipPixels = phase9[1];
+    result.phase9MultiChannelSensorClipPixels = phase9[2];
+    result.phase9WbAboveUnityWithoutSensorClipPixels = phase9[3];
+    result.phase9CcmNegativeExcursionPixels = phase9[4];
+    result.phase9ColorConfidenceAppliedPixels = phase9[5];
+    result.phase9GamutCompressedPixels = phase9[6];
+    result.phase9LegacyMagentaRiskPixels = phase9[7];
+    result.phase9ProtectedMagentaRiskPixels = phase9[8];
+    result.phase9SceneLinearOverUnityPixels = phase9[9];
+    result.phase9FullySensorClippedPixels = phase9[10];
+    result.phase9PartialColorConfidencePixels = phase9[11];
     result.compactStatisticsReductionMs = elapsedMs(reduceStart);
     result.success = request.deferFullReadback ||
             result.outputRgb.size() == static_cast<std::size_t>(pixelCount) * 3u;
     result.fullReadbackDeferred = request.deferFullReadback;
     result.cloudCorrectionApplied = result.success && cloudMapContractValid;
+    // Promote protected post-CCM scratch to resident output without a full-frame copy/readback.
+    std::swap(deviceOutput_, rgbUpload_);
+
     // deviceOutput_ now contains post-CCM RGB, not the original demosaic generation. Prevent
     // accidental reuse/reapplication of WB+CCM under the same demosaic token, but publish a new
     // opaque color generation when the next Vulkan stage owns the full-resolution buffer.

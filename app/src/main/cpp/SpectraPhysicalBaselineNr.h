@@ -67,10 +67,14 @@ inline PhysicalPreToneChromaPlan resolvePhysicalPreToneChroma(
     plan.upstreamChromaReduction = std::clamp(
             std::isfinite(upstreamChromaReduction) ? upstreamChromaReduction : 0.0f,
             0.0f, 1.0f);
+    // Delta 0062 device correction: upstream authority is not the same as measured removal.
+    // The 1x device gate still shows coherent chroma risk after the early stage, so do not
+    // over-credit upstream cleanup. WB+CCM pressure is measured downstream amplification and
+    // therefore gets more weight in the luma-guided chroma-only pre-tone baseline.
     plan.residualHeadroom = std::clamp(
-            1.0f - 0.72f * plan.upstreamChromaReduction, 0.30f, 1.0f);
+            1.0f - 0.50f * plan.upstreamChromaReduction, 0.42f, 1.0f);
     plan.baselineStrength = std::clamp(
-            (0.58f + 0.14f * plan.noisePressure + 0.12f * plan.wbCcmPressure) *
+            (0.58f + 0.14f * plan.noisePressure + 0.18f * plan.wbCcmPressure) *
                     plan.residualHeadroom,
             0.0f, 0.86f);
 

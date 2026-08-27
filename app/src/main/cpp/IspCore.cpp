@@ -14,6 +14,7 @@
 #include "SpectraResidualChromaArtifact.h"
 #include "PhysicalAwbEstimator.h"
 #include "SensorColorScienceV2.h"
+#include "HighlightGamutProtectionV2.h"
 #include "SpectraMultiscaleContext.h"
 #include "SpectraMultiscaleResidualConsensus.h"
 #include "SpectraMultiscaleChromaContext.h"
@@ -2193,6 +2194,24 @@ struct HighlightRecoveryDebug {
     std::string reason = "not_run";
 };
 
+struct Phase9ColorProtectionDebug {
+    bool gpuPrimary = false;
+    bool cpuFallback = false;
+    std::uint64_t sensorClipCandidatePixels = 0u;
+    std::uint64_t singleChannelSensorClipPixels = 0u;
+    std::uint64_t multiChannelSensorClipPixels = 0u;
+    std::uint64_t fullySensorClippedPixels = 0u;
+    std::uint64_t wbAboveUnityWithoutSensorClipPixels = 0u;
+    std::uint64_t ccmNegativeExcursionPixels = 0u;
+    std::uint64_t colorConfidenceAppliedPixels = 0u;
+    std::uint64_t partialColorConfidencePixels = 0u;
+    std::uint64_t gamutCompressedPixels = 0u;
+    std::uint64_t legacyMagentaRiskPixels = 0u;
+    std::uint64_t protectedMagentaRiskPixels = 0u;
+    std::uint64_t sceneLinearOverUnityPixels = 0u;
+    float cpuFallbackMs = 0.0f;
+};
+
 
 float medianFromSamples(std::vector<float>& values) {
     if (values.empty()) return 0.0f;
@@ -2427,121 +2446,8 @@ LensShadingDebug applyLensShadingToJpegRaw(LinearFloatRaw& raw, const IspFrameMe
     return debug;
 }
 
-HighlightRecoveryDebug applyLocalHighlightRecovery(cv::Mat& linearRgb) {
-    HighlightRecoveryDebug debug{};
-    const auto start = IspClock::now();
-    if (linearRgb.empty() || linearRgb.type() != CV_32FC3 || linearRgb.cols < 3 || linearRgb.rows < 3) {
-        debug.reason = "invalid_rgb";
-        debug.elapsedMs = elapsedMs(start);
-        return debug;
-    }
-
-    int minCandidateX = linearRgb.cols;
-    int minCandidateY = linearRgb.rows;
-    int maxCandidateX = -1;
-    int maxCandidateY = -1;
-    int candidateCount = 0;
-    std::mutex candidateMutex;
-    cv::parallel_for_(cv::Range(1, linearRgb.rows - 1), [&](const cv::Range& range) {
-        int localMinX = linearRgb.cols;
-        int localMinY = linearRgb.rows;
-        int localMaxX = -1;
-        int localMaxY = -1;
-        int localCandidates = 0;
-        for (int y = range.start; y < range.end; ++y) {
-            const cv::Vec3f* row = linearRgb.ptr<cv::Vec3f>(y);
-            for (int x = 1; x < linearRgb.cols - 1; ++x) {
-                const cv::Vec3f center = row[x];
-                const float maxChannel = std::max({center[0], center[1], center[2]});
-                const float minChannel = std::min({center[0], center[1], center[2]});
-                if (maxChannel > 0.985f ||
-                    (maxChannel > 0.92f && maxChannel - minChannel > 0.28f)) {
-                    localMinX = std::min(localMinX, x);
-                    localMinY = std::min(localMinY, y);
-                    localMaxX = std::max(localMaxX, x);
-                    localMaxY = std::max(localMaxY, y);
-                    ++localCandidates;
-                }
-            }
-        }
-        if (localCandidates > 0) {
-            std::lock_guard<std::mutex> lock(candidateMutex);
-            minCandidateX = std::min(minCandidateX, localMinX);
-            minCandidateY = std::min(minCandidateY, localMinY);
-            maxCandidateX = std::max(maxCandidateX, localMaxX);
-            maxCandidateY = std::max(maxCandidateY, localMaxY);
-            candidateCount += localCandidates;
-        }
-    });
-    if (candidateCount == 0) {
-        debug.reason = "no_recoverable_local_highlights_prescan";
-        debug.elapsedMs = elapsedMs(start);
-        return debug;
-    }
-
-    const int roiLeft = std::max(0, minCandidateX - 1);
-    const int roiTop = std::max(0, minCandidateY - 1);
-    const int roiRight = std::min(linearRgb.cols, maxCandidateX + 2);
-    const int roiBottom = std::min(linearRgb.rows, maxCandidateY + 2);
-    const cv::Rect highlightRoi(
-            roiLeft, roiTop, roiRight - roiLeft, roiBottom - roiTop);
-    const cv::Mat source = linearRgb(highlightRoi).clone();
-    std::atomic<int> correctedCount{0};
-    cv::parallel_for_(cv::Range(1, source.rows - 1), [&](const cv::Range& range) {
-        int localCount = 0;
-        for (int y = range.start; y < range.end; ++y) {
-            cv::Vec3f* outRow = linearRgb.ptr<cv::Vec3f>(roiTop + y);
-            for (int x = 1; x < source.cols - 1; ++x) {
-                cv::Vec3f center = source.ptr<cv::Vec3f>(y)[x];
-                const float maxChannel = std::max({center[0], center[1], center[2]});
-                const float minChannel = std::min({center[0], center[1], center[2]});
-                const bool clipped = maxChannel > 0.985f || (maxChannel > 0.92f && maxChannel - minChannel > 0.28f);
-                if (!clipped) continue;
-
-                cv::Vec3f sumRatio(0.0f, 0.0f, 0.0f);
-                float sumWeight = 0.0f;
-                for (int dy = -1; dy <= 1; ++dy) {
-                    const cv::Vec3f* row = source.ptr<cv::Vec3f>(y + dy);
-                    for (int dx = -1; dx <= 1; ++dx) {
-                        if (dx == 0 && dy == 0) continue;
-                        const cv::Vec3f n = row[x + dx];
-                        const float nMax = std::max({n[0], n[1], n[2]});
-                        if (nMax > 0.98f) continue;
-                        const float nY = std::max(1.0e-4f, 0.2126f * n[0] + 0.7152f * n[1] + 0.0722f * n[2]);
-                        const float weight = 1.0f / (1.0f + static_cast<float>(dx * dx + dy * dy));
-                        sumRatio += cv::Vec3f(n[0] / nY, n[1] / nY, n[2] / nY) * weight;
-                        sumWeight += weight;
-                    }
-                }
-                if (sumWeight <= 1.0e-5f) continue;
-
-                const float centerY = std::max(1.0e-4f, 0.2126f * center[0] + 0.7152f * center[1] + 0.0722f * center[2]);
-                const cv::Vec3f ratio = sumRatio * (1.0f / sumWeight);
-                cv::Vec3f reconstructed(
-                        clampSceneLinear(centerY * ratio[0]),
-                        clampSceneLinear(centerY * ratio[1]),
-                        clampSceneLinear(centerY * ratio[2])
-                );
-                const float severity = smoothstepIsp(0.90f, 1.20f, maxChannel);
-                center = center * (1.0f - 0.65f * severity) + reconstructed * (0.65f * severity);
-                outRow[roiLeft + x] = cv::Vec3f(
-                        clampSceneLinear(center[0]),
-                        clampSceneLinear(center[1]),
-                        clampSceneLinear(center[2]));
-                ++localCount;
-            }
-        }
-        correctedCount.fetch_add(localCount, std::memory_order_relaxed);
-    });
-
-    debug.correctedPixels = correctedCount.load(std::memory_order_relaxed);
-    debug.applied = debug.correctedPixels > 0;
-    debug.reason = debug.applied
-            ? "local_rgb_chroma_reconstruction_on_bounded_jpeg_roi"
-            : "no_recoverable_local_highlights";
-    debug.elapsedMs = elapsedMs(start);
-    return debug;
-}
+// Phase 9 removed the legacy CPU post-CCM 3x3 highlight heuristic. Failure recovery now
+// rebuilds the same sensor-domain clip reconstruction + signed-CCM gamut contract used by Vulkan.
 
 float resolveLegacySharpenAmount(bool isRaw10, int iso, float exposureGain) {
     const float isoPressure = smoothstepIsp(400.0f, 3200.0f, static_cast<float>(std::max(iso, 0)));
@@ -15661,28 +15567,141 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     const bncam::color::PrePresentationSceneAudit phase8PrePresentationSceneAudit =
             bncam::color::auditPrePresentationSceneMean(ccmMeanR, ccmMeanG, ccmMeanB);
 
-    // Failure-only CPU materialization. The normal 8H-J path stays device-resident from
-    // demosaic through highlight recovery and scene observation. If the new Vulkan stage fails,
-    // recreate the deterministic CPU post-CCM reference exactly once and continue safely.
+    Phase9ColorProtectionDebug phase9ColorDebug{};
+    if (vulkanColorTransform.success) {
+        phase9ColorDebug.gpuPrimary = true;
+        phase9ColorDebug.sensorClipCandidatePixels = vulkanColorTransform.phase9SensorClipCandidatePixels;
+        phase9ColorDebug.singleChannelSensorClipPixels = vulkanColorTransform.phase9SingleChannelSensorClipPixels;
+        phase9ColorDebug.multiChannelSensorClipPixels = vulkanColorTransform.phase9MultiChannelSensorClipPixels;
+        phase9ColorDebug.fullySensorClippedPixels = vulkanColorTransform.phase9FullySensorClippedPixels;
+        phase9ColorDebug.wbAboveUnityWithoutSensorClipPixels =
+                vulkanColorTransform.phase9WbAboveUnityWithoutSensorClipPixels;
+        phase9ColorDebug.ccmNegativeExcursionPixels = vulkanColorTransform.phase9CcmNegativeExcursionPixels;
+        phase9ColorDebug.colorConfidenceAppliedPixels =
+                vulkanColorTransform.phase9ColorConfidenceAppliedPixels;
+        phase9ColorDebug.partialColorConfidencePixels =
+                vulkanColorTransform.phase9PartialColorConfidencePixels;
+        phase9ColorDebug.gamutCompressedPixels = vulkanColorTransform.phase9GamutCompressedPixels;
+        phase9ColorDebug.legacyMagentaRiskPixels = vulkanColorTransform.phase9LegacyMagentaRiskPixels;
+        phase9ColorDebug.protectedMagentaRiskPixels = vulkanColorTransform.phase9ProtectedMagentaRiskPixels;
+        phase9ColorDebug.sceneLinearOverUnityPixels = vulkanColorTransform.phase9SceneLinearOverUnityPixels;
+    }
+
+    // Failure-only CPU materialization. The normal path stays device-resident from demosaic
+    // through Phase-9 sensor-clip/gamut protection and scene observation. If the Vulkan color
+    // stage fails, recreate the deterministic Phase-9 CPU reference exactly once.
     const auto materializeCpuPostCcmReference = [&]() {
         if (cpuColorTransformApplied && !linearRgb.empty()) return;
+        const auto phase9CpuStart = IspClock::now();
         linearRgb = runCpuDemosaicFallback();
         vulkanDemosaicResident = false;
+        if (linearRgb.empty() || linearRgb.type() != CV_32FC3) {
+            cpuColorTransformApplied = true;
+            phase9ColorDebug.cpuFallback = true;
+            phase9ColorDebug.cpuFallbackMs = elapsedMs(phase9CpuStart);
+            return;
+        }
+
+        // Failure-only reference path mirrors the GPU clipping-confidence owner. No neighbour
+        // reconstruction or extra full-frame clone is needed: confidence is derived from each
+        // immutable pre-WB pixel before that same pixel is overwritten with the protected result.
+        const std::array<float, 9> phase9Ccm{
+                ccm[0], ccm[1], ccm[2],
+                ccm[3], ccm[4], ccm[5],
+                ccm[6], ccm[7], ccm[8]};
+        std::atomic<std::uint64_t> sensorClipCandidates{0u};
+        std::atomic<std::uint64_t> singleClip{0u};
+        std::atomic<std::uint64_t> multiClip{0u};
+        std::atomic<std::uint64_t> fullClip{0u};
+        std::atomic<std::uint64_t> wbOverUnity{0u};
+        std::atomic<std::uint64_t> ccmExcursions{0u};
+        std::atomic<std::uint64_t> colorConfidenceApplied{0u};
+        std::atomic<std::uint64_t> partialColorConfidence{0u};
+        std::atomic<std::uint64_t> gamutCompressed{0u};
+        std::atomic<std::uint64_t> legacyMagentaRisk{0u};
+        std::atomic<std::uint64_t> protectedMagentaRisk{0u};
+        std::atomic<std::uint64_t> sceneLinearOverUnity{0u};
+
         cv::parallel_for_(cv::Range(0, linearRgb.rows), [&](const cv::Range& range) {
             for (int y = range.start; y < range.end; ++y) {
-                cv::Vec3f* row = linearRgb.ptr<cv::Vec3f>(y);
+                cv::Vec3f* outRow = linearRgb.ptr<cv::Vec3f>(y);
                 for (int x = 0; x < linearRgb.cols; ++x) {
-                    const cv::Vec3f input = row[x];
-                    const float wbR = input[0] * wbRgb[0];
-                    const float wbG = input[1] * wbRgb[1];
-                    const float wbB = input[2] * wbRgb[2];
-                    row[x] = cv::Vec3f(
-                            std::max(0.0f, ccm[0] * wbR + ccm[1] * wbG + ccm[2] * wbB),
-                            std::max(0.0f, ccm[3] * wbR + ccm[4] * wbG + ccm[5] * wbB),
-                            std::max(0.0f, ccm[6] * wbR + ccm[7] * wbG + ccm[8] * wbB));
+                    const cv::Vec3f rawCv = outRow[x];
+                    const bncam::highlight::Rgb raw{rawCv[0], rawCv[1], rawCv[2]};
+                    const auto clip = bncam::highlight::classifySensorClip(raw);
+                    const auto colorConfidence = bncam::highlight::resolveSensorColorConfidence(raw);
+                    if (colorConfidence.reduced) {
+                        sensorClipCandidates.fetch_add(1u, std::memory_order_relaxed);
+                    }
+                    if (clip.clippedChannels == 1) singleClip.fetch_add(1u, std::memory_order_relaxed);
+                    if (clip.clippedChannels >= 2) multiClip.fetch_add(1u, std::memory_order_relaxed);
+                    if (clip.all) fullClip.fetch_add(1u, std::memory_order_relaxed);
+                    if (colorConfidence.confidence > 1.0e-6f &&
+                            colorConfidence.confidence < 1.0f - 1.0e-6f) {
+                        partialColorConfidence.fetch_add(1u, std::memory_order_relaxed);
+                    }
+
+                    const bncam::highlight::Rgb wb{
+                            raw.r * wbRgb[0],
+                            raw.g * wbRgb[1],
+                            raw.b * wbRgb[2]};
+                    if (bncam::highlight::wbAboveUnityWithoutSensorClip(raw, wb)) {
+                        wbOverUnity.fetch_add(1u, std::memory_order_relaxed);
+                    }
+                    const bncam::highlight::Rgb signedCcm =
+                            bncam::highlight::multiplyMatrix(phase9Ccm, wb);
+                    const bncam::highlight::Rgb legacyPositive{
+                            std::max(0.0f, signedCcm.r),
+                            std::max(0.0f, signedCcm.g),
+                            std::max(0.0f, signedCcm.b)};
+                    if (bncam::highlight::heuristicMagentaHighlightRisk(legacyPositive)) {
+                        legacyMagentaRisk.fetch_add(1u, std::memory_order_relaxed);
+                    }
+                    const bool originalCcmExcursion =
+                            std::min({signedCcm.r, signedCcm.g, signedCcm.b}) <
+                                    -bncam::highlight::kCcmNegativeTolerance;
+                    if (originalCcmExcursion) {
+                        ccmExcursions.fetch_add(1u, std::memory_order_relaxed);
+                    }
+                    const auto confidenceSafe =
+                            bncam::highlight::applyClippingAwareHighlightColor(
+                                    signedCcm, colorConfidence);
+                    if (confidenceSafe.applied) {
+                        colorConfidenceApplied.fetch_add(1u, std::memory_order_relaxed);
+                    }
+                    const auto protectedCcm =
+                            bncam::highlight::protectSignedCcmLowerGamut(confidenceSafe.rgb);
+                    if (protectedCcm.applied) gamutCompressed.fetch_add(1u, std::memory_order_relaxed);
+                    if (bncam::highlight::heuristicMagentaHighlightRisk(protectedCcm.rgb)) {
+                        protectedMagentaRisk.fetch_add(1u, std::memory_order_relaxed);
+                    }
+                    if (std::max({protectedCcm.rgb.r, protectedCcm.rgb.g, protectedCcm.rgb.b}) > 1.0f) {
+                        sceneLinearOverUnity.fetch_add(1u, std::memory_order_relaxed);
+                    }
+                    outRow[x] = cv::Vec3f(
+                            protectedCcm.rgb.r,
+                            protectedCcm.rgb.g,
+                            protectedCcm.rgb.b);
                 }
             }
         });
+        phase9ColorDebug = {};
+        phase9ColorDebug.cpuFallback = true;
+        phase9ColorDebug.sensorClipCandidatePixels = sensorClipCandidates.load(std::memory_order_relaxed);
+        phase9ColorDebug.singleChannelSensorClipPixels = singleClip.load(std::memory_order_relaxed);
+        phase9ColorDebug.multiChannelSensorClipPixels = multiClip.load(std::memory_order_relaxed);
+        phase9ColorDebug.fullySensorClippedPixels = fullClip.load(std::memory_order_relaxed);
+        phase9ColorDebug.wbAboveUnityWithoutSensorClipPixels = wbOverUnity.load(std::memory_order_relaxed);
+        phase9ColorDebug.ccmNegativeExcursionPixels = ccmExcursions.load(std::memory_order_relaxed);
+        phase9ColorDebug.colorConfidenceAppliedPixels =
+                colorConfidenceApplied.load(std::memory_order_relaxed);
+        phase9ColorDebug.partialColorConfidencePixels =
+                partialColorConfidence.load(std::memory_order_relaxed);
+        phase9ColorDebug.gamutCompressedPixels = gamutCompressed.load(std::memory_order_relaxed);
+        phase9ColorDebug.legacyMagentaRiskPixels = legacyMagentaRisk.load(std::memory_order_relaxed);
+        phase9ColorDebug.protectedMagentaRiskPixels = protectedMagentaRisk.load(std::memory_order_relaxed);
+        phase9ColorDebug.sceneLinearOverUnityPixels = sceneLinearOverUnity.load(std::memory_order_relaxed);
+        phase9ColorDebug.cpuFallbackMs = elapsedMs(phase9CpuStart);
         cpuColorTransformApplied = true;
     };
 
@@ -15721,6 +15740,10 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             bncam::spectra2::resolvePhysicalPreToneLumaAuthority(
                     galoshPreToneChromaPlan.baselineStrength);
 
+    // Phase 9 Delta 0066: uniform evidence ownership. No demosaic-family or RAW-format
+    // rule is allowed to scale chroma authority. Local structure, stochastic residuals,
+    // physical sensor noise and WB+CCM amplification are the only decision inputs.
+
     bncam::vulkan::SpectraResidentSceneObserverResult vulkanSceneObserver{};
     if (vulkanColorResident) {
         bncam::vulkan::SpectraResidentSceneObserverRequest request{};
@@ -15729,6 +15752,8 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         request.targetSampleCount = 50000u;
         request.preToneChroma444Enabled = galoshPreToneChroma444Enabled;
         request.preToneChroma444Strength = galoshPreToneChroma444Strength;
+        request.preToneChromaNoisePressure = galoshPreToneChromaPlan.noisePressure;
+        request.preToneChromaWbCcmPressure = galoshPreToneChromaPlan.wbCcmPressure;
         vulkanSceneObserver =
                 bncam::vulkan::VulkanRuntime::instance().executeSpectraResidentSceneObserverFromAwbCcm(
                         request, vulkanColorTransform.residentColorGeneration);
@@ -15738,6 +15763,22 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             vulkanSceneObserver.displayGrid.size() == 32u * 24u;
 
     HighlightRecoveryDebug highlightDebug{};
+    const auto syncHighlightDebugFromPhase9 = [&]() {
+        highlightDebug.applied = phase9ColorDebug.colorConfidenceAppliedPixels > 0u;
+        highlightDebug.correctedPixels = static_cast<int>(std::min<std::uint64_t>(
+                phase9ColorDebug.colorConfidenceAppliedPixels,
+                static_cast<std::uint64_t>(std::numeric_limits<int>::max())));
+        // Clipping-aware color is fused with AWB+CCM, so no separate kernel time is attributable.
+        highlightDebug.elapsedMs = phase9ColorDebug.cpuFallback ? phase9ColorDebug.cpuFallbackMs : 0.0f;
+        highlightDebug.reason = highlightDebug.applied
+                ? (phase9ColorDebug.gpuPrimary
+                        ? "phase9_clipping_aware_highlight_color_fused_awb_ccm_vulkan"
+                        : "phase9_clipping_aware_highlight_color_cpu_failure_reference")
+                : (phase9ColorDebug.gpuPrimary
+                        ? "phase9_no_highlight_color_confidence_reduction_required_vulkan"
+                        : "phase9_no_highlight_color_confidence_reduction_required_cpu_failure_reference");
+    };
+    syncHighlightDebugFromPhase9();
     std::vector<float> lumaSamples;
     std::vector<float> maximumChannelSamples;
     const size_t totalPixels = expectedColorPixels;
@@ -15780,17 +15821,9 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                     vulkanSceneObserver.sampledRgb[base + 2u]);
         }
         std::copy_n(vulkanSceneObserver.displayGrid.begin(), displayGrid.size(), displayGrid.begin());
-        highlightDebug.applied = vulkanSceneObserver.highlightRecoveryApplied;
-        highlightDebug.correctedPixels = static_cast<int>(std::min<std::uint64_t>(
-                vulkanSceneObserver.correctedHighlightPixels,
-                static_cast<std::uint64_t>(std::numeric_limits<int>::max())));
-        highlightDebug.elapsedMs = vulkanSceneObserver.highlightKernelMs;
-        highlightDebug.reason = highlightDebug.applied
-                ? "vulkan_local_rgb_chroma_reconstruction_resident"
-                : "vulkan_no_recoverable_local_highlights";
     } else {
         materializeCpuPostCcmReference();
-        highlightDebug = applyLocalHighlightRecovery(linearRgb);
+        syncHighlightDebugFromPhase9();
         cpuSceneProcessingApplied = true;
         const cv::Vec3f* sampledPixels = linearRgb.ptr<cv::Vec3f>(0);
         for (size_t index = 0; index < totalPixels; index += sampleStep) {
@@ -16649,7 +16682,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         // the post-CCM CPU reference and apply the same highlight recovery before the CPU tone
         // fallback. This path executes only after an explicit Vulkan tone failure.
         materializeCpuPostCcmReference();
-        highlightDebug = applyLocalHighlightRecovery(linearRgb);
+        syncHighlightDebugFromPhase9();
         cpuSceneProcessingApplied = true;
     }
 
@@ -16683,7 +16716,9 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                 bool magentaClip = (r > 0.85f && b > 0.85f && g < std::min(r, b) - 0.10f && preShoulderY > 0.60f);
 
                 bool pixelWasNeutralized = false;
-                if (nearWhiteClipped || magentaClip) {
+                // RAW clipping color is already owned pre-tone by Phase 9. Keep this legacy
+                // presentation heuristic only for YUV, where no RAW sensor-confidence exists.
+                if (!isRawBayer && (nearWhiteClipped || magentaClip)) {
                     const float severity = std::clamp((maxRGB - 0.85f) / 0.15f, 0.0f, 1.0f);
                     const float t = 0.5f + 0.45f * severity;
                     r = r * (1.0f - t) + preShoulderY * t;
@@ -17568,7 +17603,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             }
         } else {
             materializeCpuPostCcmReference();
-            highlightDebug = applyLocalHighlightRecovery(linearRgb);
+            syncHighlightDebugFromPhase9();
             applyCpuToneAndVibrance(rawJpegBaseVibrance);
             cpuSceneProcessingApplied = true;
             residentTelemetry.vulkanResidentCpuFallbackUsed = true;
@@ -19593,6 +19628,15 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; galoshPreToneChroma444Enabled=" << (galoshPreToneChroma444Enabled ? "true" : "false")
             << "; galoshPreToneChroma444Strength=" << galoshPreToneChroma444Strength
             << "; galoshPreToneChroma444Applied=" << (vulkanSceneObserver.preToneChroma444Applied ? "true" : "false")
+            << "; phase9ChromaTileScanApplied=" << (vulkanSceneObserver.preToneChromaTileScanApplied ? "true" : "false")
+            << "; phase9ChromaTilesScanned=" << vulkanSceneObserver.preToneChromaTilesScanned
+            << "; phase9ChromaEligibleTiles=" << vulkanSceneObserver.preToneChromaEligibleTiles
+            << "; phase9ChromaCorrectedPixels=" << vulkanSceneObserver.preToneChromaCorrectedPixels
+            << "; phase9ChromaDetailProtectedPixels=" << vulkanSceneObserver.preToneChromaDetailProtectedPixels
+            << "; phase9ChromaStructuredTiles=" << vulkanSceneObserver.preToneChromaStructuredTiles
+            << "; phase9ChromaMeanNoisePressure=" << vulkanSceneObserver.preToneChromaMeanNoisePressure
+            << "; phase9ChromaMeanResidualSigma=" << vulkanSceneObserver.preToneChromaMeanResidualSigma
+            << "; phase9ChromaMaxCorrection=" << vulkanSceneObserver.preToneChromaMaxCorrection
             << "; galoshPreToneWbCcmPressure=" << galoshPreToneWbCcmPressure
             << "; galoshPreTonePhysicalBaselineActive=" << (galoshPreToneChromaPlan.physicalBaselineActive ? "true" : "false")
             << "; galoshPreToneSpectraEnhancementActive=" << (galoshPreToneChromaPlan.spectraEnhancementActive ? "true" : "false")
@@ -19908,6 +19952,37 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << (phase8PrePresentationSceneAudit.finite ? "true" : "false")
             << "; phase8PrePresentationSceneMeanRgbSpread="
             << phase8PrePresentationSceneAudit.normalizedRgbSpread
+            << "; phase9Owner=FUSED_AWB_CCM_CLIPPING_AWARE_HIGHLIGHT_GAMUT_V3"
+            << "; phase9GpuPrimary=" << (phase9ColorDebug.gpuPrimary ? "true" : "false")
+            << "; phase9CpuFailureReferenceUsed=" << (phase9ColorDebug.cpuFallback ? "true" : "false")
+            << "; phase9SensorClipDomain=PRE_WB_NORMALIZED_DEMOSAIC_CEILING_CONFIDENCE"
+            << "; phase9SensorClipCandidatePixels=" << phase9ColorDebug.sensorClipCandidatePixels
+            << "; phase9SingleChannelSensorClipPixels=" << phase9ColorDebug.singleChannelSensorClipPixels
+            << "; phase9MultiChannelSensorClipPixels=" << phase9ColorDebug.multiChannelSensorClipPixels
+            << "; phase9FullySensorClippedPixels=" << phase9ColorDebug.fullySensorClippedPixels
+            << "; phase9PartialColorConfidencePixels="
+            << phase9ColorDebug.partialColorConfidencePixels
+            << "; phase9ColorConfidenceAppliedPixels="
+            << phase9ColorDebug.colorConfidenceAppliedPixels
+            << "; phase9ColorConfidenceStart=0.960000"
+            << "; phase9ColorConfidenceZero=0.995000"
+            << "; phase9FullyClippedForcesZeroColorConfidence=true"
+            << "; phase9HighlightColorPolicy=PRE_WB_CONFIDENCE_POST_CCM_NEUTRAL_LUMA_MIX"
+            << "; phase9WbAboveUnityWithoutSensorClipPixels="
+            << phase9ColorDebug.wbAboveUnityWithoutSensorClipPixels
+            << "; phase9WbOverUnityPreserved=true"
+            << "; phase9CcmNegativeExcursionPixels=" << phase9ColorDebug.ccmNegativeExcursionPixels
+            << "; phase9GamutCompressedPixels=" << phase9ColorDebug.gamutCompressedPixels
+            << "; phase9LegacyMagentaRiskPixels=" << phase9ColorDebug.legacyMagentaRiskPixels
+            << "; phase9ProtectedMagentaRiskPixels=" << phase9ColorDebug.protectedMagentaRiskPixels
+            << "; phase9SceneLinearOverUnityPixels=" << phase9ColorDebug.sceneLinearOverUnityPixels
+            << "; phase9SceneLinearOverUnityPreserved=true"
+            << "; phase9ToneOutputClippingOwner=PHASE10_DEFERRED"
+            << "; phase9LegacyPostCcmRecoveryOwner=false"
+            << "; phase9LegacyRawPostToneNeutralizerOwner=false"
+            << "; phase9NoGlobalDesaturation=true"
+            << "; phase9FullFrameReadback=false"
+            << "; phase9CpuFailureReferenceMs=" << phase9ColorDebug.cpuFallbackMs
             << "; colorStageMeansToneR=" << toneMeanR
             << "; colorStageMeansToneG=" << toneMeanG
             << "; colorStageMeansToneB=" << toneMeanB

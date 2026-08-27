@@ -277,7 +277,7 @@ public:
      */
     std::uint64_t rawPreviewOutputHardwareBufferUsage() const noexcept;
 
-    /** 8H-J resident post-CCM highlight recovery + compact scene observer. */
+    /** Phase 9: consume upstream-protected post-CCM RGB; pre-tone cleanup + compact scene observer. */
     SpectraResidentSceneObserverResult executeSpectraResidentSceneObserverFromAwbCcm(
             const SpectraResidentSceneObserverRequest& request,
             std::uint64_t residentColorGeneration
