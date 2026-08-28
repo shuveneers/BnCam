@@ -26,7 +26,9 @@ struct ProfileToneRenderPlan {
     float shadowRangeDelta = 0.0f;
     float highlightRangeDelta = 0.0f;
     float whiteRangeDelta = 0.0f;
-    float blackAnchorDelta = 0.0f;
+    // Phase 10: Blacks is a creative display-range control, never an automatic black pedestal.
+    float blackAnchorDelta = 0.0f; // Retained ABI/debug field; RAW architecture keeps this at zero.
+    float blackRangeDelta = 0.0f;
     float contrastDelta = 0.0f;
     float localToneStrengthScale = 1.0f;
     float localToneLiftScale = 1.0f;
@@ -68,8 +70,10 @@ inline ProfileToneRenderPlan resolveProfileToneRenderPlan(
     out.highlightRangeDelta = 0.055f * highlights;
     out.whiteRangeDelta = 0.080f * whites;
 
-    // Positive Blacks lifts the black floor by reducing subtraction; negative Blacks deepens it.
-    out.blackAnchorDelta = -0.0040f * blacks;
+    // Phase 10: preserve true zero. Blacks reshapes the near-black range with an endpoint-
+    // preserving window instead of subtracting a pedestal from every display value.
+    out.blackAnchorDelta = 0.0f;
+    out.blackRangeDelta = 0.060f * blacks;
     out.contrastDelta = 0.090f * contrast;
 
     // Local tone is a bias over Auto, not a second independent exposure control.
@@ -84,6 +88,11 @@ inline float applyProfileTonalRanges(float luma, const ProfileToneRenderPlan& pl
 
     // Endpoint-preserving polynomial windows. Their bounded derivatives keep the mapping monotonic
     // across the full -1..+1 control range, avoiding local luminance inversions/banding.
+    const float oneMinusBlack = 1.0f - out;
+    const float blackWindow = 6.0f * out * oneMinusBlack * oneMinusBlack *
+            oneMinusBlack * oneMinusBlack * oneMinusBlack;
+    out = std::clamp(out + plan.blackRangeDelta * blackWindow, 0.0f, 1.0f);
+
     const float oneMinusShadow = 1.0f - out;
     const float shadowWindow = 4.0f * out * oneMinusShadow * oneMinusShadow * oneMinusShadow;
     out = std::clamp(out + plan.shadowRangeDelta * shadowWindow, 0.0f, 1.0f);

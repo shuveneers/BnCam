@@ -30,25 +30,22 @@ class Phase2DynamicRangeToneSourceContractTest {
     }
 
     @Test
-    fun `scene adaptive shoulder is applied identically by Vulkan and CPU failsafe`() {
+    fun `phase10 separates RAW scene placement from YUV legacy shoulder ownership`() {
         val core = source("src/main/cpp/IspCore.cpp")
-        val header = source("src/main/cpp/vulkan/VulkanSpectraResidentToneBackend.h")
         val backend = source("src/main/cpp/vulkan/VulkanSpectraResidentToneBackend.cpp")
         val shader = source("src/main/cpp/vulkan/shaders/spectra_tone_resident.comp")
 
-        // Automatic GTM is combined with the active profile Highlight control exactly once.
-        assertTrue(core.contains("dynamicRangeTonePlan.shoulderStart + profileTonePlan.shoulderStartDelta"))
-        assertTrue(core.contains("dynamicRangeTonePlan.shoulderStrength * profileTonePlan.shoulderStrengthScale"))
-        assertTrue(core.contains("request.shoulderStart = effectiveShoulderStart"))
-        assertTrue(core.contains("request.shoulderStrength = effectiveShoulderStrength"))
-        assertTrue(core.contains("const float shoulderStart = effectiveShoulderStart"))
-        assertTrue(core.contains("const float shoulderStrength = effectiveShoulderStrength"))
-        assertTrue(header.contains("float shoulderStart"))
-        assertTrue(header.contains("float shoulderStrength"))
-        assertTrue(backend.contains("push.shoulderStart"))
-        assertTrue(backend.contains("push.shoulderStrength"))
-        assertTrue(shader.contains("pc.shoulderStart"))
-        assertTrue(shader.contains("pc.shoulderStrength"))
+        assertTrue(core.contains("const bool phase10RawToneArchitecture = isRawBayer"))
+        assertTrue(core.contains("phase10RawToneArchitecture ? 0.0f : dynamicRangeTonePlan.contrastStrength"))
+        assertTrue(core.contains("if (!phase10RawToneArchitecture)"))
+        assertTrue(core.contains("request.localToneStrength = !phase10RawToneArchitecture"))
+        assertTrue(core.contains("phase10ToneArchitecture="))
+        assertTrue(core.contains("GTM_SCENE_PLACEMENT__FLLF__AGX"))
+        assertTrue(backend.contains("push.presenceReserved0 = fllfRequested ? 1u : 0u"))
+        assertTrue(shader.contains("if (pc.presenceReserved0 != 0u) rgb = applyFllfLocalExposure"))
+        assertTrue(shader.contains("rgb = applyAgXTonemap(rgb);"))
+        assertTrue(shader.indexOf("rgb = applyAgXTonemap(rgb);") >
+            shader.indexOf("applyFllfLocalExposure(gid, rgb)"))
         assertFalse(shader.contains("const float shoulderStart = 0.68"))
     }
 

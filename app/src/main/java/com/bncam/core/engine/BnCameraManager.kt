@@ -1943,9 +1943,17 @@ class BnCameraManager(private val context: Context) {
                         "fallback_without_result"
                     )
                 }
-                val previewWbGains = if (quality.whiteBalanceGains.fromMetadata) {
+                val exactPreviewColorPair = calibrationResult?.let { current ->
+                    runCatching {
+                        current.get(CaptureResult.COLOR_CORRECTION_GAINS) != null &&
+                            current.get(CaptureResult.COLOR_CORRECTION_TRANSFORM) != null
+                    }.getOrDefault(false)
+                } == true
+                val previewWbGains = if (quality.whiteBalanceGains.fromMetadata && !exactPreviewColorPair) {
                     stabilizeRawPreviewAutoWb(quality.whiteBalanceGains.toNativeArray(), generation)
                 } else {
+                    // Exact Camera2 gains and transform are an atomic pair; never replace only
+                    // the WB half with a historical stable value.
                     quality.whiteBalanceGains.toNativeArray()
                 }
                 val config = RawPreviewRenderConfig(
@@ -9422,8 +9430,21 @@ class BnCameraManager(private val context: Context) {
                 gains = floatArrayOf(gains.red, gains.greenEven, gains.greenOdd, gains.blue),
                 convergence = convergence
             )
-            if (after != null && liveWhiteBalanceTargetSensorGains == null) {
-                rawPreviewRenderer.updateWhiteBalanceGains(after.copyGains())
+            if (liveWhiteBalanceTargetSensorGains == null) {
+                val transform = calibrationResult.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)
+                val timestampNs = calibrationResult.get(CaptureResult.SENSOR_TIMESTAMP)
+                    ?: result.get(CaptureResult.SENSOR_TIMESTAMP)
+                    ?: 0L
+                if (transform != null && timestampNs > 0L) {
+                    val matrix = FloatArray(9) { index ->
+                        transform.getElement(index / 3, index % 3).toFloat()
+                    }
+                    rawPreviewRenderer.updateExactFrameCamera2ColorPair(
+                        sensorTimestampNs = timestampNs,
+                        gains = floatArrayOf(gains.red, gains.greenEven, gains.greenOdd, gains.blue),
+                        colorMatrix = matrix
+                    )
+                }
             }
             if (before == null && after != null) {
                 Log.i(
@@ -9502,9 +9523,16 @@ class BnCameraManager(private val context: Context) {
 
                 requestedLiveWhiteBalanceKelvin = requestedKelvin
                 liveWhiteBalanceTargetSensorGains = targetSensorGains?.copyOf(4)
-                val rawPreviewTarget = targetSensorGains
-                    ?: stableAutoWhiteBalanceSnapshotForActiveCamera()?.copyGains()
-                rawPreviewRenderer.updateWhiteBalanceGains(rawPreviewTarget)
+                if (targetSensorGains != null) {
+                    // Explicit profile/manual WB intentionally overrides the WB half.
+                    rawPreviewRenderer.clearExactFrameCamera2ColorPairs()
+                    rawPreviewRenderer.updateWhiteBalanceGains(targetSensorGains)
+                } else {
+                    // System Auto is exact-frame Camera2 pair owned. Clear any manual WB-only
+                    // override and let timestamp-paired WB+CCM metadata drive each RAW frame.
+                    rawPreviewRenderer.updateWhiteBalanceGains(null)
+                    lastRawPreviewConfigRefreshMs = 0L
+                }
                 if (targetSensorGains == null) {
                     _liveWhiteBalanceDisplayCompensation.value = LiveWhiteBalanceDisplayCompensation()
                 }

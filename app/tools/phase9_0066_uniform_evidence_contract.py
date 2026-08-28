@@ -20,13 +20,14 @@ checks = {
     'multiscale_detail_guard_retained': 'multiScalePredictionDisagreement' in shader and 'predictionDisagreementProtection' in shader,
     'stochastic_gate_uniform': '0.45 * tileResidualVariance' in shader and '1.85 * tileResidualVariance' in shader,
     'per_opponent_gate_uniform': 'smoothstep(0.30, 1.80, residualZ.x)' in shader and 'smoothstep(0.30, 1.80, residualZ.y)' in shader,
-    'telemetry_back_to_eight_words': 'kTelemetryWords = 8u' in backend,
+    'phase9_telemetry_prefix_retained': ('kTelemetryWords = 8u' in backend or 'kTelemetryWords = 20u' in backend),
     '0065_post_demosaic_domain_retained': 'writeResidualCandidate(gid, false)' in demosaic_shader and 'push.mode = 4u;' in demosaic_backend,
     '0065_post_colour_domain_retained': 'writeResidualCandidate(gid, true)' in demosaic_shader and 'push.mode = 11u;' in demosaic_backend,
 }
 
-indices = [int(x) for x in re.findall(r'telemetry\[(\d+)\]', shader)]
-checks['telemetry_indexes_fit_eight_words'] = bool(indices) and max(indices) <= 7
+phase9_shader = shader[shader.index('vec3 preToneChroma444FromInput'):shader.index('// PHASE 10') if '// PHASE 10' in shader else shader.index('uint localToneMapWidth')]
+indices = [int(x) for x in re.findall(r'telemetry\[(\d+)\]', phase9_shader)]
+checks['phase9_telemetry_indexes_fit_prefix'] = bool(indices) and max(indices) <= 7
 
 failed = [k for k,v in checks.items() if not v]
 if failed:

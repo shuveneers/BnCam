@@ -15,6 +15,7 @@ import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledThreadPoolExecutor
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
@@ -177,7 +178,15 @@ class RawPreviewRenderer(
     private val configRevision = AtomicLong(0L)
     private val backendPrepareScheduled = AtomicBoolean(false)
     private val backendPrepared = AtomicBoolean(false)
+    private data class ExactFrameColorPair(
+        val wbGains: FloatArray,
+        val colorMatrix: FloatArray
+    )
+
     private val liveWhiteBalanceOverride = AtomicReference<FloatArray?>(null)
+    // System-AWB RAW preview must consume WB + CCM from the same sensor timestamp. A WB-only
+    // convergence override can otherwise pair one frame's gains with another frame's matrix.
+    private val exactFrameColorPairs = ConcurrentHashMap<Long, ExactFrameColorPair>()
     private val latestOfferedSensorTimestampNs = AtomicLong(Long.MIN_VALUE)
     private class OutputSlot(val id: Int) {
         private var cpuRgba: ByteBuffer? = null
@@ -346,6 +355,31 @@ class RawPreviewRenderer(
         liveWhiteBalanceOverride.set(gains.copyOf(4))
     }
 
+    fun updateExactFrameCamera2ColorPair(
+        sensorTimestampNs: Long,
+        gains: FloatArray,
+        colorMatrix: FloatArray
+    ) {
+        if (sensorTimestampNs <= 0L || gains.size < 4 || colorMatrix.size < 9 ||
+            gains.take(4).any { !it.isFinite() || it !in 0.25f..6.0f } ||
+            colorMatrix.take(9).any { !it.isFinite() || kotlin.math.abs(it) > 8.0f }
+        ) {
+            return
+        }
+        exactFrameColorPairs[sensorTimestampNs] = ExactFrameColorPair(
+            wbGains = gains.copyOf(4),
+            colorMatrix = colorMatrix.copyOf(9)
+        )
+        if (exactFrameColorPairs.size > 24) {
+            val oldest = exactFrameColorPairs.keys.minOrNull()
+            if (oldest != null && oldest != sensorTimestampNs) exactFrameColorPairs.remove(oldest)
+        }
+    }
+
+    fun clearExactFrameCamera2ColorPairs() {
+        exactFrameColorPairs.clear()
+    }
+
     fun configure(config: RawPreviewRenderConfig?) {
         if (config != null && !config.isSafeForNativePreview()) {
             Log.e(
@@ -365,6 +399,7 @@ class RawPreviewRenderer(
         activeConfig = config
         if (routeChanged) {
             liveWhiteBalanceOverride.set(null)
+            exactFrameColorPairs.clear()
             configRevision.incrementAndGet()
             latestOfferedSensorTimestampNs.set(Long.MIN_VALUE)
             pendingRequest.getAndSet(null)?.let(::releaseRequest)
@@ -568,8 +603,14 @@ class RawPreviewRenderer(
                 slot.ensureCpuRgbaBuffer().apply { clear() }
             }
 
-            val effectiveWbGains = liveWhiteBalanceOverride.get()?.copyOf()
-                ?: request.config.wbGains
+            val liveWb = liveWhiteBalanceOverride.get()?.copyOf()
+            val exactFramePair = if (liveWb == null) {
+                exactFrameColorPairs.remove(request.sensorTimestampNs)
+            } else {
+                null
+            }
+            val effectiveWbGains = liveWb ?: exactFramePair?.wbGains ?: request.config.wbGains
+            val effectiveColorMatrix = exactFramePair?.colorMatrix ?: request.config.colorMatrix
             RawPreviewFirstActivationTrace.nativeRenderStarted(
                 source = request.config.source.name,
                 generation = request.config.pipelineGeneration,
@@ -583,7 +624,7 @@ class RawPreviewRenderer(
                 blackLevels = localBlackLevels,
                 whiteLevel = request.config.whiteLevel,
                 wbGains = effectiveWbGains,
-                colorMatrix = request.config.colorMatrix,
+                colorMatrix = effectiveColorMatrix,
                 exposureGain = request.config.exposureGain,
                 captureSensitivityIso = request.config.captureSensitivityIso,
                 captureExposureTimeNs = request.config.captureExposureTimeNs,

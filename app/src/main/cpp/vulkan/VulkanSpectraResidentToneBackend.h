@@ -73,11 +73,21 @@ struct SpectraResidentToneRequest {
     float rawJpegBaseVibrance = 1.0f;
     float shoulderStart = 0.68f;
     float shoulderStrength = 1.0f;
-    // Automatic local-tone policy. Spatial analysis/application remains Vulkan-resident.
+    // Legacy local-tone fields are retained temporarily for source compatibility during Phase 10;
+    // the final RAW production path is replaced by the FLLF contract below.
     float localToneStrength = 0.0f;
     float localToneSceneKey = 0.125f;
     float localToneMaxLiftEv = 0.25f;
     float localToneMaxCompressEv = 0.15f;
+    // Phase 10: Fast Local Laplacian local exposure field in scene-referred log luminance.
+    bool fllfEnabled = false;
+    float fllfStrength = 0.0f;
+    float fllfSceneKey = 0.150f;
+    float fllfMaxLiftEv = 0.18f;
+    float fllfMaxCompressEv = 0.20f;
+    float fllfEdgeStopEv = 0.62f;
+    float fllfRefinement = 0.10f;
+    std::uint32_t fllfPyramidLevels = 6u;
     bool isRawBayer = true;
     float profileColorSaturation = 0.0f;
     float profileColorContrast = 0.0f;
@@ -113,6 +123,15 @@ struct SpectraResidentToneResult {
     bool localToneRequested = false;
     bool localToneApplied = false;
     std::uint64_t localToneAdjustedPixels = 0u;
+    bool fllfRequested = false;
+    bool fllfApplied = false;
+    std::uint64_t fllfAdjustedPixels = 0u;
+    std::uint64_t fllfEdgeProtectedSamples = 0u;
+    float fllfMeanAbsCorrectionEv = 0.0f;
+    float fllfMaxAbsCorrectionEv = 0.0f;
+    float fllfPyramidBuildMs = 0.0f;
+    float fllfRemapReconstructMs = 0.0f;
+    std::uint64_t fllfResidentBytes = 0u;
     std::vector<float> outputRgb;
     float lutUploadMs = 0.0f;
     float kernelMs = 0.0f;
@@ -234,8 +253,13 @@ private:
     PersistentBuffer ultraHdrGainmapPacked_;
     PersistentBuffer portraitMask_;
     PersistentBuffer portraitBlurRgb_;
-    // Quarter-resolution edge-aware scene-luma base used by the Vulkan local-tone stage.
+    // Legacy quarter-resolution local-tone base. Retired from RAW production later in Phase 10.
     PersistentBuffer localToneBase_;
+    // Phase 10 FLLF: packed half-resolution Gaussian pyramid and reconstructed local-exposure
+    // correction pyramid. Two scalar buffers keep memory bounded and avoid full-resolution RGB
+    // intermediates.
+    PersistentBuffer fllfGaussian_;
+    PersistentBuffer fllfCorrection_;
     [[maybe_unused]] std::uint64_t allocationGeneration_ = 0u;
     [[maybe_unused]] std::uint64_t residentSceneGeneration_ = 0u;
     std::uint64_t residentToneGeneration_ = 0u;

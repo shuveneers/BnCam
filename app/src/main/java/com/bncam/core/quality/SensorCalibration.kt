@@ -814,8 +814,24 @@ object SensorCalibrationResolver {
                     }
             }
 
+        val systemAwbRequested = when {
+            safeProfileAwb?.mode == ProfileAwbModes.SYSTEM_AUTO -> true
+            safeProfileAwb == null && override.awbMode == "System" -> true
+            else -> false
+        }
+        val exactFrameCamera2Wb = base.baseWbAppliedByDefault &&
+            base.baseWbSource.contains("CaptureResult.COLOR_CORRECTION_GAINS", ignoreCase = true)
+        val exactFrameCamera2Ccm = base.baseColorMatrixApplied &&
+            base.baseColorMatrixSource.contains("CaptureResult.COLOR_CORRECTION_TRANSFORM", ignoreCase = true)
+        val exactFrameCamera2ColorPair = systemAwbRequested && exactFrameCamera2Wb && exactFrameCamera2Ccm
+
+        // Still System-AWB color must be one selected-frame Camera2 solution. The process-local
+        // stable WB engine remains useful for preview/bootstrap, but it must never be paired with
+        // a different frame's COLOR_CORRECTION_TRANSFORM. Stable fallback is therefore allowed
+        // only when neither half of an exact selected-frame pair is available.
         val stableSystemAutoWb = stableAutoWhiteBalance?.takeIf { snapshot ->
-            snapshot.confidence >= 0.55f && snapshot.gains.size >= 4 &&
+            systemAwbRequested && !exactFrameCamera2Wb && !exactFrameCamera2Ccm &&
+                snapshot.confidence >= 0.55f && snapshot.gains.size >= 4 &&
                 snapshot.gains.take(4).all { gain -> gain.isFinite() && gain in 0.25f..6.0f }
         }
 
@@ -825,30 +841,34 @@ object SensorCalibrationResolver {
                     "The stored profile is preserved and cannot brick RAW preview/startup."
             )
         }
-
-        val stableSystemAutoWbAllowed = stableSystemAutoWb?.takeIf {
-            when {
-                safeProfileAwb?.mode == ProfileAwbModes.SYSTEM_AUTO -> true
-                safeProfileAwb == null && override.awbMode == "System" -> true
-                else -> false
-            }
+        if (systemAwbRequested && exactFrameCamera2Wb.xor(exactFrameCamera2Ccm)) {
+            warnings.add(
+                "Incomplete selected-frame Camera2 color pair: exactWb=$exactFrameCamera2Wb exactCcm=$exactFrameCamera2Ccm. " +
+                    "Historical stable WB is not mixed with current-frame color metadata."
+            )
         }
+
         val wb = when {
             sensorAwareProfileAwb != null -> sensorAwareProfileAwb.bayerWbGains.copyOf()
-            stableSystemAutoWbAllowed != null -> stableSystemAutoWbAllowed.copyGains()
-            safeProfileAwb?.mode == ProfileAwbModes.SYSTEM_AUTO -> base.baseWbGains
-            safeProfileAwb != null -> base.baseWbGains
+            systemAwbRequested && exactFrameCamera2Wb -> base.baseWbGains.copyOf()
+            stableSystemAutoWb != null -> stableSystemAutoWb.copyGains()
+            safeProfileAwb?.mode == ProfileAwbModes.SYSTEM_AUTO -> base.baseWbGains.copyOf()
+            safeProfileAwb != null -> base.baseWbGains.copyOf()
             override.awbMode != "System" -> {
                 warnings.add("Legacy Lens ID AWB override applied because no profile AWB snapshot was supplied")
                 applyAwbOverride(base.baseWbGains, override)
             }
-            else -> base.baseWbGains
+            else -> base.baseWbGains.copyOf()
         }
         val wbSource = when {
             sensorAwareProfileAwb != null ->
                 "Sensor-aware profile WB ${sensorAwareProfileAwb.targetKelvin}K / ${sensorAwareProfileAwb.illuminantModel} / Camera2 calibration matrices"
-            stableSystemAutoWbAllowed != null ->
-                "BnCam stable CaptureResult AWB confidence=${String.format(Locale.US, "%.3f", stableSystemAutoWbAllowed.confidence)} samples=${stableSystemAutoWbAllowed.acceptedSampleCount}"
+            exactFrameCamera2ColorPair ->
+                "CaptureResult exact-frame color pair: COLOR_CORRECTION_GAINS + COLOR_CORRECTION_TRANSFORM"
+            systemAwbRequested && exactFrameCamera2Wb ->
+                "Exact-frame Camera2 WB gains with non-frame CCM fallback: ${base.baseColorMatrixSource}"
+            stableSystemAutoWb != null ->
+                "BnCam stable Camera2 AWB bootstrap confidence=${String.format(Locale.US, "%.3f", stableSystemAutoWb.confidence)} samples=${stableSystemAutoWb.acceptedSampleCount}"
             safeProfileAwb?.mode == ProfileAwbModes.SYSTEM_AUTO -> base.baseWbSource
             safeProfileAwb != null -> "Profile WB fallback -> ${base.baseWbSource}"
             override.awbMode != "System" -> "Legacy Lens ID AWB override profile=${override.awbProfile} over ${base.baseWbSource}"
@@ -869,6 +889,8 @@ object SensorCalibrationResolver {
         }
         val colorSource = when {
             manualColorOverrideActive -> "Lens ID Manual color matrix override"
+            exactFrameCamera2ColorPair ->
+                "CaptureResult exact-frame color pair: COLOR_CORRECTION_TRANSFORM + COLOR_CORRECTION_GAINS"
             sensorAwareProfileAwb != null -> "${base.baseColorMatrixSource} + sensor-aware profile WB gains (${sensorAwareProfileAwb.targetKelvin}K)"
             else -> base.baseColorMatrixSource
         }

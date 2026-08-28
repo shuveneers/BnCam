@@ -25,6 +25,7 @@
 #include "SpectraVisibleChromaSupportPolicy.h"
 #include "Demosaic.h"
 #include "DynamicRangeTonePolicy.h"
+#include "FastLocalLaplacianPolicy.h"
 #include "LocalTonePolicy.h"
 #include "ProfileToneRenderPolicy.h"
 #include "ProfileDetailSharpenPolicy.h"
@@ -885,6 +886,63 @@ inline float fastSmoothstep(float edge0, float invEdgeDiff, float value) {
     const float u = std::clamp((value - edge0) * invEdgeDiff, 0.0f, 1.0f);
     return u * u * (3.0f - 2.0f * u);
 }
+
+inline cv::Vec3f phase10AgxCoreCpu(const cv::Vec3f& linearRgb) {
+    // AgX allocation bounds in absolute log2(linear BT.709), including log2(0.18).
+    constexpr float minEv = -12.47393f;
+    constexpr float maxEv = 4.026069f;
+    const auto contrast = [](float x) noexcept {
+        const float x2 = x * x;
+        const float x4 = x2 * x2;
+        return std::clamp(15.5f * x4 * x2 - 40.14f * x4 * x + 31.96f * x4 -
+                          6.868f * x2 * x + 0.4298f * x2 + 0.1191f * x - 0.00232f,
+                          0.0f, 1.0f);
+    };
+    const float r = std::max(1.0e-6f, linearRgb[0]);
+    const float g = std::max(1.0e-6f, linearRgb[1]);
+    const float b = std::max(1.0e-6f, linearRgb[2]);
+    // Explicit rows match the GLSL mat3*vec semantics used by the resident AgX shader.
+    float ir = 0.8424790623f * r + 0.0784336000f * g + 0.0792237451f * b;
+    float ig = 0.0423282423f * r + 0.8784686365f * g + 0.0791661275f * b;
+    float ib = 0.0423756549f * r + 0.0784336000f * g + 0.8791429738f * b;
+    const auto encode = [&](float v) noexcept {
+        const float logV = std::clamp(std::log2(std::max(v, 1.0e-6f)), minEv, maxEv);
+        return contrast((logV - minEv) / (maxEv - minEv));
+    };
+    ir = encode(ir); ig = encode(ig); ib = encode(ib);
+    // AgX sigmoid + outset is still in the 2.2 display-encoded reference domain.
+    // Linearize it before any display-linear profile/gamut stage and before final sRGB encoding.
+    // Preserve the sign as an extended-domain contract so the single final gamut owner remains
+    // authoritative for small outset excursions instead of clipping individual channels here.
+    const auto linearizeAgxOutset = [](float v) noexcept {
+        if (!std::isfinite(v)) return 0.0f;
+        return std::copysign(std::pow(std::abs(v), 2.2f), v);
+    };
+    return cv::Vec3f(
+            linearizeAgxOutset(1.1968790243f * ir - 0.0980208811f * ig - 0.0990297441f * ib),
+            linearizeAgxOutset(-0.0528968518f * ir + 1.1519031299f * ig - 0.0989611768f * ib),
+            linearizeAgxOutset(-0.0529716355f * ir - 0.0980434501f * ig + 1.1510736726f * ib));
+}
+
+inline cv::Vec3f phase10CompressUnitGamutCpu(const cv::Vec3f& input) {
+    cv::Vec3f rgb = input;
+    if (!std::isfinite(rgb[0]) || !std::isfinite(rgb[1]) || !std::isfinite(rgb[2])) return cv::Vec3f(0.0f);
+    float y = 0.2126f * rgb[0] + 0.7152f * rgb[1] + 0.0722f * rgb[2];
+    if (!(y > 1.0e-8f)) return cv::Vec3f(0.0f);
+    if (y > 1.0f) { rgb *= 1.0f / y; y = 1.0f; }
+    const float mx = std::max({rgb[0], rgb[1], rgb[2]});
+    const float mn = std::min({rgb[0], rgb[1], rgb[2]});
+    if (mx <= 1.0f && mn >= 0.0f) return rgb;
+    const float positive = std::max(0.0f, mx - y);
+    const float negative = std::max(0.0f, y - mn);
+    float authority = 1.0f;
+    if (positive > 1.0e-6f) authority = std::min(authority, (1.0f - y) / positive);
+    if (negative > 1.0e-6f) authority = std::min(authority, y / negative);
+    authority = std::clamp(authority, 0.0f, 1.0f);
+    for (int c = 0; c < 3; ++c) rgb[c] = std::clamp(y + (rgb[c] - y) * authority, 0.0f, 1.0f);
+    return rgb;
+}
+
 
 float evalCurveIsp(const std::vector<float>& curve, float x) {
     if (curve.size() <= 1u) return std::clamp(x, 0.0f, 1.0f);
@@ -14926,14 +14984,18 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             1.0f,
             wbMetadata[3] / greenReference
     };
+    // ImageUtils sets wbFromMetadata only when the selected frame supplies both the exact
+    // COLOR_CORRECTION_GAINS and exact COLOR_CORRECTION_TRANSFORM. In that case Android's
+    // coupled color solution is authoritative for System AWB; Phase-7 remains an observer.
+    const bool exactCamera2ColorPair = uiConfig.wbFromMetadata && uiConfig.colorMatrixFromMetadata;
 
     float nativeAppliedContributionWeight = 0.0f;
     std::string nativeAdjustmentType = "none";
     float nativeAdjustmentMagnitude = 0.0f;
 
     const float rawContributionWeight = std::clamp(meta.auxContributionWeight, 0.0f, 0.15f);
-    if (meta.phoneAssistanceSensorsEnabled && meta.auxSensorValid && rawContributionWeight > 0.001f &&
-        meta.auxCctKelvin >= 1500.0f && meta.auxCctKelvin <= 12000.0f) {
+    if (!exactCamera2ColorPair && meta.phoneAssistanceSensorsEnabled && meta.auxSensorValid &&
+        rawContributionWeight > 0.001f && meta.auxCctKelvin >= 1500.0f && meta.auxCctKelvin <= 12000.0f) {
         const float cctRatio = std::clamp(5500.0f / meta.auxCctKelvin, 0.60f, 1.80f);
         const float sensorWbRScale = 1.0f + (cctRatio - 1.0f) * 0.15f * rawContributionWeight;
         const float sensorWbBScale = 1.0f + (1.0f / cctRatio - 1.0f) * 0.15f * rawContributionWeight;
@@ -14964,6 +15026,19 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             static_cast<double>(demosaicNoiseContext.sigmaY));
     if (!vulkanDemosaicResident) {
         phase7AwbEstimate.method = "PHYSICAL_AWB_CPU_FAILURE_REFERENCE_GRAY_WORLD_V1";
+    }
+    if (exactCamera2ColorPair) {
+        // Do not let a gray-world/scene-content estimator rewrite an exact Camera2 System-AWB
+        // still solution. Keep all Phase-7 evidence/telemetry, but make it observer-only.
+        phase7AwbEstimate.finalGainsRgb[0] = phase7AwbEstimate.priorGainsRgb[0];
+        phase7AwbEstimate.finalGainsRgb[1] = 1.0;
+        phase7AwbEstimate.finalGainsRgb[2] = phase7AwbEstimate.priorGainsRgb[2];
+        phase7AwbEstimate.dataAuthority = 0.0;
+        phase7AwbEstimate.method = "CAMERA2_EXACT_FRAME_COLOR_PAIR_OBSERVER_ONLY";
+        phase7AwbEstimate.status = "READY_EXACT_CAMERA2_PAIR";
+        nativeAppliedContributionWeight = 0.0f;
+        nativeAdjustmentType = "none_exact_camera2_color_pair";
+        nativeAdjustmentMagnitude = 0.0f;
     }
     float wbRgb[3] = {
             static_cast<float>(phase7AwbEstimate.finalGainsRgb[0]),
@@ -16068,6 +16143,10 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                     uiConfig.profileToneContrast,
                     uiConfig.profileLocalToneBias
             });
+    // Phase 10: RAW uses a strict scene-referred GTM -> local adaptation -> AgX contract.
+    // DynamicRangeTonePolicy still provides scene classification/pressure for both RAW and YUV,
+    // but its legacy display shoulder/black/contrast pieces are not owners on the RAW path.
+    const bool phase10RawToneArchitecture = isRawBayer;
     const float effectiveShoulderStart = std::clamp(
             dynamicRangeTonePlan.shoulderStart + profileTonePlan.shoulderStartDelta,
             0.50f, 0.85f);
@@ -16075,7 +16154,8 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             dynamicRangeTonePlan.shoulderStrength * profileTonePlan.shoulderStrengthScale,
             0.50f, 2.50f);
     const float effectiveToneContrastStrength = std::clamp(
-            dynamicRangeTonePlan.contrastStrength + profileTonePlan.contrastDelta,
+            (phase10RawToneArchitecture ? 0.0f : dynamicRangeTonePlan.contrastStrength) +
+                    profileTonePlan.contrastDelta,
             -0.08f, 0.22f);
     const bncam::tone::LocalTonePlan automaticLocalTonePlan = bncam::tone::resolveLocalTonePlan({
             dynamicRangeTonePlan.sceneMidtoneTarget,
@@ -16086,6 +16166,16 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             std::clamp(isoState.combinedNoisePressure, 0.0f, 1.0f),
             lowLightScene
     });
+    const bncam::tone::FastLocalLaplacianPlan automaticFllfPlan =
+            bncam::tone::resolveFastLocalLaplacianPlan({
+                    dynamicRangeTonePlan.sceneMidtoneTarget,
+                    dynamicRangeTonePlan.shadowPressure,
+                    dynamicRangeTonePlan.dynamicRangePressure,
+                    dynamicRangeTonePlan.recoverableHighlightPressure,
+                    dynamicRangeTonePlan.sensorClipPressure,
+                    std::clamp(isoState.combinedNoisePressure, 0.0f, 1.0f),
+                    lowLightScene
+            });
     const float targetP50 = dynamicRangeTonePlan.sceneMidtoneTarget;
 
     float maxGain = 2.50f;
@@ -16215,6 +16305,16 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     localTonePlan.maxCompressEv = std::clamp(
             localTonePlan.maxCompressEv * profileTonePlan.localToneCompressScale, 0.08f, 0.70f);
     localTonePlan.enabled = localTonePlan.strength >= 0.02f;
+
+    bncam::tone::FastLocalLaplacianPlan fllfPlan = automaticFllfPlan;
+    fllfPlan.strength = std::clamp(
+            fllfPlan.strength * profileTonePlan.localToneStrengthScale, 0.0f, 0.55f);
+    fllfPlan.maxLiftEv = std::clamp(
+            fllfPlan.maxLiftEv * profileTonePlan.localToneLiftScale, 0.0f, 0.60f);
+    fllfPlan.maxCompressEv = std::clamp(
+            fllfPlan.maxCompressEv * profileTonePlan.localToneCompressScale, 0.0f, 0.70f);
+    fllfPlan.enabled = phase10RawToneArchitecture && automaticFllfPlan.enabled &&
+            fllfPlan.strength >= 0.04f;
 
     // Profile Exposure is a post-capture render control. Apply it only after the automatic scene
     // exposure governor has resolved its physical/highlight-safe baseline.
@@ -16362,9 +16462,10 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     const float baselineIndoorLowLightMidtoneLiftAmount = indoorLowLightMidtoneLiftApplied
             ? (displayHighlightScene ? 0.055f : 0.035f)
             : 0.0f;
-    const float requestedSceneLowerMidtoneLiftAmount = std::max(
-            baselineIndoorLowLightMidtoneLiftAmount,
-            dynamicRangeTonePlan.requestedLowerMidLift);
+    const float requestedSceneLowerMidtoneLiftAmount = phase10RawToneArchitecture
+            ? 0.0f
+            : std::max(baselineIndoorLowLightMidtoneLiftAmount,
+                       dynamicRangeTonePlan.requestedLowerMidLift);
     const bool sceneLowerMidtoneLiftApplied = requestedSceneLowerMidtoneLiftAmount > 1.0e-4f;
     const float sceneLowerMidtoneLiftAfterNoiseGuard =
             requestedSceneLowerMidtoneLiftAmount * (1.0f - toneGuardAutoLiftAttenuation);
@@ -16373,6 +16474,10 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                     sceneLowerMidtoneLiftAfterNoiseGuard,
                     localToneExposureStackGuard.attenuation);
     const float rawJpegBaseVibrance = lowLightPresentationPlan.rawBaseVibrance;
+    // Phase 10: AgX owns automatic high-exposure colour behavior. The historical automatic RAW
+    // base-vibrance compensation was a second display-colour owner. Explicit profile saturation/
+    // vibrance controls remain user-owned creative look parameters.
+    const float phase10AppliedBaseVibrance = phase10RawToneArchitecture ? 1.0f : rawJpegBaseVibrance;
     constexpr double colorMetricScale = 1000000.0;
     std::atomic<uint64_t> vibranceEffectiveSumQ{0};
     std::atomic<uint32_t> vibranceEffectiveMaxQ{0};
@@ -16390,9 +16495,10 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     std::atomic<uint64_t> deepShadowProtectedPixels{0};
     std::atomic<uint64_t> displayHighlightMaskPixels{0};
     const auto toneAndVibranceStart = IspClock::now();
-    const float effectiveBlackAnchor = std::clamp(
-            dynamicRangeTonePlan.effectiveBlackAnchor + profileTonePlan.blackAnchorDelta,
-            0.0f, 0.08f);
+    const float effectiveBlackAnchor = phase10RawToneArchitecture
+            ? 0.0f
+            : std::clamp(dynamicRangeTonePlan.effectiveBlackAnchor +
+                         profileTonePlan.blackAnchorDelta, 0.0f, 0.08f);
 
     struct ToneLutEntry {
         float curvedLuma;
@@ -16410,12 +16516,14 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         const float contrastDelta = effectiveToneContrastStrength * contrastHighlightGate * contrastShadowGate *
                                      anchoredLuma * (1.0f - anchoredLuma) * (anchoredLuma - 0.5f);
         float curvedLuma = std::clamp(anchoredLuma + contrastDelta, 0.0f, 1.0f);
-        // AgX deliberately preserves large scene headroom; calibrate only the upper display range
-        // back toward photographic white. This leaves lower/mid tones untouched and is monotonic.
-        curvedLuma = bncam::tone::applyDisplayWhiteExpansion(
-                curvedLuma,
-                dynamicRangeTonePlan.displayWhiteExpansionStart,
-                dynamicRangeTonePlan.displayWhiteExpansionGamma);
+        // Phase 10 RAW: AgX is the sole scene-to-display transform. Do not expand its upper
+        // display range a second time. YUV preserves the established presentation behavior.
+        if (!phase10RawToneArchitecture) {
+            curvedLuma = bncam::tone::applyDisplayWhiteExpansion(
+                    curvedLuma,
+                    dynamicRangeTonePlan.displayWhiteExpansionStart,
+                    dynamicRangeTonePlan.displayWhiteExpansionGamma);
+        }
         // Lightroom-style profile range controls are applied before user curves.
         curvedLuma = bncam::tone::applyProfileTonalRanges(curvedLuma, profileTonePlan);
         const float toneCurveDerivative = toneCurveActive
@@ -16494,16 +16602,38 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         const double shoulderHeadroom = 1.0 - shoulderStartForPropagation;
         const double shoulderStrength = effectiveShoulderStrength;
         double lookLuma = exposedLuma;
-        double shoulderDerivative = 1.0;
-        double shoulderScale = 1.0;
-        if (exposedLuma > shoulderStartForPropagation) {
+        double toneCoreDerivative = 1.0;
+        double toneCoreScale = 1.0;
+        if (phase10RawToneArchitecture) {
+            // Phase 10 RAW propagation follows the actual sole automatic DRT rather than the
+            // retired pre-AgX shoulder. A neutral finite-difference Jacobian is sufficient for
+            // compact noise planning and costs no image readback. FLLF is intentionally not
+            // promoted to a global Jacobian: its bounded scalar exposure is spatial/local and
+            // has its own GPU authority telemetry.
+            const float x = static_cast<float>(std::max(1.0e-6, exposedLuma));
+            const float eps = std::max(1.0e-5f, 0.002f * std::max(x, 0.02f));
+            const float lowX = std::max(0.0f, x - eps);
+            const float highX = x + eps;
+            const cv::Vec3f agxMid = phase10AgxCoreCpu(cv::Vec3f(x, x, x));
+            const cv::Vec3f agxLow = phase10AgxCoreCpu(cv::Vec3f(lowX, lowX, lowX));
+            const cv::Vec3f agxHigh = phase10AgxCoreCpu(cv::Vec3f(highX, highX, highX));
+            const auto neutralY = [](const cv::Vec3f& v) noexcept -> double {
+                return 0.2126 * static_cast<double>(v[0]) +
+                       0.7152 * static_cast<double>(v[1]) +
+                       0.0722 * static_cast<double>(v[2]);
+            };
+            lookLuma = std::max(0.0, neutralY(agxMid));
+            const double denominator = std::max(1.0e-9, static_cast<double>(highX - lowX));
+            toneCoreDerivative = std::max(0.0, (neutralY(agxHigh) - neutralY(agxLow)) / denominator);
+            toneCoreScale = lookLuma / std::max(exposedLuma, 1.0e-6);
+        } else if (exposedLuma > shoulderStartForPropagation) {
             const double excess = exposedLuma - shoulderStartForPropagation;
             const double shoulderDenominator = excess + shoulderHeadroom * shoulderStrength;
             lookLuma = shoulderStartForPropagation +
                     shoulderHeadroom * excess / shoulderDenominator;
-            shoulderDerivative = shoulderHeadroom * shoulderHeadroom * shoulderStrength /
+            toneCoreDerivative = shoulderHeadroom * shoulderHeadroom * shoulderStrength /
                     (shoulderDenominator * shoulderDenominator);
-            shoulderScale = lookLuma / std::max(exposedLuma, 1.0e-6);
+            toneCoreScale = lookLuma / std::max(exposedLuma, 1.0e-6);
         }
         const double clampedLook = std::clamp(lookLuma, 0.0, 1.0);
         const double lutPosition = clampedLook * 4095.0;
@@ -16516,8 +16646,8 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         };
         const double curvedLuma = interpolate(&ToneLutEntry::curvedLuma);
         const double totalDerivative = static_cast<double>(exposureGain) *
-                shoulderDerivative * lutTotalDerivativeAt(lutIndex);
-        const double chromaScale = static_cast<double>(exposureGain) * shoulderScale *
+                toneCoreDerivative * lutTotalDerivativeAt(lutIndex);
+        const double chromaScale = static_cast<double>(exposureGain) * toneCoreScale *
                 curvedLuma / std::max(lookLuma, 1.0e-6);
         actualToneDerivatives.push_back(interpolate(&ToneLutEntry::toneCurveDerivative));
         actualSectionDerivatives.push_back(interpolate(&ToneLutEntry::sectionCurveDerivative));
@@ -16541,8 +16671,10 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             residualNoiseState.totalToneDerivative.rms,
             residualNoiseState.toneChromaScale.rms,
             residualNoiseState.toneChromaScale.rms,
-            "POST_TONE_CURVES_PRE_VIBRANCE",
-            "SCENE_SAMPLED_LUMA_JACOBIAN_AND_CHROMA_SCALE",
+            phase10RawToneArchitecture ? "POST_PHASE10_AGX_LOOK_PRE_PROFILE_COLOR"
+                                       : "POST_TONE_CURVES_PRE_VIBRANCE",
+            phase10RawToneArchitecture ? "SCENE_SAMPLED_AGX_NEUTRAL_JACOBIAN_AND_CHROMA_SCALE"
+                                       : "SCENE_SAMPLED_LUMA_JACOBIAN_AND_CHROMA_SCALE",
             0.80
     );
     residualNoiseState.tonePropagationMs = elapsedMs(tonePropagationStart);
@@ -16618,13 +16750,22 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         request.frameHeight = static_cast<std::uint32_t>(demosaicInputHeight);
         request.residentSceneGeneration = vulkanSceneObserver.residentSceneGeneration;
         request.exposureGain = exposureGain;
-        request.rawJpegBaseVibrance = rawJpegBaseVibrance;
+        request.rawJpegBaseVibrance = phase10AppliedBaseVibrance;
         request.shoulderStart = effectiveShoulderStart;
         request.shoulderStrength = effectiveShoulderStrength;
-        request.localToneStrength = localTonePlan.enabled ? localTonePlan.strength : 0.0f;
+        request.localToneStrength = !phase10RawToneArchitecture && localTonePlan.enabled
+                ? localTonePlan.strength : 0.0f;
         request.localToneSceneKey = localTonePlan.sceneKey;
         request.localToneMaxLiftEv = localTonePlan.maxLiftEv;
         request.localToneMaxCompressEv = localTonePlan.maxCompressEv;
+        request.fllfEnabled = fllfPlan.enabled;
+        request.fllfStrength = fllfPlan.strength;
+        request.fllfSceneKey = fllfPlan.sceneKey;
+        request.fllfMaxLiftEv = fllfPlan.maxLiftEv;
+        request.fllfMaxCompressEv = fllfPlan.maxCompressEv;
+        request.fllfEdgeStopEv = fllfPlan.edgeStopEv;
+        request.fllfRefinement = fllfPlan.refinement;
+        request.fllfPyramidLevels = fllfPlan.pyramidLevels;
         request.isRawBayer = isRawBayer;
         request.profileColorSaturation = uiConfig.profileColorSaturation;
         request.profileColorContrast = uiConfig.profileColorContrast;
@@ -16686,16 +16827,11 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         cpuSceneProcessingApplied = true;
     }
 
-    constexpr float invSatShadow = 1.0f / (0.15f - 0.035f);
-    constexpr float invSatHighlight = 1.0f / (0.88f - 0.64f);
-    constexpr float invNeutral = 1.0f / (0.045f - 0.012f);
-    constexpr float invVibrance = 1.0f / (0.85f - 0.40f);
-
     constexpr float invSatShadowMono = 1.0f / (0.22f - 0.08f);
     constexpr float invSatHighlightMono = 1.0f / (0.90f - 0.70f);
     constexpr float invVibranceMono = 1.0f / (0.70f - 0.30f);
 
-    const auto applyCpuToneAndVibrance = [&](float cpuRawJpegBaseVibrance) {
+    const auto applyCpuToneAndProfile = [&]() {
     cv::parallel_for_(cv::Range(0, linearRgb.rows), [&](const cv::Range& range) {
         for (int y = range.start; y < range.end; ++y) {
             cv::Vec3f* row = linearRgb.ptr<cv::Vec3f>(y);
@@ -16703,6 +16839,10 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                 float r = row[x][0] * exposureGain;
                 float g = row[x][1] * exposureGain;
                 float b = row[x][2] * exposureGain;
+                if (phase10RawToneArchitecture) {
+                    const cv::Vec3f agx = phase10AgxCoreCpu(cv::Vec3f(r, g, b));
+                    r = agx[0]; g = agx[1]; b = agx[2];
+                }
                 const float preShoulderY = std::max(
                         1.0e-6f,
                         0.2126f * r + 0.7152f * g + 0.0722f * b
@@ -16737,7 +16877,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                 const float shoulderStart = effectiveShoulderStart;
                 const float shoulderStrength = effectiveShoulderStrength;
                 float lookLuma = postNeutralY;
-                if (postNeutralY > shoulderStart) {
+                if (!phase10RawToneArchitecture && postNeutralY > shoulderStart) {
                     const float headroom = 1.0f - shoulderStart;
                     const float excess = postNeutralY - shoulderStart;
                     const float mappedY = shoulderStart + headroom * excess /
@@ -16749,13 +16889,13 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                     lookLuma = mappedY;
                 }
 
-                // Gamut mapping
+                // RAW keeps signed display-linear RGB through AgX, tone LUT and explicit
+                // profile color. Final gamut placement happens exactly once after those stages.
+                // YUV retains its established presentation clamp because it is already HAL-toned.
                 float mappedMaximum = std::max({r, g, b});
-                if (mappedMaximum > 1.0f) {
+                if (!phase10RawToneArchitecture && mappedMaximum > 1.0f) {
                     const float gamutScale = 1.0f / mappedMaximum;
-                    r *= gamutScale;
-                    g *= gamutScale;
-                    b *= gamutScale;
+                    r *= gamutScale; g *= gamutScale; b *= gamutScale;
                     mappedMaximum = 1.0f;
                     lookLuma = std::max(1.0e-6f, 0.2126f * r + 0.7152f * g + 0.0722f * b);
                 }
@@ -16767,41 +16907,19 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                 const int nextIdx = std::min(4095, lutIdx + 1);
 
                 const float curvedLuma = toneLookLut[lutIdx].curvedLuma * (1.0f - frac) + toneLookLut[nextIdx].curvedLuma * frac;
-                const float safeMidtoneGate = toneLookLut[lutIdx].safeMidtoneGate * (1.0f - frac) + toneLookLut[nextIdx].safeMidtoneGate * frac;
-
                 const float lookScale = curvedLuma / lookLuma;
                 r *= lookScale;
                 g *= lookScale;
                 b *= lookScale;
 
-                float finalLuma = curvedLuma;
-                float finalMax = std::max({r, g, b});
-                float finalMin = std::min({r, g, b});
-                float lookRelativeChroma = (finalMax - finalMin) / std::max(finalMax, 0.02f);
+                if (!phase10RawToneArchitecture) {
+                    float finalLuma = curvedLuma;
+                    float finalMax = std::max({r, g, b});
+                    float finalMin = std::min({r, g, b});
+                    float lookRelativeChroma = (finalMax - finalMin) / std::max(finalMax, 0.02f);
 
-                float requestedSaturationFactor = 1.0f;
-                if (!pixelWasNeutralized) {
-                    if (isRawBayer) {
-                        const float saturationShadowGate = fastSmoothstep(0.035f, invSatShadow, finalLuma);
-                        const float saturationHighlightGate =
-                                1.0f - fastSmoothstep(0.64f, invSatHighlight, finalLuma);
-                        // Preserve true neutrals while still giving weak real color a useful lift.
-                        const float neutralGate = fastSmoothstep(0.012f, invNeutral, lookRelativeChroma);
-                        const float vibranceColorGate =
-                                1.0f - 0.35f * fastSmoothstep(0.40f, invVibrance, lookRelativeChroma);
-                        const float effectiveBoostGate = saturationShadowGate *
-                                saturationHighlightGate * neutralGate * vibranceColorGate *
-                                (0.85f + 0.15f * safeMidtoneGate);
-                        requestedSaturationFactor = 1.0f +
-                                (cpuRawJpegBaseVibrance - 1.0f) * effectiveBoostGate;
-                        // Avoid cartoon colors even if a weak color sits near a gamut boundary.
-                        if (lookRelativeChroma > 1.0e-5f) {
-                            requestedSaturationFactor = std::min(
-                                    requestedSaturationFactor,
-                                    0.95f / lookRelativeChroma
-                            );
-                        }
-                    } else {
+                    float requestedSaturationFactor = 1.0f;
+                    if (!pixelWasNeutralized) {
                         const float saturationShadowGate = fastSmoothstep(0.08f, invSatShadowMono, finalLuma);
                         const float saturationHighlightGate = 1.0f - fastSmoothstep(0.70f, invSatHighlightMono, finalLuma);
                         const float vibranceColorGate = 1.0f -
@@ -16809,29 +16927,37 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                         requestedSaturationFactor = 1.0f +
                                 0.05f * saturationShadowGate * saturationHighlightGate * vibranceColorGate;
                     }
+
+                    const float positiveDeviation = std::max(0.0f, finalMax - finalLuma);
+                    const float negativeDeviation = std::max(0.0f, finalLuma - finalMin);
+                    const float highlightGamutLimit = positiveDeviation > 1.0e-6f
+                            ? (1.0f - finalLuma) / positiveDeviation : requestedSaturationFactor;
+                    const float shadowGamutLimit = negativeDeviation > 1.0e-6f
+                            ? finalLuma / negativeDeviation : requestedSaturationFactor;
+                    const float saturationFactor = std::max(
+                            1.0f,
+                            std::min({requestedSaturationFactor, highlightGamutLimit, shadowGamutLimit})
+                    );
+
+                    r = std::max(0.0f, finalLuma + (r - finalLuma) * saturationFactor);
+                    g = std::max(0.0f, finalLuma + (g - finalLuma) * saturationFactor);
+                    b = std::max(0.0f, finalLuma + (b - finalLuma) * saturationFactor);
                 }
 
-                const float positiveDeviation = std::max(0.0f, finalMax - finalLuma);
-                const float negativeDeviation = std::max(0.0f, finalLuma - finalMin);
-                const float highlightGamutLimit = positiveDeviation > 1.0e-6f ? (1.0f - finalLuma) / positiveDeviation : requestedSaturationFactor;
-                const float shadowGamutLimit = negativeDeviation > 1.0e-6f ? finalLuma / negativeDeviation : requestedSaturationFactor;
-                const float saturationFactor = std::max(
-                        1.0f,
-                        std::min({requestedSaturationFactor, highlightGamutLimit, shadowGamutLimit})
-                );
-
-                r = std::max(0.0f, finalLuma + (r - finalLuma) * saturationFactor);
-                g = std::max(0.0f, finalLuma + (g - finalLuma) * saturationFactor);
-                b = std::max(0.0f, finalLuma + (b - finalLuma) * saturationFactor);
-
-                applyBncamProfileColorManagement(r, g, b, uiConfig);
+                if (phase10RawToneArchitecture) {
+                    applyBncamProfileColorManagement(r, g, b, uiConfig, false);
+                    const cv::Vec3f mapped = phase10CompressUnitGamutCpu(cv::Vec3f(r, g, b));
+                    r = mapped[0]; g = mapped[1]; b = mapped[2];
+                } else {
+                    applyBncamProfileColorManagement(r, g, b, uiConfig);
+                }
                 row[x] = cv::Vec3f(r, g, b);
             }
         }
     });
     };
     if (!vulkanToneApplied) {
-        applyCpuToneAndVibrance(rawJpegBaseVibrance);
+        applyCpuToneAndProfile();
     }
     // Keep the RAW mosaic until the 8H-K tone->post-demosaic resident handoff has either
     // succeeded or selected its typed fallback. That preserves deterministic recovery without
@@ -17604,7 +17730,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         } else {
             materializeCpuPostCcmReference();
             syncHighlightDebugFromPhase9();
-            applyCpuToneAndVibrance(rawJpegBaseVibrance);
+            applyCpuToneAndProfile();
             cpuSceneProcessingApplied = true;
             residentTelemetry.vulkanResidentCpuFallbackUsed = true;
             residentTelemetry.vulkanResidentFailureReason =
@@ -18417,6 +18543,19 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; toneShadowPressure=" << dynamicRangeTonePlan.shadowPressure
             << "; toneDynamicRangePressure=" << dynamicRangeTonePlan.dynamicRangePressure
             << "; toneSceneMidtoneTarget=" << dynamicRangeTonePlan.sceneMidtoneTarget
+            << "; phase10ToneArchitecture=" << (phase10RawToneArchitecture ? "GTM_SCENE_PLACEMENT__FLLF__AGX" : "YUV_LEGACY_PRESENTATION")
+            << "; phase10RawGtmSceneReferredOnly=" << (phase10RawToneArchitecture ? "true" : "false")
+            << "; phase10GtmOutputDomain=" << (phase10RawToneArchitecture ? "SCENE_LINEAR_EXPOSURE_PLACED" : "YUV_PRESENTATION")
+            << "; phase10FllfDomain=" << (phase10RawToneArchitecture ? "SCENE_REFERRED_LOG_LUMA_LOCAL_EXPOSURE" : "NOT_RAW")
+            << "; phase10AgxRole=" << (phase10RawToneArchitecture ? "SOLE_AUTOMATIC_SCENE_TO_DISPLAY_DRT" : "NOT_RAW")
+            << "; phase10AutomaticPostAgxLook=" << (phase10RawToneArchitecture ? "IDENTITY_UNLESS_EXPLICIT_PROFILE_TONE" : "YUV_LEGACY")
+            << "; phase10AutomaticRawBaseVibrance=" << (phase10RawToneArchitecture ? "DISABLED" : "NOT_RAW")
+            << "; phase10AgxAllocationMin=" << (phase10RawToneArchitecture ? -12.47393f : 0.0f)
+            << "; phase10AgxAllocationMax=" << (phase10RawToneArchitecture ? 4.026069f : 0.0f)
+            << "; phase10AgxEotf=" << (phase10RawToneArchitecture ? "SIGNED_2P2_TO_DISPLAY_LINEAR" : "NOT_RAW_PHASE10")
+            << "; phase10AgxOutputDomain=" << (phase10RawToneArchitecture ? "DISPLAY_LINEAR" : "LEGACY")
+            << "; phase10OutputGamutOwner=" << (phase10RawToneArchitecture ? "POST_PROFILE_SIGNED_LUMA_PRESERVING" : "YUV_TONE_STAGE")
+            << "; phase10ColorPairOwner=" << (exactCamera2ColorPair ? "CAMERA2_EXACT_FRAME_PAIR" : "RESOLVED_FALLBACK_OR_PROFILE")
             << "; toneDisplayWhiteExpansionStart=" << dynamicRangeTonePlan.displayWhiteExpansionStart
             << "; toneDisplayWhiteExpansionGamma=" << dynamicRangeTonePlan.displayWhiteExpansionGamma
             << "; toneShoulderStart=" << effectiveShoulderStart
@@ -18429,14 +18568,31 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; profileToneContrast=" << uiConfig.profileToneContrast
             << "; profileLocalToneBias=" << uiConfig.profileLocalToneBias
             << "; localToneAutomaticStrength=" << automaticLocalTonePlan.strength
-            << "; localToneEnabled=" << (localTonePlan.enabled ? "true" : "false")
+            << "; localToneEnabled=" << ((!phase10RawToneArchitecture && localTonePlan.enabled) ? "true" : "false")
             << "; localToneStrength=" << localTonePlan.strength
             << "; localToneSceneKey=" << localTonePlan.sceneKey
             << "; localToneMaxLiftEv=" << localTonePlan.maxLiftEv
             << "; localToneMaxCompressEv=" << localTonePlan.maxCompressEv
-            << "; localToneBackend=" << (vulkanTone.localToneApplied ? "VULKAN_QUARTER_RES_EDGE_AWARE" :
-                    (localTonePlan.enabled ? "REQUESTED_NOT_APPLIED" : "DISABLED"))
+            << "; localToneBackend=" << (phase10RawToneArchitecture ? "RETIRED_FOR_RAW_PHASE10" :
+                    (vulkanTone.localToneApplied ? "VULKAN_QUARTER_RES_EDGE_AWARE" :
+                    (localTonePlan.enabled ? "REQUESTED_NOT_APPLIED" : "DISABLED")))
             << "; localToneAdjustedPixels=" << vulkanTone.localToneAdjustedPixels
+            << "; fllfEnabled=" << (fllfPlan.enabled ? "true" : "false")
+            << "; fllfStrength=" << fllfPlan.strength
+            << "; fllfSceneKey=" << fllfPlan.sceneKey
+            << "; fllfMaxLiftEv=" << fllfPlan.maxLiftEv
+            << "; fllfMaxCompressEv=" << fllfPlan.maxCompressEv
+            << "; fllfEdgeStopEv=" << fllfPlan.edgeStopEv
+            << "; fllfRefinement=" << fllfPlan.refinement
+            << "; fllfBackend=" << (vulkanTone.fllfApplied ? "VULKAN_PACKED_LOG_LUMA_PYRAMID" :
+                    (fllfPlan.enabled ? "REQUESTED_NOT_APPLIED" : "DISABLED"))
+            << "; fllfAdjustedPixels=" << vulkanTone.fllfAdjustedPixels
+            << "; fllfEdgeProtectedSamples=" << vulkanTone.fllfEdgeProtectedSamples
+            << "; fllfMeanAbsCorrectionEv=" << vulkanTone.fllfMeanAbsCorrectionEv
+            << "; fllfMaxAbsCorrectionEv=" << vulkanTone.fllfMaxAbsCorrectionEv
+            << "; fllfPyramidBuildMs=" << vulkanTone.fllfPyramidBuildMs
+            << "; fllfRemapReconstructMs=" << vulkanTone.fllfRemapReconstructMs
+            << "; fllfResidentBytes=" << vulkanTone.fllfResidentBytes
             << "; requestedSceneLowerMidtoneLiftAmount="
             << requestedSceneLowerMidtoneLiftAmount
             << "; sceneLowerMidtoneLiftAfterNoiseGuard="
@@ -19436,6 +19592,19 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << dynamicRangeTonePlan.recoverableHighlightPressure
             << "; toneDynamicRangePressure=" << dynamicRangeTonePlan.dynamicRangePressure
             << "; toneSceneMidtoneTarget=" << dynamicRangeTonePlan.sceneMidtoneTarget
+            << "; phase10ToneArchitecture=" << (phase10RawToneArchitecture ? "GTM_SCENE_PLACEMENT__FLLF__AGX" : "YUV_LEGACY_PRESENTATION")
+            << "; phase10RawGtmSceneReferredOnly=" << (phase10RawToneArchitecture ? "true" : "false")
+            << "; phase10GtmOutputDomain=" << (phase10RawToneArchitecture ? "SCENE_LINEAR_EXPOSURE_PLACED" : "YUV_PRESENTATION")
+            << "; phase10FllfDomain=" << (phase10RawToneArchitecture ? "SCENE_REFERRED_LOG_LUMA_LOCAL_EXPOSURE" : "NOT_RAW")
+            << "; phase10AgxRole=" << (phase10RawToneArchitecture ? "SOLE_AUTOMATIC_SCENE_TO_DISPLAY_DRT" : "NOT_RAW")
+            << "; phase10AutomaticPostAgxLook=" << (phase10RawToneArchitecture ? "IDENTITY_UNLESS_EXPLICIT_PROFILE_TONE" : "YUV_LEGACY")
+            << "; phase10AutomaticRawBaseVibrance=" << (phase10RawToneArchitecture ? "DISABLED" : "NOT_RAW")
+            << "; phase10AgxAllocationMin=" << (phase10RawToneArchitecture ? -12.47393f : 0.0f)
+            << "; phase10AgxAllocationMax=" << (phase10RawToneArchitecture ? 4.026069f : 0.0f)
+            << "; phase10AgxEotf=" << (phase10RawToneArchitecture ? "SIGNED_2P2_TO_DISPLAY_LINEAR" : "NOT_RAW_PHASE10")
+            << "; phase10AgxOutputDomain=" << (phase10RawToneArchitecture ? "DISPLAY_LINEAR" : "LEGACY")
+            << "; phase10OutputGamutOwner=" << (phase10RawToneArchitecture ? "POST_PROFILE_SIGNED_LUMA_PRESERVING" : "YUV_TONE_STAGE")
+            << "; phase10ColorPairOwner=" << (exactCamera2ColorPair ? "CAMERA2_EXACT_FRAME_PAIR" : "RESOLVED_FALLBACK_OR_PROFILE")
             << "; toneDisplayWhiteExpansionStart=" << dynamicRangeTonePlan.displayWhiteExpansionStart
             << "; toneDisplayWhiteExpansionGamma=" << dynamicRangeTonePlan.displayWhiteExpansionGamma
             << "; toneShoulderStart=" << effectiveShoulderStart
@@ -19448,14 +19617,31 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; profileToneContrast=" << uiConfig.profileToneContrast
             << "; profileLocalToneBias=" << uiConfig.profileLocalToneBias
             << "; localToneAutomaticStrength=" << automaticLocalTonePlan.strength
-            << "; localToneEnabled=" << (localTonePlan.enabled ? "true" : "false")
+            << "; localToneEnabled=" << ((!phase10RawToneArchitecture && localTonePlan.enabled) ? "true" : "false")
             << "; localToneStrength=" << localTonePlan.strength
             << "; localToneSceneKey=" << localTonePlan.sceneKey
             << "; localToneMaxLiftEv=" << localTonePlan.maxLiftEv
             << "; localToneMaxCompressEv=" << localTonePlan.maxCompressEv
-            << "; localToneBackend=" << (vulkanTone.localToneApplied ? "VULKAN_QUARTER_RES_EDGE_AWARE" :
-                    (localTonePlan.enabled ? "REQUESTED_NOT_APPLIED" : "DISABLED"))
+            << "; localToneBackend=" << (phase10RawToneArchitecture ? "RETIRED_FOR_RAW_PHASE10" :
+                    (vulkanTone.localToneApplied ? "VULKAN_QUARTER_RES_EDGE_AWARE" :
+                    (localTonePlan.enabled ? "REQUESTED_NOT_APPLIED" : "DISABLED")))
             << "; localToneAdjustedPixels=" << vulkanTone.localToneAdjustedPixels
+            << "; fllfEnabled=" << (fllfPlan.enabled ? "true" : "false")
+            << "; fllfStrength=" << fllfPlan.strength
+            << "; fllfSceneKey=" << fllfPlan.sceneKey
+            << "; fllfMaxLiftEv=" << fllfPlan.maxLiftEv
+            << "; fllfMaxCompressEv=" << fllfPlan.maxCompressEv
+            << "; fllfEdgeStopEv=" << fllfPlan.edgeStopEv
+            << "; fllfRefinement=" << fllfPlan.refinement
+            << "; fllfBackend=" << (vulkanTone.fllfApplied ? "VULKAN_PACKED_LOG_LUMA_PYRAMID" :
+                    (fllfPlan.enabled ? "REQUESTED_NOT_APPLIED" : "DISABLED"))
+            << "; fllfAdjustedPixels=" << vulkanTone.fllfAdjustedPixels
+            << "; fllfEdgeProtectedSamples=" << vulkanTone.fllfEdgeProtectedSamples
+            << "; fllfMeanAbsCorrectionEv=" << vulkanTone.fllfMeanAbsCorrectionEv
+            << "; fllfMaxAbsCorrectionEv=" << vulkanTone.fllfMaxAbsCorrectionEv
+            << "; fllfPyramidBuildMs=" << vulkanTone.fllfPyramidBuildMs
+            << "; fllfRemapReconstructMs=" << vulkanTone.fllfRemapReconstructMs
+            << "; fllfResidentBytes=" << vulkanTone.fllfResidentBytes
             << "; curveStackApplied=" << (anyCurveActive ? "true" : "false")
             << "; toneCurveApplied=" << (toneCurveActive ? "true" : "false")
             << "; gammaCurveApplied=" << (gammaCurveActive ? "true" : "false")
@@ -19550,6 +19736,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; spectraMeasuredVisibleResidualMs=" << residualNoiseState.measuredVisibleResidualMs
             << "; spectraPropagationMathMs=" << spectraPropagationMathMs
             << "; spectraPropagationSequentialMs=" << spectraPropagationSequentialMs
+            << "; phase7ExactCamera2ColorPair=" << (exactCamera2ColorPair ? "true" : "false")
             << "; phase7AwbEstimatorMs=" << phase7AwbEstimatorMs
             << "; phase7AwbSampleSource=" << phase7AwbSampleSource
             << "; phase7AwbStatus=" << phase7AwbEstimate.status
@@ -19987,7 +20174,8 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; colorStageMeansToneG=" << toneMeanG
             << "; colorStageMeansToneB=" << toneMeanB
             << "; rawJpegVibranceApplied=" << (rawJpegVibranceApplied ? "true" : "false")
-            << "; rawJpegBaseVibrance=" << rawJpegBaseVibrance
+            << "; rawJpegBaseVibranceRequested=" << rawJpegBaseVibrance
+            << "; rawJpegBaseVibranceApplied=" << phase10AppliedBaseVibrance
             << "; lowLightPresentationNoisePressure="
             << lowLightPresentationPlan.presentationNoisePressure
             << "; rawJpegEffectiveVibranceMean=" << rawJpegEffectiveVibranceMean

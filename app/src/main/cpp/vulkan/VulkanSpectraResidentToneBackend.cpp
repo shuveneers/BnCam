@@ -64,8 +64,37 @@ static_assert(sizeof(PushConstants) == 128u, "resident tone push constants misma
 
 [[maybe_unused]] constexpr std::uint32_t kDisplayGridWidth = 32u;
 [[maybe_unused]] constexpr std::uint32_t kDisplayGridHeight = 24u;
-[[maybe_unused]] constexpr std::uint32_t kTelemetryWords = 8u;
+[[maybe_unused]] constexpr std::uint32_t kTelemetryWords = 20u;
 constexpr std::size_t kToneLutFloats = 4096u * 2u;
+
+constexpr std::uint32_t kFllfMaxLevels = 6u;
+struct FllfLevelLayout {
+    std::uint32_t width = 1u;
+    std::uint32_t height = 1u;
+    std::uint32_t offset = 0u;
+};
+struct FllfPyramidLayout {
+    FllfLevelLayout levels[kFllfMaxLevels]{};
+    std::uint32_t levelCount = 0u;
+    std::uint64_t totalFloats = 0u;
+};
+FllfPyramidLayout buildFllfPyramidLayout(
+        std::uint32_t frameWidth, std::uint32_t frameHeight, std::uint32_t requestedLevels) noexcept {
+    FllfPyramidLayout out{};
+    std::uint32_t w = std::max(1u, (frameWidth + 1u) / 2u);
+    std::uint32_t h = std::max(1u, (frameHeight + 1u) / 2u);
+    const std::uint32_t levels = std::clamp(requestedLevels, 2u, kFllfMaxLevels);
+    for (std::uint32_t level = 0u; level < levels; ++level) {
+        if (out.totalFloats > static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max())) break;
+        out.levels[level] = {w, h, static_cast<std::uint32_t>(out.totalFloats)};
+        out.totalFloats += static_cast<std::uint64_t>(w) * h;
+        ++out.levelCount;
+        if ((w == 1u && h == 1u) || level + 1u == levels) break;
+        w = std::max(1u, (w + 1u) / 2u);
+        h = std::max(1u, (h + 1u) / 2u);
+    }
+    return out;
+}
 
 } // namespace
 
@@ -129,7 +158,7 @@ void VulkanSpectraResidentToneBackend::destroyBuffersLocked() noexcept {
     if (allocator_ != nullptr) {
         for (PersistentBuffer* b : {&workingRgb_, &compact_, &toneLut_, &readback_, &telemetry_,
                                     &ultraHdrLuma_, &ultraHdrGainLog_, &ultraHdrGainmapPacked_, &portraitMask_, &portraitBlurRgb_,
-                                    &localToneBase_}) {
+                                    &localToneBase_, &fllfGaussian_, &fllfCorrection_}) {
             if (b->buffer != VK_NULL_HANDLE && b->allocation != nullptr) {
                 vmaDestroyBuffer(allocator_, b->buffer, b->allocation);
             }
@@ -194,8 +223,8 @@ bool VulkanSpectraResidentToneBackend::initializeLocked(
         failureReason = "RESIDENT_TONE_INITIALIZATION_INVALID";
         return false;
     }
-    VkDescriptorSetLayoutBinding bindings[11]{};
-    for (std::uint32_t i = 0u; i < 11u; ++i) {
+    VkDescriptorSetLayoutBinding bindings[13]{};
+    for (std::uint32_t i = 0u; i < 13u; ++i) {
         bindings[i].binding = i;
         bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         bindings[i].descriptorCount = 1u;
@@ -203,7 +232,7 @@ bool VulkanSpectraResidentToneBackend::initializeLocked(
     }
     VkDescriptorSetLayoutCreateInfo dsl{};
     dsl.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    dsl.bindingCount = 11u;
+    dsl.bindingCount = 13u;
     dsl.pBindings = bindings;
     if (vkCreateDescriptorSetLayout(device, &dsl, nullptr, &descriptorSetLayout_) != VK_SUCCESS) {
         failureReason = "vkCreateDescriptorSetLayout_resident_tone_failed";
@@ -245,7 +274,7 @@ bool VulkanSpectraResidentToneBackend::initializeLocked(
     }
     VkDescriptorPoolSize ps{};
     ps.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    ps.descriptorCount = 11u;
+    ps.descriptorCount = 13u;
     VkDescriptorPoolCreateInfo dpi{};
     dpi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     dpi.maxSets = 1u;
@@ -282,7 +311,7 @@ bool VulkanSpectraResidentToneBackend::initializeLocked(
     VkQueryPoolCreateInfo qi{};
     qi.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
     qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
-    qi.queryCount = 4u;
+    qi.queryCount = 8u;
     if (vkCreateQueryPool(device, &qi, nullptr, &queryPool_) != VK_SUCCESS) queryPool_ = VK_NULL_HANDLE;
     initialized_ = true;
     initializedDevice_ = device;
@@ -297,7 +326,7 @@ void VulkanSpectraResidentToneBackend::updateDescriptorsLocked(
     // Bind harmless already-valid buffers for optional Ultra HDR bindings until a gainmap is
     // actually requested. This keeps the shared scene/tone shader descriptor set valid without
     // allocating gainmap resources for ordinary captures.
-    VkDescriptorBufferInfo infos[11]{};
+    VkDescriptorBufferInfo infos[13]{};
     infos[0].buffer = inputOverride != VK_NULL_HANDLE ? inputOverride : workingRgb_.buffer;
     infos[1].buffer = workingRgb_.buffer;
     infos[2].buffer = compact_.buffer;
@@ -309,9 +338,11 @@ void VulkanSpectraResidentToneBackend::updateDescriptorsLocked(
     infos[8].buffer = portraitMask_.buffer != VK_NULL_HANDLE ? portraitMask_.buffer : compact_.buffer;
     infos[9].buffer = portraitBlurRgb_.buffer != VK_NULL_HANDLE ? portraitBlurRgb_.buffer : workingRgb_.buffer;
     infos[10].buffer = localToneBase_.buffer != VK_NULL_HANDLE ? localToneBase_.buffer : compact_.buffer;
+    infos[11].buffer = fllfGaussian_.buffer != VK_NULL_HANDLE ? fllfGaussian_.buffer : compact_.buffer;
+    infos[12].buffer = fllfCorrection_.buffer != VK_NULL_HANDLE ? fllfCorrection_.buffer : compact_.buffer;
     for (auto& info : infos) info.range = VK_WHOLE_SIZE;
-    VkWriteDescriptorSet writes[11]{};
-    for (std::uint32_t i = 0u; i < 11u; ++i) {
+    VkWriteDescriptorSet writes[13]{};
+    for (std::uint32_t i = 0u; i < 13u; ++i) {
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].dstSet = descriptorSet_;
         writes[i].dstBinding = i;
@@ -319,7 +350,7 @@ void VulkanSpectraResidentToneBackend::updateDescriptorsLocked(
         writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         writes[i].pBufferInfo = &infos[i];
     }
-    vkUpdateDescriptorSets(device, 11u, writes, 0u, nullptr);
+    vkUpdateDescriptorSets(device, 13u, writes, 0u, nullptr);
 }
 
 SpectraResidentSceneObserverResult VulkanSpectraResidentToneBackend::executeSceneObserverFromResident(
@@ -394,7 +425,8 @@ SpectraResidentSceneObserverResult VulkanSpectraResidentToneBackend::executeScen
     result.persistentResidentBytes = workingRgb_.capacityBytes + compact_.capacityBytes +
             toneLut_.capacityBytes + readback_.capacityBytes + telemetry_.capacityBytes +
             ultraHdrLuma_.capacityBytes + ultraHdrGainLog_.capacityBytes + ultraHdrGainmapPacked_.capacityBytes +
-            portraitMask_.capacityBytes + portraitBlurRgb_.capacityBytes + localToneBase_.capacityBytes;
+            portraitMask_.capacityBytes + portraitBlurRgb_.capacityBytes + localToneBase_.capacityBytes +
+            fllfGaussian_.capacityBytes + fllfCorrection_.capacityBytes;
     updateDescriptorsLocked(device, residentInputBuffer);
 
     vkResetFences(device, 1u, &fence_);
@@ -648,6 +680,11 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
             outputMapHeight * sizeof(std::uint32_t);
     const bool localToneRequested = request.localToneStrength > 1.0e-4f;
     result.localToneRequested = localToneRequested;
+    const bool fllfRequested = request.isRawBayer && request.fllfEnabled && request.fllfStrength > 1.0e-4f;
+    result.fllfRequested = fllfRequested;
+    const FllfPyramidLayout fllfLayout = buildFllfPyramidLayout(
+            request.frameWidth, request.frameHeight, request.fllfPyramidLevels);
+    const std::uint64_t fllfScalarBytes = fllfLayout.totalFloats * sizeof(float);
     result.ultraHdrGainmapRequested = request.ultraHdrGainmapRequested;
     if (request.ultraHdrGainmapRequested && !supportedRotation) {
         result.ultraHdrStatus = "UNSUPPORTED_OUTPUT_ROTATION";
@@ -663,7 +700,9 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
         (ultraHdrRequested && !ensureBufferLocked(allocator_, packedBytes, readAccess, ultraHdrGainmapPacked_, reallocated, failure)) ||
         (portraitRequested && !ensureBufferLocked(allocator_, portraitMaskPixels * sizeof(float), writeAccess, portraitMask_, reallocated, failure)) ||
         (portraitRequested && !ensureBufferLocked(allocator_, rgbBytes, 0u, portraitBlurRgb_, reallocated, failure)) ||
-        (localToneRequested && !ensureBufferLocked(allocator_, mapPixels * sizeof(float), 0u, localToneBase_, reallocated, failure))) {
+        (localToneRequested && !ensureBufferLocked(allocator_, mapPixels * sizeof(float), 0u, localToneBase_, reallocated, failure)) ||
+        (fllfRequested && (!ensureBufferLocked(allocator_, std::max<std::uint64_t>(fllfScalarBytes, 16u), 0u, fllfGaussian_, reallocated, failure) ||
+                           !ensureBufferLocked(allocator_, std::max<std::uint64_t>(fllfScalarBytes, 16u), 0u, fllfCorrection_, reallocated, failure)))) {
         result.status = "GPU_TONE_BUFFER_ALLOCATION_FAILED";
         result.failureReason = failure;
         result.totalMs = elapsedMs(totalStart);
@@ -675,7 +714,11 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
     result.persistentResidentBytes = workingRgb_.capacityBytes + compact_.capacityBytes +
             toneLut_.capacityBytes + readback_.capacityBytes + telemetry_.capacityBytes +
             ultraHdrLuma_.capacityBytes + ultraHdrGainLog_.capacityBytes + ultraHdrGainmapPacked_.capacityBytes +
-            portraitMask_.capacityBytes + portraitBlurRgb_.capacityBytes;
+            portraitMask_.capacityBytes + portraitBlurRgb_.capacityBytes + localToneBase_.capacityBytes +
+            fllfGaussian_.capacityBytes + fllfCorrection_.capacityBytes;
+    result.fllfResidentBytes = fllfRequested
+            ? fllfGaussian_.capacityBytes + fllfCorrection_.capacityBytes
+            : 0u;
     const auto uploadStart = Clock::now();
     std::memcpy(toneLut_.mapped, request.toneLut, kToneLutFloats * sizeof(float));
     vmaFlushAllocation(allocator_, toneLut_.allocation, 0u, kToneLutFloats * sizeof(float));
@@ -715,10 +758,10 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
     ready[1].size = kToneLutFloats * sizeof(float);
     vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr, 2u, ready, 0u, nullptr);
-    // Reset tone/gainmap/LTM telemetry while preserving scene-observer mode-0 tile count [0].
-    // Phase 9 retired the former highlight-recovery meaning of telemetry[0].
+    // Reset tone/gainmap/local-adaptation telemetry while preserving Phase-9 scene-observer
+    // tile count [0]. FLLF policy lives in [8..13], output evidence in [14..18].
     vkCmdFillBuffer(commandBuffer_, telemetry_.buffer, sizeof(std::uint32_t),
-                    7u * sizeof(std::uint32_t), 0u);
+                    19u * sizeof(std::uint32_t), 0u);
     if (localToneRequested) {
         const float ltmValues[4] = {
                 std::clamp(request.localToneStrength, 0.0f, 1.0f),
@@ -729,6 +772,19 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
         std::memcpy(ltmBits, ltmValues, sizeof(ltmBits));
         vkCmdUpdateBuffer(commandBuffer_, telemetry_.buffer,
                           3u * sizeof(std::uint32_t), sizeof(ltmBits), ltmBits);
+    }
+    if (fllfRequested) {
+        const float fllfValues[6] = {
+                std::clamp(request.fllfStrength, 0.0f, 0.55f),
+                std::clamp(request.fllfSceneKey, 0.10f, 0.20f),
+                std::clamp(request.fllfMaxLiftEv, 0.0f, 0.60f),
+                std::clamp(request.fllfMaxCompressEv, 0.0f, 0.70f),
+                std::clamp(request.fllfEdgeStopEv, 0.40f, 0.90f),
+                std::clamp(request.fllfRefinement, 0.0f, 0.22f)};
+        std::uint32_t fllfBits[6]{};
+        std::memcpy(fllfBits, fllfValues, sizeof(fllfBits));
+        vkCmdUpdateBuffer(commandBuffer_, telemetry_.buffer,
+                          8u * sizeof(std::uint32_t), sizeof(fllfBits), fllfBits);
     }
     VkBufferMemoryBarrier telemetryReady{};
     telemetryReady.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
@@ -770,6 +826,117 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
     push.portraitTargetTop = request.portraitTargetTop;
     push.portraitTargetRight = request.portraitTargetRight;
     push.portraitTargetBottom = request.portraitTargetBottom;
+
+    if (fllfRequested && fllfLayout.levelCount >= 2u) {
+        if (queryPool_ != VK_NULL_HANDLE) {
+            vkCmdResetQueryPool(commandBuffer_, queryPool_, 0u, 8u);
+            vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 0u);
+        }
+        const auto& level0 = fllfLayout.levels[0];
+        push.mode = 10u;
+        push.sampleStep = 0u;
+        push.sampleCount = level0.offset;
+        push.displayOffsetFloats = 0u;
+        push.presenceReserved0 = 0u;
+        push.ultraHdrSourceMapWidth = level0.width;
+        push.ultraHdrSourceMapHeight = level0.height;
+        vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0u, sizeof(push), &push);
+        vkCmdDispatch(commandBuffer_, (level0.width + 15u) / 16u, (level0.height + 15u) / 16u, 1u);
+        for (std::uint32_t level = 1u; level < fllfLayout.levelCount; ++level) {
+            VkBufferMemoryBarrier previousReady{};
+            previousReady.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            previousReady.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            previousReady.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            previousReady.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            previousReady.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            previousReady.buffer = fllfGaussian_.buffer;
+            previousReady.size = VK_WHOLE_SIZE;
+            vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u,
+                                 0u, nullptr, 1u, &previousReady, 0u, nullptr);
+            const auto& src = fllfLayout.levels[level - 1u];
+            const auto& dst = fllfLayout.levels[level];
+            push.mode = 11u;
+            push.sampleStep = src.offset;
+            push.sampleCount = dst.offset;
+            push.displayOffsetFloats = src.width;
+            push.presenceReserved0 = src.height;
+            push.ultraHdrSourceMapWidth = dst.width;
+            push.ultraHdrSourceMapHeight = dst.height;
+            vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0u, sizeof(push), &push);
+            vkCmdDispatch(commandBuffer_, (dst.width + 15u) / 16u, (dst.height + 15u) / 16u, 1u);
+        }
+        if (queryPool_ != VK_NULL_HANDLE) {
+            vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 1u);
+        }
+        push.sampleStep = 1u;
+        push.sampleCount = 0u;
+        push.displayOffsetFloats = 0u;
+        push.presenceReserved0 = 0u;
+        push.ultraHdrSourceMapWidth = sourceMapWidth;
+        push.ultraHdrSourceMapHeight = sourceMapHeight;
+
+        if (queryPool_ != VK_NULL_HANDLE) {
+            vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 2u);
+        }
+        // Seed local exposure on the coarsest still-spatial Gaussian level, then reconstruct the
+        // correction field toward level 0. Each finer level uses its Laplacian band as an edge
+        // stop, so broad exposure adaptation does not cross strong scene structure.
+        const auto& coarse = fllfLayout.levels[fllfLayout.levelCount - 1u];
+        push.mode = 12u;
+        push.sampleStep = coarse.offset;
+        push.sampleCount = coarse.offset;
+        push.displayOffsetFloats = coarse.width;
+        push.presenceReserved0 = coarse.height;
+        push.ultraHdrSourceMapWidth = coarse.width;
+        push.ultraHdrSourceMapHeight = coarse.height;
+        vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0u, sizeof(push), &push);
+        vkCmdDispatch(commandBuffer_, (coarse.width + 15u) / 16u, (coarse.height + 15u) / 16u, 1u);
+        for (std::uint32_t level = fllfLayout.levelCount - 1u; level > 0u; --level) {
+            VkBufferMemoryBarrier correctionReady{};
+            correctionReady.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            correctionReady.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            correctionReady.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            correctionReady.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            correctionReady.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            correctionReady.buffer = fllfCorrection_.buffer;
+            correctionReady.size = VK_WHOLE_SIZE;
+            vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u,
+                                 0u, nullptr, 1u, &correctionReady, 0u, nullptr);
+            const auto& src = fllfLayout.levels[level];
+            const auto& dst = fllfLayout.levels[level - 1u];
+            push.mode = 13u;
+            push.sampleStep = src.offset;
+            push.sampleCount = dst.offset;
+            push.displayOffsetFloats = src.width;
+            push.presenceReserved0 = src.height;
+            push.ultraHdrSourceMapWidth = dst.width;
+            push.ultraHdrSourceMapHeight = dst.height;
+            vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0u, sizeof(push), &push);
+            vkCmdDispatch(commandBuffer_, (dst.width + 15u) / 16u, (dst.height + 15u) / 16u, 1u);
+        }
+        VkBufferMemoryBarrier finalCorrectionReady{};
+        finalCorrectionReady.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        finalCorrectionReady.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        finalCorrectionReady.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        finalCorrectionReady.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        finalCorrectionReady.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        finalCorrectionReady.buffer = fllfCorrection_.buffer;
+        finalCorrectionReady.size = VK_WHOLE_SIZE;
+        vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u,
+                             0u, nullptr, 1u, &finalCorrectionReady, 0u, nullptr);
+        if (queryPool_ != VK_NULL_HANDLE) {
+            vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 3u);
+        }
+        push.sampleStep = 1u;
+        push.sampleCount = 0u;
+        push.displayOffsetFloats = 0u;
+        push.presenceReserved0 = 0u;
+        push.ultraHdrSourceMapWidth = sourceMapWidth;
+        push.ultraHdrSourceMapHeight = sourceMapHeight;
+    }
 
     if (portraitRequested) {
         // Pass 7 builds a mask-aware scene-linear background bokeh into a separate resident
@@ -856,16 +1023,20 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
     }
 
     if (queryPool_ != VK_NULL_HANDLE) {
-        vkCmdResetQueryPool(commandBuffer_, queryPool_, 0u, 4u);
-        vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 0u);
+        if (!fllfRequested) vkCmdResetQueryPool(commandBuffer_, queryPool_, 0u, 8u);
+        vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, fllfRequested ? 4u : 0u);
     }
+    // Phase 10 final invariant: in mode 3 this reused field is a boolean FLLF-active flag.
+    // It prevents the tone kernel from interpreting the compact fallback descriptor as a
+    // full FLLF correction pyramid when policy evidence did not request local processing.
+    push.presenceReserved0 = fllfRequested ? 1u : 0u;
     push.mode = 3u;
     vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
                        0u, sizeof(push), &push);
     vkCmdDispatch(commandBuffer_, (request.frameWidth + 15u) / 16u,
                    (request.frameHeight + 15u) / 16u, 1u);
     if (queryPool_ != VK_NULL_HANDLE) {
-        vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 1u);
+        vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, fllfRequested ? 5u : 1u);
     }
 
     if (ultraHdrRequested) {
@@ -983,12 +1154,20 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
     }
     result.synchronizationMs = elapsedMs(waitStart);
     if (queryPool_ != VK_NULL_HANDLE) {
-        std::uint64_t ts[2]{};
-        if (vkGetQueryPoolResults(device, queryPool_, 0u, 2u, sizeof(ts), ts, sizeof(std::uint64_t),
-                                  VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && ts[1] >= ts[0]) {
+        std::uint64_t ts[6]{};
+        const std::uint32_t count = fllfRequested ? 6u : 2u;
+        if (vkGetQueryPoolResults(device, queryPool_, 0u, count, sizeof(ts), ts, sizeof(std::uint64_t),
+                                  VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
             VkPhysicalDeviceProperties props{};
             vkGetPhysicalDeviceProperties(physicalDevice, &props);
-            result.kernelMs = static_cast<float>((ts[1] - ts[0]) * (static_cast<double>(props.limits.timestampPeriod) / 1.0e6));
+            const double ms = static_cast<double>(props.limits.timestampPeriod) / 1.0e6;
+            if (fllfRequested) {
+                if (ts[1] >= ts[0]) result.fllfPyramidBuildMs = static_cast<float>((ts[1] - ts[0]) * ms);
+                if (ts[3] >= ts[2]) result.fllfRemapReconstructMs = static_cast<float>((ts[3] - ts[2]) * ms);
+                if (ts[5] >= ts[4]) result.kernelMs = static_cast<float>((ts[5] - ts[4]) * ms);
+            } else if (ts[1] >= ts[0]) {
+                result.kernelMs = static_cast<float>((ts[1] - ts[0]) * ms);
+            }
         }
     }
     const auto readStart = Clock::now();
@@ -997,6 +1176,15 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
     result.highlightNeutralizeApplied = telemetry[1] > 0u;
     result.localToneAdjustedPixels = telemetry[7];
     result.localToneApplied = localToneRequested && result.localToneAdjustedPixels > 0u;
+    result.fllfAdjustedPixels = telemetry[14];
+    result.fllfEdgeProtectedSamples = telemetry[15];
+    const std::uint32_t fllfCorrectionSamples = telemetry[18];
+    result.fllfMeanAbsCorrectionEv = fllfCorrectionSamples > 0u
+            ? static_cast<float>(telemetry[16]) / (1024.0f * static_cast<float>(fllfCorrectionSamples))
+            : 0.0f;
+    std::uint32_t fllfMaxBits = telemetry[17];
+    std::memcpy(&result.fllfMaxAbsCorrectionEv, &fllfMaxBits, sizeof(float));
+    result.fllfApplied = fllfRequested && result.fllfAdjustedPixels > 0u;
     if (ultraHdrRequested) {
         constexpr float kMeaningfulGainLog2 = 0.111031312f; // log2(1.08)
         const float maxLog2Boost = static_cast<float>(telemetry[2]) / 65536.0f;

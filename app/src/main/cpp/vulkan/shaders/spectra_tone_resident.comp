@@ -13,6 +13,10 @@ layout(std430, binding = 7) buffer UltraHdrGainmapPacked { uint ultraHdrGainmapP
 layout(std430, binding = 8) readonly buffer PortraitMask { float portraitMask[]; };
 layout(std430, binding = 9) buffer PortraitBlurRgb { float portraitBlurRgb[]; };
 layout(std430, binding = 10) buffer LocalToneBase { float localToneBase[]; };
+// Phase 10 packed scalar FLLF pyramids. Level 0 is half-resolution; higher levels are
+// concatenated. No RGB pyramid and no CPU roundtrip are used.
+layout(std430, binding = 11) buffer FllfGaussian { float fllfGaussian[]; };
+layout(std430, binding = 12) buffer FllfCorrection { float fllfCorrection[]; };
 
 layout(push_constant) uniform Params {
     uint frameWidth;
@@ -95,30 +99,27 @@ float smoothstepFast(float edge0, float invRange, float value) {
 }
 
 vec3 compressToUnitGamutPreserveLuma(vec3 rgb) {
-    // Keep in-gamut values bit-for-bit. For out-of-gamut colors, reduce chroma around the current
-    // luminance instead of clipping R/G/B independently; independent channel clipping shifts hue.
-    vec3 nonNegative = max(rgb, vec3(0.0));
-    float originalY = max(0.0, lumaOf(nonNegative));
-    if (originalY > 1.0) {
-        nonNegative *= 1.0 / max(originalY, 1.0e-6);
+    // One final output-gamut owner. Work from the signed RGB vector so negative
+    // outset components are compressed toward the same luminance instead of being
+    // clipped independently (which rotates hue). In-gamut values remain untouched.
+    if (any(isnan(rgb)) || any(isinf(rgb))) return vec3(0.0);
+    float y = lumaOf(rgb);
+    if (!(y > 1.0e-8)) return vec3(0.0);
+    if (y > 1.0) {
+        rgb *= 1.0 / y;
+        y = 1.0;
     }
-
-    float y = clamp(lumaOf(nonNegative), 0.0, 1.0);
-    float maximum = max(nonNegative.r, max(nonNegative.g, nonNegative.b));
-    float minimum = min(nonNegative.r, min(nonNegative.g, nonNegative.b));
-    if (maximum <= 1.0 && minimum >= 0.0) return nonNegative;
+    float maximum = max(rgb.r, max(rgb.g, rgb.b));
+    float minimum = min(rgb.r, min(rgb.g, rgb.b));
+    if (maximum <= 1.0 && minimum >= 0.0) return rgb;
 
     float positiveDeviation = max(0.0, maximum - y);
     float negativeDeviation = max(0.0, y - minimum);
     float authority = 1.0;
-    if (positiveDeviation > 1.0e-6) {
-        authority = min(authority, (1.0 - y) / positiveDeviation);
-    }
-    if (negativeDeviation > 1.0e-6) {
-        authority = min(authority, y / negativeDeviation);
-    }
+    if (positiveDeviation > 1.0e-6) authority = min(authority, (1.0 - y) / positiveDeviation);
+    if (negativeDeviation > 1.0e-6) authority = min(authority, y / negativeDeviation);
     authority = clamp(authority, 0.0, 1.0);
-    return clamp(vec3(y) + (nonNegative - vec3(y)) * authority, vec3(0.0), vec3(1.0));
+    return clamp(vec3(y) + (rgb - vec3(y)) * authority, vec3(0.0), vec3(1.0));
 }
 
 float profileContrastCurve(float value, float signedControl) {
@@ -485,6 +486,155 @@ float telemetryFloat(uint index, float fallbackValue) {
     return (isnan(value) || isinf(value)) ? fallbackValue : value;
 }
 
+// PHASE 10 — FLLF packed Gaussian pyramid.
+// Mode-specific push aliases used only by modes 10/11:
+// sampleStep=sourceOffset, sampleCount=destinationOffset, displayOffsetFloats=sourceWidth,
+// presenceReserved0=sourceHeight, ultraHdrSourceMapWidth=destinationWidth,
+// ultraHdrSourceMapHeight=destinationHeight.
+uint fllfSourceOffset() { return pc.sampleStep; }
+uint fllfDestinationOffset() { return pc.sampleCount; }
+uint fllfSourceWidth() { return max(1u, pc.displayOffsetFloats); }
+uint fllfSourceHeight() { return max(1u, pc.presenceReserved0); }
+uint fllfDestinationWidth() { return max(1u, pc.ultraHdrSourceMapWidth); }
+uint fllfDestinationHeight() { return max(1u, pc.ultraHdrSourceMapHeight); }
+
+float fllfSceneLogLumaAt(int x, int y) {
+    vec3 rgb = workingAt(x, y) * pc.exposureGain;
+    return log2(max(1.0e-6, lumaOf(rgb)) + 0.0025);
+}
+
+void buildFllfGaussianLevel0(uvec2 gid) {
+    uint dstW = fllfDestinationWidth();
+    uint dstH = fllfDestinationHeight();
+    if (gid.x >= dstW || gid.y >= dstH) return;
+    int x0 = int(gid.x * 2u);
+    int y0 = int(gid.y * 2u);
+    float v = 0.25 * (
+            fllfSceneLogLumaAt(x0, y0) + fllfSceneLogLumaAt(x0 + 1, y0) +
+            fllfSceneLogLumaAt(x0, y0 + 1) + fllfSceneLogLumaAt(x0 + 1, y0 + 1));
+    fllfGaussian[fllfDestinationOffset() + gid.y * dstW + gid.x] = v;
+}
+
+float fllfGaussianAt(uint offset, uint width, uint height, int x, int y) {
+    int sx = clamp(x, 0, int(width) - 1);
+    int sy = clamp(y, 0, int(height) - 1);
+    return fllfGaussian[offset + uint(sy) * width + uint(sx)];
+}
+
+void buildFllfGaussianDownsample(uvec2 gid) {
+    uint srcW = fllfSourceWidth();
+    uint srcH = fllfSourceHeight();
+    uint dstW = fllfDestinationWidth();
+    uint dstH = fllfDestinationHeight();
+    if (gid.x >= dstW || gid.y >= dstH) return;
+    int cx = int(gid.x * 2u);
+    int cy = int(gid.y * 2u);
+    float sum = 0.0;
+    const float k[3] = float[3](1.0, 2.0, 1.0);
+    for (int j = -1; j <= 1; ++j) {
+        for (int i = -1; i <= 1; ++i) {
+            sum += k[i + 1] * k[j + 1] * fllfGaussianAt(
+                    fllfSourceOffset(), srcW, srcH, cx + i, cy + j);
+        }
+    }
+    fllfGaussian[fllfDestinationOffset() + gid.y * dstW + gid.x] = sum * (1.0 / 16.0);
+}
+
+float fllfParam(uint index, float fallbackValue) {
+    return telemetryFloat(index, fallbackValue);
+}
+
+float fllfCorrectionAt(uint offset, uint width, uint height, int x, int y) {
+    int sx = clamp(x, 0, int(width) - 1);
+    int sy = clamp(y, 0, int(height) - 1);
+    return fllfCorrection[offset + uint(sy) * width + uint(sx)];
+}
+
+float fllfBilinearGaussian(uint offset, uint width, uint height, vec2 p) {
+    ivec2 p0 = ivec2(floor(p));
+    vec2 f = fract(p);
+    float a = mix(fllfGaussianAt(offset, width, height, p0.x, p0.y),
+                  fllfGaussianAt(offset, width, height, p0.x + 1, p0.y), f.x);
+    float b = mix(fllfGaussianAt(offset, width, height, p0.x, p0.y + 1),
+                  fllfGaussianAt(offset, width, height, p0.x + 1, p0.y + 1), f.x);
+    return mix(a, b, f.y);
+}
+
+float fllfBilinearCorrection(uint offset, uint width, uint height, vec2 p) {
+    ivec2 p0 = ivec2(floor(p));
+    vec2 f = fract(p);
+    float a = mix(fllfCorrectionAt(offset, width, height, p0.x, p0.y),
+                  fllfCorrectionAt(offset, width, height, p0.x + 1, p0.y), f.x);
+    float b = mix(fllfCorrectionAt(offset, width, height, p0.x, p0.y + 1),
+                  fllfCorrectionAt(offset, width, height, p0.x + 1, p0.y + 1), f.x);
+    return mix(a, b, f.y);
+}
+
+float fllfRequestedCorrection(float localLogLuma) {
+    float strength = clamp(fllfParam(8u, 0.0), 0.0, 0.55);
+    float sceneKey = clamp(fllfParam(9u, 0.150), 0.10, 0.20);
+    float maxLiftEv = clamp(fllfParam(10u, 0.18), 0.0, 0.60);
+    float maxCompressEv = clamp(fllfParam(11u, 0.20), 0.0, 0.70);
+    float localLuma = max(1.0e-6, exp2(localLogLuma) - 0.0025);
+    float requested = clamp(log2(sceneKey / localLuma), -maxCompressEv, maxLiftEv);
+    float need = smoothstep(0.10, 0.46, abs(requested));
+    float deepBlackGuard = requested > 0.0 ? smoothstep(0.010, 0.050, localLuma) : 1.0;
+    return requested * strength * need * deepBlackGuard;
+}
+
+void seedFllfCoarseCorrection(uvec2 gid) {
+    uint w = fllfDestinationWidth();
+    uint h = fllfDestinationHeight();
+    if (gid.x >= w || gid.y >= h) return;
+    uint index = fllfDestinationOffset() + gid.y * w + gid.x;
+    fllfCorrection[index] = fllfRequestedCorrection(fllfGaussian[index]);
+}
+
+void reconstructFllfCorrectionLevel(uvec2 gid) {
+    uint srcW = fllfSourceWidth();
+    uint srcH = fllfSourceHeight();
+    uint dstW = fllfDestinationWidth();
+    uint dstH = fllfDestinationHeight();
+    if (gid.x >= dstW || gid.y >= dstH) return;
+    vec2 coarseP = (vec2(gid) + vec2(0.5)) * vec2(srcW, srcH) / vec2(dstW, dstH) - vec2(0.5);
+    float coarseLog = fllfBilinearGaussian(fllfSourceOffset(), srcW, srcH, coarseP);
+    float fineLog = fllfGaussian[fllfDestinationOffset() + gid.y * dstW + gid.x];
+    // fineLog - upsample(coarseLog) is the local Laplacian band. Strong bands stop the
+    // propagation of a broad exposure field, which preserves edge polarity and avoids halos.
+    float laplacianBand = fineLog - coarseLog;
+    float edgeStopEv = clamp(fllfParam(12u, 0.62), 0.40, 0.90);
+    float edge = smoothstep(0.62 * edgeStopEv, 1.28 * edgeStopEv, abs(laplacianBand));
+    float upCorrection = fllfBilinearCorrection(fllfSourceOffset(), srcW, srcH, coarseP);
+    float localRequested = fllfRequestedCorrection(fineLog);
+    float refinement = clamp(fllfParam(13u, 0.10), 0.0, 0.22);
+    float refineNeed = smoothstep(0.12, 0.55, abs(localRequested - upCorrection));
+    float correction = mix(upCorrection, localRequested, refinement * refineNeed * (1.0 - edge));
+    correction *= 1.0 - 0.84 * edge;
+    correction = clamp(correction, -fllfParam(11u, 0.20), fllfParam(10u, 0.18));
+    if (edge > 0.55 && abs(upCorrection) > 0.015) atomicAdd(telemetry[15], 1u);
+    fllfCorrection[fllfDestinationOffset() + gid.y * dstW + gid.x] = correction;
+}
+
+float sampleFllfFullResolutionCorrection(uvec2 gid) {
+    uint w = (pc.frameWidth + 1u) / 2u;
+    uint h = (pc.frameHeight + 1u) / 2u;
+    vec2 p = (vec2(gid) + vec2(0.5)) * 0.5 - vec2(0.5);
+    return fllfBilinearCorrection(0u, w, h, p);
+}
+
+vec3 applyFllfLocalExposure(uvec2 gid, vec3 sceneRgb) {
+    float correctionEv = sampleFllfFullResolutionCorrection(gid);
+    if (abs(correctionEv) > 0.006) atomicAdd(telemetry[14], 1u);
+    if (((gid.x & 3u) == 0u) && ((gid.y & 3u) == 0u)) {
+        atomicAdd(telemetry[16], uint(round(min(0.999, abs(correctionEv)) * 1024.0)));
+        atomicAdd(telemetry[18], 1u);
+    }
+    atomicMax(telemetry[17], floatBitsToUint(max(0.0, abs(correctionEv))));
+    // One scalar exposure factor is applied to RGB. Hue and neutral balance are therefore not
+    // independently remapped by the local stage.
+    return sceneRgb * exp2(correctionEv);
+}
+
 const vec2 kLocalToneDirections[12] = vec2[12](
     vec2(1.0, 0.0), vec2(-1.0, 0.0), vec2(0.0, 1.0), vec2(0.0, -1.0),
     vec2(0.7071, 0.7071), vec2(-0.7071, 0.7071), vec2(0.7071, -0.7071), vec2(-0.7071, -0.7071),
@@ -593,8 +743,11 @@ vec3 agxDefaultContrastApprox(vec3 x) {
 }
 
 vec3 applyAgXTonemap(vec3 colorLinear) {
-    const float min_ev = -10.0;
-    const float max_ev = +6.5;
+    // AgX allocation bounds are absolute log2(linear BT.709) values.
+    // The published -10/+6.5 EV span is relative to 18% middle grey, so
+    // log2(0.18) must be included in the actual shader-domain bounds.
+    const float min_ev = -12.47393;
+    const float max_ev = +4.026069;
 
     // 1. Inset matrix: rotate linear sRGB into wide-gamut AgX working space
     vec3 val = AGX_INSET_MATRIX * max(colorLinear, vec3(1.0e-6));
@@ -606,30 +759,18 @@ vec3 applyAgXTonemap(vec3 colorLinear) {
     // 3. Sigmoid contrast curve (polynomial approximation)
     val = clamp(agxDefaultContrastApprox(val), vec3(0.0), vec3(1.0));
 
-    // 4. Outset matrix: convert back to linear display space
-    val = max(vec3(0.0), AGX_OUTSET_MATRIX * val);
-
-    // 5. AgX Balanced Black Anchor & Soft Toe:
-    // Mild pedestal subtraction (~0.005) and gentle 1.08 toe to anchor true black without crushing shadow details.
-    const float kAgxBlackPedestal = 0.005;
-    val = max(vec3(0.0), (val - vec3(kAgxBlackPedestal)) / (1.0 - kAgxBlackPedestal));
-    val = pow(val, vec3(1.08));
-
-    // 6. AgX Photographic Chroma / Saturation Restoration:
-    // AgX DRT compresses chromaticity across dynamic range to avoid clipping and hue skew.
-    // Restore natural photographic chromaticity in midtones while preserving smooth highlight rolloff.
-    float y = max(1.0e-6, lumaOf(val));
-    float maxC = max(val.r, max(val.g, val.b));
-    float minC = min(val.r, min(val.g, val.b));
-    float relChroma = (maxC - minC) / max(maxC, 0.02);
-    float shadowGate = smoothstep(0.015, 0.12, y);
-    float highlightGate = 1.0 - smoothstep(0.72, 0.96, y);
-    // Keep only a small compensation for AgX's intentional chroma compression. The previous
-    // +38% restoration stacked with RAW base vibrance and visibly re-amplified chroma clouds.
-    float satBoost = 1.0 + 0.14 * shadowGate * highlightGate *
-            (1.0 - 0.25 * smoothstep(0.30, 0.80, relChroma));
-    val = max(vec3(0.0), vec3(y) + (val - vec3(y)) * satBoost);
-
+    // 4. Outset matrix: convert back to linear display space.
+    // Phase 10 freezes the existing AgX inset/log/sigmoid/outset math and removes two BnCam
+    // compensations that had been embedded *after* the DRT: a second black toe and an automatic
+    // saturation restoration. Those were competing display-look owners, not AgX core.
+    // Preserve signed display-linear RGB through the outset. A single luma-preserving
+    // output-gamut owner runs after the explicit profile look; clipping here would
+    // independently destroy hue in saturated colours.
+    val = AGX_OUTSET_MATRIX * val;
+    // AgX sigmoid/outset is still in the display-encoded 2.2 reference domain.
+    // Linearize before BnCam's display-linear profile/gamut stages and before the final sRGB OETF.
+    // Use an odd/signed extension so small outset excursions survive to the single final gamut owner.
+    val = sign(val) * pow(abs(val), vec3(2.2));
     return val;
 }
 
@@ -646,7 +787,10 @@ vec3 applyToneLookLut(vec3 rgb) {
     // Entry +1 is retained for capture diagnostics/legacy YUV use. RAW output uses the same
     // luminance LUT that IspCore built from black/contrast/range controls + user curves.
     float scale = curvedLuma / inputLuma;
-    return compressToUnitGamutPreserveLuma(rgb * scale);
+    // Phase 10: do not perform output-gamut compression inside the tone-look stage.
+    // applyProfileColor() is the single final display-gamut owner after optional explicit
+    // profile color controls, avoiding two consecutive output-gamut compressions.
+    return rgb * scale;
 }
 
 // Phase 9: the former RAW post-tone magenta/near-white neutralizer was removed from
@@ -659,15 +803,22 @@ void runTone(uvec2 gid) {
     uint base = (gid.y * pc.frameWidth + gid.x) * 3u;
     vec3 rgb = vec3(workingRgb[base + 0u], workingRgb[base + 1u], workingRgb[base + 2u]);
     rgb *= pc.exposureGain;
-    rgb = applyLocalTone(gid, rgb);
     if (pc.isRawBayer != 0u) {
-        // Scene-linear RAW Bayer path: AgX owns scene-to-display compression. The display-linear
-        // look LUT then owns automatic black/contrast/lower-mid shaping plus every profile tone
-        // range/curve. Previously this LUT was silently skipped whenever the RAW AgX path won.
+        // In tone mode presenceReserved0 is the explicit FLLF-active bit. FLLF pyramid
+        // construction modes reuse the same slot for sourceHeight, but their dispatches are
+        // complete before this mode-3 push. Never sample binding 12 when the policy disabled FLLF.
+        if (pc.presenceReserved0 != 0u) rgb = applyFllfLocalExposure(gid, rgb);
+        // Scene-linear RAW Bayer path: AgX is the sole automatic scene-to-display DRT.
+        // The following display-linear LUT is automatically identity in RAW Phase 10 and exists
+        // only for explicit profile tonal ranges/curves.
         rgb = applyAgXTonemap(rgb);
+        // The LUT is identity for automatic RAW rendering in Phase 10; only explicit profile
+        // tonal ranges/curves remain. Profile color is explicit user look intent, not automatic
+        // compensation. Final unit-gamut placement is performed by applyProfileColor.
         rgb = applyToneLookLut(rgb);
         rgb = applyProfileColor(rgb);
     } else {
+        rgb = applyLocalTone(gid, rgb);
         // YUV capture path (already ISP-tonemapped by HAL)
         float preShoulderY = max(1.0e-6, lumaOf(rgb));
         float maxRGB = max(rgb.r, max(rgb.g, rgb.b));
@@ -942,5 +1093,13 @@ void main() {
         compositePortrait(gid);
     } else if (pc.mode == 9u) {
         buildLocalToneBase(gid);
+    } else if (pc.mode == 10u) {
+        buildFllfGaussianLevel0(gid);
+    } else if (pc.mode == 11u) {
+        buildFllfGaussianDownsample(gid);
+    } else if (pc.mode == 12u) {
+        seedFllfCoarseCorrection(gid);
+    } else if (pc.mode == 13u) {
+        reconstructFllfCorrectionLevel(gid);
     }
 }

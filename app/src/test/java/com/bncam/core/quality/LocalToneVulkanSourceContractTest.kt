@@ -13,43 +13,44 @@ class LocalToneVulkanSourceContractTest {
     private fun source(relative: String): String = File(appDir, relative).readText()
 
     @Test
-    fun `local tone is planned from scene dynamic range and noise pressure`() {
-        val policy = source("src/main/cpp/LocalTonePolicy.h")
+    fun `raw local adaptation is planned by phase10 FLLF from scene evidence`() {
+        val policy = source("src/main/cpp/FastLocalLaplacianPolicy.h")
         val core = source("src/main/cpp/IspCore.cpp")
 
         assertTrue(policy.contains("dynamicRangePressure"))
         assertTrue(policy.contains("recoverableHighlightPressure"))
+        assertTrue(policy.contains("sensorClipPressure"))
         assertTrue(policy.contains("noisePressure"))
-        assertTrue(policy.contains("strength *= 1.0f - 0.45f * noise"))
-        assertTrue(core.contains("resolveLocalTonePlan"))
-        assertTrue(core.contains("request.localToneStrength = localTonePlan.enabled"))
-        assertTrue(core.contains("localToneBackend="))
-        assertTrue(policy.contains("std::clamp(input.sceneMidtoneTarget, 0.145f, 0.185f)"))
-        assertTrue(shaderOrCoreSceneKeyContract())
+        assertTrue(policy.contains("out.maxLiftEv"))
+        assertTrue(policy.contains("out.maxCompressEv"))
+        assertTrue(policy.contains("out.edgeStopEv"))
+        assertTrue(core.contains("resolveFastLocalLaplacianPlan"))
+        assertTrue(core.contains("request.fllfEnabled = fllfPlan.enabled"))
+        assertTrue(core.contains("request.localToneStrength = !phase10RawToneArchitecture"))
+        assertTrue(core.contains("phase10ToneArchitecture="))
     }
 
-    private fun shaderOrCoreSceneKeyContract(): Boolean =
-        source("src/main/cpp/vulkan/shaders/spectra_tone_resident.comp")
-            .contains("telemetryFloat(4u, 0.155)")
-
     @Test
-    fun `local tone spatial work stays Vulkan resident and edge aware`() {
+    fun `raw FLLF is resident pyramid based while legacy LTM is YUV only`() {
         val shader = source("src/main/cpp/vulkan/shaders/spectra_tone_resident.comp")
         val backend = source("src/main/cpp/vulkan/VulkanSpectraResidentToneBackend.cpp")
         val header = source("src/main/cpp/vulkan/VulkanSpectraResidentToneBackend.h")
 
-        assertTrue(shader.contains("binding = 10"))
-        assertTrue(shader.contains("buildLocalToneBase"))
-        assertTrue(shader.contains("rangeWeight = exp(-1.55 * abs(neighborLog - centerLog))"))
-        assertTrue(shader.contains("rgb = applyLocalTone(gid, rgb)"))
-        assertTrue(shader.contains("positiveHighlightGuard"))
-        assertTrue(shader.contains("deepBlackGuard"))
-        assertTrue(backend.contains("push.mode = 9u"))
-        assertTrue(backend.contains("localToneBase_.buffer"))
-        assertTrue(header.contains("PersistentBuffer localToneBase_"))
-        assertFalse(coreOrBackendContainsCpuLtm(backend))
+        assertTrue(shader.contains("binding = 11"))
+        assertTrue(shader.contains("binding = 12"))
+        assertTrue(shader.contains("buildFllfGaussianLevel0"))
+        assertTrue(shader.contains("buildFllfGaussianNextLevel"))
+        assertTrue(shader.contains("seedFllfCorrection"))
+        assertTrue(shader.contains("reconstructFllfCorrection"))
+        assertTrue(shader.contains("if (pc.presenceReserved0 != 0u) rgb = applyFllfLocalExposure"))
+        assertTrue(shader.contains("else {\n        rgb = applyLocalTone(gid, rgb);"))
+        assertTrue(backend.contains("push.mode = 10u"))
+        assertTrue(backend.contains("push.mode = 11u"))
+        assertTrue(backend.contains("push.mode = 12u"))
+        assertTrue(backend.contains("push.mode = 13u"))
+        assertTrue(header.contains("PersistentBuffer fllfGaussian_"))
+        assertTrue(header.contains("PersistentBuffer fllfCorrection_"))
+        assertFalse(backend.contains("CPU_FLLF"))
+        assertFalse(backend.contains("fllfCpu"))
     }
-
-    private fun coreOrBackendContainsCpuLtm(backend: String): Boolean =
-        backend.contains("localToneCpu") || backend.contains("CPU_LOCAL_TONE")
 }

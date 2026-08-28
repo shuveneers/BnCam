@@ -42,8 +42,8 @@ vec3 agxDefaultContrastApprox(vec3 x) {
 }
 
 vec3 applyAgXTonemap(vec3 colorLinear) {
-    const float min_ev = -10.0;
-    const float max_ev = +6.5;
+    const float min_ev = -12.47393;
+    const float max_ev = +4.026069;
 
     // 1. Inset matrix: rotate linear sRGB into wide-gamut AgX working space
     vec3 val = AGX_INSET_MATRIX * max(colorLinear, vec3(1.0e-6));
@@ -56,9 +56,25 @@ vec3 applyAgXTonemap(vec3 colorLinear) {
     val = clamp(agxDefaultContrastApprox(val), vec3(0.0), vec3(1.0));
 
     // 4. Outset matrix: convert back to linear display space
-    val = max(vec3(0.0), AGX_OUTSET_MATRIX * val);
+    val = AGX_OUTSET_MATRIX * val;
+    // AgX's base sigmoid is a 2.2 display encoding. Convert it back to display-linear
+    // before later display-linear profile/gamut work and before the final sRGB OETF.
+    val = sign(val) * pow(abs(val), vec3(2.2));
 
     return val;
+}
+
+vec3 compressToUnitGamutPreserveLuma(vec3 rgb) {
+    float y = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+    if (!(y > 1.0e-8)) return vec3(0.0);
+    if (y > 1.0) { rgb /= y; y = 1.0; }
+    float mx = max(rgb.r, max(rgb.g, rgb.b));
+    float mn = min(rgb.r, min(rgb.g, rgb.b));
+    if (mx <= 1.0 && mn >= 0.0) return rgb;
+    float authority = 1.0;
+    if (mx > y + 1.0e-6) authority = min(authority, (1.0 - y) / (mx - y));
+    if (mn < y - 1.0e-6) authority = min(authority, y / (y - mn));
+    return clamp(vec3(y) + (rgb - vec3(y)) * clamp(authority, 0.0, 1.0), vec3(0.0), vec3(1.0));
 }
 
 float linearToSrgb(float c) {
@@ -78,7 +94,7 @@ void main() {
     vec3 linearRgb = inputPixels[pixelIdx].rgb * pc.exposureGain;
 
     // Apply AgX Display Rendering Transform in scene-linear domain
-    vec3 toneMappedLinear = applyAgXTonemap(linearRgb);
+    vec3 toneMappedLinear = compressToUnitGamutPreserveLuma(applyAgXTonemap(linearRgb));
 
     // sRGB Gamma transfer curve
     vec3 finalRgb = vec3(

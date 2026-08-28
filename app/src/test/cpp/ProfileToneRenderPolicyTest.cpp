@@ -53,7 +53,8 @@ int main() {
     const auto range = resolveProfileToneRenderPlan(rangeInput);
     assert(range.shadowRangeDelta > 0.0f);
     assert(range.whiteRangeDelta < 0.0f);
-    assert(range.blackAnchorDelta < 0.0f);
+    assert(near(range.blackAnchorDelta, 0.0f));
+    assert(range.blackRangeDelta > 0.0f);
     assert(range.contrastDelta > 0.0f);
     assert(range.localToneStrengthScale > 1.0f);
     assert(range.localToneLiftScale > 1.0f);
@@ -62,20 +63,23 @@ int main() {
     for (float shadows : {-1.0f, 0.0f, 1.0f}) {
         for (float highlights : {-1.0f, 0.0f, 1.0f}) {
             for (float whites : {-1.0f, 0.0f, 1.0f}) {
-                ProfileToneRenderInput tonal{};
-                tonal.shadows = shadows;
-                tonal.highlights = highlights;
-                tonal.whites = whites;
-                const auto plan = resolveProfileToneRenderPlan(tonal);
-                float previous = applyProfileTonalRanges(0.0f, plan);
-                assert(near(previous, 0.0f));
-                for (int i = 1; i <= 4096; ++i) {
-                    const float x = static_cast<float>(i) / 4096.0f;
-                    const float y = applyProfileTonalRanges(x, plan);
-                    assert(y + 1.0e-5f >= previous);
-                    previous = y;
+                for (float blacks : {-1.0f, 0.0f, 1.0f}) {
+                    ProfileToneRenderInput tonal{};
+                    tonal.shadows = shadows;
+                    tonal.highlights = highlights;
+                    tonal.whites = whites;
+                    tonal.blacks = blacks;
+                    const auto plan = resolveProfileToneRenderPlan(tonal);
+                    float previous = applyProfileTonalRanges(0.0f, plan);
+                    assert(near(previous, 0.0f));
+                    for (int i = 1; i <= 4096; ++i) {
+                        const float x = static_cast<float>(i) / 4096.0f;
+                        const float y = applyProfileTonalRanges(x, plan);
+                        assert(y + 1.0e-5f >= previous);
+                        previous = y;
+                    }
+                    assert(near(applyProfileTonalRanges(1.0f, plan), 1.0f));
                 }
-                assert(near(applyProfileTonalRanges(1.0f, plan), 1.0f));
             }
         }
     }

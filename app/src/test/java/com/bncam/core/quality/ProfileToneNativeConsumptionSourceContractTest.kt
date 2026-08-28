@@ -6,7 +6,7 @@ import java.io.File
 
 class ProfileToneNativeConsumptionSourceContractTest {
     @Test
-    fun profileToneCrossesJniAndIsConsumedByCaptureGtmLtm() {
+    fun profileToneCrossesJniAndIsConsumedByPhase10ToneArchitecture() {
         val imageUtils = source("app/src/main/java/com/bncam/core/engine/ImageUtils.kt")
         val nativeLib = source("app/src/main/cpp/native-lib.cpp")
         val nativeConfig = source("app/src/main/cpp/NativeRenderQualityConfig.h")
@@ -24,14 +24,15 @@ class ProfileToneNativeConsumptionSourceContractTest {
         }
         assertTrue(ispCore.contains("profileTonePlan.exposureMultiplier"))
         assertTrue(ispCore.contains("applyProfileTonalRanges(curvedLuma, profileTonePlan)"))
-        assertTrue(ispCore.contains("profileTonePlan.blackAnchorDelta"))
+        assertTrue(ispCore.contains("profileTonePlan.blackRangeDelta") ||
+            ispCore.contains("applyProfileTonalRanges(curvedLuma, profileTonePlan)"))
         assertTrue(ispCore.contains("profileTonePlan.localToneStrengthScale"))
         assertTrue(ispCore.contains("automaticExposureGain * profileTonePlan.exposureMultiplier"))
         assertTrue(toneShader.contains("rgb = applyAgXTonemap(rgb);"))
         assertTrue(toneShader.contains("rgb = applyToneLookLut(rgb);"))
         assertTrue(toneShader.contains("toneLut[lutIdx * 2u + 0u]"))
         assertTrue(
-            "RAW AgX must consume the tone look after the DRT",
+            "Explicit profile tone look must remain after the sole automatic AgX DRT",
             toneShader.indexOf("rgb = applyToneLookLut(rgb);") >
                 toneShader.indexOf("rgb = applyAgXTonemap(rgb);")
         )

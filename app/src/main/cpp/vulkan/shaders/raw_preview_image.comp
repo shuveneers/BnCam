@@ -393,12 +393,25 @@ float previewProfileLumaDetail(int x, int y) {
     return clamp(combined * baseAmount * maskingGate * tonalGate, -maxOvershoot, maxOvershoot);
 }
 
+vec3 protectPreviewSignedLowerGamut(vec3 rgb) {
+    if (any(isnan(rgb)) || any(isinf(rgb))) return vec3(0.0);
+    float minimum = min(rgb.r, min(rgb.g, rgb.b));
+    if (minimum >= -1.0e-6) return rgb;
+    float y = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+    if (!(y > 1.0e-7)) return vec3(0.0);
+    float chromaScale = clamp(y / max(y - minimum, 1.0e-8), 0.0, 1.0);
+    return max(vec3(0.0), vec3(y) + (rgb - vec3(y)) * chromaScale);
+}
+
 vec3 colorTransform(vec3 raw) {
     vec3 wb = raw * vec3(pc.wbR, pc.wbG, pc.wbB);
-    return max(vec3(0.0), vec3(
+    vec3 signedCcm = vec3(
             pc.ccm0 * wb.r + pc.ccm1 * wb.g + pc.ccm2 * wb.b,
             pc.ccm3 * wb.r + pc.ccm4 * wb.g + pc.ccm5 * wb.b,
-            pc.ccm6 * wb.r + pc.ccm7 * wb.g + pc.ccm8 * wb.b));
+            pc.ccm6 * wb.r + pc.ccm7 * wb.g + pc.ccm8 * wb.b);
+    // Match the Phase-9 capture contract: preserve luma and chromatic direction when
+    // a signed CCM component falls below zero; never clamp channels independently.
+    return protectPreviewSignedLowerGamut(signedCcm);
 }
 
 float tone(float value) {
@@ -435,25 +448,27 @@ vec3 resolvePreviewLocalTonePolicy(
         float recoverableHighlightPressure,
         float sensorClipPressure,
         bool lowLight) {
+    // Phase 10 preview proxy uses the same scene-evidence policy as capture FLLF. The preview
+    // keeps a single resident scale for 60-fps cost bounds, but it must not invent different
+    // global tone ownership or demosaic/sensor-specific heuristics.
     float isoNoiseProxy = smoothstep(800.0, 3200.0, max(0.0, pc.captureIso));
     float exposureNoiseProxy = smoothstep(28.0, 90.0, max(0.0, pc.captureExposureMs));
     float noiseProxy = clamp(max(isoNoiseProxy, 0.70 * exposureNoiseProxy), 0.0, 1.0);
     float shadow = clamp(shadowPressure, 0.0, 1.0);
     float dynamicRange = clamp(dynamicRangePressure, 0.0, 1.0);
     float highlight = clamp(max(recoverableHighlightPressure, 0.72 * sensorClipPressure), 0.0, 1.0);
-    float highDrAuthority = dynamicRange * (0.65 + 0.35 * highlight);
-    float strength = 0.06 + 0.28 * highDrAuthority + 0.05 * shadow * highlight;
-    if (lowLight) strength *= 1.0 - 0.50 * noiseProxy;
-    strength = clamp(strength, 0.04, 0.42);
+    float highDrAuthority = clamp(dynamicRange * (0.62 + 0.38 * highlight), 0.0, 1.0);
+    float strength = clamp(0.055 + 0.30 * highDrAuthority + 0.045 * shadow * highlight, 0.045, 0.40);
+    if (lowLight) strength *= 1.0 - 0.38 * noiseProxy;
 
-    float maxLiftEv = 0.16 + 0.38 * dynamicRange + 0.06 * shadow;
-    if (lowLight) maxLiftEv *= 1.0 - 0.72 * noiseProxy;
-    maxLiftEv = clamp(maxLiftEv, 0.05, 0.62);
-    float maxCompressEv = clamp(0.10 + 0.24 * highlight + 0.06 * dynamicRange, 0.10, 0.36);
+    float maxLiftEv = 0.10 + 0.34 * dynamicRange + 0.05 * shadow;
+    maxLiftEv *= lowLight ? (1.0 - 0.82 * noiseProxy) : (1.0 - 0.30 * noiseProxy);
+    maxLiftEv = clamp(maxLiftEv, 0.035, 0.46);
+    float maxCompressEv = clamp(0.12 + 0.34 * highlight + 0.10 * dynamicRange, 0.10, 0.56);
 
     float localToneBias = clamp(uintBitsToFloat(statsBuffer[PROFILE_LOCAL_TONE_BIAS_INDEX]), -1.0, 1.0);
     strength = clamp(strength * exp2(0.75 * localToneBias), 0.02, 0.90);
-    maxLiftEv = clamp(maxLiftEv * exp2(0.45 * localToneBias), 0.10, 1.20);
+    maxLiftEv = clamp(maxLiftEv * exp2(0.45 * localToneBias), 0.035, 0.62);
     maxCompressEv = clamp(maxCompressEv * exp2(0.30 * localToneBias), 0.08, 0.70);
     return vec3(strength, maxLiftEv, maxCompressEv);
 }
@@ -472,10 +487,9 @@ void exposurePass() {
         statsBuffer[GTM_MIDTONE_TARGET_INDEX] = floatBitsToUint(0.150);
         statsBuffer[GTM_SHOULDER_START_INDEX] = floatBitsToUint(0.72);
         statsBuffer[GTM_SHOULDER_STRENGTH_INDEX] = floatBitsToUint(0.90);
-        float profileBlacks = clamp(uintBitsToFloat(statsBuffer[PROFILE_TONE_BLACKS_INDEX]), -1.0, 1.0);
-        statsBuffer[GTM_BLACK_ANCHOR_INDEX] = floatBitsToUint(clamp(0.0065 - 0.0040 * profileBlacks, 0.0, 0.08));
+        statsBuffer[GTM_BLACK_ANCHOR_INDEX] = floatBitsToUint(0.0);
         statsBuffer[GTM_LOWER_MID_LIFT_INDEX] = floatBitsToUint(0.0);
-        statsBuffer[GTM_CONTRAST_STRENGTH_INDEX] = floatBitsToUint(0.10);
+        statsBuffer[GTM_CONTRAST_STRENGTH_INDEX] = floatBitsToUint(0.0);
         statsBuffer[GTM_DYNAMIC_RANGE_PRESSURE_INDEX] = floatBitsToUint(0.0);
         vec3 localTonePolicy = resolvePreviewLocalTonePolicy(0.0, 0.0, 0.0, 0.0, false);
         statsBuffer[LTM_STRENGTH_INDEX] = floatBitsToUint(localTonePolicy.x);
@@ -538,23 +552,17 @@ void exposurePass() {
     float dynamicRangePressure = clamp(
             shadowPressure * max(highlightPressure, 0.72 * strongHighlightEvidence), 0.0, 1.0);
 
-    float automaticBlackAnchor = clamp(
-            0.0065 - 0.0035 * dynamicRangePressure -
-            0.0010 * (lowLight ? shadowPressure : 0.0), 0.0025, 0.0080);
-    float profileBlacks = clamp(uintBitsToFloat(statsBuffer[PROFILE_TONE_BLACKS_INDEX]), -1.0, 1.0);
-    float effectiveBlackAnchor = clamp(automaticBlackAnchor - 0.0040 * profileBlacks, 0.0, 0.08);
+    // Phase 10 preview GTM owns scene placement only. Automatic black/toe/contrast/lower-mid
+    // display shaping is retired here exactly as in capture; explicit profile tone remains later.
+    float effectiveBlackAnchor = 0.0;
     float shadowTargetLift = dynamicRangePressure > 0.10 ? 0.006 * dynamicRangePressure : 0.0;
     float highDrTargetLift = 0.004 * dynamicRangePressure;
     float lowLightTargetReduction = lowLight ? 0.018 * (1.0 - dynamicRangePressure) : 0.0;
     float midtoneTarget = clamp(
             0.150 + shadowTargetLift + highDrTargetLift - lowLightTargetReduction,
             0.130, 0.162);
-    float lowLightOnlyLift = (lowLight && dynamicRangePressure > 0.15)
-            ? 0.008 * shadowPressure * (1.0 - 0.55 * highlightPressure) : 0.0;
-    float lowerMidLift = clamp(lowLightOnlyLift + 0.025 * dynamicRangePressure, 0.0, 0.035);
-    float profileToneContrast = clamp(uintBitsToFloat(statsBuffer[PROFILE_TONE_CONTRAST_INDEX]), -1.0, 1.0);
-    float contrastStrength = clamp(
-            0.105 - 0.042 * dynamicRangePressure + 0.090 * profileToneContrast, -0.08, 0.22);
+    float lowerMidLift = 0.0;
+    float contrastStrength = 0.0;
     // Profile Highlights is carried by ToneLut with Shadows/Whites. Shoulder statistics remain
     // automatic scene telemetry only and are not a second user-control path.
     float shoulderStart = clamp(
@@ -628,16 +636,8 @@ vec3 applyProfile(vec3 rgb) {
         rgb *= y > 0.000001 ? mapped / y : 1.0;
         y = mapped;
     }
-    // Small sensor base-vibrance compensation only. AgX already includes a bounded chroma
-    // restoration; the former ~1.38 baseline stacked both and amplified residual colour noise.
-    float isoNoise = smoothstep(100.0, 1600.0, max(0.0, pc.captureIso));
-    float baseVibrance = mix(1.16, 1.10, isoNoise);
-    float maxChan = max(rgb.r, max(rgb.g, rgb.b));
-    float minChan = min(rgb.r, min(rgb.g, rgb.b));
-    float sat = (maxChan - minChan) / max(1.0e-4, maxChan);
-    float prot = clamp(1.0 - sat, 0.0, 1.0);
-    float baseAuthority = (baseVibrance - 1.0) * (0.25 + 0.75 * prot);
-    rgb = vec3(y) + (rgb - vec3(y)) * (1.0 + baseAuthority);
+    // Phase 10: no automatic post-AgX preview vibrance compensation. Explicit profile
+    // Vibrance/Saturation below remain user-owned creative controls.
 
     float vibranceControl = clamp(pc.profileVibrance, -1.0, 1.0);
     if (abs(vibranceControl) >= 0.0001) {
@@ -653,7 +653,23 @@ vec3 applyProfile(vec3 rgb) {
     if (abs(pc.profileSaturation) >= 0.0001) {
         rgb = vec3(y) + (rgb - vec3(y)) * exp2(clamp(pc.profileSaturation, -1.0, 1.0) * 0.85);
     }
-    return clamp(rgb, vec3(0.0), vec3(1.0));
+    return rgb;
+}
+
+vec3 compressPreviewToUnitGamutPreserveLuma(vec3 rgb) {
+    if (any(isnan(rgb)) || any(isinf(rgb))) return vec3(0.0);
+    float y = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+    if (!(y > 1.0e-8)) return vec3(0.0);
+    if (y > 1.0) { rgb /= y; y = 1.0; }
+    float mx = max(rgb.r, max(rgb.g, rgb.b));
+    float mn = min(rgb.r, min(rgb.g, rgb.b));
+    if (mx <= 1.0 && mn >= 0.0) return rgb;
+    float positive = max(0.0, mx - y);
+    float negative = max(0.0, y - mn);
+    float authority = 1.0;
+    if (positive > 1.0e-6) authority = min(authority, (1.0 - y) / positive);
+    if (negative > 1.0e-6) authority = min(authority, y / negative);
+    return clamp(vec3(y) + (rgb - vec3(y)) * clamp(authority, 0.0, 1.0), vec3(0.0), vec3(1.0));
 }
 
 vec3 srgb(vec3 linear) {
@@ -738,8 +754,11 @@ vec3 agxDefaultContrastApprox(vec3 x) {
 }
 
 vec3 applyAgXTonemap(vec3 colorLinear) {
-    const float min_ev = -10.0;
-    const float max_ev = +6.5;
+    // AgX allocation bounds are absolute log2(linear BT.709) values.
+    // The published -10/+6.5 EV span is relative to 18% middle grey, so
+    // log2(0.18) must be included in the actual shader-domain bounds.
+    const float min_ev = -12.47393;
+    const float max_ev = +4.026069;
 
     // 1. Inset matrix: rotate linear sRGB into wide-gamut AgX working space
     vec3 val = AGX_INSET_MATRIX * max(colorLinear, vec3(1.0e-6));
@@ -752,26 +771,17 @@ vec3 applyAgXTonemap(vec3 colorLinear) {
     val = clamp(agxDefaultContrastApprox(val), vec3(0.0), vec3(1.0));
 
     // 4. Outset matrix: convert back to linear display space
-    val = max(vec3(0.0), AGX_OUTSET_MATRIX * val);
+    // Preserve signed display-linear RGB through the outset. A single luma-preserving
+    // output-gamut owner runs after the explicit profile look; clipping here would
+    // independently destroy hue in saturated colours.
+    val = AGX_OUTSET_MATRIX * val;
+    // AgX sigmoid/outset is still in the display-encoded 2.2 reference domain.
+    // Linearize before BnCam's display-linear profile/gamut stages and before the final sRGB OETF.
+    // Use an odd/signed extension so small outset excursions survive to the single final gamut owner.
+    val = sign(val) * pow(abs(val), vec3(2.2));
 
-    // 5. AgX Balanced Black Anchor & Soft Toe:
-    // Mild pedestal subtraction (~0.005) and gentle 1.08 toe to anchor true black without crushing shadow details.
-    const float kAgxBlackPedestal = 0.005;
-    val = max(vec3(0.0), (val - vec3(kAgxBlackPedestal)) / (1.0 - kAgxBlackPedestal));
-    val = pow(val, vec3(1.08));
-
-    // 6. AgX Photographic Chroma / Saturation Restoration:
-    // AgX DRT compresses chromaticity across dynamic range to avoid clipping and hue skew.
-    // Restore natural photographic chromaticity in midtones while preserving smooth highlight rolloff.
-    float y = max(1.0e-6, dot(val, vec3(0.2126, 0.7152, 0.0722)));
-    float maxC = max(val.r, max(val.g, val.b));
-    float minC = min(val.r, min(val.g, val.b));
-    float relChroma = (maxC - minC) / max(maxC, 0.02);
-    float shadowGate = smoothstep(0.015, 0.12, y);
-    float highlightGate = 1.0 - smoothstep(0.72, 0.96, y);
-    float satBoost = 1.0 + 0.14 * shadowGate * highlightGate *
-            (1.0 - 0.25 * smoothstep(0.30, 0.80, relChroma));
-    val = max(vec3(0.0), vec3(y) + (val - vec3(y)) * satBoost);
+    // Phase 10 freezes the same AgX core used by capture. No second toe or automatic
+    // saturation restoration is allowed after the AgX outset.
 
     return val;
 }
@@ -802,16 +812,12 @@ float applyDynamicGtmLowerMidLift(float curvedLuma) {
 }
 
 vec3 applyPreviewGtmLook(vec3 rgb) {
+    // Historical name retained for source/API stability. In Phase 10 this is NOT GTM: the
+    // automatic RAW preview look is identity after AgX and only the explicit profile tone LUT
+    // is consumed here.
     float inputLuma = max(1.0e-6, dot(rgb, vec3(0.2126, 0.7152, 0.0722)));
-    float preCurveLuma = applyDynamicGtmPreCurve(inputLuma);
-    rgb *= preCurveLuma / inputLuma;
-
-    float profileCurveLuma = tone(preCurveLuma);
-    rgb *= profileCurveLuma / max(preCurveLuma, 1.0e-6);
-
-    float finalLuma = applyDynamicGtmLowerMidLift(profileCurveLuma);
-    rgb *= finalLuma / max(profileCurveLuma, 1.0e-6);
-    return clamp(rgb, vec3(0.0), vec3(1.0));
+    float profileCurveLuma = tone(clamp(inputLuma, 0.0, 1.0));
+    return rgb * (profileCurveLuma / inputLuma);
 }
 
 uint previewLocalToneMapWidth() {
@@ -885,20 +891,28 @@ float samplePreviewLocalToneBase(uvec2 gid) {
 }
 
 vec3 applyPreviewLocalTone(uvec2 gid, vec3 exposedRgb) {
-    float sceneKey = clamp(uintBitsToFloat(statsBuffer[GTM_MIDTONE_TARGET_INDEX]), 0.08, 0.20);
+    // Real-time Phase-10 FLLF proxy. Capture owns the full packed multiscale pyramid; preview
+    // reuses its existing resident single-scale base but uses the same correction semantics,
+    // deep-black gate and Laplacian edge-stop. RGB receives one scalar exposure factor.
+    float sceneKey = clamp(uintBitsToFloat(statsBuffer[GTM_MIDTONE_TARGET_INDEX]), 0.125, 0.170);
     float strength = clamp(uintBitsToFloat(statsBuffer[LTM_STRENGTH_INDEX]), 0.02, 0.90);
-    float maxLiftEv = clamp(uintBitsToFloat(statsBuffer[LTM_MAX_LIFT_EV_INDEX]), 0.10, 1.20);
+    float maxLiftEv = clamp(uintBitsToFloat(statsBuffer[LTM_MAX_LIFT_EV_INDEX]), 0.035, 0.62);
     float maxCompressEv = clamp(uintBitsToFloat(statsBuffer[LTM_MAX_COMPRESS_EV_INDEX]), 0.08, 0.70);
 
     float centerLuma = max(1.0e-6, dot(exposedRgb, vec3(0.2126, 0.7152, 0.0722)));
-    float localBase = max(0.006, samplePreviewLocalToneBase(gid));
+    float localBase = max(1.0e-6, samplePreviewLocalToneBase(gid));
     float requestedEv = clamp(log2(sceneKey / localBase), -maxCompressEv, maxLiftEv);
-    float deepBlackGuard = smoothstep(0.018, 0.065, centerLuma);
-    float positiveHighlightGuard = 1.0 - 0.88 * smoothstep(0.48, 0.90, centerLuma);
-    float localNeedGate = smoothstep(0.045, 0.16, abs(requestedEv));
-    float authority = deepBlackGuard * localNeedGate *
-            (requestedEv > 0.0 ? positiveHighlightGuard : 1.0);
-    float appliedEv = requestedEv * strength * authority;
+    float localNeedGate = smoothstep(0.10, 0.46, abs(requestedEv));
+    float deepBlackGuard = requestedEv > 0.0 ? smoothstep(0.010, 0.050, localBase) : 1.0;
+    float requestedCorrection = requestedEv * strength * localNeedGate * deepBlackGuard;
+
+    float isoNoiseProxy = smoothstep(800.0, 3200.0, max(0.0, pc.captureIso));
+    float exposureNoiseProxy = smoothstep(28.0, 90.0, max(0.0, pc.captureExposureMs));
+    float noiseProxy = clamp(max(isoNoiseProxy, 0.70 * exposureNoiseProxy), 0.0, 1.0);
+    float edgeStopEv = clamp(0.56 + 0.20 * noiseProxy, 0.54, 0.78);
+    float laplacianBand = log2(centerLuma + 0.0025) - log2(localBase + 0.0025);
+    float edge = smoothstep(0.62 * edgeStopEv, 1.28 * edgeStopEv, abs(laplacianBand));
+    float appliedEv = clamp(requestedCorrection * (1.0 - 0.84 * edge), -maxCompressEv, maxLiftEv);
     return exposedRgb * exp2(appliedEv);
 }
 
@@ -1005,15 +1019,18 @@ void renderPass() {
     float denoisedLuma = max(1.0e-5, dot(rgb, vec3(0.2126, 0.7152, 0.0722)));
     float exposureGain = uintBitsToFloat(statsBuffer[EXPOSURE_INDEX]) * previewProfileExposureMultiplier();
     float sharpeningScale = 1.0 / max(1.0, exposureGain * 0.45);
-    rgb = max(vec3(0.0), rgb + vec3(
+    float previewDetailDelta =
             (previewLumaDetail(int(gid.x), int(gid.y), denoisedLuma) +
-             previewProfileLumaDetail(int(gid.x), int(gid.y))) * sharpeningScale));
+             previewProfileLumaDetail(int(gid.x), int(gid.y))) * sharpeningScale;
+    float sharpenedLuma = max(0.0, denoisedLuma + previewDetailDelta);
+    rgb *= sharpenedLuma / max(denoisedLuma, 1.0e-6);
     rgb *= exposureGain;
     rgb = applyPreviewLocalTone(gid, rgb);
     rgb = applyAgXTonemap(rgb);
     // Match capture: AgX scene-to-display first, then automatic/profile display-linear tone look.
     rgb = applyPreviewGtmLook(rgb);
     rgb = applyProfile(rgb);
+    rgb = compressPreviewToUnitGamutPreserveLuma(rgb);
     rgb = srgb(rgb);
     rgb = clamp(rgb, vec3(0.0), vec3(1.0));
     recordDisplayAnalysis(gid, rgb);
