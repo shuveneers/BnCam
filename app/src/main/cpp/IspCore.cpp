@@ -1,6 +1,7 @@
 #include "ProfileColorManagement.h"
 #include "SrgbByteLut.h"
 #include "Bgr8PublicationStats.h"
+#include "ObjectiveValidationSummary.h"
 #include "JpegEncodingPolicy.h"
 #include "IspCore.h"
 #include "RawCfaLevelMapping.h"
@@ -18431,6 +18432,70 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     residualNoiseState.propagationStatus =
             "PHASE11_FINAL_JPEG_RESIDUAL_STATE_MEASURED_PRE_ENCODE_POST_QUANTIZATION_IDENTITY";
     const float totalRawIspCoreMs = elapsedMs(totalRenderStart);
+
+    // FASE 16: consolidate existing objective measurements into one reporting-only scorecard.
+    // This introduces no thresholds into image processing and deliberately does not declare a
+    // visual-quality PASS: actual-image/reference review remains mandatory for Phase 16.
+    bncam::validation::ObjectiveValidationInput phase16ValidationInput{};
+    phase16ValidationInput.raw10 = isRaw10;
+    phase16ValidationInput.iso = actualIso;
+    phase16ValidationInput.finalRedClippedPct = finalRedClippedPct;
+    phase16ValidationInput.finalGreenClippedPct = finalGreenClippedPct;
+    phase16ValidationInput.finalBlueClippedPct = finalBlueClippedPct;
+    phase16ValidationInput.finalMeanR = toneMeanR;
+    phase16ValidationInput.finalMeanG = toneMeanG;
+    phase16ValidationInput.finalMeanB = toneMeanB;
+    phase16ValidationInput.measuredVarianceY = measuredVisibleResidual.varianceY;
+    phase16ValidationInput.measuredVarianceRG = measuredVisibleResidual.varianceRG;
+    phase16ValidationInput.measuredVarianceBG = measuredVisibleResidual.varianceBG;
+    phase16ValidationInput.measuredResidualSampleCount = measuredVisibleResidual.sampleCount;
+    phase16ValidationInput.modeledVarianceY = residualNoiseState.finalJpeg.varianceY;
+    phase16ValidationInput.modeledVarianceRG = residualNoiseState.finalJpeg.varianceRG;
+    phase16ValidationInput.modeledVarianceBG = residualNoiseState.finalJpeg.varianceBG;
+    phase16ValidationInput.modeledConfidence = residualNoiseState.finalJpeg.confidence;
+    phase16ValidationInput.visibleInputVarianceRG = visibleChromaState.telemetry.inputVarianceRG;
+    phase16ValidationInput.visibleInputVarianceBG = visibleChromaState.telemetry.inputVarianceBG;
+    phase16ValidationInput.visibleOutputVarianceRG = visibleChromaState.telemetry.outputVarianceRG;
+    phase16ValidationInput.visibleOutputVarianceBG = visibleChromaState.telemetry.outputVarianceBG;
+    phase16ValidationInput.visibleInputResidualSampleCount = static_cast<std::uint64_t>(
+            std::max(0, visibleChromaState.telemetry.inputResidualSampleCount));
+    phase16ValidationInput.visibleOutputResidualSampleCount = static_cast<std::uint64_t>(
+            std::max(0, visibleChromaState.telemetry.outputResidualSampleCount));
+    phase16ValidationInput.visibleChangedPixelFraction = visibleChromaState.telemetry.changedPixelFraction;
+    phase16ValidationInput.visibleMeanAcceptance = visibleChromaState.telemetry.meanAcceptance;
+    phase16ValidationInput.visibleMeanColourShift = visibleChromaState.telemetry.meanColourShift;
+    phase16ValidationInput.visibleMaximumColourShift = visibleChromaState.telemetry.maximumColourShift;
+    phase16ValidationInput.visibleEdgePreservationScore = visibleChromaState.telemetry.edgePreservationScore;
+    phase16ValidationInput.visibleOversmoothingScore = visibleChromaState.telemetry.oversmoothingScore;
+    phase16ValidationInput.linearDetailEvaluatedPixels = vulkanToneApplied
+            ? vulkanTone.linearDetailEvaluatedPixels : linearDetailCpuFallback.evaluatedPixels;
+    phase16ValidationInput.linearDetailEdgeSupportedPixels = vulkanToneApplied
+            ? vulkanTone.linearDetailEdgeSupportedPixels : linearDetailCpuFallback.edgeSupportedPixels;
+    phase16ValidationInput.linearDetailNoiseRejectedPixels = vulkanToneApplied
+            ? vulkanTone.linearDetailNoiseRejectedPixels : linearDetailCpuFallback.noiseRejectedPixels;
+    phase16ValidationInput.linearDetailHaloClampedPixels = vulkanToneApplied
+            ? vulkanTone.linearDetailHaloClampedPixels : linearDetailCpuFallback.haloClampedPixels;
+    phase16ValidationInput.perceptualDetailEvaluatedPixels = vulkanTone.perceptualDetailEvaluatedPixels;
+    phase16ValidationInput.perceptualDetailEdgeSupportedPixels = vulkanTone.perceptualDetailEdgeSupportedPixels;
+    phase16ValidationInput.perceptualDetailNoiseRejectedPixels = vulkanTone.perceptualDetailNoiseRejectedPixels;
+    phase16ValidationInput.perceptualDetailHaloClampedPixels = vulkanTone.perceptualDetailHaloClampedPixels;
+    phase16ValidationInput.awbConfidence = phase7AwbEstimate.confidence;
+    phase16ValidationInput.awbNeutralSupport = phase7AwbEstimate.neutralSupport;
+    phase16ValidationInput.awbMixedLightScore = phase7AwbEstimate.mixedLightScore;
+    phase16ValidationInput.awbPriorDisagreement = phase7AwbEstimate.priorDisagreement;
+    phase16ValidationInput.awbMixedIllumination = phase7AwbEstimate.mixedIllumination;
+    phase16ValidationInput.demosaicFallback = demosaicResolution.fallbackOccurred;
+    phase16ValidationInput.demosaicMs = demosaicMs;
+    phase16ValidationInput.rawIspMs = totalRawIspCoreMs;
+    phase16ValidationInput.sceneMedianSignal = vulkanRawFinalize.autoSceneMedianSignal;
+    phase16ValidationInput.sceneP90Gradient = vulkanRawFinalize.autoSceneP90Gradient;
+    phase16ValidationInput.sceneEdgeFraction = vulkanRawFinalize.autoSceneEdgeFraction;
+    phase16ValidationInput.sceneLowSignalFraction = vulkanRawFinalize.autoSceneLowSignalFraction;
+    phase16ValidationInput.residentPublication = residentPostDemosaicApplied;
+    phase16ValidationInput.finalOutputStatsSource = finalOutputStatsSource;
+    const bncam::validation::ObjectiveValidationSummary phase16Validation =
+            bncam::validation::summarizeObjectiveValidation(phase16ValidationInput);
+
     const uint64_t rawIspWorkingSetEstimateBytes =
             static_cast<uint64_t>(demosaicInputWidth) * demosaicInputHeight *
                     (demosaicResolution.algorithm == DemosaicAlgorithm::Menon2007 ? 41u : 19u);
@@ -18653,6 +18718,69 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; sharedRawBayerJpegPolicyUsed=true"
             << "; rawBayerJpegRenderPolicy=RAW_BAYER_JPEG_RENDER"
             << "; actualIso=" << actualIso
+            << "; phase16ValidationSchema=1"
+            << "; phase16ValidationRoute=" << phase16Validation.route
+            << "; phase16ValidationIso=" << actualIso
+            << "; phase16ValidationIsoBand=" << phase16Validation.isoBand
+            << "; phase16TelemetryReady=" << (phase16Validation.coreTelemetryReady ? "true" : "false")
+            << "; phase16ResidualMeasurementReady="
+            << (phase16Validation.residualMeasurementReady ? "true" : "false")
+            << "; phase16VisibleChromaMeasurementReady="
+            << (phase16Validation.visibleChromaMeasurementReady ? "true" : "false")
+            << "; phase16TelemetryStatus=" << phase16Validation.telemetryStatus
+            << "; phase16MeasuredFinalLumaSigma=" << phase16Validation.measuredFinalLumaSigma
+            << "; phase16MeasuredFinalChromaSigma=" << phase16Validation.measuredFinalChromaSigma
+            << "; phase16ModeledFinalLumaSigma=" << phase16Validation.modeledFinalLumaSigma
+            << "; phase16ModeledFinalChromaSigma=" << phase16Validation.modeledFinalChromaSigma
+            << "; phase16ModeledFinalConfidence=" << residualNoiseState.finalJpeg.confidence
+            << "; phase16MeasuredFinalResidualSamples=" << measuredVisibleResidual.sampleCount
+            << "; phase16VisibleChromaSigmaRatio=" << phase16Validation.visibleChromaSigmaRatio
+            << "; phase16VisibleChromaChangedPixelFraction="
+            << visibleChromaState.telemetry.changedPixelFraction
+            << "; phase16VisibleChromaMeanAcceptance=" << visibleChromaState.telemetry.meanAcceptance
+            << "; phase16VisibleChromaMeanColourShift=" << visibleChromaState.telemetry.meanColourShift
+            << "; phase16VisibleChromaMaximumColourShift=" << visibleChromaState.telemetry.maximumColourShift
+            << "; phase16VisibleChromaEdgePreservationScore="
+            << visibleChromaState.telemetry.edgePreservationScore
+            << "; phase16VisibleChromaOversmoothingScore=" << visibleChromaState.telemetry.oversmoothingScore
+            << "; phase16LinearDetailEdgeSupportFraction="
+            << phase16Validation.linearDetailEdgeSupportFraction
+            << "; phase16LinearDetailNoiseRejectedFraction="
+            << phase16Validation.linearDetailNoiseRejectedFraction
+            << "; phase16LinearDetailHaloClampFraction="
+            << phase16Validation.linearDetailHaloClampFraction
+            << "; phase16PerceptualDetailEdgeSupportFraction="
+            << phase16Validation.perceptualDetailEdgeSupportFraction
+            << "; phase16PerceptualDetailNoiseRejectedFraction="
+            << phase16Validation.perceptualDetailNoiseRejectedFraction
+            << "; phase16PerceptualDetailHaloClampFraction="
+            << phase16Validation.perceptualDetailHaloClampFraction
+            << "; phase16FinalClipMaxPct=" << phase16Validation.finalClipMaxPct
+            << "; phase16FinalMeanRgb=[" << toneMeanR << "," << toneMeanG << "," << toneMeanB << "]"
+            << "; phase16AwbConfidence=" << phase7AwbEstimate.confidence
+            << "; phase16AwbNeutralSupport=" << phase7AwbEstimate.neutralSupport
+            << "; phase16AwbMixedLightScore=" << phase7AwbEstimate.mixedLightScore
+            << "; phase16AwbPriorDisagreement=" << phase7AwbEstimate.priorDisagreement
+            << "; phase16AwbMixedIllumination="
+            << (phase7AwbEstimate.mixedIllumination ? "true" : "false")
+            << "; phase16DemosaicRequested=" << demosaicModeName(demosaicResolution.requestedMode)
+            << "; phase16DemosaicResolved="
+            << (autoHybridUsedForOutput ? "AUTO_HYBRID" : demosaicAlgorithmName(demosaicResolution.algorithm))
+            << "; phase16DemosaicFallback=" << (demosaicResolution.fallbackOccurred ? "true" : "false")
+            << "; phase16DemosaicMs=" << demosaicMs
+            << "; phase16RawIspMs=" << totalRawIspCoreMs
+            << "; phase16SceneMedianSignal=" << vulkanRawFinalize.autoSceneMedianSignal
+            << "; phase16SceneP90Gradient=" << vulkanRawFinalize.autoSceneP90Gradient
+            << "; phase16SceneEdgeFraction=" << vulkanRawFinalize.autoSceneEdgeFraction
+            << "; phase16SceneLowSignalFraction=" << vulkanRawFinalize.autoSceneLowSignalFraction
+            << "; phase16ResidentPublication=" << (residentPostDemosaicApplied ? "true" : "false")
+            << "; phase16FinalOutputStatsSource=" << finalOutputStatsSource
+            << "; phase16ImageReviewRequired="
+            << (phase16Validation.imageReviewRequired ? "true" : "false")
+            << "; phase16ColorAccuracyReferenceRequired="
+            << (phase16Validation.colorAccuracyReferenceRequired ? "true" : "false")
+            << "; phase16NearNyquistReferenceRequired="
+            << (phase16Validation.nearNyquistReferenceRequired ? "true" : "false")
             << "; exposureKnown=" << (exposureKnown ? "true" : "false")
             << "; exposureMs=" << exposureMs
             << "; lowLightScene=" << (lowLightScene ? "true" : "false")
