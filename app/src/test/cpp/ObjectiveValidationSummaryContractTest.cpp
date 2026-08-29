@@ -55,6 +55,20 @@ int main() {
     input.visibleOutputVarianceBG = 0.0004;
     input.visibleInputResidualSampleCount = 4096u;
     input.visibleOutputResidualSampleCount = 4096u;
+    input.visibleChangedPixelFraction = 0.48;
+    input.visibleMeanAcceptance = 0.36;
+    input.visibleMeanColourShift = 0.0008;
+    input.visibleMaximumColourShift = 0.033;
+    input.visibleEdgePreservationScore = 0.992;
+    input.visibleOversmoothingScore = 0.012;
+    input.visibleProcessedPixelCount = 49152u;
+    input.visibleCandidatePixelCount = 20543u;
+    input.visibleChangedPixelCount = 23609u;
+    input.visibleExecutionStatus = "SPECTRA_CONTEXT_FUSION_GPU_RESIDENT_VISIBLE_CHROMA_APPLIED";
+    input.visibleStatisticsMethod = "GPU_16X16_STRATIFIED_COUNTS_AND_Q12_SAMPLES_NO_CPU_FULL_FRAME_MEASUREMENT";
+    input.chromaCloudClassificationReady = true;
+    input.chromaCloudRiskEvidence = 0.69;
+    input.chromaCloudRiskStatus = "SUPPORTED_COHERENT_CHROMA_CLOUD_RISK";
     input.linearDetailEvaluatedPixels = 1000u;
     input.linearDetailEdgeSupportedPixels = 250u;
     input.linearDetailNoiseRejectedPixels = 100u;
@@ -73,7 +87,13 @@ int main() {
     require(summary.isoBand == "MEDIUM", "ISO 800 must be MEDIUM");
     require(summary.coreTelemetryReady, "complete core telemetry must be ready");
     require(summary.residualMeasurementReady, "final residual measurement must be ready");
-    require(summary.visibleChromaMeasurementReady, "visible-chroma measurement must be ready");
+    require(summary.visibleChromaMeasurementReady, "visible-chroma execution measurement must be ready");
+    require(summary.visibleChromaVarianceComparisonReady,
+            "full pre/post variance comparison must be ready when residual samples exist");
+    require(summary.visibleChromaSigmaRatioAvailable,
+            "sigma ratio must be explicitly available with full variance comparison");
+    require(summary.falseColorRiskTelemetryReady, "false-color risk telemetry must be ready");
+    require(summary.colourDriftProxyReady, "colour-drift proxy must be ready");
     require(summary.telemetryStatus == "OBJECTIVE_TELEMETRY_READY_IMAGE_REVIEW_REQUIRED",
             "ready telemetry must still require image review");
     require(near(summary.finalClipMaxPct, 0.20), "maximum clipping must be exact");
@@ -91,8 +111,32 @@ int main() {
     require(near(summary.perceptualDetailNoiseRejectedFraction, 0.10), "perceptual reject fraction mismatch");
     require(near(summary.perceptualDetailHaloClampFraction, 0.025), "perceptual halo fraction mismatch");
     require(summary.imageReviewRequired && summary.colorAccuracyReferenceRequired &&
-                    summary.nearNyquistReferenceRequired,
+                    summary.hueStabilityReferenceRequired && summary.nearNyquistReferenceRequired,
             "objective telemetry must never replace image/reference review");
+
+    // Current resident production truth: compact GPU counts/Q12 telemetry is available while
+    // pre/post full residual-variance sample counts intentionally remain zero. This must not be
+    // mislabeled as missing visible-chroma execution telemetry.
+    auto residentCompact = input;
+    residentCompact.visibleInputResidualSampleCount = 0u;
+    residentCompact.visibleOutputResidualSampleCount = 0u;
+    residentCompact.visibleOutputVarianceRG = 0.0;
+    residentCompact.visibleOutputVarianceBG = 0.0;
+    const auto residentCompactSummary =
+            bncam::validation::summarizeObjectiveValidation(residentCompact);
+    require(residentCompactSummary.visibleChromaMeasurementReady,
+            "resident compact GPU visible-chroma telemetry must be ready");
+    require(!residentCompactSummary.visibleChromaVarianceComparisonReady,
+            "missing pre/post residual samples must keep variance comparison unavailable");
+    require(!residentCompactSummary.visibleChromaSigmaRatioAvailable,
+            "unavailable variance comparison must not fabricate a sigma ratio");
+    require(residentCompactSummary.visibleChromaSigmaRatio == 0.0,
+            "unavailable sigma ratio must remain the explicit zero sentinel");
+    require(residentCompactSummary.falseColorRiskTelemetryReady,
+            "existing demosaic chroma-cloud risk evidence must remain available");
+    require(residentCompactSummary.telemetryStatus ==
+                    "OBJECTIVE_TELEMETRY_READY_VISIBLE_CHROMA_VARIANCE_COMPARISON_UNAVAILABLE_IMAGE_REVIEW_REQUIRED",
+            "resident compact telemetry status must describe the missing variance comparison exactly");
 
     auto invalid = input;
     invalid.finalMeanG = std::numeric_limits<double>::quiet_NaN();

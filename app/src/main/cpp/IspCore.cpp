@@ -18467,6 +18467,16 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     phase16ValidationInput.visibleMaximumColourShift = visibleChromaState.telemetry.maximumColourShift;
     phase16ValidationInput.visibleEdgePreservationScore = visibleChromaState.telemetry.edgePreservationScore;
     phase16ValidationInput.visibleOversmoothingScore = visibleChromaState.telemetry.oversmoothingScore;
+    phase16ValidationInput.visibleProcessedPixelCount = visibleChromaState.telemetry.processedPixelCount;
+    phase16ValidationInput.visibleCandidatePixelCount = visibleChromaState.telemetry.candidatePixelCount;
+    phase16ValidationInput.visibleChangedPixelCount = visibleChromaState.telemetry.changedPixelCount;
+    phase16ValidationInput.visibleExecutionStatus = visibleChromaState.telemetry.resultStatus;
+    phase16ValidationInput.visibleStatisticsMethod = visibleChromaState.telemetry.vulkanResidentStatisticsMethod;
+    phase16ValidationInput.chromaCloudClassificationReady =
+            residualNoiseState.demosaicChromaCloudClassificationReady;
+    phase16ValidationInput.chromaCloudRiskEvidence =
+            residualNoiseState.demosaicChromaCloudRiskEvidence;
+    phase16ValidationInput.chromaCloudRiskStatus = residualNoiseState.demosaicChromaCloudRiskStatus;
     phase16ValidationInput.linearDetailEvaluatedPixels = vulkanToneApplied
             ? vulkanTone.linearDetailEvaluatedPixels : linearDetailCpuFallback.evaluatedPixels;
     phase16ValidationInput.linearDetailEdgeSupportedPixels = vulkanToneApplied
@@ -18727,6 +18737,14 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << (phase16Validation.residualMeasurementReady ? "true" : "false")
             << "; phase16VisibleChromaMeasurementReady="
             << (phase16Validation.visibleChromaMeasurementReady ? "true" : "false")
+            << "; phase16VisibleChromaVarianceComparisonReady="
+            << (phase16Validation.visibleChromaVarianceComparisonReady ? "true" : "false")
+            << "; phase16VisibleChromaSigmaRatioAvailable="
+            << (phase16Validation.visibleChromaSigmaRatioAvailable ? "true" : "false")
+            << "; phase16FalseColorRiskTelemetryReady="
+            << (phase16Validation.falseColorRiskTelemetryReady ? "true" : "false")
+            << "; phase16ColourDriftProxyReady="
+            << (phase16Validation.colourDriftProxyReady ? "true" : "false")
             << "; phase16TelemetryStatus=" << phase16Validation.telemetryStatus
             << "; phase16MeasuredFinalLumaSigma=" << phase16Validation.measuredFinalLumaSigma
             << "; phase16MeasuredFinalChromaSigma=" << phase16Validation.measuredFinalChromaSigma
@@ -18735,6 +18753,15 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; phase16ModeledFinalConfidence=" << residualNoiseState.finalJpeg.confidence
             << "; phase16MeasuredFinalResidualSamples=" << measuredVisibleResidual.sampleCount
             << "; phase16VisibleChromaSigmaRatio=" << phase16Validation.visibleChromaSigmaRatio
+            << "; phase16VisibleChromaProcessedPixelCount="
+            << visibleChromaState.telemetry.processedPixelCount
+            << "; phase16VisibleChromaCandidatePixelCount="
+            << visibleChromaState.telemetry.candidatePixelCount
+            << "; phase16VisibleChromaChangedPixelCount="
+            << visibleChromaState.telemetry.changedPixelCount
+            << "; phase16VisibleChromaExecutionStatus=" << visibleChromaState.telemetry.resultStatus
+            << "; phase16VisibleChromaStatisticsMethod="
+            << visibleChromaState.telemetry.vulkanResidentStatisticsMethod
             << "; phase16VisibleChromaChangedPixelFraction="
             << visibleChromaState.telemetry.changedPixelFraction
             << "; phase16VisibleChromaMeanAcceptance=" << visibleChromaState.telemetry.meanAcceptance
@@ -18743,6 +18770,8 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; phase16VisibleChromaEdgePreservationScore="
             << visibleChromaState.telemetry.edgePreservationScore
             << "; phase16VisibleChromaOversmoothingScore=" << visibleChromaState.telemetry.oversmoothingScore
+            << "; phase16FalseColorRiskEvidence=" << phase16Validation.falseColorRiskEvidence
+            << "; phase16FalseColorRiskStatus=" << residualNoiseState.demosaicChromaCloudRiskStatus
             << "; phase16LinearDetailEdgeSupportFraction="
             << phase16Validation.linearDetailEdgeSupportFraction
             << "; phase16LinearDetailNoiseRejectedFraction="
@@ -18779,6 +18808,8 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << (phase16Validation.imageReviewRequired ? "true" : "false")
             << "; phase16ColorAccuracyReferenceRequired="
             << (phase16Validation.colorAccuracyReferenceRequired ? "true" : "false")
+            << "; phase16HueStabilityReferenceRequired="
+            << (phase16Validation.hueStabilityReferenceRequired ? "true" : "false")
             << "; phase16NearNyquistReferenceRequired="
             << (phase16Validation.nearNyquistReferenceRequired ? "true" : "false")
             << "; exposureKnown=" << (exposureKnown ? "true" : "false")

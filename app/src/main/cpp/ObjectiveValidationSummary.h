@@ -48,6 +48,15 @@ struct ObjectiveValidationInput {
     double visibleMaximumColourShift = 0.0;
     double visibleEdgePreservationScore = 1.0;
     double visibleOversmoothingScore = 0.0;
+    std::uint64_t visibleProcessedPixelCount = 0u;
+    std::uint64_t visibleCandidatePixelCount = 0u;
+    std::uint64_t visibleChangedPixelCount = 0u;
+    std::string visibleExecutionStatus;
+    std::string visibleStatisticsMethod;
+
+    bool chromaCloudClassificationReady = false;
+    double chromaCloudRiskEvidence = 0.0;
+    std::string chromaCloudRiskStatus;
 
     std::uint64_t linearDetailEvaluatedPixels = 0u;
     std::uint64_t linearDetailEdgeSupportedPixels = 0u;
@@ -82,6 +91,10 @@ struct ObjectiveValidationSummary {
     bool coreTelemetryReady = false;
     bool residualMeasurementReady = false;
     bool visibleChromaMeasurementReady = false;
+    bool visibleChromaVarianceComparisonReady = false;
+    bool visibleChromaSigmaRatioAvailable = false;
+    bool falseColorRiskTelemetryReady = false;
+    bool colourDriftProxyReady = false;
     std::string telemetryStatus = "UNINITIALIZED";
 
     double finalClipMaxPct = 0.0;
@@ -89,7 +102,8 @@ struct ObjectiveValidationSummary {
     double measuredFinalChromaSigma = 0.0;
     double modeledFinalLumaSigma = 0.0;
     double modeledFinalChromaSigma = 0.0;
-    double visibleChromaSigmaRatio = 1.0;
+    double visibleChromaSigmaRatio = 0.0;
+    double falseColorRiskEvidence = 0.0;
     double linearDetailEdgeSupportFraction = 0.0;
     double linearDetailNoiseRejectedFraction = 0.0;
     double linearDetailHaloClampFraction = 0.0;
@@ -100,6 +114,7 @@ struct ObjectiveValidationSummary {
     // These remain true by design. Phase 16 explicitly requires actual-image/reference review.
     bool imageReviewRequired = true;
     bool colorAccuracyReferenceRequired = true;
+    bool hueStabilityReferenceRequired = true;
     bool nearNyquistReferenceRequired = true;
 };
 
@@ -169,19 +184,58 @@ inline ObjectiveValidationSummary summarizeObjectiveValidation(
                 0.0, 0.5 * (input.modeledVarianceRG + input.modeledVarianceBG)));
     }
 
+    // The production resident visible-chroma path reports compact GPU statistics without
+    // materializing a second full-frame pre/post residual image on CPU. Execution observability
+    // and variance-comparison observability are therefore separate truths.
+    const bool visibleFractionsFinite =
+            validationFiniteNonNegative(input.visibleChangedPixelFraction) &&
+            input.visibleChangedPixelFraction <= 1.0 &&
+            validationFiniteNonNegative(input.visibleMeanAcceptance) &&
+            input.visibleMeanAcceptance <= 1.0 &&
+            validationFiniteNonNegative(input.visibleMeanColourShift) &&
+            validationFiniteNonNegative(input.visibleMaximumColourShift) &&
+            validationFiniteNonNegative(input.visibleEdgePreservationScore) &&
+            input.visibleEdgePreservationScore <= 1.0 &&
+            validationFiniteNonNegative(input.visibleOversmoothingScore) &&
+            input.visibleOversmoothingScore <= 1.0;
+    const bool visibleCountsCoherent =
+            input.visibleProcessedPixelCount >= 2048u &&
+            input.visibleCandidatePixelCount <= input.visibleProcessedPixelCount &&
+            input.visibleChangedPixelCount <= input.visibleProcessedPixelCount;
+    const bool visibleExecutionReported =
+            !input.visibleExecutionStatus.empty() &&
+            input.visibleExecutionStatus != "NOT_RUN" &&
+            !input.visibleStatisticsMethod.empty() &&
+            input.visibleStatisticsMethod != "NOT_RUN";
     out.visibleChromaMeasurementReady =
+            visibleFractionsFinite && visibleCountsCoherent && visibleExecutionReported;
+    out.colourDriftProxyReady = out.visibleChromaMeasurementReady;
+
+    out.visibleChromaVarianceComparisonReady =
             input.visibleInputResidualSampleCount >= 2048u &&
             input.visibleOutputResidualSampleCount >= 2048u &&
             validationFiniteNonNegative(input.visibleInputVarianceRG) &&
             validationFiniteNonNegative(input.visibleInputVarianceBG) &&
             validationFiniteNonNegative(input.visibleOutputVarianceRG) &&
             validationFiniteNonNegative(input.visibleOutputVarianceBG);
-    if (out.visibleChromaMeasurementReady) {
+    if (out.visibleChromaVarianceComparisonReady) {
         const double inputSigma = std::sqrt(std::max(
                 0.0, 0.5 * (input.visibleInputVarianceRG + input.visibleInputVarianceBG)));
         const double outputSigma = std::sqrt(std::max(
                 0.0, 0.5 * (input.visibleOutputVarianceRG + input.visibleOutputVarianceBG)));
-        out.visibleChromaSigmaRatio = inputSigma > 1.0e-12 ? outputSigma / inputSigma : 1.0;
+        if (inputSigma > 1.0e-12) {
+            out.visibleChromaSigmaRatio = outputSigma / inputSigma;
+            out.visibleChromaSigmaRatioAvailable = true;
+        }
+    }
+
+    out.falseColorRiskTelemetryReady =
+            input.chromaCloudClassificationReady &&
+            validationFiniteNonNegative(input.chromaCloudRiskEvidence) &&
+            input.chromaCloudRiskEvidence <= 1.0 &&
+            !input.chromaCloudRiskStatus.empty();
+    if (out.falseColorRiskTelemetryReady) {
+        out.falseColorRiskEvidence = input.chromaCloudRiskEvidence;
     }
 
     out.linearDetailEdgeSupportFraction = validationFraction(
@@ -202,7 +256,12 @@ inline ObjectiveValidationSummary summarizeObjectiveValidation(
     } else if (!out.residualMeasurementReady) {
         out.telemetryStatus = "CORE_READY_RESIDUAL_MEASUREMENT_UNAVAILABLE";
     } else if (!out.visibleChromaMeasurementReady) {
-        out.telemetryStatus = "CORE_AND_FINAL_RESIDUAL_READY_VISIBLE_CHROMA_MEASUREMENT_UNAVAILABLE";
+        out.telemetryStatus = "CORE_AND_FINAL_RESIDUAL_READY_VISIBLE_CHROMA_EXECUTION_TELEMETRY_UNAVAILABLE";
+    } else if (!out.falseColorRiskTelemetryReady) {
+        out.telemetryStatus = "CORE_RESIDUAL_VISIBLE_READY_FALSE_COLOR_RISK_TELEMETRY_UNAVAILABLE";
+    } else if (!out.visibleChromaVarianceComparisonReady) {
+        out.telemetryStatus =
+                "OBJECTIVE_TELEMETRY_READY_VISIBLE_CHROMA_VARIANCE_COMPARISON_UNAVAILABLE_IMAGE_REVIEW_REQUIRED";
     } else {
         out.telemetryStatus = "OBJECTIVE_TELEMETRY_READY_IMAGE_REVIEW_REQUIRED";
     }
