@@ -1,5 +1,6 @@
 #include "VulkanYuvSingleFrameBackend.h"
 #include "VulkanPipelineCacheRegistry.h"
+#include "../YuvSingleFrameResidualPolicy.h"
 
 #ifndef BNCAM_VMA_HEADER_AVAILABLE
 #define BNCAM_VMA_HEADER_AVAILABLE 0
@@ -329,7 +330,8 @@ YuvSingleFrameIspResult VulkanYuvSingleFrameBackend::execute(
     const std::uint64_t paddedInputBytes = align4(expectedNv21Bytes);
     const std::uint64_t paddedOutputBytes = align4(bgrBytes);
     constexpr std::uint64_t toneBytes = 256u * sizeof(std::uint32_t);
-    constexpr std::uint64_t telemetryBytes = 4u * sizeof(std::uint32_t);
+    constexpr std::uint64_t telemetryBytes =
+            bncam::yuv_phase13::kTelemetryWordCount * sizeof(std::uint32_t);
     const bool useUltraHdr = request.ultraHdrGainmapRequested &&
             request.residentHdrAccumulatorBuffer != VK_NULL_HANDLE &&
             request.residentHdrWeightBuffer != VK_NULL_HANDLE &&
@@ -381,7 +383,7 @@ YuvSingleFrameIspResult VulkanYuvSingleFrameBackend::execute(
         (useUltraHdr && !ensureBufferLocked(allocator_, gainLogBytes, false, gainLogDevice_, out.failureReason)) ||
         (useUltraHdr && !ensureBufferLocked(allocator_, gainmapPackedBytes, false, gainmapDevice_, out.failureReason)) ||
         (useUltraHdr && !ensureBufferLocked(allocator_, gainmapPackedBytes, true, gainmapReadback_, out.failureReason)) ||
-        (useUltraHdr && !ensureBufferLocked(allocator_, telemetryBytes, true, ultraHdrTelemetry_, out.failureReason)) ||
+        !ensureBufferLocked(allocator_, telemetryBytes, true, ultraHdrTelemetry_, out.failureReason) ||
         (usePortrait && !ensureBufferLocked(allocator_, portraitMaskPixels * sizeof(float), true, portraitMask_, out.failureReason))) {
         return out;
     }
@@ -420,10 +422,10 @@ YuvSingleFrameIspResult VulkanYuvSingleFrameBackend::execute(
     vmaFlushAllocation(allocator_, toneStaging_.allocation, 0u, toneBytes);
     out.inputUploadMs = elapsedMs(uploadStart);
 
-    if (useUltraHdr) {
-        std::memset(ultraHdrTelemetry_.mapped, 0, static_cast<std::size_t>(telemetryBytes));
-        vmaFlushAllocation(allocator_, ultraHdrTelemetry_.allocation, 0u, telemetryBytes);
-    }
+    // FASE 13 residual-noise analysis uses the compact telemetry buffer on every YUV render.
+    // Ultra HDR retains word 0; YUV analysis owns words 8..63.
+    std::memset(ultraHdrTelemetry_.mapped, 0, static_cast<std::size_t>(telemetryBytes));
+    vmaFlushAllocation(allocator_, ultraHdrTelemetry_.allocation, 0u, telemetryBytes);
 
     VkDescriptorBufferInfo descriptorBuffers[9]{};
     descriptorBuffers[0] = {inputDevice_.buffer, 0u, paddedInputBytes};
@@ -445,10 +447,7 @@ YuvSingleFrameIspResult VulkanYuvSingleFrameBackend::execute(
             useUltraHdr ? gainmapDevice_.buffer : outputDevice_.buffer,
             0u,
             useUltraHdr ? gainmapPackedBytes : paddedOutputBytes};
-    descriptorBuffers[7] = {
-            useUltraHdr ? ultraHdrTelemetry_.buffer : outputReadback_.buffer,
-            0u,
-            useUltraHdr ? telemetryBytes : paddedOutputBytes};
+    descriptorBuffers[7] = {ultraHdrTelemetry_.buffer, 0u, telemetryBytes};
     descriptorBuffers[8] = {
             usePortrait ? portraitMask_.buffer : toneDevice_.buffer,
             0u,
@@ -572,7 +571,9 @@ YuvSingleFrameIspResult VulkanYuvSingleFrameBackend::execute(
         std::clamp(request.contrast, -1.0f, 1.0f),
         std::clamp(request.vibrance, -1.0f, 1.0f),
         std::clamp(request.profileDetailAmount, 0.0f, 1.0f),
-        std::clamp(request.profileDetailRadius, 0.50f, 3.00f),
+        request.profileDetailAmount > 1.0e-6f
+                ? std::clamp(request.profileDetailRadius, 0.50f, 3.00f)
+                : 0.0f,
         std::clamp(request.profileDetailDetail, 0.0f, 1.0f),
         std::clamp(request.profileDetailMasking, 0.0f, 1.0f),
         0u,
@@ -602,10 +603,50 @@ YuvSingleFrameIspResult VulkanYuvSingleFrameBackend::execute(
             &descriptorSet_,
             0u,
             nullptr);
-    vkCmdPushConstants(command, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0u, sizeof(push), &push);
     const std::uint32_t blocks = static_cast<std::uint32_t>((outputPixelCount + 3u) / 4u);
     const std::uint32_t groups = (blocks + 63u) / 64u;
     const auto gpuStart = Clock::now();
+
+    // FASE 13 is deliberately three resident dispatches:
+    // 2 = sampled residual histogram, 3 = compact robust model finalize, 0 = render.
+    // No full-frame intermediate leaves the GPU.
+    push.ultraHdrMode = 2u;
+    vkCmdPushConstants(command, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0u, sizeof(push), &push);
+    vkCmdDispatch(command, groups, 1u, 1u);
+
+    VkMemoryBarrier analysisBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    analysisBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    analysisBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(
+            command,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0u,
+            1u, &analysisBarrier,
+            0u, nullptr,
+            0u, nullptr);
+
+    push.ultraHdrMode = 3u;
+    vkCmdPushConstants(command, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0u, sizeof(push), &push);
+    vkCmdDispatch(command, 1u, 1u, 1u);
+
+    VkMemoryBarrier modelBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    modelBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    modelBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(
+            command,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0u,
+            1u, &modelBarrier,
+            0u, nullptr,
+            0u, nullptr);
+
+    push.ultraHdrMode = 0u;
+    vkCmdPushConstants(command, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0u, sizeof(push), &push);
     vkCmdDispatch(command, groups, 1u, 1u);
 
     if (useUltraHdr) {
@@ -708,10 +749,30 @@ YuvSingleFrameIspResult VulkanYuvSingleFrameBackend::execute(
     vmaInvalidateAllocation(allocator_, outputReadback_.allocation, 0u, paddedOutputBytes);
     out.bgr24.resize(static_cast<std::size_t>(bgrBytes));
     std::memcpy(out.bgr24.data(), outputReadback_.mapped, static_cast<std::size_t>(bgrBytes));
+
+    vmaInvalidateAllocation(allocator_, ultraHdrTelemetry_.allocation, 0u, telemetryBytes);
+    const auto* telemetry = static_cast<const std::uint32_t*>(ultraHdrTelemetry_.mapped);
+    if (telemetry != nullptr) {
+        out.yuvResidualLumaSamples = telemetry[bncam::yuv_phase13::kLumaSampleCountWord];
+        out.yuvResidualChromaSamples = telemetry[bncam::yuv_phase13::kChromaSampleCountWord];
+        out.yuvResidualSigmaY = static_cast<float>(telemetry[bncam::yuv_phase13::kSigmaYQ24Word]) /
+                bncam::yuv_phase13::kQ24Scale;
+        out.yuvResidualSigmaU = static_cast<float>(telemetry[bncam::yuv_phase13::kSigmaUQ24Word]) /
+                bncam::yuv_phase13::kQ24Scale;
+        out.yuvResidualSigmaV = static_cast<float>(telemetry[bncam::yuv_phase13::kSigmaVQ24Word]) /
+                bncam::yuv_phase13::kQ24Scale;
+        out.yuvResidualLumaAuthority = static_cast<float>(
+                telemetry[bncam::yuv_phase13::kLumaAuthorityQ24Word]) / bncam::yuv_phase13::kQ24Scale;
+        out.yuvResidualChromaAuthority = static_cast<float>(
+                telemetry[bncam::yuv_phase13::kChromaAuthorityQ24Word]) / bncam::yuv_phase13::kQ24Scale;
+        out.yuvResidualModelConfidence = static_cast<float>(
+                telemetry[bncam::yuv_phase13::kModelConfidenceQ24Word]) / bncam::yuv_phase13::kQ24Scale;
+        out.yuvResidualNoiseModelAvailable = out.yuvResidualModelConfidence >= 0.15f &&
+                out.yuvResidualLumaSamples >= 24u && out.yuvResidualChromaSamples >= 16u;
+    }
+
     if (useUltraHdr) {
         constexpr float kMeaningfulGainLog2 = 0.111031312f; // log2(1.08)
-        vmaInvalidateAllocation(allocator_, ultraHdrTelemetry_.allocation, 0u, telemetryBytes);
-        const auto* telemetry = static_cast<const std::uint32_t*>(ultraHdrTelemetry_.mapped);
         const float maxLog2Boost = telemetry != nullptr
                 ? static_cast<float>(telemetry[0]) / 65536.0f
                 : 0.0f;
@@ -741,7 +802,7 @@ YuvSingleFrameIspResult VulkanYuvSingleFrameBackend::execute(
         out.portraitEffectApplied = true;
         out.portraitStatus = "GPU_PORTRAIT_APPLIED";
     }
-    out.backend = "VULKAN_YUV_SINGLE_FRAME_ISP";
+    out.backend = "VULKAN_YUV_SINGLE_FRAME_ISP_PHASE13_RESIDUAL";
     out.failureReason = "none";
     out.success = true;
     return out;

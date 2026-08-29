@@ -125,6 +125,8 @@ struct NativeRenderQualityConfig {
     float lensDynamicIsoCoeff = 0.0f;
     float lensManualIsoValue = 0.0f;
     int captureSensitivityIso = 0;
+    // FASE 13 compatibility telemetry only. ISO-derived authority is retired for YUV: the
+    // vendor-processed frame is denoised from measured residual evidence on Vulkan instead.
     float yuvLensIsoNoiseReductionBoost = 0.0f;
     bool yuvLensIsoNrApplied = false;
 

@@ -73,6 +73,23 @@ layout(push_constant) uniform PushConstants {
     float profileNrChromaProtection;
 } pc;
 
+// FASE 13 compact residual-noise telemetry. Words 0..7 remain owned/reserved by
+// Ultra HDR; YUV analysis owns 8..63. Q24 retains sub-code-value sigma precision.
+const uint kYuvHistBins = 16u;
+const uint kYuvHistYBase = 8u;
+const uint kYuvHistUBase = 24u;
+const uint kYuvHistVBase = 40u;
+const uint kYuvLumaSamplesWord = 56u;
+const uint kYuvChromaSamplesWord = 57u;
+const uint kYuvSigmaYWord = 58u;
+const uint kYuvSigmaUWord = 59u;
+const uint kYuvSigmaVWord = 60u;
+const uint kYuvLumaAuthorityWord = 61u;
+const uint kYuvChromaAuthorityWord = 62u;
+const uint kYuvConfidenceWord = 63u;
+const float kYuvQ24 = 16777216.0;
+const float kAbsLaplacianP35ToSigma = 2.722573141;
+
 uint readByte(uint byteIndex) {
     uint word = inputBuffer.words[byteIndex >> 2u];
     uint shift = (byteIndex & 3u) * 8u;
@@ -222,19 +239,66 @@ float inputYAtOutput(int outputX, int outputY) {
     return float(readByte(yIndex)) / 255.0;
 }
 
+float yuvTelemetryFloat(uint word) {
+    return float(ultraHdrTelemetry.values[word]) / kYuvQ24;
+}
+
+uint yuvQ24(float value) {
+    return uint(clamp(roundEven(clamp(value, 0.0, 1.0) * kYuvQ24), 0.0, kYuvQ24));
+}
+
+float yuvMeasuredSigmaY() {
+    return clamp(yuvTelemetryFloat(kYuvSigmaYWord), 0.0, 0.08);
+}
+
+vec2 yuvMeasuredSigmaUv() {
+    return clamp(vec2(
+        yuvTelemetryFloat(kYuvSigmaUWord),
+        yuvTelemetryFloat(kYuvSigmaVWord)), vec2(0.0), vec2(0.08));
+}
+
+float yuvMeasuredLumaAuthority() {
+    return clamp(yuvTelemetryFloat(kYuvLumaAuthorityWord), 0.0, 0.75);
+}
+
+float yuvMeasuredChromaAuthority() {
+    return clamp(yuvTelemetryFloat(kYuvChromaAuthorityWord), 0.0, 0.85);
+}
+
+float yuvResidualPreserve(float residualSnr, float protection, bool chroma) {
+    float p = clamp(protection, 0.0, 1.0);
+    float low = chroma ? mix(1.55, 0.95, p) : mix(1.25, 0.75, p);
+    float high = chroma ? mix(3.80, 2.60, p) : mix(3.20, 2.00, p);
+    return smoothstep(low, high, max(0.0, residualSnr));
+}
+
 float denoisedInputYAtOutput(int outputX, int outputY) {
     float center = inputYAtOutput(outputX, outputY);
-    float blend = clamp(pc.profileNrLumaBlend, 0.0, 0.75);
-    if (blend <= 1.0e-6) return center;
+    float authority = yuvMeasuredLumaAuthority();
+    if (authority <= 1.0e-6) return center;
+
     float n = inputYAtOutput(outputX, outputY - 1);
     float s = inputYAtOutput(outputX, outputY + 1);
     float w = inputYAtOutput(outputX - 1, outputY);
     float e = inputYAtOutput(outputX + 1, outputY);
-    float localMean = 0.20 * (center + n + s + w + e);
-    float structure = 0.25 * (abs(center - n) + abs(center - s) + abs(center - w) + abs(center - e));
-    float protection = clamp(pc.profileNrLumaProtection, 0.0, 1.0);
-    float structureGate = 1.0 - protection * smoothstep(0.012, 0.085, structure);
-    return clamp(mix(center, localMean, blend * structureGate), 0.0, 1.0);
+
+    float sigmaY = max(yuvMeasuredSigmaY(), 1.0 / 255.0);
+    float protection = max(clamp(pc.profileNrLumaProtection, 0.0, 1.0), 0.65);
+    float guideScale = sigmaY * mix(3.10, 1.85, protection) + 1.0 / 255.0;
+    float wn = exp(-0.5 * pow((n - center) / guideScale, 2.0));
+    float ws = exp(-0.5 * pow((s - center) / guideScale, 2.0));
+    float ww = exp(-0.5 * pow((w - center) / guideScale, 2.0));
+    float we = exp(-0.5 * pow((e - center) / guideScale, 2.0));
+    float weightSum = wn + ws + ww + we;
+    if (weightSum <= 1.0e-5) return center;
+
+    float predictor = (wn * n + ws * s + ww * w + we * e) / weightSum;
+    float residual = center - predictor;
+    float residualSnr = abs(residual) / max(1.15 * sigmaY, 1.0 / 255.0);
+    float preserve = yuvResidualPreserve(residualSnr, protection, false);
+    float correction = residual * authority * (1.0 - preserve);
+    float correctionCap = sigmaY * mix(2.10, 1.45, protection);
+    return clamp(center - clamp(correction, -correctionCap, correctionCap), 0.0, 1.0);
 }
 
 float toneMappedYAtOutput(int outputX, int outputY) {
@@ -255,22 +319,164 @@ vec2 inputUvAtOutput(int outputX, int outputY) {
 
 vec2 denoisedUvAtOutput(uint outputX, uint outputY) {
     vec2 center = inputUvAtOutput(int(outputX), int(outputY));
-    float blend = clamp(pc.profileNrChromaBlend, 0.0, 0.85);
-    if (blend <= 1.0e-6) return center;
+    float authority = yuvMeasuredChromaAuthority();
+    if (authority <= 1.0e-6) return center;
+
     vec2 n = inputUvAtOutput(int(outputX), int(outputY) - 2);
     vec2 s = inputUvAtOutput(int(outputX), int(outputY) + 2);
     vec2 w = inputUvAtOutput(int(outputX) - 2, int(outputY));
     vec2 e = inputUvAtOutput(int(outputX) + 2, int(outputY));
-    vec2 localMean = 0.20 * (center + n + s + w + e);
     float yCenter = inputYAtOutput(int(outputX), int(outputY));
-    float structure = 0.25 * (
-        abs(yCenter - inputYAtOutput(int(outputX), int(outputY) - 2)) +
-        abs(yCenter - inputYAtOutput(int(outputX), int(outputY) + 2)) +
-        abs(yCenter - inputYAtOutput(int(outputX) - 2, int(outputY))) +
-        abs(yCenter - inputYAtOutput(int(outputX) + 2, int(outputY))));
-    float protection = clamp(pc.profileNrChromaProtection, 0.0, 1.0);
-    float structureGate = 1.0 - protection * smoothstep(0.015, 0.10, structure);
-    return clamp(mix(center, localMean, blend * structureGate), vec2(0.0), vec2(1.0));
+    float yn = inputYAtOutput(int(outputX), int(outputY) - 2);
+    float ys = inputYAtOutput(int(outputX), int(outputY) + 2);
+    float yw = inputYAtOutput(int(outputX) - 2, int(outputY));
+    float ye = inputYAtOutput(int(outputX) + 2, int(outputY));
+
+    float sigmaY = max(yuvMeasuredSigmaY(), 1.0 / 255.0);
+    vec2 sigmaUv = max(yuvMeasuredSigmaUv(), vec2(0.65 / 255.0));
+    float protection = max(clamp(pc.profileNrChromaProtection, 0.0, 1.0), 0.55);
+    float guideScale = sigmaY * mix(4.00, 2.15, protection) + 2.0 / 255.0;
+    float wn = exp(-0.5 * pow((yn - yCenter) / guideScale, 2.0));
+    float ws = exp(-0.5 * pow((ys - yCenter) / guideScale, 2.0));
+    float ww = exp(-0.5 * pow((yw - yCenter) / guideScale, 2.0));
+    float we = exp(-0.5 * pow((ye - yCenter) / guideScale, 2.0));
+    float weightSum = wn + ws + ww + we;
+    if (weightSum <= 1.0e-5) return center;
+
+    vec2 predictor = (wn * n + ws * s + ww * w + we * e) / weightSum;
+    vec2 residual = center - predictor;
+    vec2 residualSigma = 1.25 * sigmaUv;
+    float q = sqrt(
+        pow(residual.x / max(residualSigma.x, 1.0 / 255.0), 2.0) +
+        pow(residual.y / max(residualSigma.y, 1.0 / 255.0), 2.0));
+    float preserve = yuvResidualPreserve(q, protection, true);
+
+    // Near-black authority is SNR-based rather than an absolute black threshold. A dark
+    // but coherent colour remains untouched when its UV residual is statistically real.
+    float lumaSnr = max(0.0, yCenter) / sigmaY;
+    float nearBlack = 1.0 - smoothstep(4.0, 12.0, lumaSnr);
+    float localAuthority = clamp(authority * (1.0 + 0.25 * nearBlack), 0.0, 0.90);
+    vec2 cap = sigmaUv * mix(vec2(3.20), vec2(2.35), vec2(protection));
+    vec2 correction = residual * localAuthority * (1.0 - preserve);
+    correction = clamp(correction, -cap, cap);
+    return clamp(center - correction, vec2(0.0), vec2(1.0));
+}
+
+float yuvLaplacianY(int x, int y) {
+    float tl = inputYAtOutput(x - 1, y - 1);
+    float t  = inputYAtOutput(x,     y - 1);
+    float tr = inputYAtOutput(x + 1, y - 1);
+    float l  = inputYAtOutput(x - 1, y);
+    float c  = inputYAtOutput(x,     y);
+    float r  = inputYAtOutput(x + 1, y);
+    float bl = inputYAtOutput(x - 1, y + 1);
+    float b  = inputYAtOutput(x,     y + 1);
+    float br = inputYAtOutput(x + 1, y + 1);
+    return abs(tl - 2.0 * t + tr - 2.0 * l + 4.0 * c - 2.0 * r + bl - 2.0 * b + br);
+}
+
+float yuvLocalRangeY(int x, int y) {
+    float mn = 1.0;
+    float mx = 0.0;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            float value = inputYAtOutput(x + dx, y + dy);
+            mn = min(mn, value);
+            mx = max(mx, value);
+        }
+    }
+    return mx - mn;
+}
+
+vec2 yuvLaplacianUv(int x, int y) {
+    vec2 tl = inputUvAtOutput(x - 2, y - 2);
+    vec2 t  = inputUvAtOutput(x,     y - 2);
+    vec2 tr = inputUvAtOutput(x + 2, y - 2);
+    vec2 l  = inputUvAtOutput(x - 2, y);
+    vec2 c  = inputUvAtOutput(x,     y);
+    vec2 r  = inputUvAtOutput(x + 2, y);
+    vec2 bl = inputUvAtOutput(x - 2, y + 2);
+    vec2 b  = inputUvAtOutput(x,     y + 2);
+    vec2 br = inputUvAtOutput(x + 2, y + 2);
+    return abs(tl - 2.0 * t + tr - 2.0 * l + 4.0 * c - 2.0 * r + bl - 2.0 * b + br);
+}
+
+uint yuvHistogramBin(float normalizedLaplacian) {
+    float codeValue = clamp(normalizedLaplacian * 255.0, 0.0, 255.0);
+    return min(uint(floor(codeValue + 0.5)), kYuvHistBins - 1u);
+}
+
+void accumulateYuvResidualSample(uint pixelIndex) {
+    uint x = pixelIndex % pc.outputWidth;
+    uint y = pixelIndex / pc.outputWidth;
+    if ((x & 15u) != 8u || (y & 15u) != 8u) return;
+    if (x < 2u || y < 2u || x + 2u >= pc.outputWidth || y + 2u >= pc.outputHeight) return;
+
+    float flatRange = yuvLocalRangeY(int(x), int(y));
+    if (flatRange <= 32.0 / 255.0) {
+        atomicAdd(ultraHdrTelemetry.values[kYuvHistYBase + yuvHistogramBin(yuvLaplacianY(int(x), int(y)))], 1u);
+        atomicAdd(ultraHdrTelemetry.values[kYuvLumaSamplesWord], 1u);
+    }
+
+    float yc = inputYAtOutput(int(x), int(y));
+    float guideRange = max(max(
+        abs(yc - inputYAtOutput(int(x) - 2, int(y))),
+        abs(yc - inputYAtOutput(int(x) + 2, int(y)))), max(
+        abs(yc - inputYAtOutput(int(x), int(y) - 2)),
+        abs(yc - inputYAtOutput(int(x), int(y) + 2))));
+    if (guideRange <= 32.0 / 255.0) {
+        vec2 lapUv = yuvLaplacianUv(int(x), int(y));
+        atomicAdd(ultraHdrTelemetry.values[kYuvHistUBase + yuvHistogramBin(lapUv.x)], 1u);
+        atomicAdd(ultraHdrTelemetry.values[kYuvHistVBase + yuvHistogramBin(lapUv.y)], 1u);
+        atomicAdd(ultraHdrTelemetry.values[kYuvChromaSamplesWord], 1u);
+    }
+}
+
+float yuvHistogramP35CodeValue(uint base, uint count) {
+    if (count == 0u) return 0.0;
+    uint target = max(1u, (count * 35u + 99u) / 100u);
+    uint cumulative = 0u;
+    for (uint i = 0u; i < kYuvHistBins; ++i) {
+        cumulative += ultraHdrTelemetry.values[base + i];
+        if (cumulative >= target) return float(i);
+    }
+    return float(kYuvHistBins - 1u);
+}
+
+void finalizeYuvResidualModel() {
+    uint yCount = ultraHdrTelemetry.values[kYuvLumaSamplesWord];
+    uint cCount = ultraHdrTelemetry.values[kYuvChromaSamplesWord];
+    float yConfidence = smoothstep(24.0, 256.0, float(yCount));
+    float cConfidence = smoothstep(16.0, 128.0, float(cCount));
+    float confidence = min(yConfidence, cConfidence);
+
+    float sigmaY = yuvHistogramP35CodeValue(kYuvHistYBase, yCount) /
+            (kAbsLaplacianP35ToSigma * 255.0);
+    float sigmaU = yuvHistogramP35CodeValue(kYuvHistUBase, cCount) /
+            (kAbsLaplacianP35ToSigma * 255.0);
+    float sigmaV = yuvHistogramP35CodeValue(kYuvHistVBase, cCount) /
+            (kAbsLaplacianP35ToSigma * 255.0);
+    sigmaY = clamp(sigmaY, 0.0, 0.08);
+    sigmaU = clamp(sigmaU, 0.0, 0.08);
+    sigmaV = clamp(sigmaV, 0.0, 0.08);
+
+    float lumaPressure = smoothstep(0.70, 4.00, sigmaY * 255.0);
+    float sigmaC = sqrt(max(0.0, 0.5 * (sigmaU * sigmaU + sigmaV * sigmaV)));
+    float chromaPressure = smoothstep(0.50, 4.00, sigmaC * 255.0);
+    float measuredLuma = clamp(0.38 * lumaPressure * confidence, 0.0, 0.38);
+    float measuredChroma = clamp(0.70 * chromaPressure * confidence, 0.0, 0.70);
+
+    // Request fields now contain creative profile authority only. The physical baseline is
+    // entirely residual-measured here, so capture ISO cannot double-denoise a vendor-clean YUV.
+    float lumaAuthority = clamp(max(measuredLuma, pc.profileNrLumaBlend), 0.0, 0.75);
+    float chromaAuthority = clamp(max(measuredChroma, pc.profileNrChromaBlend), 0.0, 0.85);
+
+    ultraHdrTelemetry.values[kYuvSigmaYWord] = yuvQ24(sigmaY);
+    ultraHdrTelemetry.values[kYuvSigmaUWord] = yuvQ24(sigmaU);
+    ultraHdrTelemetry.values[kYuvSigmaVWord] = yuvQ24(sigmaV);
+    ultraHdrTelemetry.values[kYuvLumaAuthorityWord] = yuvQ24(lumaAuthority);
+    ultraHdrTelemetry.values[kYuvChromaAuthorityWord] = yuvQ24(chromaAuthority);
+    ultraHdrTelemetry.values[kYuvConfidenceWord] = yuvQ24(confidence);
 }
 
 float profileDetailedYAtOutput(uint outputX, uint outputY) {
@@ -306,13 +512,15 @@ float profileDetailedYAtOutput(uint outputX, uint outputY) {
 vec3 renderRgbUnblurred(uint outputX, uint outputY) {
     uint yValue = uint(clamp(roundEven(profileDetailedYAtOutput(outputX, outputY) * 255.0), 0.0, 255.0));
     vec2 filteredUv = denoisedUvAtOutput(outputX, outputY);
-    int u = int(clamp(roundEven(filteredUv.x * 255.0), 0.0, 255.0)) - 128;
-    int v = int(clamp(roundEven(filteredUv.y * 255.0), 0.0, 255.0)) - 128;
-    int c = max(int(yValue) - 16, 0);
-    int r8 = clamp((298 * c + 409 * v + 128) >> 8, 0, 255);
-    int g8 = clamp((298 * c - 100 * u - 208 * v + 128) >> 8, 0, 255);
-    int b8 = clamp((298 * c + 516 * u + 128) >> 8, 0, 255);
-    return applyProfile(vec3(float(r8), float(g8), float(b8)) / 255.0);
+    float y = float(yValue);
+    float u = clamp(roundEven(filteredUv.x * 255.0), 0.0, 255.0) - 128.0;
+    float v = clamp(roundEven(filteredUv.y * 255.0), 0.0, 255.0) - 128.0;
+    // Android Camera2 default YUV contract: JFIF / Rec.601 full-range -> sRGB.
+    // Do not apply studio/video-range Y-16 scaling to a default Camera2 YUV_420_888 frame.
+    float r8 = clamp(y + 1.402000 * v, 0.0, 255.0);
+    float g8 = clamp(y - 0.344136 * u - 0.714136 * v, 0.0, 255.0);
+    float b8 = clamp(y + 1.772000 * u, 0.0, 255.0);
+    return applyProfile(vec3(r8, g8, b8) / 255.0);
 }
 
 vec3 renderRgbPortrait(uint outputX, uint outputY) {
@@ -414,6 +622,21 @@ float gainLogForMapPixel(uint mapPixelIndex) {
 
 void main() {
     uint blockIndex = gl_GlobalInvocationID.x;
+
+    if (pc.ultraHdrMode == 2u) {
+        uint firstPixel = blockIndex * 4u;
+        for (uint lane = 0u; lane < 4u; ++lane) {
+            uint pixelIndex = firstPixel + lane;
+            if (pixelIndex >= pc.outputPixelCount) break;
+            accumulateYuvResidualSample(pixelIndex);
+        }
+        return;
+    }
+
+    if (pc.ultraHdrMode == 3u) {
+        if (blockIndex == 0u) finalizeYuvResidualModel();
+        return;
+    }
 
     if (pc.ultraHdrMode == 1u) {
         if (pc.gainmapWidth == 0u || pc.gainmapHeight == 0u) return;

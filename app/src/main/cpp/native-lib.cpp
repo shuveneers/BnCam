@@ -737,12 +737,13 @@ void applyYuvPostProcessing(cv::Mat& bgrMat, const LumaPercentiles& inputLuma, c
     const auto profileNrPlan = bncam::profile_nr::resolveProfileNoiseReduction(
             rawCfg.profileNrLuminance, rawCfg.profileNrLuminanceDetail, rawCfg.profileNrLuminanceContrast,
             rawCfg.profileNrColor, rawCfg.profileNrColorDetail, rawCfg.profileNrColorSmoothness);
-    const float physicalYuvNr = std::clamp(rawCfg.yuvLensIsoNoiseReductionBoost, 0.0f, 0.38f);
-    const float effectiveLumaNr = bncam::profile_nr::combineWithResidualHeadroom(
-            physicalYuvNr * 0.75f, profileNrPlan.lumaCreativeBlend, 0.75f);
-    const float effectiveChromaNr = bncam::profile_nr::combineWithResidualHeadroom(
-            physicalYuvNr, profileNrPlan.chromaCreativeBlend *
-                    (0.70f + 0.30f * profileNrPlan.colorSmoothness), 0.85f);
+    // FASE 13: Camera2 YUV is already vendor-ISP processed, so capture ISO is not a
+    // physical residual-noise model. The CPU failsafe keeps creative profile NR only;
+    // the production Vulkan path derives its baseline from measured Y/U/V residuals.
+    const float effectiveLumaNr = std::clamp(profileNrPlan.lumaCreativeBlend, 0.0f, 0.75f);
+    const float effectiveChromaNr = std::clamp(
+            profileNrPlan.chromaCreativeBlend *
+                    (0.70f + 0.30f * profileNrPlan.colorSmoothness), 0.0f, 0.85f);
     const float effectiveNr = std::max(effectiveLumaNr, effectiveChromaNr);
     float sigmaColor = effectiveNr * 80.0f;
     float sigmaSpace = 2.6f + 1.2f * std::max(profileNrPlan.luminance, profileNrPlan.color);
@@ -902,6 +903,16 @@ struct YuvEncodeTiming {
     float yuvResolvedGpuLumaNrProtection = 0.0f;
     float yuvResolvedGpuChromaNrProtection = 0.0f;
 
+    // FASE 13 measured residual-noise and Camera2 color-contract truth.
+    bool yuvResidualNoiseModelAvailable = false;
+    std::uint32_t yuvResidualLumaSamples = 0u;
+    std::uint32_t yuvResidualChromaSamples = 0u;
+    float yuvResidualSigmaY = 0.0f;
+    float yuvResidualSigmaU = 0.0f;
+    float yuvResidualSigmaV = 0.0f;
+    float yuvResidualModelConfidence = 0.0f;
+    std::string yuvColorContract = "CAMERA2_JFIF_REC601_FULL_RANGE_TO_SRGB";
+
     float yuvOutputBgrLumaP0_1 = 0.0f;
     float yuvOutputBgrLumaP1 = 0.0f;
     float yuvOutputBgrLumaP5 = 0.0f;
@@ -990,6 +1001,41 @@ void applyYuvProfileDetailCpuFallback(cv::Mat& bgr, const NativeRenderQualityCon
         }
     });
     rgb32.convertTo(bgr, CV_8UC3, 255.0);
+}
+
+void convertNv21JfifFullToBgr(const cv::Mat& nv21, cv::Mat& bgr) {
+    if (nv21.empty() || nv21.type() != CV_8UC1 || nv21.rows < 3 || nv21.cols < 2) {
+        bgr.release();
+        return;
+    }
+    const int width = nv21.cols;
+    const int height = (nv21.rows * 2) / 3;
+    if (height <= 0 || (height & 1) != 0 || (width & 1) != 0 ||
+        nv21.rows < height + height / 2) {
+        bgr.release();
+        return;
+    }
+    bgr.create(height, width, CV_8UC3);
+    cv::parallel_for_(cv::Range(0, height), [&](const cv::Range& range) {
+        for (int y = range.start; y < range.end; ++y) {
+            const std::uint8_t* yRow = nv21.ptr<std::uint8_t>(y);
+            const std::uint8_t* vuRow = nv21.ptr<std::uint8_t>(height + (y >> 1));
+            cv::Vec3b* dst = bgr.ptr<cv::Vec3b>(y);
+            for (int x = 0; x < width; ++x) {
+                const int uv = (x >> 1) * 2;
+                const float yy = static_cast<float>(yRow[x]);
+                const float vv = static_cast<float>(vuRow[uv]) - 128.0f;
+                const float uu = static_cast<float>(vuRow[uv + 1]) - 128.0f;
+                // Android Camera2 default YUV: JFIF / Rec.601 full-range -> sRGB.
+                const float r = yy + 1.402000f * vv;
+                const float g = yy - 0.344136f * uu - 0.714136f * vv;
+                const float b = yy + 1.772000f * uu;
+                dst[x][0] = cv::saturate_cast<std::uint8_t>(b);
+                dst[x][1] = cv::saturate_cast<std::uint8_t>(g);
+                dst[x][2] = cv::saturate_cast<std::uint8_t>(r);
+            }
+        }
+    });
 }
 
 bool encodeNv21ToJpegCpuFallback(
@@ -1081,7 +1127,7 @@ bool encodeNv21ToJpegCpuFallback(
         std::memcpy(rotatedNv21.data + rotatedY.total(), rotatedVU.data, rotatedVU.total() * 2);
 
         auto stageToBgr = NativeClock::now();
-        cv::cvtColor(rotatedNv21, bgrMat, cv::COLOR_YUV2BGR_NV21);
+        convertNv21JfifFullToBgr(rotatedNv21, bgrMat);
         if (timingOut != nullptr) timingOut->yuvToBgrMs = nativeElapsedMs(stageToBgr);
     } else {
         cv::Mat nv21Mat(static_cast<int>(height + height / 2u), static_cast<int>(width), CV_8UC1, fallbackPtr);
@@ -1095,7 +1141,7 @@ bool encodeNv21ToJpegCpuFallback(
             }
         });
         auto stageToBgr = NativeClock::now();
-        cv::cvtColor(nv21Mat, bgrMat, cv::COLOR_YUV2BGR_NV21);
+        convertNv21JfifFullToBgr(nv21Mat, bgrMat);
         if (timingOut != nullptr) timingOut->yuvToBgrMs = nativeElapsedMs(stageToBgr);
     }
     if (timingOut != nullptr) timingOut->yuvRotateMs = nativeElapsedMs(stageStart);
@@ -1211,21 +1257,20 @@ bool encodeNv21ToJpeg(
             qualityConfig.profileNrColor,
             qualityConfig.profileNrColorDetail,
             qualityConfig.profileNrColorSmoothness);
-    const float physicalYuvNr = std::clamp(qualityConfig.yuvLensIsoNoiseReductionBoost, 0.0f, 0.38f);
-    request.profileNrLumaBlend = bncam::profile_nr::combineWithResidualHeadroom(
-            physicalYuvNr * 0.75f, profileNrPlan.lumaCreativeBlend, 0.75f);
+    // FASE 13 production contract: request fields carry creative profile authority only.
+    // The Vulkan resident analysis derives the baseline from the actual processed YUV frame.
+    request.profileNrLumaBlend = std::clamp(profileNrPlan.lumaCreativeBlend, 0.0f, 0.75f);
     request.profileNrLumaProtection = std::clamp(
             0.45f + 0.40f * profileNrPlan.luminanceDetail +
                     0.20f * profileNrPlan.luminanceContrast, 0.0f, 1.0f);
     const float creativeChroma = profileNrPlan.chromaCreativeBlend *
             (0.70f + 0.30f * profileNrPlan.colorSmoothness);
-    request.profileNrChromaBlend = bncam::profile_nr::combineWithResidualHeadroom(
-            physicalYuvNr, creativeChroma, 0.85f);
+    request.profileNrChromaBlend = std::clamp(creativeChroma, 0.0f, 0.85f);
     request.profileNrChromaProtection = std::clamp(
             0.35f + 0.50f * profileNrPlan.colorDetail, 0.0f, 1.0f);
     if (timingOut != nullptr) {
-        timingOut->yuvResolvedGpuLumaNrBlend = request.profileNrLumaBlend;
-        timingOut->yuvResolvedGpuChromaNrBlend = request.profileNrChromaBlend;
+        timingOut->yuvResolvedGpuLumaNrBlend = 0.0f;
+        timingOut->yuvResolvedGpuChromaNrBlend = 0.0f;
         timingOut->yuvResolvedGpuLumaNrProtection = request.profileNrLumaProtection;
         timingOut->yuvResolvedGpuChromaNrProtection = request.profileNrChromaProtection;
     }
@@ -1272,6 +1317,16 @@ bool encodeNv21ToJpeg(
         timingOut->yuvUltraHdrMeaningfulHeadroom = gpu.ultraHdrMeaningfulHeadroom;
         timingOut->yuvUltraHdrMaxContentBoost = gpu.ultraHdrMaxContentBoost;
         timingOut->yuvUltraHdrStatus = gpu.ultraHdrStatus;
+        timingOut->yuvResidualNoiseModelAvailable = gpu.yuvResidualNoiseModelAvailable;
+        timingOut->yuvResidualLumaSamples = gpu.yuvResidualLumaSamples;
+        timingOut->yuvResidualChromaSamples = gpu.yuvResidualChromaSamples;
+        timingOut->yuvResidualSigmaY = gpu.yuvResidualSigmaY;
+        timingOut->yuvResidualSigmaU = gpu.yuvResidualSigmaU;
+        timingOut->yuvResidualSigmaV = gpu.yuvResidualSigmaV;
+        timingOut->yuvResidualModelConfidence = gpu.yuvResidualModelConfidence;
+        timingOut->yuvResolvedGpuLumaNrBlend = gpu.yuvResidualLumaAuthority;
+        timingOut->yuvResolvedGpuChromaNrBlend = gpu.yuvResidualChromaAuthority;
+        timingOut->yuvColorContract = gpu.yuvColorContract;
         timingOut->yuvPortraitRequested = request.portraitEffectRequested;
         timingOut->yuvPortraitApplied = gpu.portraitEffectApplied;
         timingOut->yuvPortraitStatus = gpu.portraitStatus;
@@ -1310,9 +1365,9 @@ bool encodeNv21ToJpeg(
             timingOut->yuvDefaultColorToneBypassed = true;
             timingOut->yuvGpuPostApplied = true;
             timingOut->yuvDenoiseApplied =
-                    request.profileNrLumaBlend > 0.002f || request.profileNrChromaBlend > 0.002f;
+                    gpu.yuvResidualLumaAuthority > 0.002f || gpu.yuvResidualChromaAuthority > 0.002f;
             timingOut->yuvDenoiseStrengthResolved =
-                    std::max(request.profileNrLumaBlend, request.profileNrChromaBlend);
+                    std::max(gpu.yuvResidualLumaAuthority, gpu.yuvResidualChromaAuthority);
             timingOut->yuvPostBypassReason = "vulkan_yuv_single_frame_isp";
             timingOut->yuvToneAlignmentApplied = true;
             timingOut->yuvToneLutSize = 256;
@@ -2228,7 +2283,11 @@ Java_com_bncam_core_engine_ImageUtils_processNativeYuv(
     yuvQuality.profileColorContrast = std::isfinite(profileColorContrast) ? std::clamp(profileColorContrast, -1.0f, 1.0f) : 0.0f;
     yuvQuality.profilePresenceVibrance = std::isfinite(profilePresenceVibrance) ? std::clamp(profilePresenceVibrance, -1.0f, 1.0f) : 0.0f;
     yuvQuality.profileDetailAmount = std::isfinite(profileDetailAmount) ? std::clamp(profileDetailAmount, 0.0f, 1.0f) : bncam::profile_defaults::kDetailAmount;
-    yuvQuality.profileDetailRadius = std::isfinite(profileDetailRadius) ? std::clamp(profileDetailRadius, bncam::profile_defaults::kDetailMinRadius, bncam::profile_defaults::kDetailMaxRadius) : bncam::profile_defaults::kDetailRadius;
+    yuvQuality.profileDetailRadius = yuvQuality.profileDetailAmount > 1.0e-6f
+            ? (std::isfinite(profileDetailRadius)
+                    ? std::clamp(profileDetailRadius, bncam::profile_defaults::kDetailMinRadius, bncam::profile_defaults::kDetailMaxRadius)
+                    : std::max(bncam::profile_defaults::kDetailRadius, bncam::profile_defaults::kDetailMinRadius))
+            : 0.0f;
     yuvQuality.profileDetailDetail = std::isfinite(profileDetailDetail) ? std::clamp(profileDetailDetail, 0.0f, 1.0f) : bncam::profile_defaults::kDetailDetail;
     yuvQuality.profileDetailMasking = std::isfinite(profileDetailMasking) ? std::clamp(profileDetailMasking, 0.0f, 1.0f) : bncam::profile_defaults::kDetailMasking;
     yuvQuality.profileNrLuminance = std::isfinite(profileNrLuminance) ? std::clamp(profileNrLuminance, 0.0f, 1.0f) : 0.0f;
@@ -2262,19 +2321,10 @@ Java_com_bncam_core_engine_ImageUtils_processNativeYuv(
     yuvQuality.toneCurve = extractCurveVector(env, toneCurveArray, 2, 64);
     yuvQuality.gammaCurve = extractCurveVector(env, gammaCurveArray, 2, 64);
     yuvQuality.sectionCurve = extractCurveVector(env, sectionCurveArray, 2, 64);
-    {
-        const int mode = std::clamp(yuvQuality.lensIsoNrMode, 0, 2);
-        const float effectiveIso = mode == 2 && yuvQuality.lensManualIsoValue > 0.0f
-                ? yuvQuality.lensManualIsoValue
-                : static_cast<float>(yuvQuality.captureSensitivityIso);
-        if (mode > 0 && std::isfinite(effectiveIso) && effectiveIso > 0.0f) {
-            const float isoStopsOverBase = std::max(0.0f, std::log2(std::max(100.0f, effectiveIso) / 100.0f));
-            const float isoWeight = std::clamp(isoStopsOverBase / 4.0f, 0.0f, 1.0f);
-            const float coeff = mode == 1 ? yuvQuality.lensDynamicIsoCoeff : 1.0f;
-            yuvQuality.yuvLensIsoNoiseReductionBoost = std::clamp(coeff * isoWeight * 0.38f, 0.0f, 0.38f);
-            yuvQuality.yuvLensIsoNrApplied = yuvQuality.yuvLensIsoNoiseReductionBoost > 0.002f;
-        }
-    }
+    // FASE 13: retire ISO-derived YUV "physical NR". Camera2 YUV has already passed
+    // through the vendor ISP; only the measured residual frame can establish baseline NR.
+    yuvQuality.yuvLensIsoNoiseReductionBoost = 0.0f;
+    yuvQuality.yuvLensIsoNrApplied = false;
 
     LOGI("NATIVE BRIDGE: YUV engine started with %zu frame(s), lens=%s, jpegQuality=%d", hwBuffers.size(), lensId.c_str(), yuvQuality.jpegQuality);
 
@@ -2667,6 +2717,14 @@ Java_com_bncam_core_engine_ImageUtils_processNativeYuv(
           << ";yuvSingleFrameGpuExecutionWallMs=" << nativeFmtMs(encodeTiming.yuvIspGpuExecutionWallMs)
           << ";yuvSingleFrameGpuSyncMs=" << nativeFmtMs(encodeTiming.yuvIspGpuSyncMs)
           << ";yuvSingleFramePublicationReadbackMs=" << nativeFmtMs(encodeTiming.yuvIspPublicationReadbackMs)
+          << ";yuvColorContract=" << encodeTiming.yuvColorContract
+          << ";yuvResidualNoiseModelAvailable=" << (encodeTiming.yuvResidualNoiseModelAvailable ? "true" : "false")
+          << ";yuvResidualLumaSamples=" << encodeTiming.yuvResidualLumaSamples
+          << ";yuvResidualChromaSamples=" << encodeTiming.yuvResidualChromaSamples
+          << ";yuvResidualSigmaY=" << nativeFmtMs(encodeTiming.yuvResidualSigmaY)
+          << ";yuvResidualSigmaU=" << nativeFmtMs(encodeTiming.yuvResidualSigmaU)
+          << ";yuvResidualSigmaV=" << nativeFmtMs(encodeTiming.yuvResidualSigmaV)
+          << ";yuvResidualModelConfidence=" << nativeFmtMs(encodeTiming.yuvResidualModelConfidence)
           << ";yuvSingleFrameResidentLumaConsumed=" << (encodeTiming.yuvIspResidentLumaConsumed ? "true" : "false")
           << ";yuvSingleFrameResidentLumaGeneration=" << encodeTiming.yuvIspResidentLumaGeneration
           << ";yuvUltraHdrRequested=" << (encodeTiming.yuvUltraHdrRequested ? "true" : "false")
@@ -2712,7 +2770,7 @@ Java_com_bncam_core_engine_ImageUtils_processNativeYuv(
           << ";profileDetailRadius=" << yuvQuality.profileDetailRadius
           << ";profileDetailDetail=" << yuvQuality.profileDetailDetail
           << ";profileDetailMasking=" << yuvQuality.profileDetailMasking
-          << ";toneMode=NEUTRAL_YUV_LUMA"
+          << ";toneMode=CAMERA2_YUV_IDENTITY_LUMA"
           << ";rawToneDefaultsUsed=false"
           << ";legacyNativeToneLaneRemoved=true"
           << ";highlightRolloffApplied=true"

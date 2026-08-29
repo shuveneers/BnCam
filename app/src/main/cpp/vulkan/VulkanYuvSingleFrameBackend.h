@@ -39,11 +39,14 @@ struct YuvSingleFrameIspRequest {
     float saturation = 0.0f;
     float contrast = 0.0f;
     float vibrance = 0.0f;
-    float profileDetailAmount = 0.40f;
-    float profileDetailRadius = 1.00f;
-    float profileDetailDetail = 0.25f;
-    float profileDetailMasking = 0.00f;
-    // Effective YUV NR scalars resolved from physical ISO NR + Lightroom NR.
+    // Profile-owned output detail is true identity by default. FASE 11/12 RAW detail
+    // ownership must never leak an old hidden sharpening default into the YUV route.
+    float profileDetailAmount = 0.0f;
+    float profileDetailRadius = 0.0f;
+    float profileDetailDetail = 0.0f;
+    float profileDetailMasking = 0.0f;
+    // Creative profile NR ceilings only. FASE 13 derives the baseline from measured
+    // residual Y/U/V evidence on GPU; capture ISO is not a physical YUV noise model.
     float profileNrLumaBlend = 0.0f;
     float profileNrLumaProtection = 0.65f;
     float profileNrChromaBlend = 0.0f;
@@ -83,6 +86,17 @@ struct YuvSingleFrameIspResult {
     float ultraHdrOffsetHdr = 1.0f / 64.0f;
     std::vector<std::uint8_t> ultraHdrGainmapBytes;
     std::string ultraHdrStatus = "NOT_REQUESTED";
+    // FASE 13: compact GPU residual-noise model for the vendor-processed YUV frame.
+    bool yuvResidualNoiseModelAvailable = false;
+    std::uint32_t yuvResidualLumaSamples = 0u;
+    std::uint32_t yuvResidualChromaSamples = 0u;
+    float yuvResidualSigmaY = 0.0f;
+    float yuvResidualSigmaU = 0.0f;
+    float yuvResidualSigmaV = 0.0f;
+    float yuvResidualModelConfidence = 0.0f;
+    float yuvResidualLumaAuthority = 0.0f;
+    float yuvResidualChromaAuthority = 0.0f;
+    std::string yuvColorContract = "CAMERA2_JFIF_REC601_FULL_RANGE_TO_SRGB";
     bool portraitEffectRequested = false;
     bool portraitEffectApplied = false;
     std::string portraitStatus = "NOT_REQUESTED";
