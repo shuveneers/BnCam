@@ -1,5 +1,6 @@
 #include "ProfileColorManagement.h"
 #include "SrgbByteLut.h"
+#include "Bgr8PublicationStats.h"
 #include "JpegEncodingPolicy.h"
 #include "IspCore.h"
 #include "RawCfaLevelMapping.h"
@@ -10498,6 +10499,7 @@ struct StripedResidentPostDemosaicExecution {
     std::uint64_t persistentAllocationGeneration = 0u;
     std::array<std::uint64_t, 16> spatialCounters{};
     std::array<std::uint64_t, 16> visibleCounters{};
+    bncam::publication::Bgr8PublicationStats publicationStats{};
     float maximumLumaDelta = 0.0f;
     float maximumChromaDelta = 0.0f;
     float maximumColourShift = 0.0f;
@@ -10518,6 +10520,7 @@ bool copyResidentPostDemosaicPublicationToBgr8(
         int width,
         bool& packedPublicationUsed,
         bool& floatFallbackUsed,
+        bncam::publication::Bgr8PublicationStats* publicationStats,
         std::string& failureReason
 ) {
     if (execution.outputMappedPointer == nullptr || output.empty() || output.type() != CV_8UC3 ||
@@ -10537,10 +10540,48 @@ bool copyResidentPostDemosaicPublicationToBgr8(
             return false;
         }
         const auto* sourceData = static_cast<const std::uint8_t*>(execution.outputMappedPointer);
-        for (int localY = 0; localY < outputRows; ++localY) {
-            std::uint8_t* destination = output.ptr<std::uint8_t>(outputStartY + localY);
-            const std::uint8_t* source = sourceData + static_cast<std::size_t>(localY) * rowStride;
-            std::memcpy(destination, source, publishedRowBytes);
+        if (publicationStats != nullptr) {
+            std::atomic<std::uint64_t> pixelCount{0u};
+            std::atomic<std::uint64_t> redClipped{0u};
+            std::atomic<std::uint64_t> greenClipped{0u};
+            std::atomic<std::uint64_t> blueClipped{0u};
+            std::atomic<std::uint64_t> redSum{0u};
+            std::atomic<std::uint64_t> greenSum{0u};
+            std::atomic<std::uint64_t> blueSum{0u};
+            cv::parallel_for_(cv::Range(0, outputRows), [&](const cv::Range& range) {
+                bncam::publication::Bgr8PublicationStats localStats{};
+                for (int localY = range.start; localY < range.end; ++localY) {
+                    std::uint8_t* destination = output.ptr<std::uint8_t>(outputStartY + localY);
+                    const std::uint8_t* source = sourceData +
+                            static_cast<std::size_t>(localY) * rowStride;
+                    std::memcpy(destination, source, publishedRowBytes);
+                    // The exact final-output telemetry is consumed while the source row is
+                    // already cache-hot from the mandatory GPU->BGR8 publication copy.
+                    bncam::publication::accumulateBgr8Row(
+                            source, static_cast<std::size_t>(width), localStats);
+                }
+                pixelCount.fetch_add(localStats.pixelCount, std::memory_order_relaxed);
+                redClipped.fetch_add(localStats.redClipped, std::memory_order_relaxed);
+                greenClipped.fetch_add(localStats.greenClipped, std::memory_order_relaxed);
+                blueClipped.fetch_add(localStats.blueClipped, std::memory_order_relaxed);
+                redSum.fetch_add(localStats.redSum, std::memory_order_relaxed);
+                greenSum.fetch_add(localStats.greenSum, std::memory_order_relaxed);
+                blueSum.fetch_add(localStats.blueSum, std::memory_order_relaxed);
+            });
+            publicationStats->pixelCount = pixelCount.load(std::memory_order_relaxed);
+            publicationStats->redClipped = redClipped.load(std::memory_order_relaxed);
+            publicationStats->greenClipped = greenClipped.load(std::memory_order_relaxed);
+            publicationStats->blueClipped = blueClipped.load(std::memory_order_relaxed);
+            publicationStats->redSum = redSum.load(std::memory_order_relaxed);
+            publicationStats->greenSum = greenSum.load(std::memory_order_relaxed);
+            publicationStats->blueSum = blueSum.load(std::memory_order_relaxed);
+        } else {
+            for (int localY = 0; localY < outputRows; ++localY) {
+                std::uint8_t* destination = output.ptr<std::uint8_t>(outputStartY + localY);
+                const std::uint8_t* source = sourceData +
+                        static_cast<std::size_t>(localY) * rowStride;
+                std::memcpy(destination, source, publishedRowBytes);
+            }
         }
         packedPublicationUsed = true;
         return true;
@@ -10556,6 +10597,7 @@ bool copyResidentPostDemosaicPublicationToBgr8(
             return false;
         }
         const auto* sourceBytes = static_cast<const std::uint8_t*>(execution.outputMappedPointer);
+        bncam::publication::Bgr8PublicationStats fallbackStats{};
         for (int localY = 0; localY < outputRows; ++localY) {
             const auto* source = reinterpret_cast<const float*>(
                     sourceBytes + static_cast<std::size_t>(localY) * rowStride);
@@ -10574,7 +10616,12 @@ bool copyResidentPostDemosaicPublicationToBgr8(
                         ? cv::saturate_cast<std::uint8_t>(std::clamp(r, 0.0f, 1.0f) * 255.0f)
                         : quantizeSrgb8(r);
             }
+            if (publicationStats != nullptr) {
+                bncam::publication::accumulateBgr8Row(
+                        destination, static_cast<std::size_t>(width), fallbackStats);
+            }
         }
+        if (publicationStats != nullptr) *publicationStats = fallbackStats;
         floatFallbackUsed = true;
         return true;
     }
@@ -10790,10 +10837,12 @@ StripedResidentPostDemosaicExecution executeStripedResidentPostDemosaic(
         }
 
         std::string publicationFailure;
+        bncam::publication::Bgr8PublicationStats stripPublicationStats{};
         if (!copyResidentPostDemosaicPublicationToBgr8(
                     execution, output, strip.outputStartY, strip.outputRowCount,
                     immutableInput.cols, aggregate.packedBgr8PublicationUsed,
-                    aggregate.floatPublicationFallbackUsed, publicationFailure)) {
+                    aggregate.floatPublicationFallbackUsed, &stripPublicationStats,
+                    publicationFailure)) {
             aggregate.status = "RESIDENT_POST_DEMOSAIC_PUBLICATION_UNAVAILABLE";
             aggregate.failureReason = publicationFailure;
             aggregate.totalMs = elapsedMs(totalStarted);
@@ -10801,6 +10850,8 @@ StripedResidentPostDemosaicExecution executeStripedResidentPostDemosaic(
         }
         aggregate.outputBytes += execution.outputBytes;
         aggregate.outputSrgbEncoded = true;
+        bncam::publication::mergeBgr8PublicationStats(
+                aggregate.publicationStats, stripPublicationStats);
         for (std::size_t index = 0; index < aggregate.spatialCounters.size(); ++index) {
             aggregate.spatialCounters[index] += execution.spatialCounters[index];
             aggregate.visibleCounters[index] += execution.visibleCounters[index];
@@ -11046,7 +11097,7 @@ StripedResidentPostDemosaicExecution executeResidentTonePostDemosaic(
     if (!copyResidentPostDemosaicPublicationToBgr8(
                 execution, output, 0, height, width,
                 aggregate.packedBgr8PublicationUsed, aggregate.floatPublicationFallbackUsed,
-                publicationFailure)) {
+                &aggregate.publicationStats, publicationFailure)) {
         aggregate.status = "RESIDENT_TONE_POST_DEMOSAIC_PUBLICATION_UNAVAILABLE";
         aggregate.failureReason = publicationFailure;
         aggregate.totalMs = elapsedMs(totalStarted);
@@ -17395,6 +17446,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     bool residentLegacySharpenApplied = false;
     bool residentOutputSrgbEncoded = false;
     cv::Mat residentPublishedBgr8;
+    bncam::publication::Bgr8PublicationStats residentPublicationStats{};
     float residentLegacySharpenGpuMs = 0.0f;
     float finalOutSpatialNrMs = 0.0f;
 
@@ -17593,6 +17645,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
 
         if (residentExecution.success) {
             residentPublishedBgr8 = std::move(residentGpuOutput);
+            residentPublicationStats = residentExecution.publicationStats;
             linearRgb.release();
             residentPostDemosaicApplied = true;
             residentLegacySharpenApplied = residentExecution.legacySharpenApplied;
@@ -18167,38 +18220,39 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     std::atomic<uint64_t> toneGreenSum{0};
     std::atomic<uint64_t> toneBlueSum{0};
 
+    std::string finalOutputStatsSource = "CPU_QUANTIZATION_FUSED_EXACT";
     if (!residentPublishedBgr8.empty()) {
-        // FASE 15: resident visible-chroma now fuses exact-LUT sRGB/BGR8 publication.
-        // The host consumes only 3 bytes/pixel and never materializes the final CV_32FC3 frame.
+        // FASE 15: exact final-output telemetry is fused into the mandatory resident
+        // GPU->BGR8 publication copy. A second full-frame CPU scan is retained only
+        // as an exact fail-safe if the publication contract is ever incomplete.
         bgr8 = std::move(residentPublishedBgr8);
-        cv::parallel_for_(cv::Range(0, bgr8.rows), [&](const cv::Range& range) {
-            uint64_t localRedClipped = 0;
-            uint64_t localGreenClipped = 0;
-            uint64_t localBlueClipped = 0;
-            uint64_t localRedSum = 0;
-            uint64_t localGreenSum = 0;
-            uint64_t localBlueSum = 0;
-            for (int y = range.start; y < range.end; ++y) {
-                const uint8_t* row = bgr8.ptr<uint8_t>(y);
-                for (int x = 0; x < bgr8.cols; ++x) {
-                    const uint8_t outB = row[x * 3 + 0];
-                    const uint8_t outG = row[x * 3 + 1];
-                    const uint8_t outR = row[x * 3 + 2];
-                    if (outR >= 254u) ++localRedClipped;
-                    if (outG >= 254u) ++localGreenClipped;
-                    if (outB >= 254u) ++localBlueClipped;
-                    localRedSum += outR;
-                    localGreenSum += outG;
-                    localBlueSum += outB;
+        const std::uint64_t residentPixelCount = static_cast<std::uint64_t>(bgr8.total());
+        if (bncam::publication::hasCompleteBgr8PublicationStats(
+                    residentPublicationStats, residentPixelCount)) {
+            finalRedClipped.store(residentPublicationStats.redClipped, std::memory_order_relaxed);
+            finalGreenClipped.store(residentPublicationStats.greenClipped, std::memory_order_relaxed);
+            finalBlueClipped.store(residentPublicationStats.blueClipped, std::memory_order_relaxed);
+            toneRedSum.store(residentPublicationStats.redSum, std::memory_order_relaxed);
+            toneGreenSum.store(residentPublicationStats.greenSum, std::memory_order_relaxed);
+            toneBlueSum.store(residentPublicationStats.blueSum, std::memory_order_relaxed);
+            finalOutputStatsSource = "RESIDENT_PUBLICATION_COPY_FUSED_EXACT";
+        } else {
+            finalOutputStatsSource = "RESIDENT_BGR8_RESCAN_EXACT_FAILSAFE";
+            cv::parallel_for_(cv::Range(0, bgr8.rows), [&](const cv::Range& range) {
+                bncam::publication::Bgr8PublicationStats localStats{};
+                for (int y = range.start; y < range.end; ++y) {
+                    bncam::publication::accumulateBgr8Row(
+                            bgr8.ptr<std::uint8_t>(y),
+                            static_cast<std::size_t>(bgr8.cols), localStats);
                 }
-            }
-            finalRedClipped.fetch_add(localRedClipped, std::memory_order_relaxed);
-            finalGreenClipped.fetch_add(localGreenClipped, std::memory_order_relaxed);
-            finalBlueClipped.fetch_add(localBlueClipped, std::memory_order_relaxed);
-            toneRedSum.fetch_add(localRedSum, std::memory_order_relaxed);
-            toneGreenSum.fetch_add(localGreenSum, std::memory_order_relaxed);
-            toneBlueSum.fetch_add(localBlueSum, std::memory_order_relaxed);
-        });
+                finalRedClipped.fetch_add(localStats.redClipped, std::memory_order_relaxed);
+                finalGreenClipped.fetch_add(localStats.greenClipped, std::memory_order_relaxed);
+                finalBlueClipped.fetch_add(localStats.blueClipped, std::memory_order_relaxed);
+                toneRedSum.fetch_add(localStats.redSum, std::memory_order_relaxed);
+                toneGreenSum.fetch_add(localStats.greenSum, std::memory_order_relaxed);
+                toneBlueSum.fetch_add(localStats.blueSum, std::memory_order_relaxed);
+            });
+        }
     } else {
         bgr8 = cv::Mat(linearRgb.size(), CV_8UC3);
         cv::parallel_for_(cv::Range(0, linearRgb.rows), [&](const cv::Range& range) {
@@ -19839,6 +19893,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; sharpenBackend=RETIRED_PHASE11_LINEAR_DETAIL_OWNER"
             << "; residentOutputSrgbEncoded=" << (residentOutputSrgbEncoded ? "true" : "false")
             << "; sharpenReason=" << downstreamIspState.resultStatus
+            << "; finalOutputStatsSource=" << finalOutputStatsSource
             << "; finalRedClippedPct=" << finalRedClippedPct
             << "; finalGreenClippedPct=" << finalGreenClippedPct
             << "; finalBlueClippedPct=" << finalBlueClippedPct
