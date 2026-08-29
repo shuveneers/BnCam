@@ -64,7 +64,7 @@ static_assert(sizeof(PushConstants) == 128u, "resident tone push constants misma
 
 [[maybe_unused]] constexpr std::uint32_t kDisplayGridWidth = 32u;
 [[maybe_unused]] constexpr std::uint32_t kDisplayGridHeight = 24u;
-[[maybe_unused]] constexpr std::uint32_t kTelemetryWords = 40u;
+[[maybe_unused]] constexpr std::uint32_t kTelemetryWords = 64u;
 constexpr std::size_t kToneLutFloats = 4096u * 2u;
 
 constexpr std::uint32_t kFllfMaxLevels = 6u;
@@ -311,7 +311,7 @@ bool VulkanSpectraResidentToneBackend::initializeLocked(
     VkQueryPoolCreateInfo qi{};
     qi.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
     qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
-    qi.queryCount = 10u;
+    qi.queryCount = 12u;
     if (vkCreateQueryPool(device, &qi, nullptr, &queryPool_) != VK_SUCCESS) queryPool_ = VK_NULL_HANDLE;
     initialized_ = true;
     initializedDevice_ = device;
@@ -395,6 +395,18 @@ SpectraResidentSceneObserverResult VulkanSpectraResidentToneBackend::executeScen
     const float preToneChroma444Strength = std::clamp(request.preToneChroma444Strength, 0.0f, 0.94f);
     const bool preToneChroma444Requested = request.preToneChroma444Enabled &&
             preToneChroma444Strength > 1.0e-4f;
+    const bool preToneChromaCovarianceWhiteningRequested = preToneChroma444Requested &&
+            request.preToneChromaCovarianceWhiteningEnabled &&
+            std::isfinite(request.preToneChromaVarianceY) && request.preToneChromaVarianceY > 1.0e-14f &&
+            std::isfinite(request.preToneChromaVarianceC1) && request.preToneChromaVarianceC1 > 1.0e-14f &&
+            std::isfinite(request.preToneChromaVarianceC2) && request.preToneChromaVarianceC2 > 1.0e-14f &&
+            std::isfinite(request.preToneChromaCovarianceC1C2) &&
+            std::isfinite(request.preToneChromaReferenceSignal) && request.preToneChromaReferenceSignal > 0.0f &&
+            std::isfinite(request.preToneChromaShotNoiseFraction) &&
+            std::isfinite(request.preToneChromaModelConfidence) && request.preToneChromaModelConfidence >= 0.10f &&
+            std::isfinite(request.preToneChromaFullShrinkSigma) &&
+            std::isfinite(request.preToneChromaPreserveSigma) &&
+            request.preToneChromaPreserveSigma > request.preToneChromaFullShrinkSigma;
     if (residentInputBytes < rgbBytes) {
         result.status = "GPU_SCENE_OBSERVER_RESIDENT_INPUT_TOO_SMALL";
         result.failureReason = "RESIDENT_RGB_BYTES_BELOW_FRAME_REQUIREMENT";
@@ -475,6 +487,18 @@ SpectraResidentSceneObserverResult VulkanSpectraResidentToneBackend::executeScen
     push.displayOffsetFloats = result.sampleCount * 3u;
     push.presenceReserved0 = preToneChroma444Requested ? 1u : 0u;
     push.presenceReserved1 = preToneChroma444Strength;
+    // Mode-0-only aliases. Keep the push block at the portable 128-byte Vulkan minimum while
+    // supplying the exact propagated physical covariance needed for whitened chroma shrinkage.
+    push.portraitEnabled = preToneChromaCovarianceWhiteningRequested ? 1u : 0u;
+    push.exposureGain = std::max(0.0f, request.preToneChromaVarianceY);
+    push.rawJpegBaseVibrance = std::max(0.0f, request.preToneChromaVarianceC1);
+    push.profileSaturation = std::max(0.0f, request.preToneChromaVarianceC2);
+    push.profileContrast = request.preToneChromaCovarianceC1C2;
+    push.profileVibrance = std::clamp(request.preToneChromaReferenceSignal, 1.0e-4f, 2.0f);
+    push.portraitTargetLeft = std::clamp(request.preToneChromaShotNoiseFraction, 0.0f, 1.0f);
+    push.portraitTargetTop = std::clamp(request.preToneChromaModelConfidence, 0.0f, 1.0f);
+    push.portraitTargetRight = std::max(0.50f, request.preToneChromaFullShrinkSigma);
+    push.portraitTargetBottom = std::max(push.portraitTargetRight + 0.25f, request.preToneChromaPreserveSigma);
     // Mode 0 owns no tone shoulder. Reuse these two existing push slots only for
     // measured physical-noise and WB+CCM amplification evidence. Delta 0066 removes
     // all demosaic-family / RAW-format authority heuristics from Phase 9.
@@ -587,6 +611,24 @@ SpectraResidentSceneObserverResult VulkanSpectraResidentToneBackend::executeScen
             std::isfinite(preToneChromaMaxCorrection) && preToneChromaMaxCorrection >= 0.0f
                     ? preToneChromaMaxCorrection
                     : 0.0f;
+    result.preToneChromaCovarianceEvaluatedPixels = telemetry[56];
+    result.preToneChromaNearBlackPixels = telemetry[57];
+    result.preToneChromaStrongShrinkPixels = telemetry[58];
+    result.preToneChromaPreservedEvidencePixels = telemetry[59];
+    float maximumMahalanobisRadius = 0.0f;
+    std::memcpy(&maximumMahalanobisRadius, &telemetry[60], sizeof(maximumMahalanobisRadius));
+    result.preToneChromaMaxMahalanobisRadius =
+            std::isfinite(maximumMahalanobisRadius) && maximumMahalanobisRadius >= 0.0f
+                    ? maximumMahalanobisRadius : 0.0f;
+    if (telemetry[63] > 0u) {
+        result.preToneChromaMeanShrinkAuthority =
+                static_cast<float>(telemetry[61]) /
+                (4095.0f * static_cast<float>(telemetry[63]));
+    }
+    result.preToneChromaCovarianceFallbackPixels = telemetry[62];
+    result.preToneChromaCovarianceWhiteningApplied =
+            preToneChromaCovarianceWhiteningRequested &&
+            result.preToneChromaCovarianceEvaluatedPixels > 0u;
     result.compactReadbackMs = elapsedMs(readStart);
     result.residentInputUsed = true;
     residentSceneGeneration_++;
@@ -686,6 +728,10 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
             request.linearDetailAuthority > 1.0e-4f && request.linearDetailNoiseSigmaY > 0.0f &&
             request.linearDetailModelConfidence >= 0.15f;
     result.linearDetailRequested = linearDetailRequested;
+    const bool perceptualDetailRequested = request.isRawBayer && request.perceptualDetailEnabled &&
+            request.perceptualDetailAuthority > 1.0e-4f && request.perceptualDetailNoiseSigmaY > 0.0f &&
+            request.perceptualDetailModelConfidence >= 0.15f;
+    result.perceptualDetailRequested = perceptualDetailRequested;
     const FllfPyramidLayout fllfLayout = buildFllfPyramidLayout(
             request.frameWidth, request.frameHeight, request.fllfPyramidLevels);
     const std::uint64_t fllfScalarBytes = fllfLayout.totalFloats * sizeof(float);
@@ -703,7 +749,7 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
         (ultraHdrRequested && !ensureBufferLocked(allocator_, mapPixels * sizeof(float), 0u, ultraHdrGainLog_, reallocated, failure)) ||
         (ultraHdrRequested && !ensureBufferLocked(allocator_, packedBytes, readAccess, ultraHdrGainmapPacked_, reallocated, failure)) ||
         (portraitRequested && !ensureBufferLocked(allocator_, portraitMaskPixels * sizeof(float), writeAccess, portraitMask_, reallocated, failure)) ||
-        ((portraitRequested || linearDetailRequested) && !ensureBufferLocked(allocator_, rgbBytes, 0u, portraitBlurRgb_, reallocated, failure)) ||
+        ((portraitRequested || linearDetailRequested || perceptualDetailRequested) && !ensureBufferLocked(allocator_, rgbBytes, 0u, portraitBlurRgb_, reallocated, failure)) ||
         (localToneRequested && !ensureBufferLocked(allocator_, mapPixels * sizeof(float), 0u, localToneBase_, reallocated, failure)) ||
         (fllfRequested && (!ensureBufferLocked(allocator_, std::max<std::uint64_t>(fllfScalarBytes, 16u), 0u, fllfGaussian_, reallocated, failure) ||
                            !ensureBufferLocked(allocator_, std::max<std::uint64_t>(fllfScalarBytes, 16u), 0u, fllfCorrection_, reallocated, failure)))) {
@@ -724,6 +770,7 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
             ? fllfGaussian_.capacityBytes + fllfCorrection_.capacityBytes
             : 0u;
     result.linearDetailScratchBytes = linearDetailRequested ? portraitBlurRgb_.capacityBytes : 0u;
+    result.perceptualDetailScratchBytes = perceptualDetailRequested ? portraitBlurRgb_.capacityBytes : 0u;
     const auto uploadStart = Clock::now();
     std::memcpy(toneLut_.mapped, request.toneLut, kToneLutFloats * sizeof(float));
     vmaFlushAllocation(allocator_, toneLut_.allocation, 0u, kToneLutFloats * sizeof(float));
@@ -764,7 +811,8 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
     vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr, 2u, ready, 0u, nullptr);
     // Reset tone/gainmap/local-adaptation/detail telemetry while preserving Phase-9 scene-observer
-    // tile count [0]. FLLF owns [8..19]; Phase-11 detail policy/evidence owns [20..38].
+    // tile count [0]. FLLF owns [8..19]; Phase-11 owns [20..38]; Phase-12 owns [39..55].
+    // Mode-0 near-black covariance telemetry uses [56..63] and is read before this tone reset.
     vkCmdFillBuffer(commandBuffer_, telemetry_.buffer, sizeof(std::uint32_t),
                     (kTelemetryWords - 1u) * sizeof(std::uint32_t), 0u);
     if (localToneRequested) {
@@ -814,6 +862,22 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
         std::memcpy(detailBits, detailValues, sizeof(detailBits));
         vkCmdUpdateBuffer(commandBuffer_, telemetry_.buffer,
                           20u * sizeof(std::uint32_t), sizeof(detailBits), detailBits);
+    }
+    if (perceptualDetailRequested) {
+        const float perceptualValues[9] = {
+                std::clamp(request.perceptualDetailAuthority, 0.0f, 0.46f),
+                std::clamp(request.perceptualDetailRadius, 0.50f, 3.00f),
+                std::clamp(request.perceptualDetailEmphasis, 0.0f, 1.0f),
+                std::clamp(request.perceptualDetailMasking, 0.0f, 1.0f),
+                std::max(1.0e-7f, request.perceptualDetailNoiseSigmaY),
+                std::max(0.5f, request.perceptualDetailMinimumResidualSnr),
+                std::max(0.4f, request.perceptualDetailMinimumGradientSnr),
+                std::clamp(request.perceptualDetailHardHaloLimit, 0.003f, 0.02f),
+                std::clamp(request.perceptualDetailModelConfidence, 0.0f, 1.0f)};
+        std::uint32_t perceptualBits[9]{};
+        std::memcpy(perceptualBits, perceptualValues, sizeof(perceptualBits));
+        vkCmdUpdateBuffer(commandBuffer_, telemetry_.buffer,
+                          39u * sizeof(std::uint32_t), sizeof(perceptualBits), perceptualBits);
     }
     VkBufferMemoryBarrier telemetryReady{};
     telemetryReady.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
@@ -1114,6 +1178,68 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
         vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, fllfRequested ? 5u : 1u);
     }
 
+    if (perceptualDetailRequested) {
+        if (queryPool_ != VK_NULL_HANDLE) {
+            vkCmdResetQueryPool(commandBuffer_, queryPool_, 10u, 2u);
+            vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 10u);
+        }
+        VkBufferMemoryBarrier toneToPerceptual[2]{};
+        toneToPerceptual[0].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        toneToPerceptual[0].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        toneToPerceptual[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        toneToPerceptual[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toneToPerceptual[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toneToPerceptual[0].buffer = workingRgb_.buffer;
+        toneToPerceptual[0].size = static_cast<VkDeviceSize>(rgbBytes);
+        toneToPerceptual[1].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        toneToPerceptual[1].srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        toneToPerceptual[1].dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        toneToPerceptual[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toneToPerceptual[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toneToPerceptual[1].buffer = portraitBlurRgb_.buffer;
+        toneToPerceptual[1].size = static_cast<VkDeviceSize>(rgbBytes);
+        vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u,
+                             0u, nullptr, 2u, toneToPerceptual, 0u, nullptr);
+
+        push.mode = 16u;
+        vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
+                           0u, sizeof(push), &push);
+        vkCmdDispatch(commandBuffer_, (request.frameWidth + 15u) / 16u,
+                       (request.frameHeight + 15u) / 16u, 1u);
+        VkBufferMemoryBarrier perceptualProposalReady{};
+        perceptualProposalReady.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        perceptualProposalReady.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        perceptualProposalReady.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        perceptualProposalReady.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        perceptualProposalReady.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        perceptualProposalReady.buffer = portraitBlurRgb_.buffer;
+        perceptualProposalReady.size = static_cast<VkDeviceSize>(rgbBytes);
+        vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u,
+                             0u, nullptr, 1u, &perceptualProposalReady, 0u, nullptr);
+
+        push.mode = 17u;
+        vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
+                           0u, sizeof(push), &push);
+        vkCmdDispatch(commandBuffer_, (request.frameWidth + 15u) / 16u,
+                       (request.frameHeight + 15u) / 16u, 1u);
+        VkBufferMemoryBarrier perceptualCommitted{};
+        perceptualCommitted.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        perceptualCommitted.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        perceptualCommitted.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        perceptualCommitted.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        perceptualCommitted.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        perceptualCommitted.buffer = workingRgb_.buffer;
+        perceptualCommitted.size = static_cast<VkDeviceSize>(rgbBytes);
+        vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u,
+                             0u, nullptr, 1u, &perceptualCommitted, 0u, nullptr);
+        if (queryPool_ != VK_NULL_HANDLE) {
+            vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 11u);
+        }
+    }
+
     if (ultraHdrRequested) {
         VkBufferMemoryBarrier tonedRgbReady{};
         tonedRgbReady.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
@@ -1256,6 +1382,17 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
             result.linearDetailKernelMs = static_cast<float>((detailTs[1] - detailTs[0]) * ms);
         }
     }
+    if (queryPool_ != VK_NULL_HANDLE && perceptualDetailRequested) {
+        std::uint64_t perceptualTs[2]{};
+        if (vkGetQueryPoolResults(device, queryPool_, 10u, 2u, sizeof(perceptualTs), perceptualTs,
+                                  sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS &&
+            perceptualTs[1] >= perceptualTs[0]) {
+            VkPhysicalDeviceProperties props{};
+            vkGetPhysicalDeviceProperties(physicalDevice, &props);
+            const double ms = static_cast<double>(props.limits.timestampPeriod) / 1.0e6;
+            result.perceptualDetailKernelMs = static_cast<float>((perceptualTs[1] - perceptualTs[0]) * ms);
+        }
+    }
     const auto readStart = Clock::now();
     vmaInvalidateAllocation(allocator_, telemetry_.allocation, 0u, kTelemetryWords * sizeof(std::uint32_t));
     const auto* telemetry = static_cast<const std::uint32_t*>(telemetry_.mapped);
@@ -1286,6 +1423,19 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
     std::uint32_t linearDetailMaxBits = telemetry[38];
     std::memcpy(&result.linearDetailMaxAbsCorrection, &linearDetailMaxBits, sizeof(float));
     result.linearDetailApplied = linearDetailRequested && result.linearDetailChangedPixels > 0u;
+    result.perceptualDetailEvaluatedPixels = telemetry[48];
+    result.perceptualDetailChangedPixels = telemetry[49];
+    result.perceptualDetailEdgeSupportedPixels = telemetry[50];
+    result.perceptualDetailNoiseRejectedPixels = telemetry[51];
+    result.perceptualDetailHaloClampedPixels = telemetry[52];
+    const std::uint32_t perceptualCorrectionSamples = telemetry[54];
+    result.perceptualDetailMeanAbsCorrection = perceptualCorrectionSamples > 0u
+            ? static_cast<float>(telemetry[53]) /
+                    (65536.0f * static_cast<float>(perceptualCorrectionSamples))
+            : 0.0f;
+    std::uint32_t perceptualMaxBits = telemetry[55];
+    std::memcpy(&result.perceptualDetailMaxAbsCorrection, &perceptualMaxBits, sizeof(float));
+    result.perceptualDetailApplied = perceptualDetailRequested && result.perceptualDetailChangedPixels > 0u;
     if (ultraHdrRequested) {
         constexpr float kMeaningfulGainLog2 = 0.111031312f; // log2(1.08)
         const float maxLog2Boost = static_cast<float>(telemetry[2]) / 65536.0f;

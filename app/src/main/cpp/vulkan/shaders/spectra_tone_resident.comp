@@ -52,12 +52,11 @@ layout(push_constant) uniform Params {
 } pc;
 
 
-// PHASE 9 DELTA 0063 — 16x16 workgroup tile chroma-noise model.
+// PHASE 9 / DELTA 0093 — 16x16 workgroup chroma predictor.
 // Each Vulkan workgroup is one immutable post-AWB/CCM tile. One lane fits a local
-// opponent-chroma-vs-luma model and measures residual R-Y/B-Y variance. Pixel lanes
-// then use that measured stochastic floor to decide whether the existing 5x5 local
-// regression is allowed to change chroma. This is not an RGB blur and does not use
-// chroma magnitude alone as scene-structure evidence.
+// opponent-chroma-vs-luma model. DELTA 0093 no longer treats that observed tile spread
+// as the noise truth: the correction significance is whitened against the propagated
+// physical post-WB/CCM covariance. The tile model remains only a structure/prediction aid.
 shared vec4 phase9TileOpponent[256]; // Y, R-Y, B-Y, valid
 shared vec4 phase9TileModel0;        // meanY, varY, slopeRY, slopeBY
 shared vec4 phase9TileModel1;        // interceptRY, interceptBY, residualVarRY, residualVarBY
@@ -185,6 +184,66 @@ vec3 preToneOpponent444ToRgb(vec3 opponent) {
     return vec3(r, g, b);
 }
 
+// DELTA 0093 mode-0 push aliases. The 128-byte push-constant ABI is intentionally unchanged:
+// exposureGain=Var(Y), rawJpegBaseVibrance=Var(R-Y), profileSaturation=Var(B-Y),
+// profileContrast=Cov(R-Y,B-Y), profileVibrance=reference signal, portraitTargetLeft=shot
+// fraction, portraitTargetTop=model confidence, portraitTargetRight=full-shrink sigma,
+// portraitTargetBottom=preserve sigma, portraitEnabled=covariance-valid flag.
+bool preTonePhysicalCovarianceReady() {
+    return pc.portraitEnabled != 0u && pc.exposureGain > 1.0e-14 &&
+            pc.rawJpegBaseVibrance > 1.0e-14 && pc.profileSaturation > 1.0e-14 &&
+            pc.profileVibrance > 0.0 && pc.portraitTargetTop >= 0.10 &&
+            pc.portraitTargetBottom > pc.portraitTargetRight;
+}
+
+float preToneVarianceScale(float y) {
+    float referenceSignal = max(pc.profileVibrance, 1.0e-4);
+    float shotFraction = clamp(pc.portraitTargetLeft, 0.0, 1.0);
+    float signalRatio = clamp(max(y, 0.0) / referenceSignal, 0.0, 8.0);
+    return max(1.0e-4, (1.0 - shotFraction) + shotFraction * signalRatio);
+}
+
+float preTonePhysicalLumaSigma(float y) {
+    return sqrt(max(1.0e-14, pc.exposureGain * preToneVarianceScale(y)));
+}
+
+vec3 preTonePhysicalChromaCovariance(float y) {
+    float scale = preToneVarianceScale(y);
+    float v1 = max(1.0e-14, pc.rawJpegBaseVibrance * scale);
+    float v2 = max(1.0e-14, pc.profileSaturation * scale);
+    float maxCov = 0.98 * sqrt(v1 * v2);
+    float cov = clamp(pc.profileContrast * scale, -maxCov, maxCov);
+    return vec3(v1, v2, cov);
+}
+
+float preToneChromaMahalanobisRadius(vec2 residual, vec3 covariance) {
+    float v1 = covariance.x;
+    float v2 = covariance.y;
+    float cov = covariance.z;
+    float determinant = max(1.0e-20, v1 * v2 - cov * cov);
+    float q2 = (residual.x * residual.x * v2 -
+            2.0 * residual.x * residual.y * cov +
+            residual.y * residual.y * v1) / determinant;
+    // Fail-safe: invalid covariance arithmetic must preserve colour evidence, never create
+    // a NaN authority that can contaminate the resident RGB buffer. A very large whitened
+    // radius maps to residualKeep=1 (no chroma shrink).
+    if (isnan(q2) || isinf(q2)) return 1.0e6;
+    return sqrt(max(0.0, q2));
+}
+
+float preToneFirmResidualKeep(float whitenedRadius) {
+    float low = max(0.50, pc.portraitTargetRight);
+    float high = max(low + 0.25, pc.portraitTargetBottom);
+    return smoothstep(low, high, whitenedRadius);
+}
+
+float preToneNearBlackPressure(float y) {
+    float sigmaY = max(1.0e-7, preTonePhysicalLumaSigma(y));
+    float lumaSnr = max(y, 0.0) / sigmaY;
+    // No absolute black cutoff: the release follows the physical noise floor.
+    return 1.0 - smoothstep(3.0, 12.0, lumaSnr);
+}
+
 
 vec3 preToneChroma444FromInput(uvec2 gid, vec3 centerRgb) {
     float strength = clamp(pc.presenceReserved1, 0.0, 0.94);
@@ -204,7 +263,9 @@ vec3 preToneChroma444FromInput(uvec2 gid, vec3 centerRgb) {
     // Fine 5x5 model: luma is the range guide, never chroma. This preserves the
     // established detail-safe GALOSH-style local regression while the workgroup tile
     // model below decides how much of the residual is statistically noise-like.
-    float guideSigma = 0.008 + 0.030 * sqrt(max(0.0, center.x));
+    float guideSigma = preTonePhysicalCovarianceReady()
+            ? clamp(2.75 * preTonePhysicalLumaSigma(center.x), 0.0020, 0.050)
+            : (0.008 + 0.030 * sqrt(max(0.0, center.x)));
     float inv2SigmaSq = 1.0 / max(2.0 * guideSigma * guideSigma, 1.0e-8);
 
     for (int dy = -radius; dy <= radius; ++dy) {
@@ -291,23 +352,7 @@ vec3 preToneChroma444FromInput(uvec2 gid, vec3 centerRgb) {
     float detailProtection = max(max(lumaDetailProtection, chromaDetailProtection),
                                  predictionDisagreementProtection);
 
-    // Stochastic evidence is measured as fine-window opponent variance relative to the
-    // workgroup residual noise floor. This gate is deliberately demosaic/format agnostic:
-    // only local measured noise versus coherent structure decides whether chroma may move.
-    float localResidualVariance = 0.5 * (localVarC.x + localVarC.y);
-    float tileResidualVariance = max(1.0e-10, 0.5 * (tileNoiseVar.x + tileNoiseVar.y));
-    float stochasticEvidence = smoothstep(
-            0.45 * tileResidualVariance,
-            1.85 * tileResidualVariance,
-            localResidualVariance) * (1.0 - detailProtection);
-
-    // Per-opponent residual significance prevents one colour channel from borrowing authority
-    // from the other. The correction changes R-Y/B-Y only; Y remains separately owned below.
     vec2 chromaResidual = center.yz - predictedC;
-    vec2 residualZ = abs(chromaResidual) / max(tileNoiseSigma, vec2(1.0e-5));
-    vec2 channelEvidence = vec2(
-            smoothstep(0.30, 1.80, residualZ.x),
-            smoothstep(0.30, 1.80, residualZ.y));
 
     float maximum = max(centerRgb.r, max(centerRgb.g, centerRgb.b));
     float minimum = min(centerRgb.r, min(centerRgb.g, centerRgb.b));
@@ -315,15 +360,63 @@ vec3 preToneChroma444FromInput(uvec2 gid, vec3 centerRgb) {
     float saturatedColourProtection = 1.0 - 0.70 * smoothstep(0.34, 0.78, saturation);
     float highlightProtection = 1.0 - 0.78 * smoothstep(0.70, 1.08, center.x);
 
-    // Delta 0062 invariant: chroma still uses full strength; only the separate luma branch is capped.
-    // Compatibility expression retained conceptually from: float blend = clamp(strength * saturatedColourProtection * highlightProtection);
-    float baseChromaAuthority = clamp(
-            strength * tileNoisePressure * tileFlatness * stochasticEvidence *
-            saturatedColourProtection * highlightProtection,
-            0.0, 0.94);
-    vec2 opponentAuthority = clamp(vec2(baseChromaAuthority) * channelEvidence,
-                                   vec2(0.0), vec2(0.94));
-    vec2 filteredC = mix(center.yz, predictedC, opponentAuthority);
+    float chromaAuthority = 0.0;
+    float whitenedRadius = 0.0;
+    float residualKeep = 1.0;
+    float nearBlackPressure = 0.0;
+    bool covarianceWhitened = preTonePhysicalCovarianceReady();
+    if (covarianceWhitened) {
+        // Physical covariance whitening: a residual is removable when it is statistically
+        // plausible under the propagated sensor model. This deliberately reverses the old
+        // behaviour that gave *less* authority to small near-floor residuals.
+        vec3 physicalCovariance = preTonePhysicalChromaCovariance(center.x);
+        whitenedRadius = preToneChromaMahalanobisRadius(chromaResidual, physicalCovariance);
+        residualKeep = preToneFirmResidualKeep(whitenedRadius);
+        nearBlackPressure = preToneNearBlackPressure(center.x);
+        float confidence = clamp(pc.portraitTargetTop, 0.0, 1.0);
+        float baselineAuthority = strength * mix(0.72, 1.0, confidence);
+        float nearBlackAuthority = min(0.985, 0.90 + 0.08 * confidence);
+        float physicalAuthority = mix(baselineAuthority, nearBlackAuthority, nearBlackPressure);
+        // Measured tile noise may modestly reinforce physical authority but can never veto it.
+        // Scene structure remains the veto through detailProtection and residual significance.
+        float observedSupport = 0.88 + 0.12 * tileNoisePressure;
+        chromaAuthority = clamp(
+                physicalAuthority * (1.0 - residualKeep) * (1.0 - detailProtection) *
+                observedSupport * saturatedColourProtection * highlightProtection,
+                0.0, 0.985);
+
+        atomicAdd(telemetry[56], 1u);
+        if (nearBlackPressure >= 0.50) atomicAdd(telemetry[57], 1u);
+        if (chromaAuthority >= 0.50) atomicAdd(telemetry[58], 1u);
+        if (residualKeep >= 0.85 || detailProtection >= 0.60) atomicAdd(telemetry[59], 1u);
+        atomicMax(telemetry[60], floatBitsToUint(max(0.0, whitenedRadius)));
+        // Sample the mean-authority telemetry once per 16x16 pixel lattice. Full-frame
+        // per-pixel sums could overflow uint32 on high-resolution sensors.
+        if ((gid.x & 15u) == 0u && (gid.y & 15u) == 0u) {
+            atomicAdd(telemetry[61], uint(round(clamp(chromaAuthority, 0.0, 1.0) * 4095.0)));
+            atomicAdd(telemetry[63], 1u);
+        }
+    } else {
+        // Typed compatibility fallback only. Production RAW with a valid physical S/O model
+        // should take the covariance-whitened branch above.
+        float localResidualVariance = 0.5 * (localVarC.x + localVarC.y);
+        float tileResidualVariance = max(1.0e-10, 0.5 * (tileNoiseVar.x + tileNoiseVar.y));
+        float stochasticEvidence = smoothstep(
+                0.45 * tileResidualVariance,
+                1.85 * tileResidualVariance,
+                localResidualVariance) * (1.0 - detailProtection);
+        vec2 residualZ = abs(chromaResidual) / max(tileNoiseSigma, vec2(1.0e-5));
+        vec2 channelEvidence = vec2(
+                smoothstep(0.30, 1.80, residualZ.x),
+                smoothstep(0.30, 1.80, residualZ.y));
+        float baseChromaAuthority = clamp(
+                strength * tileNoisePressure * tileFlatness * stochasticEvidence *
+                saturatedColourProtection * highlightProtection,
+                0.0, 0.94);
+        chromaAuthority = max(channelEvidence.x, channelEvidence.y) * baseChromaAuthority;
+        atomicAdd(telemetry[62], 1u);
+    }
+    vec2 filteredC = mix(center.yz, predictedC, chromaAuthority);
 
     // Keep the exact Delta-0062 luma branch. This delta increases no luma authority at all.
     float lumaStrength = min(strength, 0.64);
@@ -358,7 +451,7 @@ vec3 preToneChroma444FromInput(uvec2 gid, vec3 centerRgb) {
     // mutation decision, while one workgroup leader records tile-level noise statistics.
     float chromaShift = length((filteredC - center.yz) * safeScale);
     if (chromaShift > 1.0e-6) atomicAdd(telemetry[2], 1u);
-    if (detailProtection > 0.55 && stochasticEvidence > 0.10) atomicAdd(telemetry[3], 1u);
+    if (detailProtection > 0.55) atomicAdd(telemetry[3], 1u);
     atomicMax(telemetry[6], floatBitsToUint(max(0.0, chromaShift)));
 
     if (any(isnan(outRgb)) || any(isinf(outRgb))) return centerRgb;
@@ -1197,6 +1290,101 @@ void commitLinearDetailRecovery(uvec2 gid) {
     writeWorking(gid, linearDetailScratchAt(int(gid.x), int(gid.y)));
 }
 
+// Phase 12 — post-display perceptual detail/output sharpening.
+// This stage is intentionally narrow-band. It never builds a broad local-contrast base and thus
+// does not compete with FLLF. Proposal/commit reuse the full-resolution scratch buffer exactly as
+// Phase 11 does, but execute after the scene-to-display transform.
+float perceptualDetailSigma() {
+    return max(telemetryFloat(43u, 0.0), 1.0e-7);
+}
+
+void proposePerceptualDetail(uvec2 gid) {
+    if (gid.x >= pc.frameWidth || gid.y >= pc.frameHeight) return;
+    atomicAdd(telemetry[48], 1u);
+
+    int x = int(gid.x);
+    int y = int(gid.y);
+    vec3 centerRgb = workingAt(x, y);
+    float centerY = clamp(lumaOf(centerRgb), 0.0, 1.0);
+    float authority = clamp(telemetryFloat(39u, 0.0), 0.0, 0.46);
+    float radius = clamp(telemetryFloat(40u, 0.85), 0.50, 3.0);
+    float detail = clamp(telemetryFloat(41u, 0.0), 0.0, 1.0);
+    float masking = clamp(telemetryFloat(42u, 0.0), 0.0, 1.0);
+    float sigma = perceptualDetailSigma();
+    float minResidualSnr = max(0.5, telemetryFloat(44u, 1.5));
+    float minGradientSnr = max(0.4, telemetryFloat(45u, 1.0));
+    float hardHalo = clamp(telemetryFloat(46u, 0.008), 0.003, 0.02);
+    float modelConfidence = clamp(telemetryFloat(47u, 0.0), 0.0, 1.0);
+
+    float l = lumaOf(workingAt(x - 1, y));
+    float r = lumaOf(workingAt(x + 1, y));
+    float u = lumaOf(workingAt(x, y - 1));
+    float d = lumaOf(workingAt(x, y + 1));
+    float ul = lumaOf(workingAt(x - 1, y - 1));
+    float ur = lumaOf(workingAt(x + 1, y - 1));
+    float dl = lumaOf(workingAt(x - 1, y + 1));
+    float dr = lumaOf(workingAt(x + 1, y + 1));
+
+    float crossMean = 0.25 * (l + r + u + d);
+    float boxMean = (l + r + u + d + ul + ur + dl + dr) * 0.125;
+    float farCross = 0.25 * (lumaOf(workingAt(x - 2, y)) + lumaOf(workingAt(x + 2, y)) +
+                             lumaOf(workingAt(x, y - 2)) + lumaOf(workingAt(x, y + 2)));
+    float radiusT = clamp((radius - 0.50) / 2.50, 0.0, 1.0);
+    float compactMean = mix(0.70 * crossMean + 0.30 * boxMean,
+                            0.52 * crossMean + 0.28 * boxMean + 0.20 * farCross,
+                            radiusT);
+    float residual = centerY - compactMean;
+    float gx = 0.5 * (r - l);
+    float gy = 0.5 * (d - u);
+    float gradient = sqrt(max(0.0, gx * gx + gy * gy));
+    float residualSnr = abs(residual) / sigma;
+    float gradientSnr = gradient / sigma;
+
+    float noiseGate = smoothstep(minResidualSnr, minResidualSnr + 2.0, residualSnr);
+    float edgeGate = smoothstep(minGradientSnr, minGradientSnr + 2.4, gradientSnr);
+    float textureGate = smoothstep(minResidualSnr + 0.6, minResidualSnr + 3.2, residualSnr);
+    float participation = mix(edgeGate, max(edgeGate, textureGate), detail);
+    float maskGate = mix(1.0, edgeGate, masking);
+    float localAuthority = authority * modelConfidence * noiseGate * participation * maskGate;
+
+    if (participation > 0.25 && noiseGate > 0.05) atomicAdd(telemetry[50], 1u);
+    if (noiseGate < 0.05) atomicAdd(telemetry[51], 1u);
+
+    float localMin = min(centerY, min(min(min(l, r), min(u, d)), min(min(ul, ur), min(dl, dr))));
+    float localMax = max(centerY, max(max(max(l, r), max(u, d)), max(max(ul, ur), max(dl, dr))));
+    float localRange = max(0.0, localMax - localMin);
+    float fineGain = mix(0.85, 1.15, detail);
+    float delta = residual * localAuthority * fineGain;
+    float adaptiveHalo = min(hardHalo, 0.12 * localRange + 1.15 * sigma);
+    float rawDelta = delta;
+    delta = clamp(delta, -adaptiveHalo, adaptiveHalo);
+    float proposedY = clamp(centerY + delta,
+                            max(0.0, localMin - adaptiveHalo),
+                            min(1.0, localMax + adaptiveHalo));
+    delta = proposedY - centerY;
+    if (abs(delta - rawDelta) > 1.0e-7) atomicAdd(telemetry[52], 1u);
+
+    vec3 proposedRgb = centerRgb;
+    if (centerY > 1.0e-5) {
+        proposedRgb = centerRgb * clamp(proposedY / centerY, 0.88, 1.12);
+        proposedRgb = compressToUnitGamutPreserveLuma(proposedRgb);
+    }
+    writeLinearDetailScratch(gid, proposedRgb);
+
+    float absCorrection = abs(delta);
+    if (absCorrection > 1.0e-7) atomicAdd(telemetry[49], 1u);
+    if (((gid.x & 3u) == 0u) && ((gid.y & 3u) == 0u)) {
+        atomicAdd(telemetry[53], uint(round(min(absCorrection, 0.999) * 65536.0)));
+        atomicAdd(telemetry[54], 1u);
+    }
+    atomicMax(telemetry[55], floatBitsToUint(absCorrection));
+}
+
+void commitPerceptualDetail(uvec2 gid) {
+    if (gid.x >= pc.frameWidth || gid.y >= pc.frameHeight) return;
+    writeWorking(gid, linearDetailScratchAt(int(gid.x), int(gid.y)));
+}
+
 void packUltraHdrGainmap(uvec2 gid) {
     if (gid.x >= pc.ultraHdrPackedWordsPerRow || gid.y >= pc.ultraHdrOutputMapHeight) return;
     float maxLogGain = max(float(telemetry[2]) / 65536.0, 1.0 / 65536.0);
@@ -1252,5 +1440,9 @@ void main() {
         proposeLinearDetailRecovery(gid);
     } else if (pc.mode == 15u) {
         commitLinearDetailRecovery(gid);
+    } else if (pc.mode == 16u) {
+        proposePerceptualDetail(gid);
+    } else if (pc.mode == 17u) {
+        commitPerceptualDetail(gid);
     }
 }

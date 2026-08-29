@@ -22,6 +22,7 @@
 #include "SpectraMultiscaleChromaContext.h"
 #include "SpectraCfaOrthonormalSupport.h"
 #include "SpectraGaloshChroma.h"
+#include "PhysicalNearBlackChromaPolicy.h"
 #include "SpectraCfaSurfaceClassifier.h"
 #include "SpectraVisibleChromaCoarseGuide.h"
 #include "SpectraVisibleChromaSupportPolicy.h"
@@ -31,6 +32,7 @@
 #include "LocalTonePolicy.h"
 #include "ProfileToneRenderPolicy.h"
 #include "LinearDetailRecoveryPolicy.h"
+#include "PerceptualDetailPolicy.h"
 #include "NoiseAwareRenderGainPolicy.h"
 #include "SpectraDownstreamDenoisePolicy.h"
 #include "ProfileNoiseReductionPolicy.h"
@@ -15235,8 +15237,6 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     const float linearDetailPreToneLumaSigma = static_cast<float>(std::sqrt(std::max(
             0.0, residualNoiseState.postColourTransform.varianceY)));
     const bncam::detail_recovery::Plan linearDetailPlan = bncam::detail_recovery::resolve(
-            {uiConfig.profileDetailAmount, uiConfig.profileDetailRadius,
-             uiConfig.profileDetailDetail, uiConfig.profileDetailMasking},
             {linearDetailPhysicalNoiseAvailable,
              linearDetailPreToneLumaSigma,
              linearDetailReferenceSignal,
@@ -15761,6 +15761,28 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                             : 0.0f);
     const bool galoshPreToneChroma444Enabled = galoshPreToneChromaPlan.enabled;
     const float galoshPreToneChroma444Strength = galoshPreToneChromaPlan.finalStrength;
+
+    // DELTA 0093: physical covariance-whitened near-black chroma rejection.  The existing
+    // luma-guided predictor is retained, but its residual is now classified in the exact
+    // propagated post-WB/CCM covariance instead of a brightness heuristic.  This makes a
+    // low-SNR black pixel aggressively reject statistically plausible colour noise while
+    // coherent dark colour remains protected by the local predictor/edge evidence.
+    const float nearBlackChromaModelConfidence = std::clamp(
+            std::min(
+                    static_cast<float>(residualNoiseState.postColourTransform.confidence),
+                    meta.calibration.signalModelConfidence),
+            0.0f, 1.0f);
+    const bncam::near_black_chroma::Plan nearBlackChromaPlan =
+            bncam::near_black_chroma::resolve({
+                    rawBayerForPreToneChroma,
+                    physicalNoiseModelForPreToneChroma,
+                    galoshPreToneChroma444Enabled,
+                    galoshPreToneChroma444Strength,
+                    residualNoiseState.postColourTransform.covariance.values,
+                    linearDetailReferenceSignal,
+                    linearDetailShotNoiseFraction,
+                    nearBlackChromaModelConfidence});
+
     // QUALITY DELTA 0014: SPECTRA's chroma finishing increment must not implicitly
     // increase luma smoothing. The physical pre-tone luma baseline is identical with
     // SPECTRA Off/On; explicit SPECTRA Luma remains connected in the residual stage.
@@ -15782,6 +15804,16 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         request.preToneChroma444Strength = galoshPreToneChroma444Strength;
         request.preToneChromaNoisePressure = galoshPreToneChromaPlan.noisePressure;
         request.preToneChromaWbCcmPressure = galoshPreToneChromaPlan.wbCcmPressure;
+        request.preToneChromaCovarianceWhiteningEnabled = nearBlackChromaPlan.enabled;
+        request.preToneChromaVarianceY = nearBlackChromaPlan.varianceY;
+        request.preToneChromaVarianceC1 = nearBlackChromaPlan.varianceC1;
+        request.preToneChromaVarianceC2 = nearBlackChromaPlan.varianceC2;
+        request.preToneChromaCovarianceC1C2 = nearBlackChromaPlan.covarianceC1C2;
+        request.preToneChromaReferenceSignal = nearBlackChromaPlan.referenceSignal;
+        request.preToneChromaShotNoiseFraction = nearBlackChromaPlan.shotNoiseFraction;
+        request.preToneChromaModelConfidence = nearBlackChromaPlan.modelConfidence;
+        request.preToneChromaFullShrinkSigma = nearBlackChromaPlan.fullShrinkSigma;
+        request.preToneChromaPreserveSigma = nearBlackChromaPlan.preserveSigma;
         vulkanSceneObserver =
                 bncam::vulkan::VulkanRuntime::instance().executeSpectraResidentSceneObserverFromAwbCcm(
                         request, vulkanColorTransform.residentColorGeneration);
@@ -16669,6 +16701,26 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             0.25f
     );
 
+    // Phase 12 is profile-owned perceptual/output detail. It consumes the already propagated
+    // post-tone physical luma noise floor and is strictly complementary to Phase 11 and FLLF.
+    const float phase12DisplayLumaSigma = static_cast<float>(std::sqrt(postToneVarianceY));
+    const bncam::perceptual_detail::Plan perceptualDetailPlan = bncam::perceptual_detail::resolve(
+            {uiConfig.profileDetailAmount, uiConfig.profileDetailRadius,
+             uiConfig.profileDetailDetail, uiConfig.profileDetailMasking},
+            {linearDetailPhysicalNoiseAvailable,
+             phase12DisplayLumaSigma,
+             meta.calibration.signalModelConfidence});
+    if (perceptualDetailPlan.enabled) {
+        residualNoiseState.postTone = bncam::spectra2::propagateOpponentGains(
+                residualNoiseState.postTone,
+                std::sqrt(std::max(1.0f, perceptualDetailPlan.predictedLumaVarianceGain)),
+                1.0,
+                1.0,
+                "POST_PHASE12_PERCEPTUAL_DETAIL",
+                "PROFILE_OUTPUT_DETAIL_PHYSICAL_NOISE_GATED_UPPER_BOUND",
+                0.84);
+    }
+
     residualNoiseState.varianceY = static_cast<float>(residualNoiseState.postTone.varianceY);
     residualNoiseState.varianceRG = static_cast<float>(residualNoiseState.postTone.varianceRG);
     residualNoiseState.varianceBG = static_cast<float>(residualNoiseState.postTone.varianceBG);
@@ -16736,6 +16788,16 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         request.linearDetailReferenceSignal = linearDetailPlan.referenceSignal;
         request.linearDetailShotNoiseFraction = linearDetailPlan.shotNoiseFraction;
         request.linearDetailModelConfidence = linearDetailPlan.modelConfidence;
+        request.perceptualDetailEnabled = perceptualDetailPlan.enabled;
+        request.perceptualDetailAuthority = perceptualDetailPlan.authority;
+        request.perceptualDetailRadius = perceptualDetailPlan.radius;
+        request.perceptualDetailEmphasis = perceptualDetailPlan.detail;
+        request.perceptualDetailMasking = perceptualDetailPlan.masking;
+        request.perceptualDetailNoiseSigmaY = perceptualDetailPlan.displayLumaSigma;
+        request.perceptualDetailMinimumResidualSnr = perceptualDetailPlan.minimumResidualSnr;
+        request.perceptualDetailMinimumGradientSnr = perceptualDetailPlan.minimumGradientSnr;
+        request.perceptualDetailHardHaloLimit = perceptualDetailPlan.hardHaloLimit;
+        request.perceptualDetailModelConfidence = perceptualDetailPlan.modelConfidence;
         request.isRawBayer = isRawBayer;
         request.profileColorSaturation = uiConfig.profileColorSaturation;
         request.profileColorContrast = uiConfig.profileColorContrast;
@@ -18555,6 +18617,30 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; phase11LinearDetailKernelMs="
             << (vulkanToneApplied ? vulkanTone.linearDetailKernelMs : linearDetailCpuFallback.processingMs)
             << "; phase11LinearDetailScratchBytes=" << vulkanTone.linearDetailScratchBytes
+            << "; phase12PerceptualDetailEnabled=" << (perceptualDetailPlan.enabled ? "true" : "false")
+            << "; phase12PerceptualDetailAuthoritySource=" << perceptualDetailPlan.authoritySource
+            << "; phase12PerceptualDetailRuntimeOrder=POST_GTM_FLLF_AGX_PROFILE_COLOR_BEFORE_OUTPUT_ARTIFACTS"
+            << "; phase12PerceptualDetailAuthority=" << perceptualDetailPlan.authority
+            << "; phase12PerceptualDetailRadius=" << perceptualDetailPlan.radius
+            << "; phase12PerceptualDetailEmphasis=" << perceptualDetailPlan.detail
+            << "; phase12PerceptualDetailMasking=" << perceptualDetailPlan.masking
+            << "; phase12PerceptualDetailDisplayLumaSigma=" << perceptualDetailPlan.displayLumaSigma
+            << "; phase12PerceptualDetailMinimumResidualSnr=" << perceptualDetailPlan.minimumResidualSnr
+            << "; phase12PerceptualDetailMinimumGradientSnr=" << perceptualDetailPlan.minimumGradientSnr
+            << "; phase12PerceptualDetailHardHaloLimit=" << perceptualDetailPlan.hardHaloLimit
+            << "; phase12PerceptualDetailPredictedVarianceGain=" << perceptualDetailPlan.predictedLumaVarianceGain
+            << "; phase12PerceptualDetailBackend="
+            << (vulkanTone.perceptualDetailRequested ? "VULKAN_RESIDENT_DISPLAY_DETAIL" : "BYPASSED")
+            << "; phase12PerceptualDetailApplied=" << (vulkanTone.perceptualDetailApplied ? "true" : "false")
+            << "; phase12PerceptualDetailEvaluatedPixels=" << vulkanTone.perceptualDetailEvaluatedPixels
+            << "; phase12PerceptualDetailChangedPixels=" << vulkanTone.perceptualDetailChangedPixels
+            << "; phase12PerceptualDetailEdgeSupportedPixels=" << vulkanTone.perceptualDetailEdgeSupportedPixels
+            << "; phase12PerceptualDetailNoiseRejectedPixels=" << vulkanTone.perceptualDetailNoiseRejectedPixels
+            << "; phase12PerceptualDetailHaloClampedPixels=" << vulkanTone.perceptualDetailHaloClampedPixels
+            << "; phase12PerceptualDetailMeanAbsCorrection=" << vulkanTone.perceptualDetailMeanAbsCorrection
+            << "; phase12PerceptualDetailMaxAbsCorrection=" << vulkanTone.perceptualDetailMaxAbsCorrection
+            << "; phase12PerceptualDetailKernelMs=" << vulkanTone.perceptualDetailKernelMs
+            << "; phase12PerceptualDetailScratchBytes=" << vulkanTone.perceptualDetailScratchBytes
             << "; legacyPostToneSharpenOwner=RETIRED_PHASE11"
             << "; fllfEnabled=" << (fllfPlan.enabled ? "true" : "false")
             << "; fllfStrength=" << fllfPlan.strength
@@ -19804,6 +19890,25 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; galoshPreToneChroma444Enabled=" << (galoshPreToneChroma444Enabled ? "true" : "false")
             << "; galoshPreToneChroma444Strength=" << galoshPreToneChroma444Strength
             << "; galoshPreToneChroma444Applied=" << (vulkanSceneObserver.preToneChroma444Applied ? "true" : "false")
+            << "; nearBlackChromaCovarianceWhiteningEnabled=" << (nearBlackChromaPlan.enabled ? "true" : "false")
+            << "; nearBlackChromaCovarianceValid=" << (nearBlackChromaPlan.covarianceValid ? "true" : "false")
+            << "; nearBlackChromaVarianceY=" << nearBlackChromaPlan.varianceY
+            << "; nearBlackChromaVarianceC1=" << nearBlackChromaPlan.varianceC1
+            << "; nearBlackChromaVarianceC2=" << nearBlackChromaPlan.varianceC2
+            << "; nearBlackChromaCovarianceC1C2=" << nearBlackChromaPlan.covarianceC1C2
+            << "; nearBlackChromaReferenceSignal=" << nearBlackChromaPlan.referenceSignal
+            << "; nearBlackChromaShotNoiseFraction=" << nearBlackChromaPlan.shotNoiseFraction
+            << "; nearBlackChromaModelConfidence=" << nearBlackChromaPlan.modelConfidence
+            << "; nearBlackChromaFullShrinkSigma=" << nearBlackChromaPlan.fullShrinkSigma
+            << "; nearBlackChromaPreserveSigma=" << nearBlackChromaPlan.preserveSigma
+            << "; nearBlackChromaWhiteningApplied=" << (vulkanSceneObserver.preToneChromaCovarianceWhiteningApplied ? "true" : "false")
+            << "; nearBlackChromaCovarianceEvaluatedPixels=" << vulkanSceneObserver.preToneChromaCovarianceEvaluatedPixels
+            << "; nearBlackChromaLowSnrPixels=" << vulkanSceneObserver.preToneChromaNearBlackPixels
+            << "; nearBlackChromaStrongShrinkPixels=" << vulkanSceneObserver.preToneChromaStrongShrinkPixels
+            << "; nearBlackChromaPreservedEvidencePixels=" << vulkanSceneObserver.preToneChromaPreservedEvidencePixels
+            << "; nearBlackChromaMeanShrinkAuthority=" << vulkanSceneObserver.preToneChromaMeanShrinkAuthority
+            << "; nearBlackChromaMaxMahalanobisRadius=" << vulkanSceneObserver.preToneChromaMaxMahalanobisRadius
+            << "; nearBlackChromaCovarianceFallbackPixels=" << vulkanSceneObserver.preToneChromaCovarianceFallbackPixels
             << "; phase9ChromaTileScanApplied=" << (vulkanSceneObserver.preToneChromaTileScanApplied ? "true" : "false")
             << "; phase9ChromaTilesScanned=" << vulkanSceneObserver.preToneChromaTilesScanned
             << "; phase9ChromaEligibleTiles=" << vulkanSceneObserver.preToneChromaEligibleTiles

@@ -509,14 +509,14 @@ fun ProfileSharpnessSettingsScreen(
         if (method == ProfileSharpnessMethods.NORMAL) {
             SettingsCard(
                 "Normal Sharpness",
-                "Production sharpener. Edge Sharpness is reserved in the profile now but remains unconnected until it has an independent edge-only backend."
+                "Phase 12 perceptual/output detail. It runs after the physical capture-detail and tone chain, is noise-aware and halo-limited, and defaults fully neutral."
             ) {
                 ProfileRangeSlider(
                     repo = repo,
                     profileId = profileId,
                     key = ProfileIspKeys.DETAIL_SHARPENING_AMOUNT,
                     title = "Global Sharpness",
-                    description = "Overall sharpening authority.",
+                    description = "Perceptual/output sharpening authority. 0 is true identity.",
                     defaultValue = ProfileDetailDefaults.AMOUNT,
                     valueRange = 0f..1f,
                     formatter = { value -> String.format(Locale.US, "%.0f", value * 100f) }
@@ -536,7 +536,7 @@ fun ProfileSharpnessSettingsScreen(
                     profileId = profileId,
                     key = ProfileIspKeys.DETAIL_SHARPENING_DETAIL,
                     title = "Detail",
-                    description = "Fine-texture participation in sharpening.",
+                    description = "Fine-texture participation after physical noise qualification.",
                     defaultValue = ProfileDetailDefaults.DETAIL,
                     valueRange = 0f..1f,
                     formatter = { value -> String.format(Locale.US, "%.0f", value * 100f) }
@@ -561,9 +561,9 @@ fun ProfileSharpnessSettingsScreen(
                 ProfileRangeSlider(repo, profileId, ProfileIspKeys.POLYSHARP_MACRO_GAIN, "Sharp Macro Gain (not connected)", "Large-structure sharpening authority.", ProfilePlannedDefaults.POLYSHARP_MACRO_GAIN, 0f..2f)
                 ProfileRangeSlider(repo, profileId, ProfileIspKeys.POLYSHARP_MICRO_GAIN, "Sharp Micro Gain (not connected)", "Fine-detail sharpening authority.", ProfilePlannedDefaults.POLYSHARP_MICRO_GAIN, 0f..2f)
                 ProfileRangeSlider(repo, profileId, ProfileIspKeys.POLYSHARP_MAX_DETAIL, "Sharpen Max Detail (not connected)", "Planned detail ceiling/smoothing control.", ProfilePlannedDefaults.POLYSHARP_MAX_DETAIL, 0f..1f, formatter = { String.format(Locale.US, "%.0f", it * 100f) })
-                ProfileRangeSlider(repo, profileId, ProfileIspKeys.POLYSHARP_RADIUS_SMALL, "Polysharp Radius Small (not connected)", "Small-scale Polysharp radius.", ProfilePlannedDefaults.POLYSHARP_RADIUS_SMALL, 0.25f..2f)
-                ProfileRangeSlider(repo, profileId, ProfileIspKeys.POLYSHARP_RADIUS_MEDIUM, "Polysharp Radius Medium (not connected)", "Medium-scale Polysharp radius.", ProfilePlannedDefaults.POLYSHARP_RADIUS_MEDIUM, 0.5f..4f)
-                ProfileRangeSlider(repo, profileId, ProfileIspKeys.POLYSHARP_RADIUS_LARGE, "Polysharp Radius Large (not connected)", "Large-scale Polysharp radius.", ProfilePlannedDefaults.POLYSHARP_RADIUS_LARGE, 1f..8f)
+                ProfileRangeSlider(repo, profileId, ProfileIspKeys.POLYSHARP_RADIUS_SMALL, "Polysharp Radius Small (not connected)", "Small-scale Polysharp radius.", ProfilePlannedDefaults.POLYSHARP_RADIUS_SMALL, 0f..2f)
+                ProfileRangeSlider(repo, profileId, ProfileIspKeys.POLYSHARP_RADIUS_MEDIUM, "Polysharp Radius Medium (not connected)", "Medium-scale Polysharp radius.", ProfilePlannedDefaults.POLYSHARP_RADIUS_MEDIUM, 0f..4f)
+                ProfileRangeSlider(repo, profileId, ProfileIspKeys.POLYSHARP_RADIUS_LARGE, "Polysharp Radius Large (not connected)", "Large-scale Polysharp radius.", ProfilePlannedDefaults.POLYSHARP_RADIUS_LARGE, 0f..8f)
             }
         }
 

@@ -546,14 +546,14 @@ data class RenderQualityConfig(
             val normalDetailTuning = ProfileDetailTuning(
                 method = sharpeningMethod,
                 amount = readProfileFloatOrFallback(repo, profileId, ProfileIspKeys.DETAIL_SHARPENING_AMOUNT, ProfileDetailDefaults.AMOUNT, 0f..1f),
-                radius = readProfileFloatOrFallback(repo, profileId, ProfileIspKeys.DETAIL_SHARPENING_RADIUS, ProfileDetailDefaults.RADIUS, ProfileDetailDefaults.MIN_RADIUS..ProfileDetailDefaults.MAX_RADIUS),
+                radius = readProfileFloatOrFallback(repo, profileId, ProfileIspKeys.DETAIL_SHARPENING_RADIUS, ProfileDetailDefaults.RADIUS, 0f..ProfileDetailDefaults.MAX_RADIUS),
                 detail = readProfileFloatOrFallback(repo, profileId, ProfileIspKeys.DETAIL_SHARPENING_DETAIL, ProfileDetailDefaults.DETAIL, 0f..1f),
                 masking = readProfileFloatOrFallback(repo, profileId, ProfileIspKeys.DETAIL_SHARPENING_MASKING, ProfileDetailDefaults.MASKING, 0f..1f)
             ).sanitized()
             // Polysharp owns sharpening exclusively when selected. Its pixel backend is deliberately
             // not connected yet, so Normal Sharpness is neutralized rather than silently stacking.
             val detailTuning = if (sharpeningMethod == ProfileSharpnessMethods.POLYSHARP) {
-                normalDetailTuning.copy(amount = 0f, detail = 0f, masking = 1f)
+                normalDetailTuning.copy(amount = 0f, radius = 0f, detail = 0f, masking = 0f)
             } else {
                 normalDetailTuning
             }

@@ -72,9 +72,9 @@ struct FinalSensorCalibrationNative {
 
 
 namespace bncam::profile_defaults {
-inline constexpr float kDetailAmount = 0.40f;
-inline constexpr float kDetailRadius = 1.00f;
-inline constexpr float kDetailDetail = 0.25f;
+inline constexpr float kDetailAmount = 0.00f;
+inline constexpr float kDetailRadius = 0.00f;
+inline constexpr float kDetailDetail = 0.00f;
 inline constexpr float kDetailMasking = 0.00f;
 inline constexpr float kDetailMinRadius = 0.50f;
 inline constexpr float kDetailMaxRadius = 3.00f;

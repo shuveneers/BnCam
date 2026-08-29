@@ -1288,9 +1288,9 @@ class SettingsRepository(private val context: Context) {
                 key == ProfileIspKeys.POLYSHARP_GAIN ||
                     key == ProfileIspKeys.POLYSHARP_MACRO_GAIN ||
                     key == ProfileIspKeys.POLYSHARP_MICRO_GAIN -> finite.coerceIn(0f, 2f)
-                key == ProfileIspKeys.POLYSHARP_RADIUS_SMALL -> finite.coerceIn(0.25f, 2f)
-                key == ProfileIspKeys.POLYSHARP_RADIUS_MEDIUM -> finite.coerceIn(0.5f, 4f)
-                key == ProfileIspKeys.POLYSHARP_RADIUS_LARGE -> finite.coerceIn(1f, 8f)
+                key == ProfileIspKeys.POLYSHARP_RADIUS_SMALL -> finite.coerceIn(0f, 2f)
+                key == ProfileIspKeys.POLYSHARP_RADIUS_MEDIUM -> finite.coerceIn(0f, 4f)
+                key == ProfileIspKeys.POLYSHARP_RADIUS_LARGE -> finite.coerceIn(0f, 8f)
                 key == CaptureSettingKeys.MERGE_STRICTNESS -> finite.coerceIn(0f, 1f)
                 key == CaptureSettingKeys.SHUTTER_PRIORITY_MULTIPLIER ||
                     key == CaptureSettingKeys.ISO_PRIORITY_MULTIPLIER -> finite.coerceIn(0.25f, 4.0f)

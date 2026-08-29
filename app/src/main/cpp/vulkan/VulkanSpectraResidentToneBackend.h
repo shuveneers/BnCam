@@ -25,6 +25,19 @@ struct SpectraResidentSceneObserverRequest {
     // for the resident 16x16 tile chroma model. No ISO/format heuristic is passed.
     float preToneChromaNoisePressure = 0.0f;
     float preToneChromaWbCcmPressure = 0.0f;
+    // DELTA 0093: post-WB/CCM physical covariance in the exact Y,(R-Y),(B-Y) basis.
+    // Mode 0 uses this to whiten chroma residuals before firm shrinkage; no display-black
+    // threshold or device/model-specific constant is required.
+    bool preToneChromaCovarianceWhiteningEnabled = false;
+    float preToneChromaVarianceY = 0.0f;
+    float preToneChromaVarianceC1 = 0.0f;
+    float preToneChromaVarianceC2 = 0.0f;
+    float preToneChromaCovarianceC1C2 = 0.0f;
+    float preToneChromaReferenceSignal = 0.10f;
+    float preToneChromaShotNoiseFraction = 0.50f;
+    float preToneChromaModelConfidence = 0.0f;
+    float preToneChromaFullShrinkSigma = 1.10f;
+    float preToneChromaPreserveSigma = 4.50f;
 };
 
 struct SpectraResidentSceneObserverResult {
@@ -48,6 +61,14 @@ struct SpectraResidentSceneObserverResult {
     float preToneChromaMeanNoisePressure = 0.0f;
     float preToneChromaMeanResidualSigma = 0.0f;
     float preToneChromaMaxCorrection = 0.0f;
+    bool preToneChromaCovarianceWhiteningApplied = false;
+    std::uint64_t preToneChromaCovarianceEvaluatedPixels = 0u;
+    std::uint64_t preToneChromaNearBlackPixels = 0u;
+    std::uint64_t preToneChromaStrongShrinkPixels = 0u;
+    std::uint64_t preToneChromaPreservedEvidencePixels = 0u;
+    std::uint64_t preToneChromaCovarianceFallbackPixels = 0u;
+    float preToneChromaMeanShrinkAuthority = 0.0f;
+    float preToneChromaMaxMahalanobisRadius = 0.0f;
     std::uint32_t sampleStep = 1u;
     std::uint32_t sampleCount = 0u;
     std::vector<float> sampledRgb;  // tightly packed R,G,B triples
@@ -104,6 +125,18 @@ struct SpectraResidentToneRequest {
     float linearDetailReferenceSignal = 0.10f;
     float linearDetailShotNoiseFraction = 0.5f;
     float linearDetailModelConfidence = 0.0f;
+    // Phase 12: profile-owned perceptual/output detail, executed only after the RAW display
+    // transform. It is narrow-band and does not own local exposure/contrast (FLLF remains sole owner).
+    bool perceptualDetailEnabled = false;
+    float perceptualDetailAuthority = 0.0f;
+    float perceptualDetailRadius = 0.0f;
+    float perceptualDetailEmphasis = 0.0f;
+    float perceptualDetailMasking = 0.0f;
+    float perceptualDetailNoiseSigmaY = 0.0f;
+    float perceptualDetailMinimumResidualSnr = 1.5f;
+    float perceptualDetailMinimumGradientSnr = 1.0f;
+    float perceptualDetailHardHaloLimit = 0.0f;
+    float perceptualDetailModelConfidence = 0.0f;
     bool isRawBayer = true;
     float profileColorSaturation = 0.0f;
     float profileColorContrast = 0.0f;
@@ -160,6 +193,17 @@ struct SpectraResidentToneResult {
     float linearDetailMaxAbsCorrection = 0.0f;
     float linearDetailKernelMs = 0.0f;
     std::uint64_t linearDetailScratchBytes = 0u;
+    bool perceptualDetailRequested = false;
+    bool perceptualDetailApplied = false;
+    std::uint64_t perceptualDetailEvaluatedPixels = 0u;
+    std::uint64_t perceptualDetailChangedPixels = 0u;
+    std::uint64_t perceptualDetailEdgeSupportedPixels = 0u;
+    std::uint64_t perceptualDetailNoiseRejectedPixels = 0u;
+    std::uint64_t perceptualDetailHaloClampedPixels = 0u;
+    float perceptualDetailMeanAbsCorrection = 0.0f;
+    float perceptualDetailMaxAbsCorrection = 0.0f;
+    float perceptualDetailKernelMs = 0.0f;
+    std::uint64_t perceptualDetailScratchBytes = 0u;
     std::vector<float> outputRgb;
     float lutUploadMs = 0.0f;
     float kernelMs = 0.0f;

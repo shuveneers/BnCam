@@ -5,13 +5,6 @@
 
 namespace bncam::detail_recovery {
 
-struct Controls {
-    float amount = 0.40f;
-    float radius = 1.00f;
-    float detail = 0.25f;
-    float masking = 0.00f;
-};
-
 struct PhysicalNoiseEvidence {
     bool available = false;
     float preToneLumaSigma = 0.0f;
@@ -25,10 +18,10 @@ struct Plan {
     float authority = 0.0f;
     float radius = 1.0f;
     float detailEmphasis = 0.25f;
-    float masking = 0.0f;
-    float minimumResidualSnr = 1.5f;
-    float minimumGradientSnr = 1.0f;
-    float hardHaloLimit = 0.02f;
+    float masking = 0.15f;
+    float minimumResidualSnr = 1.65f;
+    float minimumGradientSnr = 1.10f;
+    float hardHaloLimit = 0.018f;
     float preToneLumaSigma = 0.0f;
     float referenceSignal = 0.10f;
     float shotNoiseFraction = 0.5f;
@@ -42,36 +35,25 @@ inline float finiteOr(float value, float fallback) noexcept {
 }
 
 /**
- * Phase 11 capture-detail owner.
+ * Phase 11 physical capture-detail owner.
  *
- * The policy intentionally requires a physical Camera2/manual S/O model.  When physical noise
- * evidence is unavailable, capture deconvolution is disabled rather than guessing an ISO/device
- * heuristic.  Amount remains creative authority; radius/detail/masking only shape a bounded
- * one-step Van-Cittert inverse-PSF proposal.  Per-pixel SNR/edge/halo decisions stay on Vulkan.
+ * Profile Sharpness is deliberately NOT an input. Phase 11 restores a small, bounded amount of
+ * capture/optical detail from the physically calibrated scene-linear signal. Creative/perceptual
+ * sharpness belongs to Phase 12 and defaults to zero. Without valid physical S/O evidence Phase 11
+ * disables rather than guessing an ISO, device or vendor heuristic.
  */
-inline Plan resolve(Controls controls, PhysicalNoiseEvidence noise) noexcept {
-    controls.amount = std::clamp(finiteOr(controls.amount, 0.40f), 0.0f, 1.0f);
-    controls.radius = std::clamp(finiteOr(controls.radius, 1.00f), 0.50f, 3.00f);
-    controls.detail = std::clamp(finiteOr(controls.detail, 0.25f), 0.0f, 1.0f);
-    controls.masking = std::clamp(finiteOr(controls.masking, 0.00f), 0.0f, 1.0f);
+inline Plan resolve(PhysicalNoiseEvidence noise) noexcept {
     noise.preToneLumaSigma = std::max(0.0f, finiteOr(noise.preToneLumaSigma, 0.0f));
     noise.referenceSignal = std::clamp(finiteOr(noise.referenceSignal, 0.10f), 1.0e-4f, 2.0f);
     noise.shotNoiseFraction = std::clamp(finiteOr(noise.shotNoiseFraction, 0.5f), 0.0f, 1.0f);
     noise.modelConfidence = std::clamp(finiteOr(noise.modelConfidence, 0.0f), 0.0f, 1.0f);
 
     Plan out{};
-    out.radius = controls.radius;
-    out.detailEmphasis = controls.detail;
-    out.masking = controls.masking;
     out.preToneLumaSigma = noise.preToneLumaSigma;
     out.referenceSignal = noise.referenceSignal;
     out.shotNoiseFraction = noise.shotNoiseFraction;
     out.modelConfidence = noise.modelConfidence;
 
-    if (controls.amount <= 1.0e-4f) {
-        out.authoritySource = "PROFILE_AMOUNT_ZERO";
-        return out;
-    }
     if (!noise.available || !(noise.preToneLumaSigma > 0.0f)) {
         out.authoritySource = "PHYSICAL_SO_UNAVAILABLE";
         return out;
@@ -81,26 +63,22 @@ inline Plan resolve(Controls controls, PhysicalNoiseEvidence noise) noexcept {
         return out;
     }
 
-    // Keep default capture recovery deliberately moderate. Fine-detail intent may increase the
-    // inverse-PSF step, while a high masking value reserves it for high-confidence edges.
+    // Preserve the validated Phase-11 strength envelope near its prior neutral-profile result,
+    // while making it exclusively physical and slightly more selective in noisy/flat regions.
     const float confidenceScale = 0.35f + 0.65f * noise.modelConfidence;
-    const float detailScale = 0.82f + 0.32f * controls.detail;
-    out.authority = std::clamp(controls.amount * 0.62f * detailScale * confidenceScale, 0.0f, 0.62f);
-    out.minimumResidualSnr = 1.35f + 2.15f * controls.masking;
-    out.minimumGradientSnr = 0.85f + 1.65f * controls.masking;
-    out.hardHaloLimit = std::clamp(
-            (0.014f + 0.030f * controls.amount) * (1.0f - 0.45f * controls.masking),
-            0.008f,
-            0.040f);
-
-    // Conservative white-noise upper bound for a local inverse-PSF step. Actual Vulkan authority
-    // is normally lower because SNR/edge/halo gates suppress flat/noisy pixels.
+    out.authority = std::clamp(0.225f * confidenceScale, 0.0f, 0.225f);
+    out.radius = 1.0f;
+    out.detailEmphasis = 0.25f;
+    out.masking = 0.15f;
+    out.minimumResidualSnr = 1.65f;
+    out.minimumGradientSnr = 1.10f;
+    out.hardHaloLimit = 0.018f;
     out.predictedLumaVarianceGain = std::clamp(
             1.0f + 0.52f * out.authority * out.authority,
             1.0f,
-            1.20f);
+            1.04f);
     out.enabled = out.authority > 1.0e-4f;
-    out.authoritySource = "PHYSICAL_SO_SCENE_LINEAR_VAN_CITTERT";
+    out.authoritySource = "PHYSICAL_SO_CAPTURE_RECOVERY";
     return out;
 }
 

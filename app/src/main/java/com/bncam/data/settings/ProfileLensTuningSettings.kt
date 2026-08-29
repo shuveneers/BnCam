@@ -88,21 +88,23 @@ object ProfilePlannedDefaults {
     const val CLARITY = 0f
     const val COLOR_FRINGE_SUPPRESSION = 0f
 
-    const val EDGE_SHARPNESS = 0.50f
-    const val POLYSHARP_GAIN = 1.00f
-    const val POLYSHARP_MACRO_GAIN = 1.00f
-    const val POLYSHARP_MICRO_GAIN = 1.00f
-    const val POLYSHARP_MAX_DETAIL = 1.00f
-    const val POLYSHARP_RADIUS_SMALL = 0.75f
-    const val POLYSHARP_RADIUS_MEDIUM = 1.50f
-    const val POLYSHARP_RADIUS_LARGE = 3.00f
+    // Phase 12 baseline: every profile-owned sharpness control is neutral by default.
+    // Capture-detail recovery is a separate physical Phase-11 owner and does not read these values.
+    const val EDGE_SHARPNESS = 0.00f
+    const val POLYSHARP_GAIN = 0.00f
+    const val POLYSHARP_MACRO_GAIN = 0.00f
+    const val POLYSHARP_MICRO_GAIN = 0.00f
+    const val POLYSHARP_MAX_DETAIL = 0.00f
+    const val POLYSHARP_RADIUS_SMALL = 0.00f
+    const val POLYSHARP_RADIUS_MEDIUM = 0.00f
+    const val POLYSHARP_RADIUS_LARGE = 0.00f
 }
 
 /** Lightroom-style Detail defaults. UI displays Amount/Detail/Masking as 0..100. */
 object ProfileDetailDefaults {
-    const val AMOUNT = 0.40f
-    const val RADIUS = 1.00f
-    const val DETAIL = 0.25f
+    const val AMOUNT = 0.00f
+    const val RADIUS = 0.00f
+    const val DETAIL = 0.00f
     const val MASKING = 0.00f
 
     const val MIN_RADIUS = 0.50f
@@ -143,13 +145,19 @@ data class ProfileDetailSettings(
     val detail: Float = ProfileDetailDefaults.DETAIL,
     val masking: Float = ProfileDetailDefaults.MASKING
 ) {
-    fun sanitized(): ProfileDetailSettings = copy(
-        amount = amount.takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: ProfileDetailDefaults.AMOUNT,
-        radius = radius.takeIf { it.isFinite() }?.coerceIn(ProfileDetailDefaults.MIN_RADIUS, ProfileDetailDefaults.MAX_RADIUS)
-            ?: ProfileDetailDefaults.RADIUS,
-        detail = detail.takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: ProfileDetailDefaults.DETAIL,
-        masking = masking.takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: ProfileDetailDefaults.MASKING
-    )
+    fun sanitized(): ProfileDetailSettings {
+        val safeAmount = amount.takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: ProfileDetailDefaults.AMOUNT
+        val storedRadius = radius.takeIf { it.isFinite() }?.coerceIn(0f, ProfileDetailDefaults.MAX_RADIUS)
+            ?: ProfileDetailDefaults.RADIUS
+        return copy(
+            amount = safeAmount,
+            // Zero is a real neutral profile value. A valid kernel radius is only resolved when
+            // Amount becomes active; this prevents a hidden radius boost on neutral profiles.
+            radius = if (safeAmount <= 1.0e-4f) 0f else storedRadius.coerceIn(ProfileDetailDefaults.MIN_RADIUS, ProfileDetailDefaults.MAX_RADIUS),
+            detail = detail.takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: ProfileDetailDefaults.DETAIL,
+            masking = masking.takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: ProfileDetailDefaults.MASKING
+        )
+    }
 }
 
 data class ProfileAwbSettings(
