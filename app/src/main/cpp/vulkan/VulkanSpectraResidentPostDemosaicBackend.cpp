@@ -26,6 +26,8 @@ namespace bncam::vulkan {
 namespace {
 using Clock = std::chrono::steady_clock;
 
+[[maybe_unused]] constexpr std::uint32_t kPostDemosaicTimestampQueryCapacity = 128u;
+
 float elapsedMs(Clock::time_point started) {
     return static_cast<float>(std::chrono::duration<double, std::milli>(
             Clock::now() - started).count());
@@ -363,7 +365,7 @@ bool VulkanSpectraResidentPostDemosaicBackend::initializeLocked(
     VkQueryPoolCreateInfo queryInfo{};
     queryInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
     queryInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
-    queryInfo.queryCount = 4u;
+    queryInfo.queryCount = kPostDemosaicTimestampQueryCapacity;
     if (vkCreateQueryPool(device, &queryInfo, nullptr, &queryPool_) != VK_SUCCESS) {
         queryPool_ = VK_NULL_HANDLE;
     }
@@ -451,18 +453,41 @@ VulkanSpectraResidentPostDemosaicBackend::execute(
     return result;
 #else
     const bool residentInputUsed = request.residentInputBuffer != VK_NULL_HANDLE;
+    const bool batchPointerSet = request.batchStrips != nullptr;
+    const bool batchCountSet = request.batchStripCount != 0u;
+    if (batchPointerSet != batchCountSet) {
+        result.status = "INVALID_RESIDENT_POST_DEMOSAIC_REQUEST";
+        result.failureReason = "BATCH_POINTER_COUNT_CONTRACT_INVALID";
+        result.totalMs = elapsedMs(totalStarted);
+        return result;
+    }
+    const bool batchedExecution = batchPointerSet && batchCountSet;
+    const std::uint32_t stripCount = batchedExecution ? request.batchStripCount : 1u;
+    result.batchedExecution = batchedExecution;
+    result.batchStripCount = stripCount;
+
+    if (batchedExecution && (!residentInputUsed || !request.packedBgr8Publication)) {
+        result.status = "INVALID_RESIDENT_POST_DEMOSAIC_REQUEST";
+        result.failureReason = "BATCH_REQUIRES_RESIDENT_INPUT_AND_PACKED_BGR8_PUBLICATION";
+        result.totalMs = elapsedMs(totalStarted);
+        return result;
+    }
+
+    SpectraResidentPostDemosaicStripRange singleStrip{};
+    singleStrip.inputOriginY = request.inputOriginY;
+    singleStrip.inputRows = request.inputRows;
+    singleStrip.intermediateOriginY = request.intermediateOriginY;
+    singleStrip.intermediateRows = request.intermediateRows;
+    singleStrip.outputOriginY = request.outputOriginY;
+    singleStrip.outputRows = request.outputRows;
+    const auto stripAt = [&](std::uint32_t index) -> const SpectraResidentPostDemosaicStripRange& {
+        return batchedExecution ? request.batchStrips[index] : singleStrip;
+    };
+
     if ((!residentInputUsed && request.rgbData == nullptr) || request.spatialSigma == nullptr ||
-        request.frameWidth == 0u || request.frameHeight == 0u ||
-        request.inputRows == 0u || request.intermediateRows == 0u ||
-        request.outputRows == 0u || request.gridWidth == 0u ||
-        request.gridHeight == 0u ||
+        request.frameWidth == 0u || request.frameHeight == 0u || stripCount == 0u ||
+        request.gridWidth == 0u || request.gridHeight == 0u ||
         request.rowStrideFloats < static_cast<std::size_t>(request.frameWidth) * 3u ||
-        !rangeContained(request.inputOriginY, request.inputRows,
-                        request.intermediateOriginY, request.intermediateRows) ||
-        !rangeContained(request.intermediateOriginY, request.intermediateRows,
-                        request.outputOriginY, request.outputRows) ||
-        static_cast<std::uint64_t>(request.inputOriginY) + request.inputRows >
-                request.frameHeight ||
         !finitePositive(request.meanSpatialSigma) ||
         !std::isfinite(request.legacySharpenAmount) || request.legacySharpenAmount < 0.0f ||
         (request.visibleChromaEnabled && (
@@ -471,7 +496,35 @@ VulkanSpectraResidentPostDemosaicBackend::execute(
                 !std::isfinite(request.inverse01) ||
                 !std::isfinite(request.inverse11)))) {
         result.status = "INVALID_RESIDENT_POST_DEMOSAIC_REQUEST";
-        result.failureReason = "FRAME_RANGES_STRIDE_OR_NOISE_PARAMETERS_INVALID";
+        result.failureReason = "FRAME_STRIDE_OR_NOISE_PARAMETERS_INVALID";
+        result.totalMs = elapsedMs(totalStarted);
+        return result;
+    }
+
+    std::uint32_t maximumIntermediateRows = 0u;
+    std::uint64_t expectedBatchOutputY = 0u;
+    for (std::uint32_t index = 0u; index < stripCount; ++index) {
+        const auto& strip = stripAt(index);
+        const std::uint64_t inputEnd = static_cast<std::uint64_t>(strip.inputOriginY) + strip.inputRows;
+        const std::uint64_t outputEnd = static_cast<std::uint64_t>(strip.outputOriginY) + strip.outputRows;
+        if (strip.inputRows == 0u || strip.intermediateRows == 0u || strip.outputRows == 0u ||
+            !rangeContained(strip.inputOriginY, strip.inputRows,
+                            strip.intermediateOriginY, strip.intermediateRows) ||
+            !rangeContained(strip.intermediateOriginY, strip.intermediateRows,
+                            strip.outputOriginY, strip.outputRows) ||
+            inputEnd > request.frameHeight || outputEnd > request.frameHeight ||
+            (batchedExecution && strip.outputOriginY != expectedBatchOutputY)) {
+            result.status = "INVALID_RESIDENT_POST_DEMOSAIC_REQUEST";
+            result.failureReason = "STRIP_RANGE_OR_BATCH_CONTINUITY_INVALID";
+            result.totalMs = elapsedMs(totalStarted);
+            return result;
+        }
+        maximumIntermediateRows = std::max(maximumIntermediateRows, strip.intermediateRows);
+        if (batchedExecution) expectedBatchOutputY = outputEnd;
+    }
+    if (batchedExecution && expectedBatchOutputY != request.frameHeight) {
+        result.status = "INVALID_RESIDENT_POST_DEMOSAIC_REQUEST";
+        result.failureReason = "BATCH_DOES_NOT_COVER_FULL_FRAME";
         result.totalMs = elapsedMs(totalStarted);
         return result;
     }
@@ -479,18 +532,21 @@ VulkanSpectraResidentPostDemosaicBackend::execute(
     std::uint64_t floatRowBytes = 0u;
     std::uint64_t requiredInputBytes = 0u;
     std::uint64_t packedRowBytes = 0u;
+    const std::uint64_t logicalInputRows = batchedExecution && residentInputUsed
+            ? request.frameHeight : stripAt(0u).inputRows;
     if (!multiplyChecked(request.frameWidth, 3u * sizeof(float), floatRowBytes) ||
-        !multiplyChecked(floatRowBytes, request.inputRows, requiredInputBytes) ||
-        !multiplyChecked(floatRowBytes, request.intermediateRows, result.intermediateBytes) ||
+        !multiplyChecked(floatRowBytes, logicalInputRows, requiredInputBytes) ||
+        !multiplyChecked(floatRowBytes, maximumIntermediateRows, result.intermediateBytes) ||
         !packedBgr8RowBytes(request.frameWidth, packedRowBytes)) {
         result.status = "RESIDENT_POST_DEMOSAIC_SIZE_OVERFLOW";
         result.failureReason = "RGB_OR_BGR8_BUFFER_SIZE_OVERFLOW";
         result.totalMs = elapsedMs(totalStarted);
         return result;
     }
-    result.outputRowStrideBytes = request.packedBgr8Publication
-            ? packedRowBytes : floatRowBytes;
-    if (!multiplyChecked(result.outputRowStrideBytes, request.outputRows, result.outputBytes)) {
+    result.outputRowStrideBytes = request.packedBgr8Publication ? packedRowBytes : floatRowBytes;
+    const std::uint64_t publicationRows = batchedExecution
+            ? request.frameHeight : stripAt(0u).outputRows;
+    if (!multiplyChecked(result.outputRowStrideBytes, publicationRows, result.outputBytes)) {
         result.status = "RESIDENT_POST_DEMOSAIC_SIZE_OVERFLOW";
         result.failureReason = "PUBLICATION_BUFFER_SIZE_OVERFLOW";
         result.totalMs = elapsedMs(totalStarted);
@@ -505,8 +561,8 @@ VulkanSpectraResidentPostDemosaicBackend::execute(
     result.residentInputUsed = residentInputUsed;
     result.packedBgr8Published = request.packedBgr8Publication;
     result.floatOutputFallback = !request.packedBgr8Publication;
-    // inputBytes is transfer accounting, not the logical buffer span. A resident handoff uploads 0 bytes.
     result.inputBytes = residentInputUsed ? 0u : requiredInputBytes;
+
     std::uint64_t spatialElements = 0u;
     std::uint64_t requiredSpatialMapBytes = 0u;
     if (!multiplyChecked(request.gridWidth, request.gridHeight, spatialElements) ||
@@ -574,10 +630,10 @@ VulkanSpectraResidentPostDemosaicBackend::execute(
         float* packed = static_cast<float*>(input_.mapped);
         const std::size_t packedRowFloats = static_cast<std::size_t>(request.frameWidth) * 3u;
         if (request.rowStrideFloats == packedRowFloats) {
-            std::memcpy(packed, request.rgbData,
-                        static_cast<std::size_t>(requiredInputBytes));
+            std::memcpy(packed, request.rgbData, static_cast<std::size_t>(requiredInputBytes));
         } else {
-            for (std::uint32_t row = 0; row < request.inputRows; ++row) {
+            const auto& strip = stripAt(0u);
+            for (std::uint32_t row = 0; row < strip.inputRows; ++row) {
                 const float* source = request.rgbData +
                         static_cast<std::size_t>(row) * request.rowStrideFloats;
                 std::memcpy(packed + static_cast<std::size_t>(row) * packedRowFloats,
@@ -592,8 +648,7 @@ VulkanSpectraResidentPostDemosaicBackend::execute(
     if (uploadSpatialMap) {
         std::memcpy(spatialMap_.mapped, request.spatialSigma,
                     static_cast<std::size_t>(requiredSpatialMapBytes));
-        vmaFlushAllocation(allocator_, spatialMap_.allocation, 0u,
-                           requiredSpatialMapBytes);
+        vmaFlushAllocation(allocator_, spatialMap_.allocation, 0u, requiredSpatialMapBytes);
         spatialGenerationId_ = request.generationId;
         spatialGenerationBytes_ = requiredSpatialMapBytes;
         result.spatialMapBytes = requiredSpatialMapBytes;
@@ -604,8 +659,8 @@ VulkanSpectraResidentPostDemosaicBackend::execute(
     vmaFlushAllocation(allocator_, visibleTelemetry_.allocation, 0u, telemetryBytes);
     result.inputPackingMs = elapsedMs(packingStarted);
 
-    // Rebind every dispatch because a previous capture may have used the alternate
-    // resident-input path while the next one uses the host-staging fallback (or vice versa).
+    // One descriptor update is sufficient for the entire batch: upstream resident RGB,
+    // reusable strip-local FP32 intermediate, full-frame packed output and telemetry stay fixed.
     updateDescriptorSetsLocked(
             device,
             residentInputUsed ? request.residentInputBuffer : VK_NULL_HANDLE,
@@ -623,11 +678,15 @@ VulkanSpectraResidentPostDemosaicBackend::execute(
         return result;
     }
 
-    result.timestampQueryUsed = queryPool_ != VK_NULL_HANDLE;
+    constexpr std::uint32_t kQueriesPerStrip = 4u;
+    constexpr std::uint32_t kMaximumTimedStripCount = kPostDemosaicTimestampQueryCapacity /
+            kQueriesPerStrip;
+    result.timestampQueryUsed = queryPool_ != VK_NULL_HANDLE &&
+            stripCount <= kMaximumTimedStripCount;
+    const std::uint32_t timedQueryCount = result.timestampQueryUsed
+            ? stripCount * kQueriesPerStrip : 0u;
     if (result.timestampQueryUsed) {
-        vkCmdResetQueryPool(commandBuffer_, queryPool_, 0u, 4u);
-        vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                            queryPool_, 0u);
+        vkCmdResetQueryPool(commandBuffer_, queryPool_, 0u, timedQueryCount);
     }
     if (residentInputUsed) {
         VkBufferMemoryBarrier residentInputBarrier{};
@@ -645,107 +704,131 @@ VulkanSpectraResidentPostDemosaicBackend::execute(
     }
     vkCmdBindPipeline(commandBuffer_, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
 
-    PushConstants push{};
-    push.frameWidth = request.frameWidth;
-    push.frameHeight = request.frameHeight;
-    push.gridWidth = request.gridWidth;
-    push.gridHeight = request.gridHeight;
-    push.meanSpatialSigma = request.meanSpatialSigma;
-    push.appliedLumaSigma = request.appliedLumaSigma;
-    push.lumaRangeThresholdMean = request.lumaRangeThresholdMean;
-    push.chromaRangeThresholdMean = request.chromaRangeThresholdMean;
-    push.outerRingAuthority = std::clamp(request.outerRingAuthority, 0.0f, 1.0f);
-    push.profileNrColor = std::clamp(request.profileNrColor, 0.0f, 1.0f);
-    push.chromaNrStrength = std::clamp(request.chromaNrStrength, 0.0f, 1.0f);
-    push.chromaUserScale = request.chromaUserScale;
-    push.downstreamChromaAuthority = std::clamp(request.downstreamChromaAuthority, 0.0f, 1.0f);
-    push.noiseModelMultiplier = request.noiseModelMultiplier;
-    push.configuredDynamicIsoCoeff = std::clamp(request.configuredDynamicIsoCoeff, 0.0f, 1.0f);
-    push.downstreamLumaAuthority = std::clamp(request.downstreamLumaAuthority, 0.0f, 1.0f);
-    // Mode 0 multiplexes mode-1-only slots for the six Lightroom NR controls, keeping
-    // the Vulkan push-constant contract at 128 bytes. Every slot is restored before mode 1.
-    push.visibleSigmaY = std::clamp(request.profileNrLuminance, 0.0f, 1.0f);
-    push.visibleAuthority = std::clamp(request.profileNrLuminanceDetail, 0.0f, 1.0f);
-    push.visibleMaximumCorrection = std::clamp(request.profileNrLuminanceContrast, 0.0f, 1.0f);
-    push.inverse00 = std::clamp(request.profileNrColorDetail, 0.0f, 1.0f);
-    push.inverse01 = std::clamp(request.profileNrColorSmoothness, 0.0f, 1.0f);
-    push.inverse11 = request.inverse11;
-    push.padding1 = residentInputUsed ? 1.0f : 0.0f;
-    push.padding2 = std::clamp(request.profileSpectraLuma, -1.0f, 1.0f);
-    push.padding3 = std::clamp(request.profileSpectraDetail, -1.0f, 1.0f);
-    push.spectraNoiseActive = request.spectraNoiseActive ? 1u : 0u;
-    push.visibleChromaEnabled = request.visibleChromaEnabled ? 1u : 0u;
+    PushConstants spatialPush{};
+    spatialPush.frameWidth = request.frameWidth;
+    spatialPush.frameHeight = request.frameHeight;
+    spatialPush.gridWidth = request.gridWidth;
+    spatialPush.gridHeight = request.gridHeight;
+    spatialPush.meanSpatialSigma = request.meanSpatialSigma;
+    spatialPush.appliedLumaSigma = request.appliedLumaSigma;
+    spatialPush.lumaRangeThresholdMean = request.lumaRangeThresholdMean;
+    spatialPush.chromaRangeThresholdMean = request.chromaRangeThresholdMean;
+    spatialPush.outerRingAuthority = std::clamp(request.outerRingAuthority, 0.0f, 1.0f);
+    spatialPush.profileNrColor = std::clamp(request.profileNrColor, 0.0f, 1.0f);
+    spatialPush.chromaNrStrength = std::clamp(request.chromaNrStrength, 0.0f, 1.0f);
+    spatialPush.chromaUserScale = request.chromaUserScale;
+    spatialPush.downstreamChromaAuthority = std::clamp(request.downstreamChromaAuthority, 0.0f, 1.0f);
+    spatialPush.noiseModelMultiplier = request.noiseModelMultiplier;
+    spatialPush.configuredDynamicIsoCoeff = std::clamp(request.configuredDynamicIsoCoeff, 0.0f, 1.0f);
+    spatialPush.downstreamLumaAuthority = std::clamp(request.downstreamLumaAuthority, 0.0f, 1.0f);
+    spatialPush.visibleSigmaY = std::clamp(request.profileNrLuminance, 0.0f, 1.0f);
+    spatialPush.visibleAuthority = std::clamp(request.profileNrLuminanceDetail, 0.0f, 1.0f);
+    spatialPush.visibleMaximumCorrection = std::clamp(request.profileNrLuminanceContrast, 0.0f, 1.0f);
+    spatialPush.inverse00 = std::clamp(request.profileNrColorDetail, 0.0f, 1.0f);
+    spatialPush.inverse01 = std::clamp(request.profileNrColorSmoothness, 0.0f, 1.0f);
+    spatialPush.inverse11 = request.inverse11;
+    spatialPush.padding1 = residentInputUsed ? 1.0f : 0.0f;
+    spatialPush.padding2 = std::clamp(request.profileSpectraLuma, -1.0f, 1.0f);
+    spatialPush.padding3 = std::clamp(request.profileSpectraDetail, -1.0f, 1.0f);
+    spatialPush.spectraNoiseActive = request.spectraNoiseActive ? 1u : 0u;
+    spatialPush.visibleChromaEnabled = request.visibleChromaEnabled ? 1u : 0u;
+    spatialPush.mode = 0u;
 
-    push.mode = 0u;
-    push.inputOriginY = request.inputOriginY;
-    push.inputRows = request.inputRows;
-    push.outputOriginY = request.intermediateOriginY;
-    push.outputRows = request.intermediateRows;
-    vkCmdBindDescriptorSets(commandBuffer_, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            pipelineLayout_, 0u, 1u, &descriptorSets_[0], 0u, nullptr);
-    vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
-                       0u, sizeof(push), &push);
-    vkCmdDispatch(commandBuffer_, (request.frameWidth + 15u) / 16u,
-                  (request.intermediateRows + 15u) / 16u, 1u);
-    if (result.timestampQueryUsed) {
-        vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                            queryPool_, 1u);
-    }
-
-    VkBufferMemoryBarrier intermediateBarrier{};
-    intermediateBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-    intermediateBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    intermediateBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    intermediateBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    intermediateBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    intermediateBarrier.buffer = intermediate_.buffer;
-    intermediateBarrier.offset = 0u;
-    intermediateBarrier.size = static_cast<VkDeviceSize>(result.intermediateBytes);
-    vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u,
-                         0u, nullptr, 1u, &intermediateBarrier, 0u, nullptr);
-    if (result.timestampQueryUsed) {
-        vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                            queryPool_, 2u);
-    }
-
-    push.mode = 1u;
-    push.visibleSigmaY = request.visibleSigmaY;
-    push.visibleAuthority = request.visibleChromaEnabled
+    PushConstants visiblePush = spatialPush;
+    visiblePush.mode = 1u;
+    visiblePush.visibleSigmaY = request.visibleSigmaY;
+    visiblePush.visibleAuthority = request.visibleChromaEnabled
             ? std::clamp(request.visibleAuthority, 0.0f, 0.96f)
             : std::clamp(request.legacySharpenAmount, 0.0f, 0.30f);
-    push.visibleMaximumCorrection = request.visibleMaximumCorrection;
-    push.inverse00 = request.inverse00;
-    push.inverse01 = request.inverse01;
-    push.inverse11 = request.inverse11;
-    // Mode 1 no longer consumes these mode-0 spatial-NR slots. Reuse four slots for
-    // the Lightroom Detail tuple without growing the 128-byte push layout.
-    push.appliedLumaSigma = std::clamp(request.profileDetailAmount, 0.0f, 1.0f);
-    push.lumaRangeThresholdMean = std::clamp(request.profileDetailRadius, 0.50f, 3.00f);
-    push.chromaRangeThresholdMean = std::clamp(request.profileDetailDetail, 0.0f, 1.0f);
-    push.outerRingAuthority = std::clamp(request.profileDetailMasking, 0.0f, 1.0f);
-    push.profileNrColor = 0.0f;
-    push.chromaNrStrength = 0.0f;
-    // FASE 15: mode 1 consumes padding2 only as a publication mode switch.
-    // true => exact-LUT packed BGR8/sRGB, false => legacy FP32 publication fallback.
-    push.padding2 = request.packedBgr8Publication ? 1.0f : 0.0f;
-    // The visible-chroma pass consumes the strip-local intermediate buffer, not the
-    // upstream full-frame resident tone buffer. Restore strip-local addressing before
-    // the second dispatch even when mode 0 used a resident full-frame source.
-    push.padding1 = 0.0f;
-    push.inputOriginY = request.intermediateOriginY;
-    push.inputRows = request.intermediateRows;
-    push.outputOriginY = request.outputOriginY;
-    push.outputRows = request.outputRows;
-    vkCmdBindDescriptorSets(commandBuffer_, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            pipelineLayout_, 0u, 1u, &descriptorSets_[1], 0u, nullptr);
-    vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
-                       0u, sizeof(push), &push);
-    vkCmdDispatch(commandBuffer_, (request.frameWidth + 15u) / 16u,
-                  (request.outputRows + 15u) / 16u, 1u);
-    if (result.timestampQueryUsed) {
-        vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                            queryPool_, 3u);
+    visiblePush.visibleMaximumCorrection = request.visibleMaximumCorrection;
+    visiblePush.inverse00 = request.inverse00;
+    visiblePush.inverse01 = request.inverse01;
+    visiblePush.inverse11 = request.inverse11;
+    visiblePush.appliedLumaSigma = std::clamp(request.profileDetailAmount, 0.0f, 1.0f);
+    visiblePush.lumaRangeThresholdMean = std::clamp(request.profileDetailRadius, 0.50f, 3.00f);
+    visiblePush.chromaRangeThresholdMean = std::clamp(request.profileDetailDetail, 0.0f, 1.0f);
+    visiblePush.outerRingAuthority = std::clamp(request.profileDetailMasking, 0.0f, 1.0f);
+    visiblePush.profileNrColor = 0.0f;
+    visiblePush.chromaNrStrength = 0.0f;
+    visiblePush.padding2 = request.packedBgr8Publication ? 1.0f : 0.0f;
+    // Negative padding1 still selects strip-local intermediate addressing in fetchGlobal()
+    // while telling the packed publication store to use absolute frame rows for batch mode.
+    visiblePush.padding1 = batchedExecution ? -1.0f : 0.0f;
+
+    for (std::uint32_t index = 0u; index < stripCount; ++index) {
+        const auto& strip = stripAt(index);
+        const std::uint32_t queryBase = index * kQueriesPerStrip;
+        if (result.timestampQueryUsed) {
+            vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                queryPool_, queryBase);
+        }
+
+        PushConstants push = spatialPush;
+        push.inputOriginY = strip.inputOriginY;
+        push.inputRows = strip.inputRows;
+        push.outputOriginY = strip.intermediateOriginY;
+        push.outputRows = strip.intermediateRows;
+        vkCmdBindDescriptorSets(commandBuffer_, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                pipelineLayout_, 0u, 1u, &descriptorSets_[0], 0u, nullptr);
+        vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
+                           0u, sizeof(push), &push);
+        vkCmdDispatch(commandBuffer_, (request.frameWidth + 15u) / 16u,
+                      (strip.intermediateRows + 15u) / 16u, 1u);
+        if (result.timestampQueryUsed) {
+            vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                queryPool_, queryBase + 1u);
+        }
+
+        VkBufferMemoryBarrier intermediateReady{};
+        intermediateReady.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        intermediateReady.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        intermediateReady.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        intermediateReady.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        intermediateReady.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        intermediateReady.buffer = intermediate_.buffer;
+        intermediateReady.offset = 0u;
+        intermediateReady.size = static_cast<VkDeviceSize>(
+                floatRowBytes * static_cast<std::uint64_t>(strip.intermediateRows));
+        vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u,
+                             0u, nullptr, 1u, &intermediateReady, 0u, nullptr);
+        if (result.timestampQueryUsed) {
+            vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                queryPool_, queryBase + 2u);
+        }
+
+        push = visiblePush;
+        push.inputOriginY = strip.intermediateOriginY;
+        push.inputRows = strip.intermediateRows;
+        push.outputOriginY = strip.outputOriginY;
+        push.outputRows = strip.outputRows;
+        vkCmdBindDescriptorSets(commandBuffer_, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                pipelineLayout_, 0u, 1u, &descriptorSets_[1], 0u, nullptr);
+        vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
+                           0u, sizeof(push), &push);
+        vkCmdDispatch(commandBuffer_, (request.frameWidth + 15u) / 16u,
+                      (strip.outputRows + 15u) / 16u, 1u);
+        if (result.timestampQueryUsed) {
+            vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                queryPool_, queryBase + 3u);
+        }
+
+        if (index + 1u < stripCount) {
+            // The same strip-sized FP32 intermediate is reused by the next spatial pass.
+            // Complete all visible-pass reads before allowing the next shader writes.
+            VkBufferMemoryBarrier intermediateReuse{};
+            intermediateReuse.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            intermediateReuse.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            intermediateReuse.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            intermediateReuse.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            intermediateReuse.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            intermediateReuse.buffer = intermediate_.buffer;
+            intermediateReuse.offset = 0u;
+            intermediateReuse.size = static_cast<VkDeviceSize>(result.intermediateBytes);
+            vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u,
+                                 0u, nullptr, 1u, &intermediateReuse, 0u, nullptr);
+        }
     }
 
     VkBufferMemoryBarrier hostBarriers[3]{};
@@ -777,8 +860,14 @@ VulkanSpectraResidentPostDemosaicBackend::execute(
     submit.commandBufferCount = 1u;
     submit.pCommandBuffers = &commandBuffer_;
     const auto syncStarted = Clock::now();
-    if (vkQueueSubmit(computeQueue, 1u, &submit, fence_) != VK_SUCCESS ||
-        vkWaitForFences(device, 1u, &fence_, VK_TRUE, 3'000'000'000ull) != VK_SUCCESS) {
+    const VkResult submitResult = vkQueueSubmit(computeQueue, 1u, &submit, fence_);
+    if (submitResult == VK_SUCCESS) result.queueSubmitCount = 1u;
+    VkResult waitResult = VK_SUCCESS;
+    if (submitResult == VK_SUCCESS) {
+        result.fenceWaitCount = 1u;
+        waitResult = vkWaitForFences(device, 1u, &fence_, VK_TRUE, 3'000'000'000ull);
+    }
+    if (submitResult != VK_SUCCESS || waitResult != VK_SUCCESS) {
         VulkanRuntime::instance().markGpuStalled("PostDemosaic");
         result.status = "GPU_STALLED";
         result.failureReason = "post_demosaic_queue_submit_or_wait_timeout";
@@ -788,21 +877,40 @@ VulkanSpectraResidentPostDemosaicBackend::execute(
     result.synchronizationMs = elapsedMs(syncStarted);
 
     if (result.timestampQueryUsed) {
-        std::uint64_t timestamps[4]{};
-        if (vkGetQueryPoolResults(device, queryPool_, 0u, 4u, sizeof(timestamps),
-                timestamps, sizeof(std::uint64_t),
-                VK_QUERY_RESULT_64_BIT) == VK_SUCCESS &&
-            timestamps[1] >= timestamps[0] && timestamps[3] >= timestamps[2] &&
-            timestamps[3] >= timestamps[0]) {
-            VkPhysicalDeviceProperties properties{};
-            vkGetPhysicalDeviceProperties(physicalDevice, &properties);
-            const double toMs = static_cast<double>(properties.limits.timestampPeriod) / 1.0e6;
-            result.spatialKernelMs = static_cast<float>(
-                    static_cast<double>(timestamps[1] - timestamps[0]) * toMs);
-            result.visibleKernelMs = static_cast<float>(
-                    static_cast<double>(timestamps[3] - timestamps[2]) * toMs);
-            result.gpuKernelMs = static_cast<float>(
-                    static_cast<double>(timestamps[3] - timestamps[0]) * toMs);
+        std::array<std::uint64_t, kPostDemosaicTimestampQueryCapacity> timestamps{};
+        if (vkGetQueryPoolResults(device, queryPool_, 0u, timedQueryCount,
+                static_cast<std::size_t>(timedQueryCount) * sizeof(std::uint64_t),
+                timestamps.data(), sizeof(std::uint64_t),
+                VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+            bool monotonic = true;
+            std::uint64_t firstTimestamp = timestamps.front();
+            std::uint64_t lastTimestamp = timestamps.back();
+            std::uint64_t spatialTicks = 0u;
+            std::uint64_t visibleTicks = 0u;
+            for (std::uint32_t index = 0u; index < stripCount; ++index) {
+                const std::size_t base = static_cast<std::size_t>(index) * kQueriesPerStrip;
+                const std::uint64_t q0 = timestamps[base];
+                const std::uint64_t q1 = timestamps[base + 1u];
+                const std::uint64_t q2 = timestamps[base + 2u];
+                const std::uint64_t q3 = timestamps[base + 3u];
+                if (!(q1 >= q0 && q2 >= q1 && q3 >= q2)) {
+                    monotonic = false;
+                    break;
+                }
+                spatialTicks += q1 - q0;
+                visibleTicks += q3 - q2;
+            }
+            if (monotonic && lastTimestamp >= firstTimestamp) {
+                VkPhysicalDeviceProperties properties{};
+                vkGetPhysicalDeviceProperties(physicalDevice, &properties);
+                const double toMs = static_cast<double>(properties.limits.timestampPeriod) / 1.0e6;
+                result.spatialKernelMs = static_cast<float>(static_cast<double>(spatialTicks) * toMs);
+                result.visibleKernelMs = static_cast<float>(static_cast<double>(visibleTicks) * toMs);
+                result.gpuKernelMs = static_cast<float>(
+                        static_cast<double>(lastTimestamp - firstTimestamp) * toMs);
+            } else {
+                result.timestampQueryUsed = false;
+            }
         } else {
             result.timestampQueryUsed = false;
         }
@@ -831,8 +939,6 @@ VulkanSpectraResidentPostDemosaicBackend::execute(
     const bool profileDetailSharpenRequested = request.profileDetailAmount > 1.0e-6f;
     result.legacySharpenApplied = !request.visibleChromaEnabled &&
             (request.legacySharpenAmount > 1.0e-6f || profileDetailSharpenRequested);
-    // Mode 1 always works in quantized sRGB when visible chroma is disabled. Packed
-    // publication also sRGB-encodes the linear visible-chroma result through the exact LUT.
     result.outputSrgbEncoded = request.packedBgr8Publication || !request.visibleChromaEnabled;
     result.success = true;
     if (request.packedBgr8Publication) {
@@ -851,5 +957,4 @@ VulkanSpectraResidentPostDemosaicBackend::execute(
     return result;
 #endif
 }
-
 } // namespace bncam::vulkan

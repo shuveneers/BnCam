@@ -10883,6 +10883,7 @@ StripedResidentPostDemosaicExecution executeResidentTonePostDemosaic(
         output.empty() || output.type() != CV_8UC3 ||
         output.cols != width || output.rows != height ||
         !stripPlan.valid || stripPlan.width != width || stripPlan.height != height ||
+        stripPlan.strips.empty() ||
         (visiblePlan.enabled && (!covariance.valid || !(visibleSigmaY > 0.0f) ||
                                  !std::isfinite(visibleSigmaY)))) {
         aggregate.status = "INVALID_RESIDENT_TONE_POST_DEMOSAIC_EXECUTION_INPUT";
@@ -10914,27 +10915,18 @@ StripedResidentPostDemosaicExecution executeResidentTonePostDemosaic(
     hashBytes(&gridHeight, sizeof(gridHeight));
 
     aggregate.stripCount = static_cast<int>(stripPlan.strips.size());
-    bool allTimestampQueriesUsed = true;
-    std::vector<std::size_t> executionOrder;
-    executionOrder.reserve(stripPlan.strips.size());
-    const auto largestStrip = std::max_element(
-            stripPlan.strips.begin(), stripPlan.strips.end(),
-            [](const auto& lhs, const auto& rhs) {
-                return lhs.inputRowCount < rhs.inputRowCount;
-            });
-    if (largestStrip != stripPlan.strips.end()) {
-        executionOrder.push_back(static_cast<std::size_t>(
-                std::distance(stripPlan.strips.begin(), largestStrip)));
+    constexpr std::size_t kMaximumResidentPostDemosaicBatchStrips = 64u;
+    if (stripPlan.strips.size() > kMaximumResidentPostDemosaicBatchStrips) {
+        aggregate.status = "RESIDENT_TONE_POST_DEMOSAIC_BATCH_TOO_LARGE";
+        aggregate.failureReason = "STRIP_COUNT_EXCEEDS_FIXED_BATCH_CAPACITY";
+        aggregate.totalMs = elapsedMs(totalStarted);
+        return aggregate;
     }
-    for (std::size_t index = 0; index < stripPlan.strips.size(); ++index) {
-        if (executionOrder.empty() || index != executionOrder.front()) {
-            executionOrder.push_back(index);
-        }
-    }
-
+    std::array<bncam::vulkan::SpectraResidentPostDemosaicStripRange,
+               kMaximumResidentPostDemosaicBatchStrips> batchStrips{};
+    std::size_t batchStripCount = 0u;
     constexpr int kVisibleHaloRows = 4;
-    for (const std::size_t stripIndex : executionOrder) {
-        const auto& strip = stripPlan.strips[stripIndex];
+    for (const auto& strip : stripPlan.strips) {
         const int outputEndY = strip.outputStartY + strip.outputRowCount;
         const int intermediateOriginY = std::max(0, strip.outputStartY - kVisibleHaloRows);
         const int intermediateEndY = std::min(height, outputEndY + kVisibleHaloRows);
@@ -10947,154 +10939,144 @@ StripedResidentPostDemosaicExecution executeResidentTonePostDemosaic(
             aggregate.totalMs = elapsedMs(totalStarted);
             return aggregate;
         }
-
-        bncam::vulkan::SpectraResidentPostDemosaicRequest request{};
-        request.frameWidth = static_cast<std::uint32_t>(width);
-        request.frameHeight = static_cast<std::uint32_t>(height);
-        request.rowStrideFloats = static_cast<std::size_t>(width) * 3u;
-        request.inputOriginY = static_cast<std::uint32_t>(strip.inputStartY);
-        request.inputRows = static_cast<std::uint32_t>(strip.inputRowCount);
-        request.intermediateOriginY = static_cast<std::uint32_t>(intermediateOriginY);
-        request.intermediateRows = static_cast<std::uint32_t>(intermediateRows);
-        request.outputOriginY = static_cast<std::uint32_t>(strip.outputStartY);
-        request.outputRows = static_cast<std::uint32_t>(strip.outputRowCount);
-        request.spatialSigma = spatialSigma;
-        request.gridWidth = gridWidth;
-        request.gridHeight = gridHeight;
-        request.meanSpatialSigma = fallbackSpatialSigma;
-        request.appliedLumaSigma = appliedLumaSigma;
-        request.lumaRangeThresholdMean = lumaRangeThresholdMean;
-        request.chromaRangeThresholdMean = chromaRangeThresholdMean;
-        request.outerRingAuthority = outerRingAuthority;
-        request.spectraNoiseActive = spectraNoiseActive;
-        request.visibleChromaEnabled = visiblePlan.enabled;
-        request.profileNrLuminance = profileNrLuminance;
-        request.profileNrLuminanceDetail = profileNrLuminanceDetail;
-        request.profileNrLuminanceContrast = profileNrLuminanceContrast;
-        request.profileNrColor = profileNrColor;
-        request.profileNrColorDetail = profileNrColorDetail;
-        request.profileNrColorSmoothness = profileNrColorSmoothness;
-        request.chromaNrStrength = chromaNrStrength;
-        request.chromaUserScale = chromaUserScale;
-        request.downstreamChromaAuthority = downstreamChromaAuthority;
-        request.noiseModelMultiplier = noiseModelMultiplier;
-        request.configuredDynamicIsoCoeff = configuredDynamicIsoCoeff;
-        request.downstreamLumaAuthority = downstreamLumaAuthority;
-        request.profileSpectraLuma = profileSpectraLuma;
-        request.profileSpectraDetail = profileSpectraDetailProtection;
-        // Phase 11 owns RAW capture detail before GTM/FLLF/AgX. Post-demosaic NR/chroma
-        // remains a cleanup owner only; profile detail is forced neutral here to prevent stacking.
-        request.profileDetailAmount = 0.0f;
-        request.profileDetailRadius = profileDetailRadius;
-        request.profileDetailDetail = profileDetailDetail;
-        request.profileDetailMasking = profileDetailMasking;
-        request.visibleSigmaY = visibleSigmaY;
-        request.visibleAuthority = visiblePlan.enabled ? visiblePlan.authority : 0.0f;
-        request.visibleMaximumCorrection = visiblePlan.enabled ? visiblePlan.maximumCorrection : 0.0f;
-        // Phase 11 is the sole RAW capture-detail owner. The resident post-demosaic stage
-        // may denoise/clean chroma but must never add legacy sharpening, regardless of route.
-        request.legacySharpenAmount = 0.0f;
-        request.inverse00 = covariance.valid ? covariance.inverse00 : 1.0f;
-        request.inverse01 = covariance.valid ? covariance.inverse01 : 0.0f;
-        request.inverse11 = covariance.valid ? covariance.inverse11 : 1.0f;
-        request.generationId = spatialGeneration;
-        // FASE 15 production contract: resident tone is published as packed BGR8/sRGB.
-        // The backend's FP32 route is explicit fallback/debug only.
-        request.packedBgr8Publication = true;
-
-        const bncam::vulkan::SpectraResidentPostDemosaicResult execution =
-                bncam::vulkan::VulkanRuntime::instance()
-                        .executeSpectraResidentPostDemosaicFromTone(
-                                request, residentToneGeneration);
-        aggregate.inputPackingMs += execution.inputPackingMs;
-        aggregate.spatialKernelMs += execution.spatialKernelMs;
-        aggregate.visibleKernelMs += execution.visibleKernelMs;
-        aggregate.gpuKernelMs += execution.gpuKernelMs;
-        aggregate.synchronizationMs += execution.synchronizationMs;
-        aggregate.readbackMs += execution.readbackMs;
-        aggregate.transferAndSyncMs += execution.transferAndSyncMs;
-        aggregate.inputBytes += execution.inputBytes;
-        aggregate.intermediateBytes += execution.intermediateBytes;
-        aggregate.spatialMapBytes += execution.spatialMapBytes;
-        aggregate.persistentResidentBytes = std::max(
-                aggregate.persistentResidentBytes, execution.persistentResidentBytes);
-        aggregate.persistentAllocationGeneration = std::max(
-                aggregate.persistentAllocationGeneration,
-                execution.persistentAllocationGeneration);
-        if (execution.persistentBufferReuseHit) {
-            aggregate.persistentReuseObserved = true;
-            aggregate.persistentReuseHitCount++;
-        }
-        if (execution.persistentBufferReallocated) {
-            aggregate.persistentReallocated = true;
-            aggregate.persistentReallocationCount++;
-        }
-        allTimestampQueriesUsed = allTimestampQueriesUsed && execution.timestampQueryUsed;
-        if (!execution.success || !execution.residentInputUsed) {
-            aggregate.status = "RESIDENT_TONE_POST_DEMOSAIC_STRIP_FAILED";
-            aggregate.failureReason = "strip_y_" + std::to_string(strip.outputStartY) + "_" +
-                    (execution.failureReason.empty() ? execution.status : execution.failureReason);
-            aggregate.totalMs = elapsedMs(totalStarted);
-            return aggregate;
-        }
-        aggregate.legacySharpenApplied = aggregate.legacySharpenApplied || execution.legacySharpenApplied;
-        if (execution.legacySharpenApplied) {
-            aggregate.legacySharpenAmount = std::max(
-                    aggregate.legacySharpenAmount, std::clamp(legacySharpenAmount, 0.0f, 0.30f));
-        }
-        std::string publicationFailure;
-        if (!copyResidentPostDemosaicPublicationToBgr8(
-                    execution, output, strip.outputStartY, strip.outputRowCount, width,
-                    aggregate.packedBgr8PublicationUsed, aggregate.floatPublicationFallbackUsed,
-                    publicationFailure)) {
-            aggregate.status = "RESIDENT_TONE_POST_DEMOSAIC_PUBLICATION_UNAVAILABLE";
-            aggregate.failureReason = publicationFailure;
-            aggregate.totalMs = elapsedMs(totalStarted);
-            return aggregate;
-        }
-        aggregate.outputBytes += execution.outputBytes;
-        aggregate.outputSrgbEncoded = true;
-        for (std::size_t index = 0; index < aggregate.spatialCounters.size(); ++index) {
-            aggregate.spatialCounters[index] += execution.spatialCounters[index];
-            aggregate.visibleCounters[index] += execution.visibleCounters[index];
-        }
-        float stripMaximumLumaDelta = 0.0f;
-        float stripMaximumChromaDelta = 0.0f;
-        float stripMaximumColourShift = 0.0f;
-        const std::uint32_t maxLumaBits = execution.spatialCounters[6];
-        const std::uint32_t maxChromaBits = execution.spatialCounters[7];
-        const std::uint32_t maxColourBits = execution.visibleCounters[15];
-        std::memcpy(&stripMaximumLumaDelta, &maxLumaBits, sizeof(stripMaximumLumaDelta));
-        std::memcpy(&stripMaximumChromaDelta, &maxChromaBits, sizeof(stripMaximumChromaDelta));
-        std::memcpy(&stripMaximumColourShift, &maxColourBits, sizeof(stripMaximumColourShift));
-        if (std::isfinite(stripMaximumLumaDelta)) {
-            aggregate.maximumLumaDelta = std::max(
-                    aggregate.maximumLumaDelta, stripMaximumLumaDelta);
-        }
-        if (std::isfinite(stripMaximumChromaDelta)) {
-            aggregate.maximumChromaDelta = std::max(
-                    aggregate.maximumChromaDelta, stripMaximumChromaDelta);
-        }
-        if (std::isfinite(stripMaximumColourShift)) {
-            aggregate.maximumColourShift = std::max(
-                    aggregate.maximumColourShift, stripMaximumColourShift);
-        }
-        aggregate.successfulStripCount++;
+        bncam::vulkan::SpectraResidentPostDemosaicStripRange batchStrip{};
+        batchStrip.inputOriginY = static_cast<std::uint32_t>(strip.inputStartY);
+        batchStrip.inputRows = static_cast<std::uint32_t>(strip.inputRowCount);
+        batchStrip.intermediateOriginY = static_cast<std::uint32_t>(intermediateOriginY);
+        batchStrip.intermediateRows = static_cast<std::uint32_t>(intermediateRows);
+        batchStrip.outputOriginY = static_cast<std::uint32_t>(strip.outputStartY);
+        batchStrip.outputRows = static_cast<std::uint32_t>(strip.outputRowCount);
+        batchStrips[batchStripCount++] = batchStrip;
     }
 
-    aggregate.timestampQueryUsed = allTimestampQueriesUsed && aggregate.stripCount > 0;
-    aggregate.success = aggregate.successfulStripCount == aggregate.stripCount;
-    aggregate.status = aggregate.success
-            ? (aggregate.floatPublicationFallbackUsed
-                    ? "SPECTRA_POST_DEMOSAIC_GPU_RESIDENT_TONE_FLOAT_PUBLICATION_FALLBACK_READY"
-                    : "SPECTRA_POST_DEMOSAIC_GPU_RESIDENT_TONE_BGR8_PUBLICATION_READY")
-            : "RESIDENT_TONE_POST_DEMOSAIC_FRAME_INCOMPLETE";
-    aggregate.failureReason = aggregate.success
-            ? "none" : "NOT_ALL_RESIDENT_TONE_POST_DEMOSAIC_STRIPS_COMPLETED";
+    // FASE 15: the resident tone route now submits the complete strip plan as one backend
+    // execution. The backend reuses one strip-sized FP32 intermediate, writes each packed
+    // result into its absolute full-frame row, and performs one queue submit/fence wait.
+    const auto& firstStrip = batchStrips[0];
+    bncam::vulkan::SpectraResidentPostDemosaicRequest request{};
+    request.frameWidth = static_cast<std::uint32_t>(width);
+    request.frameHeight = static_cast<std::uint32_t>(height);
+    request.rowStrideFloats = static_cast<std::size_t>(width) * 3u;
+    request.inputOriginY = firstStrip.inputOriginY;
+    request.inputRows = firstStrip.inputRows;
+    request.intermediateOriginY = firstStrip.intermediateOriginY;
+    request.intermediateRows = firstStrip.intermediateRows;
+    request.outputOriginY = firstStrip.outputOriginY;
+    request.outputRows = firstStrip.outputRows;
+    request.spatialSigma = spatialSigma;
+    request.gridWidth = gridWidth;
+    request.gridHeight = gridHeight;
+    request.meanSpatialSigma = fallbackSpatialSigma;
+    request.appliedLumaSigma = appliedLumaSigma;
+    request.lumaRangeThresholdMean = lumaRangeThresholdMean;
+    request.chromaRangeThresholdMean = chromaRangeThresholdMean;
+    request.outerRingAuthority = outerRingAuthority;
+    request.spectraNoiseActive = spectraNoiseActive;
+    request.visibleChromaEnabled = visiblePlan.enabled;
+    request.profileNrLuminance = profileNrLuminance;
+    request.profileNrLuminanceDetail = profileNrLuminanceDetail;
+    request.profileNrLuminanceContrast = profileNrLuminanceContrast;
+    request.profileNrColor = profileNrColor;
+    request.profileNrColorDetail = profileNrColorDetail;
+    request.profileNrColorSmoothness = profileNrColorSmoothness;
+    request.chromaNrStrength = chromaNrStrength;
+    request.chromaUserScale = chromaUserScale;
+    request.downstreamChromaAuthority = downstreamChromaAuthority;
+    request.noiseModelMultiplier = noiseModelMultiplier;
+    request.configuredDynamicIsoCoeff = configuredDynamicIsoCoeff;
+    request.downstreamLumaAuthority = downstreamLumaAuthority;
+    request.profileSpectraLuma = profileSpectraLuma;
+    request.profileSpectraDetail = profileSpectraDetailProtection;
+    // Phase 11 remains the sole RAW detail owner. This route only denoises/cleans chroma.
+    request.profileDetailAmount = 0.0f;
+    request.profileDetailRadius = profileDetailRadius;
+    request.profileDetailDetail = profileDetailDetail;
+    request.profileDetailMasking = profileDetailMasking;
+    request.visibleSigmaY = visibleSigmaY;
+    request.visibleAuthority = visiblePlan.enabled ? visiblePlan.authority : 0.0f;
+    request.visibleMaximumCorrection = visiblePlan.enabled ? visiblePlan.maximumCorrection : 0.0f;
+    request.legacySharpenAmount = 0.0f;
+    request.inverse00 = covariance.valid ? covariance.inverse00 : 1.0f;
+    request.inverse01 = covariance.valid ? covariance.inverse01 : 0.0f;
+    request.inverse11 = covariance.valid ? covariance.inverse11 : 1.0f;
+    request.generationId = spatialGeneration;
+    request.packedBgr8Publication = true;
+    request.batchStrips = batchStrips.data();
+    request.batchStripCount = static_cast<std::uint32_t>(batchStripCount);
+
+    const bncam::vulkan::SpectraResidentPostDemosaicResult execution =
+            bncam::vulkan::VulkanRuntime::instance()
+                    .executeSpectraResidentPostDemosaicFromTone(
+                            request, residentToneGeneration);
+
+    aggregate.inputPackingMs = execution.inputPackingMs;
+    aggregate.spatialKernelMs = execution.spatialKernelMs;
+    aggregate.visibleKernelMs = execution.visibleKernelMs;
+    aggregate.gpuKernelMs = execution.gpuKernelMs;
+    aggregate.synchronizationMs = execution.synchronizationMs;
+    aggregate.readbackMs = execution.readbackMs;
+    aggregate.transferAndSyncMs = execution.transferAndSyncMs;
+    aggregate.inputBytes = execution.inputBytes;
+    aggregate.intermediateBytes = execution.intermediateBytes;
+    aggregate.outputBytes = execution.outputBytes;
+    aggregate.spatialMapBytes = execution.spatialMapBytes;
+    aggregate.persistentResidentBytes = execution.persistentResidentBytes;
+    aggregate.persistentAllocationGeneration = execution.persistentAllocationGeneration;
+    aggregate.persistentReuseObserved = execution.persistentBufferReuseHit;
+    aggregate.persistentReallocated = execution.persistentBufferReallocated;
+    aggregate.persistentReuseHitCount = execution.persistentBufferReuseHit ? 1 : 0;
+    aggregate.persistentReallocationCount = execution.persistentBufferReallocated ? 1 : 0;
+    aggregate.timestampQueryUsed = execution.timestampQueryUsed;
+
+    if (!execution.success || !execution.residentInputUsed || !execution.batchedExecution ||
+        execution.batchStripCount != request.batchStripCount ||
+        execution.queueSubmitCount != 1u || execution.fenceWaitCount != 1u) {
+        aggregate.status = "RESIDENT_TONE_POST_DEMOSAIC_BATCH_FAILED";
+        aggregate.failureReason = execution.failureReason.empty()
+                ? execution.status : execution.failureReason;
+        aggregate.totalMs = elapsedMs(totalStarted);
+        return aggregate;
+    }
+
+    aggregate.legacySharpenApplied = execution.legacySharpenApplied;
+    if (execution.legacySharpenApplied) {
+        aggregate.legacySharpenAmount = std::clamp(legacySharpenAmount, 0.0f, 0.30f);
+    }
+    std::string publicationFailure;
+    if (!copyResidentPostDemosaicPublicationToBgr8(
+                execution, output, 0, height, width,
+                aggregate.packedBgr8PublicationUsed, aggregate.floatPublicationFallbackUsed,
+                publicationFailure)) {
+        aggregate.status = "RESIDENT_TONE_POST_DEMOSAIC_PUBLICATION_UNAVAILABLE";
+        aggregate.failureReason = publicationFailure;
+        aggregate.totalMs = elapsedMs(totalStarted);
+        return aggregate;
+    }
+    aggregate.outputSrgbEncoded = true;
+    for (std::size_t index = 0; index < aggregate.spatialCounters.size(); ++index) {
+        aggregate.spatialCounters[index] = execution.spatialCounters[index];
+        aggregate.visibleCounters[index] = execution.visibleCounters[index];
+    }
+
+    const std::uint32_t maxLumaBits = execution.spatialCounters[6];
+    const std::uint32_t maxChromaBits = execution.spatialCounters[7];
+    const std::uint32_t maxColourBits = execution.visibleCounters[15];
+    std::memcpy(&aggregate.maximumLumaDelta, &maxLumaBits, sizeof(aggregate.maximumLumaDelta));
+    std::memcpy(&aggregate.maximumChromaDelta, &maxChromaBits, sizeof(aggregate.maximumChromaDelta));
+    std::memcpy(&aggregate.maximumColourShift, &maxColourBits, sizeof(aggregate.maximumColourShift));
+    if (!std::isfinite(aggregate.maximumLumaDelta)) aggregate.maximumLumaDelta = 0.0f;
+    if (!std::isfinite(aggregate.maximumChromaDelta)) aggregate.maximumChromaDelta = 0.0f;
+    if (!std::isfinite(aggregate.maximumColourShift)) aggregate.maximumColourShift = 0.0f;
+
+    aggregate.successfulStripCount = aggregate.stripCount;
+    aggregate.success = true;
+    aggregate.status = aggregate.floatPublicationFallbackUsed
+            ? "SPECTRA_POST_DEMOSAIC_GPU_RESIDENT_TONE_FLOAT_PUBLICATION_FALLBACK_READY"
+            : "SPECTRA_POST_DEMOSAIC_GPU_RESIDENT_TONE_BGR8_PUBLICATION_READY";
+    aggregate.failureReason = "none";
     aggregate.totalMs = elapsedMs(totalStarted);
     return aggregate;
 }
-
 void finalizeVisibleChromaResidualState(
         const cv::Mat& linearRgb,
         SpectraResidualNoiseState& residualNoiseState,

@@ -13,6 +13,17 @@
 
 namespace bncam::vulkan {
 
+// FASE 15 batch strip contract. Only row ranges vary between dispatch pairs; all
+// colour/noise parameters remain shared by SpectraResidentPostDemosaicRequest.
+struct SpectraResidentPostDemosaicStripRange {
+    std::uint32_t inputOriginY = 0;
+    std::uint32_t inputRows = 0;
+    std::uint32_t intermediateOriginY = 0;
+    std::uint32_t intermediateRows = 0;
+    std::uint32_t outputOriginY = 0;
+    std::uint32_t outputRows = 0;
+};
+
 struct SpectraResidentPostDemosaicRequest {
     const float* rgbData = nullptr;
     std::uint32_t frameWidth = 0;
@@ -73,6 +84,13 @@ struct SpectraResidentPostDemosaicRequest {
     // as an explicit typed FP32 fallback/debug path; it is never selected implicitly.
     bool packedBgr8Publication = true;
 
+    // FASE 15 queue-batching contract. When populated, execute() records all strip
+    // spatial/visible pairs into one command buffer and publishes one full-frame BGR8
+    // surface after one queue submit + fence wait. Batch mode is resident-input + packed
+    // publication only; the typed FP32/debug and host-staged paths remain single-strip.
+    const SpectraResidentPostDemosaicStripRange* batchStrips = nullptr;
+    std::uint32_t batchStripCount = 0u;
+
     // 8H-K: optional device-resident RGB input owned by an upstream Vulkan stage.
     // When non-null, rgbData is ignored and no full-frame CPU upload is performed.
     VkBuffer residentInputBuffer = VK_NULL_HANDLE;
@@ -86,6 +104,10 @@ struct SpectraResidentPostDemosaicResult {
     bool timestampQueryUsed = false;
     bool persistentBufferReuseHit = false;
     bool persistentBufferReallocated = false;
+    bool batchedExecution = false;
+    std::uint32_t batchStripCount = 1u;
+    std::uint32_t queueSubmitCount = 0u;
+    std::uint32_t fenceWaitCount = 0u;
     // Legacy typed fallback storage. Production FASE-15 publication uses outputMappedPointer.
     std::vector<float> outputRgb;
     const void* outputMappedPointer = nullptr;

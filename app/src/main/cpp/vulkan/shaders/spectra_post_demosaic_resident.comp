@@ -508,7 +508,7 @@ void stagePublicationPixel(uint localX, uint localY, vec3 rgb, bool alreadySrgb)
     publicationTileBytes[base + 2u] = publicationByte(rgb.r, alreadySrgb);
 }
 
-void flushPublicationWord(uint localX, uint localY, uint localOutputY) {
+void flushPublicationWord(uint localX, uint localY, uint publicationRow) {
     if (localX >= 12u) return;
     uint byteBase = localY * 48u + localX * 4u;
     uint packed = packByte4(publicationTileBytes[byteBase],
@@ -518,7 +518,7 @@ void flushPublicationWord(uint localX, uint localY, uint localOutputY) {
     uint wordsPerRow = (pc.frameWidth * 3u + 3u) / 4u;
     uint wordInRow = gl_WorkGroupID.x * 12u + localX;
     if (wordInRow >= wordsPerRow) return;
-    uint wordBase = localOutputY * wordsPerRow + wordInRow;
+    uint wordBase = publicationRow * wordsPerRow + wordInRow;
     outputWords[wordBase] = packed;
 }
 float mahalanobis2(float dRG, float dBG, float localNoiseScale) {
@@ -1069,6 +1069,10 @@ void main() {
     stagePublicationPixel(gl_LocalInvocationID.x, gl_LocalInvocationID.y, published, alreadySrgb);
     barrier();
     if (validY) {
-        flushPublicationWord(gl_LocalInvocationID.x, gl_LocalInvocationID.y, localOutputY);
+        // FASE 15 batched resident publication uses padding1 < 0 as an addressing-only
+        // marker. fetchGlobal() still treats it as strip-local, while the packed output
+        // lands directly in its absolute full-frame row. Single-strip fallback stays local.
+        uint publicationRow = pc.padding1 < -0.5 ? y : localOutputY;
+        flushPublicationWord(gl_LocalInvocationID.x, gl_LocalInvocationID.y, publicationRow);
     }
 }
