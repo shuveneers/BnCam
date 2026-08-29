@@ -125,7 +125,13 @@ float defectCorrectedAt(int x, int y, float center, out bool corrected) {
     float preThreshold = max(max(pc.baseDefectThreshold,
                                  3.0 * max(0.006, neighbourMax - neighbourMin)),
                              noiseFloor);
-    bool preHot = center > 0.20 && center > neighbourMax + preThreshold;
+
+    // P0 defect policy: hot-pixel admission is based on positive same-CFA outlier
+    // significance, not on an absolute scene brightness. The former center > 0.20
+    // gate made physically impossible single-pixel excursions survive in dark RAW.
+    // Real spatial structure remains protected by the four-site range term here
+    // and the robust eight-site median/spread confirmation below.
+    bool preHot = center > neighbourMax + preThreshold;
     bool preCold = center < 0.04 && neighbourMin > 0.10 && neighbourMin - center > preThreshold;
     if (!preHot && !preCold) return center;
 
@@ -140,7 +146,12 @@ float defectCorrectedAt(int x, int y, float center, out bool corrected) {
     float spread = max(0.006, neighbours[6] - neighbours[1]);
     float finalNoiseFloor = 6.0 * predictedNoiseSigma(median, noiseChannel);
     float threshold = max(max(pc.baseDefectThreshold, spread * 4.0), finalNoiseFloor);
-    bool hot = center > 0.20 && center > median + threshold;
+
+    // A hot sample must still clear the robust local median by the larger of:
+    // the format safety floor, 4x robust same-CFA spread, or 6 sigma from S/O.
+    // Multiple elevated same-CFA neighbours widen `spread`, preserving supported
+    // point/edge structure instead of treating every bright local maximum as a defect.
+    bool hot = center > median + threshold;
     bool cold = center < 0.04 && median > 0.10 && median - center > threshold;
     if (hot || cold) {
         corrected = true;

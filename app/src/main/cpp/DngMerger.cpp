@@ -125,6 +125,7 @@ struct AlignmentDecision {
 
 struct SpectraNoiseModel {
     bool enabled = false;
+    bool adaptiveCalibrationEnabled = false;
     std::array<double, 4> effectiveS{0.0, 0.0, 0.0, 0.0};
     std::array<double, 4> effectiveO{0.0, 0.0, 0.0, 0.0};
     float confidence = 0.0f;
@@ -1929,6 +1930,8 @@ jobject mergeRawToDngRaw16Internal(
         jint maxShiftPixels,
         jfloat alignmentStrictness,
         jint spectraMode,
+        bool temporalNoiseModelEnabled,
+        bool spectraAdaptiveCalibrationEnabled,
         const std::vector<double>& spectraEffectiveS,
         const std::vector<double>& spectraEffectiveO,
         jfloat spectraModelConfidence,
@@ -1973,7 +1976,10 @@ jobject mergeRawToDngRaw16Internal(
     localStats.alignmentStrictness = clampStrictness(alignmentStrictness);
 
     SpectraNoiseModel spectraModel{};
-    spectraModel.enabled = spectraMode > 0 && spectraEffectiveS.size() >= 4u && spectraEffectiveO.size() >= 4u;
+    spectraModel.enabled = temporalNoiseModelEnabled &&
+            spectraEffectiveS.size() >= 4u && spectraEffectiveO.size() >= 4u;
+    spectraModel.adaptiveCalibrationEnabled =
+            spectraAdaptiveCalibrationEnabled && spectraMode > 0;
     spectraModel.confidence = std::clamp(
             std::isfinite(spectraModelConfidence) ? static_cast<float>(spectraModelConfidence) : 0.0f,
             0.0f,
@@ -2006,10 +2012,25 @@ jobject mergeRawToDngRaw16Internal(
             0.95f
     );
     const double allowedDrift = 0.08 + 0.17 * static_cast<double>(spectraModel.noisePressure);
-    spectraModel.adaptationLowerBound = 1.0 - allowedDrift;
-    spectraModel.adaptationUpperBound = 1.0 + allowedDrift;
+    if (spectraModel.adaptiveCalibrationEnabled) {
+        spectraModel.adaptationLowerBound = 1.0 - allowedDrift;
+        spectraModel.adaptationUpperBound = 1.0 + allowedDrift;
+    } else {
+        // Physical Camera2 S/O is immutable in SPECTRA-Off baseline. The observer remains
+        // useful for motion/static classification but cannot become a second calibration authority.
+        spectraModel.adaptationLowerBound = 1.0;
+        spectraModel.adaptationUpperBound = 1.0;
+    }
     spectraModel.enabled = validSpectraNoiseModel(spectraModel);
     localStats.spectraEnabled = spectraModel.enabled;
+    localStats.temporalNoiseModelEnabled = spectraModel.enabled;
+    localStats.spectraAdaptiveCalibrationEnabled =
+            spectraModel.enabled && spectraModel.adaptiveCalibrationEnabled;
+    localStats.temporalNoiseModelAuthority = !spectraModel.enabled
+            ? "DISABLED"
+            : (spectraModel.adaptiveCalibrationEnabled
+                    ? "SPECTRA_ADAPTIVE_SO"
+                    : "PHYSICAL_CAMERA2_FIXED_SO");
     localStats.spectraModelConfidence = spectraModel.confidence;
     localStats.spectraNoisePressure = spectraModel.noisePressure;
     localStats.spectraTemporalAuthority = spectraModel.temporalAuthority;
@@ -3260,6 +3281,8 @@ jobject mergeRaw10DngToRaw16(
         jint maxShiftPixels,
         jfloat alignmentStrictness,
         jint spectraMode,
+        bool temporalNoiseModelEnabled,
+        bool spectraAdaptiveCalibrationEnabled,
         const std::vector<double>& spectraEffectiveS,
         const std::vector<double>& spectraEffectiveO,
         jfloat spectraModelConfidence,
@@ -3282,6 +3305,8 @@ jobject mergeRaw10DngToRaw16(
             maxShiftPixels,
             alignmentStrictness,
             spectraMode,
+            temporalNoiseModelEnabled,
+            spectraAdaptiveCalibrationEnabled,
             spectraEffectiveS,
             spectraEffectiveO,
             spectraModelConfidence,
@@ -3309,6 +3334,8 @@ jobject mergeRawSensorDngToRaw16(
         jint maxShiftPixels,
         jfloat alignmentStrictness,
         jint spectraMode,
+        bool temporalNoiseModelEnabled,
+        bool spectraAdaptiveCalibrationEnabled,
         const std::vector<double>& spectraEffectiveS,
         const std::vector<double>& spectraEffectiveO,
         jfloat spectraModelConfidence,
@@ -3331,6 +3358,8 @@ jobject mergeRawSensorDngToRaw16(
             maxShiftPixels,
             alignmentStrictness,
             spectraMode,
+            temporalNoiseModelEnabled,
+            spectraAdaptiveCalibrationEnabled,
             spectraEffectiveS,
             spectraEffectiveO,
             spectraModelConfidence,
@@ -3490,6 +3519,9 @@ std::string formatDngMergeStats(const DngMergeStats& stats) {
         << ";javaRaw16CopyBytes=0"
         << ";nativeRaw16BufferBytes=" << stats.raw16Bytes
         << ";nativeRaw16OutstandingBuffersAtReturn=" << stats.nativeRaw16OutstandingBuffersAtReturn
+        << ";temporalNoiseModelEnabled=" << stats.temporalNoiseModelEnabled
+        << ";temporalNoiseModelAuthority=" << stats.temporalNoiseModelAuthority
+        << ";spectraAdaptiveCalibrationEnabled=" << stats.spectraAdaptiveCalibrationEnabled
         << ";spectraEnabled=" << stats.spectraEnabled
         << ";spectraModelConfidence=" << stats.spectraModelConfidence
         << ";spectraNoisePressure=" << stats.spectraNoisePressure

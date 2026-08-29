@@ -52,6 +52,8 @@ struct SpectraResidentPreDemosaicRequest {
     std::array<float, 4> effectiveO{0.0f, 0.0f, 0.0f, 0.0f};
     float blendStrength = 0.0f;
     float maxPixelShift = 0.0f;
+    float maxLinearShift = 0.028f;
+    bool physicalBaselineMode = false;
     float isoAuthority = 0.0f;
     float greenS = 0.0f;
     float greenO = 0.0f;

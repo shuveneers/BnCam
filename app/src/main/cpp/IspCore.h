@@ -242,6 +242,9 @@ struct SpectraPass0State {
     std::string fallbackReason = "none";
     std::string planningMethod = "LEGACY_FULL_FRAME_REFERENCE";
     std::uint64_t planningSampleCount = 0u;
+    bool sceneBlackMetadataAuthoritative = false;
+    bool sceneBlackImageMutationAllowed = true;
+    std::string sceneBlackAuthorityMode = "IMAGE_DERIVED_FALLBACK_ELIGIBLE";
     float isoAuthority = 0.0f;
     float noRegretAcceptedTileFraction = 0.0f;
     float noRegretRollbackFraction = 0.0f;
@@ -273,6 +276,8 @@ struct SpectraPass1State {
     std::string fallbackReason = "none";
     float averageVstResidualVar = 1.0f;
     float maxPixelShift = 0.0f;
+    // Linear-domain per-pixel safety cap. 0.028 preserves the existing non-physical GPU path.
+    float maxLinearShift = 0.028f;
     float modelConfidence = 0.0f;
     float blendStrength = 0.0f;
     float averageWienerGain = 0.0f;

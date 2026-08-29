@@ -578,7 +578,17 @@ float fllfRequestedCorrection(float localLogLuma) {
     float localLuma = max(1.0e-6, exp2(localLogLuma) - 0.0025);
     float requested = clamp(log2(sceneKey / localLuma), -maxCompressEv, maxLiftEv);
     float need = smoothstep(0.10, 0.46, abs(requested));
-    float deepBlackGuard = requested > 0.0 ? smoothstep(0.010, 0.050, localLuma) : 1.0;
+
+    // telemetry[19] is an immutable scalar copied from the calibrated S/O-derived
+    // physical noise pressure. At zero, behavior is exactly the Phase-10 baseline.
+    // As pressure rises, only positive deep-shadow lift is delayed; negative local
+    // compression and the black endpoint remain untouched.
+    float noisePressure = clamp(fllfParam(19u, 0.0), 0.0, 1.0);
+    float shadowLiftStart = mix(0.010, 0.024, noisePressure);
+    float shadowLiftFull = mix(0.050, 0.082, noisePressure);
+    float deepBlackGuard = requested > 0.0
+            ? smoothstep(shadowLiftStart, shadowLiftFull, localLuma)
+            : 1.0;
     return requested * strength * need * deepBlackGuard;
 }
 

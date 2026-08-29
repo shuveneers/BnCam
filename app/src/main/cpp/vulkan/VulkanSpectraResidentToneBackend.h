@@ -87,6 +87,7 @@ struct SpectraResidentToneRequest {
     float fllfMaxCompressEv = 0.20f;
     float fllfEdgeStopEv = 0.62f;
     float fllfRefinement = 0.10f;
+    float fllfShadowLiftNoiseGuardPressure = 0.0f;
     std::uint32_t fllfPyramidLevels = 6u;
     bool isRawBayer = true;
     float profileColorSaturation = 0.0f;
@@ -129,6 +130,7 @@ struct SpectraResidentToneResult {
     std::uint64_t fllfEdgeProtectedSamples = 0u;
     float fllfMeanAbsCorrectionEv = 0.0f;
     float fllfMaxAbsCorrectionEv = 0.0f;
+    float fllfShadowLiftNoiseGuardPressure = 0.0f;
     float fllfPyramidBuildMs = 0.0f;
     float fllfRemapReconstructMs = 0.0f;
     std::uint64_t fllfResidentBytes = 0u;

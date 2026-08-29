@@ -121,6 +121,11 @@ struct DngMergeStats {
     double rawMultiFrameGpuSynchronizationMs = 0.0;
     double rawMultiFrameFinalReadbackMs = 0.0;
 
+    // Physical temporal S/O availability is independent from optional SPECTRA adaptation.
+    bool temporalNoiseModelEnabled = false;
+    bool spectraAdaptiveCalibrationEnabled = false;
+    std::string temporalNoiseModelAuthority = "DISABLED";
+
     // SPECTRA capture-integrated temporal observation and fusion weighting.
     bool spectraEnabled = false;
     float spectraModelConfidence = 0.0f;
@@ -225,6 +230,8 @@ jobject mergeRaw10DngToRaw16(
         jint maxShiftPixels,
         jfloat alignmentStrictness,
         jint spectraMode,
+        bool temporalNoiseModelEnabled,
+        bool spectraAdaptiveCalibrationEnabled,
         const std::vector<double>& spectraEffectiveS,
         const std::vector<double>& spectraEffectiveO,
         jfloat spectraModelConfidence,
@@ -248,6 +255,8 @@ jobject mergeRawSensorDngToRaw16(
         jint maxShiftPixels,
         jfloat alignmentStrictness,
         jint spectraMode,
+        bool temporalNoiseModelEnabled,
+        bool spectraAdaptiveCalibrationEnabled,
         const std::vector<double>& spectraEffectiveS,
         const std::vector<double>& spectraEffectiveO,
         jfloat spectraModelConfidence,

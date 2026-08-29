@@ -67,6 +67,8 @@ data class RawDomainContract(
     /** Canonical [R, Gr, Gb, B] black levels used by developed RAW JPEG/noise processing. */
     val developedRawBlackLevels: List<Float> = List(4) { 0f },
     val developedRawBlackLevelSource: String = "sensor metadata",
+    val developedBlackMetadataAuthoritative: Boolean = false,
+    val developedBlackFallbackReason: String = "not_recorded",
     val cfaPattern: Int,
     val cfaName: String,
     val cfaOriginX: Int,
@@ -138,6 +140,9 @@ data class RawDomainContract(
             append(";nativeWhiteLevel=$nativeWhiteLevel")
             append(";payloadBlackLevels=${payloadBlackLevels.joinToString(prefix = "[", postfix = "]")}")
             append(";developedRawBlackLevels=${developedRawBlackLevels.joinToString(prefix = "[", postfix = "]")}")
+            append(";developedRawBlackLevelSource=$developedRawBlackLevelSource")
+            append(";developedBlackMetadataAuthoritative=$developedBlackMetadataAuthoritative")
+            append(";developedBlackFallbackReason=$developedBlackFallbackReason")
             append(";payloadWhiteLevel=$payloadWhiteLevel")
             append(";cfa=$cfaName/$cfaPattern")
             append(";cfaOrigin=$cfaOriginX,$cfaOriginY")
@@ -258,16 +263,56 @@ object RawDomainContractResolver {
         } else {
             payloadBlack.map { it.coerceIn(0, nativeWhite.coerceAtLeast(2) - 1) }
         }
-        val developedSourceLevels = finalCal?.effectiveBlackLevels?.toList() ?: qualityConfig.blackLevels
-        val developedScale = if (qualityConfig.whiteLevel > 0 && qualityConfig.whiteLevel != payloadWhite) {
-            payloadWhite.toFloat() / qualityConfig.whiteLevel.toFloat()
-        } else 1f
-        val developedRawBlack = List(4) { index ->
-            ((developedSourceLevels.getOrNull(index) ?: 0f) * developedScale)
+
+        val fallbackDevelopedSourceLevels =
+            finalCal?.effectiveBlackLevels?.toList() ?: qualityConfig.blackLevels
+        val fallbackDevelopedScale =
+            if (qualityConfig.whiteLevel > 0 && qualityConfig.whiteLevel != payloadWhite) {
+                payloadWhite.toFloat() / qualityConfig.whiteLevel.toFloat()
+            } else {
+                1f
+            }
+        val fallbackDevelopedRawBlack = List(4) { index ->
+            ((fallbackDevelopedSourceLevels.getOrNull(index) ?: 0f) * fallbackDevelopedScale)
                 .coerceIn(0f, payloadWhite.coerceAtLeast(2) - 1f)
         }
-        val developedRawBlackSource = finalCal?.effectiveBlackLevelSource
-            ?: qualityConfig.blackLevelSource
+
+        // P0: one developed-black owner. Prefer the exact frame's dynamic metadata, then the
+        // static Camera2 pattern already selected by the central resolver. Lens/manual/scaled
+        // values are only a controlled fallback when Camera2 black metadata is unavailable or invalid.
+        val metadataMosaicBlack = when {
+            rawMetadataBlack != null -> rawMetadataBlack.take(4)
+            dynamicBlack != null -> dynamicBlack.take(4)
+            staticBlackPattern != null -> staticBlack.take(4)
+            else -> null
+        }
+        val metadataBlackSource = when {
+            rawMetadataBlack != null -> finalCal?.base?.baseBlackLevelSource ?: "SensorCalibrationResolver metadata"
+            dynamicBlack != null -> "CaptureResult.SENSOR_DYNAMIC_BLACK_LEVEL"
+            staticBlackPattern != null -> "CameraCharacteristics.SENSOR_BLACK_LEVEL_PATTERN"
+            else -> "unavailable"
+        }
+        val blackAuthority = RawBlackAuthorityPolicy.resolve(
+            metadataMosaicLevels = metadataMosaicBlack,
+            metadataSource = metadataBlackSource,
+            cfaPattern = cfa,
+            fallbackCanonicalLevels = fallbackDevelopedRawBlack,
+            fallbackSource = finalCal?.effectiveBlackLevelSource ?: qualityConfig.blackLevelSource
+        )
+        val developedRawBlack = blackAuthority.canonicalLevels.map {
+            it.coerceIn(0f, payloadWhite.coerceAtLeast(2) - 1f)
+        }
+        val developedRawBlackSource = blackAuthority.source
+
+        val blackOverrideRequested = finalCal?.override?.blackLevelMode
+            ?.equals("System", ignoreCase = true) == false
+        if (blackAuthority.metadataAuthoritative && blackOverrideRequested) {
+            warnings.add(
+                "P0 metadata-first black authority suppressed lens black override mode=" +
+                    "${finalCal?.override?.blackLevelMode}; Camera2 metadata remains the developed RAW black owner"
+            )
+        }
+
         val sourceBitDepth = when (source) {
             RawInputSource.RAW10 -> 10
             RawInputSource.RAW_SENSOR -> bitDepthForWhite(nativeWhite, 1)
@@ -288,13 +333,20 @@ object RawDomainContractResolver {
             RawInputSource.RAW16_MASTER -> RawSampleTransform.RAW16_MASTER_IDENTITY
         }
         val transform = com.bncam.core.runtime.SensorToRawBufferTransform.create(characteristics, width, height)
-        val activeArray = RawContractRect(transform.bufferActiveRect.left, transform.bufferActiveRect.top, transform.bufferActiveRect.right, transform.bufferActiveRect.bottom)
+        val activeArray = RawContractRect(
+            transform.bufferActiveRect.left,
+            transform.bufferActiveRect.top,
+            transform.bufferActiveRect.right,
+            transform.bufferActiveRect.bottom
+        )
         val crop = captureResult?.get(CaptureResult.SCALER_CROP_REGION)?.let {
             RawContractRect(it.left, it.top, it.right, it.bottom)
         } ?: RawContractRect(0, 0, width, height)
-        val preCorrection = characteristics.get(CameraCharacteristics.SENSOR_INFO_PRE_CORRECTION_ACTIVE_ARRAY_SIZE)?.let {
-            RawContractRect(it.left, it.top, it.right, it.bottom)
-        } ?: activeArray
+        val preCorrection = characteristics
+            .get(CameraCharacteristics.SENSOR_INFO_PRE_CORRECTION_ACTIVE_ARRAY_SIZE)
+            ?.let {
+                RawContractRect(it.left, it.top, it.right, it.bottom)
+            } ?: activeArray
         val physicalCameraId = (captureResult as? TotalCaptureResult)
             ?.physicalCameraResults
             ?.keys
@@ -304,6 +356,11 @@ object RawDomainContractResolver {
             ?: if (source == RawInputSource.RAW10) ((width + 3) / 4) * 5 else width * 2
         val sourcePixelStride = dngMergeStats.intValue("pixelStrideBytes")
             ?: if (source == RawInputSource.RAW10) 0 else 2
+
+        val manualBlackFallbackUsed =
+            !blackAuthority.metadataAuthoritative &&
+                finalCal?.override?.manualBlackLevels != null
+        val manualColorOverrideUsed = finalCal?.override?.manualColorMatrix != null
 
         return RawDomainContract(
             sourceFormat = source,
@@ -318,6 +375,8 @@ object RawDomainContractResolver {
             payloadWhiteLevel = payloadWhite,
             developedRawBlackLevels = developedRawBlack,
             developedRawBlackLevelSource = developedRawBlackSource,
+            developedBlackMetadataAuthoritative = blackAuthority.metadataAuthoritative,
+            developedBlackFallbackReason = blackAuthority.fallbackReason,
             cfaPattern = cfa,
             cfaName = cfaName,
             cfaOriginX = transform.cfaOffsetX,
@@ -333,8 +392,7 @@ object RawDomainContractResolver {
             dynamicWhiteLevelUsed = dynamicWhite != null,
             staticBlackLevelUsed = dynamicBlack == null && staticBlackPattern != null,
             staticWhiteLevelUsed = dynamicWhite == null && staticWhite != null,
-            manualOverrideUsed = finalCal?.override?.manualBlackLevels != null ||
-                finalCal?.override?.manualColorMatrix != null,
+            manualOverrideUsed = manualBlackFallbackUsed || manualColorOverrideUsed,
             physicalCameraId = physicalCameraId,
             lensId = lensId,
             lensShadingState = lensShadingState,
@@ -354,12 +412,19 @@ object RawDomainContractResolver {
 
     private fun resolveLensShadingState(captureResult: CaptureResult?): RawLensShadingState {
         if (captureResult == null) return RawLensShadingState.UNKNOWN
-        val mode = runCatching { captureResult.get(CaptureResult.STATISTICS_LENS_SHADING_MAP_MODE) }.getOrNull()
-        val map = runCatching { captureResult.get(CaptureResult.STATISTICS_LENS_SHADING_CORRECTION_MAP) }.getOrNull()
+        val mode = runCatching {
+            captureResult.get(CaptureResult.STATISTICS_LENS_SHADING_MAP_MODE)
+        }.getOrNull()
+        val map = runCatching {
+            captureResult.get(CaptureResult.STATISTICS_LENS_SHADING_CORRECTION_MAP)
+        }.getOrNull()
         return when {
-            mode == CaptureResult.STATISTICS_LENS_SHADING_MAP_MODE_OFF -> RawLensShadingState.NOT_REQUESTED
-            mode == CaptureResult.STATISTICS_LENS_SHADING_MAP_MODE_ON && map != null -> RawLensShadingState.REQUESTED_MAP_AVAILABLE
-            mode == CaptureResult.STATISTICS_LENS_SHADING_MAP_MODE_ON -> RawLensShadingState.REQUESTED_MAP_MISSING
+            mode == CaptureResult.STATISTICS_LENS_SHADING_MAP_MODE_OFF ->
+                RawLensShadingState.NOT_REQUESTED
+            mode == CaptureResult.STATISTICS_LENS_SHADING_MAP_MODE_ON && map != null ->
+                RawLensShadingState.REQUESTED_MAP_AVAILABLE
+            mode == CaptureResult.STATISTICS_LENS_SHADING_MAP_MODE_ON ->
+                RawLensShadingState.REQUESTED_MAP_MISSING
             map != null -> RawLensShadingState.REQUESTED_MAP_AVAILABLE
             else -> RawLensShadingState.UNKNOWN
         }

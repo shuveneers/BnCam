@@ -326,6 +326,7 @@ fun ResolvedLensHardwareSettings.toOverrideLayer(): LensOverrideLayer {
 }
 
 private const val SPECTRA_FUSION_SOURCE_FLAG: Long = 1L shl 8
+private const val PHYSICAL_TEMPORAL_FUSION_SOURCE_FLAG: Long = 1L shl 9
 
 /**
  * Applies capture-integrated SPECTRA temporal observation and fusion variance to the
@@ -334,7 +335,7 @@ private const val SPECTRA_FUSION_SOURCE_FLAG: Long = 1L shl 8
  */
 fun FinalSensorCalibration.withSpectraMergeStats(stats: String): FinalSensorCalibration {
     val snapshot = noiseSnapshot ?: return this
-    if (!snapshot.isSpectraActive() || stats.isBlank()) return this
+    if (stats.isBlank()) return this
 
     val values = stats.split(';')
         .mapNotNull { entry ->
@@ -342,7 +343,13 @@ fun FinalSensorCalibration.withSpectraMergeStats(stats: String): FinalSensorCali
             if (split <= 0) null else entry.substring(0, split) to entry.substring(split + 1)
         }
         .toMap()
-    if (!values["spectraEnabled"].equals("true", ignoreCase = true)) return this
+    val temporalModelEnabled =
+        values["temporalNoiseModelEnabled"].equals("true", ignoreCase = true) ||
+        values["spectraEnabled"].equals("true", ignoreCase = true)
+    if (!temporalModelEnabled) return this
+    val adaptiveSpectraCalibration =
+        snapshot.isSpectraActive() &&
+        values["spectraAdaptiveCalibrationEnabled"].equals("true", ignoreCase = true)
 
     fun value(key: String, fallback: Double): Double =
         values[key]?.toDoubleOrNull()?.takeIf { it.isFinite() } ?: fallback
@@ -362,6 +369,12 @@ fun FinalSensorCalibration.withSpectraMergeStats(stats: String): FinalSensorCali
     if (oldS.size < 4 || oldO.size < 4) return this
 
     fun channelScale(channel: Int, slope: Boolean): Double {
+        // Physical S/O remains fixed in shape. Multi-frame fusion lowers the expected
+        // variance by the measured fusion factor, so both S and O scale equally.
+        if (!adaptiveSpectraCalibration) {
+            return fusionVarianceScale
+        }
+
         val compatibilityKey = "spectraScale$channel"
         val specificKey = if (slope) "spectraSScale$channel" else "spectraOScale$channel"
         val compatibilityScale = value(compatibilityKey, 1.0).coerceIn(0.75, 1.25)
@@ -369,9 +382,6 @@ fun FinalSensorCalibration.withSpectraMergeStats(stats: String): FinalSensorCali
         val rawScale = value(specificKey, compatibilityScale).coerceIn(0.75, 1.25)
         val fitConfidence = value("spectraFitConfidence$channel", 0.0).coerceIn(0.0, 1.0)
         val fitPhysicalScore = value("spectraFitPhysicalScore$channel", fitConfidence).coerceIn(0.0, 1.0)
-        // Older native telemetry exposed one common scale and already incorporated its
-        // confidence before serialization. Preserve that contract. New telemetry fits
-        // S and O independently and therefore earns authority from regression quality.
         val fitAuthority = if (hasIndependentFit) {
             (0.20 + 0.55 * fitConfidence + 0.25 * fitPhysicalScore).coerceIn(0.0, 1.0)
         } else {
@@ -400,7 +410,11 @@ fun FinalSensorCalibration.withSpectraMergeStats(stats: String): FinalSensorCali
         effectiveS = adaptedS,
         effectiveO = adaptedO,
         signalModelConfidence = mergedConfidence,
-        sourceFlags = snapshot.sourceFlags or SPECTRA_FUSION_SOURCE_FLAG
+        sourceFlags = snapshot.sourceFlags or if (adaptiveSpectraCalibration) {
+            SPECTRA_FUSION_SOURCE_FLAG
+        } else {
+            PHYSICAL_TEMPORAL_FUSION_SOURCE_FLAG
+        }
     )
     val effectiveFrames = value("spectraEffectiveFrameCount", 1.0).coerceAtLeast(1.0)
     val meanFitConfidence = (0 until 4)
@@ -410,7 +424,12 @@ fun FinalSensorCalibration.withSpectraMergeStats(stats: String): FinalSensorCali
     val forwardBackward = value("spectraForwardBackwardConsistency", 0.0).coerceIn(0.0, 1.0)
     val persistentPattern = value("spectraPersistentPatternFraction", 0.0).coerceIn(0.0, 1.0)
     val fitStability = value("spectraFitStabilityConfidence", 0.0).coerceIn(0.0, 1.0)
-    val warning = "SPECTRA capture integration: observerSamples=$observerSamples, " +
+    val temporalAuthorityLabel = if (adaptiveSpectraCalibration) {
+        "SPECTRA capture integration"
+    } else {
+        "Physical Camera2 temporal fusion"
+    }
+    val warning = "$temporalAuthorityLabel: observerSamples=$observerSamples, " +
         "observerConfidence=${String.format(Locale.US, "%.3f", observerConfidence)}, " +
         "fitConfidence=${String.format(Locale.US, "%.3f", meanFitConfidence)}, " +
         "staticP50=${String.format(Locale.US, "%.3f", staticP50)}, " +
@@ -422,7 +441,11 @@ fun FinalSensorCalibration.withSpectraMergeStats(stats: String): FinalSensorCali
 
     return copy(
         effectiveNoiseProfile = adaptedProfile,
-        effectiveNoiseProfileSource = "$effectiveNoiseProfileSource + SPECTRA_CAPTURE_FUSION",
+        effectiveNoiseProfileSource = if (adaptiveSpectraCalibration) {
+            "$effectiveNoiseProfileSource + SPECTRA_CAPTURE_FUSION"
+        } else {
+            "$effectiveNoiseProfileSource + PHYSICAL_TEMPORAL_FUSION"
+        },
         noiseSnapshot = adaptedSnapshot,
         pipelineWarnings = pipelineWarnings + warning
     )

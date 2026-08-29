@@ -24,6 +24,8 @@ struct FastLocalLaplacianPlan {
     float maxCompressEv = 0.20f;
     float edgeStopEv = 0.62f;
     float refinement = 0.10f;
+    // 0..1 physical noise pressure controlling only positive deep-shadow lift permission.
+    float shadowLiftNoiseGuardPressure = 0.0f;
     std::uint32_t pyramidLevels = 6u;   // level 0 is half-resolution.
     std::uint32_t baseDownsample = 2u;
 };
@@ -74,6 +76,10 @@ inline FastLocalLaplacianPlan resolveFastLocalLaplacianPlan(
     // corrections across real high-contrast boundaries.
     out.edgeStopEv = std::clamp(0.56f + 0.20f * noise, 0.54f, 0.78f);
     out.refinement = std::clamp(0.08f + 0.08f * highDrAuthority, 0.06f, 0.16f);
+    // Do not invent a sensor-specific luma threshold here. The normalized S/O model has
+    // already been collapsed into physical noise pressure; the Vulkan stage converts that
+    // pressure into a monotonic deep-shadow lift gate.
+    out.shadowLiftNoiseGuardPressure = input.lowLightScene ? noise : 0.0f;
     out.enabled = out.strength >= 0.04f &&
             (dynamicRange > 0.025f || highlight > 0.10f || shadow > 0.32f);
     return out;

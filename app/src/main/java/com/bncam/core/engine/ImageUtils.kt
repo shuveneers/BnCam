@@ -13,6 +13,7 @@ import com.bncam.core.quality.RenderQualityConfig
 import com.bncam.core.quality.FocusConfidenceState
 import com.bncam.core.quality.FinalSensorCalibration
 import com.bncam.core.quality.ProfileYuvAwbMapper
+import com.bncam.core.quality.TemporalNoiseModelAuthorityPolicy
 import com.bncam.data.settings.ResolvedLensHardwareSettings
 import com.bncam.data.settings.ProfileNoiseReductionDefaults
 import com.bncam.core.isp.raw.MasterRawFrame
@@ -799,6 +800,7 @@ object ImageUtils {
                 profileDetailRadius = profileDetailTuning.radius,
                 profileDetailDetail = profileDetailTuning.detail,
                 profileDetailMasking = profileDetailTuning.masking,
+                knownHotPixelMap = masterFrame.knownHotPixelMap.packedXy,
                 lensShadingMap = lensShadingMap.gains,
                 lensShadingColumns = lensShadingMap.columns,
                 lensShadingRows = lensShadingMap.rows,
@@ -955,30 +957,39 @@ object ImageUtils {
     )
 
     private data class SpectraMergePayload(
+        val temporalNoiseModelEnabled: Boolean,
+        val adaptiveSpectraCalibration: Boolean,
         val mode: Int,
         val effectiveS: DoubleArray,
         val effectiveO: DoubleArray,
-        val confidence: Float
+        val confidence: Float,
+        val authoritySource: String
     )
 
     private fun FinalSensorCalibration?.toSpectraMergePayload(): SpectraMergePayload {
-        val snapshot = this?.noiseSnapshot
-        if (snapshot == null || !snapshot.isSpectraActive()) {
-            return SpectraMergePayload(0, DoubleArray(4), DoubleArray(4), 0.0f)
-        }
-        val effectiveS = snapshot.effectiveS
-        val effectiveO = snapshot.effectiveO
-        val valid = effectiveS.size >= 4 && effectiveO.size >= 4 &&
-            effectiveS.take(4).all { it.isFinite() && it >= 0.0 } &&
-            effectiveO.take(4).all { it.isFinite() && it >= 0.0 } &&
-            (effectiveS.take(4).any { it > 0.0 } || effectiveO.take(4).any { it > 0.0 })
-        if (!valid) return SpectraMergePayload(0, DoubleArray(4), DoubleArray(4), 0.0f)
-        val mode = if (snapshot.spectraMode.equals("Manual", ignoreCase = true)) 2 else 1
+        val calibration = this
+        val snapshot = calibration?.noiseSnapshot
+        val decision = TemporalNoiseModelAuthorityPolicy.resolve(
+            spectraProcessingEnabled = calibration?.spectraProcessingEnabled == true,
+            spectraModeName = snapshot?.spectraMode,
+            snapshotEffectiveS = snapshot?.effectiveS,
+            snapshotEffectiveO = snapshot?.effectiveO,
+            snapshotConfidence = snapshot?.signalModelConfidence,
+            effectiveNoiseProfile = calibration?.effectiveNoiseProfile,
+            effectiveNoiseProfileApplied = calibration?.effectiveNoiseProfileApplied == true,
+            cameraNoiseProfilePresent = calibration?.base?.baseNoiseProfilePresent == true,
+            cameraNoiseProfileValid = calibration?.base?.noiseProfileValid == true,
+            normalizationCalibrationValid = calibration?.normalizationCalibrationValid == true,
+            cfaSupportedForBayerNoiseModel = calibration?.cfaSupportedForBayerNoiseModel == true
+        )
         return SpectraMergePayload(
-            mode = mode,
-            effectiveS = effectiveS.copyOf(4),
-            effectiveO = effectiveO.copyOf(4),
-            confidence = snapshot.signalModelConfidence.coerceIn(0.0f, 1.0f)
+            temporalNoiseModelEnabled = decision.enabled,
+            adaptiveSpectraCalibration = decision.adaptiveSpectraCalibration,
+            mode = decision.spectraMode,
+            effectiveS = decision.effectiveS,
+            effectiveO = decision.effectiveO,
+            confidence = decision.confidence,
+            authoritySource = decision.authoritySource
         )
     }
 
@@ -1018,6 +1029,8 @@ object ImageUtils {
             maxShiftPixels = maxShiftPixels,
             alignmentStrictness = alignmentStrictness,
             spectraMode = spectra.mode,
+            temporalNoiseModelEnabled = spectra.temporalNoiseModelEnabled,
+            spectraAdaptiveCalibrationEnabled = spectra.adaptiveSpectraCalibration,
             spectraEffectiveS = spectra.effectiveS,
             spectraEffectiveO = spectra.effectiveO,
             spectraModelConfidence = spectra.confidence,
@@ -1064,6 +1077,8 @@ object ImageUtils {
             maxShiftPixels = maxShiftPixels,
             alignmentStrictness = alignmentStrictness,
             spectraMode = spectra.mode,
+            temporalNoiseModelEnabled = spectra.temporalNoiseModelEnabled,
+            spectraAdaptiveCalibrationEnabled = spectra.adaptiveSpectraCalibration,
             spectraEffectiveS = spectra.effectiveS,
             spectraEffectiveO = spectra.effectiveO,
             spectraModelConfidence = spectra.confidence,
@@ -1355,6 +1370,8 @@ object ImageUtils {
         maxShiftPixels: Int,
         alignmentStrictness: Float,
         spectraMode: Int,
+        temporalNoiseModelEnabled: Boolean,
+        spectraAdaptiveCalibrationEnabled: Boolean,
         spectraEffectiveS: DoubleArray,
         spectraEffectiveO: DoubleArray,
         spectraModelConfidence: Float,
@@ -1375,6 +1392,8 @@ object ImageUtils {
         maxShiftPixels: Int,
         alignmentStrictness: Float,
         spectraMode: Int,
+        temporalNoiseModelEnabled: Boolean,
+        spectraAdaptiveCalibrationEnabled: Boolean,
         spectraEffectiveS: DoubleArray,
         spectraEffectiveO: DoubleArray,
         spectraModelConfidence: Float,
@@ -1576,6 +1595,7 @@ object ImageUtils {
         profileDetailRadius: Float,
         profileDetailDetail: Float,
         profileDetailMasking: Float,
+        knownHotPixelMap: IntArray,
         lensShadingMap: FloatArray,
         lensShadingColumns: Int,
         lensShadingRows: Int,

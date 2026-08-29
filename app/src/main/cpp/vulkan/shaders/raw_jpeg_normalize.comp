@@ -4,8 +4,14 @@ layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 layout(std430, set = 0, binding = 0) readonly buffer CanonicalRawInput {
     uint inputWords[];
 };
-layout(std430, set = 0, binding = 1) writeonly buffer NormalizedRawOutput {
+layout(std430, set = 0, binding = 1) buffer NormalizedRawOutput {
     float outputPixels[];
+};
+layout(std430, set = 0, binding = 2) readonly buffer KnownDefectCoordinates {
+    int defectCoordinates[];
+};
+layout(std430, set = 0, binding = 3) buffer DefectTelemetry {
+    uint telemetry[];
 };
 
 layout(push_constant) uniform PushConstants {
@@ -17,32 +23,194 @@ layout(push_constant) uniform PushConstants {
     uint height;
     uint phaseX;
     uint phaseY;
+
     float whiteLevel;
+    uint sensorCfaPattern;
+    uint noiseModelEnabled;
+    uint knownDefectCount;
+
     vec4 blackLevels;
+    vec4 noiseS;
+    vec4 noiseO;
+
+    uint mode; // 0 = normalize + residual hot-pixel correction, 1 = known-map sparse correction
+    uint padding0;
+    uint padding1;
+    uint padding2;
 } pc;
 
-void main() {
+bool finite1(float v) { return !(isnan(v) || isinf(v)); }
+
+uint outputIndex(int x, int y) {
+    return uint(y) * pc.width + uint(x);
+}
+
+float siteBlack(int x, int y) {
+    uint site = ((uint(y) + pc.phaseY) & 1u) * 2u +
+                ((uint(x) + pc.phaseX) & 1u);
+    return site == 0u ? pc.blackLevels.x
+            : (site == 1u ? pc.blackLevels.y
+            : (site == 2u ? pc.blackLevels.z : pc.blackLevels.w));
+}
+
+float quantizationStep(int x, int y) {
+    return 1.0 / max(1.0, pc.whiteLevel - siteBlack(x, y));
+}
+
+float normalizedRawAt(int x, int y) {
+    x = clamp(x, 0, int(pc.width) - 1);
+    y = clamp(y, 0, int(pc.height) - 1);
+    uint sourceX = uint(x) + pc.cropLeft;
+    uint sourceY = uint(y) + pc.cropTop;
+    uint sourceIndex = sourceY * pc.inputWidth + sourceX;
+    uint word = inputWords[sourceIndex >> 1u];
+    uint shift = (sourceIndex & 1u) * 16u;
+    float raw = float((word >> shift) & 0xffffu);
+    float black = siteBlack(x, y);
+    float inverseRange = 1.0 / max(1.0, pc.whiteLevel - black);
+    return clamp((raw - black) * inverseRange, 0.0, 1.0);
+}
+
+// BnCam physical S/O arrays use canonical [R, Gr, Gb, B] order.
+// Gr = green on red row; Gb = green on blue row.
+int canonicalNoiseChannel(int x, int y) {
+    int xm = (x + int(pc.phaseX)) & 1;
+    int ym = (y + int(pc.phaseY)) & 1;
+    uint pattern = min(pc.sensorCfaPattern, 3u);
+    if (pattern == 0u) return ym == 0 ? (xm == 0 ? 0 : 1) : (xm == 0 ? 2 : 3); // RGGB
+    if (pattern == 1u) return ym == 0 ? (xm == 0 ? 1 : 0) : (xm == 0 ? 3 : 2); // GRBG
+    if (pattern == 2u) return ym == 0 ? (xm == 0 ? 2 : 3) : (xm == 0 ? 0 : 1); // GBRG
+    return ym == 0 ? (xm == 0 ? 3 : 2) : (xm == 0 ? 1 : 0); // BGGR
+}
+
+float channelS(int ch) {
+    return ch == 0 ? pc.noiseS.x : (ch == 1 ? pc.noiseS.y : (ch == 2 ? pc.noiseS.z : pc.noiseS.w));
+}
+float channelO(int ch) {
+    return ch == 0 ? pc.noiseO.x : (ch == 1 ? pc.noiseO.y : (ch == 2 ? pc.noiseO.z : pc.noiseO.w));
+}
+
+float predictedSigma(float signal, int channel) {
+    if (pc.noiseModelEnabled == 0u) return 0.0;
+    float s = max(0.0, channelS(channel));
+    float o = max(0.0, channelO(channel));
+    return sqrt(max(0.0, s * clamp(signal, 0.0, 1.0) + o));
+}
+
+void sort8(inout float values[8]) {
+    for (int i = 1; i < 8; ++i) {
+        float key = values[i];
+        int j = i - 1;
+        while (j >= 0 && values[j] > key) {
+            values[j + 1] = values[j];
+            --j;
+        }
+        values[j + 1] = key;
+    }
+}
+
+float sameCfaMedian8(int x, int y) {
+    float neighbours[8];
+    neighbours[0] = normalizedRawAt(x - 2, y);
+    neighbours[1] = normalizedRawAt(x + 2, y);
+    neighbours[2] = normalizedRawAt(x, y - 2);
+    neighbours[3] = normalizedRawAt(x, y + 2);
+    neighbours[4] = normalizedRawAt(x - 2, y - 2);
+    neighbours[5] = normalizedRawAt(x + 2, y - 2);
+    neighbours[6] = normalizedRawAt(x - 2, y + 2);
+    neighbours[7] = normalizedRawAt(x + 2, y + 2);
+    sort8(neighbours);
+    return 0.5 * (neighbours[3] + neighbours[4]);
+}
+
+float noiseAdaptiveHotCorrectedAt(int x, int y, float center, out bool corrected) {
+    corrected = false;
+    if (x < 2 || y < 2 || x >= int(pc.width) - 2 || y >= int(pc.height) - 2) {
+        return center;
+    }
+
+    float n0 = normalizedRawAt(x - 2, y);
+    float n1 = normalizedRawAt(x + 2, y);
+    float n2 = normalizedRawAt(x, y - 2);
+    float n3 = normalizedRawAt(x, y + 2);
+    float neighbourMin = min(min(n0, n1), min(n2, n3));
+    float neighbourMax = max(max(n0, n1), max(n2, n3));
+
+    int noiseChannel = canonicalNoiseChannel(x, y);
+    float localSignal = 0.5 * (neighbourMin + neighbourMax);
+    float q = quantizationStep(x, y);
+    float preSpread = max(2.0 * q, neighbourMax - neighbourMin);
+    float preThreshold = max(
+        max(3.0 * q, 3.0 * preSpread),
+        5.0 * predictedSigma(localSignal, noiseChannel)
+    );
+    if (!(center > neighbourMax + preThreshold)) return center;
+
+    float neighbours[8];
+    neighbours[0] = n0;
+    neighbours[1] = n1;
+    neighbours[2] = n2;
+    neighbours[3] = n3;
+    neighbours[4] = normalizedRawAt(x - 2, y - 2);
+    neighbours[5] = normalizedRawAt(x + 2, y - 2);
+    neighbours[6] = normalizedRawAt(x - 2, y + 2);
+    neighbours[7] = normalizedRawAt(x + 2, y + 2);
+    sort8(neighbours);
+
+    float median = 0.5 * (neighbours[3] + neighbours[4]);
+    float robustSpread = max(2.0 * q, neighbours[6] - neighbours[1]);
+    float threshold = max(
+        max(4.0 * q, 4.0 * robustSpread),
+        6.0 * predictedSigma(median, noiseChannel)
+    );
+
+    // Positive residuals only. Cold/dark residuals are not scene-safe without a known
+    // sensor map. Real point/edge structure raises the same-CFA robust spread.
+    if (center > median + threshold) {
+        corrected = true;
+        return median;
+    }
+    return center;
+}
+
+void normalizeAndCorrect() {
     uint x = gl_GlobalInvocationID.x;
     uint y = gl_GlobalInvocationID.y;
     if (x >= pc.width || y >= pc.height) return;
 
-    uint sourceX = x + pc.cropLeft;
-    uint sourceY = y + pc.cropTop;
-    if (sourceX >= pc.inputWidth || sourceY >= pc.inputHeight) return;
-    uint sourceIndex = sourceY * pc.inputWidth + sourceX;
-    uint outputIndex = y * pc.width + x;
-    uint word = inputWords[sourceIndex >> 1u];
-    uint shift = (sourceIndex & 1u) * 16u;
-    float raw = float((word >> shift) & 0xffffu);
+    float center = normalizedRawAt(int(x), int(y));
+    bool corrected = false;
+    float value = noiseAdaptiveHotCorrectedAt(int(x), int(y), center, corrected);
+    outputPixels[y * pc.width + x] = value;
+    if (corrected) atomicAdd(telemetry[1], 1u);
+}
 
-    uint site = (((y + pc.phaseY) & 1u) << 1u) | ((x + pc.phaseX) & 1u);
-    float black = site == 0u ? pc.blackLevels.x
-            : (site == 1u ? pc.blackLevels.y
-            : (site == 2u ? pc.blackLevels.z : pc.blackLevels.w));
-    float inverseRange = 1.0 / max(1.0, pc.whiteLevel - black);
+void applyKnownDefect() {
+    // The full-frame kernel uses the 16x16 workgroup. For this sparse pass only y==0
+    // participates, so each workgroup handles 16 known coordinates without a second shader.
+    if (gl_GlobalInvocationID.y != 0u) return;
+    uint defectIndex = gl_GlobalInvocationID.x;
+    if (defectIndex >= pc.knownDefectCount) return;
 
-    // Exact production RawDomain::normalizeRawForJpeg semantics:
-    // black subtraction, white-range normalization and final [0,1] clamp only.
-    // No WB, lens shading, demosaic, creative tone or highlight-headroom policy belongs here.
-    outputPixels[outputIndex] = clamp((raw - black) * inverseRange, 0.0, 1.0);
+    int x = defectCoordinates[defectIndex * 2u];
+    int y = defectCoordinates[defectIndex * 2u + 1u];
+    if (x < 0 || y < 0 || x >= int(pc.width) || y >= int(pc.height)) {
+        atomicAdd(telemetry[3], 1u);
+        return;
+    }
+    if (x < 2 || y < 2 || x >= int(pc.width) - 2 || y >= int(pc.height) - 2) {
+        atomicAdd(telemetry[2], 1u);
+        return;
+    }
+
+    // Camera2's sensor map is high-confidence metadata. Replace regardless of sign:
+    // mapped pixels may be hot, cold, or stuck. The same-CFA median is computed from
+    // the immutable RAW16 input, so simultaneous sparse writes cannot affect each other.
+    outputPixels[outputIndex(x, y)] = sameCfaMedian8(x, y);
+    atomicAdd(telemetry[0], 1u);
+}
+
+void main() {
+    if (pc.mode == 0u) normalizeAndCorrect();
+    else applyKnownDefect();
 }

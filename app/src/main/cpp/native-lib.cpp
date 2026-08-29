@@ -2824,6 +2824,8 @@ Java_com_bncam_core_engine_ImageUtils_mergeNativeRaw10DirectRaw16(
         jint maxShiftPixels,
         jfloat alignmentStrictness,
         jint spectraMode,
+        jboolean temporalNoiseModelEnabled,
+        jboolean spectraAdaptiveCalibrationEnabled,
         jdoubleArray spectraEffectiveSArray,
         jdoubleArray spectraEffectiveOArray,
         jfloat spectraModelConfidence,
@@ -2855,6 +2857,8 @@ Java_com_bncam_core_engine_ImageUtils_mergeNativeRaw10DirectRaw16(
             maxShiftPixels,
             alignmentStrictness,
             spectraMode,
+            temporalNoiseModelEnabled == JNI_TRUE,
+            spectraAdaptiveCalibrationEnabled == JNI_TRUE,
             spectraEffectiveS,
             spectraEffectiveO,
             spectraModelConfidence,
@@ -2892,6 +2896,8 @@ Java_com_bncam_core_engine_ImageUtils_mergeNativeRawSensorDirectRaw16(
         jint maxShiftPixels,
         jfloat alignmentStrictness,
         jint spectraMode,
+        jboolean temporalNoiseModelEnabled,
+        jboolean spectraAdaptiveCalibrationEnabled,
         jdoubleArray spectraEffectiveSArray,
         jdoubleArray spectraEffectiveOArray,
         jfloat spectraModelConfidence,
@@ -2923,6 +2929,8 @@ Java_com_bncam_core_engine_ImageUtils_mergeNativeRawSensorDirectRaw16(
             maxShiftPixels,
             alignmentStrictness,
             spectraMode,
+            temporalNoiseModelEnabled == JNI_TRUE,
+            spectraAdaptiveCalibrationEnabled == JNI_TRUE,
             spectraEffectiveS,
             spectraEffectiveO,
             spectraModelConfidence,
@@ -3263,6 +3271,7 @@ Java_com_bncam_core_engine_ImageUtils_renderJpegFromMasterNative(
         jfloat profileDetailRadius,
         jfloat profileDetailDetail,
         jfloat profileDetailMasking,
+        jintArray knownHotPixelMapArray,
         jfloatArray lensShadingMapArray,
         jint lensShadingColumns,
         jint lensShadingRows,
@@ -3295,6 +3304,34 @@ Java_com_bncam_core_engine_ImageUtils_renderJpegFromMasterNative(
     std::string routeLabel = routeChars != nullptr ? routeChars : (isRaw10 == JNI_TRUE ? "JPEG_WORKING_LINEAR_RAW_FROM_RAW10_MASTER" : "JPEG_WORKING_LINEAR_RAW_FROM_RAW_SENSOR_MASTER");
     if (routeChars != nullptr) env->ReleaseStringUTFChars(routeLabelString, routeChars);
     const std::string lensId = getJniString(env, lensIdStr, "unknown");
+
+    // P0 exact-frame Camera2 sensor-defect coordinates arrive in Master RAW16 space.
+    // Keep this sparse; never materialize or scan the full frame on CPU.
+    std::vector<std::int32_t> knownHotPixelMasterXy;
+    if (knownHotPixelMapArray != nullptr) {
+        const jsize requestedInts = env->GetArrayLength(knownHotPixelMapArray);
+        constexpr jsize kMaxKnownHotPixelInts = 131072; // 65,536 points
+        const jsize safeInts = std::min<jsize>(
+                requestedInts - (requestedInts & 1),
+                kMaxKnownHotPixelInts);
+        if (safeInts > 0) {
+            std::vector<jint> packed(static_cast<std::size_t>(safeInts));
+            env->GetIntArrayRegion(knownHotPixelMapArray, 0, safeInts, packed.data());
+            knownHotPixelMasterXy.reserve(static_cast<std::size_t>(safeInts));
+            for (jsize i = 0; i + 1 < safeInts; i += 2) {
+                const int x = static_cast<int>(packed[static_cast<std::size_t>(i)]);
+                const int y = static_cast<int>(packed[static_cast<std::size_t>(i + 1)]);
+                if (x >= 0 && y >= 0 && x < static_cast<int>(width) && y < static_cast<int>(height)) {
+                    knownHotPixelMasterXy.push_back(static_cast<std::int32_t>(x));
+                    knownHotPixelMasterXy.push_back(static_cast<std::int32_t>(y));
+                }
+            }
+        }
+        if (requestedInts > kMaxKnownHotPixelInts) {
+            LOGW("P0 hot-pixel map truncated from %d to %d packed ints",
+                 static_cast<int>(requestedInts), static_cast<int>(kMaxKnownHotPixelInts));
+        }
+    }
 
     float jniArrayLockMs = 0.0f;
     float metadataResolveMs = 0.0f;
@@ -3672,6 +3709,13 @@ Java_com_bncam_core_engine_ImageUtils_renderJpegFromMasterNative(
     std::uint64_t rawProducerResidentGeneration = 0u;
     std::uint64_t rawNormalizeResidentGeneration = 0u;
     std::string rawNormalizeBackend = "NOT_ATTEMPTED";
+    std::uint64_t rawKnownDefectMapPointCount = 0u;
+    std::uint64_t rawKnownDefectCorrectedPixelCount = 0u;
+    std::uint64_t rawResidualDefectCorrectedPixelCount = 0u;
+    std::uint64_t rawKnownDefectBorderSkipCount = 0u;
+    bool rawNoiseAdaptiveDefectDetectionEnabled = false;
+    float rawDefectSparseMetadataUploadMs = 0.0f;
+    std::uint64_t rawDefectSparseMetadataUploadBytes = 0u;
     cv::Mat bayer16Isp; // We maken de variabele buiten het try-blok aan
 
     try {
@@ -3851,6 +3895,35 @@ Java_com_bncam_core_engine_ImageUtils_renderJpegFromMasterNative(
             normalizeRequest.cfaOffsetY = static_cast<std::uint32_t>(std::max(0, rawDomainInfo.cfaOffsetY));
             normalizeRequest.whiteLevel = rawDomainInfo.effectiveWhiteLevelInMasterUnits;
             normalizeRequest.blackLevels = rawDomainInfo.effectiveBlackLevelPatternInMasterUnits;
+            normalizeRequest.sensorCfaPattern = static_cast<std::uint32_t>(
+                    std::clamp(rawDomainInfo.sensorCfaPattern, 0, 3));
+            normalizeRequest.noiseModelValid =
+                    meta.calibration.noiseProfileApplied &&
+                    meta.calibration.signalModelConfidence > 0.0f;
+            for (int ch = 0; ch < 4; ++ch) {
+                normalizeRequest.effectiveS[static_cast<std::size_t>(ch)] =
+                        static_cast<float>(std::max(0.0, meta.calibration.effectiveS[ch]));
+                normalizeRequest.effectiveO[static_cast<std::size_t>(ch)] =
+                        static_cast<float>(std::max(0.0, meta.calibration.effectiveO[ch]));
+            }
+
+            // Master coordinates from Kotlin must follow any additional visible JPEG crop.
+            std::vector<std::int32_t> normalizedHotPixelXy;
+            normalizedHotPixelXy.reserve(knownHotPixelMasterXy.size());
+            for (std::size_t i = 0; i + 1u < knownHotPixelMasterXy.size(); i += 2u) {
+                const int x = static_cast<int>(knownHotPixelMasterXy[i]) - jpegCropLeftInResidentRaw;
+                const int y = static_cast<int>(knownHotPixelMasterXy[i + 1u]) - jpegCropTopInResidentRaw;
+                if (x >= 0 && y >= 0 &&
+                    x < static_cast<int>(normalizeRequest.width) &&
+                    y < static_cast<int>(normalizeRequest.height)) {
+                    normalizedHotPixelXy.push_back(static_cast<std::int32_t>(x));
+                    normalizedHotPixelXy.push_back(static_cast<std::int32_t>(y));
+                }
+            }
+            normalizeRequest.knownDefectCoordinates =
+                    normalizedHotPixelXy.empty() ? nullptr : normalizedHotPixelXy.data();
+            normalizeRequest.knownDefectCount =
+                    static_cast<std::uint32_t>(normalizedHotPixelXy.size() / 2u);
             normalizeRequest.generationId = rawProducerResidentGeneration ^ 0x5241574a5045474eull;
             if (normalizeRequest.generationId == 0u) normalizeRequest.generationId = 1u;
 
@@ -3858,6 +3931,13 @@ Java_com_bncam_core_engine_ImageUtils_renderJpegFromMasterNative(
                     .executeRawJpegNormalizeFromResidentRaw(
                             normalizeRequest, rawProducerResidentGeneration);
             rawNormalizeBackend = normalized.backend;
+            rawKnownDefectMapPointCount = normalized.knownDefectMapPointCount;
+            rawKnownDefectCorrectedPixelCount = normalized.knownDefectCorrectedPixelCount;
+            rawResidualDefectCorrectedPixelCount = normalized.residualDefectCorrectedPixelCount;
+            rawKnownDefectBorderSkipCount = normalized.knownDefectBorderSkipCount;
+            rawNoiseAdaptiveDefectDetectionEnabled = normalized.noiseAdaptiveDefectDetectionEnabled;
+            rawDefectSparseMetadataUploadMs = normalized.sparseMetadataUploadMs;
+            rawDefectSparseMetadataUploadBytes = normalized.sparseMetadataUploadBytes;
             if (normalized.success && normalized.residentOutputProduced &&
                 normalized.residentOutputGeneration != 0u &&
                 normalized.fullFrameCpuUploadBytes == 0u && normalized.fullFrameGpuReadbackBytes == 0u) {
@@ -4061,6 +4141,15 @@ Java_com_bncam_core_engine_ImageUtils_renderJpegFromMasterNative(
                        << ";rawProducerResidentGeneration=" << rawProducerResidentGeneration
                        << ";rawNormalizeResidentGeneration=" << rawNormalizeResidentGeneration
                        << ";rawNormalizeBackend=" << rawNormalizeBackend
+                       << ";rawP0DefectCorrectionStage=RAW_JPEG_NORMALIZE_BEFORE_SPATIAL_NR"
+                       << ";rawKnownDefectMapPointCount=" << rawKnownDefectMapPointCount
+                       << ";rawKnownDefectCorrectedPixelCount=" << rawKnownDefectCorrectedPixelCount
+                       << ";rawResidualDefectCorrectedPixelCount=" << rawResidualDefectCorrectedPixelCount
+                       << ";rawKnownDefectBorderSkipCount=" << rawKnownDefectBorderSkipCount
+                       << ";rawNoiseAdaptiveDefectDetectionEnabled="
+                       << (rawNoiseAdaptiveDefectDetectionEnabled ? "true" : "false")
+                       << ";rawDefectSparseMetadataUploadMs=" << nativeFmtMs(rawDefectSparseMetadataUploadMs)
+                       << ";rawDefectSparseMetadataUploadBytes=" << rawDefectSparseMetadataUploadBytes
                        << ";rawResidentCpuFallbackUsed=" << (rawResidentCpuFallbackUsed ? "true" : "false")
                        << ";rawResidentCpuFallbackReason=" << rawResidentCpuFallbackReason;
         setMasterStats(ownershipStats.str());

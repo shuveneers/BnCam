@@ -16,32 +16,61 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 namespace bncam::vulkan {
 namespace {
 using Clock = std::chrono::steady_clock;
+
 float elapsedMs(const Clock::time_point& start) {
     return std::chrono::duration<float, std::milli>(Clock::now() - start).count();
 }
 
 struct NormalizePush {
-    std::uint32_t inputWidth;
-    std::uint32_t inputHeight;
-    std::uint32_t cropLeft;
-    std::uint32_t cropTop;
-    std::uint32_t width;
-    std::uint32_t height;
-    std::uint32_t phaseX;
-    std::uint32_t phaseY;
-    float whiteLevel;
-    float padding[3];
-    float blackLevels[4];
+    std::uint32_t inputWidth = 0u;
+    std::uint32_t inputHeight = 0u;
+    std::uint32_t cropLeft = 0u;
+    std::uint32_t cropTop = 0u;
+    std::uint32_t width = 0u;
+    std::uint32_t height = 0u;
+    std::uint32_t phaseX = 0u;
+    std::uint32_t phaseY = 0u;
+
+    float whiteLevel = 1.0f;
+    std::uint32_t sensorCfaPattern = 0u;
+    std::uint32_t noiseModelEnabled = 0u;
+    std::uint32_t knownDefectCount = 0u;
+
+    float blackLevels[4]{0.0f, 0.0f, 0.0f, 0.0f};
+    float noiseS[4]{0.0f, 0.0f, 0.0f, 0.0f};
+    float noiseO[4]{0.0f, 0.0f, 0.0f, 0.0f};
+
+    std::uint32_t mode = 0u;
+    std::uint32_t padding0 = 0u;
+    std::uint32_t padding1 = 0u;
+    std::uint32_t padding2 = 0u;
 };
-static_assert(sizeof(NormalizePush) == 64u);
+static_assert(sizeof(NormalizePush) == 112u, "P0 RAW normalize push layout mismatch");
+
+constexpr std::uint64_t kTelemetryWords = 16u;
+constexpr std::uint64_t kTelemetryBytes = kTelemetryWords * sizeof(std::uint32_t);
+
+bool validNoiseModel(const RawJpegNormalizeRequest& request) noexcept {
+    if (!request.noiseModelValid) return false;
+    bool hasEnergy = false;
+    for (std::size_t ch = 0; ch < 4u; ++ch) {
+        const float s = request.effectiveS[ch];
+        const float o = request.effectiveO[ch];
+        if (!std::isfinite(s) || !std::isfinite(o) || s < 0.0f || o < 0.0f) return false;
+        hasEnergy = hasEnergy || s > 0.0f || o > 0.0f;
+    }
+    return hasEnergy;
+}
 } // namespace
 
 bool VulkanRawJpegNormalizeBackend::ensureBufferLocked(
@@ -58,7 +87,8 @@ bool VulkanRawJpegNormalizeBackend::ensureBufferLocked(
         failureReason = "RAW_JPEG_NORMALIZE_BUFFER_REQUEST_INVALID";
         return false;
     }
-    if (target.buffer != VK_NULL_HANDLE && target.allocation != nullptr && target.capacityBytes >= bytes) {
+    if (target.buffer != VK_NULL_HANDLE && target.allocation != nullptr &&
+        target.capacityBytes >= bytes) {
         return true;
     }
     destroyBufferLocked(target);
@@ -78,6 +108,53 @@ bool VulkanRawJpegNormalizeBackend::ensureBufferLocked(
         failureReason = "RAW_JPEG_NORMALIZE_VMA_BUFFER_FAILED_" + std::to_string(result);
         return false;
     }
+    target.capacityBytes = bytes;
+    return true;
+#endif
+}
+
+bool VulkanRawJpegNormalizeBackend::ensureMappedBufferLocked(
+        VmaAllocator allocator,
+        std::uint64_t bytes,
+        std::uint32_t hostAccess,
+        PersistentBuffer& target,
+        std::string& failureReason) noexcept {
+#if !BNCAM_VMA_HEADER_AVAILABLE
+    (void)allocator; (void)bytes; (void)hostAccess; (void)target;
+    failureReason = "VMA_HEADER_NOT_AVAILABLE";
+    return false;
+#else
+    if (allocator == nullptr || bytes == 0u) {
+        failureReason = "RAW_JPEG_NORMALIZE_MAPPED_BUFFER_REQUEST_INVALID";
+        return false;
+    }
+    if (target.buffer != VK_NULL_HANDLE && target.allocation != nullptr &&
+        target.mapped != nullptr && target.capacityBytes >= bytes) {
+        return true;
+    }
+    destroyBufferLocked(target);
+
+    VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bufferInfo.size = static_cast<VkDeviceSize>(bytes);
+    bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                       VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                       VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    VmaAllocationCreateInfo allocationInfo{};
+    allocationInfo.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+    allocationInfo.flags = hostAccess | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    VmaAllocationInfo allocationResult{};
+    const VkResult result = vmaCreateBuffer(
+            allocator, &bufferInfo, &allocationInfo,
+            &target.buffer, &target.allocation, &allocationResult);
+    if (result != VK_SUCCESS || target.buffer == VK_NULL_HANDLE ||
+        target.allocation == nullptr || allocationResult.pMappedData == nullptr) {
+        target = {};
+        failureReason = "RAW_JPEG_NORMALIZE_MAPPED_VMA_BUFFER_FAILED_" + std::to_string(result);
+        return false;
+    }
+    target.mapped = allocationResult.pMappedData;
     target.capacityBytes = bytes;
     return true;
 #endif
@@ -154,6 +231,8 @@ void VulkanRawJpegNormalizeBackend::destroySubmissionResourcesLocked(VkDevice de
 void VulkanRawJpegNormalizeBackend::destroyLocked(VkDevice device) noexcept {
     destroySubmissionResourcesLocked(device);
     destroyBufferLocked(output_);
+    destroyBufferLocked(coordinates_);
+    destroyBufferLocked(telemetry_);
     if (device != VK_NULL_HANDLE) {
         if (descriptorPool_ != VK_NULL_HANDLE) vkDestroyDescriptorPool(device, descriptorPool_, nullptr);
         if (pipeline_ != VK_NULL_HANDLE) vkDestroyPipeline(device, pipeline_, nullptr);
@@ -171,6 +250,10 @@ void VulkanRawJpegNormalizeBackend::destroyLocked(VkDevice device) noexcept {
     boundInputRange_ = 0u;
     boundOutputBuffer_ = VK_NULL_HANDLE;
     boundOutputRange_ = 0u;
+    boundCoordinatesBuffer_ = VK_NULL_HANDLE;
+    boundCoordinatesRange_ = 0u;
+    boundTelemetryBuffer_ = VK_NULL_HANDLE;
+    boundTelemetryRange_ = 0u;
     allocator_ = nullptr;
     initializedDevice_ = VK_NULL_HANDLE;
     initialized_ = false;
@@ -225,21 +308,23 @@ bool VulkanRawJpegNormalizeBackend::initializeLocked(
         failureReason = "RAW_JPEG_NORMALIZE_DEVICE_INVALID";
         return false;
     }
-    VkDescriptorSetLayoutBinding bindings[2]{};
-    for (std::uint32_t i = 0u; i < 2u; ++i) {
+
+    VkDescriptorSetLayoutBinding bindings[4]{};
+    for (std::uint32_t i = 0u; i < 4u; ++i) {
         bindings[i].binding = i;
         bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         bindings[i].descriptorCount = 1u;
         bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     }
     VkDescriptorSetLayoutCreateInfo setInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    setInfo.bindingCount = 2u;
+    setInfo.bindingCount = 4u;
     setInfo.pBindings = bindings;
     if (vkCreateDescriptorSetLayout(device, &setInfo, nullptr, &descriptorSetLayout_) != VK_SUCCESS) {
         failureReason = "RAW_JPEG_NORMALIZE_DESCRIPTOR_LAYOUT_FAILED";
         destroyLocked(device);
         return false;
     }
+
     VkPushConstantRange pushRange{};
     pushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     pushRange.offset = 0u;
@@ -254,6 +339,7 @@ bool VulkanRawJpegNormalizeBackend::initializeLocked(
         destroyLocked(device);
         return false;
     }
+
     const std::vector<std::uint32_t>& spirv = getRawJpegNormalizeSpirv();
     if (spirv.empty()) {
         failureReason = "RAW_JPEG_NORMALIZE_SHADER_EMPTY";
@@ -275,14 +361,16 @@ bool VulkanRawJpegNormalizeBackend::initializeLocked(
     VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     pipelineInfo.stage = stageInfo;
     pipelineInfo.layout = pipelineLayout_;
-    if (VulkanPipelineCacheRegistry::createComputePipelines(device, 1u, &pipelineInfo, nullptr, &pipeline_) != VK_SUCCESS) {
+    if (VulkanPipelineCacheRegistry::createComputePipelines(
+            device, 1u, &pipelineInfo, nullptr, &pipeline_) != VK_SUCCESS) {
         failureReason = "RAW_JPEG_NORMALIZE_PIPELINE_FAILED";
         destroyLocked(device);
         return false;
     }
+
     VkDescriptorPoolSize poolSize{};
     poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    poolSize.descriptorCount = 2u;
+    poolSize.descriptorCount = 4u;
     VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     poolInfo.maxSets = 1u;
     poolInfo.poolSizeCount = 1u;
@@ -301,6 +389,7 @@ bool VulkanRawJpegNormalizeBackend::initializeLocked(
         destroyLocked(device);
         return false;
     }
+
     initializedDevice_ = device;
     initialized_ = true;
     return true;
@@ -329,6 +418,7 @@ RawJpegNormalizeResult VulkanRawJpegNormalizeBackend::execute(
         out.failureReason = "RAW_JPEG_NORMALIZE_REQUEST_INVALID";
         return out;
     }
+
     const std::uint64_t inputPixels = static_cast<std::uint64_t>(request.inputWidth) * request.inputHeight;
     const std::uint64_t rawBytes = inputPixels * sizeof(std::uint16_t);
     const std::uint64_t pixels = static_cast<std::uint64_t>(request.width) * request.height;
@@ -343,6 +433,24 @@ RawJpegNormalizeResult VulkanRawJpegNormalizeBackend::execute(
             return out;
         }
     }
+    if (request.knownDefectCount > pixels ||
+        (request.knownDefectCount > 0u && request.knownDefectCoordinates == nullptr)) {
+        out.failureReason = "RAW_JPEG_NORMALIZE_DEFECT_MAP_INVALID";
+        return out;
+    }
+    for (std::uint32_t i = 0u; i < request.knownDefectCount; ++i) {
+        const std::int32_t x = request.knownDefectCoordinates[i * 2u];
+        const std::int32_t y = request.knownDefectCoordinates[i * 2u + 1u];
+        if (x < 0 || y < 0 || x >= static_cast<std::int32_t>(request.width) ||
+            y >= static_cast<std::int32_t>(request.height)) {
+            out.failureReason = "RAW_JPEG_NORMALIZE_DEFECT_COORDINATE_OUT_OF_RANGE";
+            return out;
+        }
+    }
+
+    const bool noiseModelEnabled = validNoiseModel(request);
+    out.noiseAdaptiveDefectDetectionEnabled = noiseModelEnabled;
+    out.knownDefectMapPointCount = request.knownDefectCount;
 
     std::lock_guard<std::mutex> lock(mutex_);
     residentOutputGeneration_ = 0u;
@@ -354,40 +462,66 @@ RawJpegNormalizeResult VulkanRawJpegNormalizeBackend::execute(
         out.failureReason = "RAW_JPEG_NORMALIZE_VMA_ALLOCATOR_UNAVAILABLE";
         return out;
     }
+
+    const std::uint64_t coordinateBytes = std::max<std::uint64_t>(
+        2u * sizeof(std::int32_t),
+        static_cast<std::uint64_t>(request.knownDefectCount) * 2u * sizeof(std::int32_t)
+    );
+    const std::uint32_t writeAccess = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
+    const std::uint32_t readWriteAccess = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
     if (!initializeLocked(device, out.failureReason) ||
-        !ensureBufferLocked(allocator_, outputBytes, output_, out.failureReason)) {
+        !ensureBufferLocked(allocator_, outputBytes, output_, out.failureReason) ||
+        !ensureMappedBufferLocked(
+            allocator_, coordinateBytes, writeAccess, coordinates_, out.failureReason) ||
+        !ensureMappedBufferLocked(
+            allocator_, kTelemetryBytes, readWriteAccess, telemetry_, out.failureReason)) {
         return out;
     }
 
-    VkDescriptorBufferInfo inputInfo{request.canonicalRawBuffer, 0u, static_cast<VkDeviceSize>(rawBytes)};
-    VkDescriptorBufferInfo outputInfo{output_.buffer, 0u, static_cast<VkDeviceSize>(outputBytes)};
-    VkWriteDescriptorSet writes[2]{};
-    std::uint32_t writeCount = 0u;
-    if (boundInputBuffer_ != inputInfo.buffer || boundInputRange_ != inputInfo.range) {
-        auto& write = writes[writeCount++];
-        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        write.dstSet = descriptorSet_;
-        write.dstBinding = 0u;
-        write.descriptorCount = 1u;
-        write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        write.pBufferInfo = &inputInfo;
-        boundInputBuffer_ = inputInfo.buffer;
-        boundInputRange_ = inputInfo.range;
-    } else {
-        ++out.descriptorBindingsReused;
+    const auto uploadStart = Clock::now();
+    std::memset(coordinates_.mapped, 0, static_cast<std::size_t>(coordinateBytes));
+    if (request.knownDefectCount > 0u) {
+        const std::size_t usedCoordinateBytes =
+            static_cast<std::size_t>(request.knownDefectCount) * 2u * sizeof(std::int32_t);
+        std::memcpy(coordinates_.mapped, request.knownDefectCoordinates, usedCoordinateBytes);
+        out.sparseMetadataUploadBytes = usedCoordinateBytes;
     }
-    if (boundOutputBuffer_ != outputInfo.buffer || boundOutputRange_ != outputInfo.range) {
+    std::memset(telemetry_.mapped, 0, static_cast<std::size_t>(kTelemetryBytes));
+    vmaFlushAllocation(
+        allocator_, coordinates_.allocation, 0u, static_cast<VkDeviceSize>(coordinateBytes));
+    vmaFlushAllocation(
+        allocator_, telemetry_.allocation, 0u, static_cast<VkDeviceSize>(kTelemetryBytes));
+    out.sparseMetadataUploadMs = elapsedMs(uploadStart);
+
+    VkDescriptorBufferInfo infos[4] = {
+        {request.canonicalRawBuffer, 0u, static_cast<VkDeviceSize>(rawBytes)},
+        {output_.buffer, 0u, static_cast<VkDeviceSize>(outputBytes)},
+        {coordinates_.buffer, 0u, static_cast<VkDeviceSize>(coordinateBytes)},
+        {telemetry_.buffer, 0u, static_cast<VkDeviceSize>(kTelemetryBytes)}
+    };
+    VkBuffer* boundBuffers[4] = {
+        &boundInputBuffer_, &boundOutputBuffer_, &boundCoordinatesBuffer_, &boundTelemetryBuffer_
+    };
+    VkDeviceSize* boundRanges[4] = {
+        &boundInputRange_, &boundOutputRange_, &boundCoordinatesRange_, &boundTelemetryRange_
+    };
+    VkWriteDescriptorSet writes[4]{};
+    std::uint32_t writeCount = 0u;
+    for (std::uint32_t binding = 0u; binding < 4u; ++binding) {
+        if (*boundBuffers[binding] == infos[binding].buffer &&
+            *boundRanges[binding] == infos[binding].range) {
+            ++out.descriptorBindingsReused;
+            continue;
+        }
         auto& write = writes[writeCount++];
         write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         write.dstSet = descriptorSet_;
-        write.dstBinding = 1u;
+        write.dstBinding = binding;
         write.descriptorCount = 1u;
         write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        write.pBufferInfo = &outputInfo;
-        boundOutputBuffer_ = outputInfo.buffer;
-        boundOutputRange_ = outputInfo.range;
-    } else {
-        ++out.descriptorBindingsReused;
+        write.pBufferInfo = &infos[binding];
+        *boundBuffers[binding] = infos[binding].buffer;
+        *boundRanges[binding] = infos[binding].range;
     }
     if (writeCount > 0u) {
         vkUpdateDescriptorSets(device, writeCount, writes, 0u, nullptr);
@@ -409,6 +543,7 @@ RawJpegNormalizeResult VulkanRawJpegNormalizeBackend::execute(
         return out;
     }
     ++out.commandBufferResets;
+
     VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     if (vkBeginCommandBuffer(command, &beginInfo) != VK_SUCCESS) {
@@ -416,19 +551,39 @@ RawJpegNormalizeResult VulkanRawJpegNormalizeBackend::execute(
         return out;
     }
 
-    VkBufferMemoryBarrier inputBarrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
-    inputBarrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
-    inputBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    inputBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    inputBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    inputBarrier.buffer = request.canonicalRawBuffer;
-    inputBarrier.offset = 0u;
-    inputBarrier.size = static_cast<VkDeviceSize>(rawBytes);
+    VkBufferMemoryBarrier inputBarriers[3]{};
+    inputBarriers[0].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    inputBarriers[0].srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    inputBarriers[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    inputBarriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    inputBarriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    inputBarriers[0].buffer = request.canonicalRawBuffer;
+    inputBarriers[0].offset = 0u;
+    inputBarriers[0].size = static_cast<VkDeviceSize>(rawBytes);
+
+    inputBarriers[1].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    inputBarriers[1].srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+    inputBarriers[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    inputBarriers[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    inputBarriers[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    inputBarriers[1].buffer = coordinates_.buffer;
+    inputBarriers[1].offset = 0u;
+    inputBarriers[1].size = static_cast<VkDeviceSize>(coordinateBytes);
+
+    inputBarriers[2].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    inputBarriers[2].srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+    inputBarriers[2].dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    inputBarriers[2].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    inputBarriers[2].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    inputBarriers[2].buffer = telemetry_.buffer;
+    inputBarriers[2].offset = 0u;
+    inputBarriers[2].size = static_cast<VkDeviceSize>(kTelemetryBytes);
+
     vkCmdPipelineBarrier(
-            command,
-            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            0u, 0u, nullptr, 1u, &inputBarrier, 0u, nullptr);
+        command,
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0u, 0u, nullptr, 3u, inputBarriers, 0u, nullptr);
 
     NormalizePush push{};
     push.inputWidth = request.inputWidth;
@@ -440,39 +595,83 @@ RawJpegNormalizeResult VulkanRawJpegNormalizeBackend::execute(
     push.phaseX = request.cfaOffsetX & 1u;
     push.phaseY = request.cfaOffsetY & 1u;
     push.whiteLevel = request.whiteLevel;
+    push.sensorCfaPattern = std::min(request.sensorCfaPattern, 3u);
+    push.noiseModelEnabled = noiseModelEnabled ? 1u : 0u;
+    push.knownDefectCount = request.knownDefectCount;
     std::copy(request.blackLevels.begin(), request.blackLevels.end(), push.blackLevels);
+    std::copy(request.effectiveS.begin(), request.effectiveS.end(), push.noiseS);
+    std::copy(request.effectiveO.begin(), request.effectiveO.end(), push.noiseO);
+
     vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
     vkCmdBindDescriptorSets(
             command, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_,
             0u, 1u, &descriptorSet_, 0u, nullptr);
-    vkCmdPushConstants(command, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0u, sizeof(push), &push);
+
+    push.mode = 0u;
+    vkCmdPushConstants(
+        command, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0u, sizeof(push), &push);
     const auto kernelStart = Clock::now();
     vkCmdDispatch(command, (request.width + 15u) / 16u, (request.height + 15u) / 16u, 1u);
 
-    VkBufferMemoryBarrier outputBarrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
-    outputBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    outputBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    outputBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    outputBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    outputBarrier.buffer = output_.buffer;
-    outputBarrier.offset = 0u;
-    outputBarrier.size = static_cast<VkDeviceSize>(outputBytes);
-    vkCmdPipelineBarrier(
+    if (request.knownDefectCount > 0u) {
+        VkBufferMemoryBarrier betweenPasses{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+        betweenPasses.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        betweenPasses.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        betweenPasses.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        betweenPasses.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        betweenPasses.buffer = output_.buffer;
+        betweenPasses.offset = 0u;
+        betweenPasses.size = static_cast<VkDeviceSize>(outputBytes);
+        vkCmdPipelineBarrier(
             command,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            0u, 0u, nullptr, 1u, &outputBarrier, 0u, nullptr);
+            0u, 0u, nullptr, 1u, &betweenPasses, 0u, nullptr);
+
+        push.mode = 1u;
+        vkCmdPushConstants(
+            command, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0u, sizeof(push), &push);
+        // y-dispatch is one workgroup; mode 1 explicitly permits only global y==0.
+        vkCmdDispatch(command, (request.knownDefectCount + 15u) / 16u, 1u, 1u);
+    }
+
+    VkBufferMemoryBarrier finalBarriers[2]{};
+    finalBarriers[0].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    finalBarriers[0].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    finalBarriers[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    finalBarriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    finalBarriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    finalBarriers[0].buffer = output_.buffer;
+    finalBarriers[0].offset = 0u;
+    finalBarriers[0].size = static_cast<VkDeviceSize>(outputBytes);
+
+    finalBarriers[1].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    finalBarriers[1].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    finalBarriers[1].dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    finalBarriers[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    finalBarriers[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    finalBarriers[1].buffer = telemetry_.buffer;
+    finalBarriers[1].offset = 0u;
+    finalBarriers[1].size = static_cast<VkDeviceSize>(kTelemetryBytes);
+
+    vkCmdPipelineBarrier(
+        command,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+        0u, 0u, nullptr, 2u, finalBarriers, 0u, nullptr);
 
     if (vkEndCommandBuffer(command) != VK_SUCCESS) {
         out.failureReason = "RAW_JPEG_NORMALIZE_COMMAND_END_FAILED";
         return out;
     }
+
     const VkResult fenceReset = vkResetFences(device, 1u, &reusableFence_);
     if (fenceReset != VK_SUCCESS) {
         out.failureReason = "RAW_JPEG_NORMALIZE_FENCE_RESET_FAILED_" + std::to_string(fenceReset);
         return out;
     }
     ++out.fenceResets;
+
     VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submitInfo.commandBufferCount = 1u;
     submitInfo.pCommandBuffers = &command;
@@ -481,8 +680,10 @@ RawJpegNormalizeResult VulkanRawJpegNormalizeBackend::execute(
         return out;
     }
     ++out.queueSubmissions;
+
     const auto syncStart = Clock::now();
-    const VkResult wait = vkWaitForFences(device, 1u, &reusableFence_, VK_TRUE, 1'500'000'000ull);
+    const VkResult wait = vkWaitForFences(
+        device, 1u, &reusableFence_, VK_TRUE, 1'500'000'000ull);
     out.gpuSynchronizationMs = elapsedMs(syncStart);
     if (wait != VK_SUCCESS) {
         submissionResourcesUnsafe_ = true;
@@ -493,6 +694,15 @@ RawJpegNormalizeResult VulkanRawJpegNormalizeBackend::execute(
         return out;
     }
     out.gpuKernelWallMs = elapsedMs(kernelStart);
+
+    vmaInvalidateAllocation(
+        allocator_, telemetry_.allocation, 0u, static_cast<VkDeviceSize>(kTelemetryBytes));
+    const auto* telemetry = static_cast<const std::uint32_t*>(telemetry_.mapped);
+    out.knownDefectCorrectedPixelCount = telemetry[0];
+    out.residualDefectCorrectedPixelCount = telemetry[1];
+    out.knownDefectBorderSkipCount = telemetry[2];
+    out.knownDefectInvalidCoordinateCount = telemetry[3];
+    out.knownDefectMapApplied = out.knownDefectCorrectedPixelCount > 0u;
 
     residentOutputGeneration_ = request.generationId;
     residentOutputBytes_ = outputBytes;

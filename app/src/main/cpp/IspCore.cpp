@@ -3,6 +3,8 @@
 #include "IspCore.h"
 #include "RawCfaLevelMapping.h"
 #include "RawDefectCorrectionPolicy.h"
+#include "RawSceneBlackAuthorityPolicy.h"
+#include "RawSpatialNoiseCalibrationPolicy.h"
 #include "RawGreenSplitPolicy.h"
 #include "SpectraContextFusionNoRegret.h"
 #include "SpectraChromaNoRegretPolicy.h"
@@ -3961,11 +3963,13 @@ SpectraProvenanceField IspCore::buildSpectraProvenanceField(
                             const double sValue = meta.calibration.effectiveS[ch];
                             const double oValue = meta.calibration.effectiveO[ch];
                             const double predicted = isVstValid(sValue, oValue)
-                                    ? std::max(0.0, sValue * signal + oValue)
+                                    ? bncam::raw_noise::sensorVariance(signal, sValue, oValue)
                                     : 0.0;
                             const float gain = lensShadingGainAt(meta, ch, xx, yy, width, height);
                             predictedSumByChannel[ch] += predicted;
-                            visiblePredictedSumByChannel[ch] += predicted * static_cast<double>(gain * gain);
+                            visiblePredictedSumByChannel[ch] +=
+                                    bncam::raw_noise::visibleVarianceAfterMultiplicativeGain(
+                                            predicted, static_cast<double>(gain));
                             gainSum += gain;
                             gainSumByChannel[static_cast<size_t>(ch)] += gain;
 
@@ -4283,11 +4287,13 @@ SpectraProvenanceField IspCore::buildSpectraProvenanceFieldCompact(
                             const double sValue = meta.calibration.effectiveS[ch];
                             const double oValue = meta.calibration.effectiveO[ch];
                             const double predicted = isVstValid(sValue, oValue)
-                                    ? std::max(0.0, sValue * signal + oValue)
+                                    ? bncam::raw_noise::sensorVariance(signal, sValue, oValue)
                                     : 0.0;
                             const float gain = lensShadingGainAt(meta, ch, xx, yy, width, height);
                             predictedSumByChannel[ch] += predicted;
-                            visiblePredictedSumByChannel[ch] += predicted * static_cast<double>(gain * gain);
+                            visiblePredictedSumByChannel[ch] +=
+                                    bncam::raw_noise::visibleVarianceAfterMultiplicativeGain(
+                                            predicted, static_cast<double>(gain));
                             gainSum += gain;
                             gainSumByChannel[static_cast<size_t>(ch)] += gain;
 
@@ -4740,6 +4746,12 @@ SpectraPass0State IspCore::computePass0State(
     state.spectraMode = meta.calibration.spectraProcessingMode;
     state.sourceFormat = rawSourceFormatName(raw.info.sourceFormat);
     state.lensKey = raw.info.lensId;
+    const auto sceneBlackAuthority = bncam::raw_black::resolveSceneBlackAuthority(
+            raw.info.dynamicBlackLevelUsed,
+            raw.info.staticBlackLevelUsed);
+    state.sceneBlackMetadataAuthoritative = sceneBlackAuthority.metadataAuthoritative;
+    state.sceneBlackImageMutationAllowed = sceneBlackAuthority.imageDerivedMutationAllowed;
+    state.sceneBlackAuthorityMode = sceneBlackAuthority.mode;
     const SpectraIsoAdaptiveState isoState = IspCore::resolveSpectraIsoAdaptiveState(meta, uiConfig);
     state.isoAuthority = isoState.lowFrequencyAuthority;
 
@@ -4945,7 +4957,8 @@ SpectraPass0State IspCore::computePass0State(
             state.greenSplitTileConsensus *
             std::clamp(1.0f - state.greenSplitMad / std::max(consistencyLimit, 1.0e-6f), 0.0f, 1.0f);
 
-    if (state.acceptedTileCount >= 16 &&
+    if (state.sceneBlackImageMutationAllowed &&
+        state.acceptedTileCount >= 16 &&
         state.greenSplitTileCount >= 12 &&
         state.greenSplitTileConsensus >= 0.80f &&
         state.channelBiasConfidence >= 0.04f &&
@@ -4969,7 +4982,9 @@ SpectraPass0State IspCore::computePass0State(
         state.fallbackReason = "none";
     } else {
         state.g1g2After = state.g1g2Before;
-        state.fallbackReason = "no_confident_green_split_bias";
+        state.fallbackReason = state.sceneBlackImageMutationAllowed
+                ? "no_confident_green_split_bias"
+                : "metadata_black_authoritative_scene_scan_validator_only";
     }
 
     // Row/column and low-frequency residual correction are handled by Pass 3,
@@ -4989,6 +5004,12 @@ SpectraPass0State IspCore::computePass0StateCompact(
     state.spectraMode = meta.calibration.spectraProcessingMode;
     state.sourceFormat = rawSourceFormatName(raw.info.sourceFormat);
     state.lensKey = raw.info.lensId;
+    const auto sceneBlackAuthority = bncam::raw_black::resolveSceneBlackAuthority(
+            raw.info.dynamicBlackLevelUsed,
+            raw.info.staticBlackLevelUsed);
+    state.sceneBlackMetadataAuthoritative = sceneBlackAuthority.metadataAuthoritative;
+    state.sceneBlackImageMutationAllowed = sceneBlackAuthority.imageDerivedMutationAllowed;
+    state.sceneBlackAuthorityMode = sceneBlackAuthority.mode;
     const SpectraIsoAdaptiveState isoState = IspCore::resolveSpectraIsoAdaptiveState(meta, uiConfig);
     state.isoAuthority = isoState.lowFrequencyAuthority;
 
@@ -5172,7 +5193,8 @@ SpectraPass0State IspCore::computePass0StateCompact(
             state.greenSplitTileConsensus *
             std::clamp(1.0f - state.greenSplitMad / std::max(consistencyLimit, 1.0e-6f), 0.0f, 1.0f);
 
-    if (state.acceptedTileCount >= 16 && state.greenSplitTileCount >= 12 &&
+    if (state.sceneBlackImageMutationAllowed &&
+        state.acceptedTileCount >= 16 && state.greenSplitTileCount >= 12 &&
         state.greenSplitTileConsensus >= 0.80f && state.channelBiasConfidence >= 0.04f &&
         std::abs(state.g1g2Before) > activationThresholdCode &&
         state.greenSplitMad <= consistencyLimit) {
@@ -5190,7 +5212,9 @@ SpectraPass0State IspCore::computePass0StateCompact(
         state.fallbackReason = "none";
     } else {
         state.g1g2After = state.g1g2Before;
-        state.fallbackReason = "no_confident_green_split_bias";
+        state.fallbackReason = state.sceneBlackImageMutationAllowed
+                ? "no_confident_green_split_bias"
+                : "metadata_black_authoritative_scene_scan_validator_only";
     }
     state.applyRowCorrection = false;
     state.applyColumnCorrection = false;
@@ -6304,6 +6328,8 @@ bool tryApplySpectraPass1Vulkan(
     }
     request.blendStrength = pass1State.blendStrength;
     request.maxPixelShift = pass1State.maxPixelShift;
+    request.maxLinearShift = pass1State.maxLinearShift;
+    request.physicalBaselineMode = pass1State.physicalBaselineMode;
     request.isoAuthority = pass1State.isoAuthority;
     request.greenS = static_cast<float>(greenS);
     request.greenO = static_cast<float>(greenO);
@@ -6545,6 +6571,8 @@ bool tryApplySpectraPass1VulkanResident(
     }
     request.blendStrength = pass1State.blendStrength;
     request.maxPixelShift = pass1State.maxPixelShift;
+    request.maxLinearShift = pass1State.maxLinearShift;
+    request.physicalBaselineMode = pass1State.physicalBaselineMode;
     request.isoAuthority = pass1State.isoAuthority;
     request.greenS = static_cast<float>(greenS);
     request.greenO = static_cast<float>(greenO);
@@ -13006,6 +13034,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         preDemosaicAuthorityState.detailRetentionFloor = singleFrameRawDenoise.detailRetentionFloor;
         preDemosaicAuthorityState.minimumResidualRatio = singleFrameRawDenoise.minimumResidualRatio;
         preDemosaicAuthorityState.targetFloorScale = singleFrameRawDenoise.targetFloorScale;
+        preDemosaicAuthorityState.maxLinearShift = singleFrameRawDenoise.maxLinearShift;
         preDemosaicAuthorityState.regime = "PHYSICAL_SO_SINGLE_FRAME";
     }
     const auto captureProvenanceStart = IspClock::now();
@@ -13320,6 +13349,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             pass1State.combinedNoisePressure = singleFrameRawDenoise.physicalNoisePressure;
             pass1State.blendStrength = singleFrameRawDenoise.blendStrength;
             pass1State.maxPixelShift = 1.05f + 2.15f * singleFrameRawDenoise.physicalNoisePressure;
+            pass1State.maxLinearShift = singleFrameRawDenoise.maxLinearShift;
             pass1State.anisotropicDetail.enabled = true;
             pass1State.anisotropicDetail.status = "PHYSICAL_SINGLE_FRAME_PLAN_READY";
             pass1State.fallbackReason = "none";
@@ -16765,6 +16795,8 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         request.fllfMaxCompressEv = fllfPlan.maxCompressEv;
         request.fllfEdgeStopEv = fllfPlan.edgeStopEv;
         request.fllfRefinement = fllfPlan.refinement;
+        request.fllfShadowLiftNoiseGuardPressure =
+                fllfPlan.shadowLiftNoiseGuardPressure;
         request.fllfPyramidLevels = fllfPlan.pyramidLevels;
         request.isRawBayer = isRawBayer;
         request.profileColorSaturation = uiConfig.profileColorSaturation;
@@ -18582,6 +18614,8 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; fllfSceneKey=" << fllfPlan.sceneKey
             << "; fllfMaxLiftEv=" << fllfPlan.maxLiftEv
             << "; fllfMaxCompressEv=" << fllfPlan.maxCompressEv
+            << "; fllfShadowLiftNoiseGuardPressure="
+            << fllfPlan.shadowLiftNoiseGuardPressure
             << "; fllfEdgeStopEv=" << fllfPlan.edgeStopEv
             << "; fllfRefinement=" << fllfPlan.refinement
             << "; fllfBackend=" << (vulkanTone.fllfApplied ? "VULKAN_PACKED_LOG_LUMA_PYRAMID" :
@@ -18862,6 +18896,11 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << (demosaicFailureRawFinalizeMaterialized ? "true" : "false")
             << "; spectraPass0Applied=" << ((pass0State.applyChannelBias || pass0State.applyRowCorrection || pass0State.applyColumnCorrection) ? "true" : "false")
             << "; spectraPass0SkipReason=" << pass0State.fallbackReason
+            << "; sceneBlackAuthorityMode=" << pass0State.sceneBlackAuthorityMode
+            << "; sceneBlackMetadataAuthoritative="
+            << (pass0State.sceneBlackMetadataAuthoritative ? "true" : "false")
+            << "; sceneBlackImageMutationAllowed="
+            << (pass0State.sceneBlackImageMutationAllowed ? "true" : "false")
             << "; spectraPass0InputEnergy=" << pass0State.g1g2Before
             << "; spectraPass0TargetFloor=" << captureProvenance.meanPredictedRawVariance
             << "; spectraPass0OutputEnergy=" << pass0State.g1g2After
@@ -19558,6 +19597,8 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; singleFrameRawTargetFloorScale=" << singleFrameRawDenoise.targetFloorScale
             << "; singleFrameRawMinimumResidualRatio=" << singleFrameRawDenoise.minimumResidualRatio
             << "; singleFrameRawDetailRetentionFloor=" << singleFrameRawDenoise.detailRetentionFloor
+            << "; singleFrameRawMaxLinearShift=" << singleFrameRawDenoise.maxLinearShift
+            << "; pass1EffectiveMaxLinearShift=" << pass1State.maxLinearShift
             << "; singleFrameRawPass1Physical=" << (pass1State.physicalBaselineMode ? "true" : "false")
             << "; singleFrameRawPass2Physical=" << (pass2State.physicalBaselineMode ? "true" : "false")
             << "; singleFrameRawPass3Physical=" << (pass3State.physicalBaselineMode ? "true" : "false")
@@ -19631,6 +19672,8 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; fllfSceneKey=" << fllfPlan.sceneKey
             << "; fllfMaxLiftEv=" << fllfPlan.maxLiftEv
             << "; fllfMaxCompressEv=" << fllfPlan.maxCompressEv
+            << "; fllfShadowLiftNoiseGuardPressure="
+            << fllfPlan.shadowLiftNoiseGuardPressure
             << "; fllfEdgeStopEv=" << fllfPlan.edgeStopEv
             << "; fllfRefinement=" << fllfPlan.refinement
             << "; fllfBackend=" << (vulkanTone.fllfApplied ? "VULKAN_PACKED_LOG_LUMA_PYRAMID" :

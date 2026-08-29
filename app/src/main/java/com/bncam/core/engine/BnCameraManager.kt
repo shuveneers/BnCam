@@ -7762,6 +7762,27 @@ class BnCameraManager(private val context: Context) {
                     } catch (t: Throwable) {
                         Log.w(tag, "LensShadingMap request setup failed for RAW pipeline", t)
                     }
+
+                    // P0 RAW defect truth: request the Camera2 sensor hot-pixel map independently
+                    // from HOT_PIXEL_MODE. The map is metadata only; BnCam remains the owner of
+                    // pre-demosaic RAW correction. Missing optional metadata is a clean fallback.
+                    try {
+                        val hotPixelMapDecision =
+                            com.bncam.core.isp.raw.RawMetadataCaptureRequestPolicy.applyHotPixelMapRequest(
+                                builder = requestBuilder,
+                                characteristics = cameraManager.getCameraCharacteristics(camera.id),
+                                frameSourceFormat = sessionBufferFormat
+                            )
+                        Log.i(
+                            tag,
+                            "RawHotPixelMap request requested=${hotPixelMapDecision.requested} " +
+                                "supported=${hotPixelMapDecision.mapModeSupported} " +
+                                "reason=${hotPixelMapDecision.reason} " +
+                                "format=${formatName(sessionBufferFormat)}"
+                        )
+                    } catch (t: Throwable) {
+                        Log.w(tag, "RawHotPixelMap request setup failed for RAW pipeline", t)
+                    }
                 }
 
                 // -------------------------------------------------------------

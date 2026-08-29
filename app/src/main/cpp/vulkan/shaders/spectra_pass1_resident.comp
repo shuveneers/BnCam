@@ -48,8 +48,8 @@ layout(push_constant) uniform Push {
     float blendStrength;
     float maxPixelShift;
     float isoAuthority;
-    float greenS;
-    float greenO;
+    float maxLinearShift;
+    uint physicalBaselineMode;
     float modelConfidence;
     uint observationOffset;
     float combinedNoisePressure;
@@ -215,6 +215,8 @@ float channelO(int ch) {
     if (ch == 2) return pc.o2;
     return pc.o3;
 }
+float greenNoiseS() { return 0.5 * (pc.s1 + pc.s2); }
+float greenNoiseO() { return 0.5 * (pc.o1 + pc.o2); }
 
 float rawAt(int x, int y) {
     x = clamp(x, 0, int(pc.frameWidth) - 1);
@@ -455,250 +457,6 @@ struct SameCfaRingEstimate {
     float structureZ;
 };
 
-
-float firmRetainedCoefficient(float coefficient, float lowThreshold, float highThreshold) {
-    float magnitude = abs(coefficient);
-    lowThreshold = max(0.0, lowThreshold);
-    highThreshold = max(lowThreshold + 1.0e-4, highThreshold);
-    if (magnitude <= lowThreshold) return 0.0;
-    if (magnitude >= highThreshold) return coefficient;
-    float t = smoothstepSpectra(lowThreshold, highThreshold, magnitude);
-    return coefficient * t;
-}
-
-struct ProfiledMultibandDecision {
-    float target;
-    float mixWeight;
-    float retainedFineRatio;
-    float coherentDetailGain;
-};
-
-// Independent darktable-inspired *principle*, not source code: after the calibrated
-// Poisson-Gaussian VST has approximately equalised sensor noise, split same-CFA
-// detail into fine/mid/coarse Laplacian-like bands and shrink each band by its
-// statistical significance.  Firm retention leaves strong coefficients untouched
-// instead of paying the constant bias of soft thresholding.  A tiny coherent-detail
-// restitution is allowed only for strong, tensor-supported structure.
-ProfiledMultibandDecision resolveProfiledMultiband(
-        float center, float fineLow, float midLow, float coarseLow,
-        float flatContext, float edgeProtection,
-        CfaSurfaceClassification surfaceClass, TensorEstimate tensor,
-        float combinedNoisePressure, float modelConfidence) {
-    ProfiledMultibandDecision d;
-    d.target = center;
-    d.mixWeight = 0.0;
-    d.retainedFineRatio = 1.0;
-    d.coherentDetailGain = 1.0;
-    if (!finite1(center) || !finite1(fineLow) || !finite1(midLow) || !finite1(coarseLow)) return d;
-
-    float noise = saturate(combinedNoisePressure);
-    float confidence = saturate(modelConfidence);
-    float flatness = saturate(flatContext);
-    float texture = saturate(surfaceClass.textureConfidence);
-    float edge = saturate(edgeProtection);
-
-    // VST sensel noise is approximately unit sigma.  The coarser bands are
-    // differences between already-averaged estimates and therefore use smaller
-    // thresholds than the center-vs-fine band.
-    float thresholdScale = clamp(
-            0.86 + 0.48 * flatness + 0.18 * noise - 0.24 * texture + 0.10 * (1.0 - confidence),
-            0.62, 1.48);
-    float fineLowT = mix(1.10, 1.72, noise) * thresholdScale;
-    float fineHighT = mix(3.05, 3.85, noise) * (0.92 + 0.18 * thresholdScale);
-    float midLowT = mix(0.66, 1.02, noise) * thresholdScale;
-    float midHighT = mix(2.05, 2.78, noise) * (0.92 + 0.16 * thresholdScale);
-    float coarseLowT = mix(0.42, 0.72, noise) * thresholdScale;
-    float coarseHighT = mix(1.62, 2.28, noise) * (0.94 + 0.14 * thresholdScale);
-
-    float fineDetail = center - fineLow;
-    float midDetail = fineLow - midLow;
-    float coarseDetail = midLow - coarseLow;
-    float retainedFine = firmRetainedCoefficient(fineDetail, fineLowT, fineHighT);
-    float retainedMid = firmRetainedCoefficient(midDetail, midLowT, midHighT);
-    float retainedCoarse = firmRetainedCoefficient(coarseDetail, coarseLowT, coarseHighT);
-
-    // "Crispy" here means restoring only structure that is demonstrably above
-    // the noise model.  This is not generic sharpening: isolated/noise-like high
-    // frequency coefficients do not receive gain.
-    float tensorStructure = tensor.confident
-            ? saturate(tensor.confidence * (0.45 + 0.55 * tensor.coherence)) : 0.0;
-    float strongFine = smoothstepSpectra(3.10, 5.80, abs(fineDetail));
-    float coherentSupport = max(edge, tensorStructure) * (1.0 - 0.70 * flatness);
-    float detailGain = 1.0 + 0.065 * strongFine * coherentSupport * confidence;
-    retainedFine *= detailGain;
-
-    float target = coarseLow + retainedCoarse + retainedMid + retainedFine;
-    if (!finite1(target)) return d;
-
-    // Flat/noise-dominant regions may use most of the profiled estimate.  Coherent
-    // structure and classified texture rapidly reduce the mix, leaving the existing
-    // anisotropic Wiener estimator / No-Regret gates authoritative at edges.
-    float mixWeight = (0.26 + 0.62 * noise) * (0.30 + 0.70 * flatness) *
-            (1.0 - 0.80 * edge) * (1.0 - 0.68 * texture) * (0.72 + 0.28 * confidence);
-    mixWeight = clamp(mixWeight, 0.0, 0.88);
-    if (texture > 0.78) mixWeight = min(mixWeight, 0.18);
-    if (edge > 0.82) mixWeight = min(mixWeight, 0.12);
-
-    d.target = target;
-    d.mixWeight = mixWeight;
-    d.retainedFineRatio = abs(fineDetail) > 1.0e-5
-            ? clamp(abs(retainedFine) / abs(fineDetail), 0.0, 1.20) : 1.0;
-    d.coherentDetailGain = detailGain;
-    return d;
-}
-
-
-struct ProfiledPatchConsensusDecision {
-    bool valid;
-    float target;
-    float mixWeight;
-    float effectiveSupport;
-    float posteriorRetainedRatio;
-    float gradientGuard;
-};
-
-// Independent NLM/patch-consensus principle for the *physical* single-frame
-// baseline.  Similarity is evaluated in the variance-stabilised domain where a
-// difference of two independent sensor-noise samples has expected variance ~=2.
-// Only flat/noise-dominant CFA regions gain meaningful authority, so this is not
-// a spatial blur over edges or texture.
-ProfiledPatchConsensusDecision resolveProfiledPatchConsensus(
-        int x, int y, float S, float O, float centerVst,
-        float flatContext, float edgeProtection, CfaSurfaceClassification surfaceClass,
-        float combinedNoisePressure, float modelConfidence) {
-    ProfiledPatchConsensusDecision d;
-    d.valid = false;
-    d.target = centerVst;
-    d.mixWeight = 0.0;
-    d.effectiveSupport = 1.0;
-    d.posteriorRetainedRatio = 1.0;
-    d.gradientGuard = 1.0;
-
-    float noise = saturate(combinedNoisePressure);
-    float confidence = saturate(modelConfidence);
-    float flatness = saturate(flatContext);
-    float edge = saturate(edgeProtection);
-    float texture = saturate(surfaceClass.textureConfidence);
-
-    // Global sensor-noise pressure is intentionally conservative at low ISO, but
-    // locally underexposed shadows can still have poor SNR because the signal sits
-    // only a few predicted sigma above the black/noise floor. Promote those pixels
-    // into the same profiled patch-posterior only when the local S/O model proves
-    // the SNR is low; flatness/edge/texture gates below still protect real detail.
-    float centerRaw = max(0.0, rawAt(x, y));
-    float centerSigma = sqrt(max(1.0e-12, S * centerRaw + O));
-    float localSnr = centerRaw / max(centerSigma, 1.0e-6);
-    float shadowNoisePressure = 1.0 - smoothstepSpectra(4.25, 9.50, localSnr);
-    float effectiveNoise = max(noise, 0.42 * shadowNoisePressure);
-
-    if (effectiveNoise < 0.16 || confidence < 0.10 || flatness < 0.42 ||
-            edge > 0.78 || texture > 0.78) return d;
-
-    const ivec2 patchOffsets[5] = ivec2[5](
-        ivec2(0,0), ivec2(-2,0), ivec2(2,0), ivec2(0,-2), ivec2(0,2));
-    const ivec2 candidateOffsets[8] = ivec2[8](
-        ivec2(-4,0), ivec2(4,0), ivec2(0,-4), ivec2(0,4),
-        ivec2(-4,-4), ivec2(4,4), ivec2(4,-4), ivec2(-4,4));
-
-    float weighted = centerVst;
-    float weightSum = 1.0;
-    float nonLocalSupport = 0.0;
-    float axisLeft = centerVst;
-    float axisRight = centerVst;
-    float axisUp = centerVst;
-    float axisDown = centerVst;
-    bool axisLeftValid = false;
-    bool axisRightValid = false;
-    bool axisUpValid = false;
-    bool axisDownValid = false;
-    // High physical noise tolerates a slightly broader patch distance.  The
-    // subtraction of the expected variance prevents random noise itself from
-    // making identical underlying patches appear dissimilar.
-    float bandwidth = mix(0.88, 1.52, effectiveNoise) * (0.86 + 0.14 * confidence);
-    float bandwidth2 = max(0.25, bandwidth * bandwidth);
-
-    for (int i = 0; i < 8; ++i) {
-        float patchDistance = 0.0;
-        bool validPatch = true;
-        for (int j = 0; j < 5; ++j) {
-            ivec2 aPos = ivec2(x, y) + patchOffsets[j];
-            ivec2 bPos = ivec2(x, y) + candidateOffsets[i] + patchOffsets[j];
-            float aRaw = rawAt(aPos.x, aPos.y);
-            float bRaw = rawAt(bPos.x, bPos.y);
-            if (!vstValidDomain(aRaw, S, O) || !vstValidDomain(bRaw, S, O)) {
-                validPatch = false;
-                break;
-            }
-            float delta = forwardVst(aRaw, S, O) - forwardVst(bRaw, S, O);
-            patchDistance += delta * delta;
-        }
-        if (!validPatch) continue;
-        float meanDistance = patchDistance * 0.20;
-        float excessDistance = max(0.0, meanDistance - 2.0);
-        float weight = exp(-excessDistance / bandwidth2);
-        if (weight < 0.035 || !finite1(weight)) continue;
-        float candidateRaw = rawAt(x + candidateOffsets[i].x, y + candidateOffsets[i].y);
-        float candidateVst = forwardVst(candidateRaw, S, O);
-        if (i == 0) { axisLeft = candidateVst; axisLeftValid = true; }
-        else if (i == 1) { axisRight = candidateVst; axisRightValid = true; }
-        else if (i == 2) { axisUp = candidateVst; axisUpValid = true; }
-        else if (i == 3) { axisDown = candidateVst; axisDownValid = true; }
-        weighted += weight * candidateVst;
-        weightSum += weight;
-        nonLocalSupport += weight;
-    }
-
-    if (nonLocalSupport < 1.20 || weightSum <= 1.0e-6) return d;
-    float consensus = weighted / weightSum;
-    if (!finite1(consensus)) return d;
-
-    // A reliable patch consensus lets us distinguish stochastic center-pixel noise
-    // from structure in the same variance-stabilised units used by the sensor model.
-    // Noise-like center residuals collapse toward the consensus; coefficients that
-    // are several sigma away retain their full amplitude. This is deliberately a
-    // posterior shrink, not a generic blur or contrast reduction.
-    float centerResidual = centerVst - consensus;
-    float residualMagnitude = abs(centerResidual);
-    float lowThreshold = 1.08 + 0.44 * flatness + 0.18 * effectiveNoise;
-    float highThreshold = 3.05 + 0.55 * (1.0 - texture) + 0.20 * (1.0 - edge);
-    float retainedResidual = firmRetainedCoefficient(
-            centerResidual, lowThreshold, max(lowThreshold + 0.75, highThreshold));
-    float posteriorTarget = consensus + retainedResidual;
-    if (!finite1(posteriorTarget)) return d;
-
-    // Protect genuine low-frequency luminance ramps. A flat local texture classifier
-    // alone cannot distinguish a smooth wall gradient from a perfectly constant wall,
-    // so opposing same-CFA candidates provide an independent gradient-in-sigma guard.
-    float gradientZ = 0.0;
-    if (axisLeftValid && axisRightValid) gradientZ = max(gradientZ, abs(axisLeft - axisRight) * 0.70710678);
-    if (axisUpValid && axisDownValid) gradientZ = max(gradientZ, abs(axisUp - axisDown) * 0.70710678);
-    float gradientGuard = 1.0 - smoothstepSpectra(1.30, 2.85, gradientZ);
-
-    float flatGate = smoothstepSpectra(0.44, 0.86, flatness);
-    float noiseGate = smoothstepSpectra(0.16, 0.72, effectiveNoise);
-    float structureGuard = (1.0 - 0.92 * edge) * (1.0 - 0.84 * texture);
-    float supportGate = smoothstepSpectra(1.20, 4.80, nonLocalSupport);
-    float mixWeight = flatGate * noiseGate * structureGuard * supportGate *
-            confidence * mix(0.64, 0.92, effectiveNoise) * gradientGuard;
-
-    // Once the posterior has already preserved >sigma structure, flat/high-support
-    // regions may use a stronger clean target without lowering the global detail floor.
-    float retainedRatio = residualMagnitude > 1.0e-5
-            ? clamp(abs(retainedResidual) / residualMagnitude, 0.0, 1.0) : 1.0;
-    float hardCleanEvidence = (1.0 - retainedRatio) * flatGate * supportGate * noiseGate * gradientGuard;
-    mixWeight = max(mixWeight, hardCleanEvidence * mix(0.70, 0.93, effectiveNoise) * confidence);
-    mixWeight = clamp(mixWeight, 0.0, 0.93);
-    if (mixWeight <= 0.03) return d;
-
-    d.valid = true;
-    d.target = posteriorTarget;
-    d.mixWeight = mixWeight;
-    d.effectiveSupport = weightSum;
-    d.posteriorRetainedRatio = retainedRatio;
-    d.gradientGuard = gradientGuard;
-    return d;
-}
-
 SameCfaRingEstimate sameCfaRingEstimate(int x, int y, int radius, float S, float O) {
     SameCfaRingEstimate outValue;
     outValue.valid = false;
@@ -796,7 +554,7 @@ void pass1Pixel() {
     }
 
     float centerGreen = greenGuideAt(x, y);
-    float greenSigma = sqrt(max(1.0e-12, pc.greenS * max(0.0, centerGreen) + pc.greenO));
+    float greenSigma = sqrt(max(1.0e-12, greenNoiseS() * max(0.0, centerGreen) + greenNoiseO()));
 
     // SPECTRA Context Fusion: classify local structure in units of the physical
     // noise model, not in raw gradient units. In VST space one sensel has unit
@@ -811,11 +569,11 @@ void pass1Pixel() {
     float greenUp = greenGuideAt(x, y - 2);
     float greenDown = greenGuideAt(x, y + 2);
     float greenHorizontalSigma = sqrt(max(1.0e-12,
-            pc.greenS * max(0.0, greenLeft) + pc.greenO +
-            pc.greenS * max(0.0, greenRight) + pc.greenO));
+            greenNoiseS() * max(0.0, greenLeft) + greenNoiseO() +
+            greenNoiseS() * max(0.0, greenRight) + greenNoiseO()));
     float greenVerticalSigma = sqrt(max(1.0e-12,
-            pc.greenS * max(0.0, greenUp) + pc.greenO +
-            pc.greenS * max(0.0, greenDown) + pc.greenO));
+            greenNoiseS() * max(0.0, greenUp) + greenNoiseO() +
+            greenNoiseS() * max(0.0, greenDown) + greenNoiseO()));
     float greenStructureZ = max(
             abs(greenLeft - greenRight) / max(1.0e-6, greenHorizontalSigma),
             abs(greenUp - greenDown) / max(1.0e-6, greenVerticalSigma));
@@ -837,11 +595,11 @@ void pass1Pixel() {
     float coarseGreenUp = greenGuideAt(x, y - 4);
     float coarseGreenDown = greenGuideAt(x, y + 4);
     float coarseGreenHorizontalSigma = sqrt(max(1.0e-12,
-            pc.greenS * max(0.0, coarseGreenLeft) + pc.greenO +
-            pc.greenS * max(0.0, coarseGreenRight) + pc.greenO));
+            greenNoiseS() * max(0.0, coarseGreenLeft) + greenNoiseO() +
+            greenNoiseS() * max(0.0, coarseGreenRight) + greenNoiseO()));
     float coarseGreenVerticalSigma = sqrt(max(1.0e-12,
-            pc.greenS * max(0.0, coarseGreenUp) + pc.greenO +
-            pc.greenS * max(0.0, coarseGreenDown) + pc.greenO));
+            greenNoiseS() * max(0.0, coarseGreenUp) + greenNoiseO() +
+            greenNoiseS() * max(0.0, coarseGreenDown) + greenNoiseO()));
     float coarseGreenStructureZ = max(
             abs(coarseGreenLeft - coarseGreenRight) / max(1.0e-6, coarseGreenHorizontalSigma),
             abs(coarseGreenUp - coarseGreenDown) / max(1.0e-6, coarseGreenVerticalSigma));
@@ -916,30 +674,15 @@ void pass1Pixel() {
                 residualConsensus.coarseWeight * coarseRing.target;
         target = mix(target, contextualTarget,
                      clamp(residualConsensus.contextMix * surfaceClass.contextMixScale, 0.0, 0.62));
-
-        ProfiledMultibandDecision profiled = resolveProfiledMultiband(
-                center, localMean, midRing.target, coarseRing.target,
-                flatContext, multiscaleContext.edgeProtection,
-                surfaceClass, tensor, pc.combinedNoisePressure, pc.modelConfidence);
-        target = mix(target, profiled.target, profiled.mixWeight);
-        if (profiled.mixWeight > 0.05) atomicAdd(telemetry[84], 1u);
-        if (profiled.retainedFineRatio < 0.50) atomicAdd(telemetry[85], 1u);
-        if (profiled.coherentDetailGain > 1.01) atomicAdd(telemetry[86], 1u);
-    }
-
-    ProfiledPatchConsensusDecision patchConsensus = resolveProfiledPatchConsensus(
-            x, y, S, O, center, flatContext, multiscaleContext.edgeProtection,
-            surfaceClass, pc.combinedNoisePressure, pc.modelConfidence);
-    if (patchConsensus.valid) {
-        target = mix(target, patchConsensus.target, patchConsensus.mixWeight);
-        atomicAdd(telemetry[87], 1u);
-        if (patchConsensus.mixWeight >= 0.50) atomicAdd(telemetry[88], 1u);
-        if (patchConsensus.posteriorRetainedRatio <= 0.25) atomicAdd(telemetry[89], 1u);
-        if (patchConsensus.gradientGuard <= 0.35) atomicAdd(telemetry[90], 1u);
     }
 
     float edgeProtection = multiscaleContext.edgeProtection;
     float authorityScale = finalAuthorityScale(tensor, edgeProtection);
+
+    // P2 domain contract: Pass1 executes before lens-shading multiplication, so S/O and
+    // VST sigma remain in the unshaded sensor domain. Lens gain may only anticipate
+    // downstream visibility by modulating bounded denoise authority; it must NOT multiply
+    // S/O variance here. Downstream provenance separately applies Var(g*x)=g^2 Var(x).
     float lensGain = lensGainAt(ch, x, y);
     float shadingAuthority = clamp(0.90 + 0.20 * (lensGain - 1.0), 0.90, 1.38);
     float isolatedNoiseEvidence = smoothstepSpectra(0.55, 2.75, impulseScore) * flatContext;
@@ -961,8 +704,15 @@ void pass1Pixel() {
     float localSigma = sqrt(max(1.0e-12, S * max(0.0, samples[0]) + O));
     float edgeShiftGuard = tensor.confident ? clamp(0.82 + 0.18 * tensor.confidence, 0.82, 1.0) : 1.0;
     float contextShiftGuard = mix(1.12, 0.78, edgeProtection);
-    float maxLinearShift = clamp((1.25 + 1.85 * pc.isoAuthority) * localSigma * shadingAuthority *
-                                 edgeShiftGuard * contextShiftGuard, 1.0e-5, 0.028);
+    float modelLinearShift = clamp((1.25 + 1.85 * pc.isoAuthority) * localSigma * shadingAuthority *
+                                   edgeShiftGuard * contextShiftGuard, 1.0e-5, 0.028);
+    // P1 physical single-frame authority: the policy already computes a global linear-domain
+    // safety cap from calibrated S/O pressure. Apply it only to the physical baseline so
+    // SPECTRA Auto/Manual retain their established GPU envelope.
+    float policyLinearShift = pc.physicalBaselineMode != 0u
+            ? clamp(pc.maxLinearShift, 1.0e-5, 0.028)
+            : 0.028;
+    float maxLinearShift = min(modelLinearShift, policyLinearShift);
     float appliedDelta = clamp(candidate - samples[0], -maxLinearShift, maxLinearShift);
     candidateMosaic[index] = samples[0] + appliedDelta;
     atomicAdd(telemetry[0], 1u);

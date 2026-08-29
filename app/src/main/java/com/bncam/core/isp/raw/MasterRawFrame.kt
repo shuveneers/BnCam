@@ -35,6 +35,7 @@ class MasterRawFrame(
     override val dngMergeStats: String,
     override val finalCalibration: FinalSensorCalibration? = null,
     override val rawFrameInfo: RawFrameInfo,
+    override val knownHotPixelMap: RawMappedHotPixelMap = RawMappedHotPixelMap.EMPTY,
     override val demosaicAfHints: DemosaicAfHints = DemosaicAfHints(),
     override val phoneAssistanceSensorsEnabled: Boolean = false,
     override val colorSensorReading: com.bncam.core.model.ColorSensorReading = com.bncam.core.model.ColorSensorReading(),
@@ -162,6 +163,7 @@ class MasterRawFrame(
             "DNG Path Receives RawDomainInfo" to "true",
             "Final JPEG Rotation" to orientationDegrees.toString(),
             "Master Raw16 Bytes" to raw16ByteCount.toString(),
+            "Known Hot Pixel Map" to knownHotPixelMap.debugSummary(),
             "DNG Merge Stats" to dngMergeStats
         )
 
@@ -299,6 +301,18 @@ object RawMasterBuilder {
                 dngMergeStats = dngMergeStats
             )
             val payloadBlackLevels = rawDomainContract.payloadBlackLevelsIntArray()
+            val hotPixelMap = RawHotPixelMapMapper.fromCamera2(
+                points = runCatching {
+                    captureResult?.get(CaptureResult.STATISTICS_HOT_PIXEL_MAP)
+                }.getOrNull(),
+                characteristics = characteristics,
+                sourceWidth = width,
+                sourceHeight = height,
+                sourceCropLeft = nativeRaw16Buffer.sourceCropLeft,
+                sourceCropTop = nativeRaw16Buffer.sourceCropTop,
+                outputWidth = outputWidth,
+                outputHeight = outputHeight
+            )
 
             MasterRawFrame(
                 lensId = lensId,
@@ -327,6 +341,7 @@ object RawMasterBuilder {
                 dngMergeStats = dngMergeStats,
                 finalCalibration = spectraCalibration,
                 rawFrameInfo = rawDomainContract,
+                knownHotPixelMap = hotPixelMap,
                 demosaicAfHints = demosaicAfHints,
                 phoneAssistanceSensorsEnabled = phoneAssistanceSensorsEnabled,
                 colorSensorReading = colorSensorReading,

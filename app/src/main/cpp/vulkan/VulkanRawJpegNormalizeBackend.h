@@ -11,8 +11,9 @@
 
 namespace bncam::vulkan {
 
-// Phase 13 resident equivalent of RawDomain::normalizeRawForJpeg().
-// Input is canonical, tightly packed RAW16 code values already owned by Vulkan.
+// P0 resident RAW entry:
+// canonical RAW16 -> metadata-authoritative black normalization -> defect-corrected float Bayer.
+// The output generation is consumed directly by the pre-demosaic resident ISP.
 struct RawJpegNormalizeRequest {
     VkBuffer canonicalRawBuffer = VK_NULL_HANDLE;
     std::uint64_t canonicalRawBytes = 0u;
@@ -24,8 +25,21 @@ struct RawJpegNormalizeRequest {
     std::uint32_t height = 0u;
     std::uint32_t cfaOffsetX = 0u;
     std::uint32_t cfaOffsetY = 0u;
+    std::uint32_t sensorCfaPattern = 0u;
     float whiteLevel = 1.0f;
+    // Mosaic-site order [00,10,01,11] in master RAW16 units.
     std::array<float, 4> blackLevels{0.0f, 0.0f, 0.0f, 0.0f};
+
+    // Canonical BnCam order [R, Gr, Gb, B] in normalized RAW units.
+    bool noiseModelValid = false;
+    std::array<float, 4> effectiveS{0.0f, 0.0f, 0.0f, 0.0f};
+    std::array<float, 4> effectiveO{0.0f, 0.0f, 0.0f, 0.0f};
+
+    // Sparse, already crop-adjusted output coordinates [x0,y0,x1,y1,...].
+    // These are high-confidence Camera2 STATISTICS_HOT_PIXEL_MAP coordinates.
+    const std::int32_t* knownDefectCoordinates = nullptr;
+    std::uint32_t knownDefectCount = 0u;
+
     std::uint64_t generationId = 0u;
 };
 
@@ -37,6 +51,17 @@ struct RawJpegNormalizeResult {
     std::uint64_t residentOutputGeneration = 0u;
     std::uint64_t fullFrameCpuUploadBytes = 0u;
     std::uint64_t fullFrameGpuReadbackBytes = 0u;
+
+    bool noiseAdaptiveDefectDetectionEnabled = false;
+    bool knownDefectMapApplied = false;
+    std::uint64_t knownDefectMapPointCount = 0u;
+    std::uint64_t knownDefectCorrectedPixelCount = 0u;
+    std::uint64_t residualDefectCorrectedPixelCount = 0u;
+    std::uint64_t knownDefectBorderSkipCount = 0u;
+    std::uint64_t knownDefectInvalidCoordinateCount = 0u;
+    std::uint64_t sparseMetadataUploadBytes = 0u;
+    float sparseMetadataUploadMs = 0.0f;
+
     float gpuKernelWallMs = 0.0f;
     float gpuSynchronizationMs = 0.0f;
     std::uint32_t commandBufferAllocations = 0u;
@@ -73,6 +98,7 @@ private:
     struct PersistentBuffer {
         VkBuffer buffer = VK_NULL_HANDLE;
         VmaAllocation allocation = nullptr;
+        void* mapped = nullptr;
         std::uint64_t capacityBytes = 0u;
     };
 
@@ -80,6 +106,12 @@ private:
     bool ensureBufferLocked(
             VmaAllocator allocator,
             std::uint64_t bytes,
+            PersistentBuffer& target,
+            std::string& failureReason) noexcept;
+    bool ensureMappedBufferLocked(
+            VmaAllocator allocator,
+            std::uint64_t bytes,
+            std::uint32_t hostAccess,
             PersistentBuffer& target,
             std::string& failureReason) noexcept;
     void destroyBufferLocked(PersistentBuffer& buffer) noexcept;
@@ -111,8 +143,14 @@ private:
     VkDeviceSize boundInputRange_ = 0u;
     VkBuffer boundOutputBuffer_ = VK_NULL_HANDLE;
     VkDeviceSize boundOutputRange_ = 0u;
+    VkBuffer boundCoordinatesBuffer_ = VK_NULL_HANDLE;
+    VkDeviceSize boundCoordinatesRange_ = 0u;
+    VkBuffer boundTelemetryBuffer_ = VK_NULL_HANDLE;
+    VkDeviceSize boundTelemetryRange_ = 0u;
 
     PersistentBuffer output_{};
+    PersistentBuffer coordinates_{};
+    PersistentBuffer telemetry_{};
     std::uint64_t residentOutputGeneration_ = 0u;
     std::uint64_t residentOutputBytes_ = 0u;
     std::uint32_t residentOutputWidth_ = 0u;

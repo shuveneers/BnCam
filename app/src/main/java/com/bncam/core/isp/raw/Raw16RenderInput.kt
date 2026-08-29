@@ -39,6 +39,8 @@ interface Raw16RenderInput : AutoCloseable {
     val dngMergeStats: String
     val finalCalibration: FinalSensorCalibration?
     val rawFrameInfo: RawFrameInfo
+    /** Exact selected-frame Camera2 defect map transformed into cropped RAW16 coordinates. */
+    val knownHotPixelMap: RawMappedHotPixelMap get() = RawMappedHotPixelMap.EMPTY
     val demosaicAfHints: DemosaicAfHints get() = DemosaicAfHints()
     val phoneAssistanceSensorsEnabled: Boolean get() = false
     val colorSensorReading: com.bncam.core.model.ColorSensorReading get() = com.bncam.core.model.ColorSensorReading()
@@ -67,6 +69,7 @@ class SingleRaw16Frame(
     override val dngMergeStats: String,
     override val finalCalibration: FinalSensorCalibration?,
     override val rawFrameInfo: RawFrameInfo,
+    override val knownHotPixelMap: RawMappedHotPixelMap = RawMappedHotPixelMap.EMPTY,
     override val demosaicAfHints: DemosaicAfHints = DemosaicAfHints(),
     override val phoneAssistanceSensorsEnabled: Boolean = false,
     override val colorSensorReading: com.bncam.core.model.ColorSensorReading = com.bncam.core.model.ColorSensorReading(),
@@ -158,6 +161,18 @@ object SingleRaw16FrameBuilder {
                 qualityConfig = qualityConfig,
                 dngMergeStats = stats
             )
+            val hotPixelMap = RawHotPixelMapMapper.fromCamera2(
+                points = runCatching {
+                    captureResult?.get(CaptureResult.STATISTICS_HOT_PIXEL_MAP)
+                }.getOrNull(),
+                characteristics = characteristics,
+                sourceWidth = width,
+                sourceHeight = height,
+                sourceCropLeft = nativeRaw16Buffer.sourceCropLeft,
+                sourceCropTop = nativeRaw16Buffer.sourceCropTop,
+                outputWidth = outputWidth,
+                outputHeight = outputHeight
+            )
             SingleRaw16Frame(
                 lensId = lensId,
                 source = if (sourceFormat == ImageFormat.RAW10) RawInputSource.RAW10 else RawInputSource.RAW_SENSOR,
@@ -171,6 +186,7 @@ object SingleRaw16FrameBuilder {
                 dngMergeStats = stats,
                 finalCalibration = spectraCalibration,
                 rawFrameInfo = finalContract,
+                knownHotPixelMap = hotPixelMap,
                 demosaicAfHints = demosaicAfHints,
                 phoneAssistanceSensorsEnabled = phoneAssistanceSensorsEnabled,
                 colorSensorReading = colorSensorReading,

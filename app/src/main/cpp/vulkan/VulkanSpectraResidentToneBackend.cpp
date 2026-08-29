@@ -781,10 +781,16 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
                 std::clamp(request.fllfMaxCompressEv, 0.0f, 0.70f),
                 std::clamp(request.fllfEdgeStopEv, 0.40f, 0.90f),
                 std::clamp(request.fllfRefinement, 0.0f, 0.22f)};
+        const float fllfShadowLiftNoiseGuardPressure = std::clamp(
+                request.fllfShadowLiftNoiseGuardPressure, 0.0f, 1.0f);
         std::uint32_t fllfBits[6]{};
         std::memcpy(fllfBits, fllfValues, sizeof(fllfBits));
         vkCmdUpdateBuffer(commandBuffer_, telemetry_.buffer,
                           8u * sizeof(std::uint32_t), sizeof(fllfBits), fllfBits);
+        vkCmdUpdateBuffer(commandBuffer_, telemetry_.buffer,
+                          19u * sizeof(std::uint32_t),
+                          sizeof(fllfShadowLiftNoiseGuardPressure),
+                          &fllfShadowLiftNoiseGuardPressure);
     }
     VkBufferMemoryBarrier telemetryReady{};
     telemetryReady.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
@@ -1184,6 +1190,8 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
             : 0.0f;
     std::uint32_t fllfMaxBits = telemetry[17];
     std::memcpy(&result.fllfMaxAbsCorrectionEv, &fllfMaxBits, sizeof(float));
+    result.fllfShadowLiftNoiseGuardPressure = std::clamp(
+            request.fllfShadowLiftNoiseGuardPressure, 0.0f, 1.0f);
     result.fllfApplied = fllfRequested && result.fllfAdjustedPixels > 0u;
     if (ultraHdrRequested) {
         constexpr float kMeaningfulGainLog2 = 0.111031312f; // log2(1.08)

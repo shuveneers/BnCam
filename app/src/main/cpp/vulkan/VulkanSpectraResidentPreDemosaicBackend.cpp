@@ -57,8 +57,8 @@ struct alignas(16) PushConstants {
     float blendStrength = 0.0f;
     float maxPixelShift = 0.0f;
     float isoAuthority = 0.0f;
-    float greenS = 0.0f;
-    float greenO = 0.0f;
+    float maxLinearShift = 0.028f;
+    std::uint32_t physicalBaselineMode = 0u;
     float modelConfidence = 0.0f;
     std::uint32_t observationOffset = 0;
     float combinedNoisePressure = 0.0f;
@@ -836,8 +836,10 @@ SpectraResidentPreDemosaicResult VulkanSpectraResidentPreDemosaicBackend::execut
     push.blendStrength = request.blendStrength;
     push.maxPixelShift = request.maxPixelShift;
     push.isoAuthority = request.isoAuthority;
-    push.greenS = request.greenS;
-    push.greenO = request.greenO;
+    push.maxLinearShift = std::clamp(
+            std::isfinite(request.maxLinearShift) ? request.maxLinearShift : 0.028f,
+            1.0e-5f, 0.028f);
+    push.physicalBaselineMode = request.physicalBaselineMode ? 1u : 0u;
     push.modelConfidence = request.modelConfidence;
     push.combinedNoisePressure = std::clamp(
             std::isfinite(request.combinedNoisePressure) ? request.combinedNoisePressure : 0.0f,
