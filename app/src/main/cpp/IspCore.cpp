@@ -15751,7 +15751,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             bncam::spectra2::resolvePhysicalPreToneChroma(
                     rawBayerForPreToneChroma,
                     physicalNoiseModelForPreToneChroma,
-                    meta.calibration.spectraProcessingMode != 0,
+                    false,  // FASE 14: common physical baseline; SPECTRA owns residual enhancement only.
                     singleFrameRawDenoise.active
                             ? singleFrameRawDenoise.physicalNoisePressure
                             : 0.0f,
@@ -16670,6 +16670,10 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     const double postToneVarianceRg = std::max(0.0, residualNoiseState.postTone.varianceRG);
     const double postToneVarianceBg = std::max(0.0, residualNoiseState.postTone.varianceBG);
     const double postToneVarianceY = std::max(0.0, residualNoiseState.postTone.varianceY);
+    // FASE 14 residual planning freezes here, before optional Phase 12 perceptual detail.
+    // Intentional profile sharpness must not be reclassified as sensor residual noise.
+    const float phase14PostToneResidualModelConfidence = static_cast<float>(
+            residualNoiseState.postTone.confidence);
     const double postColourVarianceY =
             std::max(0.0, residualNoiseState.postColourTransform.varianceY);
     const double postLinearDetailVarianceY =
@@ -17065,16 +17069,27 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                     uiConfig.noiseModelCalibrationFactor,
                     meta.calibration.signalModelConfidence);
     const float baseChromaNrStrength = physicalChromaBasePlan.baseStrength;
-    // SPECTRA is ISO-adaptive from the actual capture metadata. The legacy
-    // manual ISO field remains transport-compatible for older profiles/YUV,
-    // but it no longer substitutes the RAW SPECTRA reference ISO.
-    const float lensIsoNrReference = static_cast<float>(std::max(actualIso, 0));
-    // The S/O model is already the primary physical authority. Keep this multiplier as a
-    // compatibility telemetry value only; multiplying by it here would count the same model twice.
-    const float noiseModelMultiplier = 1.0f + physicalChromaBasePlan.combinedNoisePressure;
+    const bool spectraNoiseActive = meta.calibration.spectraProcessingMode != 0;
+    // FASE 14: the early physical CFA stages have already spent part of the sensor-noise budget.
+    // Carry only their measured residual headroom into the late blend instead of preserving the
+    // original S/O strength a second time. Floors keep the proven edge-aware residual cleanup.
+    const float residualLumaStrengthScale = std::clamp(
+            1.0f - 0.35f * physicalPreDemosaicLumaReduction, 0.72f, 1.0f);
+    const float residualChromaStrengthScale = std::clamp(
+            1.0f - 0.45f * physicalPreDemosaicChromaReduction, 0.65f, 1.0f);
 
-    // 1. Identify true physical noise baseline (before Dynamic ISO)
-    const float physicalNoiseBaseline = baseChromaNrStrength;
+    // The physical late baseline is S/O-driven. The legacy ISO reference remains telemetry-only;
+    // Dynamic ISO is an opt-in SPECTRA residual control and must be exact identity while
+    // SPECTRA is Off. It never substitutes capture ISO for residual-noise truth.
+    const float lensIsoNrReference = static_cast<float>(std::max(actualIso, 0));
+    const float residualPhysicalNoisePressure = std::clamp(
+            physicalChromaBasePlan.combinedNoisePressure * residualLumaStrengthScale,
+            0.0f,
+            1.0f);
+    const float noiseModelMultiplier = 1.0f + residualPhysicalNoisePressure;
+
+    // 1. Physical late baseline owns only the measured residual after the early physical pass.
+    const float physicalNoiseBaseline = baseChromaNrStrength * residualChromaStrengthScale;
 
     // 2. One normalized-sensor ceiling for RAW10 and RAW_SENSOR. Phase-2 established that
     // both sources enter this stage in the same normalized physical domain.
@@ -17083,9 +17098,8 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     const float clampedBaseline = std::clamp(physicalNoiseBaseline, minimumDenoiseStrength, maximumDenoiseCeiling);
     const float availableHeadroom = std::max(0.0f, maximumDenoiseCeiling - clampedBaseline);
 
-    // 3. Dynamic ISO is a modifier of measured physical noise truth, not an ISO estimator.
-    // The actual ISO remains capture-context telemetry only. If S/O predicts little noise,
-    // a high metadata ISO may not manufacture denoise authority by itself.
+    // 3. Dynamic ISO is optional SPECTRA residual authority, not a physical noise estimator.
+    // Off = physical residual baseline only. On = baseline + budgeted adaptive headroom.
     const float referenceFrameIso = std::max(1.0f, lensIsoNrReference);
     const float noiseTruthActivation = physicalChromaBasePlan.modelDriven
             ? std::clamp(physicalChromaBasePlan.combinedNoisePressure, 0.0f, 1.0f)
@@ -17093,10 +17107,12 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     const float configuredDynamicIsoCoeff = std::clamp(uiConfig.lensDynamicIsoCoeff, 0.0f, 1.0f);
     const float normalizedChromaAuthority = std::clamp(
             uiConfig.effectiveChromaAuthorityStops / 5.0f, 0.0f, 1.0f);
-    const float dynamicBlend = bncam::spectra2::resolveNoiseTruthDynamicHeadroomFraction(
-            configuredDynamicIsoCoeff,
-            noiseTruthActivation,
-            uiConfig.effectiveChromaAuthorityStops);
+    const float dynamicBlend = spectraNoiseActive
+            ? bncam::spectra2::resolveNoiseTruthDynamicHeadroomFraction(
+                    configuredDynamicIsoCoeff,
+                    noiseTruthActivation,
+                    uiConfig.effectiveChromaAuthorityStops)
+            : 0.0f;
     const float requestedAdditionalStrength = availableHeadroom * dynamicBlend;
 
     const float finalChromaNrStrengthBeforeClamp = clampedBaseline + requestedAdditionalStrength;
@@ -17215,7 +17231,6 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                     uiConfig.profileNrColor,
                     uiConfig.profileNrColorDetail,
                     uiConfig.profileNrColorSmoothness);
-    const bool spectraNoiseActive = meta.calibration.spectraProcessingMode != 0;
     // Phase 11 owns RAW capture detail in scene-linear RGB. The former post-tone resident/8-bit
     // sharpener is retired from production so Phase 11 is never stacked with a second edge boost.
     const float residentLegacySharpenAmount = 0.0f;
@@ -17228,8 +17243,6 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     // leaving RAW10/RAW_SENSOR chroma noise unprocessed despite a valid physical model.
     const bool physicalChromaNoiseRequested =
             meta.calibration.noiseModelMode != 0 && chromaNrStrength > 0.005f;
-    const bool isNoiseModelActive = spectraNoiseActive || profileNoiseReductionRequested ||
-            physicalChromaNoiseRequested;
 
     float requestedLumaSigma = 0.0f;
     float requestedChromaSigma = 0.0f;
@@ -17239,42 +17252,45 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
 
     const bool physicalNoiseModelAvailable = meta.calibration.noiseModelMode != 0 &&
             meta.calibration.hasNoiseProfile && meta.calibration.noiseProfileApplied;
-    const bncam::spectra2::PhysicalBaselineNrPlan physicalBaselineNr =
-            bncam::spectra2::resolvePhysicalBaselineNr(
-                    physicalLumaSigma, physicalChromaSigma,
-                    physicalNoiseModelAvailable, spectraNoiseActive,
-                    physicalRawDenoiseActive ? physicalPreDemosaicLumaReduction : 0.0f,
-                    physicalRawDenoiseActive ? physicalPreDemosaicChromaReduction : 0.0f,
-                    galoshPreToneChromaPlan.finalStrength);
+
+    // FASE 14 SPECTRA V2: late spatial NR consumes the residual covariance in its own
+    // post-tone input domain. Never recreate that sigma from the original sensor S/O here.
+    const float phase14ResidualLumaSigma = static_cast<float>(std::sqrt(postToneVarianceY));
+    const float phase14ResidualChromaSigma = static_cast<float>(std::sqrt(std::max(
+            postToneVarianceRg, postToneVarianceBg)));
+    const bncam::spectra2::PostDemosaicResidualNrPlan spectraResidualNr =
+            bncam::spectra2::resolvePostDemosaicResidualNr(
+                    phase14ResidualLumaSigma,
+                    phase14ResidualChromaSigma,
+                    phase14PostToneResidualModelConfidence,
+                    uiConfig.profileSpectraStrength,
+                    uiConfig.profileSpectraLuma,
+                    uiConfig.profileSpectraChroma,
+                    budgetState.downstreamLumaAuthority,
+                    budgetState.downstreamChromaAuthority,
+                    physicalNoiseModelAvailable,
+                    spectraNoiseActive);
+
+    const bool isNoiseModelActive = spectraResidualNr.active ||
+            profileNoiseReductionRequested || physicalChromaNoiseRequested;
     // Visible opponent-chroma cleanup is part of the physical baseline ISP whenever Camera2
-    // supplied a usable noise model. SPECTRA may add authority, but switching SPECTRA Off must
-    // never bypass protection against WB/CCM-amplified residual chroma noise.
+    // supplied a usable noise model. SPECTRA only adds residual/coarse-guide authority.
     const bool physicalVisibleChromaRequested =
             physicalNoiseModelAvailable && physicalChromaNoiseRequested;
     const bool visibleChromaProcessingEnabled =
             spectraNoiseActive || physicalVisibleChromaRequested;
 
-    const bncam::spectra2::PostDemosaicResidualNrPlan spectraResidualNr =
-            bncam::spectra2::resolvePostDemosaicResidualNr(
-                    physicalLumaSigma, physicalChromaSigma,
-                    uiConfig.noiseModelCalibrationFactor,
-                    uiConfig.profileSpectraStrength,
-                    uiConfig.profileSpectraLuma,
-                    uiConfig.profileSpectraChroma,
-                    spectraNoiseActive);
-
     if (isNoiseModelActive) {
-        // Dynamic ISO already shapes the CFA-domain SPECTRA authority. Do not apply the
-        // exponential lumaUserScale/chromaUserScale a second time here: this RGB stage is
-        // residual cleanup only, not a second full-strength denoiser.
-        const float spectraLumaSigma = spectraResidualNr.lumaSigma;
-        const float spectraChromaSigma = spectraResidualNr.chromaSigma;
-        const float baseLumaSigma = spectraLumaSigma + physicalBaselineNr.lumaSigma;
-        const float baseChromaSigma = spectraChromaSigma + physicalBaselineNr.chromaSigma;
-        const float creativeLumaSigma = physicalLumaSigma * profileNrPlan.luminance * 1.25f;
-        const float creativeChromaSigma = physicalChromaSigma * profileNrPlan.color * 1.50f;
-        // Quadrature composition prevents a strong SPECTRA/base sigma from being linearly
-        // counted again by Lightroom NR while still allowing Lightroom NR with SPECTRA Off.
+        const float baseLumaSigma = spectraResidualNr.lumaSigma;
+        const float baseChromaSigma = spectraResidualNr.chromaSigma;
+        const float creativeLumaReference = spectraResidualNr.active
+                ? spectraResidualNr.inputLumaSigma : physicalLumaSigma;
+        const float creativeChromaReference = spectraResidualNr.active
+                ? spectraResidualNr.inputChromaSigma : physicalChromaSigma;
+        const float creativeLumaSigma = creativeLumaReference * profileNrPlan.luminance * 1.25f;
+        const float creativeChromaSigma = creativeChromaReference * profileNrPlan.color * 1.50f;
+        // Profile NR is creative residual headroom. Quadrature composition prevents it from
+        // linearly re-counting either the physical baseline or the SPECTRA residual increment.
         requestedLumaSigma = std::hypot(baseLumaSigma, creativeLumaSigma);
         requestedChromaSigma = std::hypot(baseChromaSigma, creativeChromaSigma);
         appliedLumaSigma = std::clamp(requestedLumaSigma, 0.0f, 0.15f);
@@ -17293,7 +17309,9 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     g_threadLocalIspStats.chromaClampReached = (requestedChromaSigma > 0.35f);
 
     const float normalizedChromaAuth = std::clamp(uiConfig.effectiveChromaAuthorityStops / 5.0f, 0.0f, 1.0f);
-    const float effectiveChromaCtrl = configuredDynamicIsoCoeff * normalizedChromaAuth;
+    const float effectiveChromaCtrl = spectraNoiseActive
+            ? configuredDynamicIsoCoeff * normalizedChromaAuth
+            : 0.0f;
     g_threadLocalIspStats.normalizedChromaAuthority = normalizedChromaAuth;
     g_threadLocalIspStats.effectiveChromaControl = effectiveChromaCtrl;
     g_threadLocalIspStats.outerRingAuthority = effectiveOuterRingAuthority;
@@ -17955,12 +17973,12 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                 const float chromaBlendBase = bncam::profile_nr::combineWithResidualHeadroom(
                         chromaNrStrength, profileNrPlan.chromaCreativeBlend, 0.98f);
                 const float chromaUserBoost = spectraNoiseActive
-                        ? 0.0f
-                        : std::clamp(
+                        ? std::clamp(
                                 (uiConfig.chromaUserScale - 1.0f) * 0.12f,
                                 0.0f,
                                 0.45f
-                        ) * budgetState.downstreamChromaAuthority;
+                        ) * budgetState.downstreamChromaAuthority
+                        : 0.0f;
                 const float profileChromaGate = bncam::profile_nr::chromaProfileStructureGate(
                         1.0f - lumaGate, profileNrPlan);
                 const float effectiveChromaBlend = std::clamp(
@@ -17972,7 +17990,9 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
 
                 const float lumaBlendBase = (noiseModelMultiplier > 1.05f)
                         ? (noiseModelMultiplier - 1.0f) * 0.25f : 0.0f;
-                const float lumaUserBoost = configuredDynamicIsoCoeff * 0.55f;
+                const float lumaUserBoost = spectraNoiseActive
+                        ? configuredDynamicIsoCoeff * 0.45f
+                        : 0.0f;
                 const float baseLumaBlend = std::clamp(
                         lumaBlendBase + lumaUserBoost, 0.0f, 0.75f);
                 const float combinedLuma = bncam::profile_nr::combineWithResidualHeadroom(
@@ -19641,13 +19661,26 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; singleFrameRawPass3ColBandingApplied=" << (pass3State.applyColBanding ? "true" : "false")
             << "; singleFrameRawPreDemosaicLumaReduction=" << physicalPreDemosaicLumaReduction
             << "; singleFrameRawPreDemosaicChromaReduction=" << physicalPreDemosaicChromaReduction
-            << "; physicalBaselineNrActive=" << (physicalBaselineNr.active ? "true" : "false")
-            << "; physicalBaselineLumaFraction=" << physicalBaselineNr.lumaFraction
-            << "; physicalBaselineChromaFraction=" << physicalBaselineNr.chromaFraction
-            << "; physicalBaselineUpstreamLumaReduction=" << physicalBaselineNr.upstreamLumaReduction
-            << "; physicalBaselineUpstreamChromaReduction=" << physicalBaselineNr.upstreamChromaReduction
-            << "; physicalBaselineLumaSigma=" << physicalBaselineNr.lumaSigma
-            << "; physicalBaselineChromaSigma=" << physicalBaselineNr.chromaSigma
+            << "; phase14ResidualBudgetActive=" << (spectraResidualNr.active ? "true" : "false")
+            << "; phase14ResidualAuthoritySource=" << spectraResidualNr.authoritySource
+            << "; phase14ResidualCovarianceAuthoritative="
+            << (spectraResidualNr.residualCovarianceAuthoritative ? "true" : "false")
+            << "; phase14DuplicatePhysicalSigmaPrevented="
+            << (spectraResidualNr.duplicatePhysicalSigmaPrevented ? "true" : "false")
+            << "; phase14ResidualInputLumaSigma=" << spectraResidualNr.inputLumaSigma
+            << "; phase14ResidualInputChromaSigma=" << spectraResidualNr.inputChromaSigma
+            << "; phase14ResidualModelConfidence=" << spectraResidualNr.modelConfidence
+            << "; phase14PhysicalBaselineLumaFraction=" << spectraResidualNr.baselineLumaFraction
+            << "; phase14PhysicalBaselineChromaFraction=" << spectraResidualNr.baselineChromaFraction
+            << "; phase14SpectraEnhancementActive="
+            << (spectraResidualNr.spectraEnhancementActive ? "true" : "false")
+            << "; phase14SpectraResidualLumaFraction=" << spectraResidualNr.spectraLumaFraction
+            << "; phase14SpectraResidualChromaFraction=" << spectraResidualNr.spectraChromaFraction
+            << "; phase14ResidualLumaSigma=" << spectraResidualNr.lumaSigma
+            << "; phase14ResidualChromaSigma=" << spectraResidualNr.chromaSigma
+            << "; phase14ResidualLumaStrengthScale=" << residualLumaStrengthScale
+            << "; phase14ResidualChromaStrengthScale=" << residualChromaStrengthScale
+            << "; phase14DynamicIsoSpectraGate=" << (spectraNoiseActive ? "ACTIVE" : "IDENTITY_OFF")
             << "; effectiveLumaSigma=" << g_threadLocalIspStats.effectiveLumaSigma
             << "; effectiveChromaSigma=" << g_threadLocalIspStats.effectiveChromaSigma
             << "; lumaRangeThresholdMin=" << g_threadLocalIspStats.lumaRangeThresholdMin

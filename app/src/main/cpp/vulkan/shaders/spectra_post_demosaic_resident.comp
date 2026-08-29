@@ -590,7 +590,11 @@ void runSpatialNr(uint x, uint localOutputY, uint y) {
     float profileNrColorAmount = clamp(pc.profileNrColor, 0.0, 1.0);
     float profileNrColorDetail = clamp(pc.inverse00, 0.0, 1.0);
 
-    float chromaUserBoost = clamp((pc.chromaUserScale - 1.0) * 0.12, 0.0, 0.45) * pc.downstreamChromaAuthority;
+    // FASE 14: Dynamic-ISO/chroma user scale is SPECTRA residual authority only.
+    // SPECTRA Off must be exact physical-baseline semantics.
+    float spectraResidualGate = pc.spectraNoiseActive != 0u ? 1.0 : 0.0;
+    float chromaUserBoost = spectraResidualGate *
+        clamp((pc.chromaUserScale - 1.0) * 0.12, 0.0, 0.45) * pc.downstreamChromaAuthority;
     float baseChromaBlend = clamp(((max(pc.chromaNrStrength, 0.0) + chromaUserBoost) * chromaUserMult) *
         (1.0 - 0.55 * structureConfidence) * shadowFactor * highlightGate * channelReliability, 0.0, 0.98);
     float profileColorProtection = 0.35 + 0.50 * profileNrColorDetail;
@@ -602,7 +606,7 @@ void runSpatialNr(uint x, uint localOutputY, uint y) {
 
     float lumaBlendBase = pc.noiseModelMultiplier > 1.05
         ? (pc.noiseModelMultiplier - 1.0) * 0.25 : 0.0;
-    float lumaUserBoost = pc.configuredDynamicIsoCoeff * 0.45;
+    float lumaUserBoost = spectraResidualGate * pc.configuredDynamicIsoCoeff * 0.45;
     float baseLumaBlend = clamp(((0.50 + lumaBlendBase + lumaUserBoost) * lumaUserMult) *
         (1.0 - 0.65 * structureConfidence) * shadowFactor * highlightGate *
         pc.downstreamLumaAuthority, 0.0, 0.95);
