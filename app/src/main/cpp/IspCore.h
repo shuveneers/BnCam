@@ -570,6 +570,7 @@ struct SpectraResidualNoiseState {
     bncam::spectra2::NoiseState postDemosaic{};
     bncam::spectra2::NoiseState postAwb{};
     bncam::spectra2::NoiseState postColourTransform{};
+    bncam::spectra2::NoiseState postLinearDetail{};
     bncam::spectra2::NoiseState postTone{};
     bncam::spectra2::NoiseState postVisibleChroma{};
     bncam::spectra2::NoiseState postQuantization{};
@@ -620,7 +621,7 @@ struct SpectraResidualNoiseState {
     float measuredPostIspVarianceBG = 0.0f;
     float measuredPostIspCovarianceRgBg = 0.0f;
     int measuredPostIspSampleCount = 0;
-    std::string measuredPostIspStage = "FINAL_JPEG_PRE_ENCODE_AFTER_SHARPEN";
+    std::string measuredPostIspStage = "FINAL_JPEG_PRE_ENCODE_POST_QUANTIZATION_IDENTITY";
     std::string measuredPostIspMethod = "CROSS_5_HIGH_PASS_ENERGY_DIVIDED_BY_1_25";
     std::string measuredPostIspStatus =
             "CONTROLLED_SCENE_PROXY_SPATIAL_CORRELATION_AND_TEXTURE_NOT_DECONVOLVED";
@@ -634,6 +635,7 @@ struct SpectraResidualNoiseState {
     float demosaicPropagationMs = 0.0f;
     float awbPropagationMs = 0.0f;
     float colourTransformPropagationMs = 0.0f;
+    float linearDetailPropagationMs = 0.0f;
     float tonePropagationMs = 0.0f;
     float measuredPostDemosaicResidualMs = 0.0f;
     float measuredPostColourTransformResidualMs = 0.0f;

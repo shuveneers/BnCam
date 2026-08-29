@@ -64,7 +64,7 @@ static_assert(sizeof(PushConstants) == 128u, "resident tone push constants misma
 
 [[maybe_unused]] constexpr std::uint32_t kDisplayGridWidth = 32u;
 [[maybe_unused]] constexpr std::uint32_t kDisplayGridHeight = 24u;
-[[maybe_unused]] constexpr std::uint32_t kTelemetryWords = 20u;
+[[maybe_unused]] constexpr std::uint32_t kTelemetryWords = 40u;
 constexpr std::size_t kToneLutFloats = 4096u * 2u;
 
 constexpr std::uint32_t kFllfMaxLevels = 6u;
@@ -311,7 +311,7 @@ bool VulkanSpectraResidentToneBackend::initializeLocked(
     VkQueryPoolCreateInfo qi{};
     qi.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
     qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
-    qi.queryCount = 8u;
+    qi.queryCount = 10u;
     if (vkCreateQueryPool(device, &qi, nullptr, &queryPool_) != VK_SUCCESS) queryPool_ = VK_NULL_HANDLE;
     initialized_ = true;
     initializedDevice_ = device;
@@ -682,6 +682,10 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
     result.localToneRequested = localToneRequested;
     const bool fllfRequested = request.isRawBayer && request.fllfEnabled && request.fllfStrength > 1.0e-4f;
     result.fllfRequested = fllfRequested;
+    const bool linearDetailRequested = request.isRawBayer && request.linearDetailEnabled &&
+            request.linearDetailAuthority > 1.0e-4f && request.linearDetailNoiseSigmaY > 0.0f &&
+            request.linearDetailModelConfidence >= 0.15f;
+    result.linearDetailRequested = linearDetailRequested;
     const FllfPyramidLayout fllfLayout = buildFllfPyramidLayout(
             request.frameWidth, request.frameHeight, request.fllfPyramidLevels);
     const std::uint64_t fllfScalarBytes = fllfLayout.totalFloats * sizeof(float);
@@ -699,7 +703,7 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
         (ultraHdrRequested && !ensureBufferLocked(allocator_, mapPixels * sizeof(float), 0u, ultraHdrGainLog_, reallocated, failure)) ||
         (ultraHdrRequested && !ensureBufferLocked(allocator_, packedBytes, readAccess, ultraHdrGainmapPacked_, reallocated, failure)) ||
         (portraitRequested && !ensureBufferLocked(allocator_, portraitMaskPixels * sizeof(float), writeAccess, portraitMask_, reallocated, failure)) ||
-        (portraitRequested && !ensureBufferLocked(allocator_, rgbBytes, 0u, portraitBlurRgb_, reallocated, failure)) ||
+        ((portraitRequested || linearDetailRequested) && !ensureBufferLocked(allocator_, rgbBytes, 0u, portraitBlurRgb_, reallocated, failure)) ||
         (localToneRequested && !ensureBufferLocked(allocator_, mapPixels * sizeof(float), 0u, localToneBase_, reallocated, failure)) ||
         (fllfRequested && (!ensureBufferLocked(allocator_, std::max<std::uint64_t>(fllfScalarBytes, 16u), 0u, fllfGaussian_, reallocated, failure) ||
                            !ensureBufferLocked(allocator_, std::max<std::uint64_t>(fllfScalarBytes, 16u), 0u, fllfCorrection_, reallocated, failure)))) {
@@ -719,6 +723,7 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
     result.fllfResidentBytes = fllfRequested
             ? fllfGaussian_.capacityBytes + fllfCorrection_.capacityBytes
             : 0u;
+    result.linearDetailScratchBytes = linearDetailRequested ? portraitBlurRgb_.capacityBytes : 0u;
     const auto uploadStart = Clock::now();
     std::memcpy(toneLut_.mapped, request.toneLut, kToneLutFloats * sizeof(float));
     vmaFlushAllocation(allocator_, toneLut_.allocation, 0u, kToneLutFloats * sizeof(float));
@@ -758,10 +763,10 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
     ready[1].size = kToneLutFloats * sizeof(float);
     vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr, 2u, ready, 0u, nullptr);
-    // Reset tone/gainmap/local-adaptation telemetry while preserving Phase-9 scene-observer
-    // tile count [0]. FLLF policy lives in [8..13], output evidence in [14..18].
+    // Reset tone/gainmap/local-adaptation/detail telemetry while preserving Phase-9 scene-observer
+    // tile count [0]. FLLF owns [8..19]; Phase-11 detail policy/evidence owns [20..38].
     vkCmdFillBuffer(commandBuffer_, telemetry_.buffer, sizeof(std::uint32_t),
-                    19u * sizeof(std::uint32_t), 0u);
+                    (kTelemetryWords - 1u) * sizeof(std::uint32_t), 0u);
     if (localToneRequested) {
         const float ltmValues[4] = {
                 std::clamp(request.localToneStrength, 0.0f, 1.0f),
@@ -791,6 +796,24 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
                           19u * sizeof(std::uint32_t),
                           sizeof(fllfShadowLiftNoiseGuardPressure),
                           &fllfShadowLiftNoiseGuardPressure);
+    }
+    if (linearDetailRequested) {
+        const float detailValues[11] = {
+                std::clamp(request.linearDetailAuthority, 0.0f, 0.62f),
+                std::clamp(request.linearDetailRadius, 0.50f, 3.00f),
+                std::clamp(request.linearDetailEmphasis, 0.0f, 1.0f),
+                std::clamp(request.linearDetailMasking, 0.0f, 1.0f),
+                std::max(0.5f, request.linearDetailMinimumResidualSnr),
+                std::max(0.4f, request.linearDetailMinimumGradientSnr),
+                std::clamp(request.linearDetailHardHaloLimit, 0.004f, 0.05f),
+                std::max(1.0e-7f, request.linearDetailNoiseSigmaY),
+                std::clamp(request.linearDetailReferenceSignal, 1.0e-4f, 2.0f),
+                std::clamp(request.linearDetailShotNoiseFraction, 0.0f, 1.0f),
+                std::clamp(request.linearDetailModelConfidence, 0.0f, 1.0f)};
+        std::uint32_t detailBits[11]{};
+        std::memcpy(detailBits, detailValues, sizeof(detailBits));
+        vkCmdUpdateBuffer(commandBuffer_, telemetry_.buffer,
+                          20u * sizeof(std::uint32_t), sizeof(detailBits), detailBits);
     }
     VkBufferMemoryBarrier telemetryReady{};
     telemetryReady.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
@@ -832,6 +855,52 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
     push.portraitTargetTop = request.portraitTargetTop;
     push.portraitTargetRight = request.portraitTargetRight;
     push.portraitTargetBottom = request.portraitTargetBottom;
+
+    if (linearDetailRequested) {
+        if (queryPool_ != VK_NULL_HANDLE) {
+            vkCmdResetQueryPool(commandBuffer_, queryPool_, 8u, 2u);
+            vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 8u);
+        }
+        // Pass 14 reads immutable workingRgb neighbourhoods and writes a proposal into the
+        // existing full-resolution scratch buffer. Pass 15 commits pointwise, so no invocation
+        // observes another invocation's partially sharpened neighbours.
+        push.mode = 14u;
+        vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
+                           0u, sizeof(push), &push);
+        vkCmdDispatch(commandBuffer_, (request.frameWidth + 15u) / 16u,
+                       (request.frameHeight + 15u) / 16u, 1u);
+        VkBufferMemoryBarrier proposalReady{};
+        proposalReady.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        proposalReady.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        proposalReady.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        proposalReady.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        proposalReady.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        proposalReady.buffer = portraitBlurRgb_.buffer;
+        proposalReady.size = static_cast<VkDeviceSize>(rgbBytes);
+        vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u,
+                             0u, nullptr, 1u, &proposalReady, 0u, nullptr);
+
+        push.mode = 15u;
+        vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
+                           0u, sizeof(push), &push);
+        vkCmdDispatch(commandBuffer_, (request.frameWidth + 15u) / 16u,
+                       (request.frameHeight + 15u) / 16u, 1u);
+        VkBufferMemoryBarrier detailCommitted{};
+        detailCommitted.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        detailCommitted.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        detailCommitted.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        detailCommitted.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        detailCommitted.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        detailCommitted.buffer = workingRgb_.buffer;
+        detailCommitted.size = static_cast<VkDeviceSize>(rgbBytes);
+        vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u,
+                             0u, nullptr, 1u, &detailCommitted, 0u, nullptr);
+        if (queryPool_ != VK_NULL_HANDLE) {
+            vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 9u);
+        }
+    }
 
     if (fllfRequested && fllfLayout.levelCount >= 2u) {
         if (queryPool_ != VK_NULL_HANDLE) {
@@ -1176,6 +1245,17 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
             }
         }
     }
+    if (queryPool_ != VK_NULL_HANDLE && linearDetailRequested) {
+        std::uint64_t detailTs[2]{};
+        if (vkGetQueryPoolResults(device, queryPool_, 8u, 2u, sizeof(detailTs), detailTs,
+                                  sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS &&
+            detailTs[1] >= detailTs[0]) {
+            VkPhysicalDeviceProperties props{};
+            vkGetPhysicalDeviceProperties(physicalDevice, &props);
+            const double ms = static_cast<double>(props.limits.timestampPeriod) / 1.0e6;
+            result.linearDetailKernelMs = static_cast<float>((detailTs[1] - detailTs[0]) * ms);
+        }
+    }
     const auto readStart = Clock::now();
     vmaInvalidateAllocation(allocator_, telemetry_.allocation, 0u, kTelemetryWords * sizeof(std::uint32_t));
     const auto* telemetry = static_cast<const std::uint32_t*>(telemetry_.mapped);
@@ -1193,6 +1273,19 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
     result.fllfShadowLiftNoiseGuardPressure = std::clamp(
             request.fllfShadowLiftNoiseGuardPressure, 0.0f, 1.0f);
     result.fllfApplied = fllfRequested && result.fllfAdjustedPixels > 0u;
+    result.linearDetailEvaluatedPixels = telemetry[31];
+    result.linearDetailChangedPixels = telemetry[32];
+    result.linearDetailEdgeSupportedPixels = telemetry[33];
+    result.linearDetailNoiseRejectedPixels = telemetry[34];
+    result.linearDetailHaloClampedPixels = telemetry[35];
+    const std::uint32_t linearDetailCorrectionSamples = telemetry[37];
+    result.linearDetailMeanAbsCorrection = linearDetailCorrectionSamples > 0u
+            ? static_cast<float>(telemetry[36]) /
+                    (65536.0f * static_cast<float>(linearDetailCorrectionSamples))
+            : 0.0f;
+    std::uint32_t linearDetailMaxBits = telemetry[38];
+    std::memcpy(&result.linearDetailMaxAbsCorrection, &linearDetailMaxBits, sizeof(float));
+    result.linearDetailApplied = linearDetailRequested && result.linearDetailChangedPixels > 0u;
     if (ultraHdrRequested) {
         constexpr float kMeaningfulGainLog2 = 0.111031312f; // log2(1.08)
         const float maxLog2Boost = static_cast<float>(telemetry[2]) / 65536.0f;

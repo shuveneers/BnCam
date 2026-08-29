@@ -89,6 +89,21 @@ struct SpectraResidentToneRequest {
     float fllfRefinement = 0.10f;
     float fllfShadowLiftNoiseGuardPressure = 0.0f;
     std::uint32_t fllfPyramidLevels = 6u;
+    // Phase 11: scene-linear capture detail recovery. The physical S/O-derived luma sigma
+    // and shot/read-noise mix are resolved by IspCore; all per-pixel significance, edge and
+    // halo decisions execute on the resident GPU scene before GTM/FLLF/AgX.
+    bool linearDetailEnabled = false;
+    float linearDetailAuthority = 0.0f;
+    float linearDetailRadius = 1.0f;
+    float linearDetailEmphasis = 0.25f;
+    float linearDetailMasking = 0.0f;
+    float linearDetailMinimumResidualSnr = 1.5f;
+    float linearDetailMinimumGradientSnr = 1.0f;
+    float linearDetailHardHaloLimit = 0.02f;
+    float linearDetailNoiseSigmaY = 0.0f;
+    float linearDetailReferenceSignal = 0.10f;
+    float linearDetailShotNoiseFraction = 0.5f;
+    float linearDetailModelConfidence = 0.0f;
     bool isRawBayer = true;
     float profileColorSaturation = 0.0f;
     float profileColorContrast = 0.0f;
@@ -134,6 +149,17 @@ struct SpectraResidentToneResult {
     float fllfPyramidBuildMs = 0.0f;
     float fllfRemapReconstructMs = 0.0f;
     std::uint64_t fllfResidentBytes = 0u;
+    bool linearDetailRequested = false;
+    bool linearDetailApplied = false;
+    std::uint64_t linearDetailEvaluatedPixels = 0u;
+    std::uint64_t linearDetailChangedPixels = 0u;
+    std::uint64_t linearDetailEdgeSupportedPixels = 0u;
+    std::uint64_t linearDetailNoiseRejectedPixels = 0u;
+    std::uint64_t linearDetailHaloClampedPixels = 0u;
+    float linearDetailMeanAbsCorrection = 0.0f;
+    float linearDetailMaxAbsCorrection = 0.0f;
+    float linearDetailKernelMs = 0.0f;
+    std::uint64_t linearDetailScratchBytes = 0u;
     std::vector<float> outputRgb;
     float lutUploadMs = 0.0f;
     float kernelMs = 0.0f;

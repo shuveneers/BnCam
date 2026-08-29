@@ -1060,6 +1060,143 @@ uvec2 ultraHdrOutputToSource(uint x, uint y) {
     return uvec2(x, y);
 }
 
+
+// Phase 11 — scene-linear capture detail recovery.
+// A bounded one-step Van-Cittert inverse-PSF proposal is formed from immutable workingRgb and
+// written to the existing full-resolution scratch buffer (binding 9). A second pointwise pass
+// commits the proposal, so neighborhood reads never race in-place. The stage is luminance-only
+// in authority: RGB is scaled by one scalar to preserve hue/demosaic character.
+vec3 linearDetailScratchAt(int x, int y) {
+    int sx = clamp(x, 0, int(pc.frameWidth) - 1);
+    int sy = clamp(y, 0, int(pc.frameHeight) - 1);
+    uint base = (uint(sy) * pc.frameWidth + uint(sx)) * 3u;
+    return vec3(portraitBlurRgb[base + 0u], portraitBlurRgb[base + 1u], portraitBlurRgb[base + 2u]);
+}
+
+void writeLinearDetailScratch(uvec2 gid, vec3 v) {
+    uint base = (gid.y * pc.frameWidth + gid.x) * 3u;
+    portraitBlurRgb[base + 0u] = v.r;
+    portraitBlurRgb[base + 1u] = v.g;
+    portraitBlurRgb[base + 2u] = v.b;
+}
+
+float linearDetailLocalSigma(float luma) {
+    float sigmaRef = max(telemetryFloat(27u, 0.0), 1.0e-7);
+    float referenceSignal = max(telemetryFloat(28u, 0.10), 1.0e-4);
+    float shotFraction = clamp(telemetryFloat(29u, 0.5), 0.0, 1.0);
+    // S/O: read noise is signal-independent; shot noise scales with local signal. The pre-tone
+    // sigma was already propagated through WB+CCM on CPU, so only the S/O signal dependence is
+    // reconstructed locally here rather than re-applying WB/CCM gains a second time.
+    float signalRatio = clamp(max(luma, 0.0) / referenceSignal, 0.05, 16.0);
+    float varianceScale = (1.0 - shotFraction) + shotFraction * signalRatio;
+    return sigmaRef * sqrt(max(varianceScale, 0.05));
+}
+
+void proposeLinearDetailRecovery(uvec2 gid) {
+    if (gid.x >= pc.frameWidth || gid.y >= pc.frameHeight) return;
+    atomicAdd(telemetry[31], 1u);
+
+    int x = int(gid.x);
+    int y = int(gid.y);
+    vec3 centerRgb = workingAt(x, y);
+    float centerY = max(0.0, lumaOf(centerRgb));
+
+    float authority = clamp(telemetryFloat(20u, 0.0), 0.0, 0.62);
+    float radius = clamp(telemetryFloat(21u, 1.0), 0.50, 3.0);
+    float detailEmphasis = clamp(telemetryFloat(22u, 0.25), 0.0, 1.0);
+    float masking = clamp(telemetryFloat(23u, 0.0), 0.0, 1.0);
+    float minResidualSnr = max(0.5, telemetryFloat(24u, 1.5));
+    float minGradientSnr = max(0.4, telemetryFloat(25u, 1.0));
+    float hardHaloLimit = clamp(telemetryFloat(26u, 0.02), 0.004, 0.05);
+    float modelConfidence = clamp(telemetryFloat(30u, 0.0), 0.0, 1.0);
+
+    float l = lumaOf(workingAt(x - 1, y));
+    float r = lumaOf(workingAt(x + 1, y));
+    float u = lumaOf(workingAt(x, y - 1));
+    float d = lumaOf(workingAt(x, y + 1));
+    float ul = lumaOf(workingAt(x - 1, y - 1));
+    float ur = lumaOf(workingAt(x + 1, y - 1));
+    float dl = lumaOf(workingAt(x - 1, y + 1));
+    float dr = lumaOf(workingAt(x + 1, y + 1));
+
+    float radiusT = clamp((radius - 0.50) / 2.50, 0.0, 1.0);
+    // Compact symmetric PSF. Larger Radius transfers modest weight from centre to neighbours;
+    // no lens-identity constant or device branch is introduced.
+    float axialWeight = mix(0.085, 0.125, radiusT);
+    float diagonalWeight = mix(0.035, 0.060, radiusT);
+    float centerWeight = max(0.05, 1.0 - 4.0 * axialWeight - 4.0 * diagonalWeight);
+    float psfBlur = centerWeight * centerY + axialWeight * (l + r + u + d) +
+            diagonalWeight * (ul + ur + dl + dr);
+
+    // Optional broader optical-radius evidence. It does not become a second sharpening band;
+    // it only refines the single inverse-PSF residual when Radius asks for a wider capture PSF.
+    float broadCross = 0.25 * (lumaOf(workingAt(x - 2, y)) + lumaOf(workingAt(x + 2, y)) +
+                               lumaOf(workingAt(x, y - 2)) + lumaOf(workingAt(x, y + 2)));
+    float broadBlur = mix(psfBlur, 0.58 * psfBlur + 0.42 * broadCross, radiusT * 0.55);
+    float residual = centerY - broadBlur;
+
+    float gx = 0.5 * (r - l);
+    float gy = 0.5 * (d - u);
+    float gradient = sqrt(max(0.0, gx * gx + gy * gy));
+    float localSigma = linearDetailLocalSigma(centerY);
+    float residualSnr = abs(residual) / max(localSigma, 1.0e-7);
+    float gradientSnr = gradient / max(localSigma, 1.0e-7);
+
+    float noiseGate = smoothstep(minResidualSnr, minResidualSnr + 2.25, residualSnr);
+    float edgeGate = smoothstep(minGradientSnr, minGradientSnr + 2.75, gradientSnr);
+    float directionalCoherence = max(abs(gx), abs(gy)) / max(abs(gx) + abs(gy), 1.0e-6);
+    float coherenceGate = mix(0.72, 1.0, smoothstep(0.52, 0.90, directionalCoherence));
+    float maskingGate = mix(1.0, edgeGate, masking);
+    float localAuthority = authority * modelConfidence * noiseGate * edgeGate * coherenceGate * maskingGate;
+
+    if (edgeGate > 0.25 && noiseGate > 0.05) atomicAdd(telemetry[33], 1u);
+    if (noiseGate < 0.05) atomicAdd(telemetry[34], 1u);
+
+    float localMin = min(centerY, min(min(min(l, r), min(u, d)), min(min(ul, ur), min(dl, dr))));
+    float localMax = max(centerY, max(max(max(l, r), max(u, d)), max(max(ul, ur), max(dl, dr))));
+    float localRange = max(0.0, localMax - localMin);
+
+    // Detail control changes the inverse-PSF step, never the noise significance threshold.
+    // Back off only when the scene-linear working value approaches this backend's existing
+    // hard 4.0 storage headroom. This is a domain guard, not an ISO/device highlight heuristic.
+    float highlightHeadroomGate = smoothstep(0.02, 0.18, 4.0 - localMax);
+    float inverseStep = mix(0.82, 1.18, detailEmphasis);
+    float delta = residual * localAuthority * highlightHeadroomGate * inverseStep;
+
+    // Hard ringing/halo envelope: the proposal may move only a small fraction beyond observed
+    // local extrema, and never by more than the global scene-linear cap from policy.
+    float adaptiveHaloLimit = min(hardHaloLimit, 0.16 * localRange + 1.25 * localSigma);
+    float unclampedDelta = delta;
+    delta = clamp(delta, -adaptiveHaloLimit, adaptiveHaloLimit);
+    float proposedY = centerY + delta;
+    float minAllowed = max(0.0, localMin - adaptiveHaloLimit);
+    float maxAllowed = min(4.0, localMax + adaptiveHaloLimit);
+    proposedY = clamp(proposedY, minAllowed, maxAllowed);
+    delta = proposedY - centerY;
+    if (abs(delta - unclampedDelta) > 1.0e-7) atomicAdd(telemetry[35], 1u);
+
+    vec3 proposedRgb = centerRgb;
+    if (centerY > 1.0e-5) {
+        float scale = clamp(proposedY / centerY, 0.78, 1.22);
+        proposedRgb = centerRgb * scale;
+    }
+    proposedRgb = clamp(proposedRgb, vec3(0.0), vec3(4.0));
+    writeLinearDetailScratch(gid, proposedRgb);
+
+    float absCorrection = abs(delta);
+    if (absCorrection > 1.0e-7) atomicAdd(telemetry[32], 1u);
+    if (((gid.x & 3u) == 0u) && ((gid.y & 3u) == 0u)) {
+        atomicAdd(telemetry[36], uint(round(min(absCorrection, 0.999) * 65536.0)));
+        atomicAdd(telemetry[37], 1u);
+    }
+    atomicMax(telemetry[38], floatBitsToUint(absCorrection));
+}
+
+void commitLinearDetailRecovery(uvec2 gid) {
+    if (gid.x >= pc.frameWidth || gid.y >= pc.frameHeight) return;
+    writeWorking(gid, linearDetailScratchAt(int(gid.x), int(gid.y)));
+}
+
 void packUltraHdrGainmap(uvec2 gid) {
     if (gid.x >= pc.ultraHdrPackedWordsPerRow || gid.y >= pc.ultraHdrOutputMapHeight) return;
     float maxLogGain = max(float(telemetry[2]) / 65536.0, 1.0 / 65536.0);
@@ -1111,5 +1248,9 @@ void main() {
         seedFllfCoarseCorrection(gid);
     } else if (pc.mode == 13u) {
         reconstructFllfCorrectionLevel(gid);
+    } else if (pc.mode == 14u) {
+        proposeLinearDetailRecovery(gid);
+    } else if (pc.mode == 15u) {
+        commitLinearDetailRecovery(gid);
     }
 }
