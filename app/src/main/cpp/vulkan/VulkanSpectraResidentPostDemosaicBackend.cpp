@@ -88,6 +88,23 @@ static_assert(sizeof(PushConstants) == 128u,
     out = lhs * rhs;
     return true;
 }
+
+[[maybe_unused]] bool addChecked(std::uint64_t lhs, std::uint64_t rhs, std::uint64_t& out) {
+    if (lhs > std::numeric_limits<std::uint64_t>::max() - rhs) return false;
+    out = lhs + rhs;
+    return true;
+}
+
+[[maybe_unused]] bool packedBgr8RowBytes(std::uint32_t width, std::uint64_t& out) {
+    std::uint64_t rawBytes = 0u;
+    std::uint64_t padded = 0u;
+    if (!multiplyChecked(static_cast<std::uint64_t>(width), 3u, rawBytes) ||
+        !addChecked(rawBytes, 3u, padded)) {
+        return false;
+    }
+    out = (padded / 4u) * 4u;
+    return out >= rawBytes;
+}
 } // namespace
 
 bool VulkanSpectraResidentPostDemosaicBackend::productionKernelConnected() const noexcept {
@@ -459,14 +476,23 @@ VulkanSpectraResidentPostDemosaicBackend::execute(
         return result;
     }
 
-    std::uint64_t rowBytes = 0u;
+    std::uint64_t floatRowBytes = 0u;
     std::uint64_t requiredInputBytes = 0u;
-    if (!multiplyChecked(request.frameWidth, 3u * sizeof(float), rowBytes) ||
-        !multiplyChecked(rowBytes, request.inputRows, requiredInputBytes) ||
-        !multiplyChecked(rowBytes, request.intermediateRows, result.intermediateBytes) ||
-        !multiplyChecked(rowBytes, request.outputRows, result.outputBytes)) {
+    std::uint64_t packedRowBytes = 0u;
+    if (!multiplyChecked(request.frameWidth, 3u * sizeof(float), floatRowBytes) ||
+        !multiplyChecked(floatRowBytes, request.inputRows, requiredInputBytes) ||
+        !multiplyChecked(floatRowBytes, request.intermediateRows, result.intermediateBytes) ||
+        !packedBgr8RowBytes(request.frameWidth, packedRowBytes)) {
         result.status = "RESIDENT_POST_DEMOSAIC_SIZE_OVERFLOW";
-        result.failureReason = "RGB_BUFFER_SIZE_OVERFLOW";
+        result.failureReason = "RGB_OR_BGR8_BUFFER_SIZE_OVERFLOW";
+        result.totalMs = elapsedMs(totalStarted);
+        return result;
+    }
+    result.outputRowStrideBytes = request.packedBgr8Publication
+            ? packedRowBytes : floatRowBytes;
+    if (!multiplyChecked(result.outputRowStrideBytes, request.outputRows, result.outputBytes)) {
+        result.status = "RESIDENT_POST_DEMOSAIC_SIZE_OVERFLOW";
+        result.failureReason = "PUBLICATION_BUFFER_SIZE_OVERFLOW";
         result.totalMs = elapsedMs(totalStarted);
         return result;
     }
@@ -477,6 +503,8 @@ VulkanSpectraResidentPostDemosaicBackend::execute(
         return result;
     }
     result.residentInputUsed = residentInputUsed;
+    result.packedBgr8Published = request.packedBgr8Publication;
+    result.floatOutputFallback = !request.packedBgr8Publication;
     // inputBytes is transfer accounting, not the logical buffer span. A resident handoff uploads 0 bytes.
     result.inputBytes = residentInputUsed ? 0u : requiredInputBytes;
     std::uint64_t spatialElements = 0u;
@@ -698,6 +726,9 @@ VulkanSpectraResidentPostDemosaicBackend::execute(
     push.outerRingAuthority = std::clamp(request.profileDetailMasking, 0.0f, 1.0f);
     push.profileNrColor = 0.0f;
     push.chromaNrStrength = 0.0f;
+    // FASE 15: mode 1 consumes padding2 only as a publication mode switch.
+    // true => exact-LUT packed BGR8/sRGB, false => legacy FP32 publication fallback.
+    push.padding2 = request.packedBgr8Publication ? 1.0f : 0.0f;
     // The visible-chroma pass consumes the strip-local intermediate buffer, not the
     // upstream full-frame resident tone buffer. Restore strip-local addressing before
     // the second dispatch even when mode 0 used a resident full-frame source.
@@ -800,13 +831,21 @@ VulkanSpectraResidentPostDemosaicBackend::execute(
     const bool profileDetailSharpenRequested = request.profileDetailAmount > 1.0e-6f;
     result.legacySharpenApplied = !request.visibleChromaEnabled &&
             (request.legacySharpenAmount > 1.0e-6f || profileDetailSharpenRequested);
-    result.outputSrgbEncoded = result.legacySharpenApplied;
+    // Mode 1 always works in quantized sRGB when visible chroma is disabled. Packed
+    // publication also sRGB-encodes the linear visible-chroma result through the exact LUT.
+    result.outputSrgbEncoded = request.packedBgr8Publication || !request.visibleChromaEnabled;
     result.success = true;
-    result.status = result.legacySharpenApplied
-            ? "SPECTRA_POST_DEMOSAIC_GPU_RESIDENT_LEGACY_SHARPEN_PUBLICATION_READY"
-            : (residentInputUsed
-            ? "SPECTRA_POST_DEMOSAIC_GPU_RESIDENT_TONE_HANDOFF_READY"
-            : "SPECTRA_POST_DEMOSAIC_GPU_RESIDENT_CHAIN_READY");
+    if (request.packedBgr8Publication) {
+        result.status = residentInputUsed
+                ? "SPECTRA_POST_DEMOSAIC_GPU_RESIDENT_TONE_BGR8_PUBLICATION_READY"
+                : "SPECTRA_POST_DEMOSAIC_GPU_RESIDENT_BGR8_PUBLICATION_READY";
+    } else {
+        result.status = result.legacySharpenApplied
+                ? "SPECTRA_POST_DEMOSAIC_GPU_RESIDENT_LEGACY_SHARPEN_PUBLICATION_READY"
+                : (residentInputUsed
+                ? "SPECTRA_POST_DEMOSAIC_GPU_RESIDENT_TONE_HANDOFF_READY"
+                : "SPECTRA_POST_DEMOSAIC_GPU_RESIDENT_CHAIN_READY");
+    }
     result.failureReason = "none";
     result.totalMs = elapsedMs(totalStarted);
     return result;

@@ -5,7 +5,7 @@ layout(std430, set = 0, binding = 0) readonly buffer InputRgbBuffer {
     float inputValues[];
 };
 layout(std430, set = 0, binding = 1) writeonly buffer OutputRgbBuffer {
-    float outputValues[];
+    uint outputWords[];
 };
 layout(std430, set = 0, binding = 2) readonly buffer SpatialNoiseBuffer {
     float spatialSigma[];
@@ -66,6 +66,140 @@ const float spatialNrInnerWeight[25] = float[](
     6.0, 24.0, 36.0, 24.0, 6.0,
     4.0, 16.0, 24.0, 16.0, 4.0,
     1.0, 4.0, 6.0, 4.0, 1.0
+);
+
+// FASE 15: exact 4097-entry sRGB byte LUT generated from SrgbByteLut.h's float contract.
+// Source preflight compares all entries; no runtime pow()/gamma approximation is used here.
+const uint srgbByteLut[4097] = uint[4097](
+    0u, 1u, 2u, 2u, 3u, 4u, 5u, 6u, 6u, 7u, 8u, 9u, 10u, 10u, 11u, 12u, 13u, 13u, 14u, 15u, 15u, 16u, 16u, 17u, 18u, 18u, 19u, 19u, 20u, 20u, 21u, 21u,
+    22u, 22u, 23u, 23u, 23u, 24u, 24u, 25u, 25u, 25u, 26u, 26u, 27u, 27u, 27u, 28u, 28u, 29u, 29u, 29u, 30u, 30u, 30u, 31u, 31u, 31u, 32u, 32u, 32u, 33u, 33u, 33u,
+    34u, 34u, 34u, 34u, 35u, 35u, 35u, 36u, 36u, 36u, 36u, 37u, 37u, 37u, 38u, 38u, 38u, 38u, 39u, 39u, 39u, 40u, 40u, 40u, 40u, 41u, 41u, 41u, 41u, 42u, 42u, 42u,
+    42u, 43u, 43u, 43u, 43u, 43u, 44u, 44u, 44u, 44u, 45u, 45u, 45u, 45u, 46u, 46u, 46u, 46u, 46u, 47u, 47u, 47u, 47u, 48u, 48u, 48u, 48u, 48u, 49u, 49u, 49u, 49u,
+    49u, 50u, 50u, 50u, 50u, 50u, 51u, 51u, 51u, 51u, 51u, 52u, 52u, 52u, 52u, 52u, 53u, 53u, 53u, 53u, 53u, 54u, 54u, 54u, 54u, 54u, 55u, 55u, 55u, 55u, 55u, 55u,
+    56u, 56u, 56u, 56u, 56u, 57u, 57u, 57u, 57u, 57u, 57u, 58u, 58u, 58u, 58u, 58u, 58u, 59u, 59u, 59u, 59u, 59u, 59u, 60u, 60u, 60u, 60u, 60u, 60u, 61u, 61u, 61u,
+    61u, 61u, 61u, 62u, 62u, 62u, 62u, 62u, 62u, 63u, 63u, 63u, 63u, 63u, 63u, 64u, 64u, 64u, 64u, 64u, 64u, 64u, 65u, 65u, 65u, 65u, 65u, 65u, 66u, 66u, 66u, 66u,
+    66u, 66u, 66u, 67u, 67u, 67u, 67u, 67u, 67u, 67u, 68u, 68u, 68u, 68u, 68u, 68u, 68u, 69u, 69u, 69u, 69u, 69u, 69u, 69u, 70u, 70u, 70u, 70u, 70u, 70u, 70u, 71u,
+    71u, 71u, 71u, 71u, 71u, 71u, 72u, 72u, 72u, 72u, 72u, 72u, 72u, 72u, 73u, 73u, 73u, 73u, 73u, 73u, 73u, 74u, 74u, 74u, 74u, 74u, 74u, 74u, 74u, 75u, 75u, 75u,
+    75u, 75u, 75u, 75u, 75u, 76u, 76u, 76u, 76u, 76u, 76u, 76u, 77u, 77u, 77u, 77u, 77u, 77u, 77u, 77u, 77u, 78u, 78u, 78u, 78u, 78u, 78u, 78u, 78u, 79u, 79u, 79u,
+    79u, 79u, 79u, 79u, 79u, 80u, 80u, 80u, 80u, 80u, 80u, 80u, 80u, 81u, 81u, 81u, 81u, 81u, 81u, 81u, 81u, 81u, 82u, 82u, 82u, 82u, 82u, 82u, 82u, 82u, 83u, 83u,
+    83u, 83u, 83u, 83u, 83u, 83u, 83u, 84u, 84u, 84u, 84u, 84u, 84u, 84u, 84u, 84u, 85u, 85u, 85u, 85u, 85u, 85u, 85u, 85u, 85u, 86u, 86u, 86u, 86u, 86u, 86u, 86u,
+    86u, 86u, 87u, 87u, 87u, 87u, 87u, 87u, 87u, 87u, 87u, 87u, 88u, 88u, 88u, 88u, 88u, 88u, 88u, 88u, 88u, 89u, 89u, 89u, 89u, 89u, 89u, 89u, 89u, 89u, 90u, 90u,
+    90u, 90u, 90u, 90u, 90u, 90u, 90u, 90u, 91u, 91u, 91u, 91u, 91u, 91u, 91u, 91u, 91u, 91u, 92u, 92u, 92u, 92u, 92u, 92u, 92u, 92u, 92u, 92u, 93u, 93u, 93u, 93u,
+    93u, 93u, 93u, 93u, 93u, 93u, 94u, 94u, 94u, 94u, 94u, 94u, 94u, 94u, 94u, 94u, 95u, 95u, 95u, 95u, 95u, 95u, 95u, 95u, 95u, 95u, 96u, 96u, 96u, 96u, 96u, 96u,
+    96u, 96u, 96u, 96u, 96u, 97u, 97u, 97u, 97u, 97u, 97u, 97u, 97u, 97u, 97u, 98u, 98u, 98u, 98u, 98u, 98u, 98u, 98u, 98u, 98u, 98u, 99u, 99u, 99u, 99u, 99u, 99u,
+    99u, 99u, 99u, 99u, 99u, 100u, 100u, 100u, 100u, 100u, 100u, 100u, 100u, 100u, 100u, 100u, 101u, 101u, 101u, 101u, 101u, 101u, 101u, 101u, 101u, 101u, 101u, 102u, 102u, 102u, 102u, 102u,
+    102u, 102u, 102u, 102u, 102u, 102u, 103u, 103u, 103u, 103u, 103u, 103u, 103u, 103u, 103u, 103u, 103u, 103u, 104u, 104u, 104u, 104u, 104u, 104u, 104u, 104u, 104u, 104u, 104u, 105u, 105u, 105u,
+    105u, 105u, 105u, 105u, 105u, 105u, 105u, 105u, 105u, 106u, 106u, 106u, 106u, 106u, 106u, 106u, 106u, 106u, 106u, 106u, 106u, 107u, 107u, 107u, 107u, 107u, 107u, 107u, 107u, 107u, 107u, 107u,
+    107u, 108u, 108u, 108u, 108u, 108u, 108u, 108u, 108u, 108u, 108u, 108u, 108u, 109u, 109u, 109u, 109u, 109u, 109u, 109u, 109u, 109u, 109u, 109u, 109u, 110u, 110u, 110u, 110u, 110u, 110u, 110u,
+    110u, 110u, 110u, 110u, 110u, 111u, 111u, 111u, 111u, 111u, 111u, 111u, 111u, 111u, 111u, 111u, 111u, 111u, 112u, 112u, 112u, 112u, 112u, 112u, 112u, 112u, 112u, 112u, 112u, 112u, 112u, 113u,
+    113u, 113u, 113u, 113u, 113u, 113u, 113u, 113u, 113u, 113u, 113u, 114u, 114u, 114u, 114u, 114u, 114u, 114u, 114u, 114u, 114u, 114u, 114u, 114u, 115u, 115u, 115u, 115u, 115u, 115u, 115u, 115u,
+    115u, 115u, 115u, 115u, 115u, 116u, 116u, 116u, 116u, 116u, 116u, 116u, 116u, 116u, 116u, 116u, 116u, 116u, 117u, 117u, 117u, 117u, 117u, 117u, 117u, 117u, 117u, 117u, 117u, 117u, 117u, 117u,
+    118u, 118u, 118u, 118u, 118u, 118u, 118u, 118u, 118u, 118u, 118u, 118u, 118u, 119u, 119u, 119u, 119u, 119u, 119u, 119u, 119u, 119u, 119u, 119u, 119u, 119u, 119u, 120u, 120u, 120u, 120u, 120u,
+    120u, 120u, 120u, 120u, 120u, 120u, 120u, 120u, 120u, 121u, 121u, 121u, 121u, 121u, 121u, 121u, 121u, 121u, 121u, 121u, 121u, 121u, 121u, 122u, 122u, 122u, 122u, 122u, 122u, 122u, 122u, 122u,
+    122u, 122u, 122u, 122u, 122u, 123u, 123u, 123u, 123u, 123u, 123u, 123u, 123u, 123u, 123u, 123u, 123u, 123u, 123u, 124u, 124u, 124u, 124u, 124u, 124u, 124u, 124u, 124u, 124u, 124u, 124u, 124u,
+    124u, 125u, 125u, 125u, 125u, 125u, 125u, 125u, 125u, 125u, 125u, 125u, 125u, 125u, 125u, 125u, 126u, 126u, 126u, 126u, 126u, 126u, 126u, 126u, 126u, 126u, 126u, 126u, 126u, 126u, 127u, 127u,
+    127u, 127u, 127u, 127u, 127u, 127u, 127u, 127u, 127u, 127u, 127u, 127u, 127u, 128u, 128u, 128u, 128u, 128u, 128u, 128u, 128u, 128u, 128u, 128u, 128u, 128u, 128u, 128u, 129u, 129u, 129u, 129u,
+    129u, 129u, 129u, 129u, 129u, 129u, 129u, 129u, 129u, 129u, 129u, 130u, 130u, 130u, 130u, 130u, 130u, 130u, 130u, 130u, 130u, 130u, 130u, 130u, 130u, 130u, 131u, 131u, 131u, 131u, 131u, 131u,
+    131u, 131u, 131u, 131u, 131u, 131u, 131u, 131u, 131u, 131u, 132u, 132u, 132u, 132u, 132u, 132u, 132u, 132u, 132u, 132u, 132u, 132u, 132u, 132u, 132u, 133u, 133u, 133u, 133u, 133u, 133u, 133u,
+    133u, 133u, 133u, 133u, 133u, 133u, 133u, 133u, 133u, 134u, 134u, 134u, 134u, 134u, 134u, 134u, 134u, 134u, 134u, 134u, 134u, 134u, 134u, 134u, 134u, 135u, 135u, 135u, 135u, 135u, 135u, 135u,
+    135u, 135u, 135u, 135u, 135u, 135u, 135u, 135u, 135u, 136u, 136u, 136u, 136u, 136u, 136u, 136u, 136u, 136u, 136u, 136u, 136u, 136u, 136u, 136u, 136u, 137u, 137u, 137u, 137u, 137u, 137u, 137u,
+    137u, 137u, 137u, 137u, 137u, 137u, 137u, 137u, 137u, 138u, 138u, 138u, 138u, 138u, 138u, 138u, 138u, 138u, 138u, 138u, 138u, 138u, 138u, 138u, 138u, 138u, 139u, 139u, 139u, 139u, 139u, 139u,
+    139u, 139u, 139u, 139u, 139u, 139u, 139u, 139u, 139u, 139u, 140u, 140u, 140u, 140u, 140u, 140u, 140u, 140u, 140u, 140u, 140u, 140u, 140u, 140u, 140u, 140u, 140u, 141u, 141u, 141u, 141u, 141u,
+    141u, 141u, 141u, 141u, 141u, 141u, 141u, 141u, 141u, 141u, 141u, 141u, 142u, 142u, 142u, 142u, 142u, 142u, 142u, 142u, 142u, 142u, 142u, 142u, 142u, 142u, 142u, 142u, 142u, 143u, 143u, 143u,
+    143u, 143u, 143u, 143u, 143u, 143u, 143u, 143u, 143u, 143u, 143u, 143u, 143u, 143u, 144u, 144u, 144u, 144u, 144u, 144u, 144u, 144u, 144u, 144u, 144u, 144u, 144u, 144u, 144u, 144u, 144u, 144u,
+    145u, 145u, 145u, 145u, 145u, 145u, 145u, 145u, 145u, 145u, 145u, 145u, 145u, 145u, 145u, 145u, 145u, 146u, 146u, 146u, 146u, 146u, 146u, 146u, 146u, 146u, 146u, 146u, 146u, 146u, 146u, 146u,
+    146u, 146u, 146u, 147u, 147u, 147u, 147u, 147u, 147u, 147u, 147u, 147u, 147u, 147u, 147u, 147u, 147u, 147u, 147u, 147u, 147u, 148u, 148u, 148u, 148u, 148u, 148u, 148u, 148u, 148u, 148u, 148u,
+    148u, 148u, 148u, 148u, 148u, 148u, 149u, 149u, 149u, 149u, 149u, 149u, 149u, 149u, 149u, 149u, 149u, 149u, 149u, 149u, 149u, 149u, 149u, 149u, 149u, 150u, 150u, 150u, 150u, 150u, 150u, 150u,
+    150u, 150u, 150u, 150u, 150u, 150u, 150u, 150u, 150u, 150u, 150u, 151u, 151u, 151u, 151u, 151u, 151u, 151u, 151u, 151u, 151u, 151u, 151u, 151u, 151u, 151u, 151u, 151u, 151u, 152u, 152u, 152u,
+    152u, 152u, 152u, 152u, 152u, 152u, 152u, 152u, 152u, 152u, 152u, 152u, 152u, 152u, 152u, 152u, 153u, 153u, 153u, 153u, 153u, 153u, 153u, 153u, 153u, 153u, 153u, 153u, 153u, 153u, 153u, 153u,
+    153u, 153u, 153u, 154u, 154u, 154u, 154u, 154u, 154u, 154u, 154u, 154u, 154u, 154u, 154u, 154u, 154u, 154u, 154u, 154u, 154u, 154u, 155u, 155u, 155u, 155u, 155u, 155u, 155u, 155u, 155u, 155u,
+    155u, 155u, 155u, 155u, 155u, 155u, 155u, 155u, 155u, 156u, 156u, 156u, 156u, 156u, 156u, 156u, 156u, 156u, 156u, 156u, 156u, 156u, 156u, 156u, 156u, 156u, 156u, 156u, 157u, 157u, 157u, 157u,
+    157u, 157u, 157u, 157u, 157u, 157u, 157u, 157u, 157u, 157u, 157u, 157u, 157u, 157u, 157u, 158u, 158u, 158u, 158u, 158u, 158u, 158u, 158u, 158u, 158u, 158u, 158u, 158u, 158u, 158u, 158u, 158u,
+    158u, 158u, 158u, 159u, 159u, 159u, 159u, 159u, 159u, 159u, 159u, 159u, 159u, 159u, 159u, 159u, 159u, 159u, 159u, 159u, 159u, 159u, 160u, 160u, 160u, 160u, 160u, 160u, 160u, 160u, 160u, 160u,
+    160u, 160u, 160u, 160u, 160u, 160u, 160u, 160u, 160u, 160u, 161u, 161u, 161u, 161u, 161u, 161u, 161u, 161u, 161u, 161u, 161u, 161u, 161u, 161u, 161u, 161u, 161u, 161u, 161u, 161u, 162u, 162u,
+    162u, 162u, 162u, 162u, 162u, 162u, 162u, 162u, 162u, 162u, 162u, 162u, 162u, 162u, 162u, 162u, 162u, 162u, 162u, 163u, 163u, 163u, 163u, 163u, 163u, 163u, 163u, 163u, 163u, 163u, 163u, 163u,
+    163u, 163u, 163u, 163u, 163u, 163u, 163u, 164u, 164u, 164u, 164u, 164u, 164u, 164u, 164u, 164u, 164u, 164u, 164u, 164u, 164u, 164u, 164u, 164u, 164u, 164u, 164u, 165u, 165u, 165u, 165u, 165u,
+    165u, 165u, 165u, 165u, 165u, 165u, 165u, 165u, 165u, 165u, 165u, 165u, 165u, 165u, 165u, 165u, 166u, 166u, 166u, 166u, 166u, 166u, 166u, 166u, 166u, 166u, 166u, 166u, 166u, 166u, 166u, 166u,
+    166u, 166u, 166u, 166u, 166u, 167u, 167u, 167u, 167u, 167u, 167u, 167u, 167u, 167u, 167u, 167u, 167u, 167u, 167u, 167u, 167u, 167u, 167u, 167u, 167u, 167u, 168u, 168u, 168u, 168u, 168u, 168u,
+    168u, 168u, 168u, 168u, 168u, 168u, 168u, 168u, 168u, 168u, 168u, 168u, 168u, 168u, 168u, 169u, 169u, 169u, 169u, 169u, 169u, 169u, 169u, 169u, 169u, 169u, 169u, 169u, 169u, 169u, 169u, 169u,
+    169u, 169u, 169u, 169u, 170u, 170u, 170u, 170u, 170u, 170u, 170u, 170u, 170u, 170u, 170u, 170u, 170u, 170u, 170u, 170u, 170u, 170u, 170u, 170u, 170u, 170u, 171u, 171u, 171u, 171u, 171u, 171u,
+    171u, 171u, 171u, 171u, 171u, 171u, 171u, 171u, 171u, 171u, 171u, 171u, 171u, 171u, 171u, 172u, 172u, 172u, 172u, 172u, 172u, 172u, 172u, 172u, 172u, 172u, 172u, 172u, 172u, 172u, 172u, 172u,
+    172u, 172u, 172u, 172u, 172u, 173u, 173u, 173u, 173u, 173u, 173u, 173u, 173u, 173u, 173u, 173u, 173u, 173u, 173u, 173u, 173u, 173u, 173u, 173u, 173u, 173u, 173u, 174u, 174u, 174u, 174u, 174u,
+    174u, 174u, 174u, 174u, 174u, 174u, 174u, 174u, 174u, 174u, 174u, 174u, 174u, 174u, 174u, 174u, 174u, 175u, 175u, 175u, 175u, 175u, 175u, 175u, 175u, 175u, 175u, 175u, 175u, 175u, 175u, 175u,
+    175u, 175u, 175u, 175u, 175u, 175u, 175u, 175u, 176u, 176u, 176u, 176u, 176u, 176u, 176u, 176u, 176u, 176u, 176u, 176u, 176u, 176u, 176u, 176u, 176u, 176u, 176u, 176u, 176u, 176u, 177u, 177u,
+    177u, 177u, 177u, 177u, 177u, 177u, 177u, 177u, 177u, 177u, 177u, 177u, 177u, 177u, 177u, 177u, 177u, 177u, 177u, 177u, 177u, 178u, 178u, 178u, 178u, 178u, 178u, 178u, 178u, 178u, 178u, 178u,
+    178u, 178u, 178u, 178u, 178u, 178u, 178u, 178u, 178u, 178u, 178u, 179u, 179u, 179u, 179u, 179u, 179u, 179u, 179u, 179u, 179u, 179u, 179u, 179u, 179u, 179u, 179u, 179u, 179u, 179u, 179u, 179u,
+    179u, 179u, 180u, 180u, 180u, 180u, 180u, 180u, 180u, 180u, 180u, 180u, 180u, 180u, 180u, 180u, 180u, 180u, 180u, 180u, 180u, 180u, 180u, 180u, 180u, 180u, 181u, 181u, 181u, 181u, 181u, 181u,
+    181u, 181u, 181u, 181u, 181u, 181u, 181u, 181u, 181u, 181u, 181u, 181u, 181u, 181u, 181u, 181u, 181u, 182u, 182u, 182u, 182u, 182u, 182u, 182u, 182u, 182u, 182u, 182u, 182u, 182u, 182u, 182u,
+    182u, 182u, 182u, 182u, 182u, 182u, 182u, 182u, 183u, 183u, 183u, 183u, 183u, 183u, 183u, 183u, 183u, 183u, 183u, 183u, 183u, 183u, 183u, 183u, 183u, 183u, 183u, 183u, 183u, 183u, 183u, 183u,
+    184u, 184u, 184u, 184u, 184u, 184u, 184u, 184u, 184u, 184u, 184u, 184u, 184u, 184u, 184u, 184u, 184u, 184u, 184u, 184u, 184u, 184u, 184u, 184u, 185u, 185u, 185u, 185u, 185u, 185u, 185u, 185u,
+    185u, 185u, 185u, 185u, 185u, 185u, 185u, 185u, 185u, 185u, 185u, 185u, 185u, 185u, 185u, 185u, 186u, 186u, 186u, 186u, 186u, 186u, 186u, 186u, 186u, 186u, 186u, 186u, 186u, 186u, 186u, 186u,
+    186u, 186u, 186u, 186u, 186u, 186u, 186u, 186u, 187u, 187u, 187u, 187u, 187u, 187u, 187u, 187u, 187u, 187u, 187u, 187u, 187u, 187u, 187u, 187u, 187u, 187u, 187u, 187u, 187u, 187u, 187u, 187u,
+    188u, 188u, 188u, 188u, 188u, 188u, 188u, 188u, 188u, 188u, 188u, 188u, 188u, 188u, 188u, 188u, 188u, 188u, 188u, 188u, 188u, 188u, 188u, 188u, 188u, 189u, 189u, 189u, 189u, 189u, 189u, 189u,
+    189u, 189u, 189u, 189u, 189u, 189u, 189u, 189u, 189u, 189u, 189u, 189u, 189u, 189u, 189u, 189u, 189u, 190u, 190u, 190u, 190u, 190u, 190u, 190u, 190u, 190u, 190u, 190u, 190u, 190u, 190u, 190u,
+    190u, 190u, 190u, 190u, 190u, 190u, 190u, 190u, 190u, 190u, 191u, 191u, 191u, 191u, 191u, 191u, 191u, 191u, 191u, 191u, 191u, 191u, 191u, 191u, 191u, 191u, 191u, 191u, 191u, 191u, 191u, 191u,
+    191u, 191u, 191u, 192u, 192u, 192u, 192u, 192u, 192u, 192u, 192u, 192u, 192u, 192u, 192u, 192u, 192u, 192u, 192u, 192u, 192u, 192u, 192u, 192u, 192u, 192u, 192u, 192u, 193u, 193u, 193u, 193u,
+    193u, 193u, 193u, 193u, 193u, 193u, 193u, 193u, 193u, 193u, 193u, 193u, 193u, 193u, 193u, 193u, 193u, 193u, 193u, 193u, 193u, 194u, 194u, 194u, 194u, 194u, 194u, 194u, 194u, 194u, 194u, 194u,
+    194u, 194u, 194u, 194u, 194u, 194u, 194u, 194u, 194u, 194u, 194u, 194u, 194u, 194u, 194u, 195u, 195u, 195u, 195u, 195u, 195u, 195u, 195u, 195u, 195u, 195u, 195u, 195u, 195u, 195u, 195u, 195u,
+    195u, 195u, 195u, 195u, 195u, 195u, 195u, 195u, 195u, 196u, 196u, 196u, 196u, 196u, 196u, 196u, 196u, 196u, 196u, 196u, 196u, 196u, 196u, 196u, 196u, 196u, 196u, 196u, 196u, 196u, 196u, 196u,
+    196u, 196u, 197u, 197u, 197u, 197u, 197u, 197u, 197u, 197u, 197u, 197u, 197u, 197u, 197u, 197u, 197u, 197u, 197u, 197u, 197u, 197u, 197u, 197u, 197u, 197u, 197u, 197u, 198u, 198u, 198u, 198u,
+    198u, 198u, 198u, 198u, 198u, 198u, 198u, 198u, 198u, 198u, 198u, 198u, 198u, 198u, 198u, 198u, 198u, 198u, 198u, 198u, 198u, 198u, 198u, 199u, 199u, 199u, 199u, 199u, 199u, 199u, 199u, 199u,
+    199u, 199u, 199u, 199u, 199u, 199u, 199u, 199u, 199u, 199u, 199u, 199u, 199u, 199u, 199u, 199u, 199u, 200u, 200u, 200u, 200u, 200u, 200u, 200u, 200u, 200u, 200u, 200u, 200u, 200u, 200u, 200u,
+    200u, 200u, 200u, 200u, 200u, 200u, 200u, 200u, 200u, 200u, 200u, 200u, 201u, 201u, 201u, 201u, 201u, 201u, 201u, 201u, 201u, 201u, 201u, 201u, 201u, 201u, 201u, 201u, 201u, 201u, 201u, 201u,
+    201u, 201u, 201u, 201u, 201u, 201u, 202u, 202u, 202u, 202u, 202u, 202u, 202u, 202u, 202u, 202u, 202u, 202u, 202u, 202u, 202u, 202u, 202u, 202u, 202u, 202u, 202u, 202u, 202u, 202u, 202u, 202u,
+    202u, 203u, 203u, 203u, 203u, 203u, 203u, 203u, 203u, 203u, 203u, 203u, 203u, 203u, 203u, 203u, 203u, 203u, 203u, 203u, 203u, 203u, 203u, 203u, 203u, 203u, 203u, 203u, 204u, 204u, 204u, 204u,
+    204u, 204u, 204u, 204u, 204u, 204u, 204u, 204u, 204u, 204u, 204u, 204u, 204u, 204u, 204u, 204u, 204u, 204u, 204u, 204u, 204u, 204u, 204u, 205u, 205u, 205u, 205u, 205u, 205u, 205u, 205u, 205u,
+    205u, 205u, 205u, 205u, 205u, 205u, 205u, 205u, 205u, 205u, 205u, 205u, 205u, 205u, 205u, 205u, 205u, 205u, 205u, 206u, 206u, 206u, 206u, 206u, 206u, 206u, 206u, 206u, 206u, 206u, 206u, 206u,
+    206u, 206u, 206u, 206u, 206u, 206u, 206u, 206u, 206u, 206u, 206u, 206u, 206u, 206u, 207u, 207u, 207u, 207u, 207u, 207u, 207u, 207u, 207u, 207u, 207u, 207u, 207u, 207u, 207u, 207u, 207u, 207u,
+    207u, 207u, 207u, 207u, 207u, 207u, 207u, 207u, 207u, 207u, 208u, 208u, 208u, 208u, 208u, 208u, 208u, 208u, 208u, 208u, 208u, 208u, 208u, 208u, 208u, 208u, 208u, 208u, 208u, 208u, 208u, 208u,
+    208u, 208u, 208u, 208u, 208u, 208u, 209u, 209u, 209u, 209u, 209u, 209u, 209u, 209u, 209u, 209u, 209u, 209u, 209u, 209u, 209u, 209u, 209u, 209u, 209u, 209u, 209u, 209u, 209u, 209u, 209u, 209u,
+    209u, 209u, 210u, 210u, 210u, 210u, 210u, 210u, 210u, 210u, 210u, 210u, 210u, 210u, 210u, 210u, 210u, 210u, 210u, 210u, 210u, 210u, 210u, 210u, 210u, 210u, 210u, 210u, 210u, 210u, 211u, 211u,
+    211u, 211u, 211u, 211u, 211u, 211u, 211u, 211u, 211u, 211u, 211u, 211u, 211u, 211u, 211u, 211u, 211u, 211u, 211u, 211u, 211u, 211u, 211u, 211u, 211u, 211u, 211u, 212u, 212u, 212u, 212u, 212u,
+    212u, 212u, 212u, 212u, 212u, 212u, 212u, 212u, 212u, 212u, 212u, 212u, 212u, 212u, 212u, 212u, 212u, 212u, 212u, 212u, 212u, 212u, 212u, 212u, 213u, 213u, 213u, 213u, 213u, 213u, 213u, 213u,
+    213u, 213u, 213u, 213u, 213u, 213u, 213u, 213u, 213u, 213u, 213u, 213u, 213u, 213u, 213u, 213u, 213u, 213u, 213u, 213u, 214u, 214u, 214u, 214u, 214u, 214u, 214u, 214u, 214u, 214u, 214u, 214u,
+    214u, 214u, 214u, 214u, 214u, 214u, 214u, 214u, 214u, 214u, 214u, 214u, 214u, 214u, 214u, 214u, 214u, 215u, 215u, 215u, 215u, 215u, 215u, 215u, 215u, 215u, 215u, 215u, 215u, 215u, 215u, 215u,
+    215u, 215u, 215u, 215u, 215u, 215u, 215u, 215u, 215u, 215u, 215u, 215u, 215u, 215u, 215u, 216u, 216u, 216u, 216u, 216u, 216u, 216u, 216u, 216u, 216u, 216u, 216u, 216u, 216u, 216u, 216u, 216u,
+    216u, 216u, 216u, 216u, 216u, 216u, 216u, 216u, 216u, 216u, 216u, 216u, 217u, 217u, 217u, 217u, 217u, 217u, 217u, 217u, 217u, 217u, 217u, 217u, 217u, 217u, 217u, 217u, 217u, 217u, 217u, 217u,
+    217u, 217u, 217u, 217u, 217u, 217u, 217u, 217u, 217u, 218u, 218u, 218u, 218u, 218u, 218u, 218u, 218u, 218u, 218u, 218u, 218u, 218u, 218u, 218u, 218u, 218u, 218u, 218u, 218u, 218u, 218u, 218u,
+    218u, 218u, 218u, 218u, 218u, 218u, 218u, 219u, 219u, 219u, 219u, 219u, 219u, 219u, 219u, 219u, 219u, 219u, 219u, 219u, 219u, 219u, 219u, 219u, 219u, 219u, 219u, 219u, 219u, 219u, 219u, 219u,
+    219u, 219u, 219u, 219u, 219u, 220u, 220u, 220u, 220u, 220u, 220u, 220u, 220u, 220u, 220u, 220u, 220u, 220u, 220u, 220u, 220u, 220u, 220u, 220u, 220u, 220u, 220u, 220u, 220u, 220u, 220u, 220u,
+    220u, 220u, 220u, 221u, 221u, 221u, 221u, 221u, 221u, 221u, 221u, 221u, 221u, 221u, 221u, 221u, 221u, 221u, 221u, 221u, 221u, 221u, 221u, 221u, 221u, 221u, 221u, 221u, 221u, 221u, 221u, 221u,
+    221u, 222u, 222u, 222u, 222u, 222u, 222u, 222u, 222u, 222u, 222u, 222u, 222u, 222u, 222u, 222u, 222u, 222u, 222u, 222u, 222u, 222u, 222u, 222u, 222u, 222u, 222u, 222u, 222u, 222u, 222u, 222u,
+    223u, 223u, 223u, 223u, 223u, 223u, 223u, 223u, 223u, 223u, 223u, 223u, 223u, 223u, 223u, 223u, 223u, 223u, 223u, 223u, 223u, 223u, 223u, 223u, 223u, 223u, 223u, 223u, 223u, 223u, 224u, 224u,
+    224u, 224u, 224u, 224u, 224u, 224u, 224u, 224u, 224u, 224u, 224u, 224u, 224u, 224u, 224u, 224u, 224u, 224u, 224u, 224u, 224u, 224u, 224u, 224u, 224u, 224u, 224u, 224u, 224u, 225u, 225u, 225u,
+    225u, 225u, 225u, 225u, 225u, 225u, 225u, 225u, 225u, 225u, 225u, 225u, 225u, 225u, 225u, 225u, 225u, 225u, 225u, 225u, 225u, 225u, 225u, 225u, 225u, 225u, 225u, 225u, 226u, 226u, 226u, 226u,
+    226u, 226u, 226u, 226u, 226u, 226u, 226u, 226u, 226u, 226u, 226u, 226u, 226u, 226u, 226u, 226u, 226u, 226u, 226u, 226u, 226u, 226u, 226u, 226u, 226u, 226u, 226u, 227u, 227u, 227u, 227u, 227u,
+    227u, 227u, 227u, 227u, 227u, 227u, 227u, 227u, 227u, 227u, 227u, 227u, 227u, 227u, 227u, 227u, 227u, 227u, 227u, 227u, 227u, 227u, 227u, 227u, 227u, 227u, 227u, 228u, 228u, 228u, 228u, 228u,
+    228u, 228u, 228u, 228u, 228u, 228u, 228u, 228u, 228u, 228u, 228u, 228u, 228u, 228u, 228u, 228u, 228u, 228u, 228u, 228u, 228u, 228u, 228u, 228u, 228u, 228u, 229u, 229u, 229u, 229u, 229u, 229u,
+    229u, 229u, 229u, 229u, 229u, 229u, 229u, 229u, 229u, 229u, 229u, 229u, 229u, 229u, 229u, 229u, 229u, 229u, 229u, 229u, 229u, 229u, 229u, 229u, 229u, 229u, 230u, 230u, 230u, 230u, 230u, 230u,
+    230u, 230u, 230u, 230u, 230u, 230u, 230u, 230u, 230u, 230u, 230u, 230u, 230u, 230u, 230u, 230u, 230u, 230u, 230u, 230u, 230u, 230u, 230u, 230u, 230u, 230u, 231u, 231u, 231u, 231u, 231u, 231u,
+    231u, 231u, 231u, 231u, 231u, 231u, 231u, 231u, 231u, 231u, 231u, 231u, 231u, 231u, 231u, 231u, 231u, 231u, 231u, 231u, 231u, 231u, 231u, 231u, 231u, 231u, 232u, 232u, 232u, 232u, 232u, 232u,
+    232u, 232u, 232u, 232u, 232u, 232u, 232u, 232u, 232u, 232u, 232u, 232u, 232u, 232u, 232u, 232u, 232u, 232u, 232u, 232u, 232u, 232u, 232u, 232u, 232u, 232u, 233u, 233u, 233u, 233u, 233u, 233u,
+    233u, 233u, 233u, 233u, 233u, 233u, 233u, 233u, 233u, 233u, 233u, 233u, 233u, 233u, 233u, 233u, 233u, 233u, 233u, 233u, 233u, 233u, 233u, 233u, 233u, 233u, 234u, 234u, 234u, 234u, 234u, 234u,
+    234u, 234u, 234u, 234u, 234u, 234u, 234u, 234u, 234u, 234u, 234u, 234u, 234u, 234u, 234u, 234u, 234u, 234u, 234u, 234u, 234u, 234u, 234u, 234u, 234u, 234u, 234u, 235u, 235u, 235u, 235u, 235u,
+    235u, 235u, 235u, 235u, 235u, 235u, 235u, 235u, 235u, 235u, 235u, 235u, 235u, 235u, 235u, 235u, 235u, 235u, 235u, 235u, 235u, 235u, 235u, 235u, 235u, 235u, 235u, 235u, 236u, 236u, 236u, 236u,
+    236u, 236u, 236u, 236u, 236u, 236u, 236u, 236u, 236u, 236u, 236u, 236u, 236u, 236u, 236u, 236u, 236u, 236u, 236u, 236u, 236u, 236u, 236u, 236u, 236u, 236u, 236u, 236u, 236u, 237u, 237u, 237u,
+    237u, 237u, 237u, 237u, 237u, 237u, 237u, 237u, 237u, 237u, 237u, 237u, 237u, 237u, 237u, 237u, 237u, 237u, 237u, 237u, 237u, 237u, 237u, 237u, 237u, 237u, 237u, 237u, 237u, 237u, 238u, 238u,
+    238u, 238u, 238u, 238u, 238u, 238u, 238u, 238u, 238u, 238u, 238u, 238u, 238u, 238u, 238u, 238u, 238u, 238u, 238u, 238u, 238u, 238u, 238u, 238u, 238u, 238u, 238u, 238u, 238u, 238u, 238u, 239u,
+    239u, 239u, 239u, 239u, 239u, 239u, 239u, 239u, 239u, 239u, 239u, 239u, 239u, 239u, 239u, 239u, 239u, 239u, 239u, 239u, 239u, 239u, 239u, 239u, 239u, 239u, 239u, 239u, 239u, 239u, 239u, 239u,
+    239u, 240u, 240u, 240u, 240u, 240u, 240u, 240u, 240u, 240u, 240u, 240u, 240u, 240u, 240u, 240u, 240u, 240u, 240u, 240u, 240u, 240u, 240u, 240u, 240u, 240u, 240u, 240u, 240u, 240u, 240u, 240u,
+    240u, 240u, 240u, 241u, 241u, 241u, 241u, 241u, 241u, 241u, 241u, 241u, 241u, 241u, 241u, 241u, 241u, 241u, 241u, 241u, 241u, 241u, 241u, 241u, 241u, 241u, 241u, 241u, 241u, 241u, 241u, 241u,
+    241u, 241u, 241u, 241u, 242u, 242u, 242u, 242u, 242u, 242u, 242u, 242u, 242u, 242u, 242u, 242u, 242u, 242u, 242u, 242u, 242u, 242u, 242u, 242u, 242u, 242u, 242u, 242u, 242u, 242u, 242u, 242u,
+    242u, 242u, 242u, 242u, 242u, 242u, 242u, 243u, 243u, 243u, 243u, 243u, 243u, 243u, 243u, 243u, 243u, 243u, 243u, 243u, 243u, 243u, 243u, 243u, 243u, 243u, 243u, 243u, 243u, 243u, 243u, 243u,
+    243u, 243u, 243u, 243u, 243u, 243u, 243u, 243u, 243u, 244u, 244u, 244u, 244u, 244u, 244u, 244u, 244u, 244u, 244u, 244u, 244u, 244u, 244u, 244u, 244u, 244u, 244u, 244u, 244u, 244u, 244u, 244u,
+    244u, 244u, 244u, 244u, 244u, 244u, 244u, 244u, 244u, 244u, 244u, 245u, 245u, 245u, 245u, 245u, 245u, 245u, 245u, 245u, 245u, 245u, 245u, 245u, 245u, 245u, 245u, 245u, 245u, 245u, 245u, 245u,
+    245u, 245u, 245u, 245u, 245u, 245u, 245u, 245u, 245u, 245u, 245u, 245u, 245u, 245u, 246u, 246u, 246u, 246u, 246u, 246u, 246u, 246u, 246u, 246u, 246u, 246u, 246u, 246u, 246u, 246u, 246u, 246u,
+    246u, 246u, 246u, 246u, 246u, 246u, 246u, 246u, 246u, 246u, 246u, 246u, 246u, 246u, 246u, 246u, 246u, 247u, 247u, 247u, 247u, 247u, 247u, 247u, 247u, 247u, 247u, 247u, 247u, 247u, 247u, 247u,
+    247u, 247u, 247u, 247u, 247u, 247u, 247u, 247u, 247u, 247u, 247u, 247u, 247u, 247u, 247u, 247u, 247u, 247u, 247u, 247u, 248u, 248u, 248u, 248u, 248u, 248u, 248u, 248u, 248u, 248u, 248u, 248u,
+    248u, 248u, 248u, 248u, 248u, 248u, 248u, 248u, 248u, 248u, 248u, 248u, 248u, 248u, 248u, 248u, 248u, 248u, 248u, 248u, 248u, 248u, 248u, 249u, 249u, 249u, 249u, 249u, 249u, 249u, 249u, 249u,
+    249u, 249u, 249u, 249u, 249u, 249u, 249u, 249u, 249u, 249u, 249u, 249u, 249u, 249u, 249u, 249u, 249u, 249u, 249u, 249u, 249u, 249u, 249u, 249u, 249u, 249u, 250u, 250u, 250u, 250u, 250u, 250u,
+    250u, 250u, 250u, 250u, 250u, 250u, 250u, 250u, 250u, 250u, 250u, 250u, 250u, 250u, 250u, 250u, 250u, 250u, 250u, 250u, 250u, 250u, 250u, 250u, 250u, 250u, 250u, 250u, 250u, 250u, 251u, 251u,
+    251u, 251u, 251u, 251u, 251u, 251u, 251u, 251u, 251u, 251u, 251u, 251u, 251u, 251u, 251u, 251u, 251u, 251u, 251u, 251u, 251u, 251u, 251u, 251u, 251u, 251u, 251u, 251u, 251u, 251u, 251u, 251u,
+    251u, 251u, 252u, 252u, 252u, 252u, 252u, 252u, 252u, 252u, 252u, 252u, 252u, 252u, 252u, 252u, 252u, 252u, 252u, 252u, 252u, 252u, 252u, 252u, 252u, 252u, 252u, 252u, 252u, 252u, 252u, 252u,
+    252u, 252u, 252u, 252u, 252u, 252u, 253u, 253u, 253u, 253u, 253u, 253u, 253u, 253u, 253u, 253u, 253u, 253u, 253u, 253u, 253u, 253u, 253u, 253u, 253u, 253u, 253u, 253u, 253u, 253u, 253u, 253u,
+    253u, 253u, 253u, 253u, 253u, 253u, 253u, 253u, 253u, 253u, 254u, 254u, 254u, 254u, 254u, 254u, 254u, 254u, 254u, 254u, 254u, 254u, 254u, 254u, 254u, 254u, 254u, 254u, 254u, 254u, 254u, 254u,
+    254u, 254u, 254u, 254u, 254u, 254u, 254u, 254u, 254u, 254u, 254u, 254u, 254u, 254u, 255u, 255u, 255u, 255u, 255u, 255u, 255u, 255u, 255u, 255u, 255u, 255u, 255u, 255u, 255u, 255u, 255u, 255u,
+    255u
 );
 
 bool finite1(float v) { return !(isnan(v) || isinf(v)); }
@@ -163,15 +297,14 @@ vec3 fetchGlobalReflect101(int x, int y) {
     return vec3(inputValues[base], inputValues[base + 1u], inputValues[base + 2u]);
 }
 
-float legacyQuantizedSrgbChannel(float linearValue) {
+uint exactSrgbByte(float linearValue) {
     float v = clamp(linearValue, 0.0, 1.0);
-    float lutIndex = floor(v * 4096.0 + 0.5);
-    float lutV = lutIndex * (1.0 / 4096.0);
-    float encoded = lutV <= 0.0031308
-        ? 12.92 * lutV
-        : 1.055 * pow(lutV, 1.0 / 2.4) - 0.055;
-    float byteValue = floor(clamp(encoded, 0.0, 1.0) * 255.0 + 0.5);
-    return byteValue * (1.0 / 255.0);
+    uint lutIndex = uint(floor(v * 4096.0 + 0.5));
+    return srgbByteLut[min(lutIndex, 4096u)];
+}
+
+float legacyQuantizedSrgbChannel(float linearValue) {
+    return float(exactSrgbByte(linearValue)) * (1.0 / 255.0);
 }
 
 vec3 legacyQuantizedSrgb(vec3 linearRgb) {
@@ -348,11 +481,45 @@ vec3 fetchGlobal(int x, int y) {
     uint base = (uint(localY) * pc.frameWidth + uint(safeX)) * 3u;
     return vec3(inputValues[base], inputValues[base + 1u], inputValues[base + 2u]);
 }
-void storeOutput(uint localY, uint x, vec3 rgb) {
+void storeFloatOutput(uint localY, uint x, vec3 rgb) {
     uint base = (localY * pc.frameWidth + x) * 3u;
-    outputValues[base] = rgb.r;
-    outputValues[base + 1u] = rgb.g;
-    outputValues[base + 2u] = rgb.b;
+    outputWords[base] = floatBitsToUint(rgb.r);
+    outputWords[base + 1u] = floatBitsToUint(rgb.g);
+    outputWords[base + 2u] = floatBitsToUint(rgb.b);
+}
+
+uint publicationByte(float value, bool alreadySrgb) {
+    if (!alreadySrgb) return exactSrgbByte(value);
+    return uint(floor(clamp(value, 0.0, 1.0) * 255.0 + 0.5));
+}
+
+uint packByte4(uint b0, uint b1, uint b2, uint b3) {
+    return (b0 & 255u) | ((b1 & 255u) << 8u) | ((b2 & 255u) << 16u) | ((b3 & 255u) << 24u);
+}
+
+// One 16x16 workgroup stages 16 BGR pixels (48 bytes) per local row. Neighbourhood math
+// remains one invocation per pixel; only the final byte stores are coalesced after the barrier.
+shared uint publicationTileBytes[16 * 16 * 3];
+
+void stagePublicationPixel(uint localX, uint localY, vec3 rgb, bool alreadySrgb) {
+    uint base = (localY * 16u + localX) * 3u;
+    publicationTileBytes[base] = publicationByte(rgb.b, alreadySrgb);
+    publicationTileBytes[base + 1u] = publicationByte(rgb.g, alreadySrgb);
+    publicationTileBytes[base + 2u] = publicationByte(rgb.r, alreadySrgb);
+}
+
+void flushPublicationWord(uint localX, uint localY, uint localOutputY) {
+    if (localX >= 12u) return;
+    uint byteBase = localY * 48u + localX * 4u;
+    uint packed = packByte4(publicationTileBytes[byteBase],
+                            publicationTileBytes[byteBase + 1u],
+                            publicationTileBytes[byteBase + 2u],
+                            publicationTileBytes[byteBase + 3u]);
+    uint wordsPerRow = (pc.frameWidth * 3u + 3u) / 4u;
+    uint wordInRow = gl_WorkGroupID.x * 12u + localX;
+    if (wordInRow >= wordsPerRow) return;
+    uint wordBase = localOutputY * wordsPerRow + wordInRow;
+    outputWords[wordBase] = packed;
 }
 float mahalanobis2(float dRG, float dBG, float localNoiseScale) {
     float scale = clamp(finite1(localNoiseScale) ? localNoiseScale : 1.0, 0.35, 3.0);
@@ -389,11 +556,11 @@ void runSpatialNr(uint x, uint localOutputY, uint y) {
     if (pc.spectraNoiseActive == 0u && pc.appliedLumaSigma <= 1.0e-7 &&
         pc.visibleSigmaY <= 1.0e-7 && pc.profileNrColor <= 1.0e-7 &&
         pc.outerRingAuthority <= 1.0e-7 && pc.chromaNrStrength <= 1.0e-7) {
-        storeOutput(localOutputY, x, center);
+        storeFloatOutput(localOutputY, x, center);
         return;
     }
     if (!finite3(center)) {
-        storeOutput(localOutputY, x, center);
+        storeFloatOutput(localOutputY, x, center);
         if (sampleTelemetry) atomicAdd(stats[12], 1u);
         return;
     }
@@ -645,7 +812,7 @@ void runSpatialNr(uint x, uint localOutputY, uint y) {
                          nonCentreWeight, sumWeightChroma, effectiveChromaBlend,
                          structureConfidence, effectiveLumaBlend);
     }
-    storeOutput(localOutputY, x, finalRgb);
+    storeFloatOutput(localOutputY, x, finalRgb);
 }
 
 void addVisibleSample(float acceptance, float colourShift, float noiseImprovement,
@@ -659,7 +826,7 @@ void addVisibleSample(float acceptance, float colourShift, float noiseImprovemen
     atomicMax(stats[15], floatBitsToUint(max(0.0, colourShift)));
 }
 
-void runVisibleChroma(uint x, uint localOutputY, uint y) {
+vec3 runVisibleChroma(uint x, uint localOutputY, uint y) {
     bool sampleTelemetry = telemetrySample(x, y);
     if (sampleTelemetry) atomicAdd(stats[0], 1u);
     vec3 center = fetchGlobal(int(x), int(y));
@@ -668,15 +835,13 @@ void runVisibleChroma(uint x, uint localOutputY, uint y) {
         vec3 outputRgb = profileNeutral && pc.visibleAuthority > 1.0e-6
                 ? runLegacySrgbSharpen(int(x), int(y), pc.visibleAuthority)
                 : applyProfileSharpnessSrgb(int(x), int(y), pc.visibleAuthority);
-        storeOutput(localOutputY, x, outputRgb);
         if (sampleTelemetry) atomicAdd(stats[8], 1u);
-        return;
+        return outputRgb;
     }
     vec3 centerOpponent = opponent(center);
     if (!finite3(center) || !finite3(centerOpponent)) {
-        storeOutput(localOutputY, x, center);
         if (sampleTelemetry) atomicAdd(stats[8], 1u);
-        return;
+        return center;
     }
     float centerY = centerOpponent.x;
     float centerRG = centerOpponent.y;
@@ -869,15 +1034,41 @@ void runVisibleChroma(uint x, uint localOutputY, uint y) {
         addVisibleSample(actualAcceptance, actualShift, max(0.0, noiseImprovement),
                          structureWeight, colourEdgeWeight);
     }
-    storeOutput(localOutputY, x, finalRgb);
+    return finalRgb;
 }
 
 void main() {
     uint x = gl_GlobalInvocationID.x;
     uint localOutputY = gl_GlobalInvocationID.y;
-    if (x >= pc.frameWidth || localOutputY >= pc.outputRows) return;
+
+    if (pc.mode == 0u) {
+        if (x >= pc.frameWidth || localOutputY >= pc.outputRows) return;
+        uint y = pc.outputOriginY + localOutputY;
+        if (y >= pc.frameHeight) return;
+        runSpatialNr(x, localOutputY, y);
+        return;
+    }
+
     uint y = pc.outputOriginY + localOutputY;
-    if (y >= pc.frameHeight) return;
-    if (pc.mode == 0u) runSpatialNr(x, localOutputY, y);
-    else runVisibleChroma(x, localOutputY, y);
+    bool validY = localOutputY < pc.outputRows && y < pc.frameHeight;
+    bool validX = x < pc.frameWidth;
+
+    // FASE 15 explicit typed fallback. The host sets padding2=0 only for the legacy/debug
+    // FP32 publication contract; production sets padding2=1 and takes the packed path below.
+    if (pc.padding2 <= 0.5) {
+        if (validX && validY) {
+            storeFloatOutput(localOutputY, x, runVisibleChroma(x, localOutputY, y));
+        }
+        return;
+    }
+
+    // FASE 15 fused publication. All packed mode-1 lanes reach the barrier, including tail
+    // lanes, while valid lanes retain the original one-pixel visible-chroma computation.
+    bool alreadySrgb = pc.visibleChromaEnabled == 0u;
+    vec3 published = validX && validY ? runVisibleChroma(x, localOutputY, y) : vec3(0.0);
+    stagePublicationPixel(gl_LocalInvocationID.x, gl_LocalInvocationID.y, published, alreadySrgb);
+    barrier();
+    if (validY) {
+        flushPublicationWord(gl_LocalInvocationID.x, gl_LocalInvocationID.y, localOutputY);
+    }
 }

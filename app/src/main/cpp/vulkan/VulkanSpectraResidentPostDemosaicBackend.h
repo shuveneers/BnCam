@@ -69,6 +69,10 @@ struct SpectraResidentPostDemosaicRequest {
     float inverse11 = 0.0f;
     std::uint64_t generationId = 0;
 
+    // FASE 15: production publication is packed BGR8/sRGB. The false value is retained only
+    // as an explicit typed FP32 fallback/debug path; it is never selected implicitly.
+    bool packedBgr8Publication = true;
+
     // 8H-K: optional device-resident RGB input owned by an upstream Vulkan stage.
     // When non-null, rgbData is ignored and no full-frame CPU upload is performed.
     VkBuffer residentInputBuffer = VK_NULL_HANDLE;
@@ -82,6 +86,7 @@ struct SpectraResidentPostDemosaicResult {
     bool timestampQueryUsed = false;
     bool persistentBufferReuseHit = false;
     bool persistentBufferReallocated = false;
+    // Legacy typed fallback storage. Production FASE-15 publication uses outputMappedPointer.
     std::vector<float> outputRgb;
     const void* outputMappedPointer = nullptr;
     std::array<std::uint32_t, 16> spatialCounters{};
@@ -98,6 +103,10 @@ struct SpectraResidentPostDemosaicResult {
     bool residentInputUsed = false;
     bool legacySharpenApplied = false;
     bool outputSrgbEncoded = false;
+    // FASE 15 publication contract. outputBytes includes row padding when packed BGR8 is used.
+    bool packedBgr8Published = false;
+    bool floatOutputFallback = false;
+    std::uint64_t outputRowStrideBytes = 0u;
     std::uint64_t intermediateBytes = 0;
     std::uint64_t outputBytes = 0;
     std::uint64_t spatialMapBytes = 0;

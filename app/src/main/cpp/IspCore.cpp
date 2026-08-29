@@ -1,4 +1,5 @@
 #include "ProfileColorManagement.h"
+#include "SrgbByteLut.h"
 #include "JpegEncodingPolicy.h"
 #include "IspCore.h"
 #include "RawCfaLevelMapping.h"
@@ -2198,22 +2199,8 @@ float clampSceneLinear(float value) {
 
 }
 
-alignas(64) static const std::array<uint8_t, 4097> gSrgbLut = [] {
-    std::array<uint8_t, 4097> values{};
-    for (size_t i = 0; i < values.size(); ++i) {
-        const float v = static_cast<float>(i) / 4096.0f;
-        const float encoded = v <= 0.0031308f
-                ? 12.92f * v
-                : 1.055f * std::pow(v, 1.0f / 2.4f) - 0.055f;
-        values[i] = static_cast<uint8_t>(std::round(encoded * 255.0f));
-    }
-    return values;
-}();
-
 inline uint8_t quantizeSrgb8(float value) {
-    const float v = std::clamp(value, 0.0f, 1.0f);
-    const int index = static_cast<int>(v * 4096.0f + 0.5f);
-    return gSrgbLut[index];
+    return bncam::color::quantizeSrgbByte(value);
 }
 
 struct DefectCorrectionDebug {
@@ -10400,7 +10387,7 @@ cv::Vec3f composeVisibleChromaCandidate(
 bncam::spectra2::VulkanOpponentStripPlan buildResidentPostDemosaicStripPlan(
         int width,
         int height,
-        int requestedOutputRows = 256,
+        int requestedOutputRows = 512,
         int haloRows = 5,
         std::uint64_t maximumTransientBytes = 192ull * 1024ull * 1024ull
 ) {
@@ -10516,10 +10503,85 @@ struct StripedResidentPostDemosaicExecution {
     float maximumColourShift = 0.0f;
     bool legacySharpenApplied = false;
     bool outputSrgbEncoded = false;
+    bool packedBgr8PublicationUsed = false;
+    bool floatPublicationFallbackUsed = false;
     float legacySharpenAmount = 0.0f;
     std::string status = "NOT_RUN";
     std::string failureReason = "none";
 };
+
+bool copyResidentPostDemosaicPublicationToBgr8(
+        const bncam::vulkan::SpectraResidentPostDemosaicResult& execution,
+        cv::Mat& output,
+        int outputStartY,
+        int outputRows,
+        int width,
+        bool& packedPublicationUsed,
+        bool& floatFallbackUsed,
+        std::string& failureReason
+) {
+    if (execution.outputMappedPointer == nullptr || output.empty() || output.type() != CV_8UC3 ||
+        width <= 0 || outputRows <= 0 || outputStartY < 0 ||
+        outputStartY + outputRows > output.rows || output.cols != width) {
+        failureReason = "PUBLICATION_POINTER_OR_DESTINATION_INVALID";
+        return false;
+    }
+
+    const std::size_t publishedRowBytes = static_cast<std::size_t>(width) * 3u;
+    if (execution.packedBgr8Published) {
+        const std::size_t rowStride = static_cast<std::size_t>(execution.outputRowStrideBytes);
+        const std::uint64_t requiredBytes = static_cast<std::uint64_t>(rowStride) *
+                static_cast<std::uint64_t>(outputRows);
+        if (rowStride < publishedRowBytes || execution.outputBytes < requiredBytes) {
+            failureReason = "PACKED_BGR8_STRIDE_OR_SIZE_INVALID";
+            return false;
+        }
+        const auto* sourceData = static_cast<const std::uint8_t*>(execution.outputMappedPointer);
+        for (int localY = 0; localY < outputRows; ++localY) {
+            std::uint8_t* destination = output.ptr<std::uint8_t>(outputStartY + localY);
+            const std::uint8_t* source = sourceData + static_cast<std::size_t>(localY) * rowStride;
+            std::memcpy(destination, source, publishedRowBytes);
+        }
+        packedPublicationUsed = true;
+        return true;
+    }
+
+    if (execution.floatOutputFallback) {
+        const std::size_t expectedFloatRowBytes = publishedRowBytes * sizeof(float);
+        const std::size_t rowStride = static_cast<std::size_t>(execution.outputRowStrideBytes);
+        const std::uint64_t requiredBytes = static_cast<std::uint64_t>(rowStride) *
+                static_cast<std::uint64_t>(outputRows);
+        if (rowStride < expectedFloatRowBytes || execution.outputBytes < requiredBytes) {
+            failureReason = "FP32_FALLBACK_STRIDE_OR_SIZE_INVALID";
+            return false;
+        }
+        const auto* sourceBytes = static_cast<const std::uint8_t*>(execution.outputMappedPointer);
+        for (int localY = 0; localY < outputRows; ++localY) {
+            const auto* source = reinterpret_cast<const float*>(
+                    sourceBytes + static_cast<std::size_t>(localY) * rowStride);
+            std::uint8_t* destination = output.ptr<std::uint8_t>(outputStartY + localY);
+            for (int x = 0; x < width; ++x) {
+                const float r = source[static_cast<std::size_t>(x) * 3u + 0u];
+                const float g = source[static_cast<std::size_t>(x) * 3u + 1u];
+                const float b = source[static_cast<std::size_t>(x) * 3u + 2u];
+                destination[static_cast<std::size_t>(x) * 3u + 0u] = execution.outputSrgbEncoded
+                        ? cv::saturate_cast<std::uint8_t>(std::clamp(b, 0.0f, 1.0f) * 255.0f)
+                        : quantizeSrgb8(b);
+                destination[static_cast<std::size_t>(x) * 3u + 1u] = execution.outputSrgbEncoded
+                        ? cv::saturate_cast<std::uint8_t>(std::clamp(g, 0.0f, 1.0f) * 255.0f)
+                        : quantizeSrgb8(g);
+                destination[static_cast<std::size_t>(x) * 3u + 2u] = execution.outputSrgbEncoded
+                        ? cv::saturate_cast<std::uint8_t>(std::clamp(r, 0.0f, 1.0f) * 255.0f)
+                        : quantizeSrgb8(r);
+            }
+        }
+        floatFallbackUsed = true;
+        return true;
+    }
+
+    failureReason = "BACKEND_DID_NOT_DECLARE_PUBLICATION_FORMAT";
+    return false;
+}
 
 StripedResidentPostDemosaicExecution executeStripedResidentPostDemosaic(
         const cv::Mat& immutableInput,
@@ -10555,7 +10617,7 @@ StripedResidentPostDemosaicExecution executeStripedResidentPostDemosaic(
     StripedResidentPostDemosaicExecution aggregate{};
     const auto totalStarted = IspClock::now();
     if (immutableInput.empty() || immutableInput.type() != CV_32FC3 ||
-        output.empty() || output.type() != CV_32FC3 ||
+        output.empty() || output.type() != CV_8UC3 ||
         immutableInput.size() != output.size() || !stripPlan.valid ||
         stripPlan.width != immutableInput.cols || stripPlan.height != immutableInput.rows ||
         (visiblePlan.enabled && (
@@ -10686,6 +10748,9 @@ StripedResidentPostDemosaicExecution executeStripedResidentPostDemosaic(
         request.inverse01 = covariance.valid ? covariance.inverse01 : 0.0f;
         request.inverse11 = covariance.valid ? covariance.inverse11 : 1.0f;
         request.generationId = spatialGeneration;
+        // FASE 15 production contract: publish directly as packed BGR8/sRGB. FP32 remains
+        // available only when a caller explicitly sets this field false.
+        request.packedBgr8Publication = true;
         bncam::vulkan::SpectraResidentPostDemosaicResult execution =
                 bncam::vulkan::VulkanRuntime::instance()
                         .executeSpectraResidentPostDemosaic(request);
@@ -10698,7 +10763,6 @@ StripedResidentPostDemosaicExecution executeStripedResidentPostDemosaic(
         aggregate.transferAndSyncMs += execution.transferAndSyncMs;
         aggregate.inputBytes += execution.inputBytes;
         aggregate.intermediateBytes += execution.intermediateBytes;
-        aggregate.outputBytes += execution.outputBytes;
         aggregate.spatialMapBytes += execution.spatialMapBytes;
         aggregate.persistentResidentBytes = std::max(
                 aggregate.persistentResidentBytes,
@@ -10725,20 +10789,18 @@ StripedResidentPostDemosaicExecution executeStripedResidentPostDemosaic(
             return aggregate;
         }
 
-        const std::size_t rowBytes = static_cast<std::size_t>(immutableInput.cols) *
-                3u * sizeof(float);
-        const float* sourceData = execution.outputMappedPointer != nullptr
-                ? static_cast<const float*>(execution.outputMappedPointer)
-                : execution.outputRgb.data();
-        if (sourceData != nullptr) {
-            for (int localY = 0; localY < strip.outputRowCount; ++localY) {
-                float* destination = output.ptr<float>(strip.outputStartY + localY);
-                const float* source = sourceData +
-                        static_cast<std::size_t>(localY) *
-                                static_cast<std::size_t>(immutableInput.cols) * 3u;
-                std::memcpy(destination, source, rowBytes);
-            }
+        std::string publicationFailure;
+        if (!copyResidentPostDemosaicPublicationToBgr8(
+                    execution, output, strip.outputStartY, strip.outputRowCount,
+                    immutableInput.cols, aggregate.packedBgr8PublicationUsed,
+                    aggregate.floatPublicationFallbackUsed, publicationFailure)) {
+            aggregate.status = "RESIDENT_POST_DEMOSAIC_PUBLICATION_UNAVAILABLE";
+            aggregate.failureReason = publicationFailure;
+            aggregate.totalMs = elapsedMs(totalStarted);
+            return aggregate;
         }
+        aggregate.outputBytes += execution.outputBytes;
+        aggregate.outputSrgbEncoded = true;
         for (std::size_t index = 0; index < aggregate.spatialCounters.size(); ++index) {
             aggregate.spatialCounters[index] += execution.spatialCounters[index];
             aggregate.visibleCounters[index] += execution.visibleCounters[index];
@@ -10770,7 +10832,9 @@ StripedResidentPostDemosaicExecution executeStripedResidentPostDemosaic(
     aggregate.timestampQueryUsed = allTimestampQueriesUsed && aggregate.stripCount > 0;
     aggregate.success = aggregate.successfulStripCount == aggregate.stripCount;
     aggregate.status = aggregate.success
-            ? "SPECTRA_POST_DEMOSAIC_GPU_RESIDENT_CHAIN_READY"
+            ? (aggregate.floatPublicationFallbackUsed
+                    ? "SPECTRA_POST_DEMOSAIC_GPU_RESIDENT_FLOAT_PUBLICATION_FALLBACK_READY"
+                    : "SPECTRA_POST_DEMOSAIC_GPU_RESIDENT_BGR8_PUBLICATION_READY")
             : "RESIDENT_POST_DEMOSAIC_FRAME_INCOMPLETE";
     aggregate.failureReason = aggregate.success
             ? "none"
@@ -10816,7 +10880,7 @@ StripedResidentPostDemosaicExecution executeResidentTonePostDemosaic(
     StripedResidentPostDemosaicExecution aggregate{};
     const auto totalStarted = IspClock::now();
     if (width <= 0 || height <= 0 || residentToneGeneration == 0u ||
-        output.empty() || output.type() != CV_32FC3 ||
+        output.empty() || output.type() != CV_8UC3 ||
         output.cols != width || output.rows != height ||
         !stripPlan.valid || stripPlan.width != width || stripPlan.height != height ||
         (visiblePlan.enabled && (!covariance.valid || !(visibleSigmaY > 0.0f) ||
@@ -10934,6 +10998,9 @@ StripedResidentPostDemosaicExecution executeResidentTonePostDemosaic(
         request.inverse01 = covariance.valid ? covariance.inverse01 : 0.0f;
         request.inverse11 = covariance.valid ? covariance.inverse11 : 1.0f;
         request.generationId = spatialGeneration;
+        // FASE 15 production contract: resident tone is published as packed BGR8/sRGB.
+        // The backend's FP32 route is explicit fallback/debug only.
+        request.packedBgr8Publication = true;
 
         const bncam::vulkan::SpectraResidentPostDemosaicResult execution =
                 bncam::vulkan::VulkanRuntime::instance()
@@ -10948,7 +11015,6 @@ StripedResidentPostDemosaicExecution executeResidentTonePostDemosaic(
         aggregate.transferAndSyncMs += execution.transferAndSyncMs;
         aggregate.inputBytes += execution.inputBytes;
         aggregate.intermediateBytes += execution.intermediateBytes;
-        aggregate.outputBytes += execution.outputBytes;
         aggregate.spatialMapBytes += execution.spatialMapBytes;
         aggregate.persistentResidentBytes = std::max(
                 aggregate.persistentResidentBytes, execution.persistentResidentBytes);
@@ -10972,26 +11038,22 @@ StripedResidentPostDemosaicExecution executeResidentTonePostDemosaic(
             return aggregate;
         }
         aggregate.legacySharpenApplied = aggregate.legacySharpenApplied || execution.legacySharpenApplied;
-        aggregate.outputSrgbEncoded = aggregate.outputSrgbEncoded || execution.outputSrgbEncoded;
         if (execution.legacySharpenApplied) {
             aggregate.legacySharpenAmount = std::max(
                     aggregate.legacySharpenAmount, std::clamp(legacySharpenAmount, 0.0f, 0.30f));
         }
-        const std::size_t expectedFloats = static_cast<std::size_t>(width) *
-                static_cast<std::size_t>(strip.outputRowCount) * 3u;
-        const std::size_t totalStripBytes = expectedFloats * sizeof(float);
-        if (execution.outputMappedPointer != nullptr) {
-            float* destination = output.ptr<float>(strip.outputStartY);
-            std::memcpy(destination, execution.outputMappedPointer, totalStripBytes);
-        } else if (execution.outputRgb.size() == expectedFloats) {
-            float* destination = output.ptr<float>(strip.outputStartY);
-            std::memcpy(destination, execution.outputRgb.data(), totalStripBytes);
-        } else {
-            aggregate.status = "RESIDENT_TONE_POST_DEMOSAIC_READBACK_SIZE_MISMATCH";
-            aggregate.failureReason = "GPU_OUTPUT_FLOAT_COUNT_MISMATCH";
+        std::string publicationFailure;
+        if (!copyResidentPostDemosaicPublicationToBgr8(
+                    execution, output, strip.outputStartY, strip.outputRowCount, width,
+                    aggregate.packedBgr8PublicationUsed, aggregate.floatPublicationFallbackUsed,
+                    publicationFailure)) {
+            aggregate.status = "RESIDENT_TONE_POST_DEMOSAIC_PUBLICATION_UNAVAILABLE";
+            aggregate.failureReason = publicationFailure;
             aggregate.totalMs = elapsedMs(totalStarted);
             return aggregate;
         }
+        aggregate.outputBytes += execution.outputBytes;
+        aggregate.outputSrgbEncoded = true;
         for (std::size_t index = 0; index < aggregate.spatialCounters.size(); ++index) {
             aggregate.spatialCounters[index] += execution.spatialCounters[index];
             aggregate.visibleCounters[index] += execution.visibleCounters[index];
@@ -11023,7 +11085,9 @@ StripedResidentPostDemosaicExecution executeResidentTonePostDemosaic(
     aggregate.timestampQueryUsed = allTimestampQueriesUsed && aggregate.stripCount > 0;
     aggregate.success = aggregate.successfulStripCount == aggregate.stripCount;
     aggregate.status = aggregate.success
-            ? "SPECTRA_POST_DEMOSAIC_GPU_RESIDENT_TONE_HANDOFF_READY"
+            ? (aggregate.floatPublicationFallbackUsed
+                    ? "SPECTRA_POST_DEMOSAIC_GPU_RESIDENT_TONE_FLOAT_PUBLICATION_FALLBACK_READY"
+                    : "SPECTRA_POST_DEMOSAIC_GPU_RESIDENT_TONE_BGR8_PUBLICATION_READY")
             : "RESIDENT_TONE_POST_DEMOSAIC_FRAME_INCOMPLETE";
     aggregate.failureReason = aggregate.success
             ? "none" : "NOT_ALL_RESIDENT_TONE_POST_DEMOSAIC_STRIPS_COMPLETED";
@@ -17348,13 +17412,14 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     bool residentPostDemosaicApplied = false;
     bool residentLegacySharpenApplied = false;
     bool residentOutputSrgbEncoded = false;
+    cv::Mat residentPublishedBgr8;
     float residentLegacySharpenGpuMs = 0.0f;
     float finalOutSpatialNrMs = 0.0f;
 
     // Milestone 8H: the first production-resident Vulkan chain owns the two
     // dominant post-demosaic neighbourhood passes. Spatial NR writes a device-local
     // intermediate, a compute barrier hands it directly to visible chroma, and only
-    // the final RGB strip is read back. The CPU implementation below is a typed
+    // the final strip is published directly as packed BGR8. The CPU implementation below is a typed
     // fallback and is not executed in parallel with a successful GPU capture.
     auto& residentTelemetry = visibleChromaState.telemetry;
     residentTelemetry.plan = bncam::spectra2::buildVisibleChromaPlan(
@@ -17373,7 +17438,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                     residentTelemetry.plan.predictedVarianceBG,
                     residentTelemetry.plan.predictedCovarianceRgBg
             );
-    constexpr int kResidentPostDemosaicOutputRows = 256;
+    constexpr int kResidentPostDemosaicOutputRows = 512;
     constexpr int kResidentPostDemosaicHaloRows = 5;
     constexpr std::uint64_t kResidentPostDemosaicTransientBytes =
             192ull * 1024ull * 1024ull;
@@ -17402,13 +17467,10 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     residentTelemetry.vulkanResidentAuthority =
             "GPU_SPATIAL_NR_AND_VISIBLE_CHROMA_PRIMARY_CPU_TYPED_FALLBACK_ONLY";
 
-    // Runtime recovery gate (2026-08-07): field A/B testing proved that SPECTRA Off
-    // publishes JPEG while SPECTRA On stalls before publication. The M8H-K resident
-    // tone -> spatial-NR -> visible-chroma chain is the last SPECTRA-only heavy stage
-    // before quantization/JPEG and currently performs synchronous strip submissions.
-    // Keep the upstream SPECTRA GPU chain active, but bypass this final resident stage
-    // until its queue/strip execution is repaired. This is deliberately fail-open:
-    // the already computed tone surface is read back once and continues to JPEG.
+    // FASE 15 recovery gate: the resident tone -> spatial-NR -> visible-chroma chain is
+    // re-enabled after replacing the FP32 publication boundary with 512-row packed BGR8
+    // publication. Keep this switch explicit as an emergency fail-open only: setting it false
+    // bypasses the final resident stage while preserving the already computed tone surface.
     constexpr bool kM8hKResidentPostDemosaicRecoveryGate = true;
     const bool m8hKPostDemosaicCircuitBreakerActive =
             spectraNoiseActive && !kM8hKResidentPostDemosaicRecoveryGate;
@@ -17423,7 +17485,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         const bool toneResidentHandoff = vulkanToneApplied &&
                 vulkanTone.residentToneGeneration != 0u;
         cv::Mat residentGpuOutput(
-                demosaicInputHeight, demosaicInputWidth, CV_32FC3);
+                demosaicInputHeight, demosaicInputWidth, CV_8UC3);
         StripedResidentPostDemosaicExecution residentExecution{};
         if (toneResidentHandoff) {
             // 8H-K primary path: the tone buffer is resolved inside VulkanRuntime and
@@ -17473,7 +17535,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             // Compatibility path for captures whose upstream tone stage already materialized
             // a CPU RGB surface. This remains the old striped Vulkan route, not a shadow run.
             const cv::Mat& immutableResidentInput = linearRgb;
-            residentGpuOutput = cv::Mat(linearRgb.size(), linearRgb.type());
+            residentGpuOutput = cv::Mat(linearRgb.size(), CV_8UC3);
             residentExecution = executeStripedResidentPostDemosaic(
                     immutableResidentInput,
                     residentGpuOutput,
@@ -17548,10 +17610,11 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         residentTelemetry.vulkanResidentFailureReason = residentExecution.failureReason;
 
         if (residentExecution.success) {
-            linearRgb = std::move(residentGpuOutput);
+            residentPublishedBgr8 = std::move(residentGpuOutput);
+            linearRgb.release();
             residentPostDemosaicApplied = true;
             residentLegacySharpenApplied = residentExecution.legacySharpenApplied;
-            residentOutputSrgbEncoded = residentExecution.outputSrgbEncoded;
+            residentOutputSrgbEncoded = true;
             residentLegacySharpenGpuMs = residentExecution.legacySharpenApplied
                     ? residentExecution.visibleKernelMs : 0.0f;
             finalOutSpatialNrMs = residentExecution.spatialKernelMs > 0.0f
@@ -18114,7 +18177,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     jpegRaw.mosaic.release();
 
     const auto quantizeStart = IspClock::now();
-    cv::Mat bgr8(linearRgb.size(), CV_8UC3);
+    cv::Mat bgr8;
     std::atomic<uint64_t> finalRedClipped{0};
     std::atomic<uint64_t> finalGreenClipped{0};
     std::atomic<uint64_t> finalBlueClipped{0};
@@ -18122,48 +18185,82 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     std::atomic<uint64_t> toneGreenSum{0};
     std::atomic<uint64_t> toneBlueSum{0};
 
-    cv::parallel_for_(cv::Range(0, linearRgb.rows), [&](const cv::Range& range) {
-        uint64_t localRedClipped = 0;
-        uint64_t localGreenClipped = 0;
-        uint64_t localBlueClipped = 0;
-        uint64_t localRedSum = 0;
-        uint64_t localGreenSum = 0;
-        uint64_t localBlueSum = 0;
-        for (int y = range.start; y < range.end; ++y) {
-            const cv::Vec3f* inputRow = linearRgb.ptr<cv::Vec3f>(y);
-            uint8_t* outputPtr = bgr8.ptr<uint8_t>(y);
-            for (int x = 0; x < linearRgb.cols; ++x) {
-                const float r = inputRow[x][0];
-                const float g = inputRow[x][1];
-                const float b = inputRow[x][2];
-
-                const uint8_t outB = residentOutputSrgbEncoded
-                        ? cv::saturate_cast<uint8_t>(std::clamp(b, 0.0f, 1.0f) * 255.0f)
-                        : quantizeSrgb8(b);
-                const uint8_t outG = residentOutputSrgbEncoded
-                        ? cv::saturate_cast<uint8_t>(std::clamp(g, 0.0f, 1.0f) * 255.0f)
-                        : quantizeSrgb8(g);
-                const uint8_t outR = residentOutputSrgbEncoded
-                        ? cv::saturate_cast<uint8_t>(std::clamp(r, 0.0f, 1.0f) * 255.0f)
-                        : quantizeSrgb8(r);
-                if (outR >= 254u) ++localRedClipped;
-                if (outG >= 254u) ++localGreenClipped;
-                if (outB >= 254u) ++localBlueClipped;
-                localRedSum += outR;
-                localGreenSum += outG;
-                localBlueSum += outB;
-                outputPtr[x * 3 + 0] = outB;
-                outputPtr[x * 3 + 1] = outG;
-                outputPtr[x * 3 + 2] = outR;
+    if (!residentPublishedBgr8.empty()) {
+        // FASE 15: resident visible-chroma now fuses exact-LUT sRGB/BGR8 publication.
+        // The host consumes only 3 bytes/pixel and never materializes the final CV_32FC3 frame.
+        bgr8 = std::move(residentPublishedBgr8);
+        cv::parallel_for_(cv::Range(0, bgr8.rows), [&](const cv::Range& range) {
+            uint64_t localRedClipped = 0;
+            uint64_t localGreenClipped = 0;
+            uint64_t localBlueClipped = 0;
+            uint64_t localRedSum = 0;
+            uint64_t localGreenSum = 0;
+            uint64_t localBlueSum = 0;
+            for (int y = range.start; y < range.end; ++y) {
+                const uint8_t* row = bgr8.ptr<uint8_t>(y);
+                for (int x = 0; x < bgr8.cols; ++x) {
+                    const uint8_t outB = row[x * 3 + 0];
+                    const uint8_t outG = row[x * 3 + 1];
+                    const uint8_t outR = row[x * 3 + 2];
+                    if (outR >= 254u) ++localRedClipped;
+                    if (outG >= 254u) ++localGreenClipped;
+                    if (outB >= 254u) ++localBlueClipped;
+                    localRedSum += outR;
+                    localGreenSum += outG;
+                    localBlueSum += outB;
+                }
             }
-        }
-        finalRedClipped.fetch_add(localRedClipped, std::memory_order_relaxed);
-        finalGreenClipped.fetch_add(localGreenClipped, std::memory_order_relaxed);
-        finalBlueClipped.fetch_add(localBlueClipped, std::memory_order_relaxed);
-        toneRedSum.fetch_add(localRedSum, std::memory_order_relaxed);
-        toneGreenSum.fetch_add(localGreenSum, std::memory_order_relaxed);
-        toneBlueSum.fetch_add(localBlueSum, std::memory_order_relaxed);
-    });
+            finalRedClipped.fetch_add(localRedClipped, std::memory_order_relaxed);
+            finalGreenClipped.fetch_add(localGreenClipped, std::memory_order_relaxed);
+            finalBlueClipped.fetch_add(localBlueClipped, std::memory_order_relaxed);
+            toneRedSum.fetch_add(localRedSum, std::memory_order_relaxed);
+            toneGreenSum.fetch_add(localGreenSum, std::memory_order_relaxed);
+            toneBlueSum.fetch_add(localBlueSum, std::memory_order_relaxed);
+        });
+    } else {
+        bgr8 = cv::Mat(linearRgb.size(), CV_8UC3);
+        cv::parallel_for_(cv::Range(0, linearRgb.rows), [&](const cv::Range& range) {
+            uint64_t localRedClipped = 0;
+            uint64_t localGreenClipped = 0;
+            uint64_t localBlueClipped = 0;
+            uint64_t localRedSum = 0;
+            uint64_t localGreenSum = 0;
+            uint64_t localBlueSum = 0;
+            for (int y = range.start; y < range.end; ++y) {
+                const cv::Vec3f* inputRow = linearRgb.ptr<cv::Vec3f>(y);
+                uint8_t* outputPtr = bgr8.ptr<uint8_t>(y);
+                for (int x = 0; x < linearRgb.cols; ++x) {
+                    const float r = inputRow[x][0];
+                    const float g = inputRow[x][1];
+                    const float b = inputRow[x][2];
+                    const uint8_t outB = residentOutputSrgbEncoded
+                            ? cv::saturate_cast<uint8_t>(std::clamp(b, 0.0f, 1.0f) * 255.0f)
+                            : quantizeSrgb8(b);
+                    const uint8_t outG = residentOutputSrgbEncoded
+                            ? cv::saturate_cast<uint8_t>(std::clamp(g, 0.0f, 1.0f) * 255.0f)
+                            : quantizeSrgb8(g);
+                    const uint8_t outR = residentOutputSrgbEncoded
+                            ? cv::saturate_cast<uint8_t>(std::clamp(r, 0.0f, 1.0f) * 255.0f)
+                            : quantizeSrgb8(r);
+                    if (outR >= 254u) ++localRedClipped;
+                    if (outG >= 254u) ++localGreenClipped;
+                    if (outB >= 254u) ++localBlueClipped;
+                    localRedSum += outR;
+                    localGreenSum += outG;
+                    localBlueSum += outB;
+                    outputPtr[x * 3 + 0] = outB;
+                    outputPtr[x * 3 + 1] = outG;
+                    outputPtr[x * 3 + 2] = outR;
+                }
+            }
+            finalRedClipped.fetch_add(localRedClipped, std::memory_order_relaxed);
+            finalGreenClipped.fetch_add(localGreenClipped, std::memory_order_relaxed);
+            finalBlueClipped.fetch_add(localBlueClipped, std::memory_order_relaxed);
+            toneRedSum.fetch_add(localRedSum, std::memory_order_relaxed);
+            toneGreenSum.fetch_add(localGreenSum, std::memory_order_relaxed);
+            toneBlueSum.fetch_add(localBlueSum, std::memory_order_relaxed);
+        });
+    }
     const float finalOutClampQuantMs = elapsedMs(quantizeStart);
     const float finalOutputPassMs = elapsedMs(finalOutputPassStart);
 
