@@ -611,9 +611,6 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
         detached = false
         acceptingRawFrames = displayedSource != ViewfinderEffectiveSource.YUV
         rawTextureGeneration = -1
-        // Probe the actual GLES/EGL context plus the already initialized Vulkan runtime. The RAW
-        // renderer enables AHardwareBuffer -> Vulkan -> EGLImage only when every required feature
-        // (including non-blocking EGL fence sync for slot reuse) is present on this exact context.
         RawPreviewInteropCapabilities.probeOnGlThread(context)
         val textures = IntArray(1)
         GLES20.glGenTextures(1, textures, 0)
@@ -653,7 +650,6 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
             setOnFrameAvailableListener(this@FocusPeakingView)
         }
 
-        // Stuur de texture terug naar de main thread zodat Jetpack Compose en de Camera API hem kunnen gebruiken
         Handler(Looper.getMainLooper()).post {
             if (!detached) surfaceTexture?.let { onSurfaceTextureCreated?.invoke(it) }
         }
@@ -679,9 +675,6 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
         }
         collectPresentedRawFrames()
         val useRaw = displayedSource != ViewfinderEffectiveSource.YUV
-        // Drain the OES producer even while the last-known-good RAW texture is still displayed.
-        // This lets the transition owner validate the exact Camera2 sensor timestamp of the first
-        // YUV frame from a replacement session before switching display ownership to YUV.
         if (oesFrameAvailable) {
             try {
                 surfaceTexture?.updateTexImage()
@@ -691,7 +684,6 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
                 if (!useRaw) displayReady = true
                 if (surfaceTimestampNs > 0L) onYuvFrameAvailable?.invoke(surfaceTimestampNs)
             } catch (e: Exception) {
-                // Ignore transient update exceptions during surface teardown or stream switch.
             }
         }
         if (useRaw) {
@@ -717,8 +709,6 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
                         while (GLES20.glGetError() != GLES20.GL_NO_ERROR) Unit
 
                         val handoffSucceeded = if (frame.gpuResidentOutputUsed && frame.hardwareBuffer != null) {
-                            // No RGBA host readback and no glTex(Sub)Image2D upload: the exact AHB that
-                            // Vulkan wrote is exposed to this GL texture through EGLImage.
                             ImageUtils.bindRawPreviewHardwareBufferToCurrentTexture(frame.hardwareBuffer)
                         } else {
                             frame.rgba.position(0)
@@ -755,8 +745,6 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
                             lastDrawnRawFrame = frame
                             uploadedRawFrame = frame
                             if (frame.gpuResidentOutputUsed) {
-                                // The slot remains owned by this frame until a fence inserted after
-                                // glDrawArrays signals. The Vulkan worker will not recycle it earlier.
                                 gpuFrameAwaitingFence = frame
                                 releaseImmediately = false
                             }
@@ -859,8 +847,6 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
         GLES20.glUniformMatrix4fv(handles.stMatrix, 1, false, activeMatrix, 0)
         GLES20.glUniform1f(handles.peaking, if (isPeakingEnabled) 1.0f else 0.0f)
         GLES20.glUniform3fv(handles.color, 1, peakingColor, 0)
-        // RAW preview already receives the frozen/effective profile + live color tuning from the
-        // native preview ISP. Apply the display-only creative delta only to YUV to avoid doubling.
         GLES20.glUniform1f(handles.liveSaturation, if (useRaw) 0f else liveSaturationOffset)
         GLES20.glUniform1f(handles.liveContrast, if (useRaw) 0f else liveContrastOffset)
         val wb = if (useRaw) neutralWhiteBalance else liveWhiteBalanceCompensation
@@ -881,6 +867,7 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
         GLES20.glUniform1f(handles.lensMoving, if (peakingLensMoving) 1f else 0f)
         GLES20.glUniform1f(handles.subjectRoi, if (peakingSubjectRoiActive) 1f else 0f)
         GLES20.glUniform2f(handles.targetCenter, peakingTargetCenterX, peakingTargetCenterY)
+        GLES20.glUniform2f(handles.targetRadius, peakingTargetRadiusX, peakingTargetRadiusY)
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
 
         if (useRaw) {
@@ -903,8 +890,6 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
         }
 
         gpuFrameAwaitingFence?.let { frame ->
-            // The fence is non-blocking: renderer slot reuse polls it from BnCamRawPreview. If the
-            // driver cannot create one, the backing slot is quarantined rather than reused unsafely.
             frame.closeAfterGlFence(ImageUtils.createRawPreviewGlFence())
         }
 
@@ -1081,10 +1066,6 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
     }
 
     override fun onDetachedFromWindow() {
-        // First reject producers and stop callbacks. Crucially, do NOT release SurfaceTexture
-        // while GLSurfaceView's render thread may still be inside onDrawFrame(). The framework
-        // super call synchronously retires that GL thread; only then is the texture bridge safe
-        // to release from the UI thread.
         quiesceForComposeRelease()
         super.onDetachedFromWindow()
         surfaceTexture?.release()
