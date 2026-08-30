@@ -238,6 +238,18 @@ struct SpectraPass0State {
     float greenSplitTileConsensus = 0.0f;
     int greenSplitTileCount = 0;
 
+    // Residual post-metadata CFA black calibration. Values are sensor code units.
+    float commonGreenResidualBefore = 0.0f;
+    float commonGreenResidualAfter = 0.0f;
+    float commonGreenResidualConfidence = 0.0f;
+    float commonGreenTileMedian = 0.0f;
+    float commonGreenTileMad = 0.0f;
+    float commonGreenTileConsensus = 0.0f;
+    float commonGreenLowerTailRbMismatch = 0.0f;
+    int commonGreenStrictTileCount = 0;
+    bool residualPedestalApplied = false;
+    std::string residualPedestalReason = "not_evaluated";
+
     std::string classification = "K. Insufficient evidence";
     std::string fallbackReason = "none";
     std::string planningMethod = "LEGACY_FULL_FRAME_REFERENCE";

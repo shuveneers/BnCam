@@ -828,10 +828,10 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
     }
     if (fllfRequested) {
         const float fllfValues[6] = {
-                std::clamp(request.fllfStrength, 0.0f, 0.55f),
+                std::clamp(request.fllfStrength, 0.0f, 0.90f),
                 std::clamp(request.fllfSceneKey, 0.10f, 0.20f),
-                std::clamp(request.fllfMaxLiftEv, 0.0f, 0.60f),
-                std::clamp(request.fllfMaxCompressEv, 0.0f, 0.70f),
+                std::clamp(request.fllfMaxLiftEv, 0.0f, 1.25f),
+                std::clamp(request.fllfMaxCompressEv, 0.0f, 1.50f),
                 std::clamp(request.fllfEdgeStopEv, 0.40f, 0.90f),
                 std::clamp(request.fllfRefinement, 0.0f, 0.22f)};
         const float fllfShadowLiftNoiseGuardPressure = std::clamp(

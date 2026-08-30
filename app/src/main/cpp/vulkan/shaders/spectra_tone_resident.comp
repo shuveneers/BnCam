@@ -140,21 +140,15 @@ vec3 applyProfileColor(vec3 rgb) {
         rgb *= scale;
         y = mappedY;
     }
-    // Phase-10 RAW presentation repair: IspCore currently suppresses the already-resolved
-    // automatic RAW base-vibrance request by forcing the push value to 1.0. The live captures
-    // still resolve ~1.21-1.22, so preserve that established policy intent here until the host
-    // contract carries the resolved value again. The existing saturation-protection weighting
-    // remains the sole authority: muted colours receive more recovery than already-saturated ones.
-    float effectiveRawBaseVibrance = pc.rawJpegBaseVibrance;
-    if (pc.isRawBayer != 0u) {
-        effectiveRawBaseVibrance = max(effectiveRawBaseVibrance, 1.20);
-    }
-    if (effectiveRawBaseVibrance > 1.001) {
+    // Automatic RAW presentation colour is owned by the host policy. Do not invent a
+    // shader-side minimum: that masked upstream sensor-colour errors and made a neutral
+    // profile non-neutral. Explicit profile vibrance/saturation remain available below.
+    if (pc.rawJpegBaseVibrance > 1.001) {
         float maximum = max(rgb.r, max(rgb.g, rgb.b));
         float minimum = min(rgb.r, min(rgb.g, rgb.b));
         float saturation = (maximum - minimum) / max(1.0e-4, maximum);
         float protection = clamp(1.0 - saturation, 0.0, 1.0);
-        float authority = (effectiveRawBaseVibrance - 1.0) * (0.25 + 0.75 * protection);
+        float authority = (pc.rawJpegBaseVibrance - 1.0) * (0.25 + 0.75 * protection);
         rgb = vec3(y) + (rgb - vec3(y)) * (1.0 + authority);
     }
     float vibranceControl = clamp(pc.profileVibrance, -1.0, 1.0);
@@ -673,25 +667,48 @@ float fllfBilinearCorrection(uint offset, uint width, uint height, vec2 p) {
 }
 
 float fllfRequestedCorrection(float localLogLuma) {
-    float strength = clamp(fllfParam(8u, 0.0), 0.0, 0.55);
+    float strength = clamp(fllfParam(8u, 0.0), 0.0, 0.90);
     float sceneKey = clamp(fllfParam(9u, 0.150), 0.10, 0.20);
-    float maxLiftEv = clamp(fllfParam(10u, 0.18), 0.0, 0.60);
-    float maxCompressEv = clamp(fllfParam(11u, 0.20), 0.0, 0.70);
+    float maxLiftEv = clamp(fllfParam(10u, 0.55), 0.0, 1.25);
+    float maxCompressEv = clamp(fllfParam(11u, 0.55), 0.0, 0.90);
     float localLuma = max(1.0e-6, exp2(localLogLuma) - 0.0025);
-    float requested = clamp(log2(sceneKey / localLuma), -maxCompressEv, maxLiftEv);
-    float need = smoothstep(0.10, 0.46, abs(requested));
 
-    // telemetry[19] is an immutable scalar copied from the calibrated S/O-derived
-    // physical noise pressure. At zero, behavior is exactly the Phase-10 baseline.
-    // As pressure rises, only positive deep-shadow lift is delayed; negative local
-    // compression and the black endpoint remain untouched.
+    // FLLF is intentionally asymmetric. Shadows may move toward the scene key, but highlights
+    // must never be normalized toward mid-grey. The previous symmetric log2(sceneKey/localLuma)
+    // request caused bright displays/lamps inside dark scenes to receive ~0.9 EV negative local
+    // exposure and become visibly darker than their surroundings.
+    float correctionEv = 0.0;
+    if (localLuma < sceneKey) {
+        float rawLiftEv = log2(sceneKey / localLuma);
+        float liftNeed = smoothstep(0.08, 0.38, rawLiftEv);
+        correctionEv = min(maxLiftEv, rawLiftEv * strength * liftNeed);
+    } else {
+        // Preserve ordinary upper-midtones. Compression begins only in a true bright zone, and
+        // the target is a highlight pivot rather than sceneKey. A second floor invariant prevents
+        // even maximum policy authority from turning a bright island into a midtone island.
+        float highlightPivot = clamp(max(0.34, sceneKey * 2.40), 0.34, 0.46);
+        if (localLuma > highlightPivot) {
+            float excessEv = max(0.0, log2(localLuma / highlightPivot));
+            float highlightNeed = smoothstep(highlightPivot, min(1.10, highlightPivot * 1.75), localLuma);
+            float shapedCompressEv = excessEv * strength * mix(0.24, 0.58, highlightNeed);
+
+            float highlightFloor = clamp(max(0.30, sceneKey * 2.05), 0.30, 0.40);
+            float floorLimitedEv = max(0.0, log2(localLuma / highlightFloor));
+            float permittedEv = min(maxCompressEv, 0.82 * floorLimitedEv);
+            correctionEv = -min(shapedCompressEv, permittedEv);
+        }
+    }
+
+    // telemetry[19] is an immutable scalar copied from the calibrated S/O-derived physical
+    // noise pressure. Noise gates only positive deep-shadow lift. Negative bright-zone
+    // compression remains available, but is bounded above by the highlight-zone invariants.
     float noisePressure = clamp(fllfParam(19u, 0.0), 0.0, 1.0);
-    float shadowLiftStart = mix(0.010, 0.024, noisePressure);
-    float shadowLiftFull = mix(0.050, 0.082, noisePressure);
-    float deepBlackGuard = requested > 0.0
+    float shadowLiftStart = mix(0.010, 0.026, noisePressure);
+    float shadowLiftFull = mix(0.045, 0.090, noisePressure);
+    float deepBlackGuard = correctionEv > 0.0
             ? smoothstep(shadowLiftStart, shadowLiftFull, localLuma)
             : 1.0;
-    return requested * strength * need * deepBlackGuard;
+    return correctionEv * deepBlackGuard;
 }
 
 void seedFllfCoarseCorrection(uvec2 gid) {
@@ -722,7 +739,7 @@ void reconstructFllfCorrectionLevel(uvec2 gid) {
     float refineNeed = smoothstep(0.12, 0.55, abs(localRequested - upCorrection));
     float correction = mix(upCorrection, localRequested, refinement * refineNeed * (1.0 - edge));
     correction *= 1.0 - 0.84 * edge;
-    correction = clamp(correction, -fllfParam(11u, 0.20), fllfParam(10u, 0.18));
+    correction = clamp(correction, -fllfParam(11u, 0.55), fllfParam(10u, 0.55));
     if (edge > 0.55 && abs(upCorrection) > 0.015) atomicAdd(telemetry[15], 1u);
     fllfCorrection[fllfDestinationOffset() + gid.y * dstW + gid.x] = correction;
 }
@@ -860,14 +877,17 @@ vec3 agxDefaultContrastApprox(vec3 x) {
 // That previous per-channel application compressed channel separation strongly and
 // was the measured source of the pastel / hue-drifting RAW render.
 // Phase-10 RAW presentation repair: AgX reserves compositor headroom that normalized mobile
-// RAW rarely occupies. DynamicRangeTonePolicy already resolves this same endpoint-preserving
-// placement, but Phase 10 explicitly skips it. Fold the placement into the AgX DRT itself so
-// there is still exactly one scene-to-display owner and no second tone-compression pass.
+// RAW rarely occupies. DynamicRangeTonePolicy resolves this endpoint-preserving placement
+// per scene and feeds it through the existing RAW-only push slots. AgX remains the single
+// scene-to-display owner; this is not a second exposure or tone-compression pass.
 float applyRawAgxDisplayWhitePlacement(float displayLuma) {
     float x = clamp(displayLuma, 0.0, 1.0);
-    const float knee = 0.55;
-    const float exponent = 2.15;
-    if (x <= knee) return x;
+    // RAW Phase-10 reuses the legacy shoulder push slots for these two values. They are resolved
+    // from actual scene statistics in DynamicRangeTonePolicy: more genuine sensor clipping moves
+    // the knee later and reduces expansion; recoverable bright range can use more display headroom.
+    float knee = clamp(pc.shoulderStart, 0.50, 0.65);
+    float exponent = clamp(pc.shoulderStrength, 1.0, 2.50);
+    if (x <= knee || exponent <= 1.0001) return x;
     float u = clamp((x - knee) / (1.0 - knee), 0.0, 1.0);
     float expanded = 1.0 - pow(1.0 - u, exponent);
     return clamp(knee + (1.0 - knee) * expanded, 0.0, 1.0);
@@ -898,20 +918,8 @@ vec3 applyAgXTonemap(vec3 colorLinear) {
     float sceneY = lumaOf(scene);
     if (sceneY <= 1.0e-7) return vec3(0.0);
 
-    // Covered-lens captures put the post-GTM residual floor below roughly 0.008
-    // scene-linear luma. Anchor only this measured near-black floor. The release
-    // is luma-only and scales all three channels equally, so it cannot invent a
-    // green/magenta correction or rotate legitimate dark-scene colour.
-    const float kRawBlackFloor = 0.0080;
-    const float kRawBlackRelease = 0.0600;
-    float floorRemovedY = max(0.0, sceneY - kRawBlackFloor);
-    float floorScale = floorRemovedY / max(sceneY, 1.0e-7);
-    float release = smoothstep(kRawBlackFloor, kRawBlackRelease, sceneY);
-    float blackScale = mix(floorScale, 1.0, release);
-    scene *= blackScale;
-    sceneY = lumaOf(scene);
-    if (sceneY <= 1.0e-7) return vec3(0.0);
-
+    // Black-level ownership is pre-demosaic. AgX must not contain a second
+    // scene-derived black subtraction; it only maps the calibrated scene luma.
     // AgX owns the tone response; scene RGB ratios carry the camera colour.
     float mappedY = applyAgXLumaValue(sceneY);
     float scale = mappedY / max(sceneY, 1.0e-7);

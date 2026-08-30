@@ -107,6 +107,29 @@ SpectraPass1NoRegretGpuResult decideNoRegret(
     acceptance.assign(request.beforeTiles.size(), 0.0f);
     if (after == nullptr || request.beforeTiles.empty()) return result;
 
+    // Pass0 is a frame-wide additive calibration whose magnitude was already qualified by
+    // IspCore's strict CFA residual estimator. A tilewise denoise acceptance map would make a
+    // single physical black offset spatially discontinuous (and could reject it for the mean
+    // change that is the correction itself). Once this pass is dispatched, blend the calibrated
+    // candidate globally. Pass1 retains the ordinary per-tile no-regret path below.
+    if (request.pass0Only) {
+        std::fill(acceptance.begin(), acceptance.end(), 1.0f);
+        result.evaluatedTiles = result.totalTiles;
+        result.acceptedTiles = result.totalTiles;
+        result.invalidTiles = 0;
+        result.rejectedTiles = 0;
+        result.meanAcceptance = 1.0f;
+        result.meanRiskImprovement = 0.0f;
+        result.meanColourShift = 0.0f;
+        result.maxColourShift = 0.0f;
+        result.edgePreservationScore = 1.0f;
+        result.oversmoothingScore = 0.0f;
+        result.acceptanceP10 = 1.0f;
+        result.acceptanceP50 = 1.0f;
+        result.acceptanceP90 = 1.0f;
+        return result;
+    }
+
     std::vector<float> evaluatedAcceptance;
     evaluatedAcceptance.reserve(request.beforeTiles.size());
     double acceptanceSum = 0.0;

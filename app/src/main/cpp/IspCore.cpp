@@ -7,6 +7,7 @@
 #include "RawCfaLevelMapping.h"
 #include "RawDefectCorrectionPolicy.h"
 #include "RawSceneBlackAuthorityPolicy.h"
+#include "RawResidualCfaPedestalPolicy.h"
 #include "RawSpatialNoiseCalibrationPolicy.h"
 #include "RawGreenSplitPolicy.h"
 #include "SpectraContextFusionNoRegret.h"
@@ -2271,6 +2272,16 @@ float medianFromSamples(std::vector<float>& values) {
     return values[middle];
 }
 
+float quantileFromSamples(std::vector<float>& values, float quantile) {
+    if (values.empty()) return 0.0f;
+    const float q = std::clamp(quantile, 0.0f, 1.0f);
+    const size_t index = std::min(
+            values.size() - 1u,
+            static_cast<size_t>(std::lround(q * static_cast<float>(values.size() - 1u))));
+    std::nth_element(values.begin(), values.begin() + static_cast<long>(index), values.end());
+    return values[index];
+}
+
 DefectCorrectionDebug applyDefectCorrectionToJpegRaw(LinearFloatRaw& raw, const IspFrameMetadata& meta) {
     DefectCorrectionDebug debug{};
     const auto start = IspClock::now();
@@ -3182,6 +3193,17 @@ std::string SpectraPass0State::formatDebugString() const {
         << ";greenSplitMad=" << greenSplitMad
         << ";greenSplitTileConsensus=" << greenSplitTileConsensus
         << ";greenSplitTileCount=" << greenSplitTileCount
+        << ";commonGreenResidualBefore=" << commonGreenResidualBefore
+        << ";commonGreenResidualAfter=" << commonGreenResidualAfter
+        << ";commonGreenResidualConfidence=" << commonGreenResidualConfidence
+        << ";commonGreenTileMedian=" << commonGreenTileMedian
+        << ";commonGreenTileMad=" << commonGreenTileMad
+        << ";commonGreenTileConsensus=" << commonGreenTileConsensus
+        << ";commonGreenLowerTailRbMismatch=" << commonGreenLowerTailRbMismatch
+        << ";commonGreenStrictTileCount=" << commonGreenStrictTileCount
+        << ";residualPedestalApplied=" << (residualPedestalApplied ? "true" : "false")
+        << ";residualPedestalReason=" << residualPedestalReason
+        << ";sceneBlackAuthorityMode=" << sceneBlackAuthorityMode
         << ";applyRowCorrection=" << (applyRowCorrection ? "true" : "false")
         << ";rowVarianceBefore=" << rowVarianceBefore
         << ";rowVarianceAfter=" << rowVarianceAfter
@@ -4616,12 +4638,6 @@ SpectraPass0State IspCore::computePass0State(
     const SpectraIsoAdaptiveState isoState = IspCore::resolveSpectraIsoAdaptiveState(meta, uiConfig);
     state.isoAuthority = isoState.lowFrequencyAuthority;
 
-    if (state.spectraMode == 0) {
-        state.fallbackReason = "legacy_mode";
-        state.classification = "K. Insufficient evidence";
-        return state;
-    }
-
     if (raw.mosaic.empty() || raw.mosaic.type() != CV_32FC1) {
         state.fallbackReason = "mosaic_empty";
         state.classification = "K. Insufficient evidence";
@@ -4654,6 +4670,8 @@ SpectraPass0State IspCore::computePass0State(
     std::vector<float> g1g2TileMedians;
     std::vector<float> rMinusGDiffs;
     std::vector<float> bMinusGDiffs;
+    std::array<std::vector<float>, 4> strictResidualChannelSamples;
+    std::vector<float> strictCommonGreenTileMedians;
 
     std::vector<double> rowSums(height, 0.0);
     std::vector<uint64_t> rowCounts(height, 0);
@@ -4690,6 +4708,9 @@ SpectraPass0State IspCore::computePass0State(
 
             if (mean <= nearBlackThreshold && stdDev <= 0.05 && clipFrac <= 0.20) {
                 state.acceptedTileCount++;
+                // Residual black calibration uses a much darker/cleaner subset than the
+                // generic Pass0 observer so scene colour cannot easily masquerade as pedestal.
+                const bool strictResidualTile = mean <= 0.100 && stdDev <= 0.030 && clipFrac <= 0.20;
                 for (int y = ty0; y < ty1; ++y) {
                     const float* r = raw.mosaic.ptr<float>(y);
                     for (int x = tx0; x < tx1; ++x) {
@@ -4698,6 +4719,9 @@ SpectraPass0State IspCore::computePass0State(
                         const int ch = cfaColorChannel(cfaPattern, x, y);
                         if (ch >= 0 && ch < 4) {
                             tileSamples[ch].push_back(v);
+                            if (strictResidualTile) {
+                                strictResidualChannelSamples[static_cast<size_t>(ch)].push_back(v);
+                            }
                             rowSums[y] += v;
                             rowCounts[y]++;
                             colSums[x] += v;
@@ -4707,7 +4731,11 @@ SpectraPass0State IspCore::computePass0State(
                 }
 
                 std::vector<float> tileGreenDiffs;
+                std::vector<float> tileCommonGreenExcesses;
                 tileGreenDiffs.reserve(static_cast<size_t>(std::max(1, (ty1 - ty0) * (tx1 - tx0) / 4)));
+                if (strictResidualTile) {
+                    tileCommonGreenExcesses.reserve(tileGreenDiffs.capacity());
+                }
                 for (int y = ty0; y < ty1 - 1; y += 16) {
                     const float* r0 = raw.mosaic.ptr<float>(y);
                     const float* r1 = raw.mosaic.ptr<float>(y + 1);
@@ -4727,10 +4755,18 @@ SpectraPass0State IspCore::computePass0State(
                         float gAvg = (g1Val + g2Val) * 0.5f;
                         rMinusGDiffs.push_back((rVal - gAvg) * whiteLevel);
                         bMinusGDiffs.push_back((bVal - gAvg) * whiteLevel);
+                        if (strictResidualTile) {
+                            const float rbAvg = 0.5f * (rVal + bVal);
+                            tileCommonGreenExcesses.push_back((gAvg - rbAvg) * whiteLevel);
+                        }
                     }
                 }
                 if (tileGreenDiffs.size() >= 16u) {
                     g1g2TileMedians.push_back(medianFromSamples(tileGreenDiffs));
+                }
+                if (strictResidualTile && tileCommonGreenExcesses.size() >= 16u) {
+                    strictCommonGreenTileMedians.push_back(
+                            medianFromSamples(tileCommonGreenExcesses));
                 }
             }
         }
@@ -4760,6 +4796,38 @@ SpectraPass0State IspCore::computePass0State(
     // G1/G2 divergence must agree across many independent tiles before a
     // frame-wide correction is allowed. A single coloured shadow or directional
     // texture is therefore unable to steer Pass 0.
+    // Estimate the additive common-green pedestal from the lower tail rather than
+    // the ordinary tile median. The lower tail tracks the post-metadata black floor;
+    // independent strict-tile medians provide the spatial/scene-content guard.
+    if (strictResidualChannelSamples[0].size() >= 32u &&
+        strictResidualChannelSamples[1].size() >= 32u &&
+        strictResidualChannelSamples[2].size() >= 32u &&
+        strictResidualChannelSamples[3].size() >= 32u) {
+        std::array<float, 4> lowerTail{};
+        for (int ch = 0; ch < 4; ++ch) {
+            lowerTail[static_cast<size_t>(ch)] = quantileFromSamples(
+                    strictResidualChannelSamples[static_cast<size_t>(ch)], 0.10f) * whiteLevel;
+        }
+        const float greenLowerTail = 0.5f * (lowerTail[1] + lowerTail[2]);
+        const float rbLowerTail = 0.5f * (lowerTail[0] + lowerTail[3]);
+        state.commonGreenResidualBefore = greenLowerTail - rbLowerTail;
+        state.commonGreenLowerTailRbMismatch = std::abs(lowerTail[0] - lowerTail[3]);
+    }
+    state.commonGreenStrictTileCount = static_cast<int>(strictCommonGreenTileMedians.size());
+    if (!strictCommonGreenTileMedians.empty()) {
+        state.commonGreenTileMedian = medianFromSamples(strictCommonGreenTileMedians);
+        int positiveTiles = 0;
+        std::vector<float> deviations;
+        deviations.reserve(strictCommonGreenTileMedians.size());
+        for (const float value : strictCommonGreenTileMedians) {
+            if (value > 0.0f) ++positiveTiles;
+            deviations.push_back(std::abs(value - state.commonGreenTileMedian));
+        }
+        state.commonGreenTileConsensus = static_cast<float>(positiveTiles) /
+                static_cast<float>(strictCommonGreenTileMedians.size());
+        state.commonGreenTileMad = medianFromSamples(deviations);
+    }
+
     state.greenSplitTileCount = static_cast<int>(g1g2TileMedians.size());
     if (!g1g2TileMedians.empty()) {
         state.g1g2Before = medianFromSamples(g1g2TileMedians);
@@ -4811,6 +4879,27 @@ SpectraPass0State IspCore::computePass0State(
     const float predictedGreenSigmaCode = isVstValid(greenS, greenO)
             ? static_cast<float>(std::sqrt(std::max(0.0, greenS * greenSignal + greenO)) * whiteLevel)
             : 1.0f;
+    const auto residualDecision = bncam::raw_black::resolveResidualGreenPedestal({
+            state.commonGreenResidualBefore,
+            state.commonGreenTileMedian,
+            state.commonGreenTileMad,
+            state.commonGreenTileConsensus,
+            state.commonGreenLowerTailRbMismatch,
+            predictedGreenSigmaCode,
+            whiteLevel,
+            state.commonGreenStrictTileCount
+    });
+    state.commonGreenResidualConfidence = residualDecision.confidence;
+    state.residualPedestalReason = residualDecision.reason;
+    if (state.sceneBlackImageMutationAllowed && residualDecision.apply) {
+        const float normalizedCommonGreen =
+                residualDecision.correctionCode / std::max(1.0f, whiteLevel);
+        state.appliedChannelBias[1] -= normalizedCommonGreen;
+        state.appliedChannelBias[2] -= normalizedCommonGreen;
+        state.residualPedestalApplied = true;
+        state.applyChannelBias = true;
+    }
+
     const float activationThresholdCode = std::max(0.75f, 1.5f * predictedGreenSigmaCode);
     const float consistencyLimit = std::max(1.25f, 0.75f * std::abs(state.g1g2Before));
     const float modelConfidence = std::clamp(meta.calibration.signalModelConfidence, 0.0f, 1.0f);
@@ -4818,13 +4907,14 @@ SpectraPass0State IspCore::computePass0State(
             state.greenSplitTileConsensus *
             std::clamp(1.0f - state.greenSplitMad / std::max(consistencyLimit, 1.0e-6f), 0.0f, 1.0f);
 
-    if (state.sceneBlackImageMutationAllowed &&
-        state.acceptedTileCount >= 16 &&
-        state.greenSplitTileCount >= 12 &&
-        state.greenSplitTileConsensus >= 0.80f &&
-        state.channelBiasConfidence >= 0.04f &&
-        std::abs(state.g1g2Before) > activationThresholdCode &&
-        state.greenSplitMad <= consistencyLimit) {
+    const bool greenSplitCorrection = state.sceneBlackImageMutationAllowed &&
+            state.acceptedTileCount >= 16 &&
+            state.greenSplitTileCount >= 12 &&
+            state.greenSplitTileConsensus >= 0.80f &&
+            state.channelBiasConfidence >= 0.04f &&
+            std::abs(state.g1g2Before) > activationThresholdCode &&
+            state.greenSplitMad <= consistencyLimit;
+    if (greenSplitCorrection) {
         const float halfCorrectionCode = std::clamp(
                 0.5f * state.g1g2Before,
                 -1.0f,
@@ -4832,20 +4922,27 @@ SpectraPass0State IspCore::computePass0State(
         );
         const float normalizedHalf = halfCorrectionCode / std::max(1.0f, whiteLevel);
         const float boundedIsoAuthority = std::clamp(0.45f + 0.55f * state.isoAuthority, 0.45f, 1.0f);
-        state.appliedChannelBias[1] = -normalizedHalf * boundedIsoAuthority;
-        state.appliedChannelBias[2] = normalizedHalf * boundedIsoAuthority;
-        state.channelBiasAfter = channelMedians;
-        state.channelBiasAfter[1] += state.appliedChannelBias[1] * whiteLevel;
-        state.channelBiasAfter[2] += state.appliedChannelBias[2] * whiteLevel;
-        state.g1g2After = state.g1g2Before +
-                (state.appliedChannelBias[1] - state.appliedChannelBias[2]) * whiteLevel;
+        state.appliedChannelBias[1] -= normalizedHalf * boundedIsoAuthority;
+        state.appliedChannelBias[2] += normalizedHalf * boundedIsoAuthority;
         state.applyChannelBias = true;
+    }
+
+    state.channelBiasAfter = channelMedians;
+    for (int ch = 0; ch < 4; ++ch) {
+        state.channelBiasAfter[static_cast<size_t>(ch)] +=
+                state.appliedChannelBias[static_cast<size_t>(ch)] * whiteLevel;
+    }
+    state.g1g2After = state.g1g2Before +
+            (state.appliedChannelBias[1] - state.appliedChannelBias[2]) * whiteLevel;
+    state.commonGreenResidualAfter = state.commonGreenResidualBefore +
+            0.5f * (state.appliedChannelBias[1] + state.appliedChannelBias[2]) * whiteLevel -
+            0.5f * (state.appliedChannelBias[0] + state.appliedChannelBias[3]) * whiteLevel;
+    if (state.applyChannelBias) {
         state.fallbackReason = "none";
+    } else if (!state.sceneBlackImageMutationAllowed) {
+        state.fallbackReason = "residual_mutation_not_allowed";
     } else {
-        state.g1g2After = state.g1g2Before;
-        state.fallbackReason = state.sceneBlackImageMutationAllowed
-                ? "no_confident_green_split_bias"
-                : "metadata_black_authoritative_scene_scan_validator_only";
+        state.fallbackReason = residualDecision.reason;
     }
 
     // Row/column and low-frequency residual correction are handled by Pass 3,
@@ -4874,11 +4971,6 @@ SpectraPass0State IspCore::computePass0StateCompact(
     const SpectraIsoAdaptiveState isoState = IspCore::resolveSpectraIsoAdaptiveState(meta, uiConfig);
     state.isoAuthority = isoState.lowFrequencyAuthority;
 
-    if (state.spectraMode == 0) {
-        state.fallbackReason = "legacy_mode";
-        state.classification = "K. Insufficient evidence";
-        return state;
-    }
     if (!raw.valid || raw.info.width <= 0 || raw.info.height <= 0) {
         state.fallbackReason = raw.failureReason.empty() ? "raw16_sample_view_invalid" : raw.failureReason;
         state.classification = "K. Insufficient evidence";
@@ -4903,7 +4995,9 @@ SpectraPass0State IspCore::computePass0StateCompact(
     state.totalTileCount = gridCols * gridRows;
 
     std::array<std::vector<float>, 4> acceptedChannelSamples;
+    std::array<std::vector<float>, 4> strictResidualChannelSamples;
     std::vector<float> g1g2TileMedians;
+    std::vector<float> strictCommonGreenTileMedians;
 
     const auto evenStepForSpan = [](int span) -> int {
         const int target = std::max(2, (span + 15) / 16);
@@ -4928,6 +5022,7 @@ SpectraPass0State IspCore::computePass0StateCompact(
             std::size_t clipped = 0u;
             std::array<std::vector<float>, 4> tileChannelSamples;
             std::vector<float> tileGreenDiffs;
+            std::vector<float> tileCommonGreenExcesses;
 
             for (int y = baseY; y + 1 < ty1; y += stepY) {
                 for (int x = baseX; x + 1 < tx1; x += stepX) {
@@ -4963,9 +5058,10 @@ SpectraPass0State IspCore::computePass0StateCompact(
                         case CFA_GBRG: g1Val = p[0]; bVal = p[1]; rVal = p[2]; g2Val = p[3]; break;
                         case CFA_BGGR: bVal = p[0]; g2Val = p[1]; g1Val = p[2]; rVal = p[3]; break;
                     }
-                    (void)rVal;
-                    (void)bVal;
                     tileGreenDiffs.push_back((g1Val - g2Val) * whiteLevel);
+                    const float greenAvg = 0.5f * (g1Val + g2Val);
+                    const float rbAvg = 0.5f * (rVal + bVal);
+                    tileCommonGreenExcesses.push_back((greenAvg - rbAvg) * whiteLevel);
                 }
             }
 
@@ -4977,13 +5073,24 @@ SpectraPass0State IspCore::computePass0StateCompact(
             if (mean > nearBlackThreshold || stdDev > 0.05 || clipFraction > 0.20) continue;
 
             ++state.acceptedTileCount;
+            const bool strictResidualTile =
+                    mean <= 0.100 && stdDev <= 0.030 && clipFraction <= 0.20;
             for (int channel = 0; channel < 4; ++channel) {
                 auto& destination = acceptedChannelSamples[static_cast<std::size_t>(channel)];
                 const auto& source = tileChannelSamples[static_cast<std::size_t>(channel)];
                 destination.insert(destination.end(), source.begin(), source.end());
+                if (strictResidualTile) {
+                    auto& strictDestination =
+                            strictResidualChannelSamples[static_cast<std::size_t>(channel)];
+                    strictDestination.insert(strictDestination.end(), source.begin(), source.end());
+                }
             }
             if (tileGreenDiffs.size() >= 16u) {
                 g1g2TileMedians.push_back(medianFromSamples(tileGreenDiffs));
+            }
+            if (strictResidualTile && tileCommonGreenExcesses.size() >= 16u) {
+                strictCommonGreenTileMedians.push_back(
+                        medianFromSamples(tileCommonGreenExcesses));
             }
         }
     }
@@ -5004,6 +5111,35 @@ SpectraPass0State IspCore::computePass0StateCompact(
         channelMedians[static_cast<std::size_t>(channel)] = medianFromSamples(samples) * whiteLevel;
         state.channelBiasBefore[static_cast<std::size_t>(channel)] =
                 channelMedians[static_cast<std::size_t>(channel)];
+    }
+
+    if (strictResidualChannelSamples[0].size() >= 32u &&
+        strictResidualChannelSamples[1].size() >= 32u &&
+        strictResidualChannelSamples[2].size() >= 32u &&
+        strictResidualChannelSamples[3].size() >= 32u) {
+        std::array<float, 4> lowerTail{};
+        for (int channel = 0; channel < 4; ++channel) {
+            lowerTail[static_cast<std::size_t>(channel)] = quantileFromSamples(
+                    strictResidualChannelSamples[static_cast<std::size_t>(channel)], 0.10f) * whiteLevel;
+        }
+        const float greenLowerTail = 0.5f * (lowerTail[1] + lowerTail[2]);
+        const float rbLowerTail = 0.5f * (lowerTail[0] + lowerTail[3]);
+        state.commonGreenResidualBefore = greenLowerTail - rbLowerTail;
+        state.commonGreenLowerTailRbMismatch = std::abs(lowerTail[0] - lowerTail[3]);
+    }
+    state.commonGreenStrictTileCount = static_cast<int>(strictCommonGreenTileMedians.size());
+    if (!strictCommonGreenTileMedians.empty()) {
+        state.commonGreenTileMedian = medianFromSamples(strictCommonGreenTileMedians);
+        int positiveTiles = 0;
+        std::vector<float> deviations;
+        deviations.reserve(strictCommonGreenTileMedians.size());
+        for (const float value : strictCommonGreenTileMedians) {
+            if (value > 0.0f) ++positiveTiles;
+            deviations.push_back(std::abs(value - state.commonGreenTileMedian));
+        }
+        state.commonGreenTileConsensus = static_cast<float>(positiveTiles) /
+                static_cast<float>(strictCommonGreenTileMedians.size());
+        state.commonGreenTileMad = medianFromSamples(deviations);
     }
 
     state.greenSplitTileCount = static_cast<int>(g1g2TileMedians.size());
@@ -5047,6 +5183,27 @@ SpectraPass0State IspCore::computePass0StateCompact(
     const float predictedGreenSigmaCode = isVstValid(greenS, greenO)
             ? static_cast<float>(std::sqrt(std::max(0.0, greenS * greenSignal + greenO)) * whiteLevel)
             : 1.0f;
+    const auto residualDecision = bncam::raw_black::resolveResidualGreenPedestal({
+            state.commonGreenResidualBefore,
+            state.commonGreenTileMedian,
+            state.commonGreenTileMad,
+            state.commonGreenTileConsensus,
+            state.commonGreenLowerTailRbMismatch,
+            predictedGreenSigmaCode,
+            whiteLevel,
+            state.commonGreenStrictTileCount
+    });
+    state.commonGreenResidualConfidence = residualDecision.confidence;
+    state.residualPedestalReason = residualDecision.reason;
+    if (state.sceneBlackImageMutationAllowed && residualDecision.apply) {
+        const float normalizedCommonGreen =
+                residualDecision.correctionCode / std::max(1.0f, whiteLevel);
+        state.appliedChannelBias[1] -= normalizedCommonGreen;
+        state.appliedChannelBias[2] -= normalizedCommonGreen;
+        state.residualPedestalApplied = true;
+        state.applyChannelBias = true;
+    }
+
     const float activationThresholdCode = std::max(0.75f, 1.5f * predictedGreenSigmaCode);
     const float consistencyLimit = std::max(1.25f, 0.75f * std::abs(state.g1g2Before));
     const float modelConfidence = std::clamp(meta.calibration.signalModelConfidence, 0.0f, 1.0f);
@@ -5054,28 +5211,36 @@ SpectraPass0State IspCore::computePass0StateCompact(
             state.greenSplitTileConsensus *
             std::clamp(1.0f - state.greenSplitMad / std::max(consistencyLimit, 1.0e-6f), 0.0f, 1.0f);
 
-    if (state.sceneBlackImageMutationAllowed &&
-        state.acceptedTileCount >= 16 && state.greenSplitTileCount >= 12 &&
-        state.greenSplitTileConsensus >= 0.80f && state.channelBiasConfidence >= 0.04f &&
-        std::abs(state.g1g2Before) > activationThresholdCode &&
-        state.greenSplitMad <= consistencyLimit) {
+    const bool greenSplitCorrection = state.sceneBlackImageMutationAllowed &&
+            state.acceptedTileCount >= 16 && state.greenSplitTileCount >= 12 &&
+            state.greenSplitTileConsensus >= 0.80f && state.channelBiasConfidence >= 0.04f &&
+            std::abs(state.g1g2Before) > activationThresholdCode &&
+            state.greenSplitMad <= consistencyLimit;
+    if (greenSplitCorrection) {
         const float halfCorrectionCode = std::clamp(0.5f * state.g1g2Before, -1.0f, 1.0f);
         const float normalizedHalf = halfCorrectionCode / std::max(1.0f, whiteLevel);
         const float boundedIsoAuthority = std::clamp(0.45f + 0.55f * state.isoAuthority, 0.45f, 1.0f);
-        state.appliedChannelBias[1] = -normalizedHalf * boundedIsoAuthority;
-        state.appliedChannelBias[2] = normalizedHalf * boundedIsoAuthority;
-        state.channelBiasAfter = channelMedians;
-        state.channelBiasAfter[1] += state.appliedChannelBias[1] * whiteLevel;
-        state.channelBiasAfter[2] += state.appliedChannelBias[2] * whiteLevel;
-        state.g1g2After = state.g1g2Before +
-                (state.appliedChannelBias[1] - state.appliedChannelBias[2]) * whiteLevel;
+        state.appliedChannelBias[1] -= normalizedHalf * boundedIsoAuthority;
+        state.appliedChannelBias[2] += normalizedHalf * boundedIsoAuthority;
         state.applyChannelBias = true;
+    }
+
+    state.channelBiasAfter = channelMedians;
+    for (int channel = 0; channel < 4; ++channel) {
+        state.channelBiasAfter[static_cast<std::size_t>(channel)] +=
+                state.appliedChannelBias[static_cast<std::size_t>(channel)] * whiteLevel;
+    }
+    state.g1g2After = state.g1g2Before +
+            (state.appliedChannelBias[1] - state.appliedChannelBias[2]) * whiteLevel;
+    state.commonGreenResidualAfter = state.commonGreenResidualBefore +
+            0.5f * (state.appliedChannelBias[1] + state.appliedChannelBias[2]) * whiteLevel -
+            0.5f * (state.appliedChannelBias[0] + state.appliedChannelBias[3]) * whiteLevel;
+    if (state.applyChannelBias) {
         state.fallbackReason = "none";
+    } else if (!state.sceneBlackImageMutationAllowed) {
+        state.fallbackReason = "residual_mutation_not_allowed";
     } else {
-        state.g1g2After = state.g1g2Before;
-        state.fallbackReason = state.sceneBlackImageMutationAllowed
-                ? "no_confident_green_split_bias"
-                : "metadata_black_authoritative_scene_scan_validator_only";
+        state.fallbackReason = residualDecision.reason;
     }
     state.applyRowCorrection = false;
     state.applyColumnCorrection = false;
@@ -5105,7 +5270,7 @@ void IspCore::applySpectraPass0(
                 for (int x = 0; x < width; ++x) {
                     const int ch = cfaColorChannel(cfaPattern, x, y);
                     if (ch >= 0 && ch < 4) {
-                        row[x] += pass0State.appliedChannelBias[ch];
+                        row[x] = std::max(0.0f, row[x] + pass0State.appliedChannelBias[ch]);
                     }
                 }
             }
@@ -6908,7 +7073,7 @@ bool tryApplySpectraPass0Vulkan(
         bncam::vulkan::SpectraResidentPreDemosaicResult* residentResult = nullptr
 ) {
     if (raw.mosaic.empty() || raw.mosaic.type() != CV_32FC1 || beforeField.tiles.empty() ||
-        pass0State.spectraMode == 0 || !pass0State.applyChannelBias ||
+        !pass0State.applyChannelBias ||
         pass0State.applyRowCorrection || pass0State.applyColumnCorrection) {
         return false;
     }
@@ -6988,7 +7153,7 @@ bool tryApplySpectraPass0VulkanResident(
 ) {
     if (!raw.valid || raw.info.width < 9 || raw.info.height < 9 ||
         rawNormalizeGeneration == 0u || beforeField.tiles.empty() ||
-        pass0State.spectraMode == 0 || pass0State.applyRowCorrection || pass0State.applyColumnCorrection) {
+        pass0State.applyRowCorrection || pass0State.applyColumnCorrection) {
         return false;
     }
     const auto runtimeSnapshot = bncam::vulkan::VulkanRuntime::instance().snapshot();
@@ -13036,7 +13201,10 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     bncam::vulkan::SpectraResidentPreDemosaicResult pass0ResidentResult{};
     bool pass0ResidentActive = false;
     const bool spectraEnabledForResidentEntry = workingMeta.calibration.spectraProcessingMode != 0;
-    if (residentEntry && !residentCpuFallbackUsed && spectraEnabledForResidentEntry) {
+    const bool pass0CalibrationRequired = pass0State.applyChannelBias ||
+            pass0State.applyRowCorrection || pass0State.applyColumnCorrection;
+    if (residentEntry && !residentCpuFallbackUsed &&
+        (spectraEnabledForResidentEntry || pass0CalibrationRequired)) {
         const bool pass0GpuApplied = tryApplySpectraPass0VulkanResident(
                 residentInput->sampleView, residentInput->rawNormalizeGeneration,
                 workingMeta, isoState, captureProvenance,
@@ -13051,11 +13219,14 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             }
             if (pass0State.applyChannelBias || pass0State.applyRowCorrection || pass0State.applyColumnCorrection) {
                 spectraPass0CpuPixelMutation = true;
-                ++spectraFullFrameCpuClones;
-                const cv::Mat pass0Before = workingRaw.mosaic.clone();
                 applySpectraPass0(workingRaw, workingMeta, pass0State);
-                pass0NoRegret = applySpectraNoRegretGate(
-                        pass0Before, workingRaw, workingMeta, isoState, captureProvenance, 0);
+                // Pass0 is calibrated black correction, not denoise. Its strict estimator
+                // is the acceptance gate; a mean-drift rollback would undo the intended offset.
+                pass0NoRegret.meanAcceptance = 1.0f;
+                pass0NoRegret.acceptanceP10 = 1.0f;
+                pass0NoRegret.acceptanceP50 = 1.0f;
+                pass0NoRegret.acceptanceP90 = 1.0f;
+                pass0NoRegret.rolledBackPixelFraction = 0.0f;
             }
         }
     } else if (pass0State.applyChannelBias || pass0State.applyRowCorrection || pass0State.applyColumnCorrection) {
@@ -13067,11 +13238,12 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         if (!pass0GpuApplied) {
             pass0State.vulkanCpuFallbackUsed = pass0State.vulkanAttempted;
             spectraPass0CpuPixelMutation = true;
-            ++spectraFullFrameCpuClones;
-            const cv::Mat pass0Before = workingRaw.mosaic.clone();
             applySpectraPass0(workingRaw, workingMeta, pass0State);
-            pass0NoRegret = applySpectraNoRegretGate(
-                    pass0Before, workingRaw, workingMeta, isoState, captureProvenance, 0);
+            pass0NoRegret.meanAcceptance = 1.0f;
+            pass0NoRegret.acceptanceP10 = 1.0f;
+            pass0NoRegret.acceptanceP50 = 1.0f;
+            pass0NoRegret.acceptanceP90 = 1.0f;
+            pass0NoRegret.rolledBackPixelFraction = 0.0f;
         }
     }
     if (pass0State.applyChannelBias || pass0State.applyRowCorrection || pass0State.applyColumnCorrection) {
@@ -16304,6 +16476,13 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     if (noiseAwareRenderGain.active) {
         maxGain = std::min(maxGain, noiseAwareRenderGain.cap);
     }
+    // Mixed-range RAW scenes are normalized locally. A large positive whole-frame gain is what
+    // made the 0-EV captures look pale while the same RAW at a negative render bias retained
+    // convincing orange/terra/black. Cap only the automatic global component here; explicit
+    // profile Exposure remains applied later and FLLF still has bidirectional local authority.
+    if (isRawBayer) {
+        maxGain = std::min(maxGain, dynamicRangeTonePlan.automaticGlobalGainCap);
+    }
 
     const bool classificationConfidenceHigh = outdoorSkyConfidence >= 0.72f ||
             broadHighlightConfidence >= 0.72f;
@@ -16391,11 +16570,11 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
 
     bncam::tone::FastLocalLaplacianPlan fllfPlan = automaticFllfPlan;
     fllfPlan.strength = std::clamp(
-            fllfPlan.strength * profileTonePlan.localToneStrengthScale, 0.0f, 0.55f);
+            fllfPlan.strength * profileTonePlan.localToneStrengthScale, 0.0f, 0.90f);
     fllfPlan.maxLiftEv = std::clamp(
-            fllfPlan.maxLiftEv * profileTonePlan.localToneLiftScale, 0.0f, 0.60f);
+            fllfPlan.maxLiftEv * profileTonePlan.localToneLiftScale, 0.0f, 1.25f);
     fllfPlan.maxCompressEv = std::clamp(
-            fllfPlan.maxCompressEv * profileTonePlan.localToneCompressScale, 0.0f, 0.70f);
+            fllfPlan.maxCompressEv * profileTonePlan.localToneCompressScale, 0.0f, 1.50f);
     fllfPlan.enabled = phase10RawToneArchitecture && automaticFllfPlan.enabled &&
             fllfPlan.strength >= 0.04f;
 
@@ -16557,10 +16736,11 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                     sceneLowerMidtoneLiftAfterNoiseGuard,
                     localToneExposureStackGuard.attenuation);
     const float rawJpegBaseVibrance = lowLightPresentationPlan.rawBaseVibrance;
-    // Phase 10: AgX owns automatic high-exposure colour behavior. The historical automatic RAW
-    // base-vibrance compensation was a second display-colour owner. Explicit profile saturation/
-    // vibrance controls remain user-owned creative look parameters.
-    const float phase10AppliedBaseVibrance = phase10RawToneArchitecture ? 1.0f : rawJpegBaseVibrance;
+    // RAW AgX now maps luminance only, so it preserves existing chromaticity rather than
+    // restoring the chroma lost to display placement. Keep one host-owned, noise-aware base
+    // vibrance policy instead of a hardcoded shader minimum. This remains bounded by the physical
+    // low-light pressure policy and is independent from explicit profile saturation/vibrance.
+    const float phase10AppliedBaseVibrance = rawJpegBaseVibrance;
     constexpr double colorMetricScale = 1000000.0;
     std::atomic<uint64_t> vibranceEffectiveSumQ{0};
     std::atomic<uint32_t> vibranceEffectiveMaxQ{0};
@@ -16861,8 +17041,16 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         request.residentSceneGeneration = vulkanSceneObserver.residentSceneGeneration;
         request.exposureGain = exposureGain;
         request.rawJpegBaseVibrance = phase10AppliedBaseVibrance;
-        request.shoulderStart = effectiveShoulderStart;
-        request.shoulderStrength = effectiveShoulderStrength;
+        // RAW Phase-10 does not execute the legacy rational shoulder. Reuse the two existing
+        // push slots for the already-resolved AgX display-white placement, so the per-scene
+        // policy is actually consumed by the Vulkan DRT instead of remaining debug-only.
+        // YUV keeps the original shoulder semantics unchanged.
+        request.shoulderStart = phase10RawToneArchitecture
+                ? dynamicRangeTonePlan.displayWhiteExpansionStart
+                : effectiveShoulderStart;
+        request.shoulderStrength = phase10RawToneArchitecture
+                ? dynamicRangeTonePlan.displayWhiteExpansionGamma
+                : effectiveShoulderStrength;
         request.localToneStrength = !phase10RawToneArchitecture && localTonePlan.enabled
                 ? localTonePlan.strength : 0.0f;
         request.localToneSceneKey = localTonePlan.sceneKey;
@@ -18858,14 +19046,17 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << dynamicRangeTonePlan.recoverableHighlightPressure
             << "; toneShadowPressure=" << dynamicRangeTonePlan.shadowPressure
             << "; toneDynamicRangePressure=" << dynamicRangeTonePlan.dynamicRangePressure
+            << "; toneSceneRangeStops=" << dynamicRangeTonePlan.sceneRangeStops
+            << "; toneSceneRangeEvidence=" << dynamicRangeTonePlan.sceneRangeEvidence
             << "; toneSceneMidtoneTarget=" << dynamicRangeTonePlan.sceneMidtoneTarget
+            << "; toneAutomaticGlobalGainCap=" << dynamicRangeTonePlan.automaticGlobalGainCap
             << "; phase10ToneArchitecture=" << (phase10RawToneArchitecture ? "GTM_SCENE_PLACEMENT__FLLF__AGX" : "YUV_LEGACY_PRESENTATION")
             << "; phase10RawGtmSceneReferredOnly=" << (phase10RawToneArchitecture ? "true" : "false")
             << "; phase10GtmOutputDomain=" << (phase10RawToneArchitecture ? "SCENE_LINEAR_EXPOSURE_PLACED" : "YUV_PRESENTATION")
             << "; phase10FllfDomain=" << (phase10RawToneArchitecture ? "SCENE_REFERRED_LOG_LUMA_LOCAL_EXPOSURE" : "NOT_RAW")
             << "; phase10AgxRole=" << (phase10RawToneArchitecture ? "SOLE_AUTOMATIC_SCENE_TO_DISPLAY_DRT" : "NOT_RAW")
             << "; phase10AutomaticPostAgxLook=" << (phase10RawToneArchitecture ? "IDENTITY_UNLESS_EXPLICIT_PROFILE_TONE" : "YUV_LEGACY")
-            << "; phase10AutomaticRawBaseVibrance=" << (phase10RawToneArchitecture ? "DISABLED" : "NOT_RAW")
+            << "; phase10AutomaticRawBaseVibrance=" << (phase10RawToneArchitecture ? "HOST_NOISE_AWARE" : "NOT_RAW")
             << "; phase10AgxAllocationMin=" << (phase10RawToneArchitecture ? -12.47393f : 0.0f)
             << "; phase10AgxAllocationMax=" << (phase10RawToneArchitecture ? 4.026069f : 0.0f)
             << "; phase10AgxEotf=" << (phase10RawToneArchitecture ? "SIGNED_2P2_TO_DISPLAY_LINEAR" : "NOT_RAW_PHASE10")
@@ -19990,14 +20181,17 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; toneRecoverableHighlightPressure="
             << dynamicRangeTonePlan.recoverableHighlightPressure
             << "; toneDynamicRangePressure=" << dynamicRangeTonePlan.dynamicRangePressure
+            << "; toneSceneRangeStops=" << dynamicRangeTonePlan.sceneRangeStops
+            << "; toneSceneRangeEvidence=" << dynamicRangeTonePlan.sceneRangeEvidence
             << "; toneSceneMidtoneTarget=" << dynamicRangeTonePlan.sceneMidtoneTarget
+            << "; toneAutomaticGlobalGainCap=" << dynamicRangeTonePlan.automaticGlobalGainCap
             << "; phase10ToneArchitecture=" << (phase10RawToneArchitecture ? "GTM_SCENE_PLACEMENT__FLLF__AGX" : "YUV_LEGACY_PRESENTATION")
             << "; phase10RawGtmSceneReferredOnly=" << (phase10RawToneArchitecture ? "true" : "false")
             << "; phase10GtmOutputDomain=" << (phase10RawToneArchitecture ? "SCENE_LINEAR_EXPOSURE_PLACED" : "YUV_PRESENTATION")
             << "; phase10FllfDomain=" << (phase10RawToneArchitecture ? "SCENE_REFERRED_LOG_LUMA_LOCAL_EXPOSURE" : "NOT_RAW")
             << "; phase10AgxRole=" << (phase10RawToneArchitecture ? "SOLE_AUTOMATIC_SCENE_TO_DISPLAY_DRT" : "NOT_RAW")
             << "; phase10AutomaticPostAgxLook=" << (phase10RawToneArchitecture ? "IDENTITY_UNLESS_EXPLICIT_PROFILE_TONE" : "YUV_LEGACY")
-            << "; phase10AutomaticRawBaseVibrance=" << (phase10RawToneArchitecture ? "DISABLED" : "NOT_RAW")
+            << "; phase10AutomaticRawBaseVibrance=" << (phase10RawToneArchitecture ? "HOST_NOISE_AWARE" : "NOT_RAW")
             << "; phase10AgxAllocationMin=" << (phase10RawToneArchitecture ? -12.47393f : 0.0f)
             << "; phase10AgxAllocationMax=" << (phase10RawToneArchitecture ? 4.026069f : 0.0f)
             << "; phase10AgxEotf=" << (phase10RawToneArchitecture ? "SIGNED_2P2_TO_DISPLAY_LINEAR" : "NOT_RAW_PHASE10")

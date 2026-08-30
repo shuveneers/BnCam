@@ -31,10 +31,10 @@ inline float presentationSmoothstep(float edge0, float edge1, float x) noexcept 
  * physical noise model has already identified. It does not add a denoise pass: full-frame tone
  * and vibrance remain on the existing Vulkan-resident path.
  *
- * Zero physical pressure keeps a small photographic colour compensation only. AgX already
- * restores part of the display-referred chroma, so a large second base-vibrance multiplier would
- * re-amplify WB/CCM residual colour noise. In low light, physical pressure further limits colour
- * amplification while preserving bounded separation.
+ * Zero physical pressure keeps a small photographic colour compensation. RAW AgX is luma-only,
+ * so it preserves camera chromaticity but does not restore presentation chroma by itself. The
+ * bounded base-vibrance term therefore remains the single automatic colour-presence owner. In low
+ * light, physical pressure reduces that term so WB/CCM residual colour noise is not re-amplified.
  */
 inline LowLightPresentationPlan resolveLowLightPresentationPlan(
         const LowLightPresentationInput& input) noexcept {

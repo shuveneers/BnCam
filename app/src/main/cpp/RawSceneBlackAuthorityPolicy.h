@@ -5,16 +5,16 @@ namespace bncam::raw_black {
 struct SceneBlackAuthorityDecision {
     bool metadataAuthoritative = false;
     bool imageDerivedMutationAllowed = true;
-    const char* mode = "IMAGE_DERIVED_FALLBACK_ELIGIBLE";
+    const char* mode = "IMAGE_DERIVED_FALLBACK_PLUS_RESIDUAL";
 };
 
 /**
- * P0 black authority.
+ * Camera2 dynamic/static black metadata owns the electronic black-level baseline.
  *
- * Camera2 dynamic black is first authority; static SENSOR_BLACK_LEVEL_PATTERN is the
- * metadata fallback. Once either has actually been selected by RawDomainContract,
- * a scene-derived dark-tile scan may validate/telemeter the result but must not
- * silently become a second black-level authority.
+ * A scene-derived estimate is never allowed to replace that baseline. It may,
+ * however, remove a *residual* CFA pedestal measured after metadata subtraction.
+ * Treating metadata as a ban on residual correction left a measured common-green
+ * offset in the normalised RAW data and propagated it through WB/CCM/tone.
  */
 constexpr SceneBlackAuthorityDecision resolveSceneBlackAuthority(
         bool dynamicBlackLevelUsed,
@@ -22,10 +22,10 @@ constexpr SceneBlackAuthorityDecision resolveSceneBlackAuthority(
     const bool metadata = dynamicBlackLevelUsed || staticBlackLevelUsed;
     return {
         metadata,
-        !metadata,
+        true,
         metadata
-            ? "METADATA_BLACK_AUTHORITATIVE_VALIDATOR_ONLY"
-            : "IMAGE_DERIVED_FALLBACK_ELIGIBLE"
+            ? "METADATA_BASELINE_PLUS_CONFIDENCE_GATED_RESIDUAL"
+            : "IMAGE_DERIVED_FALLBACK_PLUS_RESIDUAL"
     };
 }
 

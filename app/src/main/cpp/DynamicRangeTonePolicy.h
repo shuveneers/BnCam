@@ -25,9 +25,15 @@ struct DynamicRangeTonePlan {
     float recoverableHighlightPressure = 0.0f;
     float shadowPressure = 0.0f;
     float dynamicRangePressure = 0.0f;
+    float sceneRangeStops = 0.0f;
+    float sceneRangeEvidence = 0.0f;
     float automaticBlackAnchor = 0.010f;
     float effectiveBlackAnchor = 0.010f;
     float sceneMidtoneTarget = 0.155f;
+    // RAW global scene placement is intentionally conservative. Local exposure adaptation owns
+    // mixed bright/dark regions, so the global gain may not pull the whole frame toward middle
+    // grey and wash chroma merely because the histogram contains a large shadow population.
+    float automaticGlobalGainCap = 1.60f;
     float requestedLowerMidLift = 0.0f;
     float contrastStrength = 0.10f;
     float shoulderStart = 0.72f;
@@ -133,10 +139,23 @@ inline DynamicRangeTonePlan resolveDynamicRangeTonePlan(
             0.0f, 1.0f);
     const float occupancyPressure = toneSmoothstep(0.0025f, 0.045f, nearWhite);
     const float displayPressure = std::clamp(input.displayHighlightConfidence, 0.0f, 1.0f);
+
+    // Derive high-dynamic-range evidence from the actual luminance distribution. The former
+    // semantic "display" detector fired with 0.75-0.90 confidence on the supplied flower and
+    // kitchen scenes even though no bright display owned the frame, which made tone policy depend
+    // on a false scene label. Percentile span is content-agnostic and directly answers whether the
+    // frame contains simultaneously dark and bright regions.
+    const float rangeLow = std::max(0.006f, p50);
+    const float rangeHigh = std::max(rangeLow, p95);
+    out.sceneRangeStops = std::clamp(std::log2(rangeHigh / rangeLow), 0.0f, 10.0f);
+    const float rangeSpanEvidence = toneSmoothstep(1.55f, 3.85f, out.sceneRangeStops);
+    const float meaningfulBrightRange = toneSmoothstep(0.28f, 0.72f, p95);
+    out.sceneRangeEvidence = std::clamp(rangeSpanEvidence * meaningfulBrightRange, 0.0f, 1.0f);
+
     const float brightTailEvidence = std::clamp(
-            0.55f * highlightTailPressure +
-            0.25f * occupancyPressure +
-            0.20f * displayPressure,
+            0.62f * highlightTailPressure +
+            0.30f * occupancyPressure +
+            0.08f * displayPressure * out.sceneRangeEvidence,
             0.0f, 1.0f);
     out.recoverableHighlightPressure = std::clamp(
             brightTailEvidence * (1.0f - 0.78f * out.sensorClipPressure),
@@ -153,10 +172,27 @@ inline DynamicRangeTonePlan resolveDynamicRangeTonePlan(
             0.72f * out.sensorClipPressure);
     const float explicitHighDrEvidence = std::max(
             input.strongHighlightScene ? 1.0f : 0.0f,
-            std::max(displayPressure, input.outdoorSkyScene ? 0.65f : 0.0f));
+            std::max(0.92f * out.sceneRangeEvidence, input.outdoorSkyScene ? 0.65f : 0.0f));
     out.dynamicRangePressure = std::clamp(
             out.shadowPressure * std::max(highlightPressure, 0.72f * explicitHighDrEvidence),
             0.0f, 1.0f);
+
+    // Keep global RAW exposure near a neutral scene placement whenever the frame contains both
+    // shadows and recoverable highlights. The previous policy could request 2x-2.8x whole-frame
+    // gain for exactly this scene shape; device captures showed that this washed orange/terra/black
+    // even though the same RAW rendered around -1.5 EV retained correct chroma. Dark scenes without
+    // a meaningful bright tail still receive substantially more global headroom. FLLF owns the
+    // remaining local +/- exposure normalization.
+    const float darkOnlyEvidence = std::clamp(
+            out.shadowPressure *
+                    (1.0f - 0.80f * highlightPressure) *
+                    (1.0f - 0.82f * out.dynamicRangePressure),
+            0.0f, 1.0f);
+    const float lowLightHeadroom = input.lowLightScene ? 0.58f : 0.42f;
+    out.automaticGlobalGainCap = std::clamp(
+            1.05f + lowLightHeadroom * darkOnlyEvidence +
+                    0.08f * (1.0f - out.dynamicRangePressure) * (1.0f - highlightPressure),
+            1.05f, input.lowLightScene ? 1.70f : 1.55f);
 
     // Keep a real black point without using black subtraction as a global-darkening mechanism.
     // The former ~0.010 baseline visibly crushed lower tones after RAW normalization. High-DR

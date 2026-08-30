@@ -104,8 +104,8 @@ struct SpectraResidentToneRequest {
     bool fllfEnabled = false;
     float fllfStrength = 0.0f;
     float fllfSceneKey = 0.150f;
-    float fllfMaxLiftEv = 0.18f;
-    float fllfMaxCompressEv = 0.20f;
+    float fllfMaxLiftEv = 0.55f;
+    float fllfMaxCompressEv = 0.55f;
     float fllfEdgeStopEv = 0.62f;
     float fllfRefinement = 0.10f;
     float fllfShadowLiftNoiseGuardPressure = 0.0f;

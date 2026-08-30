@@ -13,6 +13,7 @@ class Phase3LowLightPresentationSourceContractTest {
         assertTrue(isp.contains("resolveLowLightPresentationPlan"))
         assertTrue(isp.contains("isoState.combinedNoisePressure"))
         assertTrue(isp.contains("lowLightPresentationPlan.rawBaseVibrance"))
+        assertTrue(isp.contains("const float phase10AppliedBaseVibrance = rawJpegBaseVibrance;"))
         assertTrue(policy.contains("if (!input.lowLightScene)"))
         assertTrue(policy.contains("out.rawBaseVibrance = 1.16f"))
         assertTrue(policy.contains("legacyLowLightVibrance"))

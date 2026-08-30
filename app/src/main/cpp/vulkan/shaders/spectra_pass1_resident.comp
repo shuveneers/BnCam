@@ -736,7 +736,9 @@ void pass0Pixel() {
     }
     int ch = cfaChannel(x, y);
     float bias = ch == 0 ? pc.s0 : (ch == 1 ? pc.s1 : (ch == 2 ? pc.s2 : pc.s3));
-    candidateMosaic[index] = original + bias;
+    // RAW-normalize already clips the metadata-subtracted floor at zero. Residual
+    // black calibration must not reintroduce negative sensor values.
+    candidateMosaic[index] = max(0.0, original + bias);
     atomicAdd(telemetry[0], 1u);
     if (abs(bias) > 1.0e-12) atomicAdd(telemetry[1], 1u);
     atomicMax(telemetry[13], floatBitsToUint(abs(bias)));

@@ -1,6 +1,7 @@
 #include "../../main/cpp/DynamicRangeTonePolicy.h"
 
 #include <cassert>
+#include <cmath>
 #include <iostream>
 
 using bncam::tone::allowLowLightSubUnityExposureGain;
@@ -51,6 +52,8 @@ int main() {
     assert(normalPlan.sceneMidtoneTarget >= 0.149f);
     assert(normalPlan.sceneMidtoneTarget <= 0.162f);
     assert(normalPlan.automaticBlackAnchor <= 0.0080f);
+    assert(normalPlan.automaticGlobalGainCap >= 1.05f);
+    assert(normalPlan.automaticGlobalGainCap <= 1.55f);
     assert(normalPlan.shoulderStart >= 0.62f);
 
     const auto backlightPlan = bncam::tone::resolveDynamicRangeTonePlan({
@@ -61,6 +64,7 @@ int main() {
     assert(backlightPlan.dynamicRangePressure > 0.35f);
     assert(backlightPlan.sceneMidtoneTarget >= normalPlan.sceneMidtoneTarget);
     assert(backlightPlan.requestedLowerMidLift > 0.010f);
+    assert(backlightPlan.automaticGlobalGainCap < 1.40f);
     assert(backlightPlan.shoulderStart < normalPlan.shoulderStart);
     assert(backlightPlan.shoulderStrength > normalPlan.shoulderStrength);
 
@@ -71,6 +75,9 @@ int main() {
     });
     assert(darkNoHighlightPlan.sceneMidtoneTarget < normalPlan.sceneMidtoneTarget);
     assert(darkNoHighlightPlan.sceneMidtoneTarget >= 0.130f);
+    // A genuinely dark scene without a bright tail keeps global headroom, so the adaptive
+    // normalization does not turn ordinary low-light captures into the user's -1.5 EV example.
+    assert(darkNoHighlightPlan.automaticGlobalGainCap > 1.55f);
     assert(darkNoHighlightPlan.shoulderStart >= 0.73f);
 
     // Sky/highlight classification must not globally dim the scene. The shoulder owns highlight
@@ -82,6 +89,43 @@ int main() {
     });
     assert(outdoorSkyPlan.sceneMidtoneTarget >= 0.149f);
     assert(outdoorSkyPlan.shoulderStart < normalPlan.shoulderStart);
+
+    // 2026-08-30 RAW_SENSOR regression shapes: prior automatic requested gains were
+    // approximately 1.13x, 2.79x and 1.0x. Mixed-range scenes must keep the global component
+    // conservative and delegate the +/- normalization to FLLF.
+    const auto flowerDevicePlan = bncam::tone::resolveDynamicRangeTonePlan({
+            0.050168f, 0.11f, 0.70f, 0.82f, 0.94f,
+            0.00027f, 0.0020f, 0.898970f, 0.967037f,
+            true, false, false
+    });
+    assert(flowerDevicePlan.dynamicRangePressure > 0.35f);
+    assert(flowerDevicePlan.automaticGlobalGainCap < 1.40f);
+
+    const auto deskDevicePlan = bncam::tone::resolveDynamicRangeTonePlan({
+            0.024831f, 0.07f, 0.78f, 0.90f, 0.98f,
+            0.262f, 0.0040f, 0.824494f, 0.600349f,
+            true, false, false
+    });
+    assert(deskDevicePlan.dynamicRangePressure > 0.45f);
+    assert(deskDevicePlan.automaticGlobalGainCap < 1.40f);
+
+    // A semantic display detector must not create HDR by itself. The supplied captures produced
+    // 0.75..0.90 display confidence on ordinary room content; with identical measured luminance
+    // percentiles that classification may only make a minor contribution.
+    const auto semanticDisplayOff = bncam::tone::resolveDynamicRangeTonePlan({
+            0.070f, 0.16f, 0.48f, 0.57f, 0.64f,
+            0.01f, 0.0004f, 0.0f, 0.2f,
+            true, false, false
+    });
+    const auto semanticDisplayOn = bncam::tone::resolveDynamicRangeTonePlan({
+            0.070f, 0.16f, 0.48f, 0.57f, 0.64f,
+            0.01f, 0.0004f, 1.0f, 0.2f,
+            true, false, false
+    });
+    assert(std::abs(semanticDisplayOn.dynamicRangePressure -
+                    semanticDisplayOff.dynamicRangePressure) < 0.05f);
+    assert(std::abs(semanticDisplayOn.automaticGlobalGainCap -
+                    semanticDisplayOff.automaticGlobalGainCap) < 0.05f);
 
     // Post-AgX white placement is not another exposure adjustment. It must leave the
     // lower/middle display range untouched, remain monotonic, and preserve both endpoints.

@@ -18,10 +18,10 @@ struct FastLocalLaplacianInput {
 
 struct FastLocalLaplacianPlan {
     bool enabled = true;
-    float strength = 0.08f;
+    float strength = 0.30f;
     float sceneKey = 0.150f;
-    float maxLiftEv = 0.18f;
-    float maxCompressEv = 0.20f;
+    float maxLiftEv = 0.55f;
+    float maxCompressEv = 0.55f;
     float edgeStopEv = 0.62f;
     float refinement = 0.10f;
     // 0..1 physical noise pressure controlling only positive deep-shadow lift permission.
@@ -49,39 +49,49 @@ inline FastLocalLaplacianPlan resolveFastLocalLaplacianPlan(
     const float highDrAuthority = std::clamp(
             dynamicRange * (0.62f + 0.38f * highlight), 0.0f, 1.0f);
 
-    // Ordinary scenes receive only weak adaptation. High-DR scenes can use materially more local
-    // authority without turning FLLF into a second global tone mapper.
+    // The FLLF field is the actual local exposure normalizer, not a cosmetic micro-contrast pass.
+    // Device captures proved that the old 0.05..0.20 authority yielded only ~0.006..0.083 EV of
+    // real correction: effectively disabled. Keep materially useful authority in mixed-DR scenes.
+    // Do not reduce the complete field for high ISO: negative highlight compression is safe in
+    // noise and must remain available. Noise limits only positive shadow lift below.
     out.strength = std::clamp(
-            0.055f + 0.30f * highDrAuthority + 0.045f * shadow * highlight,
-            0.045f, 0.40f);
-    if (input.lowLightScene) {
-        out.strength *= 1.0f - 0.38f * noise;
-    }
+            0.30f + 0.36f * dynamicRange + 0.18f * highlight +
+                    0.08f * shadow * highlight,
+            0.28f, 0.82f);
 
     out.sceneKey = std::clamp(input.sceneMidtoneTarget, 0.125f, 0.170f);
 
-    float lift = 0.10f + 0.34f * dynamicRange + 0.05f * shadow;
+    float lift = 0.45f + 0.70f * dynamicRange + 0.25f * shadow;
     if (input.lowLightScene) {
-        lift *= 1.0f - 0.82f * noise;
+        lift *= 1.0f - 0.55f * noise;
     } else {
-        lift *= 1.0f - 0.30f * noise;
+        lift *= 1.0f - 0.20f * noise;
     }
-    out.maxLiftEv = std::clamp(lift, 0.035f, 0.46f);
+    out.maxLiftEv = std::clamp(lift, 0.18f, 1.20f);
+    // Negative local exposure must be driven by actual highlight evidence, not by generic
+    // dynamic-range pressure. Device captures with a bright display in an otherwise dark room
+    // produced dynamicRangePressure ~= 0.72 while recoverable highlight pressure stayed near
+    // zero; coupling compression strongly to dynamicRange therefore turned the display into a
+    // dark island. Dynamic range may add only a small amount of headroom here. Broad/real
+    // highlight evidence remains the primary authority.
     out.maxCompressEv = std::clamp(
-            0.12f + 0.34f * highlight + 0.10f * dynamicRange,
-            0.10f, 0.56f);
+            0.34f + 0.60f * highlight + 0.18f * dynamicRange,
+            0.28f, 0.85f);
+    if (input.lowLightScene) {
+        out.maxCompressEv = std::min(out.maxCompressEv, 0.72f);
+    }
 
     // More noise asks for a larger log-luma edge before local exposure propagation is stopped.
     // This avoids interpreting fine sensor texture as a structural edge while still stopping
     // corrections across real high-contrast boundaries.
     out.edgeStopEv = std::clamp(0.56f + 0.20f * noise, 0.54f, 0.78f);
-    out.refinement = std::clamp(0.08f + 0.08f * highDrAuthority, 0.06f, 0.16f);
+    out.refinement = std::clamp(0.10f + 0.10f * highDrAuthority, 0.08f, 0.22f);
     // Do not invent a sensor-specific luma threshold here. The normalized S/O model has
     // already been collapsed into physical noise pressure; the Vulkan stage converts that
     // pressure into a monotonic deep-shadow lift gate.
     out.shadowLiftNoiseGuardPressure = input.lowLightScene ? noise : 0.0f;
-    out.enabled = out.strength >= 0.04f &&
-            (dynamicRange > 0.025f || highlight > 0.10f || shadow > 0.32f);
+    out.enabled = out.strength >= 0.20f &&
+            (dynamicRange > 0.015f || highlight > 0.08f || shadow > 0.28f);
     return out;
 }
 
