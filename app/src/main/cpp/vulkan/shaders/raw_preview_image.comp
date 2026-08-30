@@ -110,6 +110,17 @@ bool compactNv21AnalysisEnabled() { return pc.histogramStride < 0.0; }
 uint compactNv21Width() { return (pc.previewWidth / 4u) & ~1u; }
 uint compactNv21Height() { return (pc.previewHeight / 4u) & ~1u; }
 
+int cfaMirrorCoordinate(int coordinate, int extent) {
+    // Bayer reconstruction must never clamp an out-of-bounds neighbour onto a site with a
+    // different CFA phase. Mirror around the image edge with an even period so x/y parity is
+    // preserved: -1->1, -2->2 and extent->extent-2 for the even preview domains used here.
+    if (extent <= 1) return 0;
+    int period = 2 * (extent - 1);
+    int wrapped = coordinate % period;
+    if (wrapped < 0) wrapped += period;
+    return wrapped < extent ? wrapped : period - wrapped;
+}
+
 uint loadByte(uint byteAddress) {
     uint word = inputWords[byteAddress >> 2u];
     return (word >> ((byteAddress & 3u) * 8u)) & 0xffu;
@@ -147,8 +158,10 @@ float rawAtSource(int sourceX, int sourceY) {
 }
 
 float normalizedAtUncached(int previewX, int previewY) {
-    uint x = uint(clamp(previewX, 0, int(pc.previewWidth) - 1));
-    uint y = uint(clamp(previewY, 0, int(pc.previewHeight) - 1));
+    int mirroredX = cfaMirrorCoordinate(previewX, int(pc.previewWidth));
+    int mirroredY = cfaMirrorCoordinate(previewY, int(pc.previewHeight));
+    uint x = uint(mirroredX);
+    uint y = uint(mirroredY);
     uint decimation = max(1u, pc.cfaCellDecimation);
 
     int baseX = int((x >> 1u) * 2u * decimation + (x & 1u));
