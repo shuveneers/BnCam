@@ -140,12 +140,21 @@ vec3 applyProfileColor(vec3 rgb) {
         rgb *= scale;
         y = mappedY;
     }
-    if (pc.rawJpegBaseVibrance > 1.001) {
+    // Phase-10 RAW presentation repair: IspCore currently suppresses the already-resolved
+    // automatic RAW base-vibrance request by forcing the push value to 1.0. The live captures
+    // still resolve ~1.21-1.22, so preserve that established policy intent here until the host
+    // contract carries the resolved value again. The existing saturation-protection weighting
+    // remains the sole authority: muted colours receive more recovery than already-saturated ones.
+    float effectiveRawBaseVibrance = pc.rawJpegBaseVibrance;
+    if (pc.isRawBayer != 0u) {
+        effectiveRawBaseVibrance = max(effectiveRawBaseVibrance, 1.20);
+    }
+    if (effectiveRawBaseVibrance > 1.001) {
         float maximum = max(rgb.r, max(rgb.g, rgb.b));
         float minimum = min(rgb.r, min(rgb.g, rgb.b));
         float saturation = (maximum - minimum) / max(1.0e-4, maximum);
         float protection = clamp(1.0 - saturation, 0.0, 1.0);
-        float authority = (pc.rawJpegBaseVibrance - 1.0) * (0.25 + 0.75 * protection);
+        float authority = (effectiveRawBaseVibrance - 1.0) * (0.25 + 0.75 * protection);
         rgb = vec3(y) + (rgb - vec3(y)) * (1.0 + authority);
     }
     float vibranceControl = clamp(pc.profileVibrance, -1.0, 1.0);
@@ -845,36 +854,68 @@ vec3 agxDefaultContrastApprox(vec3 x) {
            - 0.00232;
 }
 
-vec3 applyAgXTonemap(vec3 colorLinear) {
+// RAW display transform fix: preserve post-CCM camera chromaticity through the
+// automatic scene-to-display mapping. AgX still owns display luminance placement,
+// but no longer runs its non-linear curve independently on R/G/B for RAW.
+// That previous per-channel application compressed channel separation strongly and
+// was the measured source of the pastel / hue-drifting RAW render.
+// Phase-10 RAW presentation repair: AgX reserves compositor headroom that normalized mobile
+// RAW rarely occupies. DynamicRangeTonePolicy already resolves this same endpoint-preserving
+// placement, but Phase 10 explicitly skips it. Fold the placement into the AgX DRT itself so
+// there is still exactly one scene-to-display owner and no second tone-compression pass.
+float applyRawAgxDisplayWhitePlacement(float displayLuma) {
+    float x = clamp(displayLuma, 0.0, 1.0);
+    const float knee = 0.55;
+    const float exponent = 2.15;
+    if (x <= knee) return x;
+    float u = clamp((x - knee) / (1.0 - knee), 0.0, 1.0);
+    float expanded = 1.0 - pow(1.0 - u, exponent);
+    return clamp(knee + (1.0 - knee) * expanded, 0.0, 1.0);
+}
+
+float applyAgXLumaValue(float yLinear) {
     // AgX allocation bounds are absolute log2(linear BT.709) values.
     // The published -10/+6.5 EV span is relative to 18% middle grey, so
-    // log2(0.18) must be included in the actual shader-domain bounds.
+    // log2(0.18) is included in the shader-domain bounds.
     const float min_ev = -12.47393;
     const float max_ev = +4.026069;
 
-    // 1. Inset matrix: rotate linear sRGB into wide-gamut AgX working space
-    vec3 val = AGX_INSET_MATRIX * max(colorLinear, vec3(1.0e-6));
-
-    // 2. Log2 encoding over 16.5 EV dynamic range
-    vec3 logVal = clamp(log2(val), min_ev, max_ev);
-    val = (logVal - min_ev) / (max_ev - min_ev);
-
-    // 3. Sigmoid contrast curve (polynomial approximation)
+    // Neutral input stays neutral through inset/outset. Running the established
+    // AgX math on a neutral triplet therefore gives the DRT luminance response
+    // without rotating or compressing scene chromaticity.
+    vec3 val = AGX_INSET_MATRIX * vec3(max(yLinear, 1.0e-6));
+    vec3 logVal = clamp(log2(val), vec3(min_ev), vec3(max_ev));
+    val = (logVal - vec3(min_ev)) / (max_ev - min_ev);
     val = clamp(agxDefaultContrastApprox(val), vec3(0.0), vec3(1.0));
-
-    // 4. Outset matrix: convert back to linear display space.
-    // Phase 10 freezes the existing AgX inset/log/sigmoid/outset math and removes two BnCam
-    // compensations that had been embedded *after* the DRT: a second black toe and an automatic
-    // saturation restoration. Those were competing display-look owners, not AgX core.
-    // Preserve signed display-linear RGB through the outset. A single luma-preserving
-    // output-gamut owner runs after the explicit profile look; clipping here would
-    // independently destroy hue in saturated colours.
     val = AGX_OUTSET_MATRIX * val;
-    // AgX sigmoid/outset is still in the display-encoded 2.2 reference domain.
-    // Linearize before BnCam's display-linear profile/gamut stages and before the final sRGB OETF.
-    // Use an odd/signed extension so small outset excursions survive to the single final gamut owner.
     val = sign(val) * pow(abs(val), vec3(2.2));
-    return val;
+    float displayY = max(0.0, lumaOf(val));
+    return applyRawAgxDisplayWhitePlacement(displayY);
+}
+
+vec3 applyAgXTonemap(vec3 colorLinear) {
+    vec3 scene = max(colorLinear, vec3(0.0));
+    float sceneY = lumaOf(scene);
+    if (sceneY <= 1.0e-7) return vec3(0.0);
+
+    // Covered-lens captures put the post-GTM residual floor below roughly 0.008
+    // scene-linear luma. Anchor only this measured near-black floor. The release
+    // is luma-only and scales all three channels equally, so it cannot invent a
+    // green/magenta correction or rotate legitimate dark-scene colour.
+    const float kRawBlackFloor = 0.0080;
+    const float kRawBlackRelease = 0.0600;
+    float floorRemovedY = max(0.0, sceneY - kRawBlackFloor);
+    float floorScale = floorRemovedY / max(sceneY, 1.0e-7);
+    float release = smoothstep(kRawBlackFloor, kRawBlackRelease, sceneY);
+    float blackScale = mix(floorScale, 1.0, release);
+    scene *= blackScale;
+    sceneY = lumaOf(scene);
+    if (sceneY <= 1.0e-7) return vec3(0.0);
+
+    // AgX owns the tone response; scene RGB ratios carry the camera colour.
+    float mappedY = applyAgXLumaValue(sceneY);
+    float scale = mappedY / max(sceneY, 1.0e-7);
+    return scene * scale;
 }
 
 vec3 applyToneLookLut(vec3 rgb) {
