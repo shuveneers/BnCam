@@ -881,6 +881,7 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
         GLES20.glUniform1f(handles.lensMoving, if (peakingLensMoving) 1f else 0f)
         GLES20.glUniform1f(handles.subjectRoi, if (peakingSubjectRoiActive) 1f else 0f)
         GLES20.glUniform2f(handles.targetCenter, peakingTargetCenterX, peakingTargetCenterY)
+        GLES20.glUniform2f(handles.targetRadius, peakingTargetRadiusX, peakingTargetRadiusY)
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
 
         if (useRaw) {
