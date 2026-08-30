@@ -6,7 +6,7 @@ on:
       - chatgpt/phase1-delta-artifacts-20260830
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   package:
@@ -16,108 +16,73 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Publish clean Delta 03 recovery commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          D2=236a6c4afbffccb02a2953a5b5cf424d257ce7af
+          TARGET=app/src/main/java/com/bncam/ui/screens/capture/FocusPeakingView.kt
+          git checkout --detach "$D2"
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('app/src/main/java/com/bncam/ui/screens/capture/FocusPeakingView.kt')
+          s = p.read_text(encoding='utf-8')
+          needle = '        GLES20.glUniform2f(handles.targetCenter, peakingTargetCenterX, peakingTargetCenterY)\n        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)'
+          replacement = '        GLES20.glUniform2f(handles.targetCenter, peakingTargetCenterX, peakingTargetCenterY)\n        GLES20.glUniform2f(handles.targetRadius, peakingTargetRadiusX, peakingTargetRadiusY)\n        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)'
+          if s.count(needle) != 1:
+              raise RuntimeError('Focus peaking insertion point is not unique')
+          p.write_text(s.replace(needle, replacement), encoding='utf-8')
+          PY
+          git config user.name "BnCam Phase Builder"
+          git config user.email "phase-builder@users.noreply.github.com"
+          git add "$TARGET"
+          test "$(git diff --cached --numstat | awk '{a+=$1; d+=$2} END {print a+0, d+0}')" = "1 0"
+          git commit -m "Phase 1 Delta 03: upload focus ROI radius to peaking shader"
+          git push --force origin HEAD:refs/heads/chatgpt/raw-pipeline-recovery-20260830
+          echo "CLEAN_D3_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
       - name: Build exact delta ZIPs
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path
-          import subprocess, zipfile, shutil
-
+          import subprocess, zipfile, shutil, os
           root = Path('delta_artifacts')
           shutil.rmtree(root, ignore_errors=True)
           root.mkdir(parents=True)
-
           BASE = '0e923d0122dc3c53d25912b47578ed8124a169e5'
           D1 = 'b97eecb3593c6c0f560e9fdd1a074d651f49064c'
           D2 = '236a6c4afbffccb02a2953a5b5cf424d257ce7af'
-          D3_BUILD = 'clean-product-derived-from-D2'
-
-          def git_file(commit: str, path: str) -> bytes:
-              return subprocess.check_output(['git', 'show', f'{commit}:{path}'])
-
-          def write_delta(zip_name: str, commit: str, files: dict[str, bytes], title: str, notes: list[str]):
-              stage = root / zip_name.removesuffix('.zip')
-              for rel, data in files.items():
-                  dest = stage / rel
-                  dest.parent.mkdir(parents=True, exist_ok=True)
-                  dest.write_bytes(data)
-              manifest = [
-                  f'# {title}', '',
-                  f'- Base commit: `{BASE}`',
-                  f'- Delta source: `{commit}`',
-                  '- Delivery format: full replacement source files; copy over the same repo-relative paths.',
-                  '- DELETE_THESE.txt: not required; this delta deletes no files.',
-                  '- Device validation: required before merge to main.', '',
-                  '## Files',
-              ]
-              manifest += [f'- `{p}`' for p in files]
-              manifest += ['', '## Notes'] + [f'- {n}' for n in notes] + ['']
-              (stage / 'DELTA_MANIFEST.md').write_text('\n'.join(manifest), encoding='utf-8')
-              with zipfile.ZipFile(root / zip_name, 'w', compression=zipfile.ZIP_DEFLATED) as z:
+          D3 = os.environ['CLEAN_D3_SHA']
+          def git_file(commit, path): return subprocess.check_output(['git','show',f'{commit}:{path}'])
+          def write_delta(name, commit, files, title, notes):
+              stage = root / name.removesuffix('.zip')
+              for rel,data in files.items():
+                  dest=stage/rel; dest.parent.mkdir(parents=True,exist_ok=True); dest.write_bytes(data)
+              lines=[f'# {title}','',f'- Base commit: `{BASE}`',f'- Delta commit: `{commit}`','- Delivery format: full replacement source files; copy over the same repo-relative paths.','- DELETE_THESE.txt: not required; this delta deletes no files.','- Device validation: required before merge to main.','','## Files']
+              lines += [f'- `{p}`' for p in files]
+              lines += ['','## Notes']+[f'- {n}' for n in notes]+['']
+              (stage/'DELTA_MANIFEST.md').write_text('\n'.join(lines),encoding='utf-8')
+              with zipfile.ZipFile(root/name,'w',compression=zipfile.ZIP_DEFLATED) as z:
                   for p in sorted(stage.rglob('*')):
-                      if p.is_file():
-                          z.write(p, p.relative_to(stage))
+                      if p.is_file(): z.write(p,p.relative_to(stage))
               shutil.rmtree(stage)
-
-          p_shader = 'app/src/main/cpp/vulkan/shaders/raw_preview.comp'
-          p_shader_img = 'app/src/main/cpp/vulkan/shaders/raw_preview_image.comp'
-          write_delta(
-              'BnCam_PHASE1_DELTA01_RAW_CFA_BORDER.zip', D1,
-              {
-                  p_shader: git_file(D1, p_shader),
-                  p_shader_img: git_file(D1, p_shader_img),
-              },
-              'Phase 1 Delta 01 — RAW CFA border parity',
-              [
-                  'Preserves Bayer/CFA phase for out-of-bounds demosaic neighbours by parity-safe mirror addressing.',
-                  'Targets the red/purple first-row edge artifact without cropping the image or changing preview lifecycle.',
-              ]
-          )
-
-          p_focus = 'app/src/main/java/com/bncam/core/quality/FocusConfidenceEngine.kt'
-          write_delta(
-              'BnCam_PHASE1_DELTA02_FOCUS_CFA_TRUTH.zip', D2,
-              {p_focus: git_file(D2, p_focus)},
-              'Phase 1 Delta 02 — CFA-neutral RAW focus evidence',
-              [
-                  'RAW focus confidence now evaluates all four sites of each local 2x2 Bayer cell.',
-                  'Same-phase +2 neighbours are retained, so Bayer colour differences are not misread as focus detail.',
-              ]
-          )
-
-          p_peak = 'app/src/main/java/com/bncam/ui/screens/capture/FocusPeakingView.kt'
-          clean_peak = git_file(D2, p_peak).decode('utf-8')
-          needle = '        GLES20.glUniform2f(handles.targetCenter, peakingTargetCenterX, peakingTargetCenterY)\n        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)'
-          replacement = '        GLES20.glUniform2f(handles.targetCenter, peakingTargetCenterX, peakingTargetCenterY)\n        GLES20.glUniform2f(handles.targetRadius, peakingTargetRadiusX, peakingTargetRadiusY)\n        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)'
-          if clean_peak.count(needle) != 1:
-              raise RuntimeError('Focus peaking target-center insertion point is not unique')
-          clean_peak = clean_peak.replace(needle, replacement)
-          write_delta(
-              'BnCam_PHASE1_DELTA03_FOCUS_ROI_RADIUS.zip', D3_BUILD,
-              {p_peak: clean_peak.encode('utf-8')},
-              'Phase 1 Delta 03 — Focus ROI radius truth',
-              [
-                  'Uploads the real focus ROI radius to the existing uTargetRadius shader uniform.',
-                  'Previously the uniform was declared and consumed but never populated, leaving the GLSL default radius at zero.',
-                  'Product file is derived from the untouched Delta-02 FocusPeakingView and adds exactly one functional line.',
-              ]
-          )
-
-          bundle = root / 'BnCam_PHASE1_ALL_DELTAS.zip'
-          with zipfile.ZipFile(bundle, 'w', compression=zipfile.ZIP_STORED) as z:
-              for name in [
-                  'BnCam_PHASE1_DELTA01_RAW_CFA_BORDER.zip',
-                  'BnCam_PHASE1_DELTA02_FOCUS_CFA_TRUTH.zip',
-                  'BnCam_PHASE1_DELTA03_FOCUS_ROI_RADIUS.zip',
-              ]:
-                  z.write(root / name, name)
+          s1='app/src/main/cpp/vulkan/shaders/raw_preview.comp'; s2='app/src/main/cpp/vulkan/shaders/raw_preview_image.comp'
+          write_delta('BnCam_PHASE1_DELTA01_RAW_CFA_BORDER.zip',D1,{s1:git_file(D1,s1),s2:git_file(D1,s2)},'Phase 1 Delta 01 — RAW CFA border parity',['Preserves Bayer/CFA phase for out-of-bounds demosaic neighbours by parity-safe mirror addressing.','Targets the red/purple first-row edge artifact without cropping or lifecycle changes.'])
+          f='app/src/main/java/com/bncam/core/quality/FocusConfidenceEngine.kt'
+          write_delta('BnCam_PHASE1_DELTA02_FOCUS_CFA_TRUTH.zip',D2,{f:git_file(D2,f)},'Phase 1 Delta 02 — CFA-neutral RAW focus evidence',['Evaluates all four sites in each local 2x2 Bayer cell.','Uses same-phase +2 neighbours so CFA colour differences are not mistaken for focus detail.'])
+          p='app/src/main/java/com/bncam/ui/screens/capture/FocusPeakingView.kt'
+          write_delta('BnCam_PHASE1_DELTA03_FOCUS_ROI_RADIUS.zip',D3,{p:git_file(D3,p)},'Phase 1 Delta 03 — Focus ROI radius truth',['Uploads the real focus ROI radius to uTargetRadius.','The shader previously declared and consumed this uniform but the GL path never populated it.','The commit is exactly +1/-0 lines relative to Delta 02.'])
+          with zipfile.ZipFile(root/'BnCam_PHASE1_ALL_DELTAS.zip','w',compression=zipfile.ZIP_STORED) as z:
+              for n in ['BnCam_PHASE1_DELTA01_RAW_CFA_BORDER.zip','BnCam_PHASE1_DELTA02_FOCUS_CFA_TRUTH.zip','BnCam_PHASE1_DELTA03_FOCUS_ROI_RADIUS.zip']:
+                  z.write(root/n,n)
           PY
 
       - name: Upload Phase 1 delta products
         uses: actions/upload-artifact@v4
         with:
-          name: BnCam-Phase1-Delta-Products
+          name: BnCam-Phase1-Delta-Products-Clean
           path: delta_artifacts/*.zip
           if-no-files-found: error
           retention-days: 7
