@@ -19,10 +19,10 @@
 
 namespace {
 
-// Fixed product tier: 4096x3072 RAW -> 4x CFA-cell decimation -> 1024x768.
-// This restores the previously proven low-latency geometry without adaptive downshifting.
-constexpr int PREVIEW_MAX_WIDTH = 1024;
-constexpr int PREVIEW_MAX_HEIGHT = 768;
+// Kotlin owns the product RAW-preview resolution. Native keeps only a higher hard safety
+// ceiling so a stale or malformed caller can never request an unbounded preview allocation.
+constexpr int PREVIEW_HARD_MAX_WIDTH = 2048;
+constexpr int PREVIEW_HARD_MAX_HEIGHT = 1536;
 constexpr int RAW10_FORMAT = 37;
 constexpr int RAW_SENSOR_FORMAT = 32;
 
@@ -419,8 +419,8 @@ RawPreviewResult renderRawPreviewRgba(
         return result;
     }
 
-    const int boundedMaxWidth = std::clamp(parameters.maxWidth, 64, PREVIEW_MAX_WIDTH);
-    const int boundedMaxHeight = std::clamp(parameters.maxHeight, 64, PREVIEW_MAX_HEIGHT);
+    const int boundedMaxWidth = std::clamp(parameters.maxWidth, 64, PREVIEW_HARD_MAX_WIDTH);
+    const int boundedMaxHeight = std::clamp(parameters.maxHeight, 64, PREVIEW_HARD_MAX_HEIGHT);
     int cropLeft = std::clamp(parameters.sourceCropLeft, 0, std::max(0, fullWidth - 2));
     int cropTop = std::clamp(parameters.sourceCropTop, 0, std::max(0, fullHeight - 2));
     int cropWidth = parameters.sourceCropWidth > 0
