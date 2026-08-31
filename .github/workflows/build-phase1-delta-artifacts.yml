@@ -1,4 +1,4 @@
-name: Build Phase 1 Delta Artifacts
+name: Build Phase 2 RAW Preview Resolution Delta
 
 on:
   push:
@@ -16,73 +16,178 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Publish clean Delta 03 recovery commit
+      - name: Publish atomic Phase 2 Delta 04
         shell: bash
         run: |
           set -euo pipefail
-          D2=236a6c4afbffccb02a2953a5b5cf424d257ce7af
-          TARGET=app/src/main/java/com/bncam/ui/screens/capture/FocusPeakingView.kt
-          git checkout --detach "$D2"
+          BASE=9711e63e013dc84749c06120913fdd95e89b32e5
+          TARGET_BRANCH=chatgpt/raw-pipeline-recovery-20260830
+          git fetch origin "$TARGET_BRANCH"
+          git checkout --detach "$BASE"
+
           python3 - <<'PY'
           from pathlib import Path
-          p = Path('app/src/main/java/com/bncam/ui/screens/capture/FocusPeakingView.kt')
-          s = p.read_text(encoding='utf-8')
-          needle = '        GLES20.glUniform2f(handles.targetCenter, peakingTargetCenterX, peakingTargetCenterY)\n        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)'
-          replacement = '        GLES20.glUniform2f(handles.targetCenter, peakingTargetCenterX, peakingTargetCenterY)\n        GLES20.glUniform2f(handles.targetRadius, peakingTargetRadiusX, peakingTargetRadiusY)\n        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)'
-          if s.count(needle) != 1:
-              raise RuntimeError('Focus peaking insertion point is not unique')
-          p.write_text(s.replace(needle, replacement), encoding='utf-8')
+
+          policy_path = Path('app/src/main/java/com/bncam/core/runtime/RawPreviewResolutionPolicy.kt')
+          policy = policy_path.read_text(encoding='utf-8')
+          old = '''/**
+           * Product resolution contract for the RAW Vulkan viewfinder.
+           *
+           * Fixed RAW viewfinder geometry. A 4096x3072 Bayer producer uses the proven 4x CFA-cell
+           * decimation path (1024x768). Runtime pressure is still handled by newest-frame-wins dropping;
+           * there is no adaptive resolution or quality degradation.
+           */
+          object RawPreviewResolutionPolicy {
+              const val QUALITY_MAX_WIDTH = 1024
+              const val QUALITY_MAX_HEIGHT = 768
+          '''.replace('          ', '')
+          new = '''/**
+           * Product resolution contract for the RAW Vulkan viewfinder.
+           *
+           * The fixed quality target is high enough to avoid visible upscaling softness on modern
+           * viewfinders while retaining bounded GPU cost. A 4096x3072 Bayer producer resolves to
+           * 1364x1024 at 3x CFA-cell decimation. Runtime pressure remains newest-frame-wins dropping;
+           * geometry never degrades adaptively.
+           */
+          object RawPreviewResolutionPolicy {
+              const val QUALITY_MAX_WIDTH = 1440
+              const val QUALITY_MAX_HEIGHT = 1080
+          '''.replace('          ', '')
+          if policy.count(old) != 1:
+              raise RuntimeError('policy contract block mismatch')
+          policy_path.write_text(policy.replace(old, new), encoding='utf-8')
+
+          native_path = Path('app/src/main/cpp/RawPreview.cpp')
+          native = native_path.read_text(encoding='utf-8')
+          old_native = '''// Fixed product tier: 4096x3072 RAW -> 4x CFA-cell decimation -> 1024x768.
+          // This restores the previously proven low-latency geometry without adaptive downshifting.
+          constexpr int PREVIEW_MAX_WIDTH = 1024;
+          constexpr int PREVIEW_MAX_HEIGHT = 768;
+          '''.replace('          ', '')
+          new_native = '''// Kotlin owns the product RAW-preview resolution. Native keeps only a higher hard safety
+          // ceiling so a stale or malformed caller can never request an unbounded preview allocation.
+          constexpr int PREVIEW_HARD_MAX_WIDTH = 2048;
+          constexpr int PREVIEW_HARD_MAX_HEIGHT = 1536;
+          '''.replace('          ', '')
+          if native.count(old_native) != 1:
+              raise RuntimeError('native contract block mismatch')
+          native = native.replace(old_native, new_native)
+          old_clamp = '''    const int boundedMaxWidth = std::clamp(parameters.maxWidth, 64, PREVIEW_MAX_WIDTH);
+              const int boundedMaxHeight = std::clamp(parameters.maxHeight, 64, PREVIEW_MAX_HEIGHT);
+          '''.replace('          ', '')
+          new_clamp = '''    const int boundedMaxWidth = std::clamp(parameters.maxWidth, 64, PREVIEW_HARD_MAX_WIDTH);
+              const int boundedMaxHeight = std::clamp(parameters.maxHeight, 64, PREVIEW_HARD_MAX_HEIGHT);
+          '''.replace('          ', '')
+          if native.count(old_clamp) != 1:
+              raise RuntimeError('native clamp block mismatch')
+          native_path.write_text(native.replace(old_clamp, new_clamp), encoding='utf-8')
+
+          test_path = Path('app/src/test/java/com/bncam/core/runtime/RawPreviewResolutionPolicyTest.kt')
+          test_path.parent.mkdir(parents=True, exist_ok=True)
+          test_path.write_text('''package com.bncam.core.runtime
+
+          import org.junit.Assert.assertEquals
+          import org.junit.Assert.assertTrue
+          import org.junit.Test
+
+          class RawPreviewResolutionPolicyTest {
+              @Test
+              fun twelveMegapixelFourByThreeUsesThreeXCellDecimation() {
+                  assertEquals(3, RawPreviewResolutionPolicy.cfaCellDecimation(4096, 3072))
+                  assertEquals(1364 to 1024, RawPreviewResolutionPolicy.outputDimensions(4096, 3072))
+              }
+
+              @Test
+              fun outputNeverExceedsProductQualityTarget() {
+                  val sources = listOf(4096 to 3072, 4080 to 3060, 8192 to 6144, 4000 to 3000, 4032 to 3024)
+                  sources.forEach { (width, height) ->
+                      val (outWidth, outHeight) = RawPreviewResolutionPolicy.outputDimensions(width, height)
+                      assertTrue(outWidth <= RawPreviewResolutionPolicy.QUALITY_MAX_WIDTH)
+                      assertTrue(outHeight <= RawPreviewResolutionPolicy.QUALITY_MAX_HEIGHT)
+                      assertEquals(0, outWidth and 1)
+                      assertEquals(0, outHeight and 1)
+                  }
+              }
+          }
+          '''.replace('          ', ''), encoding='utf-8')
           PY
+
           git config user.name "BnCam Phase Builder"
           git config user.email "phase-builder@users.noreply.github.com"
-          git add "$TARGET"
-          test "$(git diff --cached --numstat | awk '{a+=$1; d+=$2} END {print a+0, d+0}')" = "1 0"
-          git commit -m "Phase 1 Delta 03: upload focus ROI radius to peaking shader"
-          git push --force origin HEAD:refs/heads/chatgpt/raw-pipeline-recovery-20260830
-          echo "CLEAN_D3_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          git add app/src/main/java/com/bncam/core/runtime/RawPreviewResolutionPolicy.kt \
+                  app/src/main/cpp/RawPreview.cpp \
+                  app/src/test/java/com/bncam/core/runtime/RawPreviewResolutionPolicyTest.kt
+          git commit -m "Phase 2 Delta 04: raise RAW preview detail with single-owner resolution policy"
 
-      - name: Build exact delta ZIPs
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('app/src/main/java/com/bncam/core/runtime/RawPreviewResolutionPolicy.kt').read_text()
+          n = Path('app/src/main/cpp/RawPreview.cpp').read_text()
+          assert 'QUALITY_MAX_WIDTH = 1440' in p
+          assert 'QUALITY_MAX_HEIGHT = 1080' in p
+          assert 'PREVIEW_HARD_MAX_WIDTH = 2048' in n
+          assert 'PREVIEW_HARD_MAX_HEIGHT = 1536' in n
+          assert 'PREVIEW_MAX_WIDTH = 1024' not in n
+          assert 'PREVIEW_MAX_HEIGHT = 768' not in n
+          PY
+
+          chmod +x gradlew
+          ./gradlew :app:testDebugUnitTest --tests com.bncam.core.runtime.RawPreviewResolutionPolicyTest --no-daemon
+
+          git push origin HEAD:refs/heads/chatgpt/raw-pipeline-recovery-20260830
+          echo "DELTA04_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Build exact Phase 2 delta ZIP
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path
-          import subprocess, zipfile, shutil, os
-          root = Path('delta_artifacts')
+          import zipfile, shutil, os
+          root = Path('delta_artifacts_phase2')
           shutil.rmtree(root, ignore_errors=True)
           root.mkdir(parents=True)
-          BASE = '0e923d0122dc3c53d25912b47578ed8124a169e5'
-          D1 = 'b97eecb3593c6c0f560e9fdd1a074d651f49064c'
-          D2 = '236a6c4afbffccb02a2953a5b5cf424d257ce7af'
-          D3 = os.environ['CLEAN_D3_SHA']
-          def git_file(commit, path): return subprocess.check_output(['git','show',f'{commit}:{path}'])
-          def write_delta(name, commit, files, title, notes):
-              stage = root / name.removesuffix('.zip')
-              for rel,data in files.items():
-                  dest=stage/rel; dest.parent.mkdir(parents=True,exist_ok=True); dest.write_bytes(data)
-              lines=[f'# {title}','',f'- Base commit: `{BASE}`',f'- Delta commit: `{commit}`','- Delivery format: full replacement source files; copy over the same repo-relative paths.','- DELETE_THESE.txt: not required; this delta deletes no files.','- Device validation: required before merge to main.','','## Files']
-              lines += [f'- `{p}`' for p in files]
-              lines += ['','## Notes']+[f'- {n}' for n in notes]+['']
-              (stage/'DELTA_MANIFEST.md').write_text('\n'.join(lines),encoding='utf-8')
-              with zipfile.ZipFile(root/name,'w',compression=zipfile.ZIP_DEFLATED) as z:
-                  for p in sorted(stage.rglob('*')):
-                      if p.is_file(): z.write(p,p.relative_to(stage))
-              shutil.rmtree(stage)
-          s1='app/src/main/cpp/vulkan/shaders/raw_preview.comp'; s2='app/src/main/cpp/vulkan/shaders/raw_preview_image.comp'
-          write_delta('BnCam_PHASE1_DELTA01_RAW_CFA_BORDER.zip',D1,{s1:git_file(D1,s1),s2:git_file(D1,s2)},'Phase 1 Delta 01 — RAW CFA border parity',['Preserves Bayer/CFA phase for out-of-bounds demosaic neighbours by parity-safe mirror addressing.','Targets the red/purple first-row edge artifact without cropping or lifecycle changes.'])
-          f='app/src/main/java/com/bncam/core/quality/FocusConfidenceEngine.kt'
-          write_delta('BnCam_PHASE1_DELTA02_FOCUS_CFA_TRUTH.zip',D2,{f:git_file(D2,f)},'Phase 1 Delta 02 — CFA-neutral RAW focus evidence',['Evaluates all four sites in each local 2x2 Bayer cell.','Uses same-phase +2 neighbours so CFA colour differences are not mistaken for focus detail.'])
-          p='app/src/main/java/com/bncam/ui/screens/capture/FocusPeakingView.kt'
-          write_delta('BnCam_PHASE1_DELTA03_FOCUS_ROI_RADIUS.zip',D3,{p:git_file(D3,p)},'Phase 1 Delta 03 — Focus ROI radius truth',['Uploads the real focus ROI radius to uTargetRadius.','The shader previously declared and consumed this uniform but the GL path never populated it.','The commit is exactly +1/-0 lines relative to Delta 02.'])
-          with zipfile.ZipFile(root/'BnCam_PHASE1_ALL_DELTAS.zip','w',compression=zipfile.ZIP_STORED) as z:
-              for n in ['BnCam_PHASE1_DELTA01_RAW_CFA_BORDER.zip','BnCam_PHASE1_DELTA02_FOCUS_CFA_TRUTH.zip','BnCam_PHASE1_DELTA03_FOCUS_ROI_RADIUS.zip']:
-                  z.write(root/n,n)
+          stage = root / 'BnCam_PHASE2_DELTA04_RAW_PREVIEW_RESOLUTION'
+          files = [
+              'app/src/main/java/com/bncam/core/runtime/RawPreviewResolutionPolicy.kt',
+              'app/src/main/cpp/RawPreview.cpp',
+              'app/src/test/java/com/bncam/core/runtime/RawPreviewResolutionPolicyTest.kt',
+          ]
+          for rel in files:
+              dst = stage / rel
+              dst.parent.mkdir(parents=True, exist_ok=True)
+              dst.write_bytes(Path(rel).read_bytes())
+          manifest = f'''# Phase 2 Delta 04 — RAW preview resolution ownership and detail
+
+          - Base commit: `9711e63e013dc84749c06120913fdd95e89b32e5`
+          - Result commit: `{os.environ['DELTA04_SHA']}`
+          - Delivery format: full replacement source files at repo-relative paths.
+          - DELETE_THESE.txt: not required; no files are deleted.
+          - Device validation: required before merge to main.
+
+          ## Functional change
+          - Product quality target changes from 1024x768 to 1440x1080.
+          - 4096x3072 RAW resolves to 1364x1024 at CFA-cell decimation 3 instead of 1024x768 at decimation 4.
+          - Kotlin RawPreviewResolutionPolicy is the product resolution owner.
+          - Native retains only a 2048x1536 hard safety ceiling.
+          - Newest-frame-wins queueing, fence timeouts, slot count and lifecycle behavior are unchanged.
+
+          ## Files
+          '''.replace('          ', '') + ''.join(f'- `{p}`\n' for p in files)
+          (stage / 'DELTA_MANIFEST.md').write_text(manifest, encoding='utf-8')
+          delta = root / 'BnCam_PHASE2_DELTA04_RAW_PREVIEW_RESOLUTION.zip'
+          with zipfile.ZipFile(delta, 'w', compression=zipfile.ZIP_DEFLATED) as z:
+              for p in sorted(stage.rglob('*')):
+                  if p.is_file(): z.write(p, p.relative_to(stage))
+          with zipfile.ZipFile(root / 'BnCam_PHASE2_ALL_DELTAS.zip', 'w', compression=zipfile.ZIP_STORED) as z:
+              z.write(delta, delta.name)
+          shutil.rmtree(stage)
           PY
 
-      - name: Upload Phase 1 delta products
+      - name: Upload Phase 2 delta products
         uses: actions/upload-artifact@v4
         with:
-          name: BnCam-Phase1-Delta-Products-Clean
-          path: delta_artifacts/*.zip
+          name: BnCam-Phase2-Delta-Products
+          path: delta_artifacts_phase2/*.zip
           if-no-files-found: error
           retention-days: 7
