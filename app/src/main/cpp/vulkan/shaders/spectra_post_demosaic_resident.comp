@@ -615,14 +615,24 @@ void runSpatialNr(uint x, uint localOutputY, uint y) {
     float y_0_p1  = dot(r_0_p1,  vec3(kLumaR, kLumaG, kLumaB));
     float y_p1_p1 = dot(r_p1_p1, vec3(kLumaR, kLumaG, kLumaB));
 
-    float gx = (y_p1_m1 + 2.0 * y_p1_0 + y_p1_p1) - (y_m1_m1 + 2.0 * y_m1_0 + y_m1_p1);
-    float gy = (y_m1_p1 + 2.0 * y_0_p1 + y_p1_p1) - (y_m1_m1 + 2.0 * y_0_m1 + y_m1_p1);
+    float gxTop = y_p1_m1 - y_m1_m1;
+    float gxMid = y_p1_0 - y_m1_0;
+    float gxBottom = y_p1_p1 - y_m1_p1;
+    float gyLeft = y_m1_p1 - y_m1_m1;
+    float gyMid = y_0_p1 - y_0_m1;
+    float gyRight = y_p1_p1 - y_p1_m1;
+    float gx = gxTop + 2.0 * gxMid + gxBottom;
+    float gy = gyLeft + 2.0 * gyMid + gyRight;
     float gradMag = sqrt(gx * gx + gy * gy);
 
-    float jxx = gx * gx;
-    float jyy = gy * gy;
-    float jxy = gx * gy;
-    float dirCoherence = ((jxx - jyy) * (jxx - jyy) + 4.0 * jxy * jxy) / max(1.0e-6, (jxx + jyy) * (jxx + jyy));
+    // Directional agreement distinguishes real local edge/texture traces from random
+    // high-frequency noise. The former rank-1 tensor expression evaluated to ~1 for
+    // every non-zero Sobel gradient and therefore could not provide that distinction.
+    float coherentX = abs(gx) /
+        max(1.0e-6, abs(gxTop) + 2.0 * abs(gxMid) + abs(gxBottom));
+    float coherentY = abs(gy) /
+        max(1.0e-6, abs(gyLeft) + 2.0 * abs(gyMid) + abs(gyRight));
+    float dirCoherence = clamp(max(coherentX, coherentY), 0.0, 1.0);
 
     // Calculate 5x5 local luma variance
     float lumaSum = 0.0;
@@ -641,6 +651,15 @@ void runSpatialNr(uint x, uint localOutputY, uint y) {
     float normLocalStd = sqrt(localLumaVar) / max(1.0e-4, predNoiseSigma);
     float normGrad = gradMag / max(1.0e-4, predNoiseSigma);
     float rawStructure = (0.50 * normLocalStd + 0.50 * normGrad) * (0.75 + 0.75 * dirCoherence);
+
+    // One-pixel coherent micro-detail guard. Sobel carries four units of directional
+    // gain, so normalize by 4*sigma before comparing against the physical noise model.
+    // This does not sharpen or invent detail; it releases residual luma denoise only
+    // where signed local gradients agree strongly enough to be real structure.
+    float coherentGradientSigma = gradMag / max(4.0e-4, 4.0 * predNoiseSigma);
+    float microDetailConfidence =
+        smoothstepExact(1.20, 3.20, coherentGradientSigma) *
+        smoothstepExact(0.48, 0.86, dirCoherence);
 
     float detailMod = clamp(pc.padding3, -1.0, 1.0); // Detail protection slider
     float structureThresh = 2.20 * (1.0 - 0.40 * detailMod);
@@ -779,8 +798,13 @@ void runSpatialNr(uint x, uint localOutputY, uint y) {
     float lumaBlendBase = pc.noiseModelMultiplier > 1.05
         ? (pc.noiseModelMultiplier - 1.0) * 0.25 : 0.0;
     float lumaUserBoost = spectraResidualGate * pc.configuredDynamicIsoCoeff * 0.45;
+    // Flat/noisy areas retain the existing cleanup. Confirmed structure and coherent
+    // one-pixel detail release luma authority much more aggressively, preventing fine
+    // texture and edge acutance from being dragged into the residual denoise.
+    float structureLumaRelease = 1.0 - 0.82 * structureConfidence;
+    float microDetailLumaRelease = 1.0 - 0.78 * microDetailConfidence;
     float baseLumaBlend = clamp(((0.50 + lumaBlendBase + lumaUserBoost) * lumaUserMult) *
-        (1.0 - 0.65 * structureConfidence) * shadowFactor * highlightGate *
+        structureLumaRelease * microDetailLumaRelease * shadowFactor * highlightGate *
         pc.downstreamLumaAuthority, 0.0, 0.95);
     float profileLumaDetailProtection = 0.45 + 0.40 * profileNrLuminanceDetail;
     float profileLumaContrastProtection = 0.25 * profileNrLuminanceContrast * structureConfidence;

@@ -9485,7 +9485,12 @@ class BnCameraManager(private val context: Context) {
             // a physical-sensor rectangle into the opened logical camera request (or vice versa).
             val touchRegion = activeTapAeRegion
             val touchPhysicalId = activeTapAePhysicalCameraId
-            if (touchRegion != null) {
+            // Explicit metering selections are authoritative AE owners. A focus tap may
+            // temporarily own AE only while metering is Auto; otherwise it remains AF-only.
+            if (touchRegion != null && resolvedMode != MeteringMode.AUTO_DEFAULT_AE) {
+                clearTouchAeOverride()
+            }
+            if (touchRegion != null && resolvedMode == MeteringMode.AUTO_DEFAULT_AE) {
                 if (
                     touchPhysicalId != null && touchPhysicalId == activePhysicalId &&
                     physicalAeWritable && physicalMaxAeRegions > 0 &&
@@ -10778,10 +10783,13 @@ class BnCameraManager(private val context: Context) {
             }
 
             val manualExposureActive = requestedManualIso != null || requestedManualExposureNs != null
-            val touchAeRegionApplied = !manualExposureActive && maxAeRegions > 0
+            val selectedMeteringMode = MeteringMode.fromSetting(currentMeteringStyle)
+            val touchAeRegionApplied = !manualExposureActive &&
+                selectedMeteringMode == MeteringMode.AUTO_DEFAULT_AE &&
+                maxAeRegions > 0
             if (touchAeRegionApplied) {
-                // Touch-to-focus temporarily owns AE for every standard metering mode, matching
-                // PhotonCamera. Keep the exact mapped region so preview and still capture agree.
+                // Auto may temporarily let a focus tap own AE. Explicit metering modes remain
+                // authoritative and use the branch below to restore their configured AE region.
                 if (fallbackPhysicalCameraId != null && physicalAeRegionWritable &&
                     Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
                 ) {
