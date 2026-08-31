@@ -1,0 +1,27 @@
+name: Phase 3 AWB audit
+
+on:
+  push:
+    branches:
+      - chatgpt/phase3-builder-20260831
+  workflow_dispatch:
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: AWB ownership audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo '=== HEAD ==='
+          git rev-parse HEAD
+          echo '=== PhysicalAwbEstimator references ==='
+          grep -RIn --exclude-dir=.git -E 'PhysicalAwbEstimator|bncam::awb::resolve|decodeGpuResidualCandidates' app/src || true
+          echo '=== RAW preview WB/color pair references ==='
+          grep -RIn --exclude-dir=.git -E 'updateWhiteBalanceGains|updateExactFrameCamera2ColorPair|WhiteBalanceStateEngine|stableAutoWhiteBalance|COLOR_CORRECTION_GAINS|COLOR_CORRECTION_TRANSFORM' app/src/main/java/com/bncam/core app/src/main/java/com/bncam/ui/screens/capture || true
+          echo '=== AWB tests ==='
+          find app/src/test -type f -print | sort | grep -Ei 'white|awb|color|preview' || true
