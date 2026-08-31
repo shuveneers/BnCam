@@ -236,6 +236,11 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
     private var rawTextureRotationDegrees: Int = 0
     @Volatile private var rawTextureGeneration: Int = -1
     private val pendingRawFrame = AtomicReference<RawPreviewFrame?>(null)
+    // GL-thread-owned display pin. A GPU-resident AHardwareBuffer must remain unavailable to
+    // Vulkan for as long as it is the texture currently eligible for redraw. Releasing it after
+    // only the first draw allows a later guidance/UI redraw to sample the same AHB while Vulkan
+    // has already started overwriting it for a newer RAW frame.
+    @Volatile private var pinnedDisplayedGpuFrame: RawPreviewFrame? = null
 
     @Volatile private var displayedSource: ViewfinderEffectiveSource = ViewfinderEffectiveSource.YUV
     @Volatile private var displayedGeneration: Int = -1
@@ -404,14 +409,11 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
                                     (0.15 + 0.85 * resolvedGate) *
                                     contrastGate * tonalGate;
 
-            // Confidence changes selectivity only modestly. A globally confident AF result must
-            // never lower the threshold enough to paint unrelated background texture.
+            // Local image evidence owns peaking sensitivity. Global AF confidence may suppress
+            // uncertain states, but it must never lower the local threshold and paint unrelated
+            // background texture merely because Camera2 reports a confident focus state.
             float threshold = 0.062;
-            if (uFocusClass > 0.5) {
-                threshold = mix(0.052, 0.042, uFocusConfidence);
-            } else if (uFocusClass < -0.5) {
-                threshold = 0.080;
-            }
+            if (uFocusClass < -0.5) threshold = 0.080;
             if (uAfScanning > 0.5) threshold *= 1.16;
             if (uLensMoving > 0.5) threshold *= 1.28;
 
@@ -434,8 +436,19 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
             if (uAfScanning > 0.5) motionAlpha *= 0.70;
             if (uLensMoving > 0.5) motionAlpha *= 0.45;
 
+            // Confidence is one-way authority: low/indeterminate confidence can reduce overlay
+            // certainty, while high confidence cannot manufacture extra local sharpness evidence.
+            float confidenceAlpha = 1.0;
+            if (uFocusClass > 0.5) {
+                confidenceAlpha = mix(0.82, 1.0, uFocusConfidence);
+            } else if (uFocusClass < -0.5) {
+                confidenceAlpha = 0.45;
+            } else {
+                confidenceAlpha = mix(0.58, 0.82, uFocusConfidence);
+            }
+
             float peakAlpha = smoothstep(threshold, threshold * 2.10, focusLikelihood) *
-                              0.92 * roiAlpha * motionAlpha;
+                              0.92 * roiAlpha * motionAlpha * confidenceAlpha;
             gl_FragColor = vec4(mix(color.rgb, uColor, peakAlpha), color.a);
         }
     """.trimIndent()
@@ -491,6 +504,9 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
         }
         if (source == ViewfinderEffectiveSource.YUV) {
             clearRawSurfaceFrameRate()
+            // Retire the last RAW display pin on the GL owner thread. The fence is ordered after
+            // every prior RAW draw, so Vulkan cannot reclaim that AHB while GLES may still sample it.
+            runCatching { queueEvent { retirePinnedDisplayedGpuFrameOnGlThread() } }
             // The validated OES frame is already resident because the YUV commit is issued from
             // onDrawFrame after updateTexImage(). Request the next draw to publish it.
             requestRender()
@@ -503,6 +519,7 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
     fun clearPreviewForCameraTransition() {
         acceptingRawFrames = false
         pendingRawFrame.getAndSet(null)?.close()
+        runCatching { queueEvent { retirePinnedDisplayedGpuFrameOnGlThread() } }
         synchronized(presentationLock) { pendingPresentations.clear() }
         rawFrameRateEstimator.reset()
         clearRawSurfaceFrameRate()
@@ -608,6 +625,10 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
     }
 
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
+        // A recreated EGL context cannot still sample the previous context's RAW texture. Any
+        // retained display pin is therefore safe to return before new GL resources are created.
+        pinnedDisplayedGpuFrame?.close()
+        pinnedDisplayedGpuFrame = null
         detached = false
         acceptingRawFrames = displayedSource != ViewfinderEffectiveSource.YUV
         rawTextureGeneration = -1
@@ -699,7 +720,7 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
         }
 
         var uploadedRawFrame: RawPreviewFrame? = null
-        var gpuFrameAwaitingFence: RawPreviewFrame? = null
+        var gpuFrameToRetireAfterDraw: RawPreviewFrame? = null
         if (useRaw) {
             pendingRawFrame.getAndSet(null)?.let { frame ->
                 var releaseImmediately = true
@@ -754,11 +775,20 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
                             displayReady = true
                             lastDrawnRawFrame = frame
                             uploadedRawFrame = frame
+                            val previousPinnedGpuFrame = pinnedDisplayedGpuFrame
                             if (frame.gpuResidentOutputUsed) {
-                                // The slot remains owned by this frame until a fence inserted after
-                                // glDrawArrays signals. The Vulkan worker will not recycle it earlier.
-                                gpuFrameAwaitingFence = frame
+                                // Keep the newly displayed AHB pinned across redraws. It is retired
+                                // only after a successor has successfully taken display ownership.
+                                pinnedDisplayedGpuFrame = frame
+                                if (previousPinnedGpuFrame != null && previousPinnedGpuFrame !== frame) {
+                                    gpuFrameToRetireAfterDraw = previousPinnedGpuFrame
+                                }
                                 releaseImmediately = false
+                            } else if (previousPinnedGpuFrame != null) {
+                                // CPU upload owns an independent GL texture copy. Once this draw is
+                                // submitted the former GPU-backed display can be retired safely.
+                                pinnedDisplayedGpuFrame = null
+                                gpuFrameToRetireAfterDraw = previousPinnedGpuFrame
                             }
                             RawPreviewCadenceDiagnostics.glUploadCompleted(
                                 frame.source,
@@ -881,6 +911,7 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
         GLES20.glUniform1f(handles.lensMoving, if (peakingLensMoving) 1f else 0f)
         GLES20.glUniform1f(handles.subjectRoi, if (peakingSubjectRoiActive) 1f else 0f)
         GLES20.glUniform2f(handles.targetCenter, peakingTargetCenterX, peakingTargetCenterY)
+        GLES20.glUniform2f(handles.targetRadius, peakingTargetRadiusX, peakingTargetRadiusY)
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
 
         if (useRaw) {
@@ -902,9 +933,10 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
             yuvFramesDrawnCount++
         }
 
-        gpuFrameAwaitingFence?.let { frame ->
-            // The fence is non-blocking: renderer slot reuse polls it from BnCamRawPreview. If the
-            // driver cannot create one, the backing slot is quarantined rather than reused unsafely.
+        gpuFrameToRetireAfterDraw?.let { frame ->
+            // Fence retirement occurs only after a successor texture has been drawn. This preserves
+            // the currently displayed AHB across arbitrary redraws without introducing a GL wait.
+            // If fence creation fails the backing slot is quarantined rather than reused unsafely.
             frame.closeAfterGlFence(ImageUtils.createRawPreviewGlFence())
         }
 
@@ -1026,6 +1058,14 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
         }
     }
 
+    private fun retirePinnedDisplayedGpuFrameOnGlThread() {
+        val frame = pinnedDisplayedGpuFrame ?: return
+        pinnedDisplayedGpuFrame = null
+        // queueEvent executes on the GL owner thread. A fence inserted here is ordered after every
+        // previous draw that could have sampled this AHB, while remaining fully non-blocking.
+        frame.closeAfterGlFence(ImageUtils.createRawPreviewGlFence())
+    }
+
     private fun clearRawSurfaceFrameRate() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R || appliedRawSurfaceFrameRate == 0f) return
         if (detached) {
@@ -1087,6 +1127,11 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
         // to release from the UI thread.
         quiesceForComposeRelease()
         super.onDetachedFromWindow()
+        // GLSurfaceView has synchronously retired its GL thread at this point, so no texture can
+        // sample the pinned AHB anymore. RawPreviewFrame.close() is idempotent if a queued fence
+        // retirement already ran before teardown.
+        pinnedDisplayedGpuFrame?.close()
+        pinnedDisplayedGpuFrame = null
         surfaceTexture?.release()
         surfaceTexture = null
     }

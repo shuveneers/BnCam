@@ -1,6 +1,8 @@
 #include "VulkanRawPreviewBackend.h"
 #include "VulkanPipelineCacheRegistry.h"
 
+#include <cstring>
+
 #ifndef BNCAM_VMA_HEADER_AVAILABLE
 #define BNCAM_VMA_HEADER_AVAILABLE 0
 #endif
@@ -68,7 +70,32 @@ struct alignas(16) PushConstants {
     float profileVibrance = 0.0f;
 };
 static_assert(sizeof(PushConstants) == 128u, "RAW preview push constant layout mismatch");
-constexpr std::uint64_t PREVIEW_STATS_BASE_WORDS = 572u;
+constexpr std::uint64_t PREVIEW_AWB_STATS_START_WORD = 572u;
+constexpr std::uint64_t PREVIEW_AWB_SAMPLE_WORDS = 5u;
+constexpr std::uint64_t PREVIEW_AWB_STATS_WORDS =
+        static_cast<std::uint64_t>(RAW_PREVIEW_AWB_SAMPLE_COUNT) * PREVIEW_AWB_SAMPLE_WORDS;
+constexpr std::uint64_t PREVIEW_PHYSICAL_NOISE_START_WORD =
+        PREVIEW_AWB_STATS_START_WORD + PREVIEW_AWB_STATS_WORDS;
+constexpr std::uint64_t PREVIEW_SPATIAL_EXPOSURE_GRID_WIDTH = 64u;
+constexpr std::uint64_t PREVIEW_SPATIAL_EXPOSURE_GRID_HEIGHT = 48u;
+constexpr std::uint64_t PREVIEW_SPATIAL_EXPOSURE_TILE_COUNT =
+        PREVIEW_SPATIAL_EXPOSURE_GRID_WIDTH * PREVIEW_SPATIAL_EXPOSURE_GRID_HEIGHT;
+constexpr std::uint64_t PREVIEW_SPATIAL_EXPOSURE_EVIDENCE_WORDS = 4u;
+constexpr std::uint64_t PREVIEW_SPATIAL_EXPOSURE_EVIDENCE_START_WORD =
+        PREVIEW_PHYSICAL_NOISE_START_WORD + 3u;
+constexpr std::uint64_t PREVIEW_SPATIAL_EXPOSURE_MAP_START_WORD =
+        PREVIEW_SPATIAL_EXPOSURE_EVIDENCE_START_WORD +
+        PREVIEW_SPATIAL_EXPOSURE_TILE_COUNT * PREVIEW_SPATIAL_EXPOSURE_EVIDENCE_WORDS;
+constexpr std::uint64_t PREVIEW_SPATIAL_EXPOSURE_LOG_HIST_BINS = 192u;
+constexpr std::uint64_t PREVIEW_SPATIAL_EXPOSURE_LOG_HIST_START_WORD =
+        PREVIEW_SPATIAL_EXPOSURE_MAP_START_WORD + PREVIEW_SPATIAL_EXPOSURE_TILE_COUNT;
+constexpr std::uint64_t PREVIEW_SPATIAL_EXPOSURE_SUMMARY_START_WORD =
+        PREVIEW_SPATIAL_EXPOSURE_LOG_HIST_START_WORD + PREVIEW_SPATIAL_EXPOSURE_LOG_HIST_BINS;
+constexpr std::uint64_t PREVIEW_SPATIAL_EXPOSURE_SUMMARY_WORDS = 12u;
+constexpr std::uint64_t PREVIEW_ANALYSIS_NV21_START_WORD =
+        PREVIEW_SPATIAL_EXPOSURE_SUMMARY_START_WORD + PREVIEW_SPATIAL_EXPOSURE_SUMMARY_WORDS;
+static_assert(PREVIEW_PHYSICAL_NOISE_START_WORD == 15932u, "RAW preview physical-noise ABI mismatch");
+static_assert(PREVIEW_ANALYSIS_NV21_START_WORD == 31499u, "RAW preview Phase-5 statistics ABI mismatch");
 }  // namespace
 
 bool VulkanRawPreviewBackend::ensureBufferLocked(
@@ -834,7 +861,7 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
             localToneMapHeight * sizeof(float);
     const bool compactAnalysisRequested = request.analysisNv21 != nullptr && analysisPixels > 0u &&
             request.analysisNv21CapacityBytes >= analysisNv21Bytes;
-    const std::uint64_t statisticsWords = PREVIEW_STATS_BASE_WORDS +
+    const std::uint64_t statisticsWords = PREVIEW_ANALYSIS_NV21_START_WORD +
             (compactAnalysisRequested ? analysisNv21Bytes : 0u);
     const std::uint64_t statisticsBytes = statisticsWords * sizeof(std::uint32_t);
     bool reallocated = false;
@@ -1143,6 +1170,17 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
     vkCmdUpdateBuffer(slot.commandBuffer, deviceStatistics_.buffer,
                       static_cast<VkDeviceSize>(566u * sizeof(std::uint32_t)),
                       sizeof(profileNrBits), profileNrBits);
+    const float physicalNoiseSeeds[3] = {
+            std::isfinite(request.physicalGreenNoiseS) ? std::max(0.0f, request.physicalGreenNoiseS) : 0.0f,
+            std::isfinite(request.physicalGreenNoiseO) ? std::max(0.0f, request.physicalGreenNoiseO) : 0.0f,
+            std::isfinite(request.physicalNoiseConfidence)
+                    ? std::clamp(request.physicalNoiseConfidence, 0.0f, 1.0f) : 0.0f};
+    std::uint32_t physicalNoiseBits[3]{};
+    static_assert(sizeof(physicalNoiseBits) == sizeof(physicalNoiseSeeds));
+    std::memcpy(physicalNoiseBits, physicalNoiseSeeds, sizeof(physicalNoiseSeeds));
+    vkCmdUpdateBuffer(slot.commandBuffer, deviceStatistics_.buffer,
+                      static_cast<VkDeviceSize>(PREVIEW_PHYSICAL_NOISE_START_WORD * sizeof(std::uint32_t)),
+                      sizeof(physicalNoiseBits), physicalNoiseBits);
 
     if (directHardwareInput) {
         VkBufferMemoryBarrier externalInputBarrier{};
@@ -1276,6 +1314,15 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
                   (request.previewHeight + histogramStride * 16u - 1u) /
                           (histogramStride * 16u), 1u);
 
+    // Compact 64x48 pre-WB physical-AWB observer. This is twelve small workgroups in the
+    // existing command buffer; it adds no queue submission, fence wait or full-frame readback.
+    push.cfaAndMode = std::min(request.cfaPattern, 3u) | (4u << 8u) | packedDemosaic;
+    vkCmdPushConstants(slot.commandBuffer, activePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0u, sizeof(push), &push);
+    vkCmdDispatch(slot.commandBuffer,
+                  (RAW_PREVIEW_AWB_GRID_COLUMNS + 15u) / 16u,
+                  (RAW_PREVIEW_AWB_GRID_ROWS + 15u) / 16u, 1u);
+
     VkBufferMemoryBarrier statsBarrier{};
     statsBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
     statsBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -1288,6 +1335,27 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr,
                          1u, &statsBarrier, 0u, nullptr);
 
+    // FASE 5: derive the signed 64x48 exposure field entirely inside the existing preview
+    // command buffer. There is no CPU round-trip and no additional queue submission/wait.
+    push.cfaAndMode = std::min(request.cfaPattern, 3u) | (5u << 8u) | packedDemosaic;
+    vkCmdPushConstants(slot.commandBuffer, activePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0u, sizeof(push), &push);
+    vkCmdDispatch(slot.commandBuffer,
+                  static_cast<std::uint32_t>((PREVIEW_SPATIAL_EXPOSURE_GRID_WIDTH + 15u) / 16u),
+                  static_cast<std::uint32_t>((PREVIEW_SPATIAL_EXPOSURE_GRID_HEIGHT + 15u) / 16u), 1u);
+    vkCmdPipelineBarrier(slot.commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr,
+                         1u, &statsBarrier, 0u, nullptr);
+
+    push.cfaAndMode = std::min(request.cfaPattern, 3u) | (6u << 8u) | packedDemosaic;
+    vkCmdPushConstants(slot.commandBuffer, activePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0u, sizeof(push), &push);
+    // Exactly one 16x16 workgroup: the resolver uses workgroup-shared scene percentiles.
+    vkCmdDispatch(slot.commandBuffer, 1u, 1u, 1u);
+    vkCmdPipelineBarrier(slot.commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr,
+                         1u, &statsBarrier, 0u, nullptr);
+
     push.cfaAndMode = std::min(request.cfaPattern, 3u) | (1u << 8u) | packedDemosaic;
     vkCmdPushConstants(slot.commandBuffer, activePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
                        0u, sizeof(push), &push);
@@ -1296,24 +1364,8 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr,
                          1u, &statsBarrier, 0u, nullptr);
 
-    // Build a low-cost 1/8-resolution edge-aware luminance base before the normal render pass.
-    // Render remains mode 2 so its shared Bayer tile fast path is unchanged.
-    push.cfaAndMode = std::min(request.cfaPattern, 3u) | (3u << 8u) | packedDemosaic;
-    vkCmdPushConstants(slot.commandBuffer, activePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-                       0u, sizeof(push), &push);
-    vkCmdDispatch(slot.commandBuffer, (localToneMapWidth + 15u) / 16u,
-                  (localToneMapHeight + 15u) / 16u, 1u);
-    VkBufferMemoryBarrier localToneBaseReady{};
-    localToneBaseReady.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-    localToneBaseReady.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    localToneBaseReady.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    localToneBaseReady.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    localToneBaseReady.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    localToneBaseReady.buffer = localToneBase_.buffer;
-    localToneBaseReady.size = VK_WHOLE_SIZE;
-    vkCmdPipelineBarrier(slot.commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr,
-                         1u, &localToneBaseReady, 0u, nullptr);
+    // The old preview local-tone exposure pass is intentionally not dispatched in FASE 5.
+    // Spatial exposure has one owner; FLLF/local contrast is rebuilt in the later tone phase.
 
     push.cfaAndMode = std::min(request.cfaPattern, 3u) | (2u << 8u) | packedDemosaic;
     vkCmdPushConstants(slot.commandBuffer, activePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
@@ -1535,6 +1587,36 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
     result.displayRClipSampleCount = statistics[541u];
     result.displayGClipSampleCount = statistics[542u];
     result.displayBClipSampleCount = statistics[543u];
+    result.awbSampleCount = 0u;
+    for (std::uint32_t index = 0u; index < RAW_PREVIEW_AWB_SAMPLE_COUNT; ++index) {
+        const std::size_t base = static_cast<std::size_t>(PREVIEW_AWB_STATS_START_WORD +
+                static_cast<std::uint64_t>(index) * PREVIEW_AWB_SAMPLE_WORDS);
+        RawPreviewAwbSample sample{};
+        std::memcpy(&sample.luma, statistics + base + 0u, sizeof(float));
+        std::memcpy(&sample.redMinusGreen, statistics + base + 1u, sizeof(float));
+        std::memcpy(&sample.blueMinusGreen, statistics + base + 2u, sizeof(float));
+        std::memcpy(&sample.structure, statistics + base + 3u, sizeof(float));
+        sample.tileIndex = statistics[base + 4u];
+        sample.valid = std::isfinite(sample.luma) && sample.luma > 0.0f && sample.luma <= 1.25f &&
+                std::isfinite(sample.redMinusGreen) &&
+                std::isfinite(sample.blueMinusGreen) &&
+                std::isfinite(sample.structure) && sample.structure >= 0.0f &&
+                sample.tileIndex < 192u;
+        result.awbSamples[index] = sample;
+        if (sample.valid) result.awbSampleCount++;
+    }
+    result.exposureTileCount = statistics[PREVIEW_SPATIAL_EXPOSURE_SUMMARY_START_WORD + 0u];
+    result.exposureSceneP10 = readFloatStat(PREVIEW_SPATIAL_EXPOSURE_SUMMARY_START_WORD + 1u, 0.0f);
+    result.exposureSceneP25 = readFloatStat(PREVIEW_SPATIAL_EXPOSURE_SUMMARY_START_WORD + 2u, 0.0f);
+    result.exposureSceneP50 = readFloatStat(PREVIEW_SPATIAL_EXPOSURE_SUMMARY_START_WORD + 3u, 0.0f);
+    result.exposureSceneP75 = readFloatStat(PREVIEW_SPATIAL_EXPOSURE_SUMMARY_START_WORD + 4u, 0.0f);
+    result.exposureSceneP90 = readFloatStat(PREVIEW_SPATIAL_EXPOSURE_SUMMARY_START_WORD + 5u, 0.0f);
+    result.exposureSceneP95 = readFloatStat(PREVIEW_SPATIAL_EXPOSURE_SUMMARY_START_WORD + 6u, 0.0f);
+    result.exposureSceneP99 = readFloatStat(PREVIEW_SPATIAL_EXPOSURE_SUMMARY_START_WORD + 7u, 0.0f);
+    result.exposureMeasuredSceneDrEv = readFloatStat(PREVIEW_SPATIAL_EXPOSURE_SUMMARY_START_WORD + 8u, 0.0f);
+    result.exposureLowerNeutralBoundaryEv = readFloatStat(PREVIEW_SPATIAL_EXPOSURE_SUMMARY_START_WORD + 9u, 0.0f);
+    result.exposureUpperNeutralBoundaryEv = readFloatStat(PREVIEW_SPATIAL_EXPOSURE_SUMMARY_START_WORD + 10u, 0.0f);
+    result.exposureSpatialAuthority = readFloatStat(PREVIEW_SPATIAL_EXPOSURE_SUMMARY_START_WORD + 11u, 0.0f);
     result.displayShadowSampleCount = statistics[277u];
     result.displayHighlightSampleCount = statistics[278u];
     result.displaySampleCount = statistics[279u];
@@ -1550,7 +1632,7 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
                 : 0.5f;
     }
     if (compactAnalysisRequested) {
-        const std::uint32_t* analysis = statistics + PREVIEW_STATS_BASE_WORDS;
+        const std::uint32_t* analysis = statistics + PREVIEW_ANALYSIS_NV21_START_WORD;
         for (std::uint64_t index = 0u; index < analysisNv21Bytes; ++index) {
             request.analysisNv21[index] = static_cast<std::uint8_t>(std::min(analysis[index], 255u));
         }

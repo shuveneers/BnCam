@@ -5,6 +5,7 @@ import android.os.SystemClock
 import android.util.Log
 import com.bncam.core.debug.RawPreviewFirstActivationTrace
 import com.bncam.core.engine.ImageUtils
+import com.bncam.core.quality.RawColorTransformEngine
 import com.bncam.core.runtime.RawPreviewResolutionPolicy
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.withTimeoutOrNull
@@ -33,6 +34,9 @@ data class RawPreviewRenderConfig(
     val exposureGain: Float,
     val captureSensitivityIso: Int,
     val captureExposureTimeNs: Long,
+    // Canonical green-channel physical S/O noise model for preview exposure authority.
+    // Values are already in BnCam normalized RAW units: [greenS, greenO, confidence].
+    val physicalGreenNoiseSo: FloatArray,
     val focusDetailPriority: Float,
     val profileToneExposure: Float,
     val profileToneHighlights: Float,
@@ -122,6 +126,33 @@ class RawPreviewFrame internal constructor(
     val displaySampleCount: Int,
     val displayHighlightX: Float,
     val displayHighlightY: Float,
+    val renderWbGains: FloatArray,
+    val renderColorMatrix: FloatArray,
+    val camera2PriorWbGains: FloatArray,
+    val camera2PriorColorMatrix: FloatArray,
+    val physicalAwbPriorRgb: FloatArray,
+    val physicalAwbDataRgb: FloatArray,
+    val physicalAwbFinalRgb: FloatArray,
+    val physicalAwbConfidence: Float,
+    val physicalAwbDataAuthority: Float,
+    val physicalAwbNeutralSupport: Float,
+    val physicalAwbMixedLightScore: Float,
+    val physicalAwbPriorDisagreement: Float,
+    val physicalAwbValidTileCount: Int,
+    val physicalAwbAcceptedSampleCount: Int,
+    val physicalAwbDataReady: Boolean,
+    val spatialExposureTileCount: Int,
+    val spatialExposureSceneP10: Float,
+    val spatialExposureSceneP25: Float,
+    val spatialExposureSceneP50: Float,
+    val spatialExposureSceneP75: Float,
+    val spatialExposureSceneP90: Float,
+    val spatialExposureSceneP95: Float,
+    val spatialExposureSceneP99: Float,
+    val spatialExposureMeasuredDrEv: Float,
+    val spatialExposureLowerNeutralEv: Float,
+    val spatialExposureUpperNeutralEv: Float,
+    val spatialExposureAuthority: Float,
     private val releaseSlot: (Long) -> Unit
 ) : Closeable {
     private val closed = AtomicBoolean(false)
@@ -184,9 +215,11 @@ class RawPreviewRenderer(
     )
 
     private val liveWhiteBalanceOverride = AtomicReference<FloatArray?>(null)
+    private val liveWhiteBalanceColorPair = AtomicReference<ExactFrameColorPair?>(null)
     // System-AWB RAW preview must consume WB + CCM from the same sensor timestamp. A WB-only
     // convergence override can otherwise pair one frame's gains with another frame's matrix.
     private val exactFrameColorPairs = ConcurrentHashMap<Long, ExactFrameColorPair>()
+    private val autoWhiteBalanceColorPair = AtomicReference<ExactFrameColorPair?>(null)
     private val latestOfferedSensorTimestampNs = AtomicLong(Long.MIN_VALUE)
     private class OutputSlot(val id: Int) {
         private var cpuRgba: ByteBuffer? = null
@@ -290,7 +323,7 @@ class RawPreviewRenderer(
         if (whiteLevel <= 1) return false
         if (blackLevels.size < 4 || blackLevels.take(4).any { !it.isFinite() }) return false
         if (wbGains.size < 4 || wbGains.take(4).any { !it.isFinite() || it !in 0.25f..6.0f }) return false
-        if (colorMatrix.size != 9 || colorMatrix.any { !it.isFinite() || kotlin.math.abs(it) > 16f }) return false
+        if (colorMatrix.size != 9 || !RawColorTransformEngine.validateSensorToLinearSrgbMatrix(colorMatrix).valid) return false
         if (!exposureGain.isFinite() || exposureGain !in 0.05f..32f) return false
         return true
     }
@@ -344,6 +377,9 @@ class RawPreviewRenderer(
      * touching Camera2 session state.
      */
     fun updateWhiteBalanceGains(gains: FloatArray?) {
+        // Gain-only is retained only as a compatibility/clear boundary. Manual/profile WB uses
+        // updateWhiteBalanceColorPair so the sensor WB diagonal and its post-WB CCM change atomically.
+        liveWhiteBalanceColorPair.set(null)
         if (gains == null) {
             liveWhiteBalanceOverride.set(null)
             return
@@ -355,6 +391,24 @@ class RawPreviewRenderer(
         liveWhiteBalanceOverride.set(gains.copyOf(4))
     }
 
+    fun updateWhiteBalanceColorPair(gains: FloatArray?, colorMatrix: FloatArray?) {
+        if (gains == null || colorMatrix == null) {
+            liveWhiteBalanceColorPair.set(null)
+            liveWhiteBalanceOverride.set(null)
+            return
+        }
+        if (gains.size < 4 || gains.take(4).any { !it.isFinite() || it !in 0.25f..6.0f } ||
+            colorMatrix.size < 9 ||
+            !RawColorTransformEngine.validateSensorToLinearSrgbMatrix(colorMatrix.copyOf(9)).valid
+        ) {
+            Log.w(TAG, "RAW_PREVIEW_LIVE_COLOR_PAIR_REJECTED")
+            return
+        }
+        val pair = ExactFrameColorPair(gains.copyOf(4), colorMatrix.copyOf(9))
+        liveWhiteBalanceOverride.set(pair.wbGains.copyOf())
+        liveWhiteBalanceColorPair.set(pair)
+    }
+
     fun updateExactFrameCamera2ColorPair(
         sensorTimestampNs: Long,
         gains: FloatArray,
@@ -362,7 +416,7 @@ class RawPreviewRenderer(
     ) {
         if (sensorTimestampNs <= 0L || gains.size < 4 || colorMatrix.size < 9 ||
             gains.take(4).any { !it.isFinite() || it !in 0.25f..6.0f } ||
-            colorMatrix.take(9).any { !it.isFinite() || kotlin.math.abs(it) > 8.0f }
+            !RawColorTransformEngine.validateSensorToLinearSrgbMatrix(colorMatrix.copyOf(9)).valid
         ) {
             return
         }
@@ -378,6 +432,26 @@ class RawPreviewRenderer(
 
     fun clearExactFrameCamera2ColorPairs() {
         exactFrameColorPairs.clear()
+    }
+
+    /** System-Auto temporal render pair. Exact Camera2 timestamp pairs remain stored separately
+     * so the physical estimator keeps an independent metadata prior. */
+    fun updateAutoWhiteBalanceColorPair(gains: FloatArray?, colorMatrix: FloatArray?) {
+        if (gains == null || colorMatrix == null) {
+            autoWhiteBalanceColorPair.set(null)
+            return
+        }
+        if (gains.size < 4 || colorMatrix.size < 9 ||
+            gains.take(4).any { !it.isFinite() || it !in 0.25f..6.0f } ||
+            !RawColorTransformEngine.validateSensorToLinearSrgbMatrix(colorMatrix.copyOf(9)).valid
+        ) return
+        autoWhiteBalanceColorPair.set(
+            ExactFrameColorPair(gains.copyOf(4), colorMatrix.copyOf(9))
+        )
+    }
+
+    fun clearAutoWhiteBalanceColorPair() {
+        autoWhiteBalanceColorPair.set(null)
     }
 
     fun configure(config: RawPreviewRenderConfig?) {
@@ -400,6 +474,7 @@ class RawPreviewRenderer(
         if (routeChanged) {
             liveWhiteBalanceOverride.set(null)
             exactFrameColorPairs.clear()
+            autoWhiteBalanceColorPair.set(null)
             configRevision.incrementAndGet()
             latestOfferedSensorTimestampNs.set(Long.MIN_VALUE)
             pendingRequest.getAndSet(null)?.let(::releaseRequest)
@@ -603,14 +678,21 @@ class RawPreviewRenderer(
                 slot.ensureCpuRgbaBuffer().apply { clear() }
             }
 
-            val liveWb = liveWhiteBalanceOverride.get()?.copyOf()
+            val liveColorPair = liveWhiteBalanceColorPair.get()
+            val liveWb = liveColorPair?.wbGains?.copyOf() ?: liveWhiteBalanceOverride.get()?.copyOf()
+            // Exact Camera2 metadata is consumed for every System-Auto frame even when a temporal
+            // render pair is active. This prevents the filtered output from feeding back as its own
+            // PhysicalAwbEstimator prior. Manual/profile WB intentionally clears these pairs.
             val exactFramePair = if (liveWb == null) {
                 exactFrameColorPairs.remove(request.sensorTimestampNs)
             } else {
                 null
             }
-            val effectiveWbGains = liveWb ?: exactFramePair?.wbGains ?: request.config.wbGains
-            val effectiveColorMatrix = exactFramePair?.colorMatrix ?: request.config.colorMatrix
+            val autoPair = if (liveWb == null) autoWhiteBalanceColorPair.get() else null
+            val effectiveWbGains = liveWb ?: autoPair?.wbGains ?: exactFramePair?.wbGains ?: request.config.wbGains
+            val effectiveColorMatrix = liveColorPair?.colorMatrix ?: autoPair?.colorMatrix ?: exactFramePair?.colorMatrix ?: request.config.colorMatrix
+            val camera2PriorWbGains = exactFramePair?.wbGains ?: request.config.wbGains
+            val camera2PriorColorMatrix = exactFramePair?.colorMatrix ?: request.config.colorMatrix
             RawPreviewFirstActivationTrace.nativeRenderStarted(
                 source = request.config.source.name,
                 generation = request.config.pipelineGeneration,
@@ -624,10 +706,12 @@ class RawPreviewRenderer(
                 blackLevels = localBlackLevels,
                 whiteLevel = request.config.whiteLevel,
                 wbGains = effectiveWbGains,
+                camera2PriorWbGains = camera2PriorWbGains,
                 colorMatrix = effectiveColorMatrix,
                 exposureGain = request.config.exposureGain,
                 captureSensitivityIso = request.config.captureSensitivityIso,
                 captureExposureTimeNs = request.config.captureExposureTimeNs,
+                physicalGreenNoiseSo = request.config.physicalGreenNoiseSo,
                 focusDetailPriority = request.config.focusDetailPriority,
                 profileToneExposure = request.config.profileToneExposure,
                 profileToneHighlights = request.config.profileToneHighlights,
@@ -818,6 +902,42 @@ class RawPreviewRenderer(
                 displaySampleCount = result.getOrElse(40) { 0 },
                 displayHighlightX = result.getOrElse(41) { -1 } / 1_000_000.0f,
                 displayHighlightY = result.getOrElse(42) { -1 } / 1_000_000.0f,
+                renderWbGains = effectiveWbGains.copyOf(4),
+                renderColorMatrix = effectiveColorMatrix.copyOf(9),
+                camera2PriorWbGains = camera2PriorWbGains.copyOf(4),
+                camera2PriorColorMatrix = camera2PriorColorMatrix.copyOf(9),
+                physicalAwbPriorRgb = FloatArray(3) { index ->
+                    result.getOrElse(596 + index) { 1_000_000 } / 1_000_000.0f
+                },
+                physicalAwbDataRgb = FloatArray(3) { index ->
+                    result.getOrElse(599 + index) { 1_000_000 } / 1_000_000.0f
+                },
+                physicalAwbFinalRgb = FloatArray(3) { index ->
+                    result.getOrElse(602 + index) { 1_000_000 } / 1_000_000.0f
+                },
+                physicalAwbConfidence = result.getOrElse(605) { 0 } / 1_000_000.0f,
+                physicalAwbDataAuthority = result.getOrElse(606) { 0 } / 1_000_000.0f,
+                physicalAwbNeutralSupport = result.getOrElse(607) { 0 } / 1_000_000.0f,
+                physicalAwbMixedLightScore = result.getOrElse(608) { 0 } / 1_000_000.0f,
+                physicalAwbPriorDisagreement = result.getOrElse(609) { 0 } / 1_000_000.0f,
+                physicalAwbValidTileCount = result.getOrElse(610) { 0 },
+                physicalAwbAcceptedSampleCount = result.getOrElse(611) { 0 },
+                // Physical scene evidence may update the temporal owner only when the RAW frame
+                // carried an exact Camera2 WB+CCM prior from the same sensor timestamp. Missing
+                // metadata never turns the current temporal render pair into its own estimator prior.
+                physicalAwbDataReady = result.getOrElse(612) { 0 } != 0 && exactFramePair != null,
+                spatialExposureTileCount = result.getOrElse(613) { 0 },
+                spatialExposureSceneP10 = result.getOrElse(614) { 0 } / 1_000_000.0f,
+                spatialExposureSceneP25 = result.getOrElse(615) { 0 } / 1_000_000.0f,
+                spatialExposureSceneP50 = result.getOrElse(616) { 0 } / 1_000_000.0f,
+                spatialExposureSceneP75 = result.getOrElse(617) { 0 } / 1_000_000.0f,
+                spatialExposureSceneP90 = result.getOrElse(618) { 0 } / 1_000_000.0f,
+                spatialExposureSceneP95 = result.getOrElse(619) { 0 } / 1_000_000.0f,
+                spatialExposureSceneP99 = result.getOrElse(620) { 0 } / 1_000_000.0f,
+                spatialExposureMeasuredDrEv = result.getOrElse(621) { 0 } / 1_000_000.0f,
+                spatialExposureLowerNeutralEv = result.getOrElse(622) { 0 } / 1_000_000.0f,
+                spatialExposureUpperNeutralEv = result.getOrElse(623) { 0 } / 1_000_000.0f,
+                spatialExposureAuthority = result.getOrElse(624) { 0 } / 1_000_000.0f,
                 releaseSlot = { glFenceHandle -> releaseOutputSlot(slot, glFenceHandle) }
             )
             onFrame(frame)
@@ -982,6 +1102,15 @@ class RawPreviewRenderer(
                 "gtmContrast=${frame?.gtmContrastStrength ?: -1f} drPressure=${frame?.gtmDynamicRangePressure ?: -1f} " +
                 "ltmStrength=${frame?.ltmStrength ?: -1f} ltmLiftEv=${frame?.ltmMaxLiftEv ?: -1f} " +
                 "ltmCompressEv=${frame?.ltmMaxCompressEv ?: -1f} " +
+                "spatialExposureTiles=${frame?.spatialExposureTileCount ?: 0} " +
+                "spatialExposureSceneP10=${frame?.spatialExposureSceneP10 ?: -1f} " +
+                "spatialExposureSceneP50=${frame?.spatialExposureSceneP50 ?: -1f} " +
+                "spatialExposureSceneP90=${frame?.spatialExposureSceneP90 ?: -1f} " +
+                "spatialExposureSceneP99=${frame?.spatialExposureSceneP99 ?: -1f} " +
+                "spatialExposureDrEv=${frame?.spatialExposureMeasuredDrEv ?: -1f} " +
+                "spatialExposureNeutralEv=${frame?.spatialExposureLowerNeutralEv ?: -1f}/" +
+                "${frame?.spatialExposureUpperNeutralEv ?: -1f} " +
+                "spatialExposureAuthority=${frame?.spatialExposureAuthority ?: -1f} " +
                 "commonHighlightScalePixels=${frame?.commonHighlightScalePixels ?: -1} " +
                 "directHostInput=${frame?.directHostInputUsed ?: false} " +
                 "directAhbInput=${frame?.directHardwareBufferInputUsed ?: false} " +

@@ -14,6 +14,19 @@
 namespace bncam::vulkan {
 
 constexpr std::uint32_t RAW_PREVIEW_FRAMES_IN_FLIGHT = 3u;
+constexpr std::uint32_t RAW_PREVIEW_AWB_GRID_COLUMNS = 64u;
+constexpr std::uint32_t RAW_PREVIEW_AWB_GRID_ROWS = 48u;
+constexpr std::uint32_t RAW_PREVIEW_AWB_SAMPLE_COUNT =
+        RAW_PREVIEW_AWB_GRID_COLUMNS * RAW_PREVIEW_AWB_GRID_ROWS;
+
+struct RawPreviewAwbSample {
+    float luma = 0.0f;
+    float redMinusGreen = 0.0f;
+    float blueMinusGreen = 0.0f;
+    float structure = 0.0f;
+    std::uint32_t tileIndex = 0u;
+    bool valid = false;
+};
 
 struct RawPreviewGpuRequest {
     // Preferred zero-copy input candidate. Import is enabled only when the actual
@@ -40,6 +53,9 @@ struct RawPreviewGpuRequest {
     float whiteLevel = 1.0f;
     std::uint32_t captureSensitivityIso = 100;
     float captureExposureTimeMs = 0.0f;
+    float physicalGreenNoiseS = 0.0f;
+    float physicalGreenNoiseO = 0.0f;
+    float physicalNoiseConfidence = 0.0f;
     float focusDetailPriority = 1.0f;
     std::array<float, 3> wbRgb{1.0f, 1.0f, 1.0f};
     std::array<float, 9> colorMatrix{1.0f, 0.0f, 0.0f,
@@ -147,8 +163,23 @@ struct RawPreviewGpuResult {
     std::uint32_t displaySampleCount = 0;
     float displayHighlightX = -1.0f;
     float displayHighlightY = -1.0f;
+    // FASE 5 compact signed-exposure diagnostics; no full-frame readback.
+    std::uint32_t exposureTileCount = 0u;
+    float exposureSceneP10 = 0.0f;
+    float exposureSceneP25 = 0.0f;
+    float exposureSceneP50 = 0.0f;
+    float exposureSceneP75 = 0.0f;
+    float exposureSceneP90 = 0.0f;
+    float exposureSceneP95 = 0.0f;
+    float exposureSceneP99 = 0.0f;
+    float exposureMeasuredSceneDrEv = 0.0f;
+    float exposureLowerNeutralBoundaryEv = 0.0f;
+    float exposureUpperNeutralBoundaryEv = 0.0f;
+    float exposureSpatialAuthority = 0.0f;
     std::uint32_t analysisNv21Width = 0;
     std::uint32_t analysisNv21Height = 0;
+    std::array<RawPreviewAwbSample, RAW_PREVIEW_AWB_SAMPLE_COUNT> awbSamples{};
+    std::uint32_t awbSampleCount = 0u;
     std::uint32_t activeSlotIndex = 0;
     bool droppedBusy = false;
     std::string failureReason;

@@ -10,6 +10,7 @@ import com.bncam.core.quality.CfaArrangementDescriptor
 import com.bncam.core.quality.ChannelNoiseModel
 import com.bncam.core.quality.CaptureFrameRecord
 import com.bncam.core.quality.NoiseModelRecord
+import com.bncam.core.quality.RawColorTransformEngine
 import com.bncam.core.runtime.RawPipelineRuntimeOwner
 import com.bncam.core.runtime.TimestampPairingCalibration
 import com.bncam.core.runtime.TimestampPairingMode
@@ -381,7 +382,7 @@ class WarmBufferPairingCoordinator(
             frameWhiteLevel = whiteLevel,
             frameWhiteLevelSource = "CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL",
             colorCorrectionGains = result.get(CaptureResult.COLOR_CORRECTION_GAINS)?.let { floatArrayOf(it.red, it.greenEven, it.greenOdd, it.blue) },
-            colorCorrectionTransform = result.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)?.let { colorSpaceTransformToArray(it) },
+            colorCorrectionTransform = result.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)?.let { RawColorTransformEngine.colorSpaceTransformToArray(it) },
             neutralColorPoint = neutralDoubles,
             image = image
         )
@@ -466,15 +467,5 @@ class WarmBufferPairingCoordinator(
         )
     }
 
-    private fun colorSpaceTransformToArray(transform: android.hardware.camera2.params.ColorSpaceTransform): FloatArray {
-        val values = FloatArray(9)
-        for (row in 0..2) {
-            for (column in 0..2) {
-                val rational = transform.getElement(column, row)
-                val denominator = rational.denominator
-                values[row * 3 + column] = if (denominator == 0) (if (row == column) 1f else 0f) else rational.numerator.toFloat() / denominator.toFloat()
-            }
-        }
-        return values
-    }
+
 }

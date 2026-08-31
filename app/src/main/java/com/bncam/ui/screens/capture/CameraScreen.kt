@@ -265,13 +265,28 @@ data class FocusPeakingDisplayTarget(
 
 private fun focusPeakingDisplayTarget(
     guidance: FocusPeakingGuidance,
+    focusOwner: com.bncam.core.engine.FocusOwner,
     sensorOrientation: Int,
     lensFacing: Int,
     previewOrientationCorrectionDegrees: Int
 ): FocusPeakingDisplayTarget {
     val region = guidance.afRegion ?: return FocusPeakingDisplayTarget()
     val bounds = guidance.coordinateBounds ?: return FocusPeakingDisplayTarget()
-    if (!guidance.subjectRoiUsed || region.isEmpty || bounds.width() <= 0 || bounds.height() <= 0) {
+    // Camera2 may report a broad/default AF region during continuous AUTO. That is an AF search
+    // domain, not a subject ROI, and treating it as one lowers peaking selectivity over most of
+    // the frame. Spatial peaking guidance is reserved for an explicitly localized focus owner.
+    val localizedFocusOwner = when (focusOwner) {
+        com.bncam.core.engine.FocusOwner.TAP,
+        com.bncam.core.engine.FocusOwner.TRACK_ACQUIRING,
+        com.bncam.core.engine.FocusOwner.TRACK_TIMED,
+        com.bncam.core.engine.FocusOwner.TRACK_PINNED,
+        com.bncam.core.engine.FocusOwner.FACE_PRIORITY,
+        com.bncam.core.engine.FocusOwner.AE_AF_LOCK -> true
+        else -> false
+    }
+    if (!guidance.subjectRoiUsed || !localizedFocusOwner || region.isEmpty ||
+        bounds.width() <= 0 || bounds.height() <= 0
+    ) {
         return FocusPeakingDisplayTarget()
     }
     val nx = ((region.centerX() - bounds.left).toFloat() / bounds.width()).coerceIn(0f, 1f)
@@ -1605,12 +1620,14 @@ fun CameraScreen(
 
         val peakingDisplayTarget = remember(
             focusPeakingGuidance,
+            focusOwnership.owner,
             sensorOrientation,
             lensFacing,
             manualPreviewOrientationCorrectionDegrees
         ) {
             focusPeakingDisplayTarget(
                 guidance = focusPeakingGuidance,
+                focusOwner = focusOwnership.owner,
                 sensorOrientation = sensorOrientation,
                 lensFacing = lensFacing,
                 previewOrientationCorrectionDegrees = manualPreviewOrientationCorrectionDegrees

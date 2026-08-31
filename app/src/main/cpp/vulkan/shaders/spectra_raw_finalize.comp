@@ -21,6 +21,22 @@ layout(std430, binding = 4) readonly buffer LensBuffer { float lensShading[]; };
 shared uvec4 finalizeCounts[256];
 shared uint finalizeMaxGainBits[256];
 
+// Phase 5: one-workgroup scene resolver. All full-frame work stays resident on Vulkan; these
+// shared values only coordinate the 64x48 compact exposure policy within the command buffer.
+shared uint exposureValidCount;
+shared float exposureP10;
+shared float exposureP25;
+shared float exposureP35;
+shared float exposureP50;
+shared float exposureP75;
+shared float exposureP90;
+shared float exposureP95;
+shared float exposureP99;
+shared float exposureMeasuredDrEv;
+shared float exposureLowerNeutralEv;
+shared float exposureUpperNeutralEv;
+shared float exposureSpatialAuthority;
+
 layout(push_constant) uniform Params {
     uint frameWidth;
     uint frameHeight;
@@ -28,7 +44,7 @@ layout(push_constant) uniform Params {
     uint sensorCfaPattern;
     int cfaOffsetX;
     int cfaOffsetY;
-    uint mode; // 0 compact green sampling, 1 full Bayer finalization, 2 auto-scene samples
+    uint mode; // 0 green sampling, 1 finalization, 2 auto-scene, 3 exposure tiles, 4 exposure resolve, 5 exposure apply
     uint xStep;
     uint yStep;
     uint sampleColumns;
@@ -247,6 +263,368 @@ void sampleAutoScene() {
                                      center < 0.060 ? 1.0 : 0.0);
 }
 
+
+// Phase-5 compact exposure ABI inside TelemetryBuffer. Words 0..4 remain the legacy
+// raw-finalize counters. Histograms are GPU-only scratch; summary words are read back after the
+// same submission for diagnostics/noise propagation, never for production pixel decisions.
+const uint EXP_SUMMARY_VALID_COUNT = 5u;
+const uint EXP_SUMMARY_P10 = 6u;
+const uint EXP_SUMMARY_P25 = 7u;
+const uint EXP_SUMMARY_P50 = 8u;
+const uint EXP_SUMMARY_P75 = 9u;
+const uint EXP_SUMMARY_P90 = 10u;
+const uint EXP_SUMMARY_P95 = 11u;
+const uint EXP_SUMMARY_P99 = 12u;
+const uint EXP_SUMMARY_DR = 13u;
+const uint EXP_SUMMARY_LOWER_NEUTRAL = 14u;
+const uint EXP_SUMMARY_UPPER_NEUTRAL = 15u;
+const uint EXP_SUMMARY_AUTHORITY = 16u;
+const uint EXP_SUMMARY_MIN_EV = 17u;
+const uint EXP_SUMMARY_P10_EV = 18u;
+const uint EXP_SUMMARY_P50_EV = 19u;
+const uint EXP_SUMMARY_P90_EV = 20u;
+const uint EXP_SUMMARY_MAX_EV = 21u;
+const uint EXP_SUMMARY_MEAN_POS_EV = 22u;
+const uint EXP_SUMMARY_MEAN_NEG_EV = 23u;
+const uint EXP_SUMMARY_POS_FRAC = 24u;
+const uint EXP_SUMMARY_NEU_FRAC = 25u;
+const uint EXP_SUMMARY_NEG_FRAC = 26u;
+const uint EXP_SUMMARY_MEAN_GAIN2 = 27u;
+const uint EXP_SUMMARY_P90_POS_GAIN = 28u;
+const uint EXP_SUMMARY_STATUS = 29u;
+const uint EXP_LUMA_HIST_START = 32u;
+const uint EXP_LUMA_HIST_BINS = 192u;
+const uint EXP_EV_HIST_START = EXP_LUMA_HIST_START + EXP_LUMA_HIST_BINS;
+const uint EXP_EV_HIST_BINS = 256u;
+const uint EXP_POS_EV_HIST_START = EXP_EV_HIST_START + EXP_EV_HIST_BINS;
+const uint EXP_POS_EV_HIST_BINS = 128u;
+const uint EXPOSURE_MAP_RECORD_OFFSET = 64u * 48u;
+
+float exposureSafeLog2(float value) { return log2(max(value, 1.0e-6)); }
+float exposureSmoothstep(float e0, float e1, float value) {
+    if (!(e1 > e0)) return value >= e1 ? 1.0 : 0.0;
+    float t = clamp((value - e0) / (e1 - e0), 0.0, 1.0);
+    return t * t * (3.0 - 2.0 * t);
+}
+uint exposureLumaBin(float luma) {
+    float logL = clamp(exposureSafeLog2(luma), -14.0, 0.0);
+    return uint(clamp(floor(((logL + 14.0) / 14.0) * float(EXP_LUMA_HIST_BINS - 1u)),
+                      0.0, float(EXP_LUMA_HIST_BINS - 1u)));
+}
+float exposureLumaFromBin(uint bin) {
+    float normalized = (float(bin) + 0.5) / float(EXP_LUMA_HIST_BINS);
+    return exp2(-14.0 + normalized * 14.0);
+}
+float exposureLumaPercentile(uint total, float percentile) {
+    uint target = uint(floor(float(max(total, 1u) - 1u) * clamp(percentile, 0.0, 1.0)));
+    uint cumulative = 0u;
+    for (uint bin = 0u; bin < EXP_LUMA_HIST_BINS; ++bin) {
+        cumulative += telemetry[EXP_LUMA_HIST_START + bin];
+        if (cumulative > target) return exposureLumaFromBin(bin);
+    }
+    return 1.0;
+}
+uint exposureEvBin(float ev) {
+    float normalized = clamp((ev + 6.0) / 8.0, 0.0, 1.0);
+    return uint(clamp(floor(normalized * float(EXP_EV_HIST_BINS - 1u)),
+                      0.0, float(EXP_EV_HIST_BINS - 1u)));
+}
+float exposureEvFromBin(uint bin) {
+    float normalized = (float(bin) + 0.5) / float(EXP_EV_HIST_BINS);
+    return -6.0 + normalized * 8.0;
+}
+float exposureEvPercentile(uint total, float percentile) {
+    uint target = uint(floor(float(max(total, 1u) - 1u) * clamp(percentile, 0.0, 1.0)));
+    uint cumulative = 0u;
+    for (uint bin = 0u; bin < EXP_EV_HIST_BINS; ++bin) {
+        cumulative += telemetry[EXP_EV_HIST_START + bin];
+        if (cumulative > target) return exposureEvFromBin(bin);
+    }
+    return 0.0;
+}
+uint exposurePositiveEvBin(float ev) {
+    float normalized = clamp(ev / 2.0, 0.0, 1.0);
+    return uint(clamp(floor(normalized * float(EXP_POS_EV_HIST_BINS - 1u)),
+                      0.0, float(EXP_POS_EV_HIST_BINS - 1u)));
+}
+float exposurePositiveEvFromBin(uint bin) {
+    return ((float(bin) + 0.5) / float(EXP_POS_EV_HIST_BINS)) * 2.0;
+}
+float exposurePositiveEvPercentile(uint total, float percentile) {
+    if (total == 0u) return 0.0;
+    uint target = uint(floor(float(total - 1u) * clamp(percentile, 0.0, 1.0)));
+    uint cumulative = 0u;
+    for (uint bin = 0u; bin < EXP_POS_EV_HIST_BINS; ++bin) {
+        cumulative += telemetry[EXP_POS_EV_HIST_START + bin];
+        if (cumulative > target) return exposurePositiveEvFromBin(bin);
+    }
+    return 0.0;
+}
+
+void sort16(inout float v[16]) {
+    for (int i = 1; i < 16; ++i) {
+        float key = v[i];
+        int j = i - 1;
+        while (j >= 0 && v[j] > key) {
+            v[j + 1] = v[j];
+            --j;
+        }
+        v[j + 1] = key;
+    }
+}
+
+void sampleExposureTile() {
+    uvec2 gid = gl_GlobalInvocationID.xy;
+    if (gid.x >= pc.sampleColumns || gid.y >= pc.sampleRows) return;
+    uint sampleIndex = gid.y * pc.sampleColumns + gid.x;
+    greenSamples[sampleIndex] = vec4(0.0);
+    if (pc.sampleColumns == 0u || pc.sampleRows == 0u) return;
+
+    float lumaValues[16];
+    float highValues[16];
+    float snrValues[16];
+    int valid = 0;
+    int clipped = 0;
+    for (int sy = 0; sy < 4; ++sy) {
+        for (int sx = 0; sx < 4; ++sx) {
+            float fx = (float(gid.x) + (float(sx) + 0.5) / 4.0) / float(pc.sampleColumns);
+            float fy = (float(gid.y) + (float(sy) + 0.5) / 4.0) / float(pc.sampleRows);
+            int x0 = clamp((int(floor(fx * float(pc.frameWidth))) & ~1), 0, max(0, int(pc.frameWidth) - 2));
+            int y0 = clamp((int(floor(fy * float(pc.frameHeight))) & ~1), 0, max(0, int(pc.frameHeight) - 2));
+            float greenSum = 0.0;
+            float greenVariance = 0.0;
+            int greenCount = 0;
+            float cellHigh = 0.0;
+            bool cellClipped = false;
+            for (int dy = 0; dy < 2; ++dy) {
+                for (int dx = 0; dx < 2; ++dx) {
+                    int x = x0 + dx;
+                    int y = y0 + dy;
+                    float value = outputAt(x, y);
+                    cellHigh = max(cellHigh, value);
+                    cellClipped = cellClipped || value >= 1.0;
+                    int effectiveChannel = cfaChannel4(pc.effectiveCfaPattern, x, y);
+                    if (effectiveChannel != 1 && effectiveChannel != 2) continue;
+                    greenSum += max(0.0, value);
+                    ++greenCount;
+                    if (pc.noiseModelEnabled != 0u) {
+                        int sensorChannel = cfaChannel4(
+                            pc.sensorCfaPattern, x + pc.cfaOffsetX, y + pc.cfaOffsetY);
+                        float lensGain = lensGainAt(sensorChannel, x, y);
+                        float preLensSignal = max(0.0, value) / max(lensGain, 1.0e-4);
+                        int noiseChannel = noiseChannel4(pc.effectiveCfaPattern, x, y);
+                        float sigma = predictedNoiseSigma(preLensSignal, noiseChannel) * lensGain;
+                        greenVariance += sigma * sigma;
+                    }
+                }
+            }
+            if (greenCount <= 0) continue;
+            float cellLuma = greenSum / float(greenCount);
+            float sigmaAverage = pc.noiseModelEnabled != 0u
+                ? sqrt(max(0.0, greenVariance)) / float(greenCount) : 0.0;
+            lumaValues[valid] = cellLuma;
+            highValues[valid] = cellHigh;
+            snrValues[valid] = sigmaAverage > 1.0e-7 ? cellLuma / sigmaAverage : 0.0;
+            if (cellClipped) ++clipped;
+            ++valid;
+        }
+    }
+    if (valid < 8) return;
+    // The 4x4 sampler normally produces all 16 records. Pad a rare incomplete tile with its last
+    // valid value so fixed-size sorting remains deterministic without introducing a false zero tail.
+    for (int i = valid; i < 16; ++i) {
+        lumaValues[i] = lumaValues[valid - 1];
+        highValues[i] = highValues[valid - 1];
+        snrValues[i] = snrValues[valid - 1];
+    }
+    sort16(lumaValues);
+    sort16(highValues);
+    sort16(snrValues);
+    float medianLuma = 0.5 * (lumaValues[7] + lumaValues[8]);
+    float robustHigh = highValues[14];
+    float medianSnr = 0.5 * (snrValues[7] + snrValues[8]);
+    float clipFraction = float(clipped) / float(valid);
+    // w >= 1 is an explicit validity tag; w - 1 is the sampled sensor-clip fraction.
+    greenSamples[sampleIndex] = vec4(medianLuma, robustHigh, medianSnr, 1.0 + clipFraction);
+    if (medianLuma > 0.0 && finite1(medianLuma)) {
+        atomicAdd(telemetry[EXP_LUMA_HIST_START + exposureLumaBin(medianLuma)], 1u);
+    }
+}
+
+float rawSpatialExposureEv(uint tile) {
+    vec4 evidence = greenSamples[tile];
+    float luma = evidence.x;
+    float high = evidence.y;
+    float snr = evidence.z;
+    if (!(evidence.w >= 1.0) || !(luma > 0.0) || !finite1(luma)) return 0.0;
+    float clipFraction = clamp(evidence.w - 1.0, 0.0, 1.0);
+    float relativeEv = exposureSafeLog2(luma / max(exposureP50, 1.0e-6));
+    float ev = 0.0;
+    if (relativeEv < exposureLowerNeutralEv) {
+        float distance = exposureLowerNeutralEv - relativeEv;
+        float snrAuthority = pc.noiseModelEnabled != 0u && finite1(snr)
+                ? exposureSmoothstep(1.5, 6.0, snr) : 0.0;
+        float percentileDistance = max(0.25, abs(exposureLowerNeutralEv));
+        float requested = distance * (0.20 + 0.20 * exposureSmoothstep(
+                percentileDistance, percentileDistance * 3.0, distance));
+        float headroomEv = max(0.0, exposureSafeLog2(0.98 / max(max(high, luma), 1.0e-6)));
+        ev = min(requested, headroomEv) * snrAuthority * exposureSpatialAuthority;
+    } else if (relativeEv > exposureUpperNeutralEv) {
+        float distance = relativeEv - exposureUpperNeutralEv;
+        float robustTailSpan = max(0.35, exposureSafeLog2(
+                max(exposureP95, exposureP75 + 1.0e-6) / max(exposureP75, 1.0e-6)));
+        float relativeAuthority = exposureSmoothstep(0.0, robustTailSpan, distance);
+        float absoluteAuthority = exposureSmoothstep(max(exposureP90, 0.55), 1.0, max(high, luma));
+        float clipAuthority = exposureSmoothstep(0.0, 0.20, clipFraction);
+        float protectAuthority = max(relativeAuthority, max(absoluteAuthority, clipAuthority));
+        ev = -distance * (0.35 + 0.25 * protectAuthority) * exposureSpatialAuthority;
+    }
+    return finite1(ev) ? ev : 0.0;
+}
+
+void resolveExposureMap() {
+    if (gl_WorkGroupID.x != 0u || gl_WorkGroupID.y != 0u || gl_WorkGroupID.z != 0u) return;
+    uint lane = gl_LocalInvocationIndex;
+    uint tileCount = pc.sampleColumns * pc.sampleRows;
+    if (lane == 0u) {
+        uint total = 0u;
+        for (uint bin = 0u; bin < EXP_LUMA_HIST_BINS; ++bin) total += telemetry[EXP_LUMA_HIST_START + bin];
+        exposureValidCount = total;
+        if (total >= tileCount / 4u && tileCount > 0u) {
+            exposureP10 = exposureLumaPercentile(total, 0.10);
+            exposureP25 = exposureLumaPercentile(total, 0.25);
+            exposureP35 = exposureLumaPercentile(total, 0.35);
+            exposureP50 = exposureLumaPercentile(total, 0.50);
+            exposureP75 = exposureLumaPercentile(total, 0.75);
+            exposureP90 = exposureLumaPercentile(total, 0.90);
+            exposureP95 = exposureLumaPercentile(total, 0.95);
+            exposureP99 = exposureLumaPercentile(total, 0.99);
+            exposureMeasuredDrEv = max(0.0, exposureSafeLog2(exposureP90) - exposureSafeLog2(exposureP10));
+            exposureLowerNeutralEv = exposureSafeLog2(max(exposureP35, 1.0e-6) / max(exposureP50, 1.0e-6));
+            exposureUpperNeutralEv = exposureSafeLog2(max(exposureP75, 1.0e-6) / max(exposureP50, 1.0e-6));
+            float interquartileEv = max(0.0, exposureSafeLog2(max(exposureP75, 1.0e-6)) -
+                                               exposureSafeLog2(max(exposureP25, 1.0e-6)));
+            exposureSpatialAuthority = max(exposureSmoothstep(0.55, 2.2, interquartileEv),
+                    0.75 * exposureSmoothstep(1.4, 4.8, exposureMeasuredDrEv));
+        } else {
+            exposureP10=0.0; exposureP25=0.0; exposureP35=0.0; exposureP50=0.0; exposureP75=0.0;
+            exposureP90=0.0; exposureP95=0.0; exposureP99=0.0; exposureMeasuredDrEv=0.0;
+            exposureLowerNeutralEv=0.0; exposureUpperNeutralEv=0.0; exposureSpatialAuthority=0.0;
+        }
+    }
+    barrier();
+    for (uint tile = lane; tile < tileCount; tile += 256u) {
+        greenSamples[EXPOSURE_MAP_RECORD_OFFSET + tile] = vec4(rawSpatialExposureEv(tile), 0.0, 0.0, 0.0);
+    }
+    memoryBarrierBuffer();
+    barrier();
+    for (uint tile = lane; tile < tileCount; tile += 256u) {
+        float ev = greenSamples[EXPOSURE_MAP_RECORD_OFFSET + tile].x;
+        int sign = ev > 1.0e-4 ? 1 : (ev < -1.0e-4 ? -1 : 0);
+        if (sign != 0) {
+            int x = int(tile % pc.sampleColumns);
+            int y = int(tile / pc.sampleColumns);
+            int support = 1, possible = 1;
+            const ivec2 offsets[4] = ivec2[4](ivec2(-1,0), ivec2(1,0), ivec2(0,-1), ivec2(0,1));
+            for (int n = 0; n < 4; ++n) {
+                int nx=x+offsets[n].x, ny=y+offsets[n].y;
+                if (nx<0 || ny<0 || nx>=int(pc.sampleColumns) || ny>=int(pc.sampleRows)) continue;
+                ++possible;
+                uint ni=uint(ny)*pc.sampleColumns+uint(nx);
+                float nev=greenSamples[EXPOSURE_MAP_RECORD_OFFSET+ni].x;
+                int nsign=nev>1.0e-4?1:(nev<-1.0e-4?-1:0);
+                if (nsign==sign) ++support;
+            }
+            vec4 evidence=greenSamples[tile];
+            float rel=exposureSafeLog2(max(evidence.x,1.0e-6)/max(exposureP50,1.0e-6));
+            bool strongHighlight=sign<0 && (rel>exposureUpperNeutralEv+max(0.9,exposureMeasuredDrEv*0.18) ||
+                    evidence.y>=max(0.90,exposureP99) || evidence.w-1.0>0.02);
+            if (!strongHighlight) ev *= exposureSmoothstep(0.20,0.80,float(support)/float(possible));
+            greenSamples[EXPOSURE_MAP_RECORD_OFFSET+tile].x = finite1(ev) ? ev : 0.0;
+        }
+    }
+    memoryBarrierBuffer();
+    barrier();
+    for (uint tile = lane; tile < tileCount; tile += 256u) {
+        if (greenSamples[tile].w < 1.0) continue;
+        float ev=greenSamples[EXPOSURE_MAP_RECORD_OFFSET+tile].x;
+        atomicAdd(telemetry[EXP_EV_HIST_START + exposureEvBin(ev)], 1u);
+        if (ev > 0.015) atomicAdd(telemetry[EXP_POS_EV_HIST_START + exposurePositiveEvBin(ev)], 1u);
+    }
+    memoryBarrierBuffer();
+    barrier();
+    if (lane == 0u) {
+        uint valid=0u, pos=0u, neu=0u, neg=0u;
+        float minEv=1.0e20, maxEv=-1.0e20, sumPos=0.0, sumNeg=0.0, sumGain2=0.0;
+        for (uint tile=0u; tile<tileCount; ++tile) {
+            if (greenSamples[tile].w < 1.0) continue;
+            float ev=greenSamples[EXPOSURE_MAP_RECORD_OFFSET+tile].x;
+            ++valid; minEv=min(minEv,ev); maxEv=max(maxEv,ev);
+            float gain=exp2(ev); sumGain2 += gain*gain;
+            if (ev>0.015) { ++pos; sumPos+=ev; }
+            else if (ev<-0.015) { ++neg; sumNeg+=ev; }
+            else ++neu;
+        }
+        float denom=max(float(valid),1.0);
+        telemetry[EXP_SUMMARY_VALID_COUNT]=valid;
+        telemetry[EXP_SUMMARY_P10]=floatBitsToUint(exposureP10);
+        telemetry[EXP_SUMMARY_P25]=floatBitsToUint(exposureP25);
+        telemetry[EXP_SUMMARY_P50]=floatBitsToUint(exposureP50);
+        telemetry[EXP_SUMMARY_P75]=floatBitsToUint(exposureP75);
+        telemetry[EXP_SUMMARY_P90]=floatBitsToUint(exposureP90);
+        telemetry[EXP_SUMMARY_P95]=floatBitsToUint(exposureP95);
+        telemetry[EXP_SUMMARY_P99]=floatBitsToUint(exposureP99);
+        telemetry[EXP_SUMMARY_DR]=floatBitsToUint(exposureMeasuredDrEv);
+        telemetry[EXP_SUMMARY_LOWER_NEUTRAL]=floatBitsToUint(exposureLowerNeutralEv);
+        telemetry[EXP_SUMMARY_UPPER_NEUTRAL]=floatBitsToUint(exposureUpperNeutralEv);
+        telemetry[EXP_SUMMARY_AUTHORITY]=floatBitsToUint(exposureSpatialAuthority);
+        telemetry[EXP_SUMMARY_MIN_EV]=floatBitsToUint(valid>0u?minEv:0.0);
+        telemetry[EXP_SUMMARY_P10_EV]=floatBitsToUint(valid>0u?exposureEvPercentile(valid,0.10):0.0);
+        telemetry[EXP_SUMMARY_P50_EV]=floatBitsToUint(valid>0u?exposureEvPercentile(valid,0.50):0.0);
+        telemetry[EXP_SUMMARY_P90_EV]=floatBitsToUint(valid>0u?exposureEvPercentile(valid,0.90):0.0);
+        telemetry[EXP_SUMMARY_MAX_EV]=floatBitsToUint(valid>0u?maxEv:0.0);
+        telemetry[EXP_SUMMARY_MEAN_POS_EV]=floatBitsToUint(pos>0u?sumPos/float(pos):0.0);
+        telemetry[EXP_SUMMARY_MEAN_NEG_EV]=floatBitsToUint(neg>0u?sumNeg/float(neg):0.0);
+        telemetry[EXP_SUMMARY_POS_FRAC]=floatBitsToUint(float(pos)/denom);
+        telemetry[EXP_SUMMARY_NEU_FRAC]=floatBitsToUint(float(neu)/denom);
+        telemetry[EXP_SUMMARY_NEG_FRAC]=floatBitsToUint(float(neg)/denom);
+        telemetry[EXP_SUMMARY_MEAN_GAIN2]=floatBitsToUint(valid>0u?sumGain2/denom:1.0);
+        float p90PosEv=pos>0u?exposurePositiveEvPercentile(pos,0.90):0.0;
+        telemetry[EXP_SUMMARY_P90_POS_GAIN]=floatBitsToUint(pos>0u?exp2(p90PosEv):1.0);
+        uint status = exposureValidCount < tileCount/4u ? 1u :
+                (exposureP50 <= 1.0e-6 ? 2u : (exposureSpatialAuthority>0.01?3u:4u));
+        telemetry[EXP_SUMMARY_STATUS]=status;
+    }
+}
+
+float exposureEvAtPixel(int x, int y) {
+    if (pc.sampleColumns == 0u || pc.sampleRows == 0u) return 0.0;
+    float gx = (float(x) + 0.5) * float(pc.sampleColumns) / float(pc.frameWidth) - 0.5;
+    float gy = (float(y) + 0.5) * float(pc.sampleRows) / float(pc.frameHeight) - 0.5;
+    int x0 = clamp(int(floor(gx)), 0, int(pc.sampleColumns) - 1);
+    int y0 = clamp(int(floor(gy)), 0, int(pc.sampleRows) - 1);
+    int x1 = min(x0 + 1, int(pc.sampleColumns) - 1);
+    int y1 = min(y0 + 1, int(pc.sampleRows) - 1);
+    float tx = clamp(gx - float(x0), 0.0, 1.0);
+    float ty = clamp(gy - float(y0), 0.0, 1.0);
+    float e00 = greenSamples[EXPOSURE_MAP_RECORD_OFFSET + uint(y0) * pc.sampleColumns + uint(x0)].x;
+    float e10 = greenSamples[EXPOSURE_MAP_RECORD_OFFSET + uint(y0) * pc.sampleColumns + uint(x1)].x;
+    float e01 = greenSamples[EXPOSURE_MAP_RECORD_OFFSET + uint(y1) * pc.sampleColumns + uint(x0)].x;
+    float e11 = greenSamples[EXPOSURE_MAP_RECORD_OFFSET + uint(y1) * pc.sampleColumns + uint(x1)].x;
+    return mix(mix(e00, e10, tx), mix(e01, e11, tx), ty);
+}
+
+void applyExposurePixel() {
+    uvec2 gid = gl_GlobalInvocationID.xy;
+    if (gid.x >= pc.frameWidth || gid.y >= pc.frameHeight) return;
+    int x = int(gid.x), y = int(gid.y);
+    uint index = linearIndex(x, y);
+    float value = outputMosaic[index];
+    float ev = exposureEvAtPixel(x, y);
+    // One scalar gain is applied to the Bayer mosaic. CFA phase and channel ratios are untouched.
+    outputMosaic[index] = sceneClamp(value * exp2(ev));
+}
+
 void finalizePixel() {
     uvec2 gid = gl_GlobalInvocationID.xy;
     uint lane = gl_LocalInvocationIndex;
@@ -305,5 +683,8 @@ void finalizePixel() {
 void main() {
     if (pc.mode == 0u) sampleGreen();
     else if (pc.mode == 1u) finalizePixel();
-    else sampleAutoScene();
+    else if (pc.mode == 2u) sampleAutoScene();
+    else if (pc.mode == 3u) sampleExposureTile();
+    else if (pc.mode == 4u) resolveExposureMap();
+    else applyExposurePixel();
 }

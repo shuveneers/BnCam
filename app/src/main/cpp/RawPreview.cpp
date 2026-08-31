@@ -1,5 +1,6 @@
 #include "RawPreview.h"
 #include "ProfileToneRenderPolicy.h"
+#include "PhysicalAwbEstimator.h"
 #include "vulkan/VulkanRuntime.h"
 
 #if defined(BNCAM_ENABLE_RAW_PREVIEW_CPU_REFERENCE)
@@ -19,10 +20,10 @@
 
 namespace {
 
-// Fixed product tier: 4096x3072 RAW -> 4x CFA-cell decimation -> 1024x768.
-// This restores the previously proven low-latency geometry without adaptive downshifting.
-constexpr int PREVIEW_MAX_WIDTH = 1024;
-constexpr int PREVIEW_MAX_HEIGHT = 768;
+// Kotlin owns the product RAW-preview resolution. Native keeps only a higher hard safety
+// ceiling so a stale or malformed caller can never request an unbounded preview allocation.
+constexpr int PREVIEW_HARD_MAX_WIDTH = 2048;
+constexpr int PREVIEW_HARD_MAX_HEIGHT = 1536;
 constexpr int RAW10_FORMAT = 37;
 constexpr int RAW_SENSOR_FORMAT = 32;
 
@@ -419,8 +420,8 @@ RawPreviewResult renderRawPreviewRgba(
         return result;
     }
 
-    const int boundedMaxWidth = std::clamp(parameters.maxWidth, 64, PREVIEW_MAX_WIDTH);
-    const int boundedMaxHeight = std::clamp(parameters.maxHeight, 64, PREVIEW_MAX_HEIGHT);
+    const int boundedMaxWidth = std::clamp(parameters.maxWidth, 64, PREVIEW_HARD_MAX_WIDTH);
+    const int boundedMaxHeight = std::clamp(parameters.maxHeight, 64, PREVIEW_HARD_MAX_HEIGHT);
     int cropLeft = std::clamp(parameters.sourceCropLeft, 0, std::max(0, fullWidth - 2));
     int cropTop = std::clamp(parameters.sourceCropTop, 0, std::max(0, fullHeight - 2));
     int cropWidth = parameters.sourceCropWidth > 0
@@ -479,6 +480,9 @@ RawPreviewResult renderRawPreviewRgba(
             std::max(1, parameters.captureSensitivityIso));
     previewRequest.captureExposureTimeMs = parameters.captureExposureTimeNs > 0
             ? static_cast<float>(parameters.captureExposureTimeNs) / 1.0e6f : 0.0f;
+    previewRequest.physicalGreenNoiseS = std::max(0.0f, parameters.physicalGreenNoiseS);
+    previewRequest.physicalGreenNoiseO = std::max(0.0f, parameters.physicalGreenNoiseO);
+    previewRequest.physicalNoiseConfidence = std::clamp(parameters.physicalNoiseConfidence, 0.0f, 1.0f);
     previewRequest.focusDetailPriority = std::clamp(parameters.focusDetailPriority, 0.0f, 1.0f);
     const float previewGreen = std::max(
             1.0e-4f, 0.5f * (parameters.quality.wbGreenEven + parameters.quality.wbGreenOdd));
@@ -532,6 +536,41 @@ RawPreviewResult renderRawPreviewRgba(
         return result;
     }
     if (previewGpu.success) {
+        std::vector<bncam::awb::LinearOpponentSample> awbSamples;
+        awbSamples.reserve(previewGpu.awbSampleCount);
+        for (const auto& sample : previewGpu.awbSamples) {
+            if (!sample.valid) continue;
+            awbSamples.push_back({
+                    static_cast<double>(sample.luma),
+                    static_cast<double>(sample.redMinusGreen),
+                    static_cast<double>(sample.blueMinusGreen),
+                    static_cast<double>(sample.structure),
+                    static_cast<int>(sample.tileIndex)});
+        }
+        const float priorGreen = std::max(1.0e-4f, 0.5f *
+                (parameters.camera2PriorWbGains[1] + parameters.camera2PriorWbGains[2]));
+        const std::array<double, 3> camera2PriorRgb{
+                static_cast<double>(parameters.camera2PriorWbGains[0] / priorGreen),
+                1.0,
+                static_cast<double>(parameters.camera2PriorWbGains[3] / priorGreen)};
+        // No calibrated preview-domain sigma is available at this boundary yet. Pass zero rather
+        // than pretending an ISO heuristic is sensor calibration; the estimator then uses its
+        // conservative absolute dark floor. Cross-device noise-model coupling remains a later phase.
+        const auto awbEstimate = bncam::awb::resolve(awbSamples, camera2PriorRgb, 0.0);
+        for (int channel = 0; channel < 3; ++channel) {
+            result.awbPriorGainsRgb[channel] = static_cast<float>(awbEstimate.priorGainsRgb[channel]);
+            result.awbDataGainsRgb[channel] = static_cast<float>(awbEstimate.dataGainsRgb[channel]);
+            result.awbFinalGainsRgb[channel] = static_cast<float>(awbEstimate.finalGainsRgb[channel]);
+        }
+        result.awbConfidence = static_cast<float>(awbEstimate.confidence);
+        result.awbDataAuthority = static_cast<float>(awbEstimate.dataAuthority);
+        result.awbNeutralSupport = static_cast<float>(awbEstimate.neutralSupport);
+        result.awbMixedLightScore = static_cast<float>(awbEstimate.mixedLightScore);
+        result.awbPriorDisagreement = static_cast<float>(awbEstimate.priorDisagreement);
+        result.awbValidTileCount = static_cast<int>(awbEstimate.validTileCount);
+        result.awbAcceptedSampleCount = static_cast<int>(awbEstimate.acceptedSampleCount);
+        result.awbDataReady = awbEstimate.dataReady;
+
         result.normalizedRawMin = previewGpu.normalizedRawMin;
         result.normalizedRawMax = previewGpu.normalizedRawMax;
         result.targetExposureGain = previewGpu.exposureGain;
@@ -570,6 +609,18 @@ RawPreviewResult renderRawPreviewRgba(
         result.displaySampleCount = previewGpu.displaySampleCount;
         result.displayHighlightX = previewGpu.displayHighlightX;
         result.displayHighlightY = previewGpu.displayHighlightY;
+        result.exposureTileCount = previewGpu.exposureTileCount;
+        result.exposureSceneP10 = previewGpu.exposureSceneP10;
+        result.exposureSceneP25 = previewGpu.exposureSceneP25;
+        result.exposureSceneP50 = previewGpu.exposureSceneP50;
+        result.exposureSceneP75 = previewGpu.exposureSceneP75;
+        result.exposureSceneP90 = previewGpu.exposureSceneP90;
+        result.exposureSceneP95 = previewGpu.exposureSceneP95;
+        result.exposureSceneP99 = previewGpu.exposureSceneP99;
+        result.exposureMeasuredSceneDrEv = previewGpu.exposureMeasuredSceneDrEv;
+        result.exposureLowerNeutralBoundaryEv = previewGpu.exposureLowerNeutralBoundaryEv;
+        result.exposureUpperNeutralBoundaryEv = previewGpu.exposureUpperNeutralBoundaryEv;
+        result.exposureSpatialAuthority = previewGpu.exposureSpatialAuthority;
         result.analysisNv21Width = static_cast<int>(previewGpu.analysisNv21Width);
         result.analysisNv21Height = static_cast<int>(previewGpu.analysisNv21Height);
         result.rawUnpackMicroseconds = static_cast<int>(previewGpu.inputPackingMs * 1000.0f);

@@ -69,9 +69,6 @@ object FocusConfidenceEngine {
             else -> FocusEvidence.EMPTY
         }
 
-        // A sensor-specific calibrated noise model is not available here. Keep this generic floor
-        // deliberately small and bounded; it may suppress obvious ISO-driven false detail but must
-        // never classify high-ISO frames as soft merely because ISO is high.
         val noiseFloor = genericNormalizedNoiseFloor(iso)
         val noiseAdjustedDetail = max(0f, evidence.detail - noiseFloor)
         val detailRatio = noiseAdjustedDetail / max(evidence.contrast, 0.015f)
@@ -114,7 +111,6 @@ object FocusConfidenceEngine {
         )
     }
 
-
     private data class FocusEvidence(
         val detail: Float,
         val contrast: Float,
@@ -154,8 +150,6 @@ object FocusConfidenceEngine {
             }
         }
 
-        // Without a real AF/subject ROI use a broad center region. It is intentionally not labelled
-        // as subject evidence; callers can distinguish this fallback via subjectRoiUsed=false.
         val marginX = width / 5
         val marginY = height / 5
         return Rect(marginX, marginY, width - marginX, height - marginY)
@@ -249,29 +243,38 @@ object FocusConfidenceEngine {
         step: Int,
         read: (x: Int, y: Int) -> Int
     ): FocusEvidence {
-        val startX = ((roi.left + 1) / 2 * 2).coerceIn(2, image.width - 4)
-        val endX = (roi.right / 2 * 2).coerceIn(startX + 2, image.width - 2)
-        val startY = ((roi.top + 1) / 2 * 2).coerceIn(2, image.height - 4)
-        val endY = (roi.bottom / 2 * 2).coerceIn(startY + 2, image.height - 2)
+        val startX = ((roi.left + 1) / 2 * 2).coerceIn(2, image.width - 6)
+        val endX = (roi.right / 2 * 2).coerceIn(startX + 2, image.width - 4)
+        val startY = ((roi.top + 1) / 2 * 2).coerceIn(2, image.height - 6)
+        val endY = (roi.bottom / 2 * 2).coerceIn(startY + 2, image.height - 4)
 
         var sumGradient = 0.0
         var sumPixel = 0.0
         var sumPixelSq = 0.0
         var peak = 0
         var count = 0
+
         for (y in startY until endY step step) {
             for (x in startX until endX step step) {
-                // Compare the same CFA phase two pixels apart; cross-colour Bayer differences are
-                // not focus detail and would otherwise create false peaking/confidence.
-                val center = read(x, y)
-                val right = read(x + 2, y)
-                val down = read(x, y + 2)
-                if (center <= 0 && right <= 0 && down <= 0) continue
-                sumGradient += (abs(center - right) + abs(center - down)) * 0.5
-                sumPixel += center
-                sumPixelSq += center.toDouble() * center.toDouble()
-                peak = max(peak, max(center, max(right, down)))
-                count++
+                // Evaluate every site in the local 2x2 Bayer cell. The previous implementation
+                // sampled only the even/even phase, so RAW focus confidence could accidentally be
+                // driven by only R, G or B depending on the sensor CFA origin. Peaking/AF evidence
+                // must be phase-neutral and must not change character between CFA layouts.
+                for (phaseY in 0..1) {
+                    for (phaseX in 0..1) {
+                        val px = x + phaseX
+                        val py = y + phaseY
+                        val center = read(px, py)
+                        val right = read(px + 2, py)
+                        val down = read(px, py + 2)
+                        if (center <= 0 && right <= 0 && down <= 0) continue
+                        sumGradient += (abs(center - right) + abs(center - down)) * 0.5
+                        sumPixel += center
+                        sumPixelSq += center.toDouble() * center.toDouble()
+                        peak = max(peak, max(center, max(right, down)))
+                        count++
+                    }
+                }
             }
         }
         if (count == 0 || peak <= 0) return FocusEvidence.EMPTY

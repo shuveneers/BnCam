@@ -21,6 +21,24 @@ data class TargetChromaticity(
     }
 }
 
+
+
+data class ActualSensorForwardMatrixResult(
+    val values: FloatArray?,
+    val deviceCalibrationApplied: Boolean,
+    val calibrationLabel: String
+)
+
+data class SensorColorMatrixValidation(
+    val valid: Boolean,
+    val score: Float,
+    val reason: String,
+    val determinant: Float,
+    val rowSums: FloatArray,
+    val neutralAxisDeviation: Float,
+    val maxAbs: Float,
+    val negativeEnergy: Float
+)
 data class ResolvedColorTransformResult(
     val targetKelvin: Int,
     val illuminantModel: String,
@@ -60,6 +78,91 @@ object RawColorTransformEngine {
     internal fun xyzD50ToLinearSrgbMatrix(): FloatArray =
         multiply3x3(XYZ_D65_TO_LINEAR_SRGB, BRADFORD_D50_TO_D65)
             ?: identityArray()
+
+    /**
+     * Shared sensor-RGB -> linear-sRGB matrix validity contract. Row-sum/neutral-axis metrics are
+     * diagnostic only: BnCam must never force a camera matrix toward neutral by mutating its rows.
+     */
+    fun validateSensorToLinearSrgbMatrix(values: FloatArray): SensorColorMatrixValidation {
+        val emptyRows = floatArrayOf(Float.NaN, Float.NaN, Float.NaN)
+        if (values.size != 9) {
+            return SensorColorMatrixValidation(false, Float.MAX_VALUE, "expected_9_values", Float.NaN, emptyRows, Float.NaN, Float.NaN, Float.NaN)
+        }
+        if (values.any { !it.isFinite() }) {
+            return SensorColorMatrixValidation(false, Float.MAX_VALUE, "non_finite_matrix_value", Float.NaN, emptyRows, Float.NaN, Float.NaN, Float.NaN)
+        }
+        val rowSums = FloatArray(3) { row ->
+            values[row * 3] + values[row * 3 + 1] + values[row * 3 + 2]
+        }
+        val rowAbs = FloatArray(3) { row ->
+            abs(values[row * 3]) + abs(values[row * 3 + 1]) + abs(values[row * 3 + 2])
+        }
+        val maxAbs = values.maxOf { abs(it) }
+        // Android explicitly allows device-dependent CCM coefficient ranges. Keep only a broad
+        // catastrophic-data guard; do not reject legitimate sensors because their calibrated
+        // coefficients fall outside a BnCam tuning window.
+        if (rowAbs.any { !it.isFinite() || it < 1.0e-5f } || !maxAbs.isFinite() || maxAbs > 64.0f) {
+            return SensorColorMatrixValidation(false, Float.MAX_VALUE, "degenerate_or_catastrophic_matrix", Float.NaN, rowSums, Float.NaN, maxAbs, Float.NaN)
+        }
+        val det = values[0] * (values[4] * values[8] - values[5] * values[7]) -
+            values[1] * (values[3] * values[8] - values[5] * values[6]) +
+            values[2] * (values[3] * values[7] - values[4] * values[6])
+        if (!det.isFinite() || abs(det) < 1.0e-6f) {
+            return SensorColorMatrixValidation(false, Float.MAX_VALUE, "singular_matrix", det, rowSums, Float.NaN, maxAbs, Float.NaN)
+        }
+        val meanRowSum = rowSums.average().toFloat()
+        val neutralDeviation = if (abs(meanRowSum) > 1.0e-6f) {
+            rowSums.maxOf { abs(it - meanRowSum) } / abs(meanRowSum)
+        } else {
+            Float.POSITIVE_INFINITY
+        }
+        val negativeEnergy = values.filter { it < 0f }.sumOf { abs(it).toDouble() }.toFloat()
+        val score = negativeEnergy * 0.08f + abs(maxAbs - 1.0f) * 0.04f
+        return SensorColorMatrixValidation(
+            valid = true,
+            score = score,
+            reason = "valid",
+            determinant = det,
+            rowSums = rowSums,
+            neutralAxisDeviation = neutralDeviation,
+            maxAbs = maxAbs,
+            negativeEnergy = negativeEnergy
+        )
+    }
+
+    fun resolveActualSensorForwardMatrixToLinearSrgb(
+        forwardMatrix: FloatArray?,
+        calibrationTransform: FloatArray?
+    ): ActualSensorForwardMatrixResult {
+        val forward = forwardMatrix
+            ?.takeIf(::isFiniteMatrix)
+            ?.copyOf()
+            ?: return ActualSensorForwardMatrixResult(null, false, "forward_matrix_missing_or_invalid")
+        // ForwardMatrix is defined in REFERENCE-sensor space, while the RAW payload is in the
+        // ACTUAL device-sensor space. Android couples the calibration matrices to the reference
+        // illuminants; without CalibrationTransform we cannot truthfully bridge those domains.
+        // Reject the static fallback instead of silently assuming reference==actual.
+        val calibration = calibrationTransform
+            ?: return ActualSensorForwardMatrixResult(null, false, "calibration_transform_missing")
+        if (!isFiniteMatrix(calibration)) {
+            return ActualSensorForwardMatrixResult(null, false, "calibration_transform_invalid")
+        }
+        val actualSensorToReference = invert3x3(calibration)
+            ?: return ActualSensorForwardMatrixResult(null, false, "calibration_transform_noninvertible")
+        val referenceToXyzD50 = multiply3x3(forward, actualSensorToReference)
+            ?: return ActualSensorForwardMatrixResult(null, true, "matrix_multiply_failed")
+        val linearSrgb = multiply3x3(xyzD50ToLinearSrgbMatrix(), referenceToXyzD50)
+            ?.takeIf { validateSensorToLinearSrgbMatrix(it).valid }
+        return ActualSensorForwardMatrixResult(
+            values = linearSrgb,
+            deviceCalibrationApplied = true,
+            calibrationLabel = if (linearSrgb == null) {
+                "linear_srgb_matrix_out_of_bounds"
+            } else {
+                "inverse_device_calibration_applied"
+            }
+        )
+    }
 
     /**
      * Resolves a profile/manual Kelvin target in the sensor's native color space.
@@ -308,7 +411,8 @@ object RawColorTransformEngine {
                 reason = "wb_matrix_compensation_failed"
             )
 
-        val matrixValid = isPlausibleLinearSrgbMatrix(mTotal) && isPlausibleLinearSrgbMatrix(mPostCompensated)
+        val matrixValid = validateSensorToLinearSrgbMatrix(mTotal).valid &&
+            validateSensorToLinearSrgbMatrix(mPostCompensated).valid
         if (!matrixValid) {
             return invalidResult(
                 targetKelvin = targetKelvin,
@@ -378,19 +482,6 @@ object RawColorTransformEngine {
     private fun isFiniteMatrix(m: FloatArray): Boolean =
         m.size == 9 && m.all { it.isFinite() && abs(it) < 64f }
 
-    private fun isPlausibleLinearSrgbMatrix(m: FloatArray): Boolean {
-        if (!isFiniteMatrix(m)) return false
-        // Camera CCMs legitimately contain negative cross-channel coefficients. Guard only
-        // against catastrophic matrices, not against normal colorimetric negative terms.
-        if (m.any { abs(it) > 16f }) return false
-        val rowAbsSums = floatArrayOf(
-            abs(m[0]) + abs(m[1]) + abs(m[2]),
-            abs(m[3]) + abs(m[4]) + abs(m[5]),
-            abs(m[6]) + abs(m[7]) + abs(m[8])
-        )
-        return rowAbsSums.all { it.isFinite() && it in 0.05f..24f }
-    }
-
     private fun interpolateMatrices(m1: FloatArray?, m2: FloatArray?, weight: Float): FloatArray? {
         if (m1 == null && m2 == null) return null
         if (m1 != null && m2 == null) return m1
@@ -410,8 +501,10 @@ object RawColorTransformEngine {
             for (column in 0..2) {
                 val rational = transform.getElement(column, row)
                 val denominator = rational.denominator
+                // A malformed rational must invalidate the matrix. Substituting identity here
+                // would silently manufacture calibration data and can create route-dependent color.
                 values[row * 3 + column] = if (denominator == 0) {
-                    if (row == column) 1f else 0f
+                    Float.NaN
                 } else {
                     rational.numerator.toFloat() / denominator.toFloat()
                 }

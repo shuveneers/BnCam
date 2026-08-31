@@ -848,12 +848,28 @@ object SensorCalibrationResolver {
             base.baseColorMatrixSource.contains("CaptureResult.COLOR_CORRECTION_TRANSFORM", ignoreCase = true)
         val exactFrameCamera2ColorPair = systemAwbRequested && exactFrameCamera2Wb && exactFrameCamera2Ccm
 
-        // Still System-AWB color must be one selected-frame Camera2 solution. The process-local
-        // stable WB engine remains useful for preview/bootstrap, but it must never be paired with
-        // a different frame's COLOR_CORRECTION_TRANSFORM. Stable fallback is therefore allowed
-        // only when neither half of an exact selected-frame pair is available.
-        val stableSystemAutoWb = stableAutoWhiteBalance?.takeIf { snapshot ->
-            systemAwbRequested && !exactFrameCamera2Wb && !exactFrameCamera2Ccm &&
+        // System Auto uses the single temporal owner's recent physical scene solution only when
+        // it carries a coherent WB+CCM pair. Camera2 remains the exact-frame prior/fallback whenever
+        // physical evidence is unavailable, weak, stale or incomplete; no gain-only history is
+        // mixed with a current-frame matrix.
+        val stablePhysicalSystemAutoPair = stableAutoWhiteBalance?.takeIf { snapshot ->
+            val selectedTimestampNs = base.sensorTimestampNs ?: 0L
+            val ageNs = if (selectedTimestampNs > 0L && snapshot.sensorTimestampNs > 0L) {
+                abs(selectedTimestampNs - snapshot.sensorTimestampNs)
+            } else {
+                Long.MAX_VALUE
+            }
+            val matrix = snapshot.copyColorMatrix()
+            systemAwbRequested && snapshot.source == WhiteBalanceObservationSource.PHYSICAL_SCENE &&
+                snapshot.confidence >= 0.55f && snapshot.dataAuthority >= 0.10f &&
+                ageNs <= 1_000_000_000L && snapshot.gains.size >= 4 &&
+                snapshot.gains.take(4).all { gain -> gain.isFinite() && gain in 0.25f..6.0f } &&
+                matrix != null && matrix.size >= 9 &&
+                RawColorTransformEngine.validateSensorToLinearSrgbMatrix(matrix.copyOf(9)).valid
+        }
+        val stableSystemAutoWbFallback = stableAutoWhiteBalance?.takeIf { snapshot ->
+            systemAwbRequested && stablePhysicalSystemAutoPair == null &&
+                !exactFrameCamera2Wb && !exactFrameCamera2Ccm &&
                 snapshot.confidence >= 0.55f && snapshot.gains.size >= 4 &&
                 snapshot.gains.take(4).all { gain -> gain.isFinite() && gain in 0.25f..6.0f }
         }
@@ -873,8 +889,9 @@ object SensorCalibrationResolver {
 
         val wb = when {
             sensorAwareProfileAwb != null -> sensorAwareProfileAwb.bayerWbGains.copyOf()
+            stablePhysicalSystemAutoPair != null -> stablePhysicalSystemAutoPair.copyGains()
             systemAwbRequested && exactFrameCamera2Wb -> base.baseWbGains.copyOf()
-            stableSystemAutoWb != null -> stableSystemAutoWb.copyGains()
+            stableSystemAutoWbFallback != null -> stableSystemAutoWbFallback.copyGains()
             safeProfileAwb?.mode == ProfileAwbModes.SYSTEM_AUTO -> base.baseWbGains.copyOf()
             safeProfileAwb != null -> base.baseWbGains.copyOf()
             override.awbMode != "System" -> {
@@ -886,42 +903,54 @@ object SensorCalibrationResolver {
         val wbSource = when {
             sensorAwareProfileAwb != null ->
                 "Sensor-aware profile WB ${sensorAwareProfileAwb.targetKelvin}K / ${sensorAwareProfileAwb.illuminantModel} / Camera2 calibration matrices"
+            stablePhysicalSystemAutoPair != null ->
+                "BnCam physical AWB confidence=${String.format(Locale.US, "%.3f", stablePhysicalSystemAutoPair.confidence)} " +
+                    "dataAuthority=${String.format(Locale.US, "%.3f", stablePhysicalSystemAutoPair.dataAuthority)} " +
+                    "mixedLight=${String.format(Locale.US, "%.3f", stablePhysicalSystemAutoPair.mixedLightScore)}"
             exactFrameCamera2ColorPair ->
                 "CaptureResult exact-frame color pair: COLOR_CORRECTION_GAINS + COLOR_CORRECTION_TRANSFORM"
             systemAwbRequested && exactFrameCamera2Wb ->
                 "Exact-frame Camera2 WB gains with non-frame CCM fallback: ${base.baseColorMatrixSource}"
-            stableSystemAutoWb != null ->
-                "BnCam stable Camera2 AWB bootstrap confidence=${String.format(Locale.US, "%.3f", stableSystemAutoWb.confidence)} samples=${stableSystemAutoWb.acceptedSampleCount}"
+            stableSystemAutoWbFallback != null ->
+                "BnCam stable Camera2 AWB bootstrap confidence=${String.format(Locale.US, "%.3f", stableSystemAutoWbFallback.confidence)} samples=${stableSystemAutoWbFallback.acceptedSampleCount}"
             safeProfileAwb?.mode == ProfileAwbModes.SYSTEM_AUTO -> base.baseWbSource
             safeProfileAwb != null -> "Profile WB fallback -> ${base.baseWbSource}"
             override.awbMode != "System" -> "Legacy Lens ID AWB override profile=${override.awbProfile} over ${base.baseWbSource}"
             else -> base.baseWbSource
         }
 
-        // White balance and sensor colour conversion are deliberately kept as two separate
-        // operations. The per-frame Camera2 colour transform is already calibrated for this
-        // physical sensor and has proven stable on the active HAL. Replacing that entire matrix
-        // merely because the user selected a Kelvin target can turn a valid WB adjustment into a
-        // large green/magenta rotation (and has caused unstable RAW-preview configurations on
-        // some devices). Manual/profile WB therefore changes the sensor-domain WB diagonal only;
-        // the proven per-frame colour matrix remains authoritative unless the user explicitly
-        // supplied a Lens-ID manual matrix.
+        // WB gains and the post-demosaic sensor->linear-sRGB matrix are separate operations but
+        // they form one colorimetric solution. System Auto uses the exact/temporal Camera2 pair.
+        // Manual/profile Kelvin uses RawColorTransformEngine's calibration-derived post-WB matrix
+        // so a new illuminant is never paired with a CCM solved for a different white point.
+        val profileColorMatrix = sensorAwareProfileAwb?.mPostCompensated?.copyOf()?.takeIf {
+            RawColorTransformEngine.validateSensorToLinearSrgbMatrix(it).valid
+        }
         val colorMatrix = when {
             manualColorOverrideActive -> override.manualColorMatrix
+            sensorAwareProfileAwb != null && profileColorMatrix != null -> profileColorMatrix
+            stablePhysicalSystemAutoPair != null -> stablePhysicalSystemAutoPair.copyColorMatrix()
             else -> base.baseColorMatrix
         }
         val colorSource = when {
             manualColorOverrideActive -> "Lens ID Manual color matrix override"
+            sensorAwareProfileAwb != null && profileColorMatrix != null ->
+                "Sensor-aware profile WB ${sensorAwareProfileAwb.targetKelvin}K paired post-WB sensor->linear-sRGB matrix"
+            stablePhysicalSystemAutoPair != null ->
+                "BnCam physical AWB temporally paired Camera2 CCM"
             exactFrameCamera2ColorPair ->
                 "CaptureResult exact-frame color pair: COLOR_CORRECTION_TRANSFORM + COLOR_CORRECTION_GAINS"
-            sensorAwareProfileAwb != null -> "${base.baseColorMatrixSource} + sensor-aware profile WB gains (${sensorAwareProfileAwb.targetKelvin}K)"
             else -> base.baseColorMatrixSource
         }
         val colorApplied = when {
             manualColorOverrideActive -> true
+            sensorAwareProfileAwb != null && profileColorMatrix != null -> true
+            stablePhysicalSystemAutoPair != null -> colorMatrix != null
             else -> colorMatrix != null && !base.baseColorMatrixIdentityFallbackUsed
         }
-        val identityFallback = !manualColorOverrideActive && base.baseColorMatrixIdentityFallbackUsed
+        val identityFallback = !manualColorOverrideActive &&
+            !(sensorAwareProfileAwb != null && profileColorMatrix != null) &&
+            stablePhysicalSystemAutoPair == null && base.baseColorMatrixIdentityFallbackUsed
 
         val applicability = listOf(
             "Black Level Applied To" to when (base.inputDomain) {
@@ -1017,12 +1046,16 @@ object SensorCalibrationResolver {
             effectiveColorMatrixIdentityFallbackUsed = identityFallback,
             effectiveColorMatrixRejectReason = when {
                 override.manualColorMatrix != null -> "none"
-                sensorAwareProfileAwb != null -> "none"
+                sensorAwareProfileAwb != null && profileColorMatrix != null -> "none"
+                sensorAwareProfileAwb != null -> "profile_color_matrix_invalid_fallback_to_base"
                 else -> base.baseColorMatrixRejectReason
             },
             effectiveColorMatrixNote = when {
                 override.manualColorMatrix != null -> "Manual valid 3x3 matrix applied"
-                sensorAwareProfileAwb != null -> "Stable per-frame sensor color matrix retained; profile Kelvin changes WB gains only"
+                sensorAwareProfileAwb != null && profileColorMatrix != null ->
+                    "Profile Kelvin uses coherent Camera2 calibration-derived WB + post-WB sensor-to-linear-sRGB matrix"
+                sensorAwareProfileAwb != null ->
+                    "Profile color matrix unavailable; base sensor matrix fallback retained"
                 else -> base.baseColorMatrixNote
             },
             rawInputDomain = base.inputDomain,
@@ -1209,28 +1242,16 @@ object SensorCalibrationResolver {
         forwardKey: CameraCharacteristics.Key<ColorSpaceTransform>,
         calibrationKey: CameraCharacteristics.Key<ColorSpaceTransform>
     ): ForwardMatrixCandidateResolution {
-        val forward = characteristics.get(forwardKey)?.let { colorSpaceTransformToArray(it) }
-            ?: return ForwardMatrixCandidateResolution(null, false, "forward_matrix_missing")
-        val calibration = characteristics.get(calibrationKey)?.let { colorSpaceTransformToArray(it) }
-        val actualSensorToReference = when {
-            calibration == null -> IDENTITY_3X3.copyOf()
-            else -> invert3x3(calibration)
-                ?: return ForwardMatrixCandidateResolution(null, false, "calibration_transform_noninvertible")
-        }
-        val referenceToXyzD50 = multiply3x3(forward, actualSensorToReference)
-            ?: return ForwardMatrixCandidateResolution(null, calibration != null, "matrix_multiply_failed")
-        val linearSrgb = multiply3x3(
-            RawColorTransformEngine.xyzD50ToLinearSrgbMatrix(),
-            referenceToXyzD50
+        val forward = characteristics.get(forwardKey)?.let(RawColorTransformEngine::colorSpaceTransformToArray)
+        val calibration = characteristics.get(calibrationKey)?.let(RawColorTransformEngine::colorSpaceTransformToArray)
+        val resolved = RawColorTransformEngine.resolveActualSensorForwardMatrixToLinearSrgb(
+            forwardMatrix = forward,
+            calibrationTransform = calibration
         )
         return ForwardMatrixCandidateResolution(
-            values = linearSrgb,
-            deviceCalibrationApplied = calibration != null,
-            calibrationLabel = if (calibration != null) {
-                "inverse_device_calibration_applied"
-            } else {
-                "calibration_transform_missing_identity_reference_assumption"
-            }
+            values = resolved.values,
+            deviceCalibrationApplied = resolved.deviceCalibrationApplied,
+            calibrationLabel = resolved.calibrationLabel
         )
     }
 
@@ -1248,7 +1269,7 @@ object SensorCalibrationResolver {
         candidates.add(MatrixCandidate(
             source = "CaptureResult.COLOR_CORRECTION_TRANSFORM -> linear_sRGB",
             values = captureResult?.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)
-                ?.let { colorSpaceTransformToArray(it) },
+                ?.let { RawColorTransformEngine.colorSpaceTransformToArray(it) },
             note = "capture_result_sensor_rgb_to_linear_srgb_direct_phase8_preserved",
             declaredInputSpace = "actual_sensor_RGB_after_WB",
             declaredOutputSpace = "linear_sRGB_D65",
@@ -1374,61 +1395,6 @@ object SensorCalibrationResolver {
         )
     }
 
-    private fun colorSpaceTransformToArray(transform: ColorSpaceTransform): FloatArray {
-        val values = FloatArray(9)
-        for (row in 0..2) {
-            for (column in 0..2) {
-                val rational = transform.getElement(column, row)
-                val denominator = rational.denominator
-                values[row * 3 + column] = if (denominator == 0) {
-                    if (row == column) 1f else 0f
-                } else {
-                    rational.numerator.toFloat() / denominator.toFloat()
-                }
-            }
-        }
-        return values
-    }
-
-    private fun xyzToSrgbD65Matrix(): FloatArray = floatArrayOf(
-        3.2404542f, -1.5371385f, -0.4985314f,
-        -0.9692660f, 1.8760108f, 0.0415560f,
-        0.0556434f, -0.2040259f, 1.0572252f
-    )
-
-    private fun multiply3x3(a: FloatArray, b: FloatArray): FloatArray? {
-        if (a.size != 9 || b.size != 9) return null
-        val out = FloatArray(9)
-        for (row in 0..2) {
-            for (column in 0..2) {
-                var sum = 0f
-                for (k in 0..2) sum += a[row * 3 + k] * b[k * 3 + column]
-                out[row * 3 + column] = sum
-            }
-        }
-        return out
-    }
-
-    private fun invert3x3(m: FloatArray): FloatArray? {
-        if (m.size != 9 || m.any { !it.isFinite() }) return null
-        val det = m[0] * (m[4] * m[8] - m[5] * m[7]) -
-            m[1] * (m[3] * m[8] - m[5] * m[6]) +
-            m[2] * (m[3] * m[7] - m[4] * m[6])
-        if (!det.isFinite() || abs(det) < 0.00001f) return null
-        val invDet = 1f / det
-        return floatArrayOf(
-            (m[4] * m[8] - m[5] * m[7]) * invDet,
-            (m[2] * m[7] - m[1] * m[8]) * invDet,
-            (m[1] * m[5] - m[2] * m[4]) * invDet,
-            (m[5] * m[6] - m[3] * m[8]) * invDet,
-            (m[0] * m[8] - m[2] * m[6]) * invDet,
-            (m[2] * m[3] - m[0] * m[5]) * invDet,
-            (m[3] * m[7] - m[4] * m[6]) * invDet,
-            (m[1] * m[6] - m[0] * m[7]) * invDet,
-            (m[0] * m[4] - m[1] * m[3]) * invDet
-        )
-    }
-
     private fun legacyNeutralNormalizedMatrix(values: FloatArray): FloatArray? {
         if (values.size != 9 || values.any { !it.isFinite() }) return null
         val rowSums = FloatArray(3) { row -> values[row * 3] + values[row * 3 + 1] + values[row * 3 + 2] }
@@ -1444,26 +1410,16 @@ object SensorCalibrationResolver {
     }
 
     private fun validateColorMatrix(values: FloatArray): Triple<Boolean, Float, String> {
-        if (values.size != 9) return Triple(false, Float.MAX_VALUE, "expected 9 values, got ${values.size}")
-        if (values.any { !it.isFinite() }) return Triple(false, Float.MAX_VALUE, "non-finite matrix value")
-        if (values.all { abs(it) < 0.0001f }) return Triple(false, Float.MAX_VALUE, "all-zero matrix")
-        val isIdentity = values.indices.all { i -> abs(values[i] - IDENTITY_3X3[i]) < 0.0001f }
-        if (isIdentity) return Triple(false, Float.MAX_VALUE, "identity matrix is not accepted as metadata matrix")
-
-        val rowAbs = FloatArray(3) { row -> abs(values[row * 3]) + abs(values[row * 3 + 1]) + abs(values[row * 3 + 2]) }
-        if (rowAbs.any { !it.isFinite() || it < 0.05f || it > 8.0f }) {
-            return Triple(false, Float.MAX_VALUE, "row gain outside safe range ${rowAbs.toList()}")
-        }
-        val det = values[0] * (values[4] * values[8] - values[5] * values[7]) -
-            values[1] * (values[3] * values[8] - values[5] * values[6]) +
-            values[2] * (values[3] * values[7] - values[4] * values[6])
-        if (!det.isFinite() || abs(det) < 0.001f || abs(det) > 24.0f) {
-            return Triple(false, Float.MAX_VALUE, "determinant outside safe range ${String.format(Locale.US, "%.5f", det)}")
-        }
-        val maxAbs = values.maxOf { abs(it) }
-        val negativeEnergy = values.filter { it < 0f }.sumOf { abs(it).toDouble() }.toFloat()
-        val score = negativeEnergy * 0.08f + abs(maxAbs - 1.0f) * 0.04f
-        return Triple(true, score, "valid")
+        val shared = RawColorTransformEngine.validateSensorToLinearSrgbMatrix(values)
+        return Triple(
+            shared.valid,
+            shared.score,
+            if (shared.valid) {
+                "valid; neutralAxisDeviation=${String.format(Locale.US, "%.5f", shared.neutralAxisDeviation)}"
+            } else {
+                shared.reason
+            }
+        )
     }
 
 

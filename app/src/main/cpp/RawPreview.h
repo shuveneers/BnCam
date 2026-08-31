@@ -14,6 +14,9 @@ struct RawPreviewParameters {
     int whiteLevel = 1;
     int captureSensitivityIso = 100;
     std::int64_t captureExposureTimeNs = 0;
+    float physicalGreenNoiseS = 0.0f;
+    float physicalGreenNoiseO = 0.0f;
+    float physicalNoiseConfidence = 0.0f;
     float focusDetailPriority = 1.0f;
     int rotationDegrees = 0;
     int sourceWidth = 0;
@@ -27,6 +30,9 @@ struct RawPreviewParameters {
     int maxWidth = 960;
     int maxHeight = 720;
     int frameSlotIndex = 0;
+    // Exact Camera2 COLOR_CORRECTION_GAINS for this sensor timestamp. Rendering may use a
+    // temporally-filtered pair, but PhysicalAwbEstimator must keep Camera2 as the independent prior.
+    float camera2PriorWbGains[4] = {1.0f, 1.0f, 1.0f, 1.0f};
     NativeRenderQualityConfig quality;
 };
 
@@ -75,6 +81,18 @@ struct RawPreviewResult {
     std::uint32_t displaySampleCount = 0;
     float displayHighlightX = -1.0f;
     float displayHighlightY = -1.0f;
+    std::uint32_t exposureTileCount = 0u;
+    float exposureSceneP10 = 0.0f;
+    float exposureSceneP25 = 0.0f;
+    float exposureSceneP50 = 0.0f;
+    float exposureSceneP75 = 0.0f;
+    float exposureSceneP90 = 0.0f;
+    float exposureSceneP95 = 0.0f;
+    float exposureSceneP99 = 0.0f;
+    float exposureMeasuredSceneDrEv = 0.0f;
+    float exposureLowerNeutralBoundaryEv = 0.0f;
+    float exposureUpperNeutralBoundaryEv = 0.0f;
+    float exposureSpatialAuthority = 0.0f;
     int analysisNv21Width = 0;
     int analysisNv21Height = 0;
     std::uint32_t inputAhbFormat = 0;
@@ -104,6 +122,20 @@ struct RawPreviewResult {
     int queueMutexWaitMicroseconds = 0;
     int queueSubmitCallMicroseconds = 0;
     int fenceWaitMicroseconds = 0;
+
+    // Compact pre-WB GPU scene-evidence resolved by PhysicalAwbEstimator. These are diagnostics
+    // and temporal-control inputs only; no full-frame RGB leaves Vulkan.
+    float awbPriorGainsRgb[3] = {1.0f, 1.0f, 1.0f};
+    float awbDataGainsRgb[3] = {1.0f, 1.0f, 1.0f};
+    float awbFinalGainsRgb[3] = {1.0f, 1.0f, 1.0f};
+    float awbConfidence = 0.0f;
+    float awbDataAuthority = 0.0f;
+    float awbNeutralSupport = 0.0f;
+    float awbMixedLightScore = 0.0f;
+    float awbPriorDisagreement = 0.0f;
+    int awbValidTileCount = 0;
+    int awbAcceptedSampleCount = 0;
+    bool awbDataReady = false;
 };
 
 RawPreviewResult renderRawPreviewRgba(

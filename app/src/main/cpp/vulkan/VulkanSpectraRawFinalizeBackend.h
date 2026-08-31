@@ -43,6 +43,11 @@ struct SpectraRawFinalizeRequest {
     std::uint32_t lensShadingColumns = 0;
     std::uint32_t lensShadingRows = 0;
     std::uint64_t lensShadingGenerationId = 0;
+
+    // FASE 5 recovery: one signed, scene-relative exposure owner in the finalized RAW domain.
+    // Normal production evidence, resolution and scalar CFA application all remain Vulkan-resident.
+    // The C++ policy is failure/reference/test only.
+    bool adaptiveExposureEnabled = false;
 };
 
 struct SpectraRawFinalizeResult {
@@ -60,6 +65,9 @@ struct SpectraRawFinalizeResult {
     bool lensShadingApplied = false;
     bool timestampQueryUsed = false;
     bool autoSceneMetricsReady = false;
+    bool adaptiveExposureRequested = false;
+    bool adaptiveExposureApplied = false;
+    bool adaptiveExposurePhysicalNoiseModel = false;
 
     float greenEvenMedian = 0.0f;
     float greenOddMedian = 0.0f;
@@ -85,11 +93,38 @@ struct SpectraRawFinalizeResult {
     std::uint64_t overRangePixelCount = 0;
     float lensMaximumGain = 1.0f;
 
+    float exposureSceneP10 = 0.0f;
+    float exposureSceneP25 = 0.0f;
+    float exposureSceneP50 = 0.0f;
+    float exposureSceneP75 = 0.0f;
+    float exposureSceneP90 = 0.0f;
+    float exposureSceneP95 = 0.0f;
+    float exposureSceneP99 = 0.0f;
+    float exposureMeasuredSceneDrEv = 0.0f;
+    float exposureLowerNeutralBoundaryEv = 0.0f;
+    float exposureUpperNeutralBoundaryEv = 0.0f;
+    float exposureSpatialAuthority = 0.0f;
+    float exposureMinEv = 0.0f;
+    float exposureP10Ev = 0.0f;
+    float exposureP50Ev = 0.0f;
+    float exposureP90Ev = 0.0f;
+    float exposureMaxEv = 0.0f;
+    float exposureMeanPositiveEv = 0.0f;
+    float exposureMeanNegativeEv = 0.0f;
+    float exposurePositiveFraction = 0.0f;
+    float exposureNeutralFraction = 1.0f;
+    float exposureNegativeFraction = 0.0f;
+    float exposureMeanGainSquared = 1.0f;
+    float exposureP90PositiveGain = 1.0f;
+    std::string adaptiveExposureStatus = "NOT_RUN";
+
     float inputPackingMs = 0.0f;
     float lensMapUploadMs = 0.0f;
     float greenSamplingKernelMs = 0.0f;
     float greenReductionCpuMs = 0.0f;
     float finalizeKernelMs = 0.0f;
+    float exposureReductionCpuMs = 0.0f;
+    float exposureApplyKernelMs = 0.0f;
     float synchronizationMs = 0.0f;
     float readbackMs = 0.0f;
     float totalMs = 0.0f;

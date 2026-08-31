@@ -1,5 +1,6 @@
 #include "VulkanSpectraRawFinalizeBackend.h"
 #include "../RawGreenSplitPolicy.h"
+#include "../RawAdaptiveExposurePolicy.h"
 #include "VulkanPipelineCacheRegistry.h"
 
 #ifndef BNCAM_VMA_HEADER_AVAILABLE
@@ -31,6 +32,32 @@ using Clock = std::chrono::steady_clock;
 float elapsedMs(const Clock::time_point& start) {
     return std::chrono::duration<float, std::milli>(Clock::now() - start).count();
 }
+
+constexpr std::uint32_t kExposureSummaryP10 = 6u;
+constexpr std::uint32_t kExposureSummaryP25 = 7u;
+constexpr std::uint32_t kExposureSummaryP50 = 8u;
+constexpr std::uint32_t kExposureSummaryP75 = 9u;
+constexpr std::uint32_t kExposureSummaryP90 = 10u;
+constexpr std::uint32_t kExposureSummaryP95 = 11u;
+constexpr std::uint32_t kExposureSummaryP99 = 12u;
+constexpr std::uint32_t kExposureSummaryDr = 13u;
+constexpr std::uint32_t kExposureSummaryLowerNeutral = 14u;
+constexpr std::uint32_t kExposureSummaryUpperNeutral = 15u;
+constexpr std::uint32_t kExposureSummaryAuthority = 16u;
+constexpr std::uint32_t kExposureSummaryMinEv = 17u;
+constexpr std::uint32_t kExposureSummaryP10Ev = 18u;
+constexpr std::uint32_t kExposureSummaryP50Ev = 19u;
+constexpr std::uint32_t kExposureSummaryP90Ev = 20u;
+constexpr std::uint32_t kExposureSummaryMaxEv = 21u;
+constexpr std::uint32_t kExposureSummaryMeanPosEv = 22u;
+constexpr std::uint32_t kExposureSummaryMeanNegEv = 23u;
+constexpr std::uint32_t kExposureSummaryPosFrac = 24u;
+constexpr std::uint32_t kExposureSummaryNeuFrac = 25u;
+constexpr std::uint32_t kExposureSummaryNegFrac = 26u;
+constexpr std::uint32_t kExposureSummaryMeanGain2 = 27u;
+constexpr std::uint32_t kExposureSummaryP90PosGain = 28u;
+constexpr std::uint32_t kExposureSummaryStatus = 29u;
+constexpr std::uint32_t kExposureTelemetryWords = 608u;
 
 struct PushConstants {
     std::uint32_t frameWidth = 0u;
@@ -344,7 +371,7 @@ bool VulkanSpectraRawFinalizeBackend::initializeLocked(
     VkQueryPoolCreateInfo queryInfo{};
     queryInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
     queryInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
-    queryInfo.queryCount = 4u;
+    queryInfo.queryCount = 6u;
     if (vkCreateQueryPool(device, &queryInfo, nullptr, &queryPool_) != VK_SUCCESS) queryPool_ = VK_NULL_HANDLE;
     initialized_ = true;
     initializedDevice_ = device;
@@ -472,14 +499,19 @@ SpectraRawFinalizeResult VulkanSpectraRawFinalizeBackend::executeInternal(
         autoRows = ((request.frameHeight - 9u) / autoStride) + 1u;
     }
     const std::uint64_t autoCount = static_cast<std::uint64_t>(autoColumns) * autoRows;
-    const std::uint64_t compactRecordCount = std::max(greenCount, autoCount);
+    const std::uint64_t exposureCount = bncam::raw_exposure::kTileCount;
+    // Evidence and resolved EV map coexist in the compact SSBO during the single Vulkan submission.
+    const std::uint64_t exposureRecordCount = exposureCount * 2u;
+    const std::uint64_t compactRecordCount = std::max({greenCount, autoCount, exposureRecordCount});
     const std::uint64_t greenBytes = std::max<std::uint64_t>(
             sizeof(float) * 4u, compactRecordCount * 4u * sizeof(float));
-    constexpr std::uint64_t telemetryBytes = 16u * sizeof(std::uint32_t);
+    constexpr std::uint64_t telemetryBytes = kExposureTelemetryWords * sizeof(std::uint32_t);
     result.inputBytes = frameBytes;
     result.outputBytes = frameBytes;
     result.compactGreenBytes = greenBytes;
     result.residentInputUsed = residentInput;
+    result.adaptiveExposureRequested = request.adaptiveExposureEnabled;
+    result.adaptiveExposurePhysicalNoiseModel = request.noiseModelValid;
 
     bool reallocated = false;
     const std::uint32_t writeAccess = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
@@ -665,6 +697,8 @@ SpectraRawFinalizeResult VulkanSpectraRawFinalizeBackend::executeInternal(
     result.greenReductionCpuMs = elapsedMs(reductionStart);
 
     // Submission 2: exact full-frame defect + bounded green balance + lens shading on GPU.
+    // Phase 5 extends this same command buffer with compact 64x48 scene evidence, GPU exposure
+    // resolution, scalar CFA application and final Auto-demosaic evidence. No extra submit/fence.
     std::memset(telemetry_.mapped, 0, static_cast<std::size_t>(telemetryBytes));
     vmaFlushAllocation(allocator, telemetry_.allocation, 0u, static_cast<VkDeviceSize>(telemetryBytes));
     vkResetFences(device, 1u, &fence_);
@@ -675,7 +709,7 @@ SpectraRawFinalizeResult VulkanSpectraRawFinalizeBackend::executeInternal(
         result.totalMs = elapsedMs(totalStart); return result;
     }
     if (queryPool_ != VK_NULL_HANDLE) {
-        vkCmdResetQueryPool(commandBuffer_, queryPool_, 0u, 4u);
+        vkCmdResetQueryPool(commandBuffer_, queryPool_, 2u, 4u);
         vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 2u);
     }
     vkCmdBindPipeline(commandBuffer_, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
@@ -686,9 +720,10 @@ SpectraRawFinalizeResult VulkanSpectraRawFinalizeBackend::executeInternal(
     push.greenOddScale = result.greenOddScale;
     vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0u, sizeof(push), &push);
     vkCmdDispatch(commandBuffer_, (request.frameWidth + 15u) / 16u, (request.frameHeight + 15u) / 16u, 1u);
-    // The finalized Bayer output stays device-resident. Immediately derive the compact Auto
-    // demosaic scene metrics from that exact post-defect/post-green/post-lens image, so Auto no
-    // longer forces a full CPU materialization merely to choose Malvar versus Menon.
+    if (queryPool_ != VK_NULL_HANDLE) {
+        vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 3u);
+    }
+
     VkBufferMemoryBarrier outputForObserver{};
     outputForObserver.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
     outputForObserver.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -700,6 +735,71 @@ SpectraRawFinalizeResult VulkanSpectraRawFinalizeBackend::executeInternal(
     vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr,
                          1u, &outputForObserver, 0u, nullptr);
+
+    if (request.adaptiveExposureEnabled) {
+        // Phase 5 production path: evidence -> resolver -> scalar CFA apply all stay in this
+        // command buffer. No compact CPU decision or extra queue/fence cycle owns exposure.
+        push.mode = 3u;
+        push.xStep = 1u;
+        push.yStep = 1u;
+        push.sampleColumns = bncam::raw_exposure::kGridWidth;
+        push.sampleRows = bncam::raw_exposure::kGridHeight;
+        vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
+                           0u, sizeof(push), &push);
+        vkCmdDispatch(commandBuffer_,
+                      (bncam::raw_exposure::kGridWidth + 15u) / 16u,
+                      (bncam::raw_exposure::kGridHeight + 15u) / 16u, 1u);
+
+        VkBufferMemoryBarrier exposureResolveBarriers[2]{};
+        exposureResolveBarriers[0].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        exposureResolveBarriers[0].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        exposureResolveBarriers[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        exposureResolveBarriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        exposureResolveBarriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        exposureResolveBarriers[0].buffer = greenSamples_.buffer;
+        exposureResolveBarriers[0].size = VK_WHOLE_SIZE;
+        exposureResolveBarriers[1] = exposureResolveBarriers[0];
+        exposureResolveBarriers[1].buffer = telemetry_.buffer;
+        vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr,
+                             2u, exposureResolveBarriers, 0u, nullptr);
+
+        push.mode = 4u;
+        vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
+                           0u, sizeof(push), &push);
+        vkCmdDispatch(commandBuffer_, 1u, 1u, 1u);
+
+        VkBufferMemoryBarrier exposureMapForApply{};
+        exposureMapForApply.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        exposureMapForApply.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        exposureMapForApply.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        exposureMapForApply.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        exposureMapForApply.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        exposureMapForApply.buffer = greenSamples_.buffer;
+        exposureMapForApply.size = VK_WHOLE_SIZE;
+        vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr,
+                             1u, &exposureMapForApply, 0u, nullptr);
+
+        if (queryPool_ != VK_NULL_HANDLE) {
+            vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 4u);
+        }
+        push.mode = 5u;
+        vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
+                           0u, sizeof(push), &push);
+        vkCmdDispatch(commandBuffer_, (request.frameWidth + 15u) / 16u,
+                      (request.frameHeight + 15u) / 16u, 1u);
+        if (queryPool_ != VK_NULL_HANDLE) {
+            vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 5u);
+        }
+
+        outputForObserver.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        outputForObserver.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr,
+                             1u, &outputForObserver, 0u, nullptr);
+    }
+
     if (autoColumns > 0u && autoRows > 0u) {
         push.mode = 2u;
         push.xStep = autoStride;
@@ -709,9 +809,6 @@ SpectraRawFinalizeResult VulkanSpectraRawFinalizeBackend::executeInternal(
         vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
                            0u, sizeof(push), &push);
         vkCmdDispatch(commandBuffer_, (autoColumns + 15u) / 16u, (autoRows + 15u) / 16u, 1u);
-    }
-    if (queryPool_ != VK_NULL_HANDLE) {
-        vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 3u);
     }
     VkBufferMemoryBarrier hostBarriers[2]{};
     hostBarriers[0].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
@@ -788,6 +885,7 @@ SpectraRawFinalizeResult VulkanSpectraRawFinalizeBackend::executeInternal(
                     static_cast<double>(timestamps[1] - timestamps[0]) * msPerTick);
         }
     }
+
     const auto readStart = Clock::now();
     vmaInvalidateAllocation(allocator, telemetry_.allocation, 0u, static_cast<VkDeviceSize>(telemetryBytes));
     const auto* telemetry = static_cast<const std::uint32_t*>(telemetry_.mapped);
@@ -801,6 +899,66 @@ SpectraRawFinalizeResult VulkanSpectraRawFinalizeBackend::executeInternal(
     result.lensMaximumGain = std::isfinite(maxGain) ? std::max(1.0f, maxGain) : 1.0f;
     result.lensShadingApplied = request.lensShadingMap != nullptr && request.lensShadingColumns > 0u &&
             request.lensShadingRows > 0u;
+
+    if (request.adaptiveExposureEnabled) {
+        const auto telemetryFloat = [&](std::uint32_t index, float fallback) noexcept {
+            float value = fallback;
+            const std::uint32_t bits = telemetry[index];
+            std::memcpy(&value, &bits, sizeof(value));
+            return std::isfinite(value) ? value : fallback;
+        };
+        result.exposureSceneP10 = telemetryFloat(kExposureSummaryP10, 0.0f);
+        result.exposureSceneP25 = telemetryFloat(kExposureSummaryP25, 0.0f);
+        result.exposureSceneP50 = telemetryFloat(kExposureSummaryP50, 0.0f);
+        result.exposureSceneP75 = telemetryFloat(kExposureSummaryP75, 0.0f);
+        result.exposureSceneP90 = telemetryFloat(kExposureSummaryP90, 0.0f);
+        result.exposureSceneP95 = telemetryFloat(kExposureSummaryP95, 0.0f);
+        result.exposureSceneP99 = telemetryFloat(kExposureSummaryP99, 0.0f);
+        result.exposureMeasuredSceneDrEv = telemetryFloat(kExposureSummaryDr, 0.0f);
+        result.exposureLowerNeutralBoundaryEv = telemetryFloat(kExposureSummaryLowerNeutral, 0.0f);
+        result.exposureUpperNeutralBoundaryEv = telemetryFloat(kExposureSummaryUpperNeutral, 0.0f);
+        result.exposureSpatialAuthority = telemetryFloat(kExposureSummaryAuthority, 0.0f);
+        result.exposureMinEv = telemetryFloat(kExposureSummaryMinEv, 0.0f);
+        result.exposureP10Ev = telemetryFloat(kExposureSummaryP10Ev, 0.0f);
+        result.exposureP50Ev = telemetryFloat(kExposureSummaryP50Ev, 0.0f);
+        result.exposureP90Ev = telemetryFloat(kExposureSummaryP90Ev, 0.0f);
+        result.exposureMaxEv = telemetryFloat(kExposureSummaryMaxEv, 0.0f);
+        result.exposureMeanPositiveEv = telemetryFloat(kExposureSummaryMeanPosEv, 0.0f);
+        result.exposureMeanNegativeEv = telemetryFloat(kExposureSummaryMeanNegEv, 0.0f);
+        result.exposurePositiveFraction = std::clamp(telemetryFloat(kExposureSummaryPosFrac, 0.0f), 0.0f, 1.0f);
+        result.exposureNeutralFraction = std::clamp(telemetryFloat(kExposureSummaryNeuFrac, 1.0f), 0.0f, 1.0f);
+        result.exposureNegativeFraction = std::clamp(telemetryFloat(kExposureSummaryNegFrac, 0.0f), 0.0f, 1.0f);
+        result.exposureMeanGainSquared = std::max(0.0f, telemetryFloat(kExposureSummaryMeanGain2, 1.0f));
+        result.exposureP90PositiveGain = std::max(1.0f, telemetryFloat(kExposureSummaryP90PosGain, 1.0f));
+        result.exposureReductionCpuMs = 0.0f;
+        switch (telemetry[kExposureSummaryStatus]) {
+            case 1u: result.adaptiveExposureStatus = "INSUFFICIENT_SPATIAL_EVIDENCE"; break;
+            case 2u: result.adaptiveExposureStatus = "INVALID_SCENE_REFERENCE"; break;
+            case 3u: result.adaptiveExposureStatus = "SIGNED_SPATIAL_MAP_READY"; break;
+            case 4u: result.adaptiveExposureStatus = "LOW_SCENE_SEPARATION_NEUTRAL_MAP"; break;
+            default: result.adaptiveExposureStatus = "GPU_RESOLVER_NOT_READY"; break;
+        }
+        result.adaptiveExposureApplied = telemetry[kExposureSummaryStatus] == 3u ||
+                telemetry[kExposureSummaryStatus] == 4u;
+
+        if (queryPool_ != VK_NULL_HANDLE) {
+            std::uint64_t timestamps[2]{0u, 0u};
+            if (vkGetQueryPoolResults(device, queryPool_, 4u, 2u, sizeof(timestamps), timestamps,
+                                      sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS &&
+                timestamps[1] >= timestamps[0]) {
+                VkPhysicalDeviceProperties properties{};
+                vkGetPhysicalDeviceProperties(physicalDevice, &properties);
+                const double msPerTick = static_cast<double>(properties.limits.timestampPeriod) / 1.0e6;
+                result.exposureApplyKernelMs = static_cast<float>(
+                        static_cast<double>(timestamps[1] - timestamps[0]) * msPerTick);
+            }
+        }
+    } else {
+        result.adaptiveExposureStatus = "DISABLED";
+    }
+
+    // Auto-demosaic compact scene evidence is always read from the final output generation: after
+    // adaptive exposure when enabled, directly after raw finalization otherwise.
     if (autoCount > 0u) {
         vmaInvalidateAllocation(allocator, greenSamples_.allocation, 0u,
                                 static_cast<VkDeviceSize>(autoCount * 4u * sizeof(float)));

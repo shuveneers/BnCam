@@ -1696,10 +1696,12 @@ Java_com_bncam_core_engine_ImageUtils_renderRawPreviewNative(
         jfloatArray blackLevelsArray,
         jint whiteLevel,
         jfloatArray wbGainsArray,
+        jfloatArray camera2PriorWbGainsArray,
         jfloatArray colorMatrixArray,
         jfloat exposureGain,
         jint captureSensitivityIso,
         jlong captureExposureTimeNs,
+        jfloatArray physicalGreenNoiseSoArray,
         jfloat focusDetailPriority,
         jfloat profileToneExposure,
         jfloat profileToneHighlights,
@@ -1788,6 +1790,14 @@ Java_com_bncam_core_engine_ImageUtils_renderRawPreviewNative(
     parameters.whiteLevel = std::max(1, static_cast<int>(whiteLevel));
     parameters.captureSensitivityIso = std::max(1, static_cast<int>(captureSensitivityIso));
     parameters.captureExposureTimeNs = std::max<std::int64_t>(0, static_cast<std::int64_t>(captureExposureTimeNs));
+    if (physicalGreenNoiseSoArray != nullptr && env->GetArrayLength(physicalGreenNoiseSoArray) >= 3) {
+        jfloat noise[3] = {0.0f, 0.0f, 0.0f};
+        env->GetFloatArrayRegion(physicalGreenNoiseSoArray, 0, 3, noise);
+        parameters.physicalGreenNoiseS = std::isfinite(noise[0]) ? std::max(0.0f, noise[0]) : 0.0f;
+        parameters.physicalGreenNoiseO = std::isfinite(noise[1]) ? std::max(0.0f, noise[1]) : 0.0f;
+        parameters.physicalNoiseConfidence = std::isfinite(noise[2])
+                ? std::clamp(static_cast<float>(noise[2]), 0.0f, 1.0f) : 0.0f;
+    }
     parameters.focusDetailPriority = std::isfinite(focusDetailPriority)
             ? std::clamp(static_cast<float>(focusDetailPriority), 0.0f, 1.0f) : 1.0f;
     parameters.rotationDegrees = normalizeRotationDegrees(rotationDegrees);
@@ -1804,6 +1814,15 @@ Java_com_bncam_core_engine_ImageUtils_renderRawPreviewNative(
     parameters.frameSlotIndex = std::clamp(static_cast<int>(frameSlotIndex), 0, 2);
     const auto blackLevels = extractFloat4(env, blackLevelsArray);
     std::copy(blackLevels.begin(), blackLevels.end(), parameters.blackLevels);
+    if (camera2PriorWbGainsArray != nullptr && env->GetArrayLength(camera2PriorWbGainsArray) >= 4) {
+        jfloat prior[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+        env->GetFloatArrayRegion(camera2PriorWbGainsArray, 0, 4, prior);
+        for (int index = 0; index < 4; ++index) {
+            const float value = static_cast<float>(prior[index]);
+            parameters.camera2PriorWbGains[index] =
+                    std::isfinite(value) && value > 0.0f ? std::clamp(value, 0.25f, 6.0f) : 1.0f;
+        }
+    }
 
     NativeRenderQualityConfig& quality = parameters.quality;
     quality.exposureGain = std::isfinite(exposureGain)
@@ -1914,8 +1933,14 @@ Java_com_bncam_core_engine_ImageUtils_renderRawPreviewNative(
     constexpr int TONE_TRUTH_START_INDEX = DISPLAY_B_CLIP_INDEX + 1;
     constexpr int FIRST_ACTIVATION_DIAGNOSTICS_START_INDEX = TONE_TRUTH_START_INDEX + 10;
     constexpr int FIRST_ACTIVATION_DIAGNOSTICS_COUNT = 20;
-    constexpr int EXPANDED_RESULT_SIZE =
+    constexpr int PHYSICAL_AWB_DIAGNOSTICS_START_INDEX =
             FIRST_ACTIVATION_DIAGNOSTICS_START_INDEX + FIRST_ACTIVATION_DIAGNOSTICS_COUNT;
+    constexpr int PHYSICAL_AWB_DIAGNOSTICS_COUNT = 17;
+    constexpr int SPATIAL_EXPOSURE_DIAGNOSTICS_START_INDEX =
+            PHYSICAL_AWB_DIAGNOSTICS_START_INDEX + PHYSICAL_AWB_DIAGNOSTICS_COUNT;
+    constexpr int SPATIAL_EXPOSURE_DIAGNOSTICS_COUNT = 12;
+    constexpr int EXPANDED_RESULT_SIZE =
+            SPATIAL_EXPOSURE_DIAGNOSTICS_START_INDEX + SPATIAL_EXPOSURE_DIAGNOSTICS_COUNT;
     jint expandedValues[EXPANDED_RESULT_SIZE]{};
     std::copy(std::begin(values), std::end(values), std::begin(expandedValues));
     expandedValues[43] = rendered.analysisNv21Width;
@@ -1993,6 +2018,40 @@ Java_com_bncam_core_engine_ImageUtils_renderRawPreviewNative(
     for (int index = 0; index < FIRST_ACTIVATION_DIAGNOSTICS_COUNT; ++index) {
         expandedValues[FIRST_ACTIVATION_DIAGNOSTICS_START_INDEX + index] =
                 firstActivationDiagnostics[index];
+    }
+    int awbIndex = PHYSICAL_AWB_DIAGNOSTICS_START_INDEX;
+    for (int channel = 0; channel < 3; ++channel) {
+        expandedValues[awbIndex++] = static_cast<jint>(
+                std::lround(rendered.awbPriorGainsRgb[channel] * 1000000.0f));
+    }
+    for (int channel = 0; channel < 3; ++channel) {
+        expandedValues[awbIndex++] = static_cast<jint>(
+                std::lround(rendered.awbDataGainsRgb[channel] * 1000000.0f));
+    }
+    for (int channel = 0; channel < 3; ++channel) {
+        expandedValues[awbIndex++] = static_cast<jint>(
+                std::lround(rendered.awbFinalGainsRgb[channel] * 1000000.0f));
+    }
+    expandedValues[awbIndex++] = static_cast<jint>(std::lround(rendered.awbConfidence * 1000000.0f));
+    expandedValues[awbIndex++] = static_cast<jint>(std::lround(rendered.awbDataAuthority * 1000000.0f));
+    expandedValues[awbIndex++] = static_cast<jint>(std::lround(rendered.awbNeutralSupport * 1000000.0f));
+    expandedValues[awbIndex++] = static_cast<jint>(std::lround(rendered.awbMixedLightScore * 1000000.0f));
+    expandedValues[awbIndex++] = static_cast<jint>(std::lround(rendered.awbPriorDisagreement * 1000000.0f));
+    expandedValues[awbIndex++] = rendered.awbValidTileCount;
+    expandedValues[awbIndex++] = rendered.awbAcceptedSampleCount;
+    expandedValues[awbIndex++] = rendered.awbDataReady ? 1 : 0;
+    int exposureIndex = SPATIAL_EXPOSURE_DIAGNOSTICS_START_INDEX;
+    expandedValues[exposureIndex++] = static_cast<jint>(std::min<std::uint32_t>(
+            rendered.exposureTileCount, static_cast<std::uint32_t>(std::numeric_limits<jint>::max())));
+    const float exposureDiagnostics[11] = {
+            rendered.exposureSceneP10, rendered.exposureSceneP25, rendered.exposureSceneP50,
+            rendered.exposureSceneP75, rendered.exposureSceneP90, rendered.exposureSceneP95,
+            rendered.exposureSceneP99, rendered.exposureMeasuredSceneDrEv,
+            rendered.exposureLowerNeutralBoundaryEv, rendered.exposureUpperNeutralBoundaryEv,
+            rendered.exposureSpatialAuthority};
+    for (float value : exposureDiagnostics) {
+        expandedValues[exposureIndex++] = static_cast<jint>(
+                std::lround((std::isfinite(value) ? value : 0.0f) * 1000000.0f));
     }
     jintArray result = env->NewIntArray(EXPANDED_RESULT_SIZE);
     if (result != nullptr) env->SetIntArrayRegion(result, 0, EXPANDED_RESULT_SIZE, expandedValues);

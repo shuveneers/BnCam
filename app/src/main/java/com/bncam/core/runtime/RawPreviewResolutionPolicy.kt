@@ -6,13 +6,14 @@ import kotlin.math.max
 /**
  * Product resolution contract for the RAW Vulkan viewfinder.
  *
- * Fixed RAW viewfinder geometry. A 4096x3072 Bayer producer uses the proven 4x CFA-cell
- * decimation path (1024x768). Runtime pressure is still handled by newest-frame-wins dropping;
- * there is no adaptive resolution or quality degradation.
+ * The fixed quality target is high enough to avoid visible upscaling softness on modern
+ * viewfinders while retaining bounded GPU cost. A 4096x3072 Bayer producer resolves to
+ * 1364x1024 at 3x CFA-cell decimation. Runtime pressure remains newest-frame-wins dropping;
+ * geometry never degrades adaptively.
  */
 object RawPreviewResolutionPolicy {
-    const val QUALITY_MAX_WIDTH = 1024
-    const val QUALITY_MAX_HEIGHT = 768
+    const val QUALITY_MAX_WIDTH = 1440
+    const val QUALITY_MAX_HEIGHT = 1080
 
     fun cfaCellDecimation(
         cropWidth: Int,

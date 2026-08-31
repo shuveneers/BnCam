@@ -635,6 +635,7 @@ class BnCameraManager(private val context: Context) {
         capturePreviewContinuityTracker.repeatingRequestState(
             captureSession != null && currentCaptureRequest != null
         )
+        applyPhysicalRawPreviewAwbObservation(frame)
         runEnabledRawPreviewAnalysis(frame)
         com.bncam.core.debug.RawPreviewFirstActivationTrace.kotlinPublication(
             source = frame.source.name,
@@ -840,6 +841,9 @@ class BnCameraManager(private val context: Context) {
     private val whiteBalanceStateEngine = WhiteBalanceStateEngine()
 
     @Volatile
+    private var lastPhysicalAwbDiagnosticsMs: Long = 0L
+
+    @Volatile
     private var activeTapAeRegion: MeteringRectangle? = null
 
     @Volatile
@@ -859,6 +863,24 @@ class BnCameraManager(private val context: Context) {
 
     @Volatile
     private var lastMeteringPlanSummary: String = "not_applied"
+
+    @Volatile
+    private var lastRequestedLogicalAeRegionsSummary: String = "unset"
+
+    @Volatile
+    private var lastRequestedPhysicalAeRegionsSummary: String = "unset"
+
+    @Volatile
+    private var lastRequestedPhysicalAeCameraId: String? = null
+
+    @Volatile
+    private var lastLogicalCustomAeRegionsRequested: Boolean = false
+
+    @Volatile
+    private var lastPhysicalCustomAeRegionsRequested: Boolean = false
+
+    @Volatile
+    private var lastMeteringEchoLogSignature: String = ""
 
     @Volatile
     private var lastExposurePlanSummary: String = "mode=AUTO;not_applied"
@@ -1918,18 +1940,13 @@ class BnCameraManager(private val context: Context) {
                     preferenceSnapshot = preferences,
                     stableAutoWhiteBalance = stableAutoWhiteBalanceSnapshotForActiveCamera()
                 )
-                val postRawBoost = (calibrationResult?.get(CaptureResult.CONTROL_POST_RAW_SENSITIVITY_BOOST)
-                    ?: 100).coerceAtLeast(1) / 100.0f
-                // Match the capture bridge's lightweight pre-render fallback. The full JPEG path
-                // may refine this from scene statistics later; preview intentionally does not run
-                // that capture-only analysis.
                 val sensitivityIso = (calibrationResult?.get(CaptureResult.SENSOR_SENSITIVITY) ?: 100)
                     .coerceAtLeast(1)
                 val exposureTimeNs = (calibrationResult?.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 0L)
                     .coerceAtLeast(0L)
-                val previewExposureGain = (
-                    1.2f + 0.8f * (sensitivityIso.coerceAtMost(1600) / 1600.0f)
-                ) * postRawBoost
+                // FASE 5: automatic RAW preview exposure is owned by the signed Vulkan spatial map.
+                // Do not keep the former ISO/post-RAW-boost global multiplier as a second owner.
+                val previewExposureGain = 1.0f
                 val previewDemosaic = if (calibrationResult != null) {
                     resolveRawPreviewDemosaic(
                         requestedBridgeMode = quality.demosaic.requestedMode.bridgeValue,
@@ -1971,6 +1988,9 @@ class BnCameraManager(private val context: Context) {
                     exposureGain = previewExposureGain,
                     captureSensitivityIso = sensitivityIso,
                     captureExposureTimeNs = exposureTimeNs,
+                    physicalGreenNoiseSo = rawPreviewPhysicalGreenNoiseSo(
+                        quality.cfaPattern, calibrationResult, quality.finalCalibration
+                    ),
                     focusDetailPriority = calibrationResult?.let { rawPreviewFocusDetailPriority(it) } ?: 0f,
                     profileToneExposure = quality.profileToneTuning.exposure,
                     profileToneHighlights = quality.profileToneTuning.highlights,
@@ -2026,6 +2046,55 @@ class BnCameraManager(private val context: Context) {
         }
     }
 
+    private fun rawPreviewPhysicalGreenNoiseSo(
+        cfaPattern: Int,
+        captureResult: CaptureResult?,
+        finalCalibration: com.bncam.core.quality.FinalSensorCalibration? = null
+    ): FloatArray {
+        finalCalibration?.noiseSnapshot?.let { snapshot ->
+            val s = snapshot.effectiveS
+            val o = snapshot.effectiveO
+            if (s.size >= 4 && o.size >= 4 && snapshot.signalModelConfidence > 0f &&
+                s.all { it.isFinite() && it >= 0.0 } && o.all { it.isFinite() && it >= 0.0 }) {
+                return floatArrayOf(
+                    (0.5 * (s[1] + s[2])).toFloat(),
+                    (0.5 * (o[1] + o[2])).toFloat(),
+                    snapshot.signalModelConfidence.coerceIn(0f, 1f)
+                )
+            }
+        }
+        val profile = runCatching { captureResult?.get(CaptureResult.SENSOR_NOISE_PROFILE) }.getOrNull()
+        if (profile != null && profile.size >= 4) {
+            // Android orders pairs by CFA plane. RGGB/BGGR have green at 1/2; GRBG/GBRG at 0/3.
+            val greenIndices = when (cfaPattern) {
+                CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT_GRBG,
+                CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT_GBRG -> intArrayOf(0, 3)
+                else -> intArrayOf(1, 2)
+            }
+            val firstGreen = profile.getOrNull(greenIndices[0])
+            val secondGreen = profile.getOrNull(greenIndices[1])
+            if (firstGreen != null && secondGreen != null) {
+                val firstSignal = firstGreen.first
+                val firstOffset = firstGreen.second
+                val secondSignal = secondGreen.first
+                val secondOffset = secondGreen.second
+                if (firstSignal != null && firstOffset != null && secondSignal != null && secondOffset != null &&
+                    firstSignal.isFinite() && firstOffset.isFinite() &&
+                    secondSignal.isFinite() && secondOffset.isFinite() &&
+                    firstSignal >= 0.0 && firstOffset >= 0.0 &&
+                    secondSignal >= 0.0 && secondOffset >= 0.0
+                ) {
+                    return floatArrayOf(
+                        (0.5 * (firstSignal + secondSignal)).toFloat(),
+                        (0.5 * (firstOffset + secondOffset)).toFloat(),
+                        1.0f
+                    )
+                }
+            }
+        }
+        return floatArrayOf(0f, 0f, 0f)
+    }
+
     private fun buildBootstrapRawPreviewConfig(
         identity: PipelineIdentity,
         result: TotalCaptureResult?,
@@ -2061,25 +2130,23 @@ class BnCameraManager(private val context: Context) {
                 generation
             )
         } ?: floatArrayOf(1f, 1f, 1f, 1f)
-        val postRawBoost = (calibrationResult?.get(CaptureResult.CONTROL_POST_RAW_SENSITIVITY_BOOST)
-            ?: 100).coerceAtLeast(1) / 100.0f
         val sensitivityIso = (calibrationResult?.get(CaptureResult.SENSOR_SENSITIVITY) ?: 100)
             .coerceAtLeast(1)
         val exposureTimeNs = (calibrationResult?.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 0L)
             .coerceAtLeast(0L)
-        val exposureGain = (
-            1.2f + 0.8f * (sensitivityIso.coerceAtMost(1600) / 1600.0f)
-        ) * postRawBoost
+        // Bootstrap obeys the same ownership rule as steady-state preview.
+        val exposureGain = 1.0f
         fun linearCurve(size: Int) = FloatArray(size) { index ->
             index.toFloat() / (size - 1).coerceAtLeast(1).toFloat()
         }
+        val bootstrapCfaPattern = characteristics.get(
+            CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT
+        ) ?: CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT_RGGB
         RawPreviewRenderConfig(
             source = source,
             pipelineGeneration = generation,
             profileId = profileId,
-            cfaPattern = characteristics.get(
-                CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT
-            ) ?: CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT_RGGB,
+            cfaPattern = bootstrapCfaPattern,
             // Bootstrap is deliberately deterministic and matches the noise-robust BnCam product default.
             demosaicMode = com.bncam.core.quality.DemosaicMode.DEFAULT.bridgeValue,
             blackLevels = nativeBlack,
@@ -2089,6 +2156,9 @@ class BnCameraManager(private val context: Context) {
             exposureGain = exposureGain,
             captureSensitivityIso = sensitivityIso,
             captureExposureTimeNs = exposureTimeNs,
+            physicalGreenNoiseSo = rawPreviewPhysicalGreenNoiseSo(
+                bootstrapCfaPattern, calibrationResult, null
+            ),
             focusDetailPriority = calibrationResult?.let { rawPreviewFocusDetailPriority(it) } ?: 0f,
             profileToneExposure = 0f,
             profileToneHighlights = 0f,
@@ -8005,6 +8075,7 @@ class BnCameraManager(private val context: Context) {
 
                         lastCaptureResult = result
                         lastCaptureResultGeneration = sessionGeneration
+                        validateMeteringResultEcho(result)
                         updateAutoWhiteBalanceState(result, sessionGeneration)
                         updateLiveWhiteBalanceDisplayCompensation(result)
                         if (manualExposureAwaitingMetadata &&
@@ -9270,6 +9341,99 @@ class BnCameraManager(private val context: Context) {
             }
         }
 
+        private fun resolveMeteringCoordinateBounds(
+            characteristics: CameraCharacteristics,
+            builder: CaptureRequest.Builder
+        ): Rect? {
+            val maximumResolutionMode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                builder.get(CaptureRequest.SENSOR_PIXEL_MODE) ==
+                    CaptureRequest.SENSOR_PIXEL_MODE_MAXIMUM_RESOLUTION
+            } else {
+                false
+            }
+            val distortionCorrectionOff = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                builder.get(CaptureRequest.DISTORTION_CORRECTION_MODE) ==
+                    CaptureRequest.DISTORTION_CORRECTION_MODE_OFF
+            } else {
+                false
+            }
+
+            val resolved = when {
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+                    maximumResolutionMode && distortionCorrectionOff ->
+                    characteristics.get(
+                        CameraCharacteristics.SENSOR_INFO_PRE_CORRECTION_ACTIVE_ARRAY_SIZE_MAXIMUM_RESOLUTION
+                    ) ?: characteristics.get(
+                        CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE_MAXIMUM_RESOLUTION
+                    )
+
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && maximumResolutionMode ->
+                    characteristics.get(
+                        CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE_MAXIMUM_RESOLUTION
+                    )
+
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && distortionCorrectionOff ->
+                    characteristics.get(CameraCharacteristics.SENSOR_INFO_PRE_CORRECTION_ACTIVE_ARRAY_SIZE)
+                        ?: characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+
+                else -> characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+            }
+            return resolved?.let(::Rect)
+        }
+
+        private fun meteringRegionsSummary(regions: Array<MeteringRectangle>?): String =
+            regions?.joinToString(prefix = "[", postfix = "]") { region ->
+                val r = region.rect
+                "${r.left},${r.top},${r.right},${r.bottom}@${region.meteringWeight}"
+            } ?: "null"
+
+        private fun mapMeteringRegions(
+            plan: MeteringPlan,
+            bounds: Rect?,
+            maxRegions: Int
+        ): Array<MeteringRectangle>? {
+            if (!plan.supported || plan.restoreInitialAeRegions || bounds == null || maxRegions <= 0) {
+                return null
+            }
+            return plan.regions
+                .mapNotNull { it.toMeteringRectangle(bounds) }
+                .take(maxRegions)
+                .toTypedArray()
+                .takeIf { it.isNotEmpty() }
+        }
+
+        private fun validateMeteringResultEcho(result: TotalCaptureResult) {
+            if (!lastLogicalCustomAeRegionsRequested && !lastPhysicalCustomAeRegionsRequested) return
+
+            val logicalEcho = meteringRegionsSummary(result.get(CaptureResult.CONTROL_AE_REGIONS))
+            val physicalId = lastRequestedPhysicalAeCameraId
+            val physicalEcho = if (
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && physicalId != null
+            ) {
+                result.physicalCameraResults[physicalId]
+                    ?.get(CaptureResult.CONTROL_AE_REGIONS)
+                    ?.let { meteringRegionsSummary(it) }
+                    ?: "null"
+            } else {
+                "n/a"
+            }
+            val logicalMatch = !lastLogicalCustomAeRegionsRequested ||
+                logicalEcho == lastRequestedLogicalAeRegionsSummary
+            val physicalMatch = !lastPhysicalCustomAeRegionsRequested ||
+                physicalEcho == lastRequestedPhysicalAeRegionsSummary
+            val signature =
+                "mode=$currentMeteringStyle;logicalReq=$lastRequestedLogicalAeRegionsSummary;logicalEcho=$logicalEcho;" +
+                    "physicalId=${physicalId ?: "none"};physicalReq=$lastRequestedPhysicalAeRegionsSummary;" +
+                    "physicalEcho=$physicalEcho;logicalMatch=$logicalMatch;physicalMatch=$physicalMatch"
+            if (signature == lastMeteringEchoLogSignature) return
+            lastMeteringEchoLogSignature = signature
+            if (logicalMatch && physicalMatch) {
+                Log.i("BNCAM_AE_METERING", "AE_REGION_ECHO_OK $signature")
+            } else {
+                Log.w("BNCAM_AE_METERING", "AE_REGION_ECHO_MISMATCH $signature")
+            }
+        }
+
         fun applyMeteringPolicy(builder: CaptureRequest.Builder) {
             val deviceId = cameraDevice?.id ?: return
             val chars = try {
@@ -9278,9 +9442,10 @@ class BnCameraManager(private val context: Context) {
                 return
             }
 
-            val logicalActiveArray = chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE) ?: return
-            val cropRegion = builder.get(CaptureRequest.SCALER_CROP_REGION) ?: logicalActiveArray
-            val logicalMaxAeRegions = chars.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE) ?: 0
+            val logicalMaxAeRegions = (chars.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE) ?: 0)
+                .coerceAtLeast(0)
+            val logicalBounds = resolveMeteringCoordinateBounds(chars, builder)
+            val cropRegion = builder.get(CaptureRequest.SCALER_CROP_REGION)
             val activePhysicalId = synchronized(pipelineLock) { activePipelineIdentity?.physicalCameraId }
             val physicalAeWritable = if (
                 Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && activePhysicalId != null
@@ -9296,66 +9461,128 @@ class BnCameraManager(private val context: Context) {
             } else {
                 null
             }
-            val meteringBounds = physicalChars
-                ?.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
-                ?: logicalActiveArray
-            val maxAeRegions = (physicalChars
-                ?.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE)
-                ?: logicalMaxAeRegions).coerceAtLeast(0)
+            val physicalMaxAeRegions = (physicalChars
+                ?.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE) ?: 0).coerceAtLeast(0)
+            val physicalBounds = physicalChars?.let { resolveMeteringCoordinateBounds(it, builder) }
             val resolvedMode = MeteringMode.fromSetting(currentMeteringStyle)
-            val policyPlan = CameraMeteringPolicy.plan(
+            val logicalPlan = CameraMeteringPolicy.plan(
                 mode = resolvedMode,
-                maxAeRegions = maxAeRegions
+                maxAeRegions = logicalMaxAeRegions
+            )
+            val physicalPlan = CameraMeteringPolicy.plan(
+                mode = resolvedMode,
+                maxAeRegions = physicalMaxAeRegions
             )
 
-            // PhotonCamera's touch-focus contract temporarily owns AE and is copied into still
-            // requests. Keep the exact mapped Camera2 rectangle rather than remapping the UI tap.
+            var logicalRequestedRegions: Array<MeteringRectangle>? = null
+            var physicalRequestedRegions: Array<MeteringRectangle>? = null
+            var logicalCustomRequested = false
+            var physicalCustomRequested = false
+            var touchOverrideApplied = false
+            var source = ""
+
+            // A tap region is already expressed in the coordinate domain of its owner. Never copy
+            // a physical-sensor rectangle into the opened logical camera request (or vice versa).
             val touchRegion = activeTapAeRegion
             val touchPhysicalId = activeTapAePhysicalCameraId
-            var touchOverrideApplied = false
-            if (touchRegion != null && maxAeRegions > 0) {
-                builder.set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(touchRegion))
-                if (touchPhysicalId != null && physicalAeWritable && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            if (touchRegion != null) {
+                if (
+                    touchPhysicalId != null && touchPhysicalId == activePhysicalId &&
+                    physicalAeWritable && physicalMaxAeRegions > 0 &&
+                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
+                ) {
+                    if (logicalMaxAeRegions > 0) {
+                        builder.set(CaptureRequest.CONTROL_AE_REGIONS, null)
+                    }
                     builder.setPhysicalCameraKey(
                         CaptureRequest.CONTROL_AE_REGIONS,
                         arrayOf(touchRegion),
                         touchPhysicalId
                     )
+                    physicalRequestedRegions = arrayOf(touchRegion)
+                    physicalCustomRequested = true
+                    touchOverrideApplied = true
+                    source = "touch_focus_override;domain=physical:$touchPhysicalId"
+                } else if (touchPhysicalId == null && logicalMaxAeRegions > 0) {
+                    builder.set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(touchRegion))
+                    if (
+                        physicalAeWritable && activePhysicalId != null && physicalMaxAeRegions > 0 &&
+                        Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
+                    ) {
+                        builder.setPhysicalCameraKey(
+                            CaptureRequest.CONTROL_AE_REGIONS,
+                            null,
+                            activePhysicalId
+                        )
+                    }
+                    logicalRequestedRegions = arrayOf(touchRegion)
+                    logicalCustomRequested = true
+                    touchOverrideApplied = true
+                    source = "touch_focus_override;domain=logical:$deviceId"
+                } else {
+                    // The route changed or the owner no longer supports AE regions. Retire the
+                    // stale tap owner and fall through to the selected standard metering mode.
+                    clearTouchAeOverride()
                 }
-                touchOverrideApplied = true
             }
 
-            var appliedRegionCount = if (touchOverrideApplied) 1 else 0
-            var source = if (touchOverrideApplied) "touch_focus_override" else policyPlan.source
             if (!touchOverrideApplied) {
-                val targetRegions = if (policyPlan.restoreInitialAeRegions || !policyPlan.supported) {
-                    initialAeMeteringRegions
+                logicalRequestedRegions = when {
+                    logicalMaxAeRegions <= 0 -> null
+                    logicalPlan.restoreInitialAeRegions -> initialAeMeteringRegions
                         ?.takeIf { initialAeMeteringGeneration == pipelineGeneration }
                         ?.copyOf()
-                } else {
-                    policyPlan.regions
-                        .mapNotNull { it.toMeteringRectangle(meteringBounds) }
-                        .take(maxAeRegions)
-                        .toTypedArray()
-                        .takeIf { it.isNotEmpty() }
+                    else -> mapMeteringRegions(logicalPlan, logicalBounds, logicalMaxAeRegions)
                 }
+                if (logicalMaxAeRegions > 0) {
+                    builder.set(CaptureRequest.CONTROL_AE_REGIONS, logicalRequestedRegions)
+                }
+                logicalCustomRequested =
+                    resolvedMode != MeteringMode.AUTO_DEFAULT_AE && logicalRequestedRegions != null
 
-                builder.set(CaptureRequest.CONTROL_AE_REGIONS, targetRegions)
-                if (physicalAeWritable && activePhysicalId != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                if (
+                    physicalAeWritable && activePhysicalId != null && physicalMaxAeRegions > 0 &&
+                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
+                ) {
+                    physicalRequestedRegions = if (physicalPlan.restoreInitialAeRegions) {
+                        // No physical override exists in the warm template. Clearing the physical
+                        // key restores inheritance/default behavior for Auto.
+                        null
+                    } else {
+                        mapMeteringRegions(physicalPlan, physicalBounds, physicalMaxAeRegions)
+                    }
                     builder.setPhysicalCameraKey(
                         CaptureRequest.CONTROL_AE_REGIONS,
-                        targetRegions,
+                        physicalRequestedRegions,
                         activePhysicalId
                     )
-                    source += ";domain=logical:$deviceId+physical:$activePhysicalId"
-                } else {
-                    source += ";domain=logical:$deviceId"
+                    physicalCustomRequested =
+                        resolvedMode != MeteringMode.AUTO_DEFAULT_AE && physicalRequestedRegions != null
                 }
-                appliedRegionCount = targetRegions?.size ?: 0
-                if (!policyPlan.supported && !policyPlan.restoreInitialAeRegions) {
-                    source += ";fallback=camera_default_ae_regions"
+
+                val logicalState = when {
+                    logicalPlan.restoreInitialAeRegions -> "default"
+                    logicalCustomRequested -> "custom"
+                    logicalMaxAeRegions <= 0 -> "unsupported"
+                    else -> "fallback"
                 }
+                val physicalState = when {
+                    activePhysicalId == null -> "none"
+                    !physicalAeWritable -> "not_writable"
+                    physicalMaxAeRegions <= 0 -> "unsupported"
+                    physicalPlan.restoreInitialAeRegions -> "default"
+                    physicalCustomRequested -> "custom"
+                    else -> "fallback"
+                }
+                source = "logical:$deviceId=$logicalState;physical:${activePhysicalId ?: "none"}=$physicalState"
             }
+
+            lastRequestedLogicalAeRegionsSummary = meteringRegionsSummary(logicalRequestedRegions)
+            lastRequestedPhysicalAeRegionsSummary = meteringRegionsSummary(physicalRequestedRegions)
+            lastRequestedPhysicalAeCameraId = activePhysicalId
+            lastLogicalCustomAeRegionsRequested = logicalCustomRequested
+            lastPhysicalCustomAeRegionsRequested = physicalCustomRequested
+            lastMeteringEchoLogSignature = ""
 
             // Metering spatial weighting and user EV are independent. The removed legacy BnCam
             // statistics controller no longer adds hidden auto-EV on top of the HAL's AE result.
@@ -9380,11 +9607,13 @@ class BnCameraManager(private val context: Context) {
                 )
             }
 
-            lastMeteringPlanSummary = policyPlan.summary() +
-                ";effectiveSource=$source;touchOverride=$touchOverrideApplied;faceOverride=false" +
-                ";appliedRegionCount=$appliedRegionCount;meteringBounds=$meteringBounds" +
-                ";logicalActiveArray=$logicalActiveArray;crop=$cropRegion" +
-                ";userEv=$currentEvOffset;profileCaptureEv=$profileCaptureEv;effectiveAeEv=$effectiveAeEv;hiddenAutoEv=disabled"
+            lastMeteringPlanSummary =
+                "mode=${resolvedMode.settingValue};source=$source;touchOverride=$touchOverrideApplied;" +
+                    "logicalMaxAeRegions=$logicalMaxAeRegions;physicalMaxAeRegions=$physicalMaxAeRegions;" +
+                    "logicalBounds=$logicalBounds;physicalBounds=$physicalBounds;crop=$cropRegion;" +
+                    "logicalRequested=$lastRequestedLogicalAeRegionsSummary;" +
+                    "physicalRequested=$lastRequestedPhysicalAeRegionsSummary;" +
+                    "userEv=$currentEvOffset;profileCaptureEv=$profileCaptureEv;effectiveAeEv=$effectiveAeEv;hiddenAutoEv=disabled"
             traceAfWriter(builder, "applyMeteringPolicy", "AE_REGIONS_STANDARD_METERING_WRITE")
             Log.d(tag, "Camera2 metering plan $lastMeteringPlanSummary")
         }
@@ -9427,6 +9656,70 @@ class BnCameraManager(private val context: Context) {
             return targetGains.copyOf(4)
         }
 
+        private fun applyPhysicalRawPreviewAwbObservation(frame: RawPreviewFrame) {
+            if (liveWhiteBalanceTargetSensorGains != null || !frame.physicalAwbDataReady) return
+            if (frame.pipelineGeneration != pipelineGeneration || frame.sensorTimestampNs <= 0L) return
+            val identity = synchronized(pipelineLock) { activePipelineIdentity } ?: return
+            if (identity.bufferFormat != ImageFormat.RAW10 && identity.bufferFormat != ImageFormat.RAW_SENSOR) return
+            val finalRgb = frame.physicalAwbFinalRgb
+            if (finalRgb.size < 3 || finalRgb.any { !it.isFinite() || it <= 0f }) return
+            val scopeKey = identity.physicalCameraId ?: identity.logicalCameraId
+            val finalGains = floatArrayOf(finalRgb[0], 1f, 1f, finalRgb[2])
+            val before = whiteBalanceStateEngine.snapshot(scopeKey)
+            val after = whiteBalanceStateEngine.observePhysical(
+                scopeKey = scopeKey,
+                pipelineGeneration = frame.pipelineGeneration,
+                finalGains = finalGains,
+                colorMatrix = frame.camera2PriorColorMatrix,
+                confidence = frame.physicalAwbConfidence,
+                dataAuthority = frame.physicalAwbDataAuthority,
+                neutralSupport = frame.physicalAwbNeutralSupport,
+                mixedLightScore = frame.physicalAwbMixedLightScore,
+                priorDisagreement = frame.physicalAwbPriorDisagreement,
+                validTileCount = frame.physicalAwbValidTileCount,
+                dataReady = frame.physicalAwbDataReady,
+                sensorTimestampNs = frame.sensorTimestampNs
+            ) ?: return
+            val matrix = after.copyColorMatrix()
+            if (matrix != null) {
+                rawPreviewRenderer.updateAutoWhiteBalanceColorPair(after.copyGains(), matrix)
+            }
+
+            val nowMs = android.os.SystemClock.elapsedRealtime()
+            val meaningfulTransition = before?.source != after.source ||
+                before?.sceneChangeDetected != after.sceneChangeDetected
+            if (meaningfulTransition || nowMs - lastPhysicalAwbDiagnosticsMs >= 1_000L) {
+                lastPhysicalAwbDiagnosticsMs = nowMs
+                val prior = frame.physicalAwbPriorRgb
+                val data = frame.physicalAwbDataRgb
+                val applied = after.copyGains()
+                val matrixTruth = RawColorTransformEngine.validateSensorToLinearSrgbMatrix(
+                    frame.camera2PriorColorMatrix
+                )
+                val matrixRowSums = matrixTruth.rowSums.joinToString(
+                    prefix = "[", postfix = "]"
+                ) { "%.4f".format(Locale.US, it) }
+                Log.i(
+                    tag,
+                    "BNCAM_PHYSICAL_AWB scope=$scopeKey generation=${frame.pipelineGeneration} " +
+                        "priorRgb=${prior.joinToString(prefix = "[", postfix = "]") { "%.4f".format(Locale.US, it) }} " +
+                        "dataRgb=${data.joinToString(prefix = "[", postfix = "]") { "%.4f".format(Locale.US, it) }} " +
+                        "finalRgb=${finalRgb.joinToString(prefix = "[", postfix = "]") { "%.4f".format(Locale.US, it) }} " +
+                        "appliedRgb=[${"%.4f".format(Locale.US, applied[0])},1.0000,${"%.4f".format(Locale.US, applied[3])}] " +
+                        "confidence=${"%.3f".format(Locale.US, frame.physicalAwbConfidence)} " +
+                        "dataAuthority=${"%.3f".format(Locale.US, frame.physicalAwbDataAuthority)} " +
+                        "neutralSupport=${"%.3f".format(Locale.US, frame.physicalAwbNeutralSupport)} " +
+                        "validTiles=${frame.physicalAwbValidTileCount} accepted=${frame.physicalAwbAcceptedSampleCount} " +
+                        "mixedLightScore=${"%.3f".format(Locale.US, frame.physicalAwbMixedLightScore)} " +
+                        "priorDisagreement=${"%.3f".format(Locale.US, frame.physicalAwbPriorDisagreement)} " +
+                        "ccmValid=${matrixTruth.valid} ccmDet=${"%.5f".format(Locale.US, matrixTruth.determinant)} " +
+                        "ccmRowSums=$matrixRowSums ccmNeutralAxisDeviation=${"%.4f".format(Locale.US, matrixTruth.neutralAxisDeviation)} " +
+                        "temporalDelta=${"%.3f".format(Locale.US, after.temporalDelta)} " +
+                        "sceneChange=${after.sceneChangeDetected} source=${after.source}"
+                )
+            }
+        }
+
         private fun updateAutoWhiteBalanceState(
             result: TotalCaptureResult,
             generation: Int
@@ -9444,34 +9737,48 @@ class BnCameraManager(private val context: Context) {
                 CaptureResult.CONTROL_AWB_STATE_INACTIVE -> WhiteBalanceConvergence.INACTIVE
                 else -> WhiteBalanceConvergence.UNKNOWN
             }
+            val camera2Gains = floatArrayOf(gains.red, gains.greenEven, gains.greenOdd, gains.blue)
+            val transform = calibrationResult.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)
+            val camera2Matrix = transform?.let(RawColorTransformEngine::colorSpaceTransformToArray)
             val before = whiteBalanceStateEngine.snapshot(scopeKey)
             val after = whiteBalanceStateEngine.observe(
                 scopeKey = scopeKey,
                 pipelineGeneration = generation,
-                gains = floatArrayOf(gains.red, gains.greenEven, gains.greenOdd, gains.blue),
-                convergence = convergence
+                gains = camera2Gains,
+                convergence = convergence,
+                colorMatrix = camera2Matrix,
+                sensorTimestampNs = calibrationResult.get(CaptureResult.SENSOR_TIMESTAMP)
+                    ?: result.get(CaptureResult.SENSOR_TIMESTAMP)
+                    ?: 0L
             )
             if (liveWhiteBalanceTargetSensorGains == null) {
-                val transform = calibrationResult.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)
                 val timestampNs = calibrationResult.get(CaptureResult.SENSOR_TIMESTAMP)
                     ?: result.get(CaptureResult.SENSOR_TIMESTAMP)
                     ?: 0L
-                if (transform != null && timestampNs > 0L) {
-                    val matrix = FloatArray(9) { index ->
-                        transform.getElement(index / 3, index % 3).toFloat()
-                    }
+                if (camera2Matrix != null && timestampNs > 0L) {
+                    // Exact timestamp-matched Camera2 metadata remains the independent physical
+                    // prior. The temporal render pair is stored separately so filtered output can
+                    // never feed itself back into PhysicalAwbEstimator.
                     rawPreviewRenderer.updateExactFrameCamera2ColorPair(
                         sensorTimestampNs = timestampNs,
-                        gains = floatArrayOf(gains.red, gains.greenEven, gains.greenOdd, gains.blue),
-                        colorMatrix = matrix
+                        gains = camera2Gains,
+                        colorMatrix = camera2Matrix
                     )
+                    val temporalMatrix = after?.copyColorMatrix()
+                    if (after != null && temporalMatrix != null) {
+                        rawPreviewRenderer.updateAutoWhiteBalanceColorPair(
+                            after.copyGains(), temporalMatrix
+                        )
+                    }
                 }
             }
-            if (before == null && after != null) {
+            if (after != null && (before == null || (after.sceneChangeDetected && before?.sceneChangeDetected != true))) {
                 Log.i(
                     tag,
-                    "BNCAM_AWB_STABLE scope=$scopeKey generation=$generation " +
-                        "confidence=${after.confidence} samples=${after.acceptedSampleCount} convergence=${after.convergence}"
+                    "BNCAM_AWB_TEMPORAL scope=$scopeKey generation=$generation " +
+                        "confidence=${after.confidence} samples=${after.acceptedSampleCount} " +
+                        "convergence=${after.convergence} temporalDelta=${after.temporalDelta} " +
+                        "sceneChange=${after.sceneChangeDetected}"
                 )
             }
         }
@@ -9527,7 +9834,7 @@ class BnCameraManager(private val context: Context) {
                     ).sanitized()
                 } ?: base
 
-                val targetSensorGains = if (effective.mode == ProfileAwbModes.SYSTEM_AUTO) {
+                val targetColorSolution = if (effective.mode == ProfileAwbModes.SYSTEM_AUTO) {
                     null
                 } else {
                     liveWhiteBalanceCharacteristics(cameraId)?.let { characteristics ->
@@ -9535,23 +9842,36 @@ class BnCameraManager(private val context: Context) {
                             RawColorTransformEngine.computeProfileWhiteBalance(characteristics, effective)
                         }.getOrNull()?.takeIf { solution ->
                             solution.isValid && solution.bayerWbGains.size >= 4 &&
-                                solution.bayerWbGains.take(4).all { it.isFinite() && it in 0.35f..4.50f }
-                        }?.bayerWbGains
+                                solution.bayerWbGains.take(4).all { it.isFinite() && it in 0.35f..4.50f } &&
+                                RawColorTransformEngine.validateSensorToLinearSrgbMatrix(solution.mPostCompensated).valid
+                        }
                     }
                 }
+                val targetSensorGains = targetColorSolution?.bayerWbGains
+                val targetColorMatrix = targetColorSolution?.mPostCompensated
 
                 if (requestEpoch != liveWhiteBalanceRequestEpoch.get()) return@launch
 
                 requestedLiveWhiteBalanceKelvin = requestedKelvin
                 liveWhiteBalanceTargetSensorGains = targetSensorGains?.copyOf(4)
-                if (targetSensorGains != null) {
-                    // Explicit profile/manual WB intentionally overrides the WB half.
+                if (targetSensorGains != null && targetColorMatrix != null) {
+                    // Explicit profile/manual WB intentionally overrides System-Auto state. Publish
+                    // the calibrated WB diagonal + post-WB CCM atomically; a gain-only override
+                    // would pair a new illuminant with the previous Camera2 color transform.
                     rawPreviewRenderer.clearExactFrameCamera2ColorPairs()
-                    rawPreviewRenderer.updateWhiteBalanceGains(targetSensorGains)
+                    rawPreviewRenderer.clearAutoWhiteBalanceColorPair()
+                    rawPreviewRenderer.updateWhiteBalanceColorPair(targetSensorGains, targetColorMatrix)
                 } else {
-                    // System Auto is exact-frame Camera2 pair owned. Clear any manual WB-only
-                    // override and let timestamp-paired WB+CCM metadata drive each RAW frame.
+                    // System Auto keeps Camera2 exact-frame metadata as the physical prior while
+                    // the independent temporal pair controls rendering once validated.
                     rawPreviewRenderer.updateWhiteBalanceGains(null)
+                    val stable = stableAutoWhiteBalanceSnapshotForActiveCamera()
+                    val stableMatrix = stable?.copyColorMatrix()
+                    if (stable != null && stableMatrix != null) {
+                        rawPreviewRenderer.updateAutoWhiteBalanceColorPair(stable.copyGains(), stableMatrix)
+                    } else {
+                        rawPreviewRenderer.clearAutoWhiteBalanceColorPair()
+                    }
                     lastRawPreviewConfigRefreshMs = 0L
                 }
                 if (targetSensorGains == null) {

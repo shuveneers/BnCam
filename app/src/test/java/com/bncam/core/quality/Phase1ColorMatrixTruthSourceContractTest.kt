@@ -10,11 +10,12 @@ class Phase1ColorMatrixTruthSourceContractTest {
         ?: error("Unable to locate app module")
 
     @Test
-    fun `metadata matrix is preserved before existing neutral row normalization`() {
+    fun `metadata matrix is preserved without neutral row normalization`() {
         val source = File(appDir, "src/main/java/com/bncam/core/quality/SensorCalibration.kt").readText()
         assertTrue("preNormalizationValues = values.copyOf()" in source)
-        assertTrue("neutralNormalizationApplied = true" in source)
+        assertTrue("neutralNormalizationApplied = false" in source)
         assertTrue("baseColorMatrixPreNormalization = colorMatrix.preNormalizationValues?.copyOf()" in source)
+        assertTrue("legacyNeutralNormalizedValues = legacyCounterfactual" in source)
     }
 
     @Test
