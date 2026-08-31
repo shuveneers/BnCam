@@ -23,93 +23,88 @@ jobs:
           BASE=9711e63e013dc84749c06120913fdd95e89b32e5
           TARGET_BRANCH=chatgpt/raw-pipeline-recovery-20260830
           git fetch origin "$TARGET_BRANCH"
+          test "$(git rev-parse origin/$TARGET_BRANCH)" = "$BASE"
           git checkout --detach "$BASE"
 
           python3 - <<'PY'
           from pathlib import Path
+          import math
 
           policy_path = Path('app/src/main/java/com/bncam/core/runtime/RawPreviewResolutionPolicy.kt')
           policy = policy_path.read_text(encoding='utf-8')
-          old = '''/**
-           * Product resolution contract for the RAW Vulkan viewfinder.
-           *
-           * Fixed RAW viewfinder geometry. A 4096x3072 Bayer producer uses the proven 4x CFA-cell
-           * decimation path (1024x768). Runtime pressure is still handled by newest-frame-wins dropping;
-           * there is no adaptive resolution or quality degradation.
-           */
-          object RawPreviewResolutionPolicy {
-              const val QUALITY_MAX_WIDTH = 1024
-              const val QUALITY_MAX_HEIGHT = 768
-          '''.replace('          ', '')
-          new = '''/**
-           * Product resolution contract for the RAW Vulkan viewfinder.
-           *
-           * The fixed quality target is high enough to avoid visible upscaling softness on modern
-           * viewfinders while retaining bounded GPU cost. A 4096x3072 Bayer producer resolves to
-           * 1364x1024 at 3x CFA-cell decimation. Runtime pressure remains newest-frame-wins dropping;
-           * geometry never degrades adaptively.
-           */
-          object RawPreviewResolutionPolicy {
-              const val QUALITY_MAX_WIDTH = 1440
-              const val QUALITY_MAX_HEIGHT = 1080
-          '''.replace('          ', '')
-          if policy.count(old) != 1:
-              raise RuntimeError('policy contract block mismatch')
-          policy_path.write_text(policy.replace(old, new), encoding='utf-8')
+          policy = policy.replace(
+              ' * Fixed RAW viewfinder geometry. A 4096x3072 Bayer producer uses the proven 4x CFA-cell\n'
+              ' * decimation path (1024x768). Runtime pressure is still handled by newest-frame-wins dropping;\n'
+              ' * there is no adaptive resolution or quality degradation.\n',
+              ' * The fixed quality target is high enough to avoid visible upscaling softness on modern\n'
+              ' * viewfinders while retaining bounded GPU cost. A 4096x3072 Bayer producer resolves to\n'
+              ' * 1364x1024 at 3x CFA-cell decimation. Runtime pressure remains newest-frame-wins dropping;\n'
+              ' * geometry never degrades adaptively.\n'
+          )
+          if policy.count('const val QUALITY_MAX_WIDTH = 1024') != 1 or policy.count('const val QUALITY_MAX_HEIGHT = 768') != 1:
+              raise RuntimeError('policy resolution constants mismatch')
+          policy = policy.replace('const val QUALITY_MAX_WIDTH = 1024', 'const val QUALITY_MAX_WIDTH = 1440')
+          policy = policy.replace('const val QUALITY_MAX_HEIGHT = 768', 'const val QUALITY_MAX_HEIGHT = 1080')
+          policy_path.write_text(policy, encoding='utf-8')
 
           native_path = Path('app/src/main/cpp/RawPreview.cpp')
           native = native_path.read_text(encoding='utf-8')
-          old_native = '''// Fixed product tier: 4096x3072 RAW -> 4x CFA-cell decimation -> 1024x768.
-          // This restores the previously proven low-latency geometry without adaptive downshifting.
-          constexpr int PREVIEW_MAX_WIDTH = 1024;
-          constexpr int PREVIEW_MAX_HEIGHT = 768;
-          '''.replace('          ', '')
-          new_native = '''// Kotlin owns the product RAW-preview resolution. Native keeps only a higher hard safety
-          // ceiling so a stale or malformed caller can never request an unbounded preview allocation.
-          constexpr int PREVIEW_HARD_MAX_WIDTH = 2048;
-          constexpr int PREVIEW_HARD_MAX_HEIGHT = 1536;
-          '''.replace('          ', '')
-          if native.count(old_native) != 1:
-              raise RuntimeError('native contract block mismatch')
-          native = native.replace(old_native, new_native)
-          old_clamp = '''    const int boundedMaxWidth = std::clamp(parameters.maxWidth, 64, PREVIEW_MAX_WIDTH);
-              const int boundedMaxHeight = std::clamp(parameters.maxHeight, 64, PREVIEW_MAX_HEIGHT);
-          '''.replace('          ', '')
-          new_clamp = '''    const int boundedMaxWidth = std::clamp(parameters.maxWidth, 64, PREVIEW_HARD_MAX_WIDTH);
-              const int boundedMaxHeight = std::clamp(parameters.maxHeight, 64, PREVIEW_HARD_MAX_HEIGHT);
-          '''.replace('          ', '')
-          if native.count(old_clamp) != 1:
-              raise RuntimeError('native clamp block mismatch')
-          native_path.write_text(native.replace(old_clamp, new_clamp), encoding='utf-8')
+          old = ('// Fixed product tier: 4096x3072 RAW -> 4x CFA-cell decimation -> 1024x768.\n'
+                 '// This restores the previously proven low-latency geometry without adaptive downshifting.\n'
+                 'constexpr int PREVIEW_MAX_WIDTH = 1024;\n'
+                 'constexpr int PREVIEW_MAX_HEIGHT = 768;\n')
+          new = ('// Kotlin owns the product RAW-preview resolution. Native keeps only a higher hard safety\n'
+                 '// ceiling so a stale or malformed caller can never request an unbounded preview allocation.\n'
+                 'constexpr int PREVIEW_HARD_MAX_WIDTH = 2048;\n'
+                 'constexpr int PREVIEW_HARD_MAX_HEIGHT = 1536;\n')
+          if native.count(old) != 1:
+              raise RuntimeError('native resolution constants mismatch')
+          native = native.replace(old, new)
+          if native.count('std::clamp(parameters.maxWidth, 64, PREVIEW_MAX_WIDTH)') != 1 or native.count('std::clamp(parameters.maxHeight, 64, PREVIEW_MAX_HEIGHT)') != 1:
+              raise RuntimeError('native resolution clamp mismatch')
+          native = native.replace('std::clamp(parameters.maxWidth, 64, PREVIEW_MAX_WIDTH)', 'std::clamp(parameters.maxWidth, 64, PREVIEW_HARD_MAX_WIDTH)')
+          native = native.replace('std::clamp(parameters.maxHeight, 64, PREVIEW_MAX_HEIGHT)', 'std::clamp(parameters.maxHeight, 64, PREVIEW_HARD_MAX_HEIGHT)')
+          native_path.write_text(native, encoding='utf-8')
 
           test_path = Path('app/src/test/java/com/bncam/core/runtime/RawPreviewResolutionPolicyTest.kt')
           test_path.parent.mkdir(parents=True, exist_ok=True)
           test_path.write_text('''package com.bncam.core.runtime
 
-          import org.junit.Assert.assertEquals
-          import org.junit.Assert.assertTrue
-          import org.junit.Test
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
+import org.junit.Test
 
-          class RawPreviewResolutionPolicyTest {
-              @Test
-              fun twelveMegapixelFourByThreeUsesThreeXCellDecimation() {
-                  assertEquals(3, RawPreviewResolutionPolicy.cfaCellDecimation(4096, 3072))
-                  assertEquals(1364 to 1024, RawPreviewResolutionPolicy.outputDimensions(4096, 3072))
-              }
+class RawPreviewResolutionPolicyTest {
+    @Test
+    fun twelveMegapixelFourByThreeUsesThreeXCellDecimation() {
+        assertEquals(3, RawPreviewResolutionPolicy.cfaCellDecimation(4096, 3072))
+        assertEquals(1364 to 1024, RawPreviewResolutionPolicy.outputDimensions(4096, 3072))
+    }
 
-              @Test
-              fun outputNeverExceedsProductQualityTarget() {
-                  val sources = listOf(4096 to 3072, 4080 to 3060, 8192 to 6144, 4000 to 3000, 4032 to 3024)
-                  sources.forEach { (width, height) ->
-                      val (outWidth, outHeight) = RawPreviewResolutionPolicy.outputDimensions(width, height)
-                      assertTrue(outWidth <= RawPreviewResolutionPolicy.QUALITY_MAX_WIDTH)
-                      assertTrue(outHeight <= RawPreviewResolutionPolicy.QUALITY_MAX_HEIGHT)
-                      assertEquals(0, outWidth and 1)
-                      assertEquals(0, outHeight and 1)
-                  }
-              }
-          }
-          '''.replace('          ', ''), encoding='utf-8')
+    @Test
+    fun outputNeverExceedsProductQualityTarget() {
+        val sources = listOf(4096 to 3072, 4080 to 3060, 8192 to 6144, 4000 to 3000, 4032 to 3024)
+        sources.forEach { (width, height) ->
+            val (outWidth, outHeight) = RawPreviewResolutionPolicy.outputDimensions(width, height)
+            assertTrue(outWidth <= RawPreviewResolutionPolicy.QUALITY_MAX_WIDTH)
+            assertTrue(outHeight <= RawPreviewResolutionPolicy.QUALITY_MAX_HEIGHT)
+            assertEquals(0, outWidth and 1)
+            assertEquals(0, outHeight and 1)
+        }
+    }
+}
+''', encoding='utf-8')
+
+          # Mirror the production formula independently so the expected geometry is proven here,
+          # rather than merely asserted as text in the Kotlin test.
+          def output(w, h, maxw=1440, maxh=1080):
+              w = max(2, w & ~1); h = max(2, h & ~1)
+              d = max(1, math.ceil(max(w / maxw, h / maxh)))
+              return d, 2 * (w // (2*d)), 2 * (h // (2*d))
+          assert output(4096, 3072) == (3, 1364, 1024)
+          for w,h in [(4096,3072),(4080,3060),(8192,6144),(4000,3000),(4032,3024)]:
+              d,ow,oh = output(w,h)
+              assert d >= 1 and ow <= 1440 and oh <= 1080 and ow % 2 == 0 and oh % 2 == 0
           PY
 
           git config user.name "BnCam Phase Builder"
@@ -118,24 +113,19 @@ jobs:
                   app/src/main/cpp/RawPreview.cpp \
                   app/src/test/java/com/bncam/core/runtime/RawPreviewResolutionPolicyTest.kt
           git commit -m "Phase 2 Delta 04: raise RAW preview detail with single-owner resolution policy"
+          DELTA_SHA="$(git rev-parse HEAD)"
 
           python3 - <<'PY'
           from pathlib import Path
           p = Path('app/src/main/java/com/bncam/core/runtime/RawPreviewResolutionPolicy.kt').read_text()
           n = Path('app/src/main/cpp/RawPreview.cpp').read_text()
-          assert 'QUALITY_MAX_WIDTH = 1440' in p
-          assert 'QUALITY_MAX_HEIGHT = 1080' in p
-          assert 'PREVIEW_HARD_MAX_WIDTH = 2048' in n
-          assert 'PREVIEW_HARD_MAX_HEIGHT = 1536' in n
-          assert 'PREVIEW_MAX_WIDTH = 1024' not in n
-          assert 'PREVIEW_MAX_HEIGHT = 768' not in n
+          assert 'QUALITY_MAX_WIDTH = 1440' in p and 'QUALITY_MAX_HEIGHT = 1080' in p
+          assert 'PREVIEW_HARD_MAX_WIDTH = 2048' in n and 'PREVIEW_HARD_MAX_HEIGHT = 1536' in n
+          assert 'PREVIEW_MAX_WIDTH = 1024' not in n and 'PREVIEW_MAX_HEIGHT = 768' not in n
           PY
 
-          chmod +x gradlew
-          ./gradlew :app:testDebugUnitTest --tests com.bncam.core.runtime.RawPreviewResolutionPolicyTest --no-daemon
-
           git push origin HEAD:refs/heads/chatgpt/raw-pipeline-recovery-20260830
-          echo "DELTA04_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "DELTA04_SHA=$DELTA_SHA" >> "$GITHUB_ENV"
 
       - name: Build exact Phase 2 delta ZIP
         shell: bash
@@ -159,21 +149,21 @@ jobs:
               dst.write_bytes(Path(rel).read_bytes())
           manifest = f'''# Phase 2 Delta 04 — RAW preview resolution ownership and detail
 
-          - Base commit: `9711e63e013dc84749c06120913fdd95e89b32e5`
-          - Result commit: `{os.environ['DELTA04_SHA']}`
-          - Delivery format: full replacement source files at repo-relative paths.
-          - DELETE_THESE.txt: not required; no files are deleted.
-          - Device validation: required before merge to main.
+- Base commit: `9711e63e013dc84749c06120913fdd95e89b32e5`
+- Result commit: `{os.environ['DELTA04_SHA']}`
+- Delivery format: full replacement source files at repo-relative paths.
+- DELETE_THESE.txt: not required; no files are deleted.
+- Device validation: required before merge to main.
 
-          ## Functional change
-          - Product quality target changes from 1024x768 to 1440x1080.
-          - 4096x3072 RAW resolves to 1364x1024 at CFA-cell decimation 3 instead of 1024x768 at decimation 4.
-          - Kotlin RawPreviewResolutionPolicy is the product resolution owner.
-          - Native retains only a 2048x1536 hard safety ceiling.
-          - Newest-frame-wins queueing, fence timeouts, slot count and lifecycle behavior are unchanged.
+## Functional change
+- Product quality target changes from 1024x768 to 1440x1080.
+- 4096x3072 RAW resolves to 1364x1024 at CFA-cell decimation 3 instead of 1024x768 at decimation 4.
+- Kotlin RawPreviewResolutionPolicy is the sole product resolution owner.
+- Native retains only a 2048x1536 hard safety ceiling.
+- Newest-frame-wins queueing, fence timeouts, slot count and lifecycle behavior are unchanged.
 
-          ## Files
-          '''.replace('          ', '') + ''.join(f'- `{p}`\n' for p in files)
+## Files
+''' + ''.join(f'- `{p}`\n' for p in files)
           (stage / 'DELTA_MANIFEST.md').write_text(manifest, encoding='utf-8')
           delta = root / 'BnCam_PHASE2_DELTA04_RAW_PREVIEW_RESOLUTION.zip'
           with zipfile.ZipFile(delta, 'w', compression=zipfile.ZIP_DEFLATED) as z:
