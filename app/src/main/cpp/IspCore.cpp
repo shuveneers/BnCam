@@ -13484,7 +13484,11 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     SpectraPass2State pass2State = residentEntry && !residentCpuFallbackUsed
             ? computePass2StateCompact(residentInput->sampleView, workingMeta, uiConfig)
             : computePass2State(workingRaw, workingMeta, uiConfig);
-    if (physicalRawDenoiseActive && pass2State.spectraMode == 0) {
+    // Phase 6: the single-frame physical owner is luminance-only. Pass 2 is a chroma
+    // owner and must not be promoted to physicalBaselineMode when that policy publishes
+    // zero chroma authority. SPECTRA-enabled Pass 2 remains unchanged.
+    if (physicalRawDenoiseActive && pass2State.spectraMode == 0 &&
+        singleFrameRawDenoise.chromaAuthority > 0.0f) {
         bool validSo = true;
         for (int ch = 0; ch < 4; ++ch) {
             pass2State.effectiveS[ch] = workingMeta.calibration.effectiveS[ch];

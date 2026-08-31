@@ -674,9 +674,14 @@ void runSpatialNr(uint x, uint localOutputY, uint y) {
     // Signal-dependent shadow scaling (stronger cleanup in dark regions)
     float shadowFactor = 1.0 + 0.65 * (1.0 - clamp(centerY / 0.25, 0.0, 1.0));
 
-    // Luma Noise slider modifier (pc.padding2 = profileSpectraLuma, [-1.0, +1.0])
+    // Optional SPECTRA luma-character modifier. Phase-6 physical baseline ownership
+    // is independent from SPECTRA: with SPECTRA Off this multiplier is exactly 1.0.
     float lumaSliderVal = clamp(pc.padding2, -1.0, 1.0);
-    float lumaUserMult = (lumaSliderVal >= 0.0) ? (1.0 + lumaSliderVal * 1.20) : (1.0 + lumaSliderVal * 0.85);
+    float lumaUserMult = pc.spectraNoiseActive != 0u
+        ? ((lumaSliderVal >= 0.0)
+            ? (1.0 + lumaSliderVal * 1.20)
+            : (1.0 + lumaSliderVal * 0.85))
+        : 1.0;
 
     // Chroma Noise slider modifier
     float chromaSliderVal = clamp(pc.chromaNrStrength, -1.0, 1.0);

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "PhysicalLumaDenoisePolicy.h"
+
 #include <algorithm>
 #include <cmath>
 
@@ -26,20 +28,22 @@ struct PostDemosaicResidualNrPlan {
 };
 
 /**
- * FASE 14 / SPECTRA V2 residual-only post-tone cleanup.
+ * Residual-only late cleanup.
  *
- * The input sigma values are no longer the original Camera2 S/O sensor sigma. They must be the
- * residual sigma propagated through the actual production path up to the late resident filter:
+ * Phase-6 ownership:
+ * - the physical luminance baseline is resolved by PhysicalLumaDenoisePolicy;
+ * - this wrapper only combines that independent baseline with optional SPECTRA residual
+ *   enhancement and the pre-existing chroma residual contract;
+ * - the input sigma values are propagated residuals, never reconstructed from ISO.
  *
- *   CFA physical/SPECTRA cleanup -> demosaic -> AWB -> CCM -> Phase 11 -> tone.
+ * The input sigma values must represent the actual production path up to this resident
+ * filter:
  *
- * The boundary is deliberately frozen before optional Phase 12 perceptual/output detail, so
- * intentional profile sharpness cannot be reclassified as sensor residual noise.
+ *   CFA cleanup -> Phase-5 spatial exposure -> demosaic -> AWB -> CCM -> detail/tone.
  *
- * That distinction is the ownership boundary which prevents double denoise. The physical
- * baseline is always present when the propagated model is trustworthy; SPECTRA On may spend a
- * small amount of additional authority only on the residual that is still predicted to exist.
- * Dynamic ISO / character controls therefore never manufacture a second physical noise floor.
+ * That propagated covariance is the boundary which prevents double denoise. In particular,
+ * positive spatial exposure amplification is already present in residualLumaSigma; this
+ * function must not multiply it a second time.
  */
 inline PostDemosaicResidualNrPlan resolvePostDemosaicResidualNr(
         float residualLumaSigma,
@@ -68,6 +72,16 @@ inline PostDemosaicResidualNrPlan resolvePostDemosaicResidualNr(
         return plan;
     }
 
+    const bncam::luma_nr::ResidualLumaPlan physicalLuma =
+            bncam::luma_nr::resolveResidualLumaPlan(
+                    residualLumaSigma,
+                    confidence,
+                    physicalNoiseModelAvailable);
+    if (!physicalLuma.active) {
+        plan.authoritySource = "PROPAGATED_LUMA_RESIDUAL_UNAVAILABLE";
+        return plan;
+    }
+
     plan.active = true;
     plan.physicalBaselineActive = true;
     plan.residualCovarianceAuthoritative = true;
@@ -76,17 +90,20 @@ inline PostDemosaicResidualNrPlan resolvePostDemosaicResidualNr(
     plan.inputChromaSigma = residualChromaSigma;
     plan.modelConfidence = confidence;
 
-    // Confidence gates how much of the *predicted residual* the late baseline may own. These
-    // fractions are intentionally below one: the resident edge/structure gates still need room
-    // to preserve texture, and earlier physical stages have already removed part of the noise.
+    // Luma baseline ownership is external and independent from SPECTRA.
+    plan.baselineLumaFraction = physicalLuma.baselineFraction;
+
+    // Chroma is deliberately unchanged in Phase 6.
     const float confidenceScale = 0.72f + 0.28f * confidence;
-    plan.baselineLumaFraction = std::clamp(0.50f * confidenceScale, 0.34f, 0.50f);
-    plan.baselineChromaFraction = std::clamp(0.78f * confidenceScale, 0.54f, 0.78f);
+    plan.baselineChromaFraction = std::clamp(
+            0.78f * confidenceScale,
+            0.54f,
+            0.78f);
 
     if (spectraContextFusionActive) {
-        // Strength=0 is the calibrated neutral SPECTRA master authority. It is therefore a
-        // multiplicative neutral point (1.0), not "no enhancement". Luma/chroma character
-        // controls shape only the optional residual increment.
+        // Strength=0 remains the calibrated neutral SPECTRA master authority.
+        // These terms are optional residual increments only; they do not determine
+        // whether the physical luma baseline exists.
         const float overall = std::exp2(
                 std::clamp(std::isfinite(profileStrength) ? profileStrength : 0.0f,
                            -1.0f, 1.0f) * 0.20f);
@@ -114,7 +131,8 @@ inline PostDemosaicResidualNrPlan resolvePostDemosaicResidualNr(
                 0.16f * overall * chromaCharacter * chromaHeadroom,
                 0.0f,
                 0.22f);
-        plan.authoritySource = "PROPAGATED_RESIDUAL_PHYSICAL_BASELINE_PLUS_SPECTRA";
+        plan.authoritySource =
+                "PROPAGATED_RESIDUAL_PHYSICAL_BASELINE_PLUS_SPECTRA";
     } else {
         plan.authoritySource = "PROPAGATED_RESIDUAL_PHYSICAL_BASELINE";
     }
@@ -122,13 +140,24 @@ inline PostDemosaicResidualNrPlan resolvePostDemosaicResidualNr(
     plan.lumaFraction = std::clamp(
             plan.baselineLumaFraction + plan.spectraLumaFraction,
             0.0f,
-            0.64f);
+            0.78f);
     plan.chromaFraction = std::clamp(
             plan.baselineChromaFraction + plan.spectraChromaFraction,
             0.0f,
             0.96f);
-    plan.lumaSigma = std::clamp(plan.inputLumaSigma * plan.lumaFraction, 0.0f, 0.15f);
-    plan.chromaSigma = std::clamp(plan.inputChromaSigma * plan.chromaFraction, 0.0f, 0.35f);
+
+    // Use the externally resolved physical target for the baseline, then add only the
+    // optional SPECTRA residual increment. This keeps the baseline invariant to SPECTRA.
+    const float spectraLumaSigma =
+            plan.inputLumaSigma * plan.spectraLumaFraction;
+    plan.lumaSigma = std::clamp(
+            physicalLuma.targetSigma + spectraLumaSigma,
+            0.0f,
+            0.15f);
+    plan.chromaSigma = std::clamp(
+            plan.inputChromaSigma * plan.chromaFraction,
+            0.0f,
+            0.35f);
     return plan;
 }
 
