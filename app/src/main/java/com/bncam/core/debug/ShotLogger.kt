@@ -113,9 +113,11 @@ object DebugFailureTestTrigger {
 }
 
 class ShotLogger(
-    @Suppress("unused") private val context: Context?,
+    context: Context?,
     private val baseDir: File
 ) {
+    @Suppress("unused")
+    private val context: Context? = context?.applicationContext
 
     constructor(context: Context) : this(context as Context?, resolveDiagnosticsBaseDir(context))
     constructor(overrideBaseDir: File) : this(null, overrideBaseDir)
@@ -186,6 +188,14 @@ class ShotLogger(
         fork.activeAttemptId = activeAttemptId
         fork.activeAttemptState = activeAttemptState
         fork.currentCaptureLabel = currentCaptureLabel
+
+        // Deferred processing owns terminal finalization, so it must also own the
+        // heartbeat for a live attempt. Otherwise the UI logger can keep a
+        // GlobalScope heartbeat alive after its capture has been handed off.
+        if (fork.activeAttemptState == CaptureStatusState.STARTED) {
+            stopHeartbeatPolling()
+            fork.currentStateDir?.let { fork.startHeartbeatPolling(it) }
+        }
         return fork
     }
 

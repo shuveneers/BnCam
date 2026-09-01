@@ -6,6 +6,8 @@ import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.camera2.TotalCaptureResult
 import android.os.SystemClock
+import java.util.Collections
+import java.util.IdentityHashMap
 
 /**
  * Convenience wrapper delegating to the universal AuxiliarySensorManager architecture.
@@ -13,22 +15,40 @@ import android.os.SystemClock
  */
 private object SharedAuxiliarySensorManager {
     @Volatile private var instance: AuxiliarySensorManager? = null
+    private val listeningOwners = Collections.newSetFromMap(IdentityHashMap<Any, Boolean>())
 
     fun get(context: Context): AuxiliarySensorManager = instance ?: synchronized(this) {
         instance ?: AuxiliarySensorManager(context.applicationContext).also { instance = it }
+    }
+
+    @Synchronized
+    fun acquireListening(owner: Any) {
+        if (!listeningOwners.add(owner)) return
+        if (listeningOwners.size == 1) {
+            instance?.startListening()
+        }
+    }
+
+    @Synchronized
+    fun releaseListening(owner: Any) {
+        if (!listeningOwners.remove(owner)) return
+        if (listeningOwners.isEmpty()) {
+            instance?.stopListening()
+        }
     }
 }
 
 class ColorSensorHelper(context: Context) : SensorEventListener {
 
     val auxiliaryManager = SharedAuxiliarySensorManager.get(context)
+    private val listeningOwner = Any()
 
     fun startListening() {
-        auxiliaryManager.startListening()
+        SharedAuxiliarySensorManager.acquireListening(listeningOwner)
     }
 
     fun stopListening() {
-        auxiliaryManager.stopListening()
+        SharedAuxiliarySensorManager.releaseListening(listeningOwner)
     }
 
 

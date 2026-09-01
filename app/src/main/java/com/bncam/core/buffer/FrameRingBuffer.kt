@@ -6,7 +6,6 @@ import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.TotalCaptureResult
 import android.media.Image
-import android.os.Build
 import android.util.Log
 import com.bncam.core.capture.FrameRequestProvenance
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -220,6 +219,15 @@ class FrameLease internal constructor(
     override fun close() = release()
 }
 
+data class FrameCandidateSnapshot(
+    val timestampNs: Long,
+    val frameVersion: Long,
+    val format: Int,
+    val metadata: TotalCaptureResult,
+    val afState: Int,
+    val lensState: Int
+)
+
 data class FrameRingBufferHealthDiagnostics(
     val targetCapacity: Int,
     val completeFrames: Int,
@@ -262,7 +270,6 @@ data class FrameRingBufferHealthDiagnostics(
 private object SafeLog {
     fun i(tag: String, msg: String) { try { Log.i(tag, msg) } catch (_: Throwable) { println("[$tag] $msg") } }
     fun w(tag: String, msg: String) { try { Log.w(tag, msg) } catch (_: Throwable) { println("[$tag] $msg") } }
-    fun e(tag: String, msg: String, t: Throwable? = null) { try { if (t != null) Log.e(tag, msg, t) else Log.e(tag, msg) } catch (_: Throwable) { println("[$tag] $msg") } }
 }
 
 class FrameRingBuffer(private var capacity: Int = 35) {
@@ -644,13 +651,11 @@ class FrameRingBuffer(private var capacity: Int = 35) {
             }
         }
 
-        val acquiredBuffer = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            try { image.hardwareBuffer }
-            catch (e: Exception) {
-                Log.e(tag, "HardwareBuffer ophalen gefaald", e)
-                null
-            }
-        } else null
+        val acquiredBuffer = try { image.hardwareBuffer }
+        catch (e: Exception) {
+            Log.e(tag, "HardwareBuffer ophalen gefaald", e)
+            null
+        }
         if (acquiredBuffer == null) return false
         if (firstImageArrivalNs == 0L) {
             firstImageArrivalNs = imageArrivalElapsedNs
@@ -770,29 +775,6 @@ class FrameRingBuffer(private var capacity: Int = 35) {
     }
 
     /**
-     * Provides a complete frame only for the duration of [block]. The HardwareBuffer is borrowed:
-     * callers must neither close it nor let it escape this callback. Native users that outlive the
-     * callback must acquire their own AHardwareBuffer reference before returning.
-     */
-    @Synchronized
-    fun withBorrowedCompleteFrame(
-        timestamp: Long,
-        generationId: Int = activeGeneration,
-        block: (android.hardware.HardwareBuffer, TotalCaptureResult) -> Unit
-    ): Boolean {
-        if (generationId != activeGeneration) return false
-        val pair = buffer.firstOrNull {
-            it.timestamp == timestamp &&
-                    it.generationId == generationId &&
-                    it.hardwareBuffer != null &&
-                    it.metadata != null &&
-                    hasExactRequestProvenance(it)
-        } ?: return false
-        block(pair.hardwareBuffer!!, pair.metadata!!)
-        return true
-    }
-
-    /**
      * Returns the newest image-backed timestamp for display priming without requiring metadata
      * pairing. The live RAW preview is intentionally image-driven; calibration metadata is sourced
      * independently from the latest capture result. No ownership escapes this lookup.
@@ -801,7 +783,12 @@ class FrameRingBuffer(private var capacity: Int = 35) {
     fun latestImageTimestamp(generationId: Int = activeGeneration): Long? {
         if (generationId != activeGeneration) return null
         return buffer.asSequence()
-            .filter { it.generationId == generationId && it.timestamp > 0L && it.hardwareBuffer != null }
+            .filter {
+                it.generationId == generationId &&
+                    !it.disposalRequested &&
+                    it.timestamp > 0L &&
+                    it.hardwareBuffer != null
+            }
             .maxOfOrNull { it.timestamp }
     }
 
@@ -816,6 +803,7 @@ class FrameRingBuffer(private var capacity: Int = 35) {
         val pair = buffer.firstOrNull {
             it.timestamp == timestamp &&
                     it.generationId == generationId &&
+                    !it.disposalRequested &&
                     it.hardwareBuffer != null
         } ?: return false
         // The same scoped ownership rule applies: retain natively before this callback returns.
@@ -824,6 +812,10 @@ class FrameRingBuffer(private var capacity: Int = 35) {
     }
 
     private fun hasExactRequestProvenance(pair: ZslFramePair): Boolean {
+        // A deferred-close pair may retain its Image/HardwareBuffer/metadata until the final lease
+        // releases, but it is no longer a logically selectable frame from the moment disposal is
+        // requested. Keep physical resource accounting separate from frame availability.
+        if (pair.disposalRequested) return false
         val provenance = pair.requestProvenance ?: return false
         return pair.controlRequestEpoch > 0L &&
                 provenance.identity.pipelineGeneration == pair.generationId &&
@@ -919,9 +911,13 @@ class FrameRingBuffer(private var capacity: Int = 35) {
     // O(1) of maximaal O(N) met N=35. Extreem snel zonder memory allocations.
     private fun getOrAllocatePair(timestamp: Long, generationId: Int): ZslFramePair? {
         val nowNs = currentElapsedRealtimeNanos()
-        // 1. Zoek of de andere helft (image of metadata) al in de buffer zit (match ONLY by timestamp)
+        // 1. Match the other half only inside the same pipeline generation. A leased frame from
+        // a retired generation can survive clear() until its lease is released; timestamp-only
+        // matching must never let a new generation mutate that old frame.
         for (i in buffer.indices) {
-            if (buffer[i].timestamp == timestamp) return buffer[i]
+            if (buffer[i].timestamp == timestamp && buffer[i].generationId == generationId) {
+                return buffer[i]
+            }
         }
 
         // 1b. Opruimen van verlopen incomplete paren (TTL > 500ms) zodat ze geen gezonde complete paren verdringen
@@ -1005,15 +1001,78 @@ class FrameRingBuffer(private var capacity: Int = 35) {
         return pair
     }
 
+    private fun snapshotCandidate(pair: ZslFramePair): FrameCandidateSnapshot? {
+        val metadata = pair.metadata ?: return null
+        return FrameCandidateSnapshot(
+            timestampNs = pair.timestamp,
+            frameVersion = pair.frameVersion,
+            format = pair.format,
+            metadata = metadata,
+            afState = pair.afState,
+            lensState = pair.lensState
+        )
+    }
+
+    /**
+     * Immutable planning/readiness snapshot. No mutable ZslFramePair escapes the ring lock.
+     */
     @Synchronized
-    fun getLatestCompleteFrames(count: Int): List<ZslFramePair> {
-        return buffer.filter {
-            it.generationId == activeGeneration && hasExactRequestProvenance(it) &&
-                    it.timestamp != 0L && it.image != null &&
-                    it.hardwareBuffer != null && it.metadata != null
-        }
-            .sortedBy { it.metadata?.get(CaptureResult.SENSOR_TIMESTAMP) ?: it.timestamp }
+    fun latestCompleteFrameSnapshots(count: Int): List<FrameCandidateSnapshot> {
+        if (count <= 0) return emptyList()
+        return buffer.asSequence()
+            .filter {
+                it.generationId == activeGeneration &&
+                    hasExactRequestProvenance(it) &&
+                    it.timestamp != 0L &&
+                    it.hardwareBuffer != null &&
+                    it.metadata != null
+            }
+            .sortedBy {
+                try { it.metadata?.get(CaptureResult.SENSOR_TIMESTAMP) } catch (_: Throwable) { null }
+                    ?: it.timestamp
+            }
+            .toList()
             .takeLast(count)
+            .mapNotNull(::snapshotCandidate)
+    }
+
+    /**
+     * Immutable planning snapshot for code that needs metadata/focus state
+     * but does not own image or HardwareBuffer lifetime.
+     */
+    @Synchronized
+    fun queryCandidateSnapshots(
+        userShutterTimestampNs: Long = 0L,
+        maxCount: Int = 50,
+        shutterTimestampDomain: String = "ELAPSED_REALTIME"
+    ): List<FrameCandidateSnapshot> {
+        if (maxCount <= 0) return emptyList()
+        val valid = buffer.filter {
+            it.generationId == activeGeneration &&
+                hasExactRequestProvenance(it) &&
+                it.timestamp != 0L &&
+                (it.hardwareBuffer != null ||
+                    (it.format == android.graphics.ImageFormat.YUV_420_888 && it.image != null)) &&
+                it.metadata != null
+        }
+        val filtered = if (userShutterTimestampNs > 0L) {
+            valid.filter { pair ->
+                NearZslEligibilityPolicy.isFullyPreShutter(
+                    pair,
+                    userShutterTimestampNs,
+                    shutterTimestampDomain
+                )
+            }
+        } else {
+            valid
+        }
+        return filtered
+            .sortedBy {
+                try { it.metadata?.get(CaptureResult.SENSOR_TIMESTAMP) } catch (_: Throwable) { null }
+                    ?: it.timestamp
+            }
+            .takeLast(maxCount)
+            .mapNotNull(::snapshotCandidate)
     }
 
     @Synchronized
@@ -1022,12 +1081,14 @@ class FrameRingBuffer(private var capacity: Int = 35) {
         maxCount: Int = 50,
         shutterTimestampDomain: String = "ELAPSED_REALTIME"
     ): List<ZslFramePair> {
+        if (maxCount <= 0) return emptyList()
         val valid = buffer.filter {
             it.generationId == activeGeneration &&
-                    hasExactRequestProvenance(it) &&
-                    it.timestamp != 0L &&
-                    (it.hardwareBuffer != null || (it.format == android.graphics.ImageFormat.YUV_420_888 && it.image != null)) &&
-                    it.metadata != null
+                hasExactRequestProvenance(it) &&
+                it.timestamp != 0L &&
+                (it.hardwareBuffer != null ||
+                    (it.format == android.graphics.ImageFormat.YUV_420_888 && it.image != null)) &&
+                it.metadata != null
         }
         val filtered = if (userShutterTimestampNs > 0L) {
             valid.filter { pair ->
@@ -1041,7 +1102,8 @@ class FrameRingBuffer(private var capacity: Int = 35) {
             valid
         }
         return filtered.sortedBy {
-            try { it.metadata?.get(CaptureResult.SENSOR_TIMESTAMP) } catch (_: Throwable) { null } ?: it.timestamp
+            try { it.metadata?.get(CaptureResult.SENSOR_TIMESTAMP) } catch (_: Throwable) { null }
+                ?: it.timestamp
         }.takeLast(maxCount)
     }
 
@@ -1056,7 +1118,11 @@ class FrameRingBuffer(private var capacity: Int = 35) {
     ): ZslFramePair? {
         val startNs = currentElapsedRealtimeNanos()
         val maxWaitNs = maxWaitMs * 1_000_000L
-        val initialCandidates = queryCandidates(userShutterTimestampNs, maxCount = capacity, shutterTimestampDomain = shutterTimestampDomain)
+        val initialCandidates = queryCandidates(
+            userShutterTimestampNs,
+            maxCount = capacity,
+            shutterTimestampDomain = shutterTimestampDomain
+        )
         if (initialCandidates.isNotEmpty()) {
             lastColdStartWaitMs = 0.0
             return initialCandidates.last()
@@ -1064,7 +1130,11 @@ class FrameRingBuffer(private var capacity: Int = 35) {
 
         var seq = currentEventSequence()
         while (currentElapsedRealtimeNanos() - startNs < maxWaitNs) {
-            val candidates = queryCandidates(userShutterTimestampNs, maxCount = capacity, shutterTimestampDomain = shutterTimestampDomain)
+            val candidates = queryCandidates(
+                userShutterTimestampNs,
+                maxCount = capacity,
+                shutterTimestampDomain = shutterTimestampDomain
+            )
             if (candidates.isNotEmpty()) {
                 val elapsedMs = (currentElapsedRealtimeNanos() - startNs) / 1_000_000.0
                 lastColdStartWaitMs = elapsedMs
@@ -1075,9 +1145,12 @@ class FrameRingBuffer(private var capacity: Int = 35) {
             }
             seq = currentEventSequence()
         }
-        val finalResult = queryCandidates(userShutterTimestampNs, maxCount = capacity, shutterTimestampDomain = shutterTimestampDomain).lastOrNull()
-        val elapsedMs = (currentElapsedRealtimeNanos() - startNs) / 1_000_000.0
-        lastColdStartWaitMs = elapsedMs
+        val finalResult = queryCandidates(
+            userShutterTimestampNs,
+            maxCount = capacity,
+            shutterTimestampDomain = shutterTimestampDomain
+        ).lastOrNull()
+        lastColdStartWaitMs = (currentElapsedRealtimeNanos() - startNs) / 1_000_000.0
         return finalResult
     }
 
@@ -1128,7 +1201,7 @@ class FrameRingBuffer(private var capacity: Int = 35) {
         )
 
         return selected.mapNotNull { pair ->
-            val lease = leaseFrameInternal(pair) ?: return@mapNotNull null
+            val lease = leaseFrameInternal(pair, pair.frameVersion) ?: return@mapNotNull null
             LeasedCandidate(
                 frame = pair,
                 lease = lease,
@@ -1139,27 +1212,14 @@ class FrameRingBuffer(private var capacity: Int = 35) {
     }
 
     @Synchronized
-    fun leaseBurstAtomic(pairs: List<ZslFramePair>): List<FrameLease>? {
-        val leases = mutableListOf<FrameLease>()
-        for (pair in pairs) {
-            val lease = leaseFrameInternal(pair)
-            if (lease == null) {
-                leases.forEach { it.release() }
-                return null
-            }
-            leases.add(lease)
-        }
-        return leases
-    }
-
-    @Synchronized
     fun leaseFrame(pair: ZslFramePair, expectedVersion: Long = 0L): FrameLease? {
-        return leaseFrameInternal(pair, expectedVersion)
+        val authoritativeVersion = if (expectedVersion > 0L) expectedVersion else pair.frameVersion
+        return leaseFrameInternal(pair, authoritativeVersion)
     }
 
     /**
      * Waits for one exact post-shutter Camera2 request to become a complete ring pair. HDR uses
-     * this instead of [queryCandidates], which intentionally exposes pre-shutter ZSL only.
+     * this exact leased path rather than the immutable pre-shutter planning snapshots.
      */
     suspend fun awaitAndLeaseExactRequestFrame(
         sensorTimestampNs: Long,
@@ -1314,11 +1374,18 @@ class FrameRingBuffer(private var capacity: Int = 35) {
         return true
     }
 
-    private fun leaseFrameInternal(pair: ZslFramePair, expectedVersion: Long = 0L): FrameLease? {
-        val target = buffer.firstOrNull {
-            it === pair || (it.timestamp == pair.timestamp && it.generationId == pair.generationId)
-        } ?: return null
-        if (expectedVersion > 0L && target.frameVersion != expectedVersion) {
+    private fun leaseFrameInternal(pair: ZslFramePair, expectedVersion: Long): FrameLease? {
+        // Lease identity is object- and version-authoritative. Every caller resolves the pair from
+        // this ring under the same synchronized ownership boundary, so a timestamp/generation
+        // lookalike must never substitute for a recycled slot.
+        val target = buffer.firstOrNull { it === pair } ?: return null
+        // A generation transition may leave an already-leased pair physically alive until its
+        // final lease releases. Never admit a new lease once that pair belongs to a retired
+        // generation or clear()/resize has requested deferred disposal.
+        if (target.generationId != activeGeneration || target.disposalRequested) {
+            return null
+        }
+        if (expectedVersion <= 0L || target.frameVersion != expectedVersion) {
             return null
         }
         target.pinCount++
@@ -1337,16 +1404,6 @@ class FrameRingBuffer(private var capacity: Int = 35) {
     }
 
     @Synchronized
-    fun leaseFrames(pairs: List<ZslFramePair>): List<FrameLease> {
-        return pairs.mapNotNull { leaseFrame(it) }
-    }
-
-    @Synchronized
-    fun takeLatestCompleteFrames(count: Int): List<ZslFramePair> {
-        return getLatestCompleteFrames(count)
-    }
-
-    @Synchronized
     fun takeCompleteFrame(
         timestampNs: Long,
         generationId: Int,
@@ -1354,51 +1411,13 @@ class FrameRingBuffer(private var capacity: Int = 35) {
     ): ZslFramePair? {
         return buffer.firstOrNull {
             it.timestamp == timestampNs &&
-                    it.generationId == generationId &&
-                    hasExactRequestProvenance(it) &&
-                    it.format == expectedFormat &&
-                    it.image != null &&
-                    it.hardwareBuffer != null &&
-                    it.metadata != null
+                it.generationId == generationId &&
+                hasExactRequestProvenance(it) &&
+                it.format == expectedFormat &&
+                it.image != null &&
+                it.hardwareBuffer != null &&
+                it.metadata != null
         }
-    }
-
-    private fun transferPairOwnership(pair: ZslFramePair): ZslFramePair {
-        val copy = ZslFramePair().apply {
-            this.timestamp = pair.timestamp
-            this.image = pair.image
-            this.hardwareBuffer = pair.hardwareBuffer
-            this.metadata = pair.metadata
-            this.format = pair.format
-            this.generationId = pair.generationId
-            this.controlRequestEpoch = pair.controlRequestEpoch
-            this.requestProvenance = pair.requestProvenance
-            this.exposureTimeNs = pair.exposureTimeNs
-            this.imageArrivalElapsedNs = pair.imageArrivalElapsedNs
-            this.metadataArrivalElapsedNs = pair.metadataArrivalElapsedNs
-            this.pairCompleteElapsedNs = pair.pairCompleteElapsedNs
-            this.timestampSource = pair.timestampSource
-            this.sensorTimestampComparableToElapsedRealtime =
-                pair.sensorTimestampComparableToElapsedRealtime
-            this.completionCounted = pair.completionCounted
-        }
-        pair.timestamp = 0L
-        pair.image = null
-        pair.hardwareBuffer = null
-        pair.metadata = null
-        pair.format = 0
-        pair.generationId = -1
-        pair.controlRequestEpoch = 0L
-        pair.requestProvenance = null
-        pair.exposureTimeNs = 0L
-        pair.imageArrivalElapsedNs = 0L
-        pair.metadataArrivalElapsedNs = 0L
-        pair.pairCompleteElapsedNs = 0L
-        pair.timestampSource =
-            CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE_UNKNOWN
-        pair.sensorTimestampComparableToElapsedRealtime = false
-        pair.completionCounted = false
-        return copy
     }
 
     @Synchronized fun currentCapacity(): Int = capacity
@@ -1559,10 +1578,10 @@ class FrameRingBuffer(private var capacity: Int = 35) {
             newestAgeMs = completionAgeMs(completeList.lastOrNull())
         }
 
-        val preShutterCandidates = if (userShutterTimestampNs > 0L) {
-            queryCandidates(userShutterTimestampNs, maxCount = capacity)
+        val fullyPreShutterCount = if (userShutterTimestampNs > 0L) {
+            queryCandidateSnapshots(userShutterTimestampNs, maxCount = capacity).size
         } else {
-            completeList
+            completeList.size
         }
 
         val newestCompletionElapsedNs = completeList.lastOrNull()?.let { pair ->
@@ -1582,7 +1601,6 @@ class FrameRingBuffer(private var capacity: Int = 35) {
         }
 
         val validCompleteCount = completeList.size
-        val fullyPreShutterCount = preShutterCandidates.size
         val isReady = fullyPreShutterCount >= 1 || (userShutterTimestampNs == 0L && validCompleteCount >= 1)
         val stateLabel = when {
             validCompleteCount == 0 -> "BUFFER_COLD"
@@ -1703,7 +1721,7 @@ class FrameRingBuffer(private var capacity: Int = 35) {
                     // when that domain is explicitly compatible; otherwise use the completed-pair
                     // arrival marker, which is always captured in elapsedRealtime.
                     val freshnessTimestampNs = if (
-                        pair.sensorTimestampComparableToElapsedRealtime && timestampNs > 0L
+                        pair.sensorTimestampComparableToElapsedRealtime
                     ) {
                         timestampNs
                     } else {

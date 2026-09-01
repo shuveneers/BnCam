@@ -24,6 +24,8 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
 import android.view.Surface
+import androidx.lifecycle.DefaultLifecycleObserver
+import androidx.lifecycle.LifecycleOwner
 import android.view.WindowManager
 import com.bncam.core.buffer.FrameRingBuffer
 import com.bncam.core.buffer.CaptureBufferBudget
@@ -35,7 +37,6 @@ import com.bncam.core.capture.CameraMeteringPolicy
 import com.bncam.core.capture.ExposureBounds
 import com.bncam.core.capture.ExposurePlan
 import com.bncam.core.capture.CaptureExposurePreferences
-import com.bncam.core.capture.CaptureExposurePriorityMode
 import com.bncam.core.capture.ProfileExposurePriorityPlan
 import com.bncam.core.capture.ProfileExposurePriorityPlanner
 import com.bncam.core.capture.MeteringMode
@@ -77,8 +78,6 @@ import com.bncam.core.capture.HdrCapturedFrame
 import com.bncam.core.capture.HdrExposureBracketPlanner
 import com.bncam.core.capture.HdrExposureControlMode
 import com.bncam.core.capture.HdrManualSensorBounds
-import com.bncam.core.capture.HardwareQualificationRunner
-import com.bncam.core.capture.RawColorPipelineAuditor
 import com.bncam.core.debug.ShotLogger
 import com.bncam.core.quality.RenderQualityConfig
 import com.bncam.core.quality.RawColorTransformEngine
@@ -123,6 +122,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -159,6 +159,19 @@ private enum class PipelineTransitionState {
 enum class CameraEngineState {
     CAMERA_STARTING, PREVIEW_STARTING, PREVIEW_STABLE, PROCESSING_STREAM_RECONFIGURING,
     BUFFER_WARMING, BUFFER_READY, CAPTURE_READY, CAPTURING, ERROR
+}
+
+private fun physicalCaptureResultOrNull(
+    result: TotalCaptureResult,
+    physicalCameraId: String?
+): CaptureResult? {
+    if (physicalCameraId.isNullOrBlank()) return null
+    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        result.physicalCameraTotalResults[physicalCameraId]
+    } else {
+        @Suppress("DEPRECATION")
+        result.physicalCameraResults[physicalCameraId]
+    }
 }
 
 data class LiveWhiteBalanceDisplayCompensation(
@@ -282,8 +295,18 @@ class BnCameraManager(private val context: Context) {
         @Volatile var activeInstance: BnCameraManager? = null
     }
 
+    private val managerShutdownRequested = java.util.concurrent.atomic.AtomicBoolean(false)
+    private val managerShutdownFinalized = java.util.concurrent.atomic.AtomicBoolean(false)
+    private val owningLifecycle = context as? LifecycleOwner
+    private val managerLifecycleObserver = object : DefaultLifecycleObserver {
+        override fun onDestroy(owner: LifecycleOwner) {
+            shutdown("ACTIVITY_DESTROY")
+        }
+    }
+
     init {
         activeInstance = this
+        owningLifecycle?.lifecycle?.addObserver(managerLifecycleObserver)
         RawPreviewCadenceDiagnostics.initialize(context)
         com.bncam.core.debug.RawPreviewFirstActivationTrace.initialize(context)
         com.bncam.core.debug.DeviceTelemetryLogger.initialize(context)
@@ -601,18 +624,20 @@ class BnCameraManager(private val context: Context) {
     private val warmBufferWatchdogScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val sessionTransitionScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val phoneAssistanceSensorHelper = com.bncam.core.sensors.ColorSensorHelper(context.applicationContext)
-    private val phoneAssistanceSensorLifecycleJob: Job = sessionTransitionScope.launch {
-        SettingsRepository(context.applicationContext).phoneAssistanceSensorsFlow.collectLatest { enabled ->
-            if (enabled) phoneAssistanceSensorHelper.startListening()
-            else phoneAssistanceSensorHelper.stopListening()
-            com.bncam.core.debug.DiagnosticsAggregator.record(
-                stream = com.bncam.core.debug.DiagnosticsAggregator.Stream.PROFILE,
-                scope = "SESSION",
-                section = "PHONE ASSISTANCE SENSORS",
-                content = "enabled=$enabled; listening=${phoneAssistanceSensorHelper.auxiliaryManager.isListening}; " +
-                    "sensor=${phoneAssistanceSensorHelper.auxiliaryManager.selectedSensorName ?: "none"}; " +
-                    "capability=${phoneAssistanceSensorHelper.auxiliaryManager.selectedCapability}"
-            )
+    init {
+        sessionTransitionScope.launch {
+            SettingsRepository(context.applicationContext).phoneAssistanceSensorsFlow.collectLatest { enabled ->
+                if (enabled) phoneAssistanceSensorHelper.startListening()
+                else phoneAssistanceSensorHelper.stopListening()
+                com.bncam.core.debug.DiagnosticsAggregator.record(
+                    stream = com.bncam.core.debug.DiagnosticsAggregator.Stream.PROFILE,
+                    scope = "SESSION",
+                    section = "PHONE ASSISTANCE SENSORS",
+                    content = "enabled=$enabled; listening=${phoneAssistanceSensorHelper.auxiliaryManager.isListening}; " +
+                        "sensor=${phoneAssistanceSensorHelper.auxiliaryManager.selectedSensorName ?: "none"}; " +
+                        "capability=${phoneAssistanceSensorHelper.auxiliaryManager.selectedCapability}"
+                )
+            }
         }
     }
     private val focusAnalysisRequests = Channel<BufferFrameAnalysisRequest>(Channel.CONFLATED)
@@ -1129,7 +1154,9 @@ class BnCameraManager(private val context: Context) {
     }
 
     init {
-        kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+        // Manager-lifetime collector: keep it under an owned scope so Activity teardown can cancel
+        // the subscription and release the BnCameraManager object graph.
+        bufferAnalysisScope.launch(Dispatchers.IO) {
             com.bncam.core.output.CaptureProcessingQueue.events.collect { snapshot ->
                 reconcileCaptureWorkSnapshot(snapshot)
             }
@@ -2195,7 +2222,7 @@ class BnCameraManager(private val context: Context) {
         physicalCameraId: String?
     ): CaptureResult {
         if (physicalCameraId.isNullOrBlank()) return result
-        return runCatching { result.physicalCameraResults[physicalCameraId] }
+        return runCatching { physicalCaptureResultOrNull(result, physicalCameraId) }
             .getOrNull() ?: result
     }
 
@@ -2374,8 +2401,8 @@ class BnCameraManager(private val context: Context) {
                 ?.takeIf { it.cameraRouteKind == CameraRouteKind.LOGICAL_PHYSICAL }
                 ?.physicalCameraId
         }
-        val physicalMetadata = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && activePhysicalId != null) {
-            metadata.physicalCameraResults[activePhysicalId]
+        val physicalMetadata = if (activePhysicalId != null) {
+            physicalCaptureResultOrNull(metadata, activePhysicalId)
         } else {
             null
         }
@@ -2478,9 +2505,8 @@ class BnCameraManager(private val context: Context) {
         val frameIndex = rawPreviewAnalysisFrameCounter.incrementAndGet()
         val runExposureAnalysis = wantsExposureAnalysis && frameIndex % 3L == 0L
         val runQr = wantsQrAnalysis && frameIndex % 10L == 0L
-        val runTracking = wantsTrackingAnalysis
         val runPortrait = wantsPortraitAnalysis && shouldRunPortraitSegmentation()
-        if (!runExposureAnalysis && !runQr && !runTracking && !runPortrait) return
+        if (!runExposureAnalysis && !runQr && !wantsTrackingAnalysis && !runPortrait) return
 
         val width = frame.width.coerceAtLeast(1)
         val height = frame.height.coerceAtLeast(1)
@@ -2583,12 +2609,12 @@ class BnCameraManager(private val context: Context) {
             }
         }
 
-        if (runQr || runTracking || runPortrait) {
+        if (runQr || wantsTrackingAnalysis || runPortrait) {
             rawPreviewToNv21(frame)?.let { converted ->
                 if (runQr) {
                     scanQrNv21(converted.bytes, converted.width, converted.height, frame.rotationDegrees)
                 }
-                if (runTracking) {
+                if (wantsTrackingAnalysis) {
                     trackObjectsNv21(converted.bytes, converted.width, converted.height, frame.rotationDegrees)
                 }
                 if (runPortrait && portraitSegmentationBusy.compareAndSet(false, true)) {
@@ -2740,7 +2766,7 @@ class BnCameraManager(private val context: Context) {
         )
     }
 
-    private data class PreviewNv21(val bytes: ByteArray, val width: Int, val height: Int)
+    private class PreviewNv21(val bytes: ByteArray, val width: Int, val height: Int)
 
     private fun rawPreviewToNv21(frame: RawPreviewFrame): PreviewNv21? {
         val compactGpuNv21 = frame.analysisNv21
@@ -2908,25 +2934,27 @@ class BnCameraManager(private val context: Context) {
             if (availableRanges.isEmpty()) return
 
             val identity = synchronized(pipelineLock) { activePipelineIdentity }
-            val isRawActive = identity != null &&
-                (identity.bufferFormat == ImageFormat.RAW10 || identity.bufferFormat == ImageFormat.RAW_SENSOR)
+            val rawIdentity = identity?.takeIf { candidate ->
+                candidate.bufferFormat == ImageFormat.RAW10 ||
+                    candidate.bufferFormat == ImageFormat.RAW_SENSOR
+            }
 
-            if (isRawActive && identity != null) {
+            if (rawIdentity != null) {
                 // Full-resolution RAW owns the cadence decision. Do not force the generic 60 FPS
                 // preview policy onto a 12 MP RAW stream: some HALs satisfy that request by using
                 // a faster cropped sensor readout while keeping the advertised RAW allocation.
                 // Camera2 exposes the minimum frame duration for the exact selected output; use
                 // that as the upper bound for the RAW near-ZSL repeating request.
-                val streamCharacteristicsId = identity.physicalCameraId ?: identity.logicalCameraId
+                val streamCharacteristicsId = rawIdentity.physicalCameraId ?: rawIdentity.logicalCameraId
                 val streamCharacteristics = runCatching {
                     cameraManager.getCameraCharacteristics(streamCharacteristicsId)
                 }.getOrNull() ?: chars
                 val streamMap = streamCharacteristics.get(
                     CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP
                 )
-                val selectedSize = android.util.Size(identity.width, identity.height)
+                val selectedSize = android.util.Size(rawIdentity.width, rawIdentity.height)
                 val minimumFrameDurationNs = runCatching {
-                    streamMap?.getOutputMinFrameDuration(identity.bufferFormat, selectedSize) ?: 0L
+                    streamMap?.getOutputMinFrameDuration(rawIdentity.bufferFormat, selectedSize) ?: 0L
                 }.getOrDefault(0L)
                 val sustainableUpperFps = if (minimumFrameDurationNs > 0L) {
                     // +0.5 handles the normal nanosecond rounding of nominal 15/24/30 FPS modes.
@@ -2962,7 +2990,7 @@ class BnCameraManager(private val context: Context) {
                     Log.i(
                         tag,
                         "AE_TARGET_FPS_RANGE_SELECTED range=$selectedRawRange strategy=RAW_STREAM_MIN_FRAME_DURATION " +
-                            "format=${formatName(identity.bufferFormat)} size=${identity.width}x${identity.height} " +
+                            "format=${formatName(rawIdentity.bufferFormat)} size=${rawIdentity.width}x${rawIdentity.height} " +
                             "streamCamera=$streamCharacteristicsId minFrameDurationNs=$minimumFrameDurationNs " +
                             "sustainableUpperFps=$sustainableUpperFps"
                     )
@@ -2970,7 +2998,7 @@ class BnCameraManager(private val context: Context) {
                 }
             }
 
-            if (!isRawActive && identity?.bufferFormat == ImageFormat.YUV_420_888) {
+            if (identity?.bufferFormat == ImageFormat.YUV_420_888) {
                 // Full-FOV YUV geometry is also authoritative. A globally advertised 60 FPS AE
                 // range is not proof that the exact selected YUV stream can sustain 60 FPS. Some
                 // HALs satisfy that request by switching to a faster cropped sensor readout. Bound
@@ -3052,7 +3080,7 @@ class BnCameraManager(private val context: Context) {
 
             if (variable60Range != null) {
                 builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, variable60Range)
-                Log.i(tag, "AE_TARGET_FPS_RANGE_SELECTED range=$variable60Range strategy=VARIABLE_60_FPS isRaw=$isRawActive")
+                Log.i(tag, "AE_TARGET_FPS_RANGE_SELECTED range=$variable60Range strategy=VARIABLE_60_FPS isRaw=${rawIdentity != null}")
                 return
             }
 
@@ -3073,7 +3101,7 @@ class BnCameraManager(private val context: Context) {
 
             if (selectedRange != null) {
                 builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, selectedRange)
-                Log.i(tag, "AE_TARGET_FPS_RANGE_SELECTED range=$selectedRange strategy=HYSTERETIC_EXPOSURE_SWITCHING exposureMs=$recentExposureMs isRaw=$isRawActive")
+                Log.i(tag, "AE_TARGET_FPS_RANGE_SELECTED range=$selectedRange strategy=HYSTERETIC_EXPOSURE_SWITCHING exposureMs=$recentExposureMs isRaw=${rawIdentity != null}")
             }
         }.onFailure { Log.w(tag, "Failed to apply optimal AE target FPS range", it) }
     }
@@ -3122,7 +3150,7 @@ class BnCameraManager(private val context: Context) {
             }
 
             OisDecision.OisMethod.PHYSICAL_OIS -> {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && decision.physicalCameraId != null) {
+                if (decision.physicalCameraId != null) {
                     runCatching {
                         builder.setPhysicalCameraKey(
                             CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
@@ -3333,9 +3361,9 @@ class BnCameraManager(private val context: Context) {
         builders: List<CaptureRequest.Builder>,
         callback: CameraCaptureSession.CaptureCallback?,
         handler: Handler?,
-        reason: String,
         pipelineGenerationAtSubmission: Int = pipelineGeneration
     ): SubmittedCameraBurst = synchronized(requestSubmissionLock) {
+        val reason = "HDR_ENHANCED_MAIN_BURST"
         require(builders.isNotEmpty()) { "Camera2 burst requires at least one request." }
         builders.forEach { builder -> enforceOpticalStabilizationBeforeSubmission(builder, reason) }
         val firstState = snapshotControlRequestState(builders.first())
@@ -3358,9 +3386,9 @@ class BnCameraManager(private val context: Context) {
             builder.build()
         }
         val sequenceId = session.captureBurst(requests, callback, handler)
-        requests.forEach { request ->
+        requests.forEachIndexed { index, request ->
             com.bncam.core.debug.AfGroundTruthTrace.recordSubmission(
-                builder = builders[requests.indexOf(request)],
+                builder = builders[index],
                 request = request,
                 requestSequenceNumber = sequenceId,
                 submissionType = "BURST",
@@ -3620,9 +3648,13 @@ class BnCameraManager(private val context: Context) {
             )
             barcodeScanner.process(inputImage)
                 .addOnSuccessListener { barcodes ->
-                    _detectedQrCode.value = barcodes.firstOrNull {
-                        it.valueType == com.google.mlkit.vision.barcode.common.Barcode.TYPE_URL
-                    }?.url?.url
+                    _detectedQrCode.value = if (!managerShutdownRequested.get() && qrAnalysisEnabled) {
+                        barcodes.firstOrNull {
+                            it.valueType == com.google.mlkit.vision.barcode.common.Barcode.TYPE_URL
+                        }?.url?.url
+                    } else {
+                        null
+                    }
                 }
                 .addOnFailureListener {
                     _detectedQrCode.value = null
@@ -3924,7 +3956,7 @@ class BnCameraManager(private val context: Context) {
 
     private fun clearPhysicalAfRegionState(builder: CaptureRequest.Builder? = null) {
         val physicalId = activePhysicalAfCameraId
-        if (builder != null && physicalId != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+        if (builder != null && physicalId != null) {
             runCatching {
                 builder.setPhysicalCameraKey(CaptureRequest.CONTROL_AF_REGIONS, null, physicalId)
             }
@@ -3954,7 +3986,7 @@ class BnCameraManager(private val context: Context) {
             target.set(CaptureRequest.CONTROL_AF_MODE, sourceMode)
             val physicalId = activePhysicalAfCameraId
             val physicalRegion = activePhysicalAfRegion
-            if (physicalId != null && physicalRegion != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            if (physicalId != null && physicalRegion != null) {
                 target.set(CaptureRequest.CONTROL_AF_REGIONS, null)
                 runCatching {
                     target.setPhysicalCameraKey(
@@ -4042,12 +4074,11 @@ class BnCameraManager(private val context: Context) {
                 val maxAfRegions = geometryChars.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AF) ?: 0
                 if (maxAfRegions <= 0) return@enqueuePreviewControl
                 val physicalResultCrop = if (
-                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && physicalId != null &&
+                    physicalId != null &&
                     lastCaptureResultGeneration == pipelineGeneration
                 ) {
                     (lastCaptureResult as? TotalCaptureResult)
-                        ?.physicalCameraResults
-                        ?.get(physicalId)
+                        ?.let { physicalCaptureResultOrNull(it, physicalId) }
                         ?.get(CaptureResult.SCALER_CROP_REGION)
                 } else null
                 val mapped = AfCoordinateMapper.mapNormalizedPreviewPoint(
@@ -4056,19 +4087,17 @@ class BnCameraManager(private val context: Context) {
                     currentCropRegion = physicalResultCrop ?: request.get(CaptureRequest.SCALER_CROP_REGION),
                     previewStreamWidth = configuredPreviewStreamWidth,
                     previewStreamHeight = configuredPreviewStreamHeight,
-                    distortionCorrectionMode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                        request.get(CaptureRequest.DISTORTION_CORRECTION_MODE)
-                    } else null,
+                    distortionCorrectionMode = request.get(CaptureRequest.DISTORTION_CORRECTION_MODE),
                     regionSizePct = safeRegionSizePct
                 ) ?: return@enqueuePreviewControl
 
                 predictiveAfTracker.clear()
                 if (!_focusOwnership.value.trackingActive) return@enqueuePreviewControl
-                val physicalRequestKeys = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && physicalId != null) {
+                val physicalRequestKeys = if (physicalId != null) {
                     logicalChars.availablePhysicalCameraRequestKeys.orEmpty().toSet()
                 } else emptySet()
                 val physicalWritable = CaptureRequest.CONTROL_AF_REGIONS in physicalRequestKeys
-                if (physicalId != null && physicalWritable && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                if (physicalId != null && physicalWritable) {
                     request.set(CaptureRequest.CONTROL_AF_REGIONS, null)
                     request.setPhysicalCameraKey(
                         CaptureRequest.CONTROL_AF_REGIONS,
@@ -4673,15 +4702,6 @@ class BnCameraManager(private val context: Context) {
      * source of truth for hard starts, pipeline identity and physical-lens handover decisions.
      */
     fun resolveCameraDeviceRoute(cameraId: String): CameraDeviceRoute {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
-            return CameraDeviceRoute(
-                requestedLensId = cameraId,
-                logicalCameraId = cameraId,
-                physicalCameraId = null,
-                routeKind = CameraRouteKind.PUBLIC_DIRECT
-            )
-        }
-
         return try {
             val directIds = cameraManager.cameraIdList.toSet()
 
@@ -4967,15 +4987,13 @@ class BnCameraManager(private val context: Context) {
         val standardSizes = standardMap?.getOutputSizes(effectiveFormat)?.toList().orEmpty()
         var recommendedSizes = emptyList<android.util.Size>()
 
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
-            try {
-                val recMap = chars.getRecommendedStreamConfigurationMap(
-                    android.hardware.camera2.params.RecommendedStreamConfigurationMap.USECASE_PREVIEW
-                )
-                recommendedSizes = recMap?.getOutputSizes(effectiveFormat)?.toList().orEmpty()
-            } catch (e: Exception) {
-                // Standard SCALER_STREAM_CONFIGURATION_MAP remains the portable fallback.
-            }
+        try {
+            val recMap = chars.getRecommendedStreamConfigurationMap(
+                android.hardware.camera2.params.RecommendedStreamConfigurationMap.USECASE_PREVIEW
+            )
+            recommendedSizes = recMap?.getOutputSizes(effectiveFormat)?.toList().orEmpty()
+        } catch (_: Exception) {
+            // Standard SCALER_STREAM_CONFIGURATION_MAP remains the portable fallback.
         }
 
         val supportsYuv = outputSizesAvailable(standardMap, ImageFormat.YUV_420_888)
@@ -5285,11 +5303,10 @@ class BnCameraManager(private val context: Context) {
             selectedCharacteristics?.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
 
         val physicalResult = if (
-            Build.VERSION.SDK_INT >= Build.VERSION_CODES.P &&
             result != null &&
             physicalCameraId != null
         ) {
-            result.physicalCameraResults[physicalCameraId]
+            physicalCaptureResultOrNull(result, physicalCameraId)
         } else {
             null
         }
@@ -5324,8 +5341,7 @@ class BnCameraManager(private val context: Context) {
         // the request instead of calling a non-existent CaptureRequest API.
         val requestedPhysicalOisMode: Int? = activeOisDecision
             ?.takeIf { decision ->
-                Build.VERSION.SDK_INT >= Build.VERSION_CODES.P &&
-                    physicalCameraId != null &&
+                physicalCameraId != null &&
                     decision.appliedMethod == OisDecision.OisMethod.PHYSICAL_OIS &&
                     decision.physicalCameraId == physicalCameraId &&
                     decision.applied
@@ -5504,8 +5520,7 @@ class BnCameraManager(private val context: Context) {
         // Readiness therefore has two independent requirements:
         //   1. the complete requested set is already leasable from the current generation; and
         //   2. at least the newest member proves that the stream is still alive.
-        val leasableCompleteFrames =
-            ringBuffer.getLatestCompleteFrames(requirement.requiredCompleteFrames).size
+        val leasableCompleteFrames = ringBuffer.completeFrameCount()
         if (leasableCompleteFrames < requirement.requiredCompleteFrames) {
             return "LEASABLE_WARM_BUFFER_NOT_READY expected=$expectedSource " +
                     "purpose=${requirement.purpose} leasableComplete=$leasableCompleteFrames " +
@@ -5564,39 +5579,37 @@ class BnCameraManager(private val context: Context) {
                 val oisExpectationActive = oisDecision.applied && oisDecision.appliedMethod != OisDecision.OisMethod.FAILED
 
                 if (oisExpectationActive) {
-                    val latestFrames = ringBuffer.getLatestCompleteFrames(5)
+                    val latestFrames = ringBuffer.latestCompleteFrameSnapshots(5)
                     val oisIsStabilized = latestFrames.any { frame ->
                         val metadata = frame.metadata
-                        if (metadata != null) {
-                            val logicalOis = metadata.get(CaptureResult.LENS_OPTICAL_STABILIZATION_MODE)
-                            val logicalVideoStab = metadata.get(CaptureResult.CONTROL_VIDEO_STABILIZATION_MODE)
-                            var physicalOis: Int? = null
-                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && oisDecision.physicalCameraId != null) {
-                                val physicalResult = metadata.physicalCameraResults[oisDecision.physicalCameraId]
-                                physicalOis = physicalResult?.get(CaptureResult.LENS_OPTICAL_STABILIZATION_MODE)
-                            }
+                        val logicalOis = metadata.get(CaptureResult.LENS_OPTICAL_STABILIZATION_MODE)
+                        val logicalVideoStab = metadata.get(CaptureResult.CONTROL_VIDEO_STABILIZATION_MODE)
+                        var physicalOis: Int? = null
+                        if (oisDecision.physicalCameraId != null) {
+                            val physicalResult = physicalCaptureResultOrNull(metadata, oisDecision.physicalCameraId)
+                            physicalOis = physicalResult?.get(CaptureResult.LENS_OPTICAL_STABILIZATION_MODE)
+                        }
 
-                            when (oisDecision.appliedMethod) {
-                                OisDecision.OisMethod.PHYSICAL_OIS,
-                                OisDecision.OisMethod.LOGICAL_OIS -> {
-                                    logicalOis == CaptureResult.LENS_OPTICAL_STABILIZATION_MODE_ON ||
-                                        physicalOis == CaptureResult.LENS_OPTICAL_STABILIZATION_MODE_ON
-                                }
-                                OisDecision.OisMethod.VENDOR -> {
-                                    // Vendor optical OIS has no portable CaptureResult contract.
-                                    // Request acceptance is authoritative; never turn missing standard
-                                    // metadata into a shutter lockout.
-                                    true
-                                }
-                                OisDecision.OisMethod.PREVIEW_STAB -> {
-                                    logicalVideoStab == CaptureResult.CONTROL_VIDEO_STABILIZATION_MODE_PREVIEW_STABILIZATION
-                                }
-                                OisDecision.OisMethod.VIDEO_STAB -> {
-                                    logicalVideoStab == CaptureResult.CONTROL_VIDEO_STABILIZATION_MODE_ON
-                                }
-                                else -> true
+                        when (oisDecision.appliedMethod) {
+                            OisDecision.OisMethod.PHYSICAL_OIS,
+                            OisDecision.OisMethod.LOGICAL_OIS -> {
+                                logicalOis == CaptureResult.LENS_OPTICAL_STABILIZATION_MODE_ON ||
+                                    physicalOis == CaptureResult.LENS_OPTICAL_STABILIZATION_MODE_ON
                             }
-                        } else false
+                            OisDecision.OisMethod.VENDOR -> {
+                                // Vendor optical OIS has no portable CaptureResult contract.
+                                // Request acceptance is authoritative; never turn missing standard
+                                // metadata into a shutter lockout.
+                                true
+                            }
+                            OisDecision.OisMethod.PREVIEW_STAB -> {
+                                logicalVideoStab == CaptureResult.CONTROL_VIDEO_STABILIZATION_MODE_PREVIEW_STABILIZATION
+                            }
+                            OisDecision.OisMethod.VIDEO_STAB -> {
+                                logicalVideoStab == CaptureResult.CONTROL_VIDEO_STABILIZATION_MODE_ON
+                            }
+                            else -> true
+                        }
                     }
 
                     if (oisIsStabilized) {
@@ -6801,7 +6814,6 @@ class BnCameraManager(private val context: Context) {
             )
 
             var imageReaderClosed = false
-            var bufferPoolCleared = false
 
             try {
                 val oldSession = captureSession
@@ -6825,7 +6837,6 @@ class BnCameraManager(private val context: Context) {
 
                 ringBuffer.clear()
                 configureNearZslTimestampObservability(cameraId)
-                bufferPoolCleared = true
 
                 // Build the replacement producer before releasing the previous reader. Android
                 // is allowed to configure the new session before dispatching oldSession.onClosed().
@@ -7029,7 +7040,7 @@ class BnCameraManager(private val context: Context) {
                     event = "PIPELINE_RESET_END",
                     decision = decision,
                     extra = "oldGeneration=$oldGeneration\nnewGeneration=$resetGeneration\n" +
-                        "imageReaderClosed=$imageReaderClosed\nbufferPoolCleared=$bufferPoolCleared\n" +
+                        "imageReaderClosed=$imageReaderClosed\nbufferPoolCleared=true\n" +
                         "previousSessionClosed=$oldSessionClosed\n" +
                         "activePipelineAfterReset=${activePipelineIdentity?.toDebugString() ?: "none"}"
                 )
@@ -7189,8 +7200,7 @@ class BnCameraManager(private val context: Context) {
             characteristics: CameraCharacteristics,
             opticalStabilization: Boolean
         ): Boolean {
-            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return false
-            val sessionKeys = characteristics.availableSessionKeys ?: emptyList()
+            val sessionKeys = characteristics.availableSessionKeys
             if (sessionKeys.isEmpty()) return false
 
             val decision = activeOisDecision
@@ -7255,7 +7265,7 @@ class BnCameraManager(private val context: Context) {
             decision: OisDecision,
             opticalStabilization: Boolean
         ) {
-            if (!opticalStabilization || Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return
+            if (!opticalStabilization) return
 
             var logicalRequested = false
             var physicalRequested = false
@@ -7361,14 +7371,14 @@ class BnCameraManager(private val context: Context) {
             } else {
                 "Disabled"
             }
-            kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+            sessionTransitionScope.launch {
                 settingsRepo.setStabilizationStatus(statusText)
             }
 
             // Apply OIS or Video stabilization based on resolved method
             when (oisDecision.appliedMethod) {
                 OisDecision.OisMethod.PHYSICAL_OIS -> {
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && oisDecision.physicalCameraId != null) {
+                    if (oisDecision.physicalCameraId != null) {
                         requestBuilder.setPhysicalCameraKey(
                             CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
                             CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON,
@@ -7410,7 +7420,7 @@ class BnCameraManager(private val context: Context) {
                     )
                 }
                 OisDecision.OisMethod.VENDOR -> {
-                    val requestKeys = characteristics.availableCaptureRequestKeys ?: emptyList()
+                    val requestKeys = characteristics.availableCaptureRequestKeys
                     val selectedVendorKeyName = oisDecision.vendorOpticalKeyName
                     val activeKey = requestKeys.firstOrNull { key ->
                         selectedVendorKeyName != null && key.name == selectedVendorKeyName
@@ -7418,25 +7428,26 @@ class BnCameraManager(private val context: Context) {
                     if (activeKey != null) {
                         val type = OisResolver.getCaptureRequestKeyType(activeKey)
                         try {
+                            @Suppress("UNCHECKED_CAST")
+                            fun <T> setTypedVendorKey(value: T) {
+                                requestBuilder.set(activeKey as CaptureRequest.Key<T>, value)
+                            }
+
                             when {
                                 type == Byte::class.java || type == Byte::class.javaObjectType -> {
-                                    val typedKey = activeKey as CaptureRequest.Key<Byte>
-                                    requestBuilder.set(typedKey, 1.toByte())
+                                    setTypedVendorKey(1.toByte())
                                     Log.i("OisResolver", "Applied vendor key: ${activeKey.name} with value: 1 (Byte)")
                                 }
                                 type == Int::class.java || type == Int::class.javaObjectType -> {
-                                    val typedKey = activeKey as CaptureRequest.Key<Int>
-                                    requestBuilder.set(typedKey, 1)
+                                    setTypedVendorKey(1)
                                     Log.i("OisResolver", "Applied vendor key: ${activeKey.name} with value: 1 (Int)")
                                 }
                                 type == Boolean::class.java || type == Boolean::class.javaObjectType -> {
-                                    val typedKey = activeKey as CaptureRequest.Key<Boolean>
-                                    requestBuilder.set(typedKey, true)
+                                    setTypedVendorKey(true)
                                     Log.i("OisResolver", "Applied vendor key: ${activeKey.name} with value: true (Boolean)")
                                 }
                                 type == Long::class.java || type == Long::class.javaObjectType -> {
-                                    val typedKey = activeKey as CaptureRequest.Key<Long>
-                                    requestBuilder.set(typedKey, 1L)
+                                    setTypedVendorKey(1L)
                                     Log.i("OisResolver", "Applied vendor key: ${activeKey.name} with value: 1 (Long)")
                                 }
                                 else -> {
@@ -7643,7 +7654,7 @@ class BnCameraManager(private val context: Context) {
             val physicalCameraId = synchronized(pipelineLock) {
                 activePipelineIdentity?.physicalCameraId
             }
-            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P || physicalCameraId.isNullOrBlank()) {
+            if (physicalCameraId.isNullOrBlank()) {
                 return camera.createCaptureRequest(template)
             }
 
@@ -8027,8 +8038,8 @@ class BnCameraManager(private val context: Context) {
                         val activePhysicalId = decision?.physicalCameraId
 
                         var physicalOisReported: Int? = null
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && activePhysicalId != null) {
-                            val physicalResult = result.physicalCameraResults[activePhysicalId]
+                        if (activePhysicalId != null) {
+                            val physicalResult = physicalCaptureResultOrNull(result, activePhysicalId)
                             physicalOisReported = physicalResult?.get(CaptureResult.LENS_OPTICAL_STABILIZATION_MODE)
                         }
 
@@ -8563,114 +8574,92 @@ class BnCameraManager(private val context: Context) {
                     }
                 }
 
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                    val outputs = mutableListOf<OutputConfiguration>()
-                    val activePhysicalId = synchronized(pipelineLock) { activePipelineIdentity?.physicalCameraId }
-                    val activeLogicalId = synchronized(pipelineLock) { activePipelineIdentity?.logicalCameraId } ?: camera.id
-                    com.bncam.core.debug.HalParityAuditor.auditStaticCapabilities(cameraManager, activeLogicalId, activePhysicalId)
-                    com.bncam.core.debug.AfParityAuditor.auditRouteAfCapability(cameraManager, activeLogicalId, activePhysicalId)
+                val outputs = mutableListOf<OutputConfiguration>()
+                val activePhysicalId = synchronized(pipelineLock) { activePipelineIdentity?.physicalCameraId }
+                val activeLogicalId = synchronized(pipelineLock) { activePipelineIdentity?.logicalCameraId } ?: camera.id
+                com.bncam.core.debug.HalParityAuditor.auditStaticCapabilities(cameraManager, activeLogicalId, activePhysicalId)
+                com.bncam.core.debug.AfParityAuditor.auditRouteAfCapability(cameraManager, activeLogicalId, activePhysicalId)
 
-                    if (previewSurface != null) {
-                        val previewOutput = OutputConfiguration(previewSurface)
-                        if (activePhysicalId != null) {
-                            previewOutput.setPhysicalCameraId(activePhysicalId)
-                        }
-                        lastPreviewOutputPhysicalCameraId = activePhysicalId
-                        outputs.add(previewOutput)
-                    } else {
-                        lastPreviewOutputPhysicalCameraId = null
+                if (previewSurface != null) {
+                    val previewOutput = OutputConfiguration(previewSurface)
+                    if (activePhysicalId != null) {
+                        previewOutput.setPhysicalCameraId(activePhysicalId)
                     }
-
-                    imageReader?.surface?.let {
-                        val readerOutput = OutputConfiguration(it)
-                        if (activePhysicalId != null) {
-                            readerOutput.setPhysicalCameraId(activePhysicalId)
-                        }
-                        lastImageReaderOutputPhysicalCameraId = activePhysicalId
-                        outputs.add(readerOutput)
-                    }
-                    if (imageReader?.surface == null) {
-                        lastImageReaderOutputPhysicalCameraId = null
-                    }
-
-                    customRawPreviewSurface?.let { customSurface ->
-                        val customOutput = OutputConfiguration(customSurface)
-                        if (activePhysicalId != null) customOutput.setPhysicalCameraId(activePhysicalId)
-                        outputs.add(customOutput)
-                    }
-
-                    val sessionConfig = SessionConfiguration(
-                        vendorSessionType,
-                        outputs,
-                        { runnable -> backgroundHandler?.post(runnable) ?: runnable.run() },
-                        stateCallback
-                    )
-
-                    sessionParameters?.let { params ->
-                        try {
-                            sessionConfig.setSessionParameters(params)
-                            Log.i(
-                                tag,
-                                "Session parameters attached for lens=${camera.id} sessionType=$vendorSessionType"
-                            )
-                        } catch (e: Exception) {
-                            Log.e(tag, "Session parameters failed for lens=${camera.id}", e)
-                        }
-                    }
-
-                    val outputBindings = mutableListOf<Pair<String, String?>>()
-                    if (previewSurface != null) outputBindings.add("preview" to lastPreviewOutputPhysicalCameraId)
-                    if (imageReader?.surface != null) outputBindings.add("imageReader" to lastImageReaderOutputPhysicalCameraId)
-                    if (customRawPreviewSurface != null) outputBindings.add("customRawPreview" to activePhysicalId)
-                    com.bncam.core.debug.HalParityAuditor.auditSessionCreation(
-                        activeLogicalId,
-                        activePhysicalId,
-                        vendorSessionType,
-                        outputBindings,
-                        sessionParameters
-                    )
-
-                    Log.i(
-                        tag,
-                        "Creating Camera2 session lens=${camera.id} sessionType=$vendorSessionType outputs=${outputs.size} " +
-                            "previewAttached=${previewSurface != null} epoch=$sessionEpoch"
-                    )
-                    logPreviewDiagnostics(
-                        event = "SESSION_CREATION",
-                        request = requestBuilder.build(),
-                        extra = "sessionType=$vendorSessionType outputCount=${outputs.size}"
-                    )
-                    writePipelineLifecycleDebug(
-                        event = "CAMERA2_CREATE_CAPTURE_SESSION",
-                        decision = null,
-                        extra = "cameraId=${camera.id}\nsessionType=$vendorSessionType\nsessionTypeHex=0x${
-                            vendorSessionType.toString(
-                                16
-                            ).uppercase()
-                        }\noutputs=${outputs.size}\nhasSessionParameters=${sessionParameters != null}"
-                    )
-                    camera.createCaptureSession(sessionConfig)
-
+                    lastPreviewOutputPhysicalCameraId = activePhysicalId
+                    outputs.add(previewOutput)
                 } else {
                     lastPreviewOutputPhysicalCameraId = null
-                    lastImageReaderOutputPhysicalCameraId = null
-                    @Suppress("DEPRECATION")
-                    val surfaces = mutableListOf<Surface>()
-                    previewSurface?.let { surfaces.add(it) }
-
-                    imageReader?.surface?.let {
-                        surfaces.add(it)
-                    }
-                    customRawPreviewSurface?.let { surfaces.add(it) }
-
-                    logPreviewDiagnostics(
-                        event = "SESSION_CREATION_LEGACY_OUTPUTS",
-                        request = requestBuilder.build(),
-                        extra = "outputCount=${surfaces.size}"
-                    )
-                    @Suppress("DEPRECATION")
-                    camera.createCaptureSession(surfaces, stateCallback, backgroundHandler)
                 }
+
+                imageReader?.surface?.let {
+                    val readerOutput = OutputConfiguration(it)
+                    if (activePhysicalId != null) {
+                        readerOutput.setPhysicalCameraId(activePhysicalId)
+                    }
+                    lastImageReaderOutputPhysicalCameraId = activePhysicalId
+                    outputs.add(readerOutput)
+                }
+                if (imageReader?.surface == null) {
+                    lastImageReaderOutputPhysicalCameraId = null
+                }
+
+                customRawPreviewSurface?.let { customSurface ->
+                    val customOutput = OutputConfiguration(customSurface)
+                    if (activePhysicalId != null) customOutput.setPhysicalCameraId(activePhysicalId)
+                    outputs.add(customOutput)
+                }
+
+                val sessionConfig = SessionConfiguration(
+                    vendorSessionType,
+                    outputs,
+                    { runnable -> backgroundHandler?.post(runnable) ?: runnable.run() },
+                    stateCallback
+                )
+
+                sessionParameters?.let { params ->
+                    try {
+                        sessionConfig.setSessionParameters(params)
+                        Log.i(
+                            tag,
+                            "Session parameters attached for lens=${camera.id} sessionType=$vendorSessionType"
+                        )
+                    } catch (e: Exception) {
+                        Log.e(tag, "Session parameters failed for lens=${camera.id}", e)
+                    }
+                }
+
+                val outputBindings = mutableListOf<Pair<String, String?>>()
+                if (previewSurface != null) outputBindings.add("preview" to lastPreviewOutputPhysicalCameraId)
+                if (imageReader?.surface != null) outputBindings.add("imageReader" to lastImageReaderOutputPhysicalCameraId)
+                if (customRawPreviewSurface != null) outputBindings.add("customRawPreview" to activePhysicalId)
+                com.bncam.core.debug.HalParityAuditor.auditSessionCreation(
+                    activeLogicalId,
+                    activePhysicalId,
+                    vendorSessionType,
+                    outputBindings,
+                    sessionParameters
+                )
+
+                Log.i(
+                    tag,
+                    "Creating Camera2 session lens=${camera.id} sessionType=$vendorSessionType outputs=${outputs.size} " +
+                        "previewAttached=${previewSurface != null} epoch=$sessionEpoch"
+                )
+                logPreviewDiagnostics(
+                    event = "SESSION_CREATION",
+                    request = requestBuilder.build(),
+                    extra = "sessionType=$vendorSessionType outputCount=${outputs.size}"
+                )
+                writePipelineLifecycleDebug(
+                    event = "CAMERA2_CREATE_CAPTURE_SESSION",
+                    decision = null,
+                    extra = "cameraId=${camera.id}\nsessionType=$vendorSessionType\nsessionTypeHex=0x${
+                        vendorSessionType.toString(
+                            16
+                        ).uppercase()
+                    }\noutputs=${outputs.size}\nhasSessionParameters=${sessionParameters != null}"
+                )
+                camera.createCaptureSession(sessionConfig)
 
             } catch (e: Exception) {
                 Log.e(tag, "Session creation failed", e)
@@ -9152,9 +9141,8 @@ class BnCameraManager(private val context: Context) {
         val targetGeneration = pipelineGeneration
         sessionTransitionScope.launch {
             pipelineTransitionMutex.withLock {
-                val surfaceStillOwned = expectedSurface != null && lastPreviewSurface === expectedSurface
                 val staleRequest = if (expectedSurface != null) {
-                    !surfaceStillOwned
+                    lastPreviewSurface !== expectedSurface
                 } else if (targetDevice != null) {
                     pipelineGeneration != targetGeneration && cameraDevice !== targetDevice
                 } else {
@@ -9164,7 +9152,7 @@ class BnCameraManager(private val context: Context) {
                     Log.i(
                         previewDiagnosticsTag,
                         "event=STALE_CAMERA_CLOSE_SKIPPED reason=$reason targetGeneration=$targetGeneration " +
-                            "activeGeneration=$pipelineGeneration surfaceStillOwned=$surfaceStillOwned"
+                            "activeGeneration=$pipelineGeneration surfaceStillOwned=false"
                     )
                     onSafeToRelease?.invoke()
                     return@withLock
@@ -9172,6 +9160,84 @@ class BnCameraManager(private val context: Context) {
                 closeCameraOwned(reason, onSafeToRelease)
             }
         }
+    }
+
+    /**
+     * Final owner teardown for the Activity-scoped camera manager. Camera2/ImageReader resources
+     * must finish their existing serialized hard-close transaction before process-resident preview
+     * executors and manager coroutine scopes are cancelled.
+     */
+    fun shutdown(reason: String = "MANAGER_OWNER_DESTROYED") {
+        if (!managerShutdownRequested.compareAndSet(false, true)) return
+
+        // Stop accepting new UI publication immediately. Camera/resource retirement itself stays
+        // serialized on sessionTransitionScope and cannot race an in-flight lens/session change.
+        activeViewfinderCallbackRegistrationId = 0L
+        effectiveViewfinderListener = null
+        rawPreviewFrameListener = null
+        histogramAnalysisEnabled = false
+        qrAnalysisEnabled = false
+        objectTrackingAnalysisEnabled = false
+        portraitAnalysisEnabled = false
+        clearFocusTrackingState(reason = "manager_shutdown", restoreConfiguredAf = false)
+        latestPortraitMask.set(null)
+        portraitSegmentationBusy.set(false)
+        _detectedQrCode.value = null
+        rawPreviewRenderer.setMlAnalysisRequested(false)
+        stopWarmBufferWatchdog()
+
+        sessionTransitionScope.launch {
+            pipelineTransitionMutex.withLock {
+                closeCameraOwned(
+                    reason = "MANAGER_SHUTDOWN:$reason",
+                    onSafeToRelease = { finalizeManagerShutdown(reason) }
+                )
+            }
+        }
+    }
+
+    private fun finalizeManagerShutdown(reason: String) {
+        if (!managerShutdownFinalized.compareAndSet(false, true)) return
+
+        owningLifecycle?.lifecycle?.removeObserver(managerLifecycleObserver)
+        phoneAssistanceSensorHelper.stopListening()
+        trackingTimeoutJob?.cancel()
+        tapFocusTimeoutJob?.cancel()
+        pointLockJob?.cancel()
+        focusAnalysisRequests.close()
+        yuvAnalysisRequests.close()
+
+        // Stop manager-owned analysis work before closing ML/native analysis clients. Barcode and
+        // object-detector Tasks are not coroutine-owned, so the shutdown gates above also prevent
+        // late completions from reactivating preview analysis or focus tracking.
+        bufferAnalysisScope.coroutineContext[Job]?.cancel()
+        focusTimingScope.coroutineContext[Job]?.cancel()
+        runCatching { objectTracker.close() }.onFailure {
+            Log.w(tag, "Object tracker close failed during manager shutdown: ${it.message}")
+        }
+        runCatching { barcodeScanner.close() }.onFailure {
+            Log.w(tag, "Barcode scanner close failed during manager shutdown: ${it.message}")
+        }
+        runCatching { portraitSubjectSegmenter.close() }.onFailure {
+            Log.w(tag, "Portrait subject segmenter close failed during manager shutdown: ${it.message}")
+        }
+        runCatching { mediaActionSound.release() }.onFailure {
+            Log.w(tag, "MediaActionSound release failed during manager shutdown: ${it.message}")
+        }
+
+        // closeCameraOwned() already called pauseAndAwaitIdle() before this safe-release callback,
+        // so no native Vulkan render can still own an output AHB when the renderer is destroyed.
+        rawPreviewRenderer.close()
+
+        rawPreviewScope.coroutineContext[Job]?.cancel()
+        warmBufferWatchdogScope.coroutineContext[Job]?.cancel()
+
+        if (activeInstance === this) activeInstance = null
+        Log.i(tag, "CAMERA_MANAGER_SHUTDOWN_FINALIZED reason=$reason")
+
+        // Cancel last: this callback itself runs on the transition scope after Camera2/device/readers
+        // are acknowledged safe to release (including the deferred late-ack path).
+        sessionTransitionScope.coroutineContext[Job]?.cancel()
     }
 
     fun closeCamera(reason: String = "EXTERNAL_CLOSE_REQUEST") {
@@ -9351,12 +9417,9 @@ class BnCameraManager(private val context: Context) {
             } else {
                 false
             }
-            val distortionCorrectionOff = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            val distortionCorrectionOff =
                 builder.get(CaptureRequest.DISTORTION_CORRECTION_MODE) ==
                     CaptureRequest.DISTORTION_CORRECTION_MODE_OFF
-            } else {
-                false
-            }
 
             val resolved = when {
                 Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
@@ -9372,7 +9435,7 @@ class BnCameraManager(private val context: Context) {
                         CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE_MAXIMUM_RESOLUTION
                     )
 
-                Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && distortionCorrectionOff ->
+                distortionCorrectionOff ->
                     characteristics.get(CameraCharacteristics.SENSOR_INFO_PRE_CORRECTION_ACTIVE_ARRAY_SIZE)
                         ?: characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
 
@@ -9408,9 +9471,9 @@ class BnCameraManager(private val context: Context) {
             val logicalEcho = meteringRegionsSummary(result.get(CaptureResult.CONTROL_AE_REGIONS))
             val physicalId = lastRequestedPhysicalAeCameraId
             val physicalEcho = if (
-                Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && physicalId != null
+                physicalId != null
             ) {
-                result.physicalCameraResults[physicalId]
+                physicalCaptureResultOrNull(result, physicalId)
                     ?.get(CaptureResult.CONTROL_AE_REGIONS)
                     ?.let { meteringRegionsSummary(it) }
                     ?: "null"
@@ -9438,7 +9501,7 @@ class BnCameraManager(private val context: Context) {
             val deviceId = cameraDevice?.id ?: return
             val chars = try {
                 cameraManager.getCameraCharacteristics(deviceId)
-            } catch (e: Exception) {
+            } catch (_: Exception) {
                 return
             }
 
@@ -9448,7 +9511,7 @@ class BnCameraManager(private val context: Context) {
             val cropRegion = builder.get(CaptureRequest.SCALER_CROP_REGION)
             val activePhysicalId = synchronized(pipelineLock) { activePipelineIdentity?.physicalCameraId }
             val physicalAeWritable = if (
-                Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && activePhysicalId != null
+                activePhysicalId != null
             ) {
                 runCatching {
                     CaptureRequest.CONTROL_AE_REGIONS in chars.availablePhysicalCameraRequestKeys.orEmpty()
@@ -9493,8 +9556,7 @@ class BnCameraManager(private val context: Context) {
             if (touchRegion != null && resolvedMode == MeteringMode.AUTO_DEFAULT_AE) {
                 if (
                     touchPhysicalId != null && touchPhysicalId == activePhysicalId &&
-                    physicalAeWritable && physicalMaxAeRegions > 0 &&
-                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
+                    physicalAeWritable && physicalMaxAeRegions > 0
                 ) {
                     if (logicalMaxAeRegions > 0) {
                         builder.set(CaptureRequest.CONTROL_AE_REGIONS, null)
@@ -9511,8 +9573,7 @@ class BnCameraManager(private val context: Context) {
                 } else if (touchPhysicalId == null && logicalMaxAeRegions > 0) {
                     builder.set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(touchRegion))
                     if (
-                        physicalAeWritable && activePhysicalId != null && physicalMaxAeRegions > 0 &&
-                        Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
+                        physicalAeWritable && activePhysicalId != null && physicalMaxAeRegions > 0
                     ) {
                         builder.setPhysicalCameraKey(
                             CaptureRequest.CONTROL_AE_REGIONS,
@@ -9546,8 +9607,7 @@ class BnCameraManager(private val context: Context) {
                     resolvedMode != MeteringMode.AUTO_DEFAULT_AE && logicalRequestedRegions != null
 
                 if (
-                    physicalAeWritable && activePhysicalId != null && physicalMaxAeRegions > 0 &&
-                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
+                    physicalAeWritable && activePhysicalId != null && physicalMaxAeRegions > 0
                 ) {
                     physicalRequestedRegions = if (physicalPlan.restoreInitialAeRegions) {
                         // No physical override exists in the warm template. Clearing the physical
@@ -10669,7 +10729,7 @@ class BnCameraManager(private val context: Context) {
                 ?.takeIf { it.cameraRouteKind == CameraRouteKind.LOGICAL_PHYSICAL }
                 ?.physicalCameraId
             val physicalRequestKeys = if (
-                Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && fallbackPhysicalCameraId != null
+                fallbackPhysicalCameraId != null
             ) {
                 controlChars.availablePhysicalCameraRequestKeys.orEmpty().toSet()
             } else {
@@ -10721,21 +10781,19 @@ class BnCameraManager(private val context: Context) {
             if (fallbackPhysicalCameraId != null) {
                 request.set(CaptureRequest.CONTROL_AF_REGIONS, null)
                 request.set(CaptureRequest.CONTROL_AE_REGIONS, null)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                    if (physicalAfRegionWritable) {
-                        request.setPhysicalCameraKey(
-                            CaptureRequest.CONTROL_AF_REGIONS,
-                            null,
-                            fallbackPhysicalCameraId
-                        )
-                    }
-                    if (physicalAeRegionWritable) {
-                        request.setPhysicalCameraKey(
-                            CaptureRequest.CONTROL_AE_REGIONS,
-                            null,
-                            fallbackPhysicalCameraId
-                        )
-                    }
+                if (physicalAfRegionWritable) {
+                    request.setPhysicalCameraKey(
+                        CaptureRequest.CONTROL_AF_REGIONS,
+                        null,
+                        fallbackPhysicalCameraId
+                    )
+                }
+                if (physicalAeRegionWritable) {
+                    request.setPhysicalCameraKey(
+                        CaptureRequest.CONTROL_AE_REGIONS,
+                        null,
+                        fallbackPhysicalCameraId
+                    )
                 }
             }
 
@@ -10758,9 +10816,7 @@ class BnCameraManager(private val context: Context) {
             request.set(CaptureRequest.CONTROL_AF_MODE, resolvedTapMode)
             request.set(CaptureRequest.CONTROL_AE_LOCK, false)
             if (maxAfRegions > 0 && resolvedTapMode != CaptureRequest.CONTROL_AF_MODE_OFF) {
-                if (fallbackPhysicalCameraId != null && physicalAfRegionWritable &&
-                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
-                ) {
+                if (fallbackPhysicalCameraId != null && physicalAfRegionWritable) {
                     request.set(CaptureRequest.CONTROL_AF_REGIONS, null)
                     request.setPhysicalCameraKey(
                         CaptureRequest.CONTROL_AF_REGIONS,
@@ -10790,9 +10846,7 @@ class BnCameraManager(private val context: Context) {
             if (touchAeRegionApplied) {
                 // Auto may temporarily let a focus tap own AE. Explicit metering modes remain
                 // authoritative and use the branch below to restore their configured AE region.
-                if (fallbackPhysicalCameraId != null && physicalAeRegionWritable &&
-                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
-                ) {
+                if (fallbackPhysicalCameraId != null && physicalAeRegionWritable) {
                     activeTapAeRegion = mapped.meteringRectangle
                     activeTapAePhysicalCameraId = fallbackPhysicalCameraId
                     request.set(CaptureRequest.CONTROL_AE_REGIONS, null)
@@ -11278,22 +11332,20 @@ class BnCameraManager(private val context: Context) {
 
         val physicalParentById = mutableMapOf<String, String>()
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            for (directId in sortedLensIds(directIds)) {
-                try {
-                    val chars = cameraManager.getCameraCharacteristics(directId)
-                    val caps = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
-                    val isLogicalParent =
-                        caps?.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_LOGICAL_MULTI_CAMERA) == true
+        for (directId in sortedLensIds(directIds)) {
+            try {
+                val chars = cameraManager.getCameraCharacteristics(directId)
+                val caps = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
+                val isLogicalParent =
+                    caps?.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_LOGICAL_MULTI_CAMERA) == true
 
-                    if (isLogicalParent) {
-                        for (physicalId in sortedLensIds(chars.physicalCameraIds)) {
-                            physicalParentById.putIfAbsent(physicalId, directId)
-                        }
+                if (isLogicalParent) {
+                    for (physicalId in sortedLensIds(chars.physicalCameraIds)) {
+                        physicalParentById.putIfAbsent(physicalId, directId)
                     }
-                } catch (e: Exception) {
-                    Log.w(tag, "AUTO_LENS physical ID read failed directId=$directId", e)
                 }
+            } catch (e: Exception) {
+                Log.w(tag, "AUTO_LENS physical ID read failed directId=$directId", e)
             }
         }
 
@@ -11701,22 +11753,6 @@ class BnCameraManager(private val context: Context) {
         return assignments
     }
 
-    private fun getCategory(facing: Int, focalLength: Float, mainFocalLength: Float): String {
-        if (facing == CameraCharacteristics.LENS_FACING_FRONT) return "Front"
-        if (focalLength == 0f) return "Unknown"
-        val ratio = focalLength / mainFocalLength
-        return when {
-            ratio < 0.8f -> "Ultra wide"
-            ratio > 1.5f -> "Tele"
-            else -> "Main"
-        }
-    }
-
-    private fun getRatioString(focalLength: Float, mainFocalLength: Float): String {
-        val ratio = focalLength / mainFocalLength
-        return getRatioString(ratio)
-    }
-
     private fun getRatioString(ratio: Float): String {
         return if (abs(ratio - 1.0f) < 0.1f) "1.0x" else String.format(
             Locale.US,
@@ -12090,6 +12126,7 @@ class BnCameraManager(private val context: Context) {
         sensitivityIso: Int,
         source: String
     ) {
+        if (managerShutdownRequested.get()) return
         val highDrRisk =
             nativeStats.contains("renderHealthVerdict=JPEG_RENDER_HIGH_DR_RESCUE_LIMITED") ||
                 nativeStats.contains("renderHealthVerdict=JPEG_RENDER_GAIN_LIMITED_UNDEREXPOSED") ||
@@ -12194,7 +12231,7 @@ class BnCameraManager(private val context: Context) {
 
         // Pre-shutter data is planning evidence only. No pre-shutter frame is used as an HDR main
         // processing frame: the main stack below is acquired deliberately after the shutter press.
-        val planningPair = ringBuffer.queryCandidates(
+        val planningSnapshot = ringBuffer.queryCandidateSnapshots(
             userShutterTimestampNs = userShutterTimestampNs,
             maxCount = 1,
             shutterTimestampDomain = "ELAPSED_REALTIME"
@@ -12202,7 +12239,7 @@ class BnCameraManager(private val context: Context) {
             traceCaptureRuntime("HDR_ENHANCED_ABORT reason=no_pre_shutter_planning_frame")
             return null
         }
-        val planningMetadata = planningPair.metadata ?: run {
+        val planningMetadata = planningSnapshot.metadata ?: run {
             traceCaptureRuntime("HDR_ENHANCED_ABORT reason=no_pre_shutter_planning_metadata")
             return null
         }
@@ -12415,7 +12452,6 @@ class BnCameraManager(private val context: Context) {
                 builders = builders,
                 callback = callback,
                 handler = backgroundHandler,
-                reason = "HDR_ENHANCED_MAIN_BURST",
                 pipelineGenerationAtSubmission = generationAtStart
             )
         } catch (failure: Throwable) {
@@ -12548,7 +12584,7 @@ class BnCameraManager(private val context: Context) {
                             acquireAndStoreExactFrame(result)
                         }
                     }
-                    leaseJobs.forEach { it.join() }
+                    leaseJobs.joinAll()
                     true
                 }
             } ?: false
@@ -12627,11 +12663,11 @@ class BnCameraManager(private val context: Context) {
             cameraManager.getCameraCharacteristics(device.id)
         }.getOrNull() ?: return null
 
-        val basePair = ringBuffer.queryCandidates(
+        val baseSnapshot = ringBuffer.queryCandidateSnapshots(
             userShutterTimestampNs = userShutterTimestampNs,
             maxCount = 1,
             shutterTimestampDomain = "ELAPSED_REALTIME"
-        ).lastOrNull() ?: ringBuffer.queryCandidates(
+        ).lastOrNull() ?: ringBuffer.queryCandidateSnapshots(
             userShutterTimestampNs = 0L,
             maxCount = 1,
             shutterTimestampDomain = "ELAPSED_REALTIME"
@@ -12639,7 +12675,7 @@ class BnCameraManager(private val context: Context) {
             traceCaptureRuntime("HDR_BRACKET_ABORT reason=no_exact_baseline_frame")
             return null
         }
-        val baseMetadata = basePair.metadata ?: return null
+        val baseMetadata = baseSnapshot.metadata ?: return null
         val baseExposureNs = baseMetadata.get(CaptureResult.SENSOR_EXPOSURE_TIME)?.takeIf { it > 0L }
             ?: return null
         val baseIso = baseMetadata.get(CaptureResult.SENSOR_SENSITIVITY)?.takeIf { it > 0 }
@@ -12670,9 +12706,9 @@ class BnCameraManager(private val context: Context) {
             HdrAeCompensationBounds(aeRange.lower, aeRange.upper, aeStep)
         } else null
 
-        val scanningAf = basePair.afState == CaptureResult.CONTROL_AF_STATE_ACTIVE_SCAN ||
-            basePair.afState == CaptureResult.CONTROL_AF_STATE_PASSIVE_SCAN
-        val motionHigh = basePair.lensState == CaptureResult.LENS_STATE_MOVING ||
+        val scanningAf = baseSnapshot.afState == CaptureResult.CONTROL_AF_STATE_ACTIVE_SCAN ||
+            baseSnapshot.afState == CaptureResult.CONTROL_AF_STATE_PASSIVE_SCAN
+        val motionHigh = baseSnapshot.lensState == CaptureResult.LENS_STATE_MOVING ||
             scanningAf || baseExposureNs >= 33_000_000L
         val bracketPlan = HdrExposureBracketPlanner.plan(
             baseExposureTimeNs = baseExposureNs,
@@ -12953,7 +12989,7 @@ class BnCameraManager(private val context: Context) {
         val previewBuilder = currentCaptureRequest ?: return null
         val flashPipelineGeneration = pipelineGeneration
 
-        if (recipe.executionSettings.cameraSoundEnabled) {
+        if (recipe.executionSettings.cameraSoundEnabled && !managerShutdownRequested.get()) {
             mediaActionSound.play(MediaActionSound.SHUTTER_CLICK)
         }
 
@@ -13201,8 +13237,8 @@ class BnCameraManager(private val context: Context) {
                 val activePhysicalId = decision?.physicalCameraId
 
                 var physicalOisReported: Int? = null
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && activePhysicalId != null) {
-                    val physicalResult = result.physicalCameraResults[activePhysicalId]
+                if (activePhysicalId != null) {
+                    val physicalResult = physicalCaptureResultOrNull(result, activePhysicalId)
                     physicalOisReported = physicalResult?.get(CaptureResult.LENS_OPTICAL_STABILIZATION_MODE)
                 }
 
@@ -13388,7 +13424,6 @@ class BnCameraManager(private val context: Context) {
         require(userShutterTimestampNs > 0L) {
             "executeCapture requires a valid non-zero userShutterTimestampNs from actual shutter press."
         }
-        val actualUserShutterTimestampNs = userShutterTimestampNs
         // Every shutter intent gets a fresh error edge so identical consecutive admission
         // failures are still observable by the UI instead of being swallowed by StateFlow
         // de-duplication.
@@ -13409,7 +13444,7 @@ class BnCameraManager(private val context: Context) {
                 ringBufferFrameCount = ringBuffer.completeFrameCount()
             )
         )
-        val healthAtEntry = ringBuffer.healthDiagnostics(actualUserShutterTimestampNs)
+        val healthAtEntry = ringBuffer.healthDiagnostics(userShutterTimestampNs)
         Log.i(
             "NearZslTiming",
             "event=CAPTURE_ENTRY_BUFFER_HEALTH " +
@@ -13444,7 +13479,7 @@ class BnCameraManager(private val context: Context) {
 
         com.bncam.core.debug.RawRecoveryTrace.log(
             "EXECUTE_CAPTURE_ENTRY",
-            "format=${formatName(activeZslFormat)}, strategy=${activeProfile.captureStrategy}, userShutterTs=$actualUserShutterTimestampNs, " +
+            "format=${formatName(activeZslFormat)}, strategy=${activeProfile.captureStrategy}, userShutterTs=$userShutterTimestampNs, " +
                     "captureReady=${healthAtEntry.captureReady}, bufferState=${healthAtEntry.bufferState}, validComplete=${healthAtEntry.validCompleteFrameCount}, " +
                     "fullyPreShutter=${healthAtEntry.fullyPreShutterCandidateCount}, failureReason=${healthAtEntry.selectionFailureReason ?: "none"}"
         )
@@ -13531,9 +13566,14 @@ class BnCameraManager(private val context: Context) {
                     "controlPlan=${flashControlPlan?.reason ?: "none"} ownerCamera=$flashControlCameraId " +
                     "selectedLens=${activeLens.id} previewAeState=${latestCamera3AObservation?.aeState ?: "unreported"}"
             )
-            val flowValue = runCatching { withTimeoutOrNull(300L) { settingsRepo.computationalHdrEnabledFlow.first() } }.getOrNull() ?: false
-            val computationalHdrUserRequested = flowValue
-            Log.i("BnCameraManager", "COMPUTATIONAL_HDR_CHECK flow=$flowValue liveStrategy=$liveCaptureStrategy result=$computationalHdrUserRequested source=APP_SETTINGS_ONLY")
+            val computationalHdrUserRequested =
+                runCatching { withTimeoutOrNull(300L) { settingsRepo.computationalHdrEnabledFlow.first() } }
+                    .getOrNull() ?: false
+            Log.i(
+                "BnCameraManager",
+                "COMPUTATIONAL_HDR_CHECK flow=$computationalHdrUserRequested liveStrategy=$liveCaptureStrategy " +
+                    "result=$computationalHdrUserRequested source=APP_SETTINGS_ONLY"
+            )
             val ultraHdrRequested = settingsRepo.ultraHdrGainmapEnabledFlow.first()
             val nightOwnsAdaptiveMultiFrame = viewfinderMode == ViewfinderMode.NIGHT
             val authorityResolution = com.bncam.core.capture.CaptureAuthorityResolver.resolve(
@@ -13572,7 +13612,7 @@ class BnCameraManager(private val context: Context) {
                 }
             ) {
                 preleasedNormalMultiAnchor = ringBuffer.queryAndLeaseCandidates(
-                    userShutterTimestampNs = actualUserShutterTimestampNs,
+                    userShutterTimestampNs = userShutterTimestampNs,
                     maxCount = 1,
                     shutterTimestampDomain = "ELAPSED_REALTIME",
                     expectedFormat = activeZslFormat
@@ -13666,11 +13706,7 @@ class BnCameraManager(private val context: Context) {
             val thermalState = runCatching {
                 val powerManager =
                     context.getSystemService(android.content.Context.POWER_SERVICE) as android.os.PowerManager
-                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
-                    powerManager.currentThermalStatus.toString()
-                } else {
-                    "API_BELOW_29"
-                }
+                powerManager.currentThermalStatus.toString()
             }.getOrDefault("UNAVAILABLE")
             val recipe = com.bncam.core.capture.CaptureRecipeFactory.create(
                 repository = settingsRepo,
@@ -13861,7 +13897,6 @@ class BnCameraManager(private val context: Context) {
             val shutterTimestampNs: Long
             var shutterTimestampDomain = "UNSET"
             var currentSubmittedControlRequestEpochAtShutter = 0L
-            var vendorDebugCaptureResult: TotalCaptureResult? = null
             var postShutterStillCaptureUsed = false
 
             if (dedicatedFlashStill) {
@@ -13887,16 +13922,15 @@ class BnCameraManager(private val context: Context) {
                 shutterTimestampDomain = flashCaptureResult.shutterTimestampDomain
                 currentSubmittedControlRequestEpochAtShutter =
                     flashCaptureResult.controlRequestEpochAtShutter
-                vendorDebugCaptureResult = flashCaptureResult.vendorDebugCaptureResult
                 flashCaptureResult.captureFailureReason?.let { finishReason = it }
             } else {
                 // =======================================================
                 // NORMALE ZSL SEQUENCE (flash is off or Auto AE proved that flash is unnecessary)
                 // =======================================================
-                if (recipe.executionSettings.cameraSoundEnabled) {
+                if (recipe.executionSettings.cameraSoundEnabled && !managerShutdownRequested.get()) {
                     mediaActionSound.play(MediaActionSound.SHUTTER_CLICK)
                 }
-                shutterTimestampNs = actualUserShutterTimestampNs
+                shutterTimestampNs = userShutterTimestampNs
                 shutterTimestampDomain = "ELAPSED_REALTIME"
                 currentSubmittedControlRequestEpochAtShutter =
                     currentSubmittedControlRequestEpoch()
@@ -13912,14 +13946,13 @@ class BnCameraManager(private val context: Context) {
                     activeLens = activeLens,
                     recipe = recipe,
                     activeFormat = activeZslFormat,
-                    userShutterTimestampNs = actualUserShutterTimestampNs,
+                    userShutterTimestampNs = userShutterTimestampNs,
                     focusCaptureContext = focusCaptureContextAtShutter
                 )
                 if (hdrBracket != null) {
                     postShutterStillCaptureUsed = true
                     currentSubmittedControlRequestEpochAtShutter =
                         hdrBracket.anchor.lease.pair.controlRequestEpoch
-                    vendorDebugCaptureResult = hdrBracket.anchor.lease.pair.metadata
                 } else {
                     // The route stays multi so the immutable recipe remains truthful. The runner
                     // will select one pre-shutter anchor and explicitly execute a non-HDR fallback.
@@ -13943,12 +13976,16 @@ class BnCameraManager(private val context: Context) {
                 stableAutoWhiteBalanceSnapshotForActiveCamera()
             }
 
+            // Detached processing belongs to CaptureProcessingQueue and may outlive this Activity.
+            // Keep feedback non-owning so a queued RAW job cannot retain a retired BnCameraManager.
+            val asyncRenderHealthOwner = java.lang.ref.WeakReference(this@BnCameraManager)
+
             val submissionResult = try {
                 withTimeout(60_000L) {
                     when (effectiveCaptureStrategy) {
                         com.bncam.core.engine.CaptureStrategy.SINGLE_FRAME_ZSL -> {
                             val runner =
-                                com.bncam.core.runners.SingleFrameRunner(context, cameraManager)
+                                com.bncam.core.runners.SingleFrameRunner(context.applicationContext, cameraManager)
                             runner.execute(
                                 plan = capturePlan,
                                 recipe = recipe,
@@ -13972,15 +14009,17 @@ class BnCameraManager(private val context: Context) {
                                 postShutterStillCaptureUsed = postShutterStillCaptureUsed,
                                 captureStageListener = captureAttempts.listenerFor(attemptId),
                                 onRawProcessingFeedback = { feedback ->
-                                    applyRenderHealthFeedback(
-                                        nativeStats = feedback.nativeStats,
-                                        exposureTimeNs = feedback.exposureTimeNs,
-                                        sensitivityIso = feedback.sensitivityIso,
-                                        source = "ASYNC_SINGLE_RAW"
-                                    )
+                                    asyncRenderHealthOwner.get()?.let { owner ->
+                                        owner.applyRenderHealthFeedback(
+                                            nativeStats = feedback.nativeStats,
+                                            exposureTimeNs = feedback.exposureTimeNs,
+                                            sensitivityIso = feedback.sensitivityIso,
+                                            source = "ASYNC_SINGLE_RAW"
+                                        )
+                                    }
                                 },
                                 temporaryPreviewPath = temporaryPreviewPath,
-                                userShutterTimestampNs = actualUserShutterTimestampNs,
+                                userShutterTimestampNs = userShutterTimestampNs,
                                 stableAutoWhiteBalance = stableAutoWhiteBalanceAtShutter,
                                 focusCaptureContext = focusCaptureContextAtShutter,
                                 portraitCaptureContext = portraitCaptureContextAtShutter
@@ -13988,7 +14027,7 @@ class BnCameraManager(private val context: Context) {
                         }
 
                         com.bncam.core.engine.CaptureStrategy.MULTI_FRAME_ZSL -> {
-                            val runner = com.bncam.core.runners.MultiFrameRunner(context, cameraManager)
+                            val runner = com.bncam.core.runners.MultiFrameRunner(context.applicationContext, cameraManager)
                             val multiSubmission = runner.execute(
                                 plan = capturePlan,
                                 recipe = recipe,
@@ -14013,12 +14052,14 @@ class BnCameraManager(private val context: Context) {
                                 preleasedShutterAnchor = preleasedNormalMultiAnchor,
                                 captureStageListener = captureAttempts.listenerFor(attemptId),
                                 onRawProcessingFeedback = { feedback ->
-                                    applyRenderHealthFeedback(
-                                        nativeStats = feedback.nativeStats,
-                                        exposureTimeNs = feedback.exposureTimeNs,
-                                        sensitivityIso = feedback.sensitivityIso,
-                                        source = "ASYNC_MULTI_RAW"
-                                    )
+                                    asyncRenderHealthOwner.get()?.let { owner ->
+                                        owner.applyRenderHealthFeedback(
+                                            nativeStats = feedback.nativeStats,
+                                            exposureTimeNs = feedback.exposureTimeNs,
+                                            sensitivityIso = feedback.sensitivityIso,
+                                            source = "ASYNC_MULTI_RAW"
+                                        )
+                                    }
                                 },
                                 temporaryPreviewPath = temporaryPreviewPath,
                                 focusCaptureContext = focusCaptureContextAtShutter,
@@ -14032,7 +14073,7 @@ class BnCameraManager(private val context: Context) {
                         }
 
                         com.bncam.core.engine.CaptureStrategy.HDR_ENHANCED -> {
-                            val runner = com.bncam.core.runners.HdrEnhancedRunner(context, cameraManager)
+                            val runner = com.bncam.core.runners.HdrEnhancedRunner(context.applicationContext, cameraManager)
                             runner.execute(
                                 plan = capturePlan,
                                 recipe = recipe,
@@ -14054,12 +14095,14 @@ class BnCameraManager(private val context: Context) {
                                 stableAutoWhiteBalance = stableAutoWhiteBalanceAtShutter,
                                 captureStageListener = captureAttempts.listenerFor(attemptId),
                                 onRawProcessingFeedback = { feedback ->
-                                    applyRenderHealthFeedback(
-                                        nativeStats = feedback.nativeStats,
-                                        exposureTimeNs = feedback.exposureTimeNs,
-                                        sensitivityIso = feedback.sensitivityIso,
-                                        source = "ASYNC_HDR_ENHANCED_RAW"
-                                    )
+                                    asyncRenderHealthOwner.get()?.let { owner ->
+                                        owner.applyRenderHealthFeedback(
+                                            nativeStats = feedback.nativeStats,
+                                            exposureTimeNs = feedback.exposureTimeNs,
+                                            sensitivityIso = feedback.sensitivityIso,
+                                            source = "ASYNC_HDR_ENHANCED_RAW"
+                                        )
+                                    }
                                 },
                                 temporaryPreviewPath = temporaryPreviewPath,
                                 focusCaptureContext = focusCaptureContextAtShutter,
@@ -14070,7 +14113,7 @@ class BnCameraManager(private val context: Context) {
                                         activeLens = activeLens,
                                         recipe = recipe,
                                         activeFormat = activeZslFormat,
-                                        userShutterTimestampNs = actualUserShutterTimestampNs,
+                                        userShutterTimestampNs = userShutterTimestampNs,
                                         focusCaptureContext = focusCaptureContextAtShutter
                                     )
                                 }
@@ -14197,7 +14240,7 @@ class BnCameraManager(private val context: Context) {
     private fun pushHardwareConfigToNative(lensId: String) {
         // Warm native RAM config for preview/session startup. Capture runners still perform
         // their own deterministic push immediately before processing.
-        kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+        sessionTransitionScope.launch {
             try {
                 val settingsRepo = SettingsRepository(context)
                 val resolved = settingsRepo.readLensHardwareSettingsSnapshot(lensId)

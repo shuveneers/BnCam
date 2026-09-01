@@ -12,23 +12,15 @@ namespace bncam::singleframe {
  * - authority is derived only from calibrated sensor variance V(x)=S*x+O evidence;
  * - RAW container type and capture ISO are deliberately absent from the API;
  * - this owner controls luminance cleanup only;
- * - chroma / low-frequency chroma remain separate owners and receive zero authority here;
+ * - chroma / low-frequency chroma are not part of this plan and remain separate owners;
  * - the Vulkan shader remains responsible for local per-CFA noise significance and
  *   structure protection.
- *
- * The compatibility chroma fields remain in RawDenoisePlan for the current IspCore ABI.
- * They are intentionally pinned to zero until the call sites are removed in a later
- * ownership-cleanup delta.
  */
 struct RawDenoisePlan {
     bool active = false;
     float modelConfidence = 0.0f;
     float physicalNoisePressure = 0.0f;
     float lumaAuthority = 0.0f;
-
-    // Phase-6 compatibility fields. This policy does not own chroma.
-    float chromaAuthority = 0.0f;
-    float lowFrequencyChromaAuthority = 0.0f;
 
     float blendStrength = 0.0f;
     float targetFloorScale = 1.0f;
@@ -120,11 +112,6 @@ inline RawDenoisePlan resolveRawDenoisePlan(
     // Preserve the established conservative luma envelope in this ownership delta.
     // Phase-6 quality tuning can now change this owner without silently driving chroma.
     plan.lumaAuthority = std::clamp((0.16f + 0.70f * p) * c, 0.10f, 0.88f);
-
-    // Critical Phase-6 ownership boundary: no pre-demosaic chroma authority originates
-    // from the single-frame luminance baseline.
-    plan.chromaAuthority = 0.0f;
-    plan.lowFrequencyChromaAuthority = 0.0f;
 
     plan.blendStrength =
             std::clamp((0.30f + 1.00f * p) * (0.76f + 0.24f * c),
