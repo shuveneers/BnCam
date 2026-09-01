@@ -725,34 +725,6 @@ inline cv::Vec3f rawColorCompressUnitGamutPerceptualCpu(const cv::Vec3f& input) 
     return result;
 }
 
-inline cv::Vec3f rawColorDisplayHighlightChromaSafetyCpu(const cv::Vec3f& input) noexcept {
-    if (!std::isfinite(input[0]) || !std::isfinite(input[1]) || !std::isfinite(input[2])) {
-        return cv::Vec3f(0.0f);
-    }
-    const float y = std::max(0.0f, 0.2126f * input[0] + 0.7152f * input[1] + 0.0722f * input[2]);
-    const float maximum = std::max({input[0], input[1], input[2]});
-    const float minimum = std::min({input[0], input[1], input[2]});
-    const float secondMaximum = input[0] + input[1] + input[2] - maximum - minimum;
-    const float pairedCeiling = rawColorSmoothstepCpu(0.70f, 0.96f, secondMaximum);
-    const float luminancePressure = rawColorSmoothstepCpu(0.48f, 0.86f, y);
-    const float ceilingPressure = rawColorSmoothstepCpu(0.86f, 1.02f, maximum);
-    const float pressure = pairedCeiling * luminancePressure * ceilingPressure;
-    if (pressure <= 1.0e-5f) return input;
-    cv::Vec3f lab = rawColorLinearSrgbToOklabCpu(input);
-    const float chroma = std::sqrt(std::max(0.0f, lab[1] * lab[1] + lab[2] * lab[2]));
-    const float chromaEvidence = rawColorSmoothstepCpu(0.025f, 0.16f, chroma);
-    const float authority = std::clamp(0.72f * pressure * chromaEvidence, 0.0f, 0.72f);
-    lab[1] *= 1.0f - authority;
-    lab[2] *= 1.0f - authority;
-    cv::Vec3f candidate = rawColorOklabToLinearSrgbCpu(lab);
-    if (!std::isfinite(candidate[0]) || !std::isfinite(candidate[1]) || !std::isfinite(candidate[2])) {
-        return input;
-    }
-    const float outY = 0.2126f * candidate[0] + 0.7152f * candidate[1] + 0.0722f * candidate[2];
-    if (y > 1.0e-7f && outY > 1.0e-7f) candidate *= y / outY;
-    return candidate;
-}
-
 inline cv::Vec3f rawColorApplyCameraProfileRenderCpu(
         const cv::Vec3f& input, float renderStrength) noexcept {
     const float strength = std::clamp(renderStrength, 0.0f, 0.16f);
@@ -2161,6 +2133,12 @@ struct Phase9ColorProtectionDebug {
     std::uint64_t legacyMagentaRiskPixels = 0u;
     std::uint64_t protectedMagentaRiskPixels = 0u;
     std::uint64_t sceneLinearOverUnityPixels = 0u;
+    bool sourceRawConfidenceMapUsed = false;
+    std::uint64_t sourceRawConfidenceMapBytes = 0u;
+    std::uint64_t sourceRawConfidenceCandidatePixels = 0u;
+    std::uint64_t sourceRawZeroConfidencePixels = 0u;
+    std::uint64_t sourceRawPartialConfidencePixels = 0u;
+    std::uint64_t sourceRawDemosaicDisagreementPixels = 0u;
     float cpuFallbackMs = 0.0f;
 };
 
@@ -13765,6 +13743,18 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         phase9ColorDebug.legacyMagentaRiskPixels = vulkanColorTransform.phase9LegacyMagentaRiskPixels;
         phase9ColorDebug.protectedMagentaRiskPixels = vulkanColorTransform.phase9ProtectedMagentaRiskPixels;
         phase9ColorDebug.sceneLinearOverUnityPixels = vulkanColorTransform.phase9SceneLinearOverUnityPixels;
+        phase9ColorDebug.sourceRawConfidenceMapUsed =
+                vulkanColorTransform.phase9SourceRawConfidenceMapUsed;
+        phase9ColorDebug.sourceRawConfidenceMapBytes =
+                vulkanColorTransform.phase9SourceRawConfidenceMapBytes;
+        phase9ColorDebug.sourceRawConfidenceCandidatePixels =
+                vulkanColorTransform.phase9SourceRawConfidenceCandidatePixels;
+        phase9ColorDebug.sourceRawZeroConfidencePixels =
+                vulkanColorTransform.phase9SourceRawZeroConfidencePixels;
+        phase9ColorDebug.sourceRawPartialConfidencePixels =
+                vulkanColorTransform.phase9SourceRawPartialConfidencePixels;
+        phase9ColorDebug.sourceRawDemosaicDisagreementPixels =
+                vulkanColorTransform.phase9SourceRawDemosaicDisagreementPixels;
     }
 
     // Failure-only CPU materialization. The normal path stays device-resident from demosaic
@@ -14895,11 +14885,6 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                     r = agx[0];
                     g = agx[1];
                     b = agx[2];
-                    const cv::Vec3f highlightSafe = rawColorDisplayHighlightChromaSafetyCpu(
-                            cv::Vec3f(r, g, b));
-                    r = highlightSafe[0];
-                    g = highlightSafe[1];
-                    b = highlightSafe[2];
                     const float preShoulderY = std::max(
                             1.0e-6f,
                             0.2126f * r + 0.7152f * g + 0.0722f * b);
@@ -16215,8 +16200,8 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; phase10AgxEotf=" << "SIGNED_2P2_TO_DISPLAY_LINEAR"
             << "; phase10AgxOutputDomain=" << "DISPLAY_LINEAR"
             << "; phase10OutputGamutOwner=" << "POST_PROFILE_OKLAB_HUE_PRESERVING_UNIT_GAMUT"
-            << "; rawColorDisplayHighlightChromaSafety=OKLAB_TWO_CHANNEL_CEILING_LUMA_GATED"
-            << "; rawColorDisplayHighlightChromaMaxAuthority=" << 0.72f
+            << "; rawColorDisplayHighlightChromaSafety=RETIRED_SOURCE_RAW_PHASE9_OWNER"
+            << "; rawColorDisplayHighlightChromaMaxAuthority=" << 0.0f
             << "; rawColorPerceptualGamutIterations=" << 5
             << "; phase10ColorPairOwner=" << (exactCamera2ColorPair
                     ? "CAMERA2_EXACT_FRAME_PAIR_WITH_BOUNDED_PHYSICAL_AWB"
@@ -16393,6 +16378,10 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; rawFinalizeStatus=" << vulkanRawFinalize.status
             << "; rawFinalizeFailureReason=" << (vulkanRawFinalize.failureReason.empty() ? "none" : vulkanRawFinalize.failureReason)
             << "; rawFinalizeResidentOutputGeneration=" << vulkanRawFinalize.residentOutputGeneration
+            << "; rawFinalizeSourceClipConfidenceMapReady="
+            << (vulkanRawFinalize.sourceClipConfidenceMapReady ? "true" : "false")
+            << "; rawFinalizeSourceClipConfidenceMapBytes="
+            << vulkanRawFinalize.sourceClipConfidenceMapBytes
             << "; rawFinalizePersistentReuseHit=" << (vulkanRawFinalize.persistentBufferReuseHit ? "true" : "false")
             << "; rawFinalizePersistentReallocated=" << (vulkanRawFinalize.persistentBufferReallocated ? "true" : "false")
             << "; requestedDemosaicMode=" << demosaicModeName(demosaicResolution.requestedMode)
@@ -17380,7 +17369,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; phase10AgxEotf=" << "SIGNED_2P2_TO_DISPLAY_LINEAR"
             << "; phase10AgxOutputDomain=" << "DISPLAY_LINEAR"
             << "; phase10OutputGamutOwner=" << "POST_PROFILE_OKLAB_HUE_PRESERVING_UNIT_GAMUT"
-            << "; rawColorDisplayHighlightChromaSafety=OKLAB_TWO_CHANNEL_CEILING_LUMA_GATED"
+            << "; rawColorDisplayHighlightChromaSafety=RETIRED_SOURCE_RAW_PHASE9_OWNER"
             << "; phase10ColorPairOwner=" << (exactCamera2ColorPair
                     ? "CAMERA2_EXACT_FRAME_PAIR_WITH_BOUNDED_PHYSICAL_AWB"
                     : "RESOLVED_FALLBACK_OR_PROFILE")
@@ -17945,11 +17934,24 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; rawColorCameraProfileNoiseGuard=" << cameraProfileRenderPlan.noiseGuard
             << "; rawColorCameraProfileHighlightGuard=" << cameraProfileRenderPlan.highlightGuard
             << "; rawColorCameraProfileReason=" << cameraProfileRenderPlan.reason
-            << "; phase9Owner=FUSED_AWB_CCM_CLIPPING_AWARE_HIGHLIGHT_GAMUT_V3"
+            << "; phase9Owner=FUSED_AWB_CCM_SOURCE_RAW_CLIPPING_AWARE_HIGHLIGHT_GAMUT_V4"
             << "; phase9GpuPrimary=" << (phase9ColorDebug.gpuPrimary ? "true" : "false")
             << "; phase9CpuFailureReferenceUsed=" << (phase9ColorDebug.cpuFallback ? "true" : "false")
-            << "; phase9SensorClipDomain=PRE_WB_NORMALIZED_DEMOSAIC_CEILING_CONFIDENCE"
-            << "; phase9SensorClipCandidatePixels=" << phase9ColorDebug.sensorClipCandidatePixels
+            << "; phase9SensorClipDomain=PRE_WB_RAW_FINALIZE_SOURCE_BAYER_2X2_CONFIDENCE"
+            << "; phase9LegacyDemosaicConfidenceCandidatePixels=" << phase9ColorDebug.sensorClipCandidatePixels
+            << "; phase9SourceRawConfidenceMapUsed="
+            << (phase9ColorDebug.sourceRawConfidenceMapUsed ? "true" : "false")
+            << "; phase9SourceRawConfidenceMapBytes=" << phase9ColorDebug.sourceRawConfidenceMapBytes
+            << "; phase9SourceRawConfidenceCandidatePixels="
+            << phase9ColorDebug.sourceRawConfidenceCandidatePixels
+            << "; phase9SourceRawZeroConfidencePixels="
+            << phase9ColorDebug.sourceRawZeroConfidencePixels
+            << "; phase9SourceRawPartialConfidencePixels="
+            << phase9ColorDebug.sourceRawPartialConfidencePixels
+            << "; phase9SourceRawDemosaicDisagreementPixels="
+            << phase9ColorDebug.sourceRawDemosaicDisagreementPixels
+            << "; phase9SourceRawConfidencePropagation=2X2_BAYER_CELL_MIN_CONFIDENCE_PLUS_BOUNDED_3X3_DEMOSAIC_FOOTPRINT"
+            << "; phase9LegacyDemosaicConfidenceRole=DIAGNOSTIC_AND_TYPED_CPU_FALLBACK_ONLY"
             << "; phase9SingleChannelSensorClipPixels=" << phase9ColorDebug.singleChannelSensorClipPixels
             << "; phase9MultiChannelSensorClipPixels=" << phase9ColorDebug.multiChannelSensorClipPixels
             << "; phase9FullySensorClippedPixels=" << phase9ColorDebug.fullySensorClippedPixels

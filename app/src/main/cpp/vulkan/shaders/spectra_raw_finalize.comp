@@ -625,6 +625,47 @@ void applyExposurePixel() {
     outputMosaic[index] = sceneClamp(value * exp2(ev));
 }
 
+const float PHASE9_SOURCE_CLIP_CONFIDENCE_START = 0.960;
+const float PHASE9_SOURCE_CLIP_CONFIDENCE_ZERO = 0.995;
+const float PHASE9_SOURCE_HARD_CLIP = 0.985;
+
+float sourceClipSampleConfidence(float value) {
+    if (!finite1(value)) return 0.0;
+    return 1.0 - smoothstep(
+            PHASE9_SOURCE_CLIP_CONFIDENCE_START,
+            PHASE9_SOURCE_CLIP_CONFIDENCE_ZERO,
+            value);
+}
+
+void writeSourceClipConfidenceCell(int x, int y) {
+    // One confidence value per physical 2x2 Bayer cell. This is computed from the
+    // immutable pre-finalize RAW source, before defect correction, green balancing,
+    // lens shading and the signed spatial exposure map can alter the sensor ceiling.
+    if ((x & 1) != 0 || (y & 1) != 0) return;
+    uint clipWidth = (pc.frameWidth + 1u) / 2u;
+    uint cellX = uint(x) / 2u;
+    uint cellY = uint(y) / 2u;
+    float v00 = sourceAt(x, y);
+    float v10 = sourceAt(x + 1, y);
+    float v01 = sourceAt(x, y + 1);
+    float v11 = sourceAt(x + 1, y + 1);
+    int hardCount = (v00 >= PHASE9_SOURCE_HARD_CLIP ? 1 : 0) +
+                    (v10 >= PHASE9_SOURCE_HARD_CLIP ? 1 : 0) +
+                    (v01 >= PHASE9_SOURCE_HARD_CLIP ? 1 : 0) +
+                    (v11 >= PHASE9_SOURCE_HARD_CLIP ? 1 : 0);
+    // Color ratios become unreliable as soon as any Bayer phase approaches the sensor
+    // ceiling. Taking the minimum per-sensel confidence is equivalent to using the peak
+    // for finite values, but also fails safely to zero if any source sample is non-finite.
+    // It cannot let three valid phases hide one lost channel. Fully hard-clipped 2x2 cells
+    // are explicitly zero-authority; partial clipping remains continuous through smoothstep.
+    float confidence = min(
+            min(sourceClipSampleConfidence(v00), sourceClipSampleConfidence(v10)),
+            min(sourceClipSampleConfidence(v01), sourceClipSampleConfidence(v11)));
+    if (hardCount == 4) confidence = 0.0;
+    uint framePixels = pc.frameWidth * pc.frameHeight;
+    outputMosaic[framePixels + cellY * clipWidth + cellX] = clamp(confidence, 0.0, 1.0);
+}
+
 void finalizePixel() {
     uvec2 gid = gl_GlobalInvocationID.xy;
     uint lane = gl_LocalInvocationIndex;
@@ -638,6 +679,9 @@ void finalizePixel() {
         uint index = linearIndex(x, y);
         float original = sourceMosaic[index];
         if (finite1(original) && original >= 1.0) localCounts.x = 1u;
+        // Preserve exact source-domain clipping provenance in the appended resident map.
+        // Later AWB+CCM consumes this map; no tone/exposure stage may recreate it.
+        writeSourceClipConfidenceCell(x, y);
 
         bool defectCorrected = false;
         float value = defectCorrectedAt(x, y, original, defectCorrected);

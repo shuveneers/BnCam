@@ -188,6 +188,13 @@ struct SpectraResidentColorTransformResult {
     std::uint64_t phase9SceneLinearOverUnityPixels = 0u;
     std::uint64_t phase9FullySensorClippedPixels = 0u;
     std::uint64_t phase9PartialColorConfidencePixels = 0u;
+    // Source-domain clipping provenance recovered from the RawFinalize 2x2 Bayer-cell map.
+    bool phase9SourceRawConfidenceMapUsed = false;
+    std::uint64_t phase9SourceRawConfidenceMapBytes = 0u;
+    std::uint64_t phase9SourceRawConfidenceCandidatePixels = 0u;
+    std::uint64_t phase9SourceRawZeroConfidencePixels = 0u;
+    std::uint64_t phase9SourceRawPartialConfidencePixels = 0u;
+    std::uint64_t phase9SourceRawDemosaicDisagreementPixels = 0u;
     float inputPackingMs = 0.0f;
     float kernelMs = 0.0f;
     float residualKernelMs = 0.0f;
@@ -309,10 +316,14 @@ private:
     PersistentBuffer rgbUpload_;
     // Twelve float sums per 16x16 workgroup: raw/WB/CCM means plus cloud-correction telemetry.
     PersistentBuffer colorStatistics_;
-    // Phase 9: twelve uint counters only; no full-frame clipping/gamut evidence readback.
-    // Delta 0061 counter[5] is clipping-aware confidence chroma reduction; counter[11]
-    // is partial-confidence population. No neighbour reconstruction owns RAW highlights.
+    // Phase 9: compact counters only; no full-frame clipping/gamut evidence readback.
+    // Words [12..15] verify the source-RAW confidence map independently from the legacy
+    // demosaiced-ceiling detector.
     PersistentBuffer colorTelemetry_;
+    // D124: owned half-resolution confidence map copied from the appended RawFinalize
+    // transport tail during the demosaic submission. It survives independently of the
+    // RawFinalize ping-pong buffer until this exact demosaic generation reaches AWB+CCM.
+    PersistentBuffer sourceClipConfidence_;
     // Delta 46: compact 16x12 vec4 map: correctionRG, correctionBG, valid, reserved.
     PersistentBuffer cloudCorrectionMap_;
     // Six floats per sampled residual point; host-visible because the CPU only performs the
@@ -322,6 +333,10 @@ private:
     std::uint32_t residentWidth_ = 0;
     std::uint32_t residentHeight_ = 0;
     bool residentDemosaicValid_ = false;
+    bool sourceClipConfidenceValid_ = false;
+    std::uint64_t sourceClipConfidenceDemosaicGeneration_ = 0u;
+    std::uint32_t sourceClipConfidenceWidth_ = 0u;
+    std::uint32_t sourceClipConfidenceHeight_ = 0u;
     std::uint64_t residentColorGeneration_ = 0;
     bool residentColorValid_ = false;
     std::uint64_t allocationGeneration_ = 0;

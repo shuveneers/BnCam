@@ -506,8 +506,13 @@ SpectraRawFinalizeResult VulkanSpectraRawFinalizeBackend::executeInternal(
     const std::uint64_t greenBytes = std::max<std::uint64_t>(
             sizeof(float) * 4u, compactRecordCount * 4u * sizeof(float));
     constexpr std::uint64_t telemetryBytes = kExposureTelemetryWords * sizeof(std::uint32_t);
+    const std::uint64_t clipMapWidth = (static_cast<std::uint64_t>(request.frameWidth) + 1u) / 2u;
+    const std::uint64_t clipMapHeight = (static_cast<std::uint64_t>(request.frameHeight) + 1u) / 2u;
+    const std::uint64_t clipMapBytes = clipMapWidth * clipMapHeight * sizeof(float);
+    const std::uint64_t residentTransportBytes = frameBytes + clipMapBytes;
     result.inputBytes = frameBytes;
     result.outputBytes = frameBytes;
+    result.sourceClipConfidenceMapBytes = clipMapBytes;
     result.compactGreenBytes = greenBytes;
     result.residentInputUsed = residentInput;
     result.adaptiveExposureRequested = request.adaptiveExposureEnabled;
@@ -517,7 +522,7 @@ SpectraRawFinalizeResult VulkanSpectraRawFinalizeBackend::executeInternal(
     const std::uint32_t writeAccess = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
     const std::uint32_t readAccess = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
     if ((!residentInput && !ensureBufferLocked(allocator, frameBytes, writeAccess, inputStaging_, reallocated, failure)) ||
-        !ensureBufferLocked(allocator, frameBytes, 0u, output_, reallocated, failure) ||
+        !ensureBufferLocked(allocator, residentTransportBytes, 0u, output_, reallocated, failure) ||
         !ensureBufferLocked(allocator, greenBytes, readAccess, greenSamples_, reallocated, failure) ||
         !ensureBufferLocked(allocator, telemetryBytes, readAccess, telemetry_, reallocated, failure) ||
         (!request.deferFullFrameReadback &&
@@ -1011,9 +1016,12 @@ SpectraRawFinalizeResult VulkanSpectraRawFinalizeBackend::executeInternal(
     }
     result.readbackMs = elapsedMs(readStart);
     result.fullFrameReadbackDeferred = request.deferFullFrameReadback;
+    result.sourceClipConfidenceMapReady = true;
     result.success = true;
     ++residentOutputGeneration_;
-    residentOutputBytes_ = frameBytes;
+    // Internal resident transport contains the image mosaic followed by the compact
+    // 2x2-cell source clipping-confidence map. Public CPU readback remains mosaic-only.
+    residentOutputBytes_ = residentTransportBytes;
     residentOutputWidth_ = request.frameWidth;
     residentOutputHeight_ = request.frameHeight;
     result.residentOutputGeneration = residentOutputGeneration_;
@@ -1065,10 +1073,13 @@ bool VulkanSpectraRawFinalizeBackend::readbackResidentOutput(
         return false;
     }
 
+    const std::uint64_t imageBytes = static_cast<std::uint64_t>(residentOutputWidth_) *
+            residentOutputHeight_ * sizeof(float);
+    if (imageBytes == 0u || imageBytes > residentOutputBytes_) return false;
     bool reallocated = false;
     std::string failure;
     constexpr std::uint32_t readAccess = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
-    if (!ensureBufferLocked(allocator_, residentOutputBytes_, readAccess,
+    if (!ensureBufferLocked(allocator_, imageBytes, readAccess,
                             readback_, reallocated, failure) ||
         readback_.buffer == VK_NULL_HANDLE || readback_.allocation == nullptr ||
         readback_.mapped == nullptr) {
@@ -1090,13 +1101,13 @@ bool VulkanSpectraRawFinalizeBackend::readbackResidentOutput(
     outputForTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     outputForTransfer.buffer = output_.buffer;
     outputForTransfer.offset = 0u;
-    outputForTransfer.size = static_cast<VkDeviceSize>(residentOutputBytes_);
+    outputForTransfer.size = static_cast<VkDeviceSize>(imageBytes);
     vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0u, 0u, nullptr,
                          1u, &outputForTransfer, 0u, nullptr);
 
     VkBufferCopy copy{};
-    copy.size = static_cast<VkDeviceSize>(residentOutputBytes_);
+    copy.size = static_cast<VkDeviceSize>(imageBytes);
     vkCmdCopyBuffer(commandBuffer_, output_.buffer, readback_.buffer, 1u, &copy);
 
     VkBufferMemoryBarrier toHost{};
@@ -1107,7 +1118,7 @@ bool VulkanSpectraRawFinalizeBackend::readbackResidentOutput(
     toHost.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     toHost.buffer = readback_.buffer;
     toHost.offset = 0u;
-    toHost.size = static_cast<VkDeviceSize>(residentOutputBytes_);
+    toHost.size = static_cast<VkDeviceSize>(imageBytes);
     vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_TRANSFER_BIT,
                          VK_PIPELINE_STAGE_HOST_BIT, 0u, 0u, nullptr,
                          1u, &toHost, 0u, nullptr);
@@ -1125,11 +1136,11 @@ bool VulkanSpectraRawFinalizeBackend::readbackResidentOutput(
     }
 
     vmaInvalidateAllocation(allocator_, readback_.allocation, 0u,
-                            static_cast<VkDeviceSize>(residentOutputBytes_));
+                            static_cast<VkDeviceSize>(imageBytes));
     const std::size_t floatCount = static_cast<std::size_t>(
-            residentOutputBytes_ / sizeof(float));
+            imageBytes / sizeof(float));
     output.resize(floatCount);
-    std::memcpy(output.data(), readback_.mapped, static_cast<std::size_t>(residentOutputBytes_));
+    std::memcpy(output.data(), readback_.mapped, static_cast<std::size_t>(imageBytes));
     return true;
 #endif
 }

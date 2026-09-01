@@ -88,6 +88,10 @@ struct SpectraRawFinalizeResult {
     float autoSceneCoherentEdgeFraction = 0.0f;
     float autoSceneLowSignalFraction = 0.0f;
     std::uint64_t sourceSaturatedPixelCount = 0;
+    // Phase 9 source-domain highlight provenance. One float per 2x2 Bayer cell is
+    // appended to the resident output buffer and never materialized on the CPU path.
+    bool sourceClipConfidenceMapReady = false;
+    std::uint64_t sourceClipConfidenceMapBytes = 0;
     std::uint64_t defectCorrectedPixelCount = 0;
     std::uint64_t lensCorrectedPixelCount = 0;
     std::uint64_t overRangePixelCount = 0;
