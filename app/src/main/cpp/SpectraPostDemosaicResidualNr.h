@@ -13,6 +13,7 @@ struct PostDemosaicResidualNrPlan {
     bool spectraEnhancementActive = false;
     bool residualCovarianceAuthoritative = false;
     bool duplicatePhysicalSigmaPrevented = false;
+    bool chromaResidualAvailable = false;
     float inputLumaSigma = 0.0f;
     float inputChromaSigma = 0.0f;
     float modelConfidence = 0.0f;
@@ -44,6 +45,9 @@ struct PostDemosaicResidualNrPlan {
  * That propagated covariance is the boundary which prevents double denoise. In particular,
  * positive spatial exposure amplification is already present in residualLumaSigma; this
  * function must not multiply it a second time.
+ *
+ * Luma validity is intentionally independent from chroma validity. A missing/zero chroma
+ * residual must not disable a trustworthy propagated physical luminance baseline.
  */
 inline PostDemosaicResidualNrPlan resolvePostDemosaicResidualNr(
         float residualLumaSigma,
@@ -58,16 +62,17 @@ inline PostDemosaicResidualNrPlan resolvePostDemosaicResidualNr(
         bool spectraContextFusionActive) noexcept {
     PostDemosaicResidualNrPlan plan{};
 
-    const bool validResidual =
-            std::isfinite(residualLumaSigma) && residualLumaSigma > 0.0f &&
+    const bool validLumaResidual =
+            std::isfinite(residualLumaSigma) && residualLumaSigma > 0.0f;
+    const bool validChromaResidual =
             std::isfinite(residualChromaSigma) && residualChromaSigma > 0.0f;
     const float confidence = std::clamp(
             std::isfinite(modelConfidence) ? modelConfidence : 0.0f,
             0.0f,
             1.0f);
-    if (!physicalNoiseModelAvailable || !validResidual || confidence < 0.08f) {
+    if (!physicalNoiseModelAvailable || !validLumaResidual || confidence < 0.08f) {
         plan.authoritySource = physicalNoiseModelAvailable
-                ? "PROPAGATED_RESIDUAL_UNAVAILABLE"
+                ? "PROPAGATED_LUMA_RESIDUAL_UNAVAILABLE"
                 : "PHYSICAL_SO_UNAVAILABLE";
         return plan;
     }
@@ -86,19 +91,20 @@ inline PostDemosaicResidualNrPlan resolvePostDemosaicResidualNr(
     plan.physicalBaselineActive = true;
     plan.residualCovarianceAuthoritative = true;
     plan.duplicatePhysicalSigmaPrevented = true;
+    plan.chromaResidualAvailable = validChromaResidual;
     plan.inputLumaSigma = residualLumaSigma;
-    plan.inputChromaSigma = residualChromaSigma;
+    plan.inputChromaSigma = validChromaResidual ? residualChromaSigma : 0.0f;
     plan.modelConfidence = confidence;
 
     // Luma baseline ownership is external and independent from SPECTRA.
     plan.baselineLumaFraction = physicalLuma.baselineFraction;
 
-    // Chroma is deliberately unchanged in Phase 6.
+    // Chroma is deliberately unchanged in Phase 6. If its propagated residual is unavailable,
+    // leave only this wrapper's chroma contribution at zero instead of suppressing luma.
     const float confidenceScale = 0.72f + 0.28f * confidence;
-    plan.baselineChromaFraction = std::clamp(
-            0.78f * confidenceScale,
-            0.54f,
-            0.78f);
+    plan.baselineChromaFraction = validChromaResidual
+            ? std::clamp(0.78f * confidenceScale, 0.54f, 0.78f)
+            : 0.0f;
 
     if (spectraContextFusionActive) {
         // Strength=0 remains the calibrated neutral SPECTRA master authority.
@@ -127,24 +133,31 @@ inline PostDemosaicResidualNrPlan resolvePostDemosaicResidualNr(
                 0.10f * overall * lumaCharacter * lumaHeadroom,
                 0.0f,
                 0.14f);
-        plan.spectraChromaFraction = std::clamp(
-                0.16f * overall * chromaCharacter * chromaHeadroom,
-                0.0f,
-                0.22f);
-        plan.authoritySource =
-                "PROPAGATED_RESIDUAL_PHYSICAL_BASELINE_PLUS_SPECTRA";
+        plan.spectraChromaFraction = validChromaResidual
+                ? std::clamp(
+                        0.16f * overall * chromaCharacter * chromaHeadroom,
+                        0.0f,
+                        0.22f)
+                : 0.0f;
+        plan.authoritySource = validChromaResidual
+                ? "PROPAGATED_RESIDUAL_PHYSICAL_BASELINE_PLUS_SPECTRA"
+                : "PROPAGATED_LUMA_RESIDUAL_PHYSICAL_BASELINE_PLUS_SPECTRA_CHROMA_UNAVAILABLE";
     } else {
-        plan.authoritySource = "PROPAGATED_RESIDUAL_PHYSICAL_BASELINE";
+        plan.authoritySource = validChromaResidual
+                ? "PROPAGATED_RESIDUAL_PHYSICAL_BASELINE"
+                : "PROPAGATED_LUMA_RESIDUAL_PHYSICAL_BASELINE_CHROMA_UNAVAILABLE";
     }
 
     plan.lumaFraction = std::clamp(
             plan.baselineLumaFraction + plan.spectraLumaFraction,
             0.0f,
             0.78f);
-    plan.chromaFraction = std::clamp(
-            plan.baselineChromaFraction + plan.spectraChromaFraction,
-            0.0f,
-            0.96f);
+    plan.chromaFraction = validChromaResidual
+            ? std::clamp(
+                    plan.baselineChromaFraction + plan.spectraChromaFraction,
+                    0.0f,
+                    0.96f)
+            : 0.0f;
 
     // Use the externally resolved physical target for the baseline, then add only the
     // optional SPECTRA residual increment. This keeps the baseline invariant to SPECTRA.
@@ -154,10 +167,12 @@ inline PostDemosaicResidualNrPlan resolvePostDemosaicResidualNr(
             physicalLuma.targetSigma + spectraLumaSigma,
             0.0f,
             0.15f);
-    plan.chromaSigma = std::clamp(
-            plan.inputChromaSigma * plan.chromaFraction,
-            0.0f,
-            0.35f);
+    plan.chromaSigma = validChromaResidual
+            ? std::clamp(
+                    plan.inputChromaSigma * plan.chromaFraction,
+                    0.0f,
+                    0.35f)
+            : 0.0f;
     return plan;
 }
 

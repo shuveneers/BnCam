@@ -579,7 +579,12 @@ void runSpatialNr(uint x, uint localOutputY, uint y) {
     // Smooth highlight gate: retain full denoise authority across midtones and shadows
     float highlightGate = 1.0 - 0.40 * smoothstepExact(0.85, 0.98, centerY);
     float localLumaSigma = max(pc.appliedLumaSigma, 1.0e-5);
-    float pixLumaThreshold = max(1.0e-5, pc.lumaRangeThresholdMean * localNoiseRatio * 1.50);
+    float predNoiseSigma = max(1.0e-4, localLumaSigma * localNoiseRatio);
+
+    // Phase 6: above the host's legacy 0.003 floor, the established luma range is already
+    // 1.8 * 1.5 = 2.7 times local sigma. Resolve that physical relation directly here so
+    // clean/high-SNR residuals are not widened to the fixed host floor before filtering.
+    float pixLumaThreshold = max(1.0e-5, predNoiseSigma * 2.70);
     float pixChromaThreshold = max(1.0e-5, pc.chromaRangeThresholdMean * localNoiseRatio * 1.50);
     float inverseLumaThreshold2 = 1.0 / (pixLumaThreshold * pixLumaThreshold);
     float inverseChromaThreshold2 = 1.0 / (pixChromaThreshold * pixChromaThreshold);
@@ -593,8 +598,8 @@ void runSpatialNr(uint x, uint localOutputY, uint y) {
     // coefficient, inflating the classifier noise scale by roughly an order of magnitude
     // in normal midtones. That classified real micro-detail as noise and allowed broad
     // luma smoothing. Keep the classifier in sigma units and apply only the existing
-    // spatial noise-map ratio.
-    float predNoiseSigma = max(1.0e-4, localLumaSigma * localNoiseRatio);
+    // spatial noise-map ratio. predNoiseSigma above is shared by both range and structure
+    // significance so the two decisions cannot disagree about the local physical noise scale.
 
     // Sobel 3x3 on local Luma for gradient magnitude & directional structure tensor
     vec3 r_m1_m1 = fetchGlobal(int(x) - 1, int(y) - 1);
@@ -719,7 +724,10 @@ void runSpatialNr(uint x, uint localOutputY, uint y) {
             vec3 neighbour = fetchGlobal(int(x) + dx, int(y) + dy);
             float neighbourY = dot(neighbour, vec3(kLumaR, kLumaG, kLumaB));
             float deltaY = neighbourY - centerY;
-            float normalizedEdge = abs(deltaY) / localLumaSigma;
+            // Phase 6: edge significance must use the same local propagated S/O sigma as the
+            // structure classifier. Global-only sigma mislabels local noise as structure and
+            // over-smooths locally quieter regions when the spatial noise map is non-uniform.
+            float normalizedEdge = abs(deltaY) / predNoiseSigma;
             float edgeProtection = 1.0 - smoothstepExact(1.5, 3.5, normalizedEdge);
             if (sampleTelemetry && edgeProtection < 0.5) edgeProtectedNeighbours++;
             float lumaRangeWeight = exp(-0.5 * deltaY * deltaY * inverseLumaThreshold2) * (1.0 - 0.85 * structureConfidence * (1.0 - edgeProtection));

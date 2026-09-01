@@ -97,6 +97,125 @@ float smoothstepFast(float edge0, float invRange, float value) {
     return u * u * (3.0 - 2.0 * u);
 }
 
+// RAW color render camera-profile render works in Oklab after the calibrated sensor->linear-sRGB
+// transform. It changes chroma only; hue and BT.709 scene luminance are kept stable.
+vec3 rawColorLinearSrgbToOklab(vec3 c) {
+    float l = 0.4122214708 * c.r + 0.5363325363 * c.g + 0.0514459929 * c.b;
+    float m = 0.2119034982 * c.r + 0.6806995451 * c.g + 0.1073969566 * c.b;
+    float s = 0.0883024619 * c.r + 0.2817188376 * c.g + 0.6299787005 * c.b;
+    vec3 p = sign(vec3(l, m, s)) * pow(abs(vec3(l, m, s)), vec3(1.0 / 3.0));
+    return vec3(
+            0.2104542553 * p.x + 0.7936177850 * p.y - 0.0040720468 * p.z,
+            1.9779984951 * p.x - 2.4285922050 * p.y + 0.4505937099 * p.z,
+            0.0259040371 * p.x + 0.7827717662 * p.y - 0.8086757660 * p.z);
+}
+
+vec3 rawColorOklabToLinearSrgb(vec3 lab) {
+    float lp = lab.x + 0.3963377774 * lab.y + 0.2158037573 * lab.z;
+    float mp = lab.x - 0.1055613458 * lab.y - 0.0638541728 * lab.z;
+    float sp = lab.x - 0.0894841775 * lab.y - 1.2914855480 * lab.z;
+    float l = lp * lp * lp;
+    float m = mp * mp * mp;
+    float s = sp * sp * sp;
+    return vec3(
+            4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+            -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+            -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s);
+}
+
+vec3 applyRawCameraProfileRender(vec3 rgb) {
+    float strength = clamp(pc.rawJpegBaseVibrance - 1.0, 0.0, 0.16);
+    if (strength <= 1.0e-5 || any(isnan(rgb)) || any(isinf(rgb))) return rgb;
+    float y = lumaOf(rgb);
+    if (y <= 1.0e-7) return rgb;
+
+    vec3 lab = rawColorLinearSrgbToOklab(rgb);
+    float chroma = length(lab.yz);
+    float shadowGate = smoothstep(0.018, 0.085, y);
+    float highlightGate = 1.0 - smoothstep(0.62, 1.10, y);
+    float chromaGuard = 1.0 - 0.82 * smoothstep(0.16, 0.34, chroma);
+    float midtoneGate = smoothstep(0.045, 0.16, y) *
+            (1.0 - smoothstep(0.50, 0.95, y));
+    float authority = strength * shadowGate * highlightGate * chromaGuard *
+            (0.42 + 0.58 * midtoneGate);
+    lab.yz *= 1.0 + authority;
+
+    vec3 candidate = rawColorOklabToLinearSrgb(lab);
+    if (any(isnan(candidate)) || any(isinf(candidate))) return rgb;
+    float candidateY = lumaOf(candidate);
+    if (candidateY > 1.0e-7) candidate *= y / candidateY;
+
+    // Never create a new negative scene-linear component by clipping. Reduce only this chroma
+    // proposal along the original->candidate segment; Phase 9 remains the lower-gamut owner.
+    float safe = 1.0;
+    for (int c = 0; c < 3; ++c) {
+        float delta = candidate[c] - rgb[c];
+        if (delta < 0.0 && candidate[c] < 0.0) {
+            safe = min(safe, rgb[c] / max(1.0e-8, -delta));
+        }
+    }
+    return mix(rgb, candidate, clamp(0.995 * safe, 0.0, 1.0));
+}
+
+bool rawColorInsideUnitGamut(vec3 rgb) {
+    return !any(isnan(rgb)) && !any(isinf(rgb)) &&
+            min(rgb.r, min(rgb.g, rgb.b)) >= 0.0 &&
+            max(rgb.r, max(rgb.g, rgb.b)) <= 1.0;
+}
+
+vec3 rawColorCompressToUnitGamutPerceptual(vec3 rgb) {
+    if (any(isnan(rgb)) || any(isinf(rgb))) return vec3(0.0);
+    if (rawColorInsideUnitGamut(rgb)) return rgb;
+
+    vec3 lab = rawColorLinearSrgbToOklab(rgb);
+    if (any(isnan(lab)) || any(isinf(lab))) return vec3(0.0);
+    lab.x = clamp(lab.x, 0.0, 1.0);
+    float chroma = length(lab.yz);
+    if (chroma <= 1.0e-7) {
+        return clamp(rawColorOklabToLinearSrgb(vec3(lab.x, 0.0, 0.0)), vec3(0.0), vec3(1.0));
+    }
+
+    vec2 hue = lab.yz / chroma;
+    float low = 0.0;
+    float high = chroma;
+    // Five iterations are sufficient for 8-bit JPEG output and execute only on pixels that
+    // actually leave the unit sRGB gamut. Hue and Oklab lightness remain invariant.
+    for (int i = 0; i < 5; ++i) {
+        float mid = 0.5 * (low + high);
+        vec3 candidate = rawColorOklabToLinearSrgb(vec3(lab.x, hue * mid));
+        if (rawColorInsideUnitGamut(candidate)) low = mid;
+        else high = mid;
+    }
+    vec3 result = rawColorOklabToLinearSrgb(vec3(lab.x, hue * low));
+    return clamp(result, vec3(0.0), vec3(1.0));
+}
+
+vec3 rawColorDisplayHighlightChromaSafety(vec3 rgb) {
+    if (any(isnan(rgb)) || any(isinf(rgb))) return vec3(0.0);
+    float y = max(0.0, lumaOf(rgb));
+    float maximum = max(rgb.r, max(rgb.g, rgb.b));
+    float minimum = min(rgb.r, min(rgb.g, rgb.b));
+    float secondMaximum = rgb.r + rgb.g + rgb.b - maximum - minimum;
+    // Require two bright channels plus high luminance. This targets near-white purple/cyan/yellow
+    // excursions rather than desaturating legitimate single-channel saturated lights.
+    float pairedCeiling = smoothstep(0.70, 0.96, secondMaximum);
+    float luminancePressure = smoothstep(0.48, 0.86, y);
+    float ceilingPressure = smoothstep(0.86, 1.02, maximum);
+    float pressure = pairedCeiling * luminancePressure * ceilingPressure;
+    if (pressure <= 1.0e-5) return rgb;
+
+    vec3 lab = rawColorLinearSrgbToOklab(rgb);
+    float chroma = length(lab.yz);
+    float chromaEvidence = smoothstep(0.025, 0.16, chroma);
+    float authority = clamp(0.72 * pressure * chromaEvidence, 0.0, 0.72);
+    lab.yz *= 1.0 - authority;
+    vec3 candidate = rawColorOklabToLinearSrgb(lab);
+    if (any(isnan(candidate)) || any(isinf(candidate))) return rgb;
+    float outY = lumaOf(candidate);
+    if (y > 1.0e-7 && outY > 1.0e-7) candidate *= y / outY;
+    return candidate;
+}
+
 vec3 compressToUnitGamutPreserveLuma(vec3 rgb) {
     // One final output-gamut owner. Work from the signed RGB vector so negative
     // outset components are compressed toward the same luminance instead of being
@@ -129,7 +248,7 @@ float profileContrastCurve(float value, float signedControl) {
     return 1.0 - 0.5 * pow(max(0.0, 2.0 * (1.0 - v)), factor);
 }
 
-vec3 applyProfileColor(vec3 rgb) {
+vec3 applyProfileColor(vec3 rgb, bool perceptualGamut) {
     float satControl = clamp(pc.profileSaturation, -1.0, 1.0);
     float contrastControl = clamp(pc.profileContrast, -1.0, 1.0);
     float y = max(0.0, lumaOf(rgb));
@@ -140,17 +259,8 @@ vec3 applyProfileColor(vec3 rgb) {
         rgb *= scale;
         y = mappedY;
     }
-    // Automatic RAW presentation colour is owned by the host policy. Do not invent a
-    // shader-side minimum: that masked upstream sensor-colour errors and made a neutral
-    // profile non-neutral. Explicit profile vibrance/saturation remain available below.
-    if (pc.rawJpegBaseVibrance > 1.001) {
-        float maximum = max(rgb.r, max(rgb.g, rgb.b));
-        float minimum = min(rgb.r, min(rgb.g, rgb.b));
-        float saturation = (maximum - minimum) / max(1.0e-4, maximum);
-        float protection = clamp(1.0 - saturation, 0.0, 1.0);
-        float authority = (pc.rawJpegBaseVibrance - 1.0) * (0.25 + 0.75 * protection);
-        rgb = vec3(y) + (rgb - vec3(y)) * (1.0 + authority);
-    }
+    // Automatic camera rendering happens in scene-linear Oklab before AgX. This function is
+    // explicit profile intent only, so a neutral user profile remains neutral.
     float vibranceControl = clamp(pc.profileVibrance, -1.0, 1.0);
     if (abs(vibranceControl) >= 1.0e-4) {
         float maximum = max(rgb.r, max(rgb.g, rgb.b));
@@ -166,7 +276,8 @@ vec3 applyProfileColor(vec3 rgb) {
         float factor = exp2(satControl * 0.85);
         rgb = vec3(y) + (rgb - vec3(y)) * factor;
     }
-    return compressToUnitGamutPreserveLuma(rgb);
+    return perceptualGamut ? rawColorCompressToUnitGamutPerceptual(rgb)
+            : compressToUnitGamutPreserveLuma(rgb);
 }
 
 // QUALITY DELTA 0008/0012 — full-resolution (4:4:4) GALOSH-style residual cleanup.
@@ -960,15 +1071,21 @@ void runTone(uvec2 gid) {
         // construction modes reuse the same slot for sourceHeight, but their dispatches are
         // complete before this mode-3 push. Never sample binding 12 when the policy disabled FLLF.
         if (pc.presenceReserved0 != 0u) rgb = applyFllfLocalExposure(gid, rgb);
+        // RAW color render: bounded, hue-preserving camera-profile render after calibrated CCM and local
+        // scene-linear contrast, before the display transform. This is not an exposure owner.
+        rgb = applyRawCameraProfileRender(rgb);
         // Scene-linear RAW Bayer path: AgX is the sole automatic scene-to-display DRT.
         // The following display-linear LUT is automatically identity in RAW Phase 10 and exists
         // only for explicit profile tonal ranges/curves.
         rgb = applyAgXTonemap(rgb);
+        // RAW color render display-domain guard: only two-channel near-ceiling highlights are gently
+        // dechromatized in Oklab. Sensor clipping remains owned upstream by Phase 9.
+        rgb = rawColorDisplayHighlightChromaSafety(rgb);
         // The LUT is identity for automatic RAW rendering in Phase 10; only explicit profile
         // tonal ranges/curves remain. Profile color is explicit user look intent, not automatic
         // compensation. Final unit-gamut placement is performed by applyProfileColor.
         rgb = applyToneLookLut(rgb);
-        rgb = applyProfileColor(rgb);
+        rgb = applyProfileColor(rgb, true);
     } else {
         rgb = applyLocalTone(gid, rgb);
         // YUV capture path (already ISP-tonemapped by HAL)
@@ -1030,7 +1147,7 @@ void runTone(uvec2 gid) {
         float shadowLimit = negativeDeviation > 1.0e-6 ? finalLuma / negativeDeviation : requestedSaturationFactor;
         float saturationFactor = max(1.0, min(requestedSaturationFactor, min(highlightLimit, shadowLimit)));
         rgb = max(vec3(0.0), vec3(finalLuma) + (rgb - vec3(finalLuma)) * saturationFactor);
-        rgb = applyProfileColor(rgb);
+        rgb = applyProfileColor(rgb, false);
     }
 
     workingRgb[base + 0u] = rgb.r;
@@ -1416,7 +1533,7 @@ void proposePerceptualDetail(uvec2 gid) {
     vec3 proposedRgb = centerRgb;
     if (centerY > 1.0e-5) {
         proposedRgb = centerRgb * clamp(proposedY / centerY, 0.88, 1.12);
-        proposedRgb = compressToUnitGamutPreserveLuma(proposedRgb);
+        proposedRgb = rawColorCompressToUnitGamutPerceptual(proposedRgb);
     }
     writeLinearDetailScratch(gid, proposedRgb);
 

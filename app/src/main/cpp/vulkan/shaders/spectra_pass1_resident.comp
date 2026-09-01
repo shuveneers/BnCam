@@ -658,7 +658,10 @@ void pass1Pixel() {
     // a free-standing blur across gradients or coherent texture.
     SameCfaRingEstimate midRing = sameCfaRingEstimate(x, y, 4, S, O);
     SameCfaRingEstimate coarseRing = sameCfaRingEstimate(x, y, 8, S, O);
-    if (midRing.valid && coarseRing.valid) {
+    // Phase-6 physical baseline ownership: the S/O-driven SPECTRA-Off path stays local.
+    // Radius-4/8 consensus is an optional SPECTRA contextual enhancement; allowing it to
+    // steer the physical baseline correlated fine sensor grain into broad low-light mottling.
+    if (pc.physicalBaselineMode == 0u && midRing.valid && coarseRing.valid) {
         float persistentStructureZ = max(
                 multiscaleContext.coherentStructureZ,
                 0.75 * min(midRing.structureZ, coarseRing.structureZ));
@@ -686,10 +689,21 @@ void pass1Pixel() {
     float lensGain = lensGainAt(ch, x, y);
     float shadingAuthority = clamp(0.90 + 0.20 * (lensGain - 1.0), 0.90, 1.38);
     float isolatedNoiseEvidence = smoothstepSpectra(0.55, 2.75, impulseScore) * flatContext;
-    float contextBoost = mix(0.90, 1.34, flatContext * (0.70 + 0.30 * isolatedNoiseEvidence));
+    // Physical SPECTRA-Off denoise may use multiscale evidence to *protect* structure, but
+    // it must not receive >1 contextual/surface boosts. SPECTRA retains the established
+    // contextual boost envelope. This preserves strong local VST/Wiener cleanup without
+    // turning defocused/noisy regions into spatially correlated blotches.
+    float contextBoost = pc.physicalBaselineMode != 0u
+            ? 1.0
+            : mix(0.90, 1.34, flatContext * (0.70 + 0.30 * isolatedNoiseEvidence));
+    float multiscaleAuthority = pc.physicalBaselineMode != 0u
+            ? min(1.0, multiscaleContext.denoiseAuthorityScale)
+            : multiscaleContext.denoiseAuthorityScale;
+    float surfaceAuthority = pc.physicalBaselineMode != 0u
+            ? min(1.0, surfaceClass.authorityScale)
+            : surfaceClass.authorityScale;
     float authority = min(1.35, pc.blendStrength * shadingAuthority * authorityScale *
-                          contextBoost * multiscaleContext.denoiseAuthorityScale *
-                          surfaceClass.authorityScale);
+                          contextBoost * multiscaleAuthority * surfaceAuthority);
     if (edgeProtection > 0.70 || (tensor.confident && authorityScale < 0.45)) atomicAdd(telemetry[2], 1u);
     if (flatContext > 0.70) atomicAdd(telemetry[81], 1u);
     if (edgeProtection > 0.70) atomicAdd(telemetry[82], 1u);

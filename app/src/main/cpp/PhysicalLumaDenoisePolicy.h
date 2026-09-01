@@ -17,9 +17,18 @@ struct ResidualLumaPlan {
     bool active = false;
     float inputResidualSigma = 0.0f;
     float modelConfidence = 0.0f;
+    float residualNoisePressure = 0.0f;
     float baselineFraction = 0.0f;
     float targetSigma = 0.0f;
 };
+
+inline float residualLumaSmoothstep(float edge0, float edge1, float value) noexcept {
+    if (!std::isfinite(value) || !(edge1 > edge0)) {
+        return 0.0f;
+    }
+    const float t = std::clamp((value - edge0) / (edge1 - edge0), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
 
 inline ResidualLumaPlan resolveResidualLumaPlan(
         float propagatedResidualSigma,
@@ -42,18 +51,33 @@ inline ResidualLumaPlan resolveResidualLumaPlan(
     plan.inputResidualSigma = sigma;
     plan.modelConfidence = confidence;
 
-    // Keep authority proportional to the propagated physical residual. This preserves
-    // scale covariance: if an upstream linear gain doubles both signal and predicted
-    // noise sigma, the denoise significance envelope doubles with it.
-    //
-    // The resident shader remains the local structure owner. Raising the physical
-    // baseline from the old 0.34..0.50 range to 0.45..0.64 gives flat/noisy regions
-    // materially more cleanup while retaining the existing edge/texture gates.
-    const float confidenceScale = 0.70f + 0.30f * confidence;
+    // Phase 6: make baseline authority depend on the propagated physical residual itself.
+    // The former confidence-only 0.45..0.64 fraction treated a bright/high-SNR residual and a
+    // dark/noisy residual almost identically. Work in sigma stops so the policy remains scale
+    // smooth across the useful RAW range and continues to respond correctly after Phase-5
+    // positive spatial exposure propagation.
+    constexpr float kLowResidualSigma = 0.0025f;
+    const float sigmaStops = std::max(
+            0.0f,
+            std::log2(std::max(sigma, kLowResidualSigma) / kLowResidualSigma));
+    constexpr float kHighResidualStops = 3.32192809489f; // log2(0.025 / 0.0025)
+    plan.residualNoisePressure = residualLumaSmoothstep(
+            0.0f, kHighResidualStops, sigmaStops);
+
+    // Phase 6 late-envelope hardening: a trustworthy model is not, by itself, evidence that a
+    // clean propagated residual needs material smoothing. Keep only a very small baseline at
+    // pressure zero, then open authority monotonically as the propagated S/O residual rises.
+    // This mirrors the pre-demosaic pressure envelope while preserving the late pass as the
+    // owner of exposure-amplified residual noise.
+    const float confidenceScale = 0.72f + 0.28f * confidence;
+    const float pressureFraction = 0.08f + 0.70f * plan.residualNoisePressure;
     plan.baselineFraction = std::clamp(
-            0.64f * confidenceScale,
-            0.45f,
-            0.64f);
+            pressureFraction * confidenceScale,
+            0.05f,
+            0.78f);
+
+    // The resident Vulkan shader remains the local structure/texture owner. targetSigma is only
+    // the physically justified residual envelope supplied to that spatially adaptive filter.
     plan.targetSigma = std::clamp(
             sigma * plan.baselineFraction,
             0.0f,

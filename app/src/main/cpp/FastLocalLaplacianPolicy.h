@@ -17,81 +17,62 @@ struct FastLocalLaplacianInput {
 };
 
 struct FastLocalLaplacianPlan {
-    bool enabled = true;
-    float strength = 0.30f;
+    bool enabled = false;
+    float strength = 0.0f;
     float sceneKey = 0.150f;
-    float maxLiftEv = 0.55f;
-    float maxCompressEv = 0.55f;
+    float maxLiftEv = 0.0f;
+    float maxCompressEv = 0.0f;
     float edgeStopEv = 0.62f;
     float refinement = 0.10f;
-    // 0..1 physical noise pressure controlling only positive deep-shadow lift permission.
     float shadowLiftNoiseGuardPressure = 0.0f;
-    std::uint32_t pyramidLevels = 6u;   // level 0 is half-resolution.
+    std::uint32_t pyramidLevels = 6u;
     std::uint32_t baseDownsample = 2u;
 };
 
 /**
- * Phase-10 scalar FLLF policy.
+ * Phase 7 FLLF local-contrast policy.
  *
- * This policy owns only local spatial adaptation. It deliberately does not contain a display
- * shoulder, toe, saturation, gamut mapping, or a global contrast curve. Positive local exposure
- * is strongly noise-limited; negative local exposure remains available for broad bright regions.
+ * Phase 5 owns exposure and RAW GTM owns only bounded global scene placement. FLLF therefore
+ * cannot normalize a shadow field toward middle grey. It is a local contrast/highlight owner:
+ * broad bright zones may be compressed and only a very small, noise-gated positive correction
+ * is allowed in mixed-DR scenes. A dark scene with no real bright-range evidence stays untouched.
  */
 inline FastLocalLaplacianPlan resolveFastLocalLaplacianPlan(
         const FastLocalLaplacianInput& input) noexcept {
     FastLocalLaplacianPlan out{};
     const float shadow = std::clamp(input.shadowPressure, 0.0f, 1.0f);
     const float dynamicRange = std::clamp(input.dynamicRangePressure, 0.0f, 1.0f);
-    const float highlight = std::clamp(
-            std::max(input.recoverableHighlightPressure, 0.72f * input.sensorClipPressure),
-            0.0f, 1.0f);
+    const float recoverable = std::clamp(input.recoverableHighlightPressure, 0.0f, 1.0f);
+    const float sensorClip = std::clamp(input.sensorClipPressure, 0.0f, 1.0f);
+    const float highlight = std::clamp(std::max(recoverable, 0.72f * sensorClip), 0.0f, 1.0f);
     const float noise = std::clamp(input.noisePressure, 0.0f, 1.0f);
-    const float highDrAuthority = std::clamp(
-            dynamicRange * (0.62f + 0.38f * highlight), 0.0f, 1.0f);
-
-    // The FLLF field is the actual local exposure normalizer, not a cosmetic micro-contrast pass.
-    // Device captures proved that the old 0.05..0.20 authority yielded only ~0.006..0.083 EV of
-    // real correction: effectively disabled. Keep materially useful authority in mixed-DR scenes.
-    // Do not reduce the complete field for high ISO: negative highlight compression is safe in
-    // noise and must remain available. Noise limits only positive shadow lift below.
-    out.strength = std::clamp(
-            0.30f + 0.36f * dynamicRange + 0.18f * highlight +
-                    0.08f * shadow * highlight,
-            0.28f, 0.82f);
+    const float brightRangeEvidence = std::clamp(
+            std::max(highlight, 0.72f * dynamicRange), 0.0f, 1.0f);
 
     out.sceneKey = std::clamp(input.sceneMidtoneTarget, 0.125f, 0.170f);
 
-    float lift = 0.45f + 0.70f * dynamicRange + 0.25f * shadow;
-    if (input.lowLightScene) {
-        lift *= 1.0f - 0.55f * noise;
-    } else {
-        lift *= 1.0f - 0.20f * noise;
-    }
-    out.maxLiftEv = std::clamp(lift, 0.18f, 1.20f);
-    // Negative local exposure must be driven by actual highlight evidence, not by generic
-    // dynamic-range pressure. Device captures with a bright display in an otherwise dark room
-    // produced dynamicRangePressure ~= 0.72 while recoverable highlight pressure stayed near
-    // zero; coupling compression strongly to dynamicRange therefore turned the display into a
-    // dark island. Dynamic range may add only a small amount of headroom here. Broad/real
-    // highlight evidence remains the primary authority.
-    out.maxCompressEv = std::clamp(
-            0.34f + 0.60f * highlight + 0.18f * dynamicRange,
-            0.28f, 0.85f);
-    if (input.lowLightScene) {
-        out.maxCompressEv = std::min(out.maxCompressEv, 0.72f);
-    }
+    // Authority is conditional on actual mixed-DR/bright-range evidence. Shadow pressure by
+    // itself is explicitly insufficient: that was the old route by which a dim room acquired
+    // a broad local exposure field and lost its captured lighting intent.
+    out.strength = std::clamp(
+            0.16f + 0.28f * dynamicRange + 0.22f * highlight,
+            0.16f, 0.58f);
 
-    // More noise asks for a larger log-luma edge before local exposure propagation is stopped.
-    // This avoids interpreting fine sensor texture as a structural edge while still stopping
-    // corrections across real high-contrast boundaries.
-    out.edgeStopEv = std::clamp(0.56f + 0.20f * noise, 0.54f, 0.78f);
-    out.refinement = std::clamp(0.10f + 0.10f * highDrAuthority, 0.08f, 0.22f);
-    // Do not invent a sensor-specific luma threshold here. The normalized S/O model has
-    // already been collapsed into physical noise pressure; the Vulkan stage converts that
-    // pressure into a monotonic deep-shadow lift gate.
-    out.shadowLiftNoiseGuardPressure = input.lowLightScene ? noise : 0.0f;
-    out.enabled = out.strength >= 0.20f &&
-            (dynamicRange > 0.015f || highlight > 0.08f || shadow > 0.28f);
+    // Positive correction is intentionally tiny and vanishes in noisy low light. This keeps
+    // FLLF in the local-contrast domain instead of becoming a second exposure owner.
+    const float positivePermission = brightRangeEvidence * (1.0f - noise) *
+            (input.lowLightScene ? 0.45f : 1.0f);
+    out.maxLiftEv = std::clamp(0.14f * positivePermission, 0.0f, 0.14f);
+
+    out.maxCompressEv = std::clamp(
+            0.24f + 0.36f * highlight + 0.18f * dynamicRange,
+            0.24f, input.lowLightScene ? 0.58f : 0.72f);
+    out.edgeStopEv = std::clamp(0.54f + 0.18f * noise, 0.54f, 0.74f);
+    out.refinement = std::clamp(0.08f + 0.08f * brightRangeEvidence, 0.08f, 0.16f);
+    out.shadowLiftNoiseGuardPressure = noise;
+    out.pyramidLevels = 6u;
+    out.baseDownsample = 2u;
+    out.enabled = brightRangeEvidence >= 0.10f && out.strength >= 0.16f;
     return out;
 }
 

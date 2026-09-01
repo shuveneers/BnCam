@@ -108,20 +108,33 @@ inline RawDenoisePlan resolveRawDenoisePlan(
 
     const float p = plan.physicalNoisePressure;
     const float c = plan.modelConfidence;
+    const float confidenceScale = 0.70f + 0.30f * c;
 
-    // Preserve the established conservative luma envelope in this ownership delta.
-    // Phase-6 quality tuning can now change this owner without silently driving chroma.
-    plan.lumaAuthority = std::clamp((0.16f + 0.70f * p) * c, 0.10f, 0.88f);
+    // Phase 6: remove the former fixed denoise floor in physically clean captures. The
+    // calibrated S/O pressure now owns how much pre-demosaic cleanup is permitted: near-zero
+    // pressure is deliberately close to identity, while high physical pressure retains the
+    // strong single-frame cleanup envelope. Local structure/texture decisions still remain
+    // entirely inside the resident Vulkan Pass1 shader.
+    plan.lumaAuthority = std::clamp(
+            (0.04f + 0.86f * p) * confidenceScale,
+            0.02f,
+            0.90f);
 
-    plan.blendStrength =
-            std::clamp((0.30f + 1.00f * p) * (0.76f + 0.24f * c),
-                       0.14f, 1.28f);
+    plan.blendStrength = std::clamp(
+            (0.10f + 1.20f * p) * (0.72f + 0.28f * c),
+            0.05f,
+            1.30f);
 
-    plan.targetFloorScale = std::clamp(1.02f - 0.18f * p, 0.82f, 1.04f);
-    plan.minimumResidualRatio = std::clamp(0.78f - 0.44f * p, 0.30f, 0.82f);
-    plan.detailRetentionFloor = std::clamp(0.992f - 0.090f * p, 0.90f, 0.995f);
-    plan.maxLinearShift =
-            std::clamp(0.0018f + 0.0100f * p, 0.0012f, 0.0135f);
+    // No-regret/detail envelopes track the same physical pressure. Clean captures preserve
+    // almost all measured residual/structure and permit only sub-millipercent linear shifts;
+    // noisy captures progressively release more residual reduction authority.
+    plan.targetFloorScale = std::clamp(1.08f - 0.28f * p, 0.80f, 1.08f);
+    plan.minimumResidualRatio = std::clamp(0.94f - 0.64f * p, 0.28f, 0.94f);
+    plan.detailRetentionFloor = std::clamp(0.999f - 0.098f * p, 0.90f, 0.999f);
+    plan.maxLinearShift = std::clamp(
+            0.0005f + 0.0130f * p,
+            0.0004f,
+            0.0140f);
     return plan;
 }
 
