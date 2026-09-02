@@ -2802,7 +2802,8 @@ class BnCameraManager(private val context: Context) {
 
     private fun updateDefaultRawFrameSelectionExposureConstraint(
         exposureTargetNs: Long?,
-        source: String
+        source: String,
+        isoTarget: Int? = null
     ) {
         val identity = synchronized(pipelineLock) { activePipelineIdentity }
         val format = identity?.bufferFormat
@@ -2818,6 +2819,7 @@ class BnCameraManager(private val context: Context) {
             generationId = pipelineGeneration,
             expectedFormat = format,
             exposureTargetNs = exposureTargetNs,
+            isoTarget = isoTarget,
             source = source
         )
     }
@@ -10781,7 +10783,8 @@ class BnCameraManager(private val context: Context) {
                     builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, defaultRawPlan.targetExposureNs)
                     updateDefaultRawFrameSelectionExposureConstraint(
                         defaultRawPlan.targetExposureNs,
-                        "DEFAULT_RAW_API36_EXPOSURE_TIME_PRIORITY"
+                        "DEFAULT_RAW_API36_EXPOSURE_TIME_PRIORITY",
+                        isoTarget = defaultRawPlan.expectedIso
                     )
                     // AE owns the remaining sensitivity and frame duration in exposure-time priority.
                     builder.set(CaptureRequest.SENSOR_SENSITIVITY, null)
@@ -10864,7 +10867,8 @@ class BnCameraManager(private val context: Context) {
                 builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, fallbackPlan.exposureTimeNs)
                 updateDefaultRawFrameSelectionExposureConstraint(
                     fallbackPlan.exposureTimeNs,
-                    "DEFAULT_RAW_MANUAL_FALLBACK"
+                    "DEFAULT_RAW_MANUAL_FALLBACK",
+                    isoTarget = fallbackPlan.sensitivityIso
                 )
                 builder.set(CaptureRequest.SENSOR_SENSITIVITY, fallbackPlan.sensitivityIso)
                 builder.set(CaptureRequest.SENSOR_FRAME_DURATION, fallbackPlan.frameDurationNs)

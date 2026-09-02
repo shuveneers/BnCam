@@ -457,7 +457,6 @@ float rawSpatialExposureEv(uint tile) {
     float high = evidence.y;
     float snr = evidence.z;
     if (!(evidence.w >= 1.0) || !(luma > 0.0) || !finite1(luma)) return 0.0;
-    float clipFraction = clamp(evidence.w - 1.0, 0.0, 1.0);
     float relativeEv = exposureSafeLog2(luma / max(exposureP50, 1.0e-6));
     float ev = 0.0;
     if (relativeEv < exposureLowerNeutralEv) {
@@ -469,17 +468,11 @@ float rawSpatialExposureEv(uint tile) {
                 percentileDistance, percentileDistance * 3.0, distance));
         float headroomEv = max(0.0, exposureSafeLog2(0.98 / max(max(high, luma), 1.0e-6)));
         ev = min(requested, headroomEv) * snrAuthority * exposureSpatialAuthority;
-    } else if (relativeEv > exposureUpperNeutralEv) {
-        float distance = relativeEv - exposureUpperNeutralEv;
-        float robustTailSpan = max(0.35, exposureSafeLog2(
-                max(exposureP95, exposureP75 + 1.0e-6) / max(exposureP75, 1.0e-6)));
-        float relativeAuthority = exposureSmoothstep(0.0, robustTailSpan, distance);
-        float absoluteAuthority = exposureSmoothstep(max(exposureP90, 0.55), 1.0, max(high, luma));
-        float clipAuthority = exposureSmoothstep(0.0, 0.20, clipFraction);
-        float protectAuthority = max(relativeAuthority, max(absoluteAuthority, clipAuthority));
-        ev = -distance * (0.35 + 0.25 * protectAuthority) * exposureSpatialAuthority;
     }
-    return finite1(ev) ? ev : 0.0;
+    // Pre-demosaic spatial exposure is a shadow-recovery owner only. Bright-tail protection is
+    // downstream tone work (GTM -> FLLF -> AgX). A negative Bayer-domain exposure cannot recover
+    // sensor clipping and was darkening ordinary bright objects before color/tone processing.
+    return finite1(ev) ? max(ev, 0.0) : 0.0;
 }
 
 void resolveExposureMap() {
@@ -520,8 +513,7 @@ void resolveExposureMap() {
     barrier();
     for (uint tile = lane; tile < tileCount; tile += 256u) {
         float ev = greenSamples[EXPOSURE_MAP_RECORD_OFFSET + tile].x;
-        int sign = ev > 1.0e-4 ? 1 : (ev < -1.0e-4 ? -1 : 0);
-        if (sign != 0) {
+        if (ev > 1.0e-4) {
             int x = int(tile % pc.sampleColumns);
             int y = int(tile / pc.sampleColumns);
             int support = 1, possible = 1;
@@ -532,15 +524,10 @@ void resolveExposureMap() {
                 ++possible;
                 uint ni=uint(ny)*pc.sampleColumns+uint(nx);
                 float nev=greenSamples[EXPOSURE_MAP_RECORD_OFFSET+ni].x;
-                int nsign=nev>1.0e-4?1:(nev<-1.0e-4?-1:0);
-                if (nsign==sign) ++support;
+                if (nev > 1.0e-4) ++support;
             }
-            vec4 evidence=greenSamples[tile];
-            float rel=exposureSafeLog2(max(evidence.x,1.0e-6)/max(exposureP50,1.0e-6));
-            bool strongHighlight=sign<0 && (rel>exposureUpperNeutralEv+max(0.9,exposureMeasuredDrEv*0.18) ||
-                    evidence.y>=max(0.90,exposureP99) || evidence.w-1.0>0.02);
-            if (!strongHighlight) ev *= exposureSmoothstep(0.20,0.80,float(support)/float(possible));
-            greenSamples[EXPOSURE_MAP_RECORD_OFFSET+tile].x = finite1(ev) ? ev : 0.0;
+            ev *= exposureSmoothstep(0.20,0.80,float(support)/float(possible));
+            greenSamples[EXPOSURE_MAP_RECORD_OFFSET+tile].x = finite1(ev) ? max(ev, 0.0) : 0.0;
         }
     }
     memoryBarrierBuffer();

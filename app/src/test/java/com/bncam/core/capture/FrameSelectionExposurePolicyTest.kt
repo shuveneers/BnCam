@@ -23,15 +23,22 @@ class FrameSelectionExposurePolicyTest {
     fun materiallyShortOlderFrameIsRejectedAfterQualityExtension() {
         val decision = FrameSelectionExposurePolicy.evaluate(20_000_000L, 80_000_000L)
         assertFalse(decision.eligible)
-        assertEquals("FRAME_EXPOSURE_BELOW_CURRENT_TARGET", decision.reason)
+        assertEquals("FRAME_EXPOSURE_TOO_SHORT_FOR_CURRENT_TRANSITION", decision.reason)
     }
 
     @Test
-    fun materiallyLongerFrameIsRejectedAfterMotionTightening() {
+    fun neighbouringLongerFrameRemainsEligibleWhileWarmRingRefills() {
         val decision = FrameSelectionExposurePolicy.evaluate(31_000_000L, 30_000_000L)
-        assertFalse(decision.eligible)
+        assertTrue(decision.eligible)
         assertEquals(400_000L, decision.deviationNs)
-        assertEquals("FRAME_EXPOSURE_ABOVE_CURRENT_TARGET", decision.reason)
+        assertEquals("TRANSITIONAL_WARM_FRAME", decision.reason)
+    }
+
+    @Test
+    fun grosslyLongerFrameStillFailsClosed() {
+        val decision = FrameSelectionExposurePolicy.evaluate(20_000_000L, 10_000_000L)
+        assertFalse(decision.eligible)
+        assertEquals("FRAME_EXPOSURE_TOO_LONG_FOR_CURRENT_TRANSITION", decision.reason)
     }
 
     @Test
@@ -55,4 +62,67 @@ class FrameSelectionExposurePolicyTest {
         assertTrue(decision.eligible)
         assertEquals(Long.MAX_VALUE, decision.toleratedExposureMaxNs)
     }
+
+    @Test
+    fun staleHighIsoFailsEvenWhenShutterMatches() {
+        val decision = FrameSelectionExposurePolicy.evaluate(
+            actualExposureNs = 20_000_000L,
+            requestedExposureTargetNs = 20_000_000L,
+            actualIso = 5_190,
+            requestedIso = 1_455
+        )
+        assertFalse(decision.eligible)
+        assertEquals("FRAME_EXPOSURE_PRODUCT_TOO_HIGH", decision.reason)
+        assertTrue((decision.exposureErrorEv ?: 0.0) > 1.5)
+    }
+
+    @Test
+    fun staleLowIsoFailsEvenWhenShutterMatches() {
+        val decision = FrameSelectionExposurePolicy.evaluate(
+            actualExposureNs = 20_000_000L,
+            requestedExposureTargetNs = 20_000_000L,
+            actualIso = 1_000,
+            requestedIso = 2_000
+        )
+        assertFalse(decision.eligible)
+        assertEquals("FRAME_EXPOSURE_PRODUCT_TOO_LOW", decision.reason)
+    }
+
+    @Test
+    fun neighbouringShutterWithCompensatingIsoRemainsEligible() {
+        val decision = FrameSelectionExposurePolicy.evaluate(
+            actualExposureNs = 20_000_000L,
+            requestedExposureTargetNs = 15_000_000L,
+            actualIso = 1_500,
+            requestedIso = 2_000
+        )
+        assertTrue(decision.eligible)
+        assertEquals("TRANSITIONAL_WARM_FRAME_EXPOSURE_COMPENSATED", decision.reason)
+        assertEquals(0.0, decision.exposureErrorEv ?: 99.0, 1.0e-9)
+    }
+
+    @Test
+    fun missingIsoFailsClosedWhenProductAuthorityIsActive() {
+        val decision = FrameSelectionExposurePolicy.evaluate(
+            actualExposureNs = 20_000_000L,
+            requestedExposureTargetNs = 20_000_000L,
+            actualIso = null,
+            requestedIso = 2_000
+        )
+        assertFalse(decision.eligible)
+        assertEquals("UNPROVEN_FRAME_ISO", decision.reason)
+    }
+
+    @Test
+    fun noIsoTargetPreserves0154ShutterOnlyTransitionContract() {
+        val decision = FrameSelectionExposurePolicy.evaluate(
+            actualExposureNs = 20_000_000L,
+            requestedExposureTargetNs = 14_920_000L,
+            actualIso = 6_000,
+            requestedIso = null
+        )
+        assertTrue(decision.eligible)
+        assertEquals("TRANSITIONAL_WARM_FRAME", decision.reason)
+    }
+
 }

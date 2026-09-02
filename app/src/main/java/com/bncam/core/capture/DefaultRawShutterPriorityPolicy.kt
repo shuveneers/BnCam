@@ -2,6 +2,7 @@ package com.bncam.core.capture
 
 import kotlin.math.ceil
 import kotlin.math.min
+import kotlin.math.pow
 
 /**
  * Default RAW single-frame acquisition planner.
@@ -67,18 +68,21 @@ data class DefaultRawShutterPriorityPlan(
 
 object DefaultRawShutterPriorityPolicy {
     /**
-     * Plan from one fresh, stable Camera2 AE sample.
-     *
-     * The target sensitivity is preserved whenever sensor limits permit:
-     *     targetExposure × targetIso ~= referenceExposure × referenceIso
-     *
-     * Exposure is made as long as the independently-established safe ceiling permits. If the
-     * sensor minimum ISO is reached first, exposure is shortened rather than intentionally
-     * overexposing the scene.
-     *
-     * A measured-motion ceiling is mandatory for activation. A reciprocal-rule/lens fallback may
-     * constrain a plan, but cannot by itself declare a scene safe for a longer shutter.
+     * Exposure may recover more slowly after a motion event, but a newly tighter motion ceiling is
+     * obeyed immediately. This gives the controller fast safety attack / slow quality release and
+     * prevents alternating motion estimates from pumping the live exposure brighter/darker.
      */
+    private const val MAX_RELEASE_STEP_EV = 0.25
+    private val MAX_RELEASE_RATIO = 2.0.pow(MAX_RELEASE_STEP_EV)
+
+    /**
+     * Flicker quantization is a preference, not permission to introduce a large exposure step.
+     * A floor from e.g. 14.9 ms to 10 ms is ~0.58 EV and was visibly pumping AE. We only snap when
+     * the flicker-safe value is already close to the physically selected shutter.
+     */
+    private const val MAX_FLICKER_SNAP_EV = 0.25
+    private val MIN_FLICKER_SNAP_RATIO = 2.0.pow(-MAX_FLICKER_SNAP_EV)
+
     fun resolve(
         measuredIso: Int?,
         measuredExposureNs: Long?,
@@ -131,31 +135,52 @@ object DefaultRawShutterPriorityPolicy {
 
         val strictest = constraints.minBy { it.second }
         val safeCeiling = strictest.second.coerceIn(bounds.minExposureNs, bounds.maxExposureNs)
-
-        // At min ISO, this is the longest shutter that preserves the AE target sensitivity.
         val exposureAtMinIso = ceil(targetProduct / bounds.minIso.toDouble())
             .toLong()
             .coerceIn(bounds.minExposureNs, bounds.maxExposureNs)
 
-        val unconstrainedTargetExposure = min(safeCeiling, exposureAtMinIso)
+        val physicallyDesiredExposure = min(safeCeiling, exposureAtMinIso)
             .coerceIn(bounds.minExposureNs, bounds.maxExposureNs)
-        val targetExposure = flickerConstraint.constrainExposureNs(
-            unconstrainedTargetExposure,
+
+        // Never delay a safety-motivated shutter reduction. On recovery toward a longer shutter,
+        // however, limit each closed-loop Camera2 step to 0.25 EV so AE has time to realize ISO.
+        val releaseLimitedExposure = if (physicallyDesiredExposure > referenceExposure) {
+            min(
+                physicallyDesiredExposure,
+                (referenceExposure.toDouble() * MAX_RELEASE_RATIO).toLong().coerceAtLeast(referenceExposure + 1L)
+            )
+        } else {
+            physicallyDesiredExposure
+        }.coerceIn(bounds.minExposureNs, bounds.maxExposureNs)
+        val releaseLimited = releaseLimitedExposure != physicallyDesiredExposure
+
+        val flickerCandidate = flickerConstraint.constrainExposureNs(
+            releaseLimitedExposure,
             bounds.minExposureNs,
             bounds.maxExposureNs
         )
-        val flickerAdjusted = targetExposure != unconstrainedTargetExposure
+        val flickerRatio = if (releaseLimitedExposure > 0L) {
+            flickerCandidate.toDouble() / releaseLimitedExposure.toDouble()
+        } else 1.0
+        val flickerSnapAccepted = flickerCandidate != releaseLimitedExposure &&
+            flickerRatio >= MIN_FLICKER_SNAP_RATIO
+        val targetExposure = if (flickerSnapAccepted) flickerCandidate else releaseLimitedExposure
+
         val expectedIsoUnclamped = ceil(targetProduct / targetExposure.toDouble()).toInt()
         val expectedIso = expectedIsoUnclamped.coerceIn(bounds.minIso, bounds.maxIso)
 
         val limitingConstraint = when {
-            flickerAdjusted -> "FLICKER_${flickerConstraint.frequency.name}"
+            releaseLimited -> "AE_TRANSITION_RELEASE_RATE"
+            flickerSnapAccepted -> "FLICKER_${flickerConstraint.frequency.name}"
             exposureAtMinIso <= safeCeiling -> "MIN_ISO"
             else -> strictest.first
         }
         val reason = when {
             expectedIsoUnclamped > bounds.maxIso -> "iso_max_limits_target_sensitivity"
-            flickerAdjusted -> "flicker_safe_longest_shutter_preserves_reference_sensitivity"
+            releaseLimited -> "gradual_longer_shutter_release_preserves_ae_realization"
+            flickerCandidate != releaseLimitedExposure && !flickerSnapAccepted ->
+                "flicker_snap_skipped_to_avoid_large_exposure_step"
+            flickerSnapAccepted -> "nearby_flicker_safe_shutter_preserves_reference_sensitivity"
             exposureAtMinIso <= safeCeiling -> "minimum_iso_reached_before_motion_ceiling"
             else -> "longest_safe_shutter_preserves_reference_sensitivity"
         }

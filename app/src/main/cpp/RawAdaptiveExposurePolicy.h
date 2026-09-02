@@ -144,21 +144,12 @@ inline Plan resolve(
             const float high = std::max(tile.highSignal, tile.luma);
             const float headroomEv = std::max(0.0f, safeLog2(0.98f / std::max(high, 1.0e-6f)));
             ev = std::min(requested, headroomEv) * snrAuthority * out.spatialAuthority;
-        } else if (relativeEv > out.upperNeutralBoundaryEv) {
-            const float distance = relativeEv - out.upperNeutralBoundaryEv;
-            // Photographic highlights are relative to their scene. Absolute near-white/clipping
-            // increases authority but is not required for a bright display/window to be protected.
-            const float robustTailSpan = std::max(
-                    0.35f, safeLog2(std::max(out.p95, out.p75 + 1.0e-6f) / out.p75));
-            const float relativeAuthority = smoothstep(0.0f, robustTailSpan, distance);
-            const float absoluteAuthority = smoothstep(
-                    std::max(out.p90, 0.55f), 1.0f,
-                    std::max(tile.highSignal, tile.luma));
-            const float clipAuthority = smoothstep(0.0f, 0.20f, std::clamp(tile.clipFraction, 0.0f, 1.0f));
-            const float protectAuthority = std::max(relativeAuthority,
-                    std::max(absoluteAuthority, clipAuthority));
-            ev = -distance * (0.35f + 0.25f * protectAuthority) * out.spatialAuthority;
         }
+        // Pre-demosaic spatial exposure is a shadow-recovery owner only. Bright-tail protection
+        // belongs to the downstream scene-linear tone chain (GTM -> FLLF -> AgX). Darkening an
+        // already-recorded bright tile here cannot recover clipped sensor information and caused
+        // ordinary bright objects to receive multi-EV attenuation before color/tone processing.
+        // Keep the exposure field non-negative so there is one high-end compression authority.
         if (!std::isfinite(ev)) ev = 0.0f;
         rawEv[i] = ev;
         rawSign[i] = ev > 1.0e-4f ? 1 : (ev < -1.0e-4f ? -1 : 0);
@@ -190,14 +181,9 @@ inline Plan resolve(
                 if (rawSign[neighbour] == sign) ++support;
             }
             const float supportRatio = static_cast<float>(support) / static_cast<float>(possible);
-            const auto& tile = tiles[index];
-            const float rel = safeLog2(std::max(tile.luma, 1.0e-6f) / out.p50);
-            const bool strongHighlight = sign < 0 && (
-                    rel > out.upperNeutralBoundaryEv + std::max(0.9f, out.measuredSceneDrEv * 0.18f) ||
-                    tile.highSignal >= std::max(0.90f, out.p99) || tile.clipFraction > 0.02f);
-            if (!strongHighlight) {
-                ev *= smoothstep(0.20f, 0.80f, supportRatio);
-            }
+            // Only positive shadow lift can reach this pass. Require spatial agreement for weak
+            // recovery so isolated dark texture/noise cannot become a local exposure owner.
+            ev *= smoothstep(0.20f, 0.80f, supportRatio);
             out.ev[index] = std::isfinite(ev) ? ev : 0.0f;
         }
     }

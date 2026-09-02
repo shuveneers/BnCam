@@ -71,16 +71,22 @@ data class FrameSelectionExposureConstraintSnapshot(
     val pipelineGeneration: Int,
     val expectedFormat: Int,
     val requestedExposureTargetNs: Long?,
+    val requestedIsoTarget: Int?,
     val toleratedExposureMinNs: Long?,
     val toleratedExposureMaxNs: Long?,
+    val strictProductErrorEv: Double?,
+    val transitionProductErrorEv: Double?,
     val source: String,
     val rejectedCandidateCount: Int
 ) {
     fun summary(): String =
         "active=$active;generation=$pipelineGeneration;format=$expectedFormat;" +
             "requestedExposureTargetNs=${requestedExposureTargetNs ?: "none"};" +
+            "requestedIsoTarget=${requestedIsoTarget ?: "none"};" +
             "toleratedExposureMinNs=${toleratedExposureMinNs ?: "none"};" +
             "toleratedExposureMaxNs=${toleratedExposureMaxNs ?: "none"};" +
+            "strictProductErrorEv=${strictProductErrorEv ?: "none"};" +
+            "transitionProductErrorEv=${transitionProductErrorEv ?: "none"};" +
             "source=$source;rejectedCandidateCount=$rejectedCandidateCount"
 }
 
@@ -318,6 +324,7 @@ class FrameRingBuffer(private var capacity: Int = 35) {
     @Volatile private var selectionExposureConstraintGeneration: Int = -1
     @Volatile private var selectionExposureConstraintFormat: Int = 0
     @Volatile private var selectionExposureTargetNs: Long = 0L
+    @Volatile private var selectionExposureTargetIso: Int = 0
     @Volatile private var selectionExposureConstraintSource: String = "NONE"
     @Volatile private var selectionExposureRejectedCandidateCount: Int = 0
 
@@ -386,10 +393,14 @@ class FrameRingBuffer(private var capacity: Int = 35) {
 
     private fun selectionExposureDecision(pair: ZslFramePair) =
         FrameSelectionExposurePolicy.evaluate(
-            actualExposureNs = pair.exposureTimeNs.takeIf { it > 0L }
+            actualExposureNs = pair.sensorMetadataSnapshot?.sensorExposureTimeNs?.takeIf { it > 0L }
+                ?: pair.exposureTimeNs.takeIf { it > 0L }
                 ?: runCatching { pair.metadata?.get(CaptureResult.SENSOR_EXPOSURE_TIME) }.getOrNull()
                 ?: 0L,
-            requestedExposureTargetNs = selectionExposureTargetNs
+            requestedExposureTargetNs = selectionExposureTargetNs,
+            actualIso = pair.sensorMetadataSnapshot?.sensorSensitivityIso?.takeIf { it > 0 }
+                ?: runCatching { pair.metadata?.get(CaptureResult.SENSOR_SENSITIVITY) }.getOrNull()?.takeIf { it > 0 },
+            requestedIso = selectionExposureTargetIso.takeIf { it > 0 }
         )
 
     private fun selectionExposureAllows(pair: ZslFramePair, recordRejection: Boolean): Boolean {
@@ -408,6 +419,11 @@ class FrameRingBuffer(private var capacity: Int = 35) {
                     "requestedExposureTargetNs=${decision.requestedExposureTargetNs} " +
                     "toleratedExposureMinNs=${decision.toleratedExposureMinNs} " +
                     "toleratedExposureMaxNs=${decision.toleratedExposureMaxNs} " +
+                    "actualIso=${decision.actualIso ?: "unavailable"} " +
+                    "requestedIso=${decision.requestedIso ?: "unavailable"} " +
+                    "exposureProductRatio=${decision.exposureProductRatio ?: "unavailable"} " +
+                    "exposureErrorEv=${decision.exposureErrorEv ?: "unavailable"} " +
+                    "allowedExposureErrorEv=${decision.allowedExposureErrorEv ?: "unavailable"} " +
                     "reason=${decision.reason} source=$selectionExposureConstraintSource"
             )
         }
@@ -419,6 +435,7 @@ class FrameRingBuffer(private var capacity: Int = 35) {
         generationId: Int,
         expectedFormat: Int,
         exposureTargetNs: Long,
+        isoTarget: Int? = null,
         source: String
     ) {
         if (generationId != activeGeneration || exposureTargetNs <= 0L) {
@@ -428,6 +445,7 @@ class FrameRingBuffer(private var capacity: Int = 35) {
         selectionExposureConstraintGeneration = generationId
         selectionExposureConstraintFormat = expectedFormat
         selectionExposureTargetNs = exposureTargetNs
+        selectionExposureTargetIso = isoTarget?.takeIf { it > 0 } ?: 0
         selectionExposureConstraintSource = source.ifBlank { "UNSPECIFIED" }
     }
 
@@ -436,6 +454,7 @@ class FrameRingBuffer(private var capacity: Int = 35) {
         selectionExposureConstraintGeneration = -1
         selectionExposureConstraintFormat = 0
         selectionExposureTargetNs = 0L
+        selectionExposureTargetIso = 0
         selectionExposureConstraintSource = source.ifBlank { "CLEARED" }
     }
 
@@ -446,7 +465,9 @@ class FrameRingBuffer(private var capacity: Int = 35) {
         val toleratedRange = if (active) {
             FrameSelectionExposurePolicy.evaluate(
                 actualExposureNs = selectionExposureTargetNs,
-                requestedExposureTargetNs = selectionExposureTargetNs
+                requestedExposureTargetNs = selectionExposureTargetNs,
+                actualIso = selectionExposureTargetIso.takeIf { it > 0 },
+                requestedIso = selectionExposureTargetIso.takeIf { it > 0 }
             ).let { it.toleratedExposureMinNs to it.toleratedExposureMaxNs }
         } else {
             null
@@ -456,8 +477,15 @@ class FrameRingBuffer(private var capacity: Int = 35) {
             pipelineGeneration = selectionExposureConstraintGeneration,
             expectedFormat = selectionExposureConstraintFormat,
             requestedExposureTargetNs = selectionExposureTargetNs.takeIf { active },
+            requestedIsoTarget = selectionExposureTargetIso.takeIf { active && it > 0 },
             toleratedExposureMinNs = toleratedRange?.first,
             toleratedExposureMaxNs = toleratedRange?.second,
+            strictProductErrorEv = FrameSelectionExposurePolicy.STRICT_PRODUCT_ERROR_EV.takeIf {
+                active && selectionExposureTargetIso > 0
+            },
+            transitionProductErrorEv = FrameSelectionExposurePolicy.TRANSITION_PRODUCT_ERROR_EV.takeIf {
+                active && selectionExposureTargetIso > 0
+            },
             source = selectionExposureConstraintSource,
             rejectedCandidateCount = selectionExposureRejectedCandidateCount
         )
@@ -1886,6 +1914,7 @@ class FrameRingBuffer(private var capacity: Int = 35) {
         selectionExposureConstraintGeneration = -1
         selectionExposureConstraintFormat = 0
         selectionExposureTargetNs = 0L
+        selectionExposureTargetIso = 0
         selectionExposureConstraintSource = "BUFFER_CLEAR"
         selectionExposureRejectedCandidateCount = 0
         buffer.forEach { pair ->

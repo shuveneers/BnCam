@@ -30,57 +30,44 @@ inline float rawGtmSmoothstep(float edge0, float edge1, float value) noexcept {
 }
 
 /**
- * Phase 7 RAW GTM scene-placement policy.
+ * RAW GTM scene-placement policy.
  *
- * Phase 5 already owns spatial exposure. GTM therefore never normalizes the RAW median to a
- * target and never adds automatic positive exposure. Its only automatic scene-placement
- * authority is a bounded sub-unity allocation for genuinely dark scenes, preventing the AgX
- * display transform from making a dim capture look like a normally lit scene.
+ * Sensor exposure owns acquisition brightness and Phase-5 spatial exposure owns physically gated
+ * shadow recovery. GTM therefore does not add a second automatic scene-wide exposure decision.
+ * In particular, a dark histogram is not evidence that the renderer should make the already-dark
+ * RAW darker again: the supplied device traces showed this policy applying about -0.5 EV to frames
+ * that were already under-placed, while global highlight darkening was explicitly false.
  *
- * The output remains scene-linear and is consumed by FLLF before AgX. This is intentionally
- * not a display-range compression curve and cannot create the old GTM+AgX double compression.
+ * GTM remains the global tone/contrast stage elsewhere in the pipeline. This policy only governs
+ * its scene-placement multiplier, which is now neutral for automatic rendering. FLLF and AgX keep
+ * their independent local/high-end responsibilities without a hidden low-light attenuation owner.
  */
 inline RawGtmScenePlan resolveRawGtmScenePlan(const RawGtmSceneInput& input) noexcept {
     RawGtmScenePlan out{};
+
+    // Consume and sanitize the inputs for deterministic diagnostics/ABI continuity, but do not
+    // convert scene darkness into a negative global exposure. This preserves one acquisition/
+    // exposure authority and prevents low-light mood heuristics from compounding underexposure.
     const float p50 = std::clamp(std::isfinite(input.p50) ? input.p50 : 0.0f, 0.0f, 1.5f);
     const float p75 = std::clamp(std::isfinite(input.p75) ? input.p75 : 0.0f, 0.0f, 1.5f);
     const float indoor = std::clamp(
             std::isfinite(input.indoorLowLightConfidence) ? input.indoorLowLightConfidence : 0.0f,
             0.0f, 1.0f);
-    // Dynamic-range/highlight pressure is intentionally not an input to the low-end placement.
-    // Highlights have their own FLLF/AgX owners; allowing the upper tail to weaken dark-scene
-    // placement made the same room's blacks visibly float upward when a lamp/display entered frame.
-    (void)input.dynamicRangePressure;
+    const float dynamicRange = std::clamp(
+            std::isfinite(input.dynamicRangePressure) ? input.dynamicRangePressure : 0.0f,
+            0.0f, 1.0f);
+    (void)p50;
+    (void)p75;
+    (void)indoor;
+    (void)dynamicRange;
 
-    if (input.outdoorSkyScene || (!input.lowLightScene && indoor < 0.42f)) {
-        out.authority = input.outdoorSkyScene ? "OUTDOOR_SKY_NEUTRAL" : "NON_LOW_LIGHT_NEUTRAL";
-        return out;
-    }
-
-    // Median and lower-midtone evidence must both support a dark-scene interpretation. A single
-    // black object cannot darken a normally exposed frame. p50 controls the main pressure while
-    // p75 releases authority quickly when useful scene content is already normally illuminated.
-    const float medianDark = 1.0f - rawGtmSmoothstep(0.040f, 0.115f, p50);
-    const float lowerMidDark = 1.0f - rawGtmSmoothstep(0.090f, 0.245f, p75);
-    const float histogramDark = std::clamp(0.68f * medianDark + 0.32f * lowerMidDark, 0.0f, 1.0f);
-    const float sceneConfidence = std::clamp(
-            std::max(input.lowLightScene ? 0.62f : 0.0f, indoor), 0.0f, 1.0f);
-    float pressure = histogramDark * sceneConfidence;
-
-    // Low-end placement is resolved exclusively from the lower distribution (p50/p75) and
-    // low-light confidence. A localized highlight cannot lift or darken the global shadow anchor.
-    // FLLF and AgX own the upper range independently.
-    pressure = std::clamp(pressure, 0.0f, 1.0f);
-
-    // At maximum authority retain roughly two thirds of the incoming scene-linear level
-    // (-0.62 EV). This is material enough to keep a dim room dim while remaining far from the
-    // multi-stop scene normalization that previously washed low-light captures.
-    const float attenuationEv = -0.62f * pressure;
-    out.scenePlacementEv = std::clamp(attenuationEv, -0.62f, 0.0f);
-    out.scenePlacementGain = std::clamp(std::exp2(out.scenePlacementEv), 0.65f, 1.0f);
-    out.lowLightMoodPressure = pressure;
-    out.active = out.scenePlacementGain < 0.995f;
-    out.authority = out.active ? "LOW_LIGHT_MOOD_PRESERVATION" : "NEUTRAL";
+    out.active = false;
+    out.scenePlacementGain = 1.0f;
+    out.scenePlacementEv = 0.0f;
+    out.lowLightMoodPressure = 0.0f;
+    out.highlightIsolatedLowEnd = true;
+    out.authority = input.outdoorSkyScene ? "OUTDOOR_SKY_NEUTRAL" :
+            (input.lowLightScene || indoor >= 0.42f ? "LOW_LIGHT_NEUTRAL" : "NON_LOW_LIGHT_NEUTRAL");
     return out;
 }
 

@@ -4,6 +4,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import kotlin.math.pow
 
 class DefaultRawShutterPriorityPolicyTest {
     private val bounds = ExposureBounds(
@@ -14,7 +15,7 @@ class DefaultRawShutterPriorityPolicyTest {
     )
 
     @Test
-    fun `static scene spends available exposure time before iso`() {
+    fun `static scene lengthens shutter gradually before lowering iso further`() {
         val plan = DefaultRawShutterPriorityPolicy.resolve(
             measuredIso = 1_600,
             measuredExposureNs = 40_000_000L,
@@ -26,14 +27,15 @@ class DefaultRawShutterPriorityPolicyTest {
             )
         )
 
+        val expectedExposure = (40_000_000.0 * 2.0.pow(0.25)).toLong()
         assertTrue(plan.ready)
-        assertEquals(100_000_000L, plan.targetExposureNs)
-        assertEquals(640, plan.expectedIso)
-        assertEquals("CAMERA_MOTION", plan.limitingConstraint)
+        assertEquals(expectedExposure, plan.targetExposureNs)
+        assertEquals(1_346, plan.expectedIso)
+        assertEquals("AE_TRANSITION_RELEASE_RATE", plan.limitingConstraint)
     }
 
     @Test
-    fun `moving scene shortens shutter and lets iso absorb requirement`() {
+    fun `moving scene shortens shutter immediately and lets iso absorb requirement`() {
         val plan = DefaultRawShutterPriorityPolicy.resolve(
             measuredIso = 1_600,
             measuredExposureNs = 40_000_000L,
@@ -52,7 +54,7 @@ class DefaultRawShutterPriorityPolicyTest {
     }
 
     @Test
-    fun `minimum iso prevents deliberate overexposure`() {
+    fun `minimum iso target is approached gradually instead of one exposure jump`() {
         val plan = DefaultRawShutterPriorityPolicy.resolve(
             measuredIso = 100,
             measuredExposureNs = 20_000_000L,
@@ -63,10 +65,11 @@ class DefaultRawShutterPriorityPolicyTest {
             )
         )
 
+        val expectedExposure = (20_000_000.0 * 2.0.pow(0.25)).toLong()
         assertTrue(plan.ready)
-        assertEquals(40_000_000L, plan.targetExposureNs)
-        assertEquals(50, plan.expectedIso)
-        assertEquals("MIN_ISO", plan.limitingConstraint)
+        assertEquals(expectedExposure, plan.targetExposureNs)
+        assertEquals(85, plan.expectedIso)
+        assertEquals("AE_TRANSITION_RELEASE_RATE", plan.limitingConstraint)
     }
 
     @Test
@@ -86,7 +89,7 @@ class DefaultRawShutterPriorityPolicyTest {
     }
 
     @Test
-    fun `stream cadence can be stricter than measured motion`() {
+    fun `stream cadence extension is approached gradually`() {
         val plan = DefaultRawShutterPriorityPolicy.resolve(
             measuredIso = 2_000,
             measuredExposureNs = 25_000_000L,
@@ -98,9 +101,10 @@ class DefaultRawShutterPriorityPolicyTest {
             )
         )
 
+        val expectedExposure = (25_000_000.0 * 2.0.pow(0.25)).toLong()
         assertTrue(plan.ready)
-        assertEquals(50_000_000L, plan.targetExposureNs)
-        assertEquals(1_000, plan.expectedIso)
-        assertEquals("STREAM_CADENCE", plan.limitingConstraint)
+        assertEquals(expectedExposure, plan.targetExposureNs)
+        assertEquals(1_682, plan.expectedIso)
+        assertEquals("AE_TRANSITION_RELEASE_RATE", plan.limitingConstraint)
     }
 }
