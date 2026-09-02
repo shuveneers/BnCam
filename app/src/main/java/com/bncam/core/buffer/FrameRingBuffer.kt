@@ -430,6 +430,60 @@ class FrameRingBuffer(private var capacity: Int = 35) {
         return decision.eligible
     }
 
+
+    /**
+     * Product realization is a preference inside the shutter-safe set, never a second eligibility
+     * gate. Prefer current shutter×ISO realizations first; only fill from shutter-safe fallbacks
+     * when the preferred subset cannot satisfy the requested candidate count. The returned list is
+     * restored to sensor-time order so downstream burst/focus logic keeps its existing chronology.
+     */
+    private fun preferSelectionExposureProduct(
+        candidates: List<ZslFramePair>,
+        maxCount: Int
+    ): List<ZslFramePair> {
+        if (candidates.isEmpty() || maxCount <= 0 || selectionExposureTargetNs <= 0L) {
+            return candidates.takeLast(maxCount.coerceAtLeast(0))
+        }
+        val preferred = ArrayList<ZslFramePair>(candidates.size)
+        val fallback = ArrayList<Pair<ZslFramePair, Double>>(candidates.size)
+        candidates.forEach { pair ->
+            val active = selectionExposureConstraintGeneration == activeGeneration &&
+                pair.generationId == selectionExposureConstraintGeneration &&
+                pair.format == selectionExposureConstraintFormat
+            if (!active) {
+                preferred += pair
+            } else {
+                val decision = selectionExposureDecision(pair)
+                if (decision.productPreferred) {
+                    preferred += pair
+                } else if (decision.eligible) {
+                    fallback += pair to kotlin.math.abs(decision.exposureErrorEv ?: Double.POSITIVE_INFINITY)
+                }
+            }
+        }
+        val preferredNewest = preferred.takeLast(maxCount)
+        val missing = (maxCount - preferredNewest.size).coerceAtLeast(0)
+        if (missing == 0) return preferredNewest
+
+        val fallbackChosen = fallback
+            .sortedWith(compareBy<Pair<ZslFramePair, Double>> { it.second }.thenByDescending { it.first.timestamp })
+            .take(missing)
+            .map { it.first }
+        if (fallbackChosen.isNotEmpty()) {
+            val best = fallback.minByOrNull { it.second }
+            SafeLog.i(
+                tag,
+                "SELECTION_EXPOSURE_PRODUCT_FALLBACK preferred=${preferred.size} " +
+                    "fallbackEligible=${fallback.size} selectedFallback=${fallbackChosen.size} " +
+                    "bestFallbackErrorEv=${best?.second ?: "unavailable"} source=$selectionExposureConstraintSource"
+            )
+        }
+        return (preferredNewest + fallbackChosen).sortedBy { pair ->
+            try { pair.metadata?.get(CaptureResult.SENSOR_TIMESTAMP) } catch (_: Throwable) { null }
+                ?: pair.timestamp
+        }
+    }
+
     @Synchronized
     fun setSelectionExposureConstraint(
         generationId: Int,
@@ -1160,7 +1214,7 @@ class FrameRingBuffer(private var capacity: Int = 35) {
     @Synchronized
     fun latestCompleteFrameSnapshots(count: Int): List<FrameCandidateSnapshot> {
         if (count <= 0) return emptyList()
-        return buffer.asSequence()
+        val shutterSafe = buffer.asSequence()
             .filter {
                 it.generationId == activeGeneration &&
                     hasExactRequestProvenance(it) &&
@@ -1174,7 +1228,7 @@ class FrameRingBuffer(private var capacity: Int = 35) {
                     ?: it.timestamp
             }
             .toList()
-            .takeLast(count)
+        return preferSelectionExposureProduct(shutterSafe, count)
             .mapNotNull(::snapshotCandidate)
     }
 
@@ -1209,12 +1263,11 @@ class FrameRingBuffer(private var capacity: Int = 35) {
         } else {
             valid
         }
-        return filtered
-            .sortedBy {
-                try { it.metadata?.get(CaptureResult.SENSOR_TIMESTAMP) } catch (_: Throwable) { null }
-                    ?: it.timestamp
-            }
-            .takeLast(maxCount)
+        val ordered = filtered.sortedBy {
+            try { it.metadata?.get(CaptureResult.SENSOR_TIMESTAMP) } catch (_: Throwable) { null }
+                ?: it.timestamp
+        }
+        return preferSelectionExposureProduct(ordered, maxCount)
             .mapNotNull(::snapshotCandidate)
     }
 
@@ -1245,10 +1298,11 @@ class FrameRingBuffer(private var capacity: Int = 35) {
         } else {
             valid
         }
-        return filtered.sortedBy {
+        val ordered = filtered.sortedBy {
             try { it.metadata?.get(CaptureResult.SENSOR_TIMESTAMP) } catch (_: Throwable) { null }
                 ?: it.timestamp
-        }.takeLast(maxCount)
+        }
+        return preferSelectionExposureProduct(ordered, maxCount)
     }
 
     fun recordSelectionFailureReason(reason: String) {
@@ -1335,9 +1389,10 @@ class FrameRingBuffer(private var capacity: Int = 35) {
         } else {
             valid
         }
-        val selected = filtered.sortedBy {
+        val ordered = filtered.sortedBy {
             try { it.metadata?.get(CaptureResult.SENSOR_TIMESTAMP) } catch (_: Throwable) { null } ?: it.timestamp
-        }.takeLast(maxCount)
+        }
+        val selected = preferSelectionExposureProduct(ordered, maxCount)
 
         com.bncam.core.debug.RawRecoveryTrace.log(
             "QUERY_LEASE_CANDIDATES",

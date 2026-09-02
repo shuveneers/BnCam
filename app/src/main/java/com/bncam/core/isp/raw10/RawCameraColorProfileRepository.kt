@@ -14,15 +14,18 @@ import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Trusted camera colour-characterization repository with a process-session freeze.
+ * Trusted camera colour-characterization repository with a pre-render session freeze.
  *
- * The profile set used for rendering is fixed when [beginSession] is first called. Profiles learned
- * from DngCreator during that process are persisted and staged for the next process, never injected
- * into the active native registry mid-session. This prevents capture #1 and capture #2 from using
- * different camera-colour owners solely because capture #1 discovered an OEM HueSatMap.
+ * [beginSession] loads persisted profiles. If the selected sensor has no trusted active profile, one
+ * bounded OEM DngCreator bootstrap may fill that missing profile before the first RAW render. Once
+ * that profile is sealed by [sealForRendering], later discoveries for it are staged for the next
+ * process and can never replace its active native owner. Distinct sensor profile IDs may bootstrap
+ * independently before their own first render.
  *
  * Priority is provenance, not aesthetics: OEM DngCreator > explicit BnCam calibration > external
  * DNG/DCP. No API in this repository can synthesize a HueSatMap from scene statistics or tuning.
@@ -36,10 +39,11 @@ object RawCameraColorProfileRepository {
     private const val VERSION = 1
     private const val MAX_ARRAY_FLOATS = (1 shl 20) * 3 // Mirrors native registry hard bound.
     private const val STORE_DIR = "raw_camera_color_profiles_v1"
+    private const val BOOTSTRAP_RENDER_WAIT_MS = 1_500L
 
     private data class Entry(val snapshot: DngCameraColorProfileSnapshot, val priority: Int)
 
-    /** Frozen active-session candidates. */
+    /** Active-session camera-colour candidates. */
     private val profiles = ConcurrentHashMap<String, Entry>()
     /** Newly learned profiles that may become active only after a new process begins. */
     private val pendingProfiles = ConcurrentHashMap<String, Entry>()
@@ -47,15 +51,22 @@ object RawCameraColorProfileRepository {
     private val nativeInstalled = ConcurrentHashMap.newKeySet<String>()
     private val sessionStarted = AtomicBoolean(false)
     private val sessionNativeReady = AtomicBoolean(false)
+    private val renderedProfileIds = ConcurrentHashMap.newKeySet<String>()
+    private val bootstrapAttemptedProfileIds = ConcurrentHashMap.newKeySet<String>()
+    private val bootstrapCompletionSignals = ConcurrentHashMap<String, CountDownLatch>()
     private val lock = Any()
 
     @Volatile private var storageDirectory: File? = null
     @Volatile private var sessionLoadCount: Int = 0
     @Volatile private var lastPersistenceError: String = "none"
+    @Volatile private var bootstrapInstallCount: Int = 0
+    @Volatile private var bootstrapStatus: String = "NOT_ATTEMPTED"
+    @Volatile private var lastRenderSealSource: String = "NOT_SEALED"
 
     /**
-     * Freeze the colour-profile set for this process and preload profiles discovered in an earlier
-     * process. Calling this again during navigation/activity recreation is a no-op by design.
+     * Load the trusted persisted profile set for this process. Calling this again during
+     * navigation/activity recreation is a no-op. Each calibration-profile owner is sealed at that
+     * profile's first RAW render.
      */
     fun beginSession(context: Context) {
         if (!sessionStarted.compareAndSet(false, true)) return
@@ -72,8 +83,8 @@ object RawCameraColorProfileRepository {
             sessionLoadCount = profiles.size
             Log.i(
                 TAG,
-                "session frozen: persistedCandidates=${profiles.size}; " +
-                    "new discoveries will activate next process"
+                "session loaded: persistedCandidates=${profiles.size}; " +
+                    "missing OEM profile may bootstrap only before first RAW render"
             )
         }
         ensureSessionProfilesInstalled()
@@ -108,6 +119,125 @@ object RawCameraColorProfileRepository {
     fun installDiscoveredProfile(snapshot: DngCameraColorProfileSnapshot): Boolean =
         accept(snapshot.copy(source = "OEM_DNGCREATOR"), PRIORITY_OEM)
 
+    /**
+     * Claims the one-time discovery slot for a missing sensor profile before any RAW render starts.
+     * The claim is per calibration profile so switching to another physical sensor before the render
+     * seal may still discover its own OEM characterization.
+     */
+    fun shouldBootstrapBeforeFirstRender(calibrationProfileId: String): Boolean = synchronized(lock) {
+        if (!sessionStarted.get() || renderedProfileIds.contains(calibrationProfileId) ||
+            calibrationProfileId.isBlank() || calibrationProfileId == "unknown" ||
+            profiles.containsKey(calibrationProfileId)
+        ) {
+            return@synchronized false
+        }
+        val claimed = bootstrapAttemptedProfileIds.add(calibrationProfileId)
+        if (claimed) {
+            bootstrapCompletionSignals.putIfAbsent(calibrationProfileId, CountDownLatch(1))
+            bootstrapStatus = "CLAIMED:$calibrationProfileId"
+            Log.i(TAG, "pre-render OEM colour bootstrap claimed: id=$calibrationProfileId")
+        }
+        claimed
+    }
+
+    /** Marks a claimed bootstrap finished, whether it discovered a valid OEM profile or not. */
+    fun completeBootstrapAttempt(calibrationProfileId: String) {
+        val profileId = calibrationProfileId.ifBlank { "unknown" }
+        bootstrapCompletionSignals[profileId]?.countDown()
+        synchronized(lock) {
+            if (bootstrapStatus == "CLAIMED:$profileId") {
+                bootstrapStatus = "COMPLETE_NO_PROFILE:$profileId"
+            }
+        }
+    }
+
+    /**
+     * The only active-session path allowed to install a newly discovered profile. It is legal only
+     * before the first RAW render is sealed. Validation, native installation and persistence use the
+     * same trusted OEM path as normal DNG discovery; no synthetic profile can enter here.
+     */
+    fun installBootstrapDiscoveredProfile(snapshot: DngCameraColorProfileSnapshot): Boolean {
+        val entry = validateEntry(
+            snapshot.copy(source = "OEM_DNGCREATOR_BOOTSTRAP"),
+            PRIORITY_OEM
+        ) ?: return synchronized(lock) {
+            bootstrapStatus = "REJECTED_INVALID:${snapshot.calibrationProfileId}"
+            false
+        }
+        return synchronized(lock) {
+            val profileId = entry.snapshot.calibrationProfileId
+            if (!sessionStarted.get() || renderedProfileIds.contains(profileId) ||
+                !bootstrapAttemptedProfileIds.contains(profileId)
+            ) {
+                bootstrapStatus = "REJECTED_AFTER_RENDER_SEAL:$profileId"
+                Log.w(TAG, "pre-render OEM colour bootstrap rejected after render seal: id=$profileId")
+                return@synchronized stageForNextProcess(entry)
+            }
+            val existing = profiles[profileId]
+            if (existing != null && existing.priority > entry.priority) {
+                bootstrapStatus = "REJECTED_LOWER_PRIORITY:$profileId"
+                return@synchronized false
+            }
+            if (!installNative(entry)) {
+                bootstrapStatus = "NATIVE_INSTALL_FAILED:$profileId"
+                stageForNextProcess(entry)
+                return@synchronized false
+            }
+            mergeByPriority(profiles, entry)
+            nativeInstalled.add(profileId)
+            sessionNativeReady.set(profiles.keys.all(nativeInstalled::contains))
+            val persisted = persist(entry)
+            if (!persisted) {
+                Log.w(TAG, "bootstrap profile active but persistence failed: id=$profileId")
+            }
+            bootstrapInstallCount++
+            bootstrapStatus = "INSTALLED:$profileId"
+            Log.i(
+                TAG,
+                "pre-render OEM colour profile installed: id=$profileId " +
+                    "source=${entry.snapshot.source} status=${entry.snapshot.status}"
+            )
+            true
+        }
+    }
+
+    /**
+     * Permanently closes the same-process discovery window for this calibration profile before its
+     * RAW16 object is returned to a renderer. Other physical-sensor profile IDs remain independent.
+     */
+    fun sealForRendering(
+        calibrationProfileId: String,
+        source: String = "RAW_RENDER"
+    ): Boolean {
+        val profileId = calibrationProfileId.ifBlank { "unknown" }
+        val pendingBootstrap = bootstrapCompletionSignals[profileId]
+        if (pendingBootstrap != null && pendingBootstrap.count > 0L) {
+            val completed = runCatching {
+                pendingBootstrap.await(BOOTSTRAP_RENDER_WAIT_MS, TimeUnit.MILLISECONDS)
+            }.getOrDefault(false)
+            if (!completed) {
+                synchronized(lock) { bootstrapStatus = "WAIT_TIMEOUT:$profileId" }
+                Log.w(
+                    TAG,
+                    "pre-render colour bootstrap wait timed out: id=$profileId " +
+                        "waitMs=$BOOTSTRAP_RENDER_WAIT_MS; sealing current owner"
+                )
+            }
+        }
+        val firstSeal = renderedProfileIds.add(profileId)
+        if (firstSeal) {
+            lastRenderSealSource = source.ifBlank { "RAW_RENDER" }
+            Log.i(
+                TAG,
+                "camera colour owner sealed for rendering: id=$profileId " +
+                    "source=$lastRenderSealSource activeProfiles=${profiles.size} " +
+                    "bootstrapStatus=$bootstrapStatus"
+            )
+        }
+        ensureSessionProfilesInstalled()
+        return firstSeal
+    }
+
     fun installBnCamCalibratedProfileBytes(
         bytes: ByteArray,
         calibrationProfileId: String,
@@ -134,28 +264,18 @@ object RawCameraColorProfileRepository {
         profiles[calibrationProfileId]?.snapshot?.copied()
 
     fun debugSummary(): String =
-        "sessionStarted=${sessionStarted.get()}; sessionFrozen=true; " +
+        "sessionStarted=${sessionStarted.get()}; renderedProfileOwners=${renderedProfileIds.size}; " +
+            "lastRenderSealSource=$lastRenderSealSource; " +
             "persistedLoaded=$sessionLoadCount; activeProfiles=${profiles.size}; " +
             "nativeInstalled=${nativeInstalled.size}; nativeReady=${sessionNativeReady.get()}; " +
+            "preRenderBootstrapAttempts=${bootstrapAttemptedProfileIds.size}; " +
+            "preRenderBootstrapInstalled=$bootstrapInstallCount; bootstrapStatus=$bootstrapStatus; " +
             "pendingNextProcess=${pendingProfiles.size}; persistenceError=$lastPersistenceError"
 
     private fun accept(snapshot: DngCameraColorProfileSnapshot, priority: Int): Boolean {
         val entry = validateEntry(snapshot, priority) ?: return false
         if (sessionStarted.get()) {
-            val existingActive = profiles[entry.snapshot.calibrationProfileId]
-            if (existingActive != null && existingActive.priority > priority) return false
-            val existingPending = pendingProfiles[entry.snapshot.calibrationProfileId]
-            if (existingPending != null && existingPending.priority > priority) return false
-
-            val persisted = persist(entry)
-            if (!persisted) return false
-            mergeByPriority(pendingProfiles, entry)
-            Log.i(
-                TAG,
-                "profile staged for next process: id=${entry.snapshot.calibrationProfileId} " +
-                    "source=${entry.snapshot.source} status=${entry.snapshot.status}; active session unchanged"
-            )
-            return true
+            return stageForNextProcess(entry)
         }
 
         if (!installNative(entry)) return false
@@ -165,6 +285,22 @@ object RawCameraColorProfileRepository {
             TAG,
             "profile installed outside frozen session: id=${entry.snapshot.calibrationProfileId} " +
                 "source=${entry.snapshot.source} status=${entry.snapshot.status}"
+        )
+        return true
+    }
+
+    private fun stageForNextProcess(entry: Entry): Boolean {
+        val existingActive = profiles[entry.snapshot.calibrationProfileId]
+        if (existingActive != null && existingActive.priority > entry.priority) return false
+        val existingPending = pendingProfiles[entry.snapshot.calibrationProfileId]
+        if (existingPending != null && existingPending.priority > entry.priority) return false
+        val persisted = persist(entry)
+        if (!persisted) return false
+        mergeByPriority(pendingProfiles, entry)
+        Log.i(
+            TAG,
+            "profile staged for next process: id=${entry.snapshot.calibrationProfileId} " +
+                "source=${entry.snapshot.source} status=${entry.snapshot.status}; active session unchanged"
         )
         return true
     }

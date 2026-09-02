@@ -5,6 +5,8 @@ import android.hardware.HardwareBuffer
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CaptureResult
 import com.bncam.core.engine.ImageUtils
+import com.bncam.core.isp.raw10.DngWriter
+import com.bncam.core.isp.raw10.RawCameraColorProfileRepository
 import com.bncam.core.quality.FinalSensorCalibration
 import com.bncam.core.quality.FocusConfidenceState
 import com.bncam.core.quality.withSpectraMergeStats
@@ -79,6 +81,49 @@ class SingleRaw16Frame(
 }
 
 object SingleRaw16FrameBuilder {
+    private fun bootstrapCameraColorProfileBeforeFirstRender(
+        nativeRaw16Buffer: NativeRaw16Buffer,
+        width: Int,
+        height: Int,
+        sourceFormat: Int,
+        captureResult: CaptureResult?,
+        characteristics: CameraCharacteristics,
+        calibration: FinalSensorCalibration?
+    ) {
+        val profileId = calibration?.base?.calibrationProfileId ?: "unknown"
+        val effectiveCcm = calibration?.effectiveColorMatrix
+        val bootstrapClaimed = captureResult != null && effectiveCcm?.size == 9 &&
+            RawCameraColorProfileRepository.shouldBootstrapBeforeFirstRender(profileId)
+        try {
+            if (bootstrapClaimed) {
+                val discovered = nativeRaw16Buffer.withDirectBuffer { directRaw16 ->
+                    DngWriter.discoverCameraColorProfileFromVirtualRaw16(
+                        width = width,
+                        height = height,
+                        raw16Buffer = directRaw16,
+                        metadata = captureResult!!,
+                        characteristics = characteristics,
+                        calibrationProfileId = profileId,
+                        discoveryEffectiveCcm = effectiveCcm!!
+                    )
+                }
+                if (discovered != null) {
+                    RawCameraColorProfileRepository.installBootstrapDiscoveredProfile(discovered)
+                }
+            }
+        } finally {
+            if (bootstrapClaimed) {
+                RawCameraColorProfileRepository.completeBootstrapAttempt(profileId)
+            }
+            // From this point onward no newly discovered profile may alter the current-process
+            // colour owner. A concurrent first capture waits for the claimed bootstrap to finish.
+            RawCameraColorProfileRepository.sealForRendering(
+                calibrationProfileId = profileId,
+                source = if (sourceFormat == ImageFormat.RAW10) "SINGLE_RAW10" else "SINGLE_RAW_SENSOR"
+            )
+        }
+    }
+
     fun build(
         lensId: String,
         buffer: HardwareBuffer,
@@ -172,6 +217,15 @@ object SingleRaw16FrameBuilder {
                 sourceCropTop = nativeRaw16Buffer.sourceCropTop,
                 outputWidth = outputWidth,
                 outputHeight = outputHeight
+            )
+            bootstrapCameraColorProfileBeforeFirstRender(
+                nativeRaw16Buffer = nativeRaw16Buffer,
+                width = outputWidth,
+                height = outputHeight,
+                sourceFormat = sourceFormat,
+                captureResult = captureResult,
+                characteristics = characteristics,
+                calibration = spectraCalibration
             )
             SingleRaw16Frame(
                 lensId = lensId,

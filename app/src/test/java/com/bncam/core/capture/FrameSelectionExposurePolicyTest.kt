@@ -64,28 +64,30 @@ class FrameSelectionExposurePolicyTest {
     }
 
     @Test
-    fun staleHighIsoFailsEvenWhenShutterMatches() {
+    fun staleHighIsoRemainsShutterEligibleButIsNotProductPreferred() {
         val decision = FrameSelectionExposurePolicy.evaluate(
             actualExposureNs = 20_000_000L,
             requestedExposureTargetNs = 20_000_000L,
             actualIso = 5_190,
             requestedIso = 1_455
         )
-        assertFalse(decision.eligible)
-        assertEquals("FRAME_EXPOSURE_PRODUCT_TOO_HIGH", decision.reason)
+        assertTrue(decision.eligible)
+        assertFalse(decision.productPreferred)
+        assertEquals("SHUTTER_ELIGIBLE_PRODUCT_TOO_HIGH_FALLBACK", decision.reason)
         assertTrue((decision.exposureErrorEv ?: 0.0) > 1.5)
     }
 
     @Test
-    fun staleLowIsoFailsEvenWhenShutterMatches() {
+    fun staleLowIsoRemainsShutterEligibleButIsNotProductPreferred() {
         val decision = FrameSelectionExposurePolicy.evaluate(
             actualExposureNs = 20_000_000L,
             requestedExposureTargetNs = 20_000_000L,
             actualIso = 1_000,
             requestedIso = 2_000
         )
-        assertFalse(decision.eligible)
-        assertEquals("FRAME_EXPOSURE_PRODUCT_TOO_LOW", decision.reason)
+        assertTrue(decision.eligible)
+        assertFalse(decision.productPreferred)
+        assertEquals("SHUTTER_ELIGIBLE_PRODUCT_TOO_LOW_FALLBACK", decision.reason)
     }
 
     @Test
@@ -97,20 +99,22 @@ class FrameSelectionExposurePolicyTest {
             requestedIso = 2_000
         )
         assertTrue(decision.eligible)
+        assertTrue(decision.productPreferred)
         assertEquals("TRANSITIONAL_WARM_FRAME_EXPOSURE_COMPENSATED", decision.reason)
         assertEquals(0.0, decision.exposureErrorEv ?: 99.0, 1.0e-9)
     }
 
     @Test
-    fun missingIsoFailsClosedWhenProductAuthorityIsActive() {
+    fun missingIsoKeepsShutterEligibleAsNonPreferredFallback() {
         val decision = FrameSelectionExposurePolicy.evaluate(
             actualExposureNs = 20_000_000L,
             requestedExposureTargetNs = 20_000_000L,
             actualIso = null,
             requestedIso = 2_000
         )
-        assertFalse(decision.eligible)
-        assertEquals("UNPROVEN_FRAME_ISO", decision.reason)
+        assertTrue(decision.eligible)
+        assertFalse(decision.productPreferred)
+        assertEquals("SHUTTER_ELIGIBLE_UNPROVEN_ISO_FOR_PREFERENCE", decision.reason)
     }
 
     @Test
@@ -122,7 +126,20 @@ class FrameSelectionExposurePolicyTest {
             requestedIso = null
         )
         assertTrue(decision.eligible)
+        assertTrue(decision.productPreferred)
         assertEquals("TRANSITIONAL_WARM_FRAME", decision.reason)
+    }
+
+    @Test
+    fun shutterUnsafeFrameStillRejectsEvenWhenIsoWouldCompensateProduct() {
+        val decision = FrameSelectionExposurePolicy.evaluate(
+            actualExposureNs = 20_000_000L,
+            requestedExposureTargetNs = 10_000_000L,
+            actualIso = 1_000,
+            requestedIso = 2_000
+        )
+        assertFalse(decision.eligible)
+        assertEquals("FRAME_EXPOSURE_TOO_LONG_FOR_CURRENT_TRANSITION", decision.reason)
     }
 
 }

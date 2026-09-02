@@ -6,11 +6,11 @@ import kotlin.math.ln
 /**
  * Selection-only exposure realization gate for near-ZSL frames.
  *
- * Shutter remains the motion-safety authority. ISO is evaluated together with shutter as the
- * realized sensor exposure product so a warm frame from a neighbouring request epoch may bridge a
- * repeating-request transition only when it still represents the current photographic exposure.
- * This keeps the warm-buffer continuity introduced by DELTA 0154 without allowing stale ISO to
- * turn a shutter-valid frame several EV too bright or too dark.
+ * Shutter is the only hard motion-safety eligibility authority. ISO is evaluated together with
+ * shutter as a realized sensor-exposure product, but product error is selection preference only:
+ * a shutter-safe warm frame remains eligible while a repeating-request transition lands. This
+ * prevents a full RAW ring from becoming logically empty because Camera2 realized the requested
+ * shutter before it realized the compensating ISO.
  */
 data class FrameSelectionExposureDecision(
     val eligible: Boolean,
@@ -24,7 +24,8 @@ data class FrameSelectionExposureDecision(
     val requestedIso: Int? = null,
     val exposureProductRatio: Double? = null,
     val exposureErrorEv: Double? = null,
-    val allowedExposureErrorEv: Double? = null
+    val allowedExposureErrorEv: Double? = null,
+    val productPreferred: Boolean = true
 )
 
 object FrameSelectionExposurePolicy {
@@ -129,28 +130,30 @@ object FrameSelectionExposurePolicy {
 
         if (requestedIso <= 0) {
             return FrameSelectionExposureDecision(
-                eligible = false,
+                eligible = true,
                 requestedExposureTargetNs = requestedExposureTargetNs,
                 toleratedExposureMinNs = strictMinNs,
                 toleratedExposureMaxNs = strictMaxNs,
                 actualExposureNs = actualExposureNs,
                 deviationNs = deviationNs,
-                reason = "INVALID_REQUESTED_ISO_TARGET",
+                reason = "SHUTTER_ELIGIBLE_INVALID_REQUESTED_ISO_FOR_PREFERENCE",
                 actualIso = actualIso,
-                requestedIso = requestedIso
+                requestedIso = requestedIso,
+                productPreferred = false
             )
         }
         if (actualIso == null || actualIso <= 0) {
             return FrameSelectionExposureDecision(
-                eligible = false,
+                eligible = true,
                 requestedExposureTargetNs = requestedExposureTargetNs,
                 toleratedExposureMinNs = strictMinNs,
                 toleratedExposureMaxNs = strictMaxNs,
                 actualExposureNs = actualExposureNs,
                 deviationNs = deviationNs,
-                reason = "UNPROVEN_FRAME_ISO",
+                reason = "SHUTTER_ELIGIBLE_UNPROVEN_ISO_FOR_PREFERENCE",
                 actualIso = actualIso,
-                requestedIso = requestedIso
+                requestedIso = requestedIso,
+                productPreferred = false
             )
         }
 
@@ -168,17 +171,17 @@ object FrameSelectionExposurePolicy {
         } else {
             TRANSITION_PRODUCT_ERROR_EV
         }
-        val productEligible = exposureErrorEv.isFinite() && abs(exposureErrorEv) <= allowedErrorEv
+        val productPreferred = exposureErrorEv.isFinite() && abs(exposureErrorEv) <= allowedErrorEv
         val reason = when {
-            productEligible && shutterReason == "WITHIN_CURRENT_EXPOSURE_CONTRACT" ->
+            productPreferred && shutterReason == "WITHIN_CURRENT_EXPOSURE_CONTRACT" ->
                 "WITHIN_CURRENT_EXPOSURE_PRODUCT_CONTRACT"
-            productEligible -> "TRANSITIONAL_WARM_FRAME_EXPOSURE_COMPENSATED"
-            !exposureErrorEv.isFinite() -> "INVALID_FRAME_EXPOSURE_PRODUCT"
-            exposureErrorEv < -allowedErrorEv -> "FRAME_EXPOSURE_PRODUCT_TOO_LOW"
-            else -> "FRAME_EXPOSURE_PRODUCT_TOO_HIGH"
+            productPreferred -> "TRANSITIONAL_WARM_FRAME_EXPOSURE_COMPENSATED"
+            !exposureErrorEv.isFinite() -> "SHUTTER_ELIGIBLE_INVALID_EXPOSURE_PRODUCT_FALLBACK"
+            exposureErrorEv < -allowedErrorEv -> "SHUTTER_ELIGIBLE_PRODUCT_TOO_LOW_FALLBACK"
+            else -> "SHUTTER_ELIGIBLE_PRODUCT_TOO_HIGH_FALLBACK"
         }
         return FrameSelectionExposureDecision(
-            eligible = productEligible,
+            eligible = true,
             requestedExposureTargetNs = requestedExposureTargetNs,
             toleratedExposureMinNs = strictMinNs,
             toleratedExposureMaxNs = strictMaxNs,
@@ -189,7 +192,8 @@ object FrameSelectionExposurePolicy {
             requestedIso = requestedIso,
             exposureProductRatio = exposureProductRatio,
             exposureErrorEv = exposureErrorEv.takeIf { it.isFinite() },
-            allowedExposureErrorEv = allowedErrorEv
+            allowedExposureErrorEv = allowedErrorEv,
+            productPreferred = productPreferred
         )
     }
 
