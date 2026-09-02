@@ -393,12 +393,12 @@ class FrameRingBuffer(private var capacity: Int = 35) {
 
     private fun selectionExposureDecision(pair: ZslFramePair) =
         FrameSelectionExposurePolicy.evaluate(
-            actualExposureNs = pair.sensorMetadataSnapshot?.sensorExposureTimeNs?.takeIf { it > 0L }
+            actualExposureNs = pair.sensorMetadataSnapshot?.exposureTimeNs?.takeIf { it > 0L }
                 ?: pair.exposureTimeNs.takeIf { it > 0L }
                 ?: runCatching { pair.metadata?.get(CaptureResult.SENSOR_EXPOSURE_TIME) }.getOrNull()
                 ?: 0L,
             requestedExposureTargetNs = selectionExposureTargetNs,
-            actualIso = pair.sensorMetadataSnapshot?.sensorSensitivityIso?.takeIf { it > 0 }
+            actualIso = pair.sensorMetadataSnapshot?.sensitivityIso?.takeIf { it > 0 }
                 ?: runCatching { pair.metadata?.get(CaptureResult.SENSOR_SENSITIVITY) }.getOrNull()?.takeIf { it > 0 },
             requestedIso = selectionExposureTargetIso.takeIf { it > 0 }
         )
