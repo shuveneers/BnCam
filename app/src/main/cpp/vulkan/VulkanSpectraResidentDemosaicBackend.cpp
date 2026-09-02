@@ -52,6 +52,33 @@ ResidualSampling residualSamplingFor(std::uint32_t width, std::uint32_t height) 
     return sampling;
 }
 
+
+constexpr std::uint64_t kHueSatHeaderFloats = 16u;
+constexpr std::uint64_t kColorTelemetryWords = 20u;
+
+bool hueSatTableValid(const SpectraResidentColorTransformRequest& request, const float* table,
+                      std::size_t floatCount) noexcept {
+    if (table == nullptr || request.hueSatHueDivisions < 1u || request.hueSatSaturationDivisions < 2u ||
+        request.hueSatValueDivisions < 1u || request.hueSatEncoding > 1u) return false;
+    const std::uint64_t entries = static_cast<std::uint64_t>(request.hueSatHueDivisions) *
+            request.hueSatSaturationDivisions * request.hueSatValueDivisions;
+    if (entries == 0u || entries > (1u << 20) || floatCount != entries * 3u) return false;
+    for (std::uint64_t i = 0u; i < entries; ++i) {
+        const float h = table[i * 3u + 0u];
+        const float sat = table[i * 3u + 1u];
+        const float val = table[i * 3u + 2u];
+        if (!std::isfinite(h) || !std::isfinite(sat) || !std::isfinite(val) || sat < 0.0f || val < 0.0f) return false;
+    }
+    for (std::uint32_t v = 0u; v < request.hueSatValueDivisions; ++v) {
+        for (std::uint32_t h = 0u; h < request.hueSatHueDivisions; ++h) {
+            const std::uint64_t cell = (static_cast<std::uint64_t>(v) * request.hueSatHueDivisions + h) *
+                    request.hueSatSaturationDivisions;
+            if (std::abs(table[cell * 3u + 2u] - 1.0f) > 1.0e-5f) return false;
+        }
+    }
+    return true;
+}
+
 struct alignas(16) PushConstants {
     std::uint32_t frameWidth = 0;
     std::uint32_t frameHeight = 0;
@@ -145,7 +172,7 @@ void VulkanSpectraResidentDemosaicBackend::destroyBuffersLocked() noexcept {
     if (allocator_ != nullptr) {
         for (PersistentBuffer* buffer : {&inputStaging_, &outputReadback_, &deviceInput_, &deviceOutput_,
                                          &rgbUpload_, &colorStatistics_, &colorTelemetry_, &sourceClipConfidence_,
-                                         &cloudCorrectionMap_, &residualCandidates_}) {
+                                         &cloudCorrectionMap_, &hueSatProfile_, &residualCandidates_}) {
             if (buffer->buffer != VK_NULL_HANDLE && buffer->allocation != nullptr) {
                 vmaDestroyBuffer(allocator_, buffer->buffer, buffer->allocation);
             }
@@ -217,8 +244,8 @@ bool VulkanSpectraResidentDemosaicBackend::initializeLocked(
         failureReason = "RESIDENT_DEMOSAIC_INITIALIZATION_INPUT_INVALID";
         return false;
     }
-    VkDescriptorSetLayoutBinding bindings[7]{};
-    for (std::uint32_t i = 0; i < 7u; ++i) {
+    VkDescriptorSetLayoutBinding bindings[8]{};
+    for (std::uint32_t i = 0; i < 8u; ++i) {
         bindings[i].binding = i;
         bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         bindings[i].descriptorCount = 1u;
@@ -226,7 +253,7 @@ bool VulkanSpectraResidentDemosaicBackend::initializeLocked(
     }
     VkDescriptorSetLayoutCreateInfo descriptorInfo{};
     descriptorInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    descriptorInfo.bindingCount = 7u;
+    descriptorInfo.bindingCount = 8u;
     descriptorInfo.pBindings = bindings;
     if (vkCreateDescriptorSetLayout(device, &descriptorInfo, nullptr, &descriptorSetLayout_) != VK_SUCCESS) {
         failureReason = "vkCreateDescriptorSetLayout_resident_demosaic_failed";
@@ -268,7 +295,7 @@ bool VulkanSpectraResidentDemosaicBackend::initializeLocked(
     }
     VkDescriptorPoolSize poolSize{};
     poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    poolSize.descriptorCount = 7u;
+    poolSize.descriptorCount = 8u;
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolInfo.maxSets = 1u;
@@ -319,7 +346,7 @@ bool VulkanSpectraResidentDemosaicBackend::initializeLocked(
 }
 
 void VulkanSpectraResidentDemosaicBackend::updateDescriptorSetLocked(VkDevice device, VkBuffer inputOverride, VkBuffer scratchOverride) noexcept {
-    VkDescriptorBufferInfo infos[7]{};
+    VkDescriptorBufferInfo infos[8]{};
     infos[0].buffer = inputOverride != VK_NULL_HANDLE ? inputOverride : deviceInput_.buffer;
     infos[1].buffer = deviceOutput_.buffer;
     // Binding 2 aliases output only for demosaic modes that do not need scratch. AMaZE/Auto Hybrid
@@ -330,9 +357,10 @@ void VulkanSpectraResidentDemosaicBackend::updateDescriptorSetLocked(VkDevice de
     infos[4].buffer = residualCandidates_.buffer;
     infos[5].buffer = cloudCorrectionMap_.buffer;
     infos[6].buffer = colorTelemetry_.buffer;
+    infos[7].buffer = hueSatProfile_.buffer != VK_NULL_HANDLE ? hueSatProfile_.buffer : colorTelemetry_.buffer;
     for (auto& info : infos) info.range = VK_WHOLE_SIZE;
-    VkWriteDescriptorSet writes[7]{};
-    for (std::uint32_t i = 0; i < 7u; ++i) {
+    VkWriteDescriptorSet writes[8]{};
+    for (std::uint32_t i = 0; i < 8u; ++i) {
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].dstSet = descriptorSet_;
         writes[i].dstBinding = i;
@@ -340,7 +368,7 @@ void VulkanSpectraResidentDemosaicBackend::updateDescriptorSetLocked(VkDevice de
         writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         writes[i].pBufferInfo = &infos[i];
     }
-    vkUpdateDescriptorSets(device, 7u, writes, 0u, nullptr);
+    vkUpdateDescriptorSets(device, 8u, writes, 0u, nullptr);
     descriptorBindingsInitialized_ = true;
 }
 
@@ -982,11 +1010,35 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
             request.preWbCloudValidTileCount >= 6u;
     const std::uint64_t cloudMapRecordCount = cloudMapContractValid ? 192u : 1u;
     const std::uint64_t cloudMapBytes = cloudMapRecordCount * 4u * sizeof(float);
+    const bool hueSatData1Valid = request.calibratedHueSatMapEnabled &&
+            hueSatTableValid(request, request.hueSatData1, request.hueSatData1FloatCount);
+    const bool hueSatSecondRequested = request.hueSatData2 != nullptr || request.hueSatData2FloatCount != 0u ||
+            request.hueSatWeightSecond > 1.0e-6f;
+    const bool hueSatData2Valid = !hueSatSecondRequested ||
+            hueSatTableValid(request, request.hueSatData2, request.hueSatData2FloatCount);
+    const float hueSatWeightFirst = std::clamp(request.hueSatWeightFirst, 0.0f, 1.0f);
+    const float hueSatWeightSecond = std::clamp(request.hueSatWeightSecond, 0.0f, 1.0f);
+    const bool hueSatWeightsValid = std::isfinite(request.hueSatWeightFirst) &&
+            std::isfinite(request.hueSatWeightSecond) &&
+            std::abs((hueSatWeightFirst + hueSatWeightSecond) - 1.0f) <= 1.0e-3f;
+    const bool hueSatMapContractValid = request.calibratedHueSatMapEnabled && hueSatData1Valid &&
+            hueSatData2Valid && hueSatWeightsValid;
+    const std::uint64_t hueSatEntryCount = hueSatMapContractValid
+            ? static_cast<std::uint64_t>(request.hueSatHueDivisions) * request.hueSatSaturationDivisions *
+                    request.hueSatValueDivisions : 0u;
+    const std::uint64_t hueSatTableFloats = hueSatEntryCount * 3u;
+    const std::uint64_t hueSatProfileFloats = kHueSatHeaderFloats + hueSatTableFloats +
+            (hueSatSecondRequested && hueSatMapContractValid ? hueSatTableFloats : 0u);
+    const std::uint64_t hueSatProfileBytes = std::max<std::uint64_t>(kHueSatHeaderFloats * sizeof(float),
+            hueSatProfileFloats * sizeof(float));
+    result.calibratedHueSatMapRequested = request.calibratedHueSatMapEnabled;
+    result.calibratedHueSatMapWeightFirst = hueSatWeightFirst;
+    result.calibratedHueSatMapWeightSecond = hueSatWeightSecond;
     result.residualSampleStride = residualSampling.stride;
     result.residualSampleColumns = residualSampling.columns;
     result.residualSampleRows = residualSampling.rows;
     result.compactStatisticsBytes = statisticsBytes + residualSampling.bytes +
-            16u * sizeof(std::uint32_t);
+            kColorTelemetryWords * sizeof(std::uint32_t);
 
     const bool residentInputUsable = residentDemosaicValid_ &&
             request.residentDemosaicGeneration != 0u &&
@@ -1014,8 +1066,9 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
         (!request.deferFullReadback &&
          !ensureBufferLocked(allocator, rgbBytes, readAccess, outputReadback_, reallocated, failure)) ||
         !ensureBufferLocked(allocator, statisticsBytes, readAccess, colorStatistics_, reallocated, failure) ||
-        !ensureBufferLocked(allocator, 16u * sizeof(std::uint32_t), readAccess, colorTelemetry_, reallocated, failure) ||
+        !ensureBufferLocked(allocator, kColorTelemetryWords * sizeof(std::uint32_t), readAccess, colorTelemetry_, reallocated, failure) ||
         !ensureBufferLocked(allocator, cloudMapBytes, writeAccess, cloudCorrectionMap_, reallocated, failure) ||
+        !ensureBufferLocked(allocator, hueSatProfileBytes, writeAccess, hueSatProfile_, reallocated, failure) ||
         !ensureBufferLocked(allocator, std::max<std::uint64_t>(24u, residualSampling.bytes),
                             readAccess, residualCandidates_, reallocated, failure)) {
         result.status = "GPU_COLOR_TRANSFORM_BUFFER_ALLOCATION_FAILED";
@@ -1030,7 +1083,7 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
             deviceInput_.capacityBytes + deviceOutput_.capacityBytes + rgbUpload_.capacityBytes +
             colorStatistics_.capacityBytes + colorTelemetry_.capacityBytes +
             sourceClipConfidence_.capacityBytes + cloudCorrectionMap_.capacityBytes +
-            residualCandidates_.capacityBytes;
+            hueSatProfile_.capacityBytes + residualCandidates_.capacityBytes;
     result.phase9SourceRawConfidenceMapUsed = sourceClipConfidenceReady;
     result.phase9SourceRawConfidenceMapBytes = sourceClipConfidenceReady ? expectedClipBytes : 0u;
 
@@ -1049,6 +1102,30 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
         result.cloudCorrectionMapBytes = cloudMapBytes;
     }
     vmaFlushAllocation(allocator, cloudCorrectionMap_.allocation, 0u, static_cast<VkDeviceSize>(cloudMapBytes));
+
+    // Upload only trusted, already-validated DNG tables. The resident shader performs the
+    // actual illuminant blend and trilinear HSM sampling; no scene-derived synthetic LUT exists.
+    float* hueSatPacked = static_cast<float*>(hueSatProfile_.mapped);
+    std::fill(hueSatPacked, hueSatPacked + static_cast<std::ptrdiff_t>(hueSatProfileBytes / sizeof(float)), 0.0f);
+    hueSatPacked[0] = hueSatMapContractValid ? 1.0f : 0.0f;
+    if (hueSatMapContractValid) {
+        hueSatPacked[1] = static_cast<float>(request.hueSatHueDivisions);
+        hueSatPacked[2] = static_cast<float>(request.hueSatSaturationDivisions);
+        hueSatPacked[3] = static_cast<float>(request.hueSatValueDivisions);
+        hueSatPacked[4] = static_cast<float>(request.hueSatEncoding);
+        hueSatPacked[5] = hueSatWeightFirst;
+        hueSatPacked[6] = hueSatWeightSecond;
+        hueSatPacked[7] = hueSatSecondRequested ? 1.0f : 0.0f;
+        hueSatPacked[8] = static_cast<float>(hueSatEntryCount);
+        std::memcpy(hueSatPacked + kHueSatHeaderFloats, request.hueSatData1,
+                    static_cast<std::size_t>(hueSatTableFloats) * sizeof(float));
+        if (hueSatSecondRequested) {
+            std::memcpy(hueSatPacked + kHueSatHeaderFloats + hueSatTableFloats, request.hueSatData2,
+                        static_cast<std::size_t>(hueSatTableFloats) * sizeof(float));
+        }
+        result.calibratedHueSatMapProfileBytes = hueSatProfileFloats * sizeof(float);
+    }
+    vmaFlushAllocation(allocator, hueSatProfile_.allocation, 0u, static_cast<VkDeviceSize>(hueSatProfileBytes));
     // Phase 9: immutable pre-WB RGB at binding 1, protected post-CCM output at binding 2.
     // Binding 0 is repurposed in mode 3 for the source-RAW confidence map when the exact
     // demosaic generation owns one; CPU/reference fallbacks retain the legacy path.
@@ -1106,7 +1183,7 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr, 1u, &barrier, 0u, nullptr);
     }
     vkCmdFillBuffer(commandBuffer_, colorTelemetry_.buffer, 0u,
-                    16u * sizeof(std::uint32_t), 0u);
+                    kColorTelemetryWords * sizeof(std::uint32_t), 0u);
     VkBufferMemoryBarrier phase9TelemetryClear{};
     phase9TelemetryClear.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
     phase9TelemetryClear.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -1114,7 +1191,7 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
     phase9TelemetryClear.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     phase9TelemetryClear.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     phase9TelemetryClear.buffer = colorTelemetry_.buffer;
-    phase9TelemetryClear.size = 16u * sizeof(std::uint32_t);
+    phase9TelemetryClear.size = kColorTelemetryWords * sizeof(std::uint32_t);
     vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_TRANSFER_BIT,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr,
                          1u, &phase9TelemetryClear, 0u, nullptr);
@@ -1130,6 +1207,19 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
         vkCmdPipelineBarrier(
                 commandBuffer_, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                 0u, 0u, nullptr, 1u, &cloudHostToShader, 0u, nullptr);
+    }
+    if (hueSatMapContractValid) {
+        VkBufferMemoryBarrier hueSatHostToShader{};
+        hueSatHostToShader.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        hueSatHostToShader.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+        hueSatHostToShader.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        hueSatHostToShader.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        hueSatHostToShader.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        hueSatHostToShader.buffer = hueSatProfile_.buffer;
+        hueSatHostToShader.size = static_cast<VkDeviceSize>(hueSatProfileBytes);
+        vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_HOST_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u,
+                             0u, nullptr, 1u, &hueSatHostToShader, 0u, nullptr);
     }
     if (sourceClipConfidenceReady) {
         VkBufferMemoryBarrier sourceClipReady{};
@@ -1241,7 +1331,7 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
     barriers[3].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barriers[3].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barriers[3].buffer = colorTelemetry_.buffer;
-    barriers[3].size = 16u * sizeof(std::uint32_t);
+    barriers[3].size = kColorTelemetryWords * sizeof(std::uint32_t);
     const VkPipelineStageFlags colorDestinationStage = request.deferFullReadback
             ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT
             : VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT;
@@ -1301,7 +1391,7 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
     }
     vmaInvalidateAllocation(allocator, colorStatistics_.allocation, 0u, static_cast<VkDeviceSize>(statisticsBytes));
     vmaInvalidateAllocation(allocator, colorTelemetry_.allocation, 0u,
-                            16u * sizeof(std::uint32_t));
+                            kColorTelemetryWords * sizeof(std::uint32_t));
     if (residualSampling.bytes > 0u) {
         vmaInvalidateAllocation(allocator, residualCandidates_.allocation, 0u,
                                 static_cast<VkDeviceSize>(residualSampling.bytes));
@@ -1348,6 +1438,8 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
     result.phase9SourceRawZeroConfidencePixels = phase9[13];
     result.phase9SourceRawPartialConfidencePixels = phase9[14];
     result.phase9SourceRawDemosaicDisagreementPixels = phase9[15];
+    result.calibratedHueSatMapAppliedPixels = phase9[16];
+    result.calibratedHueSatMapApplied = hueSatMapContractValid && phase9[16] > 0u;
     result.compactStatisticsReductionMs = elapsedMs(reduceStart);
     result.success = request.deferFullReadback ||
             result.outputRgb.size() == static_cast<std::size_t>(pixelCount) * 3u;
@@ -1373,7 +1465,9 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
     }
     result.status = result.success
             ? (request.deferFullReadback
-                    ? "GPU_PRIMARY_AWB_CCM_RESIDENT_OUTPUT"
+                    ? (result.calibratedHueSatMapApplied
+                            ? "GPU_PRIMARY_AWB_DNG_CCM_HUESATMAP_RESIDENT_OUTPUT"
+                            : "GPU_PRIMARY_AWB_CCM_RESIDENT_OUTPUT")
                     : (useResident ? "GPU_PRIMARY_AWB_CCM_RESIDENT_DEMOSAIC_INPUT"
                                    : "GPU_PRIMARY_AWB_CCM_CPU_RGB_UPLOAD_FALLBACK_INPUT"))
             : "GPU_COLOR_TRANSFORM_READBACK_INCOMPLETE";

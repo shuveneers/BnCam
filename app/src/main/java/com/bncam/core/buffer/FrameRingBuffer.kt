@@ -8,6 +8,8 @@ import android.hardware.camera2.TotalCaptureResult
 import android.media.Image
 import android.util.Log
 import com.bncam.core.capture.FrameRequestProvenance
+import com.bncam.core.quality.FrameSensorMetadataSnapshot
+import com.bncam.core.capture.FrameSelectionExposurePolicy
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
 import java.util.ArrayDeque
@@ -64,6 +66,24 @@ data class StreamTimingEstimate(
     val pairCompletionLagSampleCount: Int
 )
 
+data class FrameSelectionExposureConstraintSnapshot(
+    val active: Boolean,
+    val pipelineGeneration: Int,
+    val expectedFormat: Int,
+    val requestedExposureTargetNs: Long?,
+    val toleratedExposureMinNs: Long?,
+    val toleratedExposureMaxNs: Long?,
+    val source: String,
+    val rejectedCandidateCount: Int
+) {
+    fun summary(): String =
+        "active=$active;generation=$pipelineGeneration;format=$expectedFormat;" +
+            "requestedExposureTargetNs=${requestedExposureTargetNs ?: "none"};" +
+            "toleratedExposureMinNs=${toleratedExposureMinNs ?: "none"};" +
+            "toleratedExposureMaxNs=${toleratedExposureMaxNs ?: "none"};" +
+            "source=$source;rejectedCandidateCount=$rejectedCandidateCount"
+}
+
 data class FrameRingBufferObservabilitySnapshot(
     val pipelineGeneration: Int,
     val timestampSourceCameraId: String,
@@ -107,6 +127,7 @@ class ZslFramePair {
     var image: Image? = null
     var hardwareBuffer: HardwareBuffer? = null
     var metadata: TotalCaptureResult? = null
+    var sensorMetadataSnapshot: FrameSensorMetadataSnapshot? = null
     var format: Int = 0
     var generationId: Int = -1
     var controlRequestEpoch: Long = 0L
@@ -149,6 +170,7 @@ class ZslFramePair {
         disposalRequested = false
         try { releaseHardwareBufferOnly() } finally {
             metadata = null
+            sensorMetadataSnapshot = null
             timestamp = 0L
             format = 0
             generationId = -1
@@ -224,6 +246,7 @@ data class FrameCandidateSnapshot(
     val frameVersion: Long,
     val format: Int,
     val metadata: TotalCaptureResult,
+    val sensorMetadataSnapshot: FrameSensorMetadataSnapshot?,
     val afState: Int,
     val lensState: Int
 )
@@ -290,6 +313,14 @@ class FrameRingBuffer(private var capacity: Int = 35) {
     @Volatile var leasedFrameMutations = 0
     @Volatile var predictiveAfTracker: com.bncam.core.capture.PredictiveAfTracker? = null
 
+    // Phase-1 selection-only exposure contract. Frames remain ring-owned even when they are no
+    // longer eligible for shutter selection under a newly tightened RAW exposure request.
+    @Volatile private var selectionExposureConstraintGeneration: Int = -1
+    @Volatile private var selectionExposureConstraintFormat: Int = 0
+    @Volatile private var selectionExposureTargetNs: Long = 0L
+    @Volatile private var selectionExposureConstraintSource: String = "NONE"
+    @Volatile private var selectionExposureRejectedCandidateCount: Int = 0
+
     private fun currentElapsedRealtimeNanos(): Long {
         return try {
             android.os.SystemClock.elapsedRealtimeNanos()
@@ -351,6 +382,85 @@ class FrameRingBuffer(private var capacity: Int = 35) {
         const val TIMING_SAMPLE_LIMIT = 9
         const val EVENT_HISTORY_LIMIT = 32
         const val MAX_REASONABLE_FRAME_DURATION_NS = 1_000_000_000L
+    }
+
+    private fun selectionExposureDecision(pair: ZslFramePair) =
+        FrameSelectionExposurePolicy.evaluate(
+            actualExposureNs = pair.exposureTimeNs.takeIf { it > 0L }
+                ?: runCatching { pair.metadata?.get(CaptureResult.SENSOR_EXPOSURE_TIME) }.getOrNull()
+                ?: 0L,
+            requestedExposureTargetNs = selectionExposureTargetNs
+        )
+
+    private fun selectionExposureAllows(pair: ZslFramePair, recordRejection: Boolean): Boolean {
+        val active = selectionExposureTargetNs > 0L &&
+            selectionExposureConstraintGeneration == activeGeneration &&
+            pair.generationId == selectionExposureConstraintGeneration &&
+            pair.format == selectionExposureConstraintFormat
+        if (!active) return true
+        val decision = selectionExposureDecision(pair)
+        if (!decision.eligible && recordRejection) {
+            selectionExposureRejectedCandidateCount++
+            SafeLog.i(
+                tag,
+                "SELECTION_EXPOSURE_REJECT timestampNs=${pair.timestamp} " +
+                    "actualExposureNs=${decision.actualExposureNs} " +
+                    "requestedExposureTargetNs=${decision.requestedExposureTargetNs} " +
+                    "toleratedExposureMinNs=${decision.toleratedExposureMinNs} " +
+                    "toleratedExposureMaxNs=${decision.toleratedExposureMaxNs} " +
+                    "reason=${decision.reason} source=$selectionExposureConstraintSource"
+            )
+        }
+        return decision.eligible
+    }
+
+    @Synchronized
+    fun setSelectionExposureConstraint(
+        generationId: Int,
+        expectedFormat: Int,
+        exposureTargetNs: Long,
+        source: String
+    ) {
+        if (generationId != activeGeneration || exposureTargetNs <= 0L) {
+            clearSelectionExposureConstraint("INVALID_OR_STALE:$source")
+            return
+        }
+        selectionExposureConstraintGeneration = generationId
+        selectionExposureConstraintFormat = expectedFormat
+        selectionExposureTargetNs = exposureTargetNs
+        selectionExposureConstraintSource = source.ifBlank { "UNSPECIFIED" }
+    }
+
+    @Synchronized
+    fun clearSelectionExposureConstraint(source: String = "CLEARED") {
+        selectionExposureConstraintGeneration = -1
+        selectionExposureConstraintFormat = 0
+        selectionExposureTargetNs = 0L
+        selectionExposureConstraintSource = source.ifBlank { "CLEARED" }
+    }
+
+    @Synchronized
+    fun selectionExposureConstraintSnapshot(): FrameSelectionExposureConstraintSnapshot {
+        val active = selectionExposureTargetNs > 0L &&
+            selectionExposureConstraintGeneration == activeGeneration
+        val toleratedRange = if (active) {
+            FrameSelectionExposurePolicy.evaluate(
+                actualExposureNs = selectionExposureTargetNs,
+                requestedExposureTargetNs = selectionExposureTargetNs
+            ).let { it.toleratedExposureMinNs to it.toleratedExposureMaxNs }
+        } else {
+            null
+        }
+        return FrameSelectionExposureConstraintSnapshot(
+            active = active,
+            pipelineGeneration = selectionExposureConstraintGeneration,
+            expectedFormat = selectionExposureConstraintFormat,
+            requestedExposureTargetNs = selectionExposureTargetNs.takeIf { active },
+            toleratedExposureMinNs = toleratedRange?.first,
+            toleratedExposureMaxNs = toleratedRange?.second,
+            source = selectionExposureConstraintSource,
+            rejectedCandidateCount = selectionExposureRejectedCandidateCount
+        )
     }
 
     private fun timestampSourceLabel(source: Int): String = when (source) {
@@ -707,7 +817,8 @@ class FrameRingBuffer(private var capacity: Int = 35) {
         timestamp: Long,
         result: TotalCaptureResult,
         generationId: Int = activeGeneration,
-        requestProvenance: FrameRequestProvenance?
+        requestProvenance: FrameRequestProvenance?,
+        sensorMetadataSnapshot: FrameSensorMetadataSnapshot? = null
     ) {
         val metadataArrivalElapsedNs = currentElapsedRealtimeNanos()
         if (generationId != activeGeneration) {
@@ -762,6 +873,7 @@ class FrameRingBuffer(private var capacity: Int = 35) {
             return
         }
         pair.metadata = result
+        pair.sensorMetadataSnapshot = sensorMetadataSnapshot
         pair.generationId = generationId
         pair.controlRequestEpoch = requestProvenance.identity.controlRequestEpoch
         pair.requestProvenance = requestProvenance
@@ -1008,6 +1120,7 @@ class FrameRingBuffer(private var capacity: Int = 35) {
             frameVersion = pair.frameVersion,
             format = pair.format,
             metadata = metadata,
+            sensorMetadataSnapshot = pair.sensorMetadataSnapshot,
             afState = pair.afState,
             lensState = pair.lensState
         )
@@ -1025,7 +1138,8 @@ class FrameRingBuffer(private var capacity: Int = 35) {
                     hasExactRequestProvenance(it) &&
                     it.timestamp != 0L &&
                     it.hardwareBuffer != null &&
-                    it.metadata != null
+                    it.metadata != null &&
+                    selectionExposureAllows(it, recordRejection = false)
             }
             .sortedBy {
                 try { it.metadata?.get(CaptureResult.SENSOR_TIMESTAMP) } catch (_: Throwable) { null }
@@ -1053,7 +1167,8 @@ class FrameRingBuffer(private var capacity: Int = 35) {
                 it.timestamp != 0L &&
                 (it.hardwareBuffer != null ||
                     (it.format == android.graphics.ImageFormat.YUV_420_888 && it.image != null)) &&
-                it.metadata != null
+                it.metadata != null &&
+                selectionExposureAllows(it, recordRejection = false)
         }
         val filtered = if (userShutterTimestampNs > 0L) {
             valid.filter { pair ->
@@ -1088,7 +1203,8 @@ class FrameRingBuffer(private var capacity: Int = 35) {
                 it.timestamp != 0L &&
                 (it.hardwareBuffer != null ||
                     (it.format == android.graphics.ImageFormat.YUV_420_888 && it.image != null)) &&
-                it.metadata != null
+                it.metadata != null &&
+                selectionExposureAllows(it, recordRejection = false)
         }
         val filtered = if (userShutterTimestampNs > 0L) {
             valid.filter { pair ->
@@ -1177,7 +1293,8 @@ class FrameRingBuffer(private var capacity: Int = 35) {
                     hasExactRequestProvenance(it) &&
                     it.timestamp != 0L &&
                     it.hardwareBuffer != null &&
-                    it.metadata != null
+                    it.metadata != null &&
+                    selectionExposureAllows(it, recordRejection = false)
         }
         val filtered = if (userShutterTimestampNs > 0L) {
             valid.filter { pair ->
@@ -1416,7 +1533,8 @@ class FrameRingBuffer(private var capacity: Int = 35) {
                 it.format == expectedFormat &&
                 it.image != null &&
                 it.hardwareBuffer != null &&
-                it.metadata != null
+                it.metadata != null &&
+                selectionExposureAllows(it, recordRejection = true)
         }
     }
 
@@ -1765,6 +1883,11 @@ class FrameRingBuffer(private var capacity: Int = 35) {
 
     @Synchronized
     fun clear() {
+        selectionExposureConstraintGeneration = -1
+        selectionExposureConstraintFormat = 0
+        selectionExposureTargetNs = 0L
+        selectionExposureConstraintSource = "BUFFER_CLEAR"
+        selectionExposureRejectedCandidateCount = 0
         buffer.forEach { pair ->
             if (pair.close()) {
                 deferredCloseCount++

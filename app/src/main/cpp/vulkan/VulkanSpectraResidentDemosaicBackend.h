@@ -147,6 +147,20 @@ struct SpectraResidentColorTransformRequest {
     std::array<float, 9> colorMatrix{1.0f, 0.0f, 0.0f,
                                      0.0f, 1.0f, 0.0f,
                                      0.0f, 0.0f, 1.0f};
+    // Phase 2 calibrated camera characterization. The LUT is accepted only after IspCore has
+    // resolved a trusted profile and its paired DNG ForwardMatrix transform. Table storage is
+    // canonical dense value-hue-saturation order, three floats per entry.
+    bool calibratedHueSatMapEnabled = false;
+    std::uint32_t hueSatHueDivisions = 0u;
+    std::uint32_t hueSatSaturationDivisions = 0u;
+    std::uint32_t hueSatValueDivisions = 0u;
+    std::uint32_t hueSatEncoding = 0u; // DNG: 0 linear, 1 sRGB value encoding.
+    const float* hueSatData1 = nullptr;
+    std::size_t hueSatData1FloatCount = 0u;
+    const float* hueSatData2 = nullptr;
+    std::size_t hueSatData2FloatCount = 0u;
+    float hueSatWeightFirst = 1.0f;
+    float hueSatWeightSecond = 0.0f;
     // 8H-J keeps post-CCM RGB resident for highlight/scene/tone Vulkan processing.
     bool deferFullReadback = false;
 };
@@ -166,6 +180,12 @@ struct SpectraResidentColorTransformResult {
     double cloudMeanAbsCorrectionRG = 0.0;
     double cloudMeanAbsCorrectionBG = 0.0;
     double cloudAffectedPixelFraction = 0.0;
+    bool calibratedHueSatMapRequested = false;
+    bool calibratedHueSatMapApplied = false;
+    std::uint64_t calibratedHueSatMapAppliedPixels = 0u;
+    std::uint64_t calibratedHueSatMapProfileBytes = 0u;
+    float calibratedHueSatMapWeightFirst = 1.0f;
+    float calibratedHueSatMapWeightSecond = 0.0f;
     std::uint64_t residentColorGeneration = 0;
     std::vector<float> outputRgb;
     std::vector<float> residualCandidates;
@@ -316,9 +336,9 @@ private:
     PersistentBuffer rgbUpload_;
     // Twelve float sums per 16x16 workgroup: raw/WB/CCM means plus cloud-correction telemetry.
     PersistentBuffer colorStatistics_;
-    // Phase 9: compact counters only; no full-frame clipping/gamut evidence readback.
-    // Words [12..15] verify the source-RAW confidence map independently from the legacy
-    // demosaiced-ceiling detector.
+    // Phase 9 + calibrated camera-profile compact counters only; no full-frame evidence readback.
+    // Words [12..15] verify source-RAW confidence. Words [16..19] are reserved for the
+    // trusted DNG HueSatMap application contract.
     PersistentBuffer colorTelemetry_;
     // D124: owned half-resolution confidence map copied from the appended RawFinalize
     // transport tail during the demosaic submission. It survives independently of the
@@ -326,6 +346,9 @@ private:
     PersistentBuffer sourceClipConfidence_;
     // Delta 46: compact 16x12 vec4 map: correctionRG, correctionBG, valid, reserved.
     PersistentBuffer cloudCorrectionMap_;
+    // Phase 2: persistent host-uploaded trusted DNG HueSatMap profile. Header (16 floats),
+    // followed by dense data1 and optional data2. No generated/synthetic LUT is accepted.
+    PersistentBuffer hueSatProfile_;
     // Six floats per sampled residual point; host-visible because the CPU only performs the
     // compact percentile/tile reduction, never another full-frame RGB scan.
     PersistentBuffer residualCandidates_;

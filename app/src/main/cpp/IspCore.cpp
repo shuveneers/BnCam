@@ -17,10 +17,17 @@
 #include "SpectraPhysicalBaselineNr.h"
 #include "SingleFrameRawDenoisePolicy.h"
 #include "SpectraPostDemosaicResidualNr.h"
+#include "SpectraResidualSeedConfidence.h"
 #include "SpectraResidualChromaArtifact.h"
 #include "PhysicalAwbEstimator.h"
 #include "SensorColorScienceV2.h"
 #include "RawCameraProfileRenderPolicy.h"
+#include "RawCameraColorCharacterizationOwnership.h"
+#include "RawCameraColorProfileRegistry.h"
+#include "RawCameraColorProfileResolver.h"
+#include "RawCameraDngForwardTransform.h"
+#include "RawCameraCalibratedHueSatRuntime.h"
+#include "RawCameraHueSatMapTelemetry.h"
 #include "HighlightGamutProtectionV2.h"
 #include "SpectraMultiscaleContext.h"
 #include "SpectraMultiscaleResidualConsensus.h"
@@ -2139,6 +2146,12 @@ struct Phase9ColorProtectionDebug {
     std::uint64_t sourceRawZeroConfidencePixels = 0u;
     std::uint64_t sourceRawPartialConfidencePixels = 0u;
     std::uint64_t sourceRawDemosaicDisagreementPixels = 0u;
+    bool calibratedHueSatMapRequested = false;
+    bool calibratedHueSatMapApplied = false;
+    std::uint64_t calibratedHueSatMapAppliedPixels = 0u;
+    std::uint64_t calibratedHueSatMapProfileBytes = 0u;
+    float calibratedHueSatMapWeightFirst = 1.0f;
+    float calibratedHueSatMapWeightSecond = 0.0f;
     float cpuFallbackMs = 0.0f;
 };
 
@@ -12092,46 +12105,26 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     const double residualSeedBlueVariance = finalVisibleVarianceReady
             ? finalVisibleVarianceByChannel[3]
             : predictedChannelVariance[3];
-    // The final lens-shading provenance already carries a validated per-channel variance field.
-    // In resident/SPECTRA-Off captures the expensive host signal-statistics pass is deliberately
-    // skipped, so validNoiseChannels is zero even though finalVisibleVarianceReady is true. Using
-    // that unrelated host-stat coverage here collapsed covariance confidence to exactly zero and
-    // disabled downstream prediction authority. Trust provenance coverage when its RGB variances
-    // are complete; only use validNoiseChannels for the explicit fallback seed.
-    const double residualSeedChannelCoverage = finalVisibleVarianceReady
-            ? 1.0
-            : std::clamp(static_cast<double>(validNoiseChannels) / 4.0, 0.0, 1.0);
-    const bool residualSeedHasSufficientChannels =
-            finalVisibleVarianceReady || validNoiseChannels >= 3;
-    const double provenanceModelConfidence = std::clamp(
-            static_cast<double>(finalProvenance.meanDiagnosticConfidence), 0.0, 1.0);
-    const double physicalBaselineModelConfidence = physicalRawDenoiseActive
-            ? std::clamp(static_cast<double>(singleFrameRawDenoise.modelConfidence), 0.0, 1.0)
-            : 0.0;
-    // SPECTRA-Off deliberately skips some diagnostic provenance work, but that must not erase
-    // confidence in an already-validated physical S/O model. Recover authority only when the
-    // resident lens-shading provenance supplied a complete RGB variance seed; the fallback path
-    // remains provenance-only so partial/unknown covariance can never acquire invented confidence.
-    const double residualSeedModelConfidence = finalVisibleVarianceReady
-            ? std::max(provenanceModelConfidence, physicalBaselineModelConfidence)
-            : provenanceModelConfidence;
+    // Resolve the covariance confidence from the authority that actually produced the seed.
+    // Resident SPECTRA-Off may intentionally have no diagnostic provenance field while still
+    // carrying a validated Camera2 S/O model and complete capture-local channel variances. Do
+    // not erase that physical authority merely because the optional diagnostic route was skipped.
+    const bncam::spectra2::ResidualSeedConfidencePlan residualSeedConfidence =
+            bncam::spectra2::resolveResidualSeedConfidence(
+                    finalVisibleVarianceReady,
+                    validNoiseChannels,
+                    static_cast<double>(finalProvenance.meanDiagnosticConfidence),
+                    physicalRawDenoiseActive,
+                    static_cast<double>(singleFrameRawDenoise.modelConfidence),
+                    static_cast<double>(workingMeta.calibration.signalModelConfidence),
+                    residualSeedRedVariance,
+                    residualSeedGreenVariance,
+                    residualSeedBlueVariance);
     residualNoiseState.preDemosaic = bncam::spectra2::makeState(
             "POST_LENS_SHADING_PRE_DEMOSAIC",
-            finalVisibleVarianceReady
-                    ? "CAMERA2_SO_LENS_SHADING_FIELD_SCALED_BY_MEASURED_RESIDUAL_REDUCTION"
-                    : "CAMERA2_SO_SCALED_BY_MEASURED_RESIDUAL_REDUCTION_LENS_SHADING_FALLBACK",
-            residualSeedHasSufficientChannels
-                    ? (finalVisibleVarianceReady
-                            ? "PROPAGATION_SEED_READY"
-                            : "PROPAGATION_SEED_LENS_SHADING_FALLBACK")
-                    : "PARTIAL_CHANNEL_FALLBACK",
-            std::clamp(
-                    residualSeedModelConfidence *
-                            residualSeedChannelCoverage *
-                            (finalVisibleVarianceReady ? 0.90 : 0.70),
-                    0.0,
-                    1.0
-            ),
+            residualSeedConfidence.method,
+            residualSeedConfidence.status,
+            residualSeedConfidence.confidence,
             bncam::spectra2::diagonalCovariance(
                     residualSeedRedVariance * chromaResidualScale,
                     residualSeedGreenVariance * lumaResidualScale,
@@ -13084,7 +13077,115 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     };
     const float phase7AwbEstimatorMs = elapsedMs(phase7AwbStart);
 
-    const float* ccm = meta.calibration.effectiveColorMatrix;
+    const float* camera2Ccm = meta.calibration.effectiveColorMatrix;
+    std::array<float, 9> activeColorMatrix{};
+    for (std::size_t i = 0; i < activeColorMatrix.size(); ++i) {
+        activeColorMatrix[i] = camera2Ccm[i];
+    }
+
+    // Phase 2: calibrated camera characterization is discovered from a real DNG profile and
+    // reused only when it matches the current RAW colour route. A matching profile owns both
+    // the paired DNG ForwardMatrix transform and its HueSatMap; the Camera2 CCM is not stacked
+    // underneath that profile. Missing/mismatched profiles leave the existing Camera2 route
+    // untouched. A configured matching profile that cannot resolve its paired PCS transform
+    // fails closed rather than being hidden by the legacy OKLab camera-presentation fallback.
+    const bncam::color::RawCameraProfileRegistrySnapshot calibratedProfileRegistry =
+            bncam::color::RawCameraColorProfileRegistry::instance().snapshot();
+    const bncam::color::RawCameraColorProfileResolution calibratedProfileResolution =
+            bncam::color::resolveRawCameraColorProfile(
+                    calibratedProfileRegistry,
+                    {activeColorMatrix, {wbRgb[0], wbRgb[1], wbRgb[2]}});
+    const bncam::color::RawCameraNativeHueSatProfile* calibratedProfile = nullptr;
+    if (calibratedProfileResolution.profileIndex < calibratedProfileRegistry.profiles.size()) {
+        calibratedProfile = &calibratedProfileRegistry.profiles[calibratedProfileResolution.profileIndex];
+    }
+    const bool calibratedProfileConfiguredForCurrentRoute = calibratedProfile != nullptr;
+    bncam::color::RawCameraDngForwardTransformResult calibratedForwardTransform{};
+    if (calibratedProfileConfiguredForCurrentRoute && calibratedProfileResolution.ready) {
+        calibratedForwardTransform = bncam::color::resolveRawCameraDngForwardTransform({
+                calibratedProfile,
+                calibratedProfileResolution.hueSatWeightFirst,
+                calibratedProfileResolution.hueSatWeightSecond,
+                {wbRgb[0], wbRgb[1], wbRgb[2]}
+        });
+    } else {
+        calibratedForwardTransform.status = calibratedProfileConfiguredForCurrentRoute
+                ? "PROFILE_RESOLUTION_NOT_READY"
+                : "NO_MATCHING_PROFILE_FOR_CURRENT_ROUTE";
+    }
+    const bncam::color::RawCameraColorCharacterizationPlan cameraCharacterizationPlan =
+            bncam::color::resolveRawCameraColorCharacterizationOwnership({
+                    calibratedProfileConfiguredForCurrentRoute,
+                    calibratedProfileResolution.ready,
+                    calibratedProfile != nullptr && calibratedProfile->valid(),
+                    calibratedForwardTransform.ready,
+                    true
+            });
+    const bool calibratedHueSatMapActive = cameraCharacterizationPlan.calibratedHueSatMapApply;
+    if (calibratedHueSatMapActive) {
+        activeColorMatrix = calibratedForwardTransform.postWbToLinearSrgb;
+    }
+    const bncam::color::RawCameraHueSatMapTelemetrySummary hueSatMapTelemetry =
+            bncam::color::summarizeRawCameraHueSatMapProfile(
+                    calibratedProfile,
+                    calibratedProfileResolution.hueSatWeightFirst,
+                    calibratedProfileResolution.hueSatWeightSecond);
+    const bool phase2CameraMatrixInterpolated = calibratedHueSatMapActive &&
+            calibratedProfile != nullptr && calibratedProfile->dualIlluminant() &&
+            calibratedProfileResolution.hueSatWeightFirst > 1.0e-5f &&
+            calibratedProfileResolution.hueSatWeightSecond > 1.0e-5f;
+    const char* phase2CameraMatrixSource = calibratedHueSatMapActive
+            ? "PAIRED_DNG_FORWARD_MATRIX_XYZ_D50"
+            : (exactCamera2ColorPair
+                    ? "CAMERA2_EXACT_FRAME_COLOR_CORRECTION_TRANSFORM"
+                    : "RESOLVED_SENSOR_COLOR_MATRIX_FALLBACK");
+    const char* phase2ColorWorkingSpace = calibratedHueSatMapActive
+            ? "DNG_XYZ_D50_TO_LINEAR_RIMM_HSV_TO_SCENE_LINEAR_SRGB"
+            : "SCENE_LINEAR_SRGB_NO_CALIBRATED_HUESATMAP";
+    const float* ccm = activeColorMatrix.data();
+
+    const auto makeCpuHueSatMap = [&](const std::vector<float>& data,
+                                      bncam::color::RawCameraHueSatMapSource source) {
+        bncam::color::RawCameraHueSatMap map{};
+        if (calibratedProfile == nullptr || data.empty()) return map;
+        map.hueDivisions = calibratedProfile->hueDivisions;
+        map.saturationDivisions = calibratedProfile->saturationDivisions;
+        map.valueDivisions = calibratedProfile->valueDivisions;
+        map.source = source;
+        map.sourceId = calibratedProfile->profileId;
+        map.trustedCalibration = true;
+        map.encoding = calibratedProfile->encoding == 1
+                ? bncam::color::RawCameraHueSatMapEncoding::SRGB
+                : bncam::color::RawCameraHueSatMapEncoding::LINEAR;
+        map.dynamicRange = bncam::color::RawCameraHueSatMapDynamicRange::SDR;
+        const std::size_t entryCount = data.size() / 3u;
+        map.entries.reserve(entryCount);
+        for (std::size_t i = 0; i < entryCount; ++i) {
+            const std::size_t base = i * 3u;
+            map.entries.push_back({data[base], data[base + 1u], data[base + 2u]});
+        }
+        return map;
+    };
+    bncam::color::RawCameraHueSatMap calibratedHueSatMapCpu{};
+    if (calibratedHueSatMapActive && calibratedProfile != nullptr) {
+        const auto firstMap = makeCpuHueSatMap(
+                calibratedProfile->hueSatData1,
+                bncam::color::RawCameraHueSatMapSource::DNG_PROFILE_DATA_1);
+        if (!calibratedProfile->hueSatData2.empty()) {
+            const auto secondMap = makeCpuHueSatMap(
+                    calibratedProfile->hueSatData2,
+                    bncam::color::RawCameraHueSatMapSource::DNG_PROFILE_DATA_2);
+            calibratedHueSatMapCpu = bncam::color::rawCameraBlendHueSatMaps(
+                    firstMap, &secondMap, calibratedProfileResolution.hueSatWeightFirst);
+            calibratedHueSatMapCpu.sourceId = calibratedProfile->profileId;
+            calibratedHueSatMapCpu.trustedCalibration = true;
+        } else {
+            calibratedHueSatMapCpu = firstMap;
+        }
+    }
+    const bool calibratedHueSatMapCpuReady = calibratedHueSatMapActive &&
+            calibratedHueSatMapCpu.productEligible() &&
+            calibratedHueSatMapCpu.directReferenceApplicationSupported();
 
     // Delta 50: direction-resolved downstream opponent amplification audit. A unit pre-WB
     // R-G error is represented by an R-only perturbation (G fixed); B-G analogously uses B.
@@ -13431,6 +13532,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     double rawRSum = 0.0, rawGSum = 0.0, rawBSum = 0.0;
     double wbRSum = 0.0, wbGSum = 0.0, wbBSum = 0.0;
     double ccmRSum = 0.0, ccmGSum = 0.0, ccmBSum = 0.0;
+    std::atomic<std::uint64_t> cpuFallbackHueSatAppliedPixels{0u};
     bncam::vulkan::SpectraResidentColorTransformResult vulkanColorTransform{};
     const auto awbColourTransformStart = IspClock::now();
     {
@@ -13465,6 +13567,22 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         }
         for (size_t i = 0; i < request.colorMatrix.size(); ++i) {
             request.colorMatrix[i] = ccm[i];
+        }
+        request.calibratedHueSatMapEnabled = calibratedHueSatMapActive;
+        if (calibratedHueSatMapActive && calibratedProfile != nullptr) {
+            request.hueSatHueDivisions = static_cast<std::uint32_t>(calibratedProfile->hueDivisions);
+            request.hueSatSaturationDivisions =
+                    static_cast<std::uint32_t>(calibratedProfile->saturationDivisions);
+            request.hueSatValueDivisions = static_cast<std::uint32_t>(calibratedProfile->valueDivisions);
+            request.hueSatEncoding = static_cast<std::uint32_t>(calibratedProfile->encoding);
+            request.hueSatData1 = calibratedProfile->hueSatData1.data();
+            request.hueSatData1FloatCount = calibratedProfile->hueSatData1.size();
+            if (!calibratedProfile->hueSatData2.empty()) {
+                request.hueSatData2 = calibratedProfile->hueSatData2.data();
+                request.hueSatData2FloatCount = calibratedProfile->hueSatData2.size();
+            }
+            request.hueSatWeightFirst = calibratedProfileResolution.hueSatWeightFirst;
+            request.hueSatWeightSecond = calibratedProfileResolution.hueSatWeightSecond;
         }
         vulkanColorTransform =
                 bncam::vulkan::VulkanRuntime::instance().executeSpectraResidentAwbCcm(request);
@@ -13649,14 +13767,35 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                     localWbG += wbG;
                     localWbB += wbB;
 
-                    const float r = std::max(0.0f, ccm[0] * wbR + ccm[1] * wbG + ccm[2] * wbB);
-                    const float g = std::max(0.0f, ccm[3] * wbR + ccm[4] * wbG + ccm[5] * wbB);
-                    const float b = std::max(0.0f, ccm[6] * wbR + ccm[7] * wbG + ccm[8] * wbB);
-                    localCcmR += r;
-                    localCcmG += g;
-                    localCcmB += b;
+                    const float signedR = ccm[0] * wbR + ccm[1] * wbG + ccm[2] * wbB;
+                    const float signedG = ccm[3] * wbR + ccm[4] * wbG + ccm[5] * wbB;
+                    const float signedB = ccm[6] * wbR + ccm[7] * wbG + ccm[8] * wbB;
+                    cv::Vec3f rendered(
+                            std::max(0.0f, signedR),
+                            std::max(0.0f, signedG),
+                            std::max(0.0f, signedB));
+                    if (calibratedHueSatMapCpuReady) {
+                        bool hsmApplied = false;
+                        const auto corrected = bncam::color::rawCameraApplyCalibratedHueSatMapLinearSrgb(
+                                calibratedHueSatMapCpu,
+                                {signedR, signedG, signedB},
+                                &hsmApplied);
+                        if (hsmApplied) {
+                            rendered = cv::Vec3f(
+                                    std::max(0.0f, corrected[0]),
+                                    std::max(0.0f, corrected[1]),
+                                    std::max(0.0f, corrected[2]));
+                            cpuFallbackHueSatAppliedPixels.fetch_add(1u, std::memory_order_relaxed);
+                        }
+                    }
+                    // Keep Phase-8 matrix statistics in the linear post-matrix/pre-HSM domain
+                    // on both GPU and failure-only CPU routes. The scene observer later sees
+                    // the actual calibrated profile output.
+                    localCcmR += std::max(0.0f, signedR);
+                    localCcmG += std::max(0.0f, signedG);
+                    localCcmB += std::max(0.0f, signedB);
 
-                    row[x] = cv::Vec3f(r, g, b);
+                    row[x] = rendered;
                 }
             }
             std::lock_guard<std::mutex> lock(colorStatsMutex);
@@ -13755,13 +13894,50 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                 vulkanColorTransform.phase9SourceRawPartialConfidencePixels;
         phase9ColorDebug.sourceRawDemosaicDisagreementPixels =
                 vulkanColorTransform.phase9SourceRawDemosaicDisagreementPixels;
+        phase9ColorDebug.calibratedHueSatMapRequested =
+                vulkanColorTransform.calibratedHueSatMapRequested;
+        phase9ColorDebug.calibratedHueSatMapApplied =
+                vulkanColorTransform.calibratedHueSatMapApplied;
+        phase9ColorDebug.calibratedHueSatMapAppliedPixels =
+                vulkanColorTransform.calibratedHueSatMapAppliedPixels;
+        phase9ColorDebug.calibratedHueSatMapProfileBytes =
+                vulkanColorTransform.calibratedHueSatMapProfileBytes;
+        phase9ColorDebug.calibratedHueSatMapWeightFirst =
+                vulkanColorTransform.calibratedHueSatMapWeightFirst;
+        phase9ColorDebug.calibratedHueSatMapWeightSecond =
+                vulkanColorTransform.calibratedHueSatMapWeightSecond;
+    } else if (cpuColorTransformApplied) {
+        phase9ColorDebug.calibratedHueSatMapRequested = calibratedHueSatMapActive;
+        phase9ColorDebug.calibratedHueSatMapAppliedPixels =
+                cpuFallbackHueSatAppliedPixels.load(std::memory_order_relaxed);
+        phase9ColorDebug.calibratedHueSatMapApplied =
+                phase9ColorDebug.calibratedHueSatMapAppliedPixels > 0u;
+        phase9ColorDebug.calibratedHueSatMapProfileBytes = (calibratedProfile != nullptr
+                        ? static_cast<std::uint64_t>((calibratedProfile->hueSatData1.size() +
+                                calibratedProfile->hueSatData2.size()) * sizeof(float))
+                        : 0u);
+        phase9ColorDebug.calibratedHueSatMapWeightFirst =
+                calibratedProfileResolution.hueSatWeightFirst;
+        phase9ColorDebug.calibratedHueSatMapWeightSecond =
+                calibratedProfileResolution.hueSatWeightSecond;
     }
 
     // Failure-only CPU materialization. The normal path stays device-resident from demosaic
     // through Phase-9 sensor-clip/gamut protection and scene observation. If the Vulkan color
     // stage fails, recreate the deterministic Phase-9 CPU reference exactly once.
     const auto materializeCpuPostCcmReference = [&]() {
-        if (cpuColorTransformApplied && !linearRgb.empty()) return;
+        if (cpuColorTransformApplied && !linearRgb.empty()) {
+            phase9ColorDebug.calibratedHueSatMapRequested = calibratedHueSatMapActive;
+            phase9ColorDebug.calibratedHueSatMapAppliedPixels =
+                    cpuFallbackHueSatAppliedPixels.load(std::memory_order_relaxed);
+            phase9ColorDebug.calibratedHueSatMapApplied =
+                    phase9ColorDebug.calibratedHueSatMapAppliedPixels > 0u;
+            phase9ColorDebug.calibratedHueSatMapWeightFirst =
+                    calibratedProfileResolution.hueSatWeightFirst;
+            phase9ColorDebug.calibratedHueSatMapWeightSecond =
+                    calibratedProfileResolution.hueSatWeightSecond;
+            return;
+        }
         const auto phase9CpuStart = IspClock::now();
         linearRgb = runCpuDemosaicFallback();
         vulkanDemosaicResident = false;
@@ -13791,6 +13967,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         std::atomic<std::uint64_t> legacyMagentaRisk{0u};
         std::atomic<std::uint64_t> protectedMagentaRisk{0u};
         std::atomic<std::uint64_t> sceneLinearOverUnity{0u};
+        std::atomic<std::uint64_t> calibratedHueSatAppliedPixels{0u};
 
         cv::parallel_for_(cv::Range(0, linearRgb.rows), [&](const cv::Range& range) {
             for (int y = range.start; y < range.end; ++y) {
@@ -13839,8 +14016,20 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                     if (confidenceSafe.applied) {
                         colorConfidenceApplied.fetch_add(1u, std::memory_order_relaxed);
                     }
+                    bncam::highlight::Rgb profileInput = confidenceSafe.rgb;
+                    if (calibratedHueSatMapCpuReady) {
+                        bool hsmApplied = false;
+                        const auto corrected = bncam::color::rawCameraApplyCalibratedHueSatMapLinearSrgb(
+                                calibratedHueSatMapCpu,
+                                {profileInput.r, profileInput.g, profileInput.b},
+                                &hsmApplied);
+                        if (hsmApplied) {
+                            profileInput = {corrected[0], corrected[1], corrected[2]};
+                            calibratedHueSatAppliedPixels.fetch_add(1u, std::memory_order_relaxed);
+                        }
+                    }
                     const auto protectedCcm =
-                            bncam::highlight::protectSignedCcmLowerGamut(confidenceSafe.rgb);
+                            bncam::highlight::protectSignedCcmLowerGamut(profileInput);
                     if (protectedCcm.applied) gamutCompressed.fetch_add(1u, std::memory_order_relaxed);
                     if (bncam::highlight::heuristicMagentaHighlightRisk(protectedCcm.rgb)) {
                         protectedMagentaRisk.fetch_add(1u, std::memory_order_relaxed);
@@ -13871,6 +14060,15 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         phase9ColorDebug.legacyMagentaRiskPixels = legacyMagentaRisk.load(std::memory_order_relaxed);
         phase9ColorDebug.protectedMagentaRiskPixels = protectedMagentaRisk.load(std::memory_order_relaxed);
         phase9ColorDebug.sceneLinearOverUnityPixels = sceneLinearOverUnity.load(std::memory_order_relaxed);
+        phase9ColorDebug.calibratedHueSatMapRequested = calibratedHueSatMapActive;
+        phase9ColorDebug.calibratedHueSatMapAppliedPixels =
+                calibratedHueSatAppliedPixels.load(std::memory_order_relaxed);
+        phase9ColorDebug.calibratedHueSatMapApplied =
+                phase9ColorDebug.calibratedHueSatMapAppliedPixels > 0u;
+        phase9ColorDebug.calibratedHueSatMapWeightFirst =
+                calibratedProfileResolution.hueSatWeightFirst;
+        phase9ColorDebug.calibratedHueSatMapWeightSecond =
+                calibratedProfileResolution.hueSatWeightSecond;
         phase9ColorDebug.cpuFallbackMs = elapsedMs(phase9CpuStart);
         cpuColorTransformApplied = true;
     };
@@ -14299,7 +14497,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                     phase7FllfPhysicalNoisePressure,
                     lowLightScene
             });
-    const bncam::color::RawCameraProfileRenderPlan cameraProfileRenderPlan =
+    const bncam::color::RawCameraProfileRenderPlan legacyCameraProfileRenderPlan =
             bncam::color::resolveRawCameraProfileRenderPlan({
                     phase8ColorMatrixAudit.finite,
                     phase8ColorMatrixAudit.determinant,
@@ -14314,6 +14512,16 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                     phase7FllfPhysicalNoisePressure,
                     lowLightScene
             });
+    bncam::color::RawCameraProfileRenderPlan cameraProfileRenderPlan{};
+    if (cameraCharacterizationPlan.legacyPresentationApply) {
+        cameraProfileRenderPlan = legacyCameraProfileRenderPlan;
+    } else if (cameraCharacterizationPlan.calibratedHueSatMapApply) {
+        cameraProfileRenderPlan.reason = "DISABLED_CALIBRATED_HUESATMAP_SINGLE_OWNER";
+    } else if (cameraCharacterizationPlan.failClosed) {
+        cameraProfileRenderPlan.reason = "DISABLED_CALIBRATED_PROFILE_FAIL_CLOSED";
+    } else {
+        cameraProfileRenderPlan.reason = "DISABLED_CAMERA_CHARACTERIZATION_NONE";
+    }
     const bncam::tone::ProfileToneRenderPlan profileTonePlan =
             bncam::tone::resolveProfileToneRenderPlan({
                     uiConfig.profileToneExposure,
@@ -16183,13 +16391,13 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; toneShadowPressure=" << dynamicRangeTonePlan.shadowPressure
             << "; toneDynamicRangePressure=" << dynamicRangeTonePlan.dynamicRangePressure
             << "; toneSceneMidtoneTarget=" << dynamicRangeTonePlan.sceneMidtoneTarget
-            << "; phase10ToneArchitecture=" << "GTM_SCENE_PLACEMENT__FLLF_LOCAL_CONTRAST__CAMERA_PROFILE__AGX"
+            << "; phase10ToneArchitecture=" << "GTM_SCENE_PLACEMENT__FLLF_LOCAL_CONTRAST__CAMERA_CHARACTERIZATION__AGX"
             << "; phase10RawGtmSceneReferredOnly=" << "true"
             << "; phase10GtmOutputDomain=" << "SCENE_LINEAR_EXPOSURE_PLACED"
             << "; phase10FllfDomain=" << "SCENE_LINEAR_LOCAL_CONTRAST_NO_GLOBAL_EXPOSURE_AUTHORITY"
             << "; phase10AgxRole=" << "SOLE_AUTOMATIC_SCENE_TO_DISPLAY_DRT"
             << "; phase10AutomaticPostAgxLook=" << "IDENTITY_UNLESS_EXPLICIT_PROFILE_TONE"
-            << "; rawColorAutomaticCameraRender=" << "BOUNDED_PRE_AGX_OKLAB_CHROMA"
+            << "; rawColorAutomaticCameraRender=" << (calibratedHueSatMapActive ? "CALIBRATED_DNG_HUESATMAP_PRE_AGX" : "BOUNDED_PRE_AGX_OKLAB_CHROMA")
             << "; rawColorCameraProfileRenderEnabled="
             << (cameraProfileRenderPlan.enabled ? "true" : "false")
             << "; rawColorCameraProfileRenderStrength=" << cameraProfileRenderPlan.renderStrength
@@ -17311,6 +17519,20 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; singleFrameRawPass3ColBandingApplied=" << (pass3State.applyColBanding ? "true" : "false")
             << "; singleFrameRawPreDemosaicLumaReduction=" << physicalPreDemosaicLumaReduction
             << "; singleFrameRawPreDemosaicChromaReduction=" << physicalPreDemosaicChromaReduction
+            << "; residualSeedConfidence=" << residualSeedConfidence.confidence
+            << "; residualSeedConfidenceStatus=" << residualSeedConfidence.status
+            << "; residualSeedConfidenceMethod=" << residualSeedConfidence.method
+            << "; residualSeedPhysicalFallbackActive="
+            << (residualSeedConfidence.physicalFallbackActive ? "true" : "false")
+            << "; residualSeedChannelCoverage=" << residualSeedConfidence.channelCoverage
+            << "; residualSeedVarianceReady="
+            << (residualSeedConfidence.varianceReady ? "true" : "false")
+            << "; phase14PlannerInputLumaSigma=" << phase14ResidualLumaSigma
+            << "; phase14PlannerInputChromaSigma=" << phase14ResidualChromaSigma
+            << "; phase14PlannerInputModelConfidence=" << phase14PostToneResidualModelConfidence
+            << "; phase14PhysicalNoiseModelAvailable="
+            << (physicalNoiseModelAvailable ? "true" : "false")
+            << "; phase14SpectraContextFusionActive=" << (spectraNoiseActive ? "true" : "false")
             << "; phase14ResidualBudgetActive=" << (spectraResidualNr.active ? "true" : "false")
             << "; phase14ResidualAuthoritySource=" << spectraResidualNr.authoritySource
             << "; phase14ResidualCovarianceAuthoritative="
@@ -17352,13 +17574,13 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << dynamicRangeTonePlan.recoverableHighlightPressure
             << "; toneDynamicRangePressure=" << dynamicRangeTonePlan.dynamicRangePressure
             << "; toneSceneMidtoneTarget=" << dynamicRangeTonePlan.sceneMidtoneTarget
-            << "; phase10ToneArchitecture=" << "GTM_SCENE_PLACEMENT__FLLF_LOCAL_CONTRAST__CAMERA_PROFILE__AGX"
+            << "; phase10ToneArchitecture=" << "GTM_SCENE_PLACEMENT__FLLF_LOCAL_CONTRAST__CAMERA_CHARACTERIZATION__AGX"
             << "; phase10RawGtmSceneReferredOnly=" << "true"
             << "; phase10GtmOutputDomain=" << "SCENE_LINEAR_EXPOSURE_PLACED"
             << "; phase10FllfDomain=" << "SCENE_LINEAR_LOCAL_CONTRAST_NO_GLOBAL_EXPOSURE_AUTHORITY"
             << "; phase10AgxRole=" << "SOLE_AUTOMATIC_SCENE_TO_DISPLAY_DRT"
             << "; phase10AutomaticPostAgxLook=" << "IDENTITY_UNLESS_EXPLICIT_PROFILE_TONE"
-            << "; rawColorAutomaticCameraRender=" << "BOUNDED_PRE_AGX_OKLAB_CHROMA"
+            << "; rawColorAutomaticCameraRender=" << (calibratedHueSatMapActive ? "CALIBRATED_DNG_HUESATMAP_PRE_AGX" : "BOUNDED_PRE_AGX_OKLAB_CHROMA")
             << "; rawColorCameraProfileRenderEnabled="
             << (cameraProfileRenderPlan.enabled ? "true" : "false")
             << "; rawColorCameraProfileRenderStrength=" << cameraProfileRenderPlan.renderStrength
@@ -17920,8 +18142,78 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << (phase8PrePresentationSceneAudit.finite ? "true" : "false")
             << "; phase8PrePresentationSceneMeanRgbSpread="
             << phase8PrePresentationSceneAudit.normalizedRgbSpread
-            << "; rawColorCameraProfileRenderOwner=POST_CCM_OKLAB_CHROMA_PRE_AGX"
-            << "; rawColorCameraProfileHuePolicy=HUE_PRESERVING_NO_SYNTHETIC_SENSOR_HUES"
+            << "; ColorWorkingSpace=" << phase2ColorWorkingSpace
+            << "; CameraMatrixSource=" << phase2CameraMatrixSource
+            << "; CameraMatrixInterpolated=" << (phase2CameraMatrixInterpolated ? "true" : "false")
+            << "; HueSatMapAvailable=" << (hueSatMapTelemetry.available ? "true" : "false")
+            << "; HueSatMapSource=" << hueSatMapTelemetry.source
+            << "; HueSatMapDims="
+            << hueSatMapTelemetry.hueDivisions << "x"
+            << hueSatMapTelemetry.saturationDivisions << "x"
+            << hueSatMapTelemetry.valueDivisions
+            << "; HueSatMapEncoding="
+            << (hueSatMapTelemetry.available
+                    ? (hueSatMapTelemetry.encoding == 1 ? "SRGB" : "LINEAR")
+                    : "UNAVAILABLE")
+            << "; HueSatMapIlluminantCount=" << hueSatMapTelemetry.illuminantCount
+            << "; HueSatMapInterpolationWeight=" << hueSatMapTelemetry.interpolationWeight
+            << "; HueSatMapApplied="
+            << (phase9ColorDebug.calibratedHueSatMapApplied ? "true" : "false")
+            << "; HueSatMapGpuPrimary="
+            << (phase9ColorDebug.calibratedHueSatMapApplied && phase9ColorDebug.gpuPrimary
+                    ? "true" : "false")
+            << "; MeanAbsHueShift=" << hueSatMapTelemetry.meanAbsHueShift
+            << "; MeanSaturationScale=" << hueSatMapTelemetry.meanSaturationScale
+            << "; MeanValueScale=" << hueSatMapTelemetry.meanValueScale
+            << "; MaxAbsHueShift=" << hueSatMapTelemetry.maxAbsHueShift
+            << "; HueSatMapStatisticDomain=" << hueSatMapTelemetry.statisticDomain
+            << "; ClippingConfidenceGateApplied="
+            << (phase9ColorDebug.colorConfidenceAppliedPixels > 0u ? "true" : "false")
+            << "; LegacyCameraProfileRenderApplied="
+            << (cameraCharacterizationPlan.legacyPresentationApply &&
+                    cameraProfileRenderPlan.enabled &&
+                    cameraProfileRenderPlan.renderStrength > 1.0e-6f
+                    ? "true" : "false")
+            << "; rawColorCharacterizationOwner="
+            << (cameraCharacterizationPlan.owner == bncam::color::RawCameraColorCharacterizationOwner::CALIBRATED_HUESATMAP
+                    ? "CALIBRATED_DNG_HUESATMAP"
+                    : (cameraCharacterizationPlan.owner == bncam::color::RawCameraColorCharacterizationOwner::LEGACY_HUE_PRESERVING_PRESENTATION
+                            ? "LEGACY_HUE_PRESERVING_PRESENTATION" : "NONE"))
+            << "; rawColorCharacterizationReason=" << cameraCharacterizationPlan.reason
+            << "; rawColorProfileRegistryGeneration=" << calibratedProfileRegistry.generation
+            << "; rawColorProfileRegistryCount=" << calibratedProfileRegistry.profiles.size()
+            << "; rawColorCalibratedProfileConfiguredForRoute="
+            << (calibratedProfileConfiguredForCurrentRoute ? "true" : "false")
+            << "; rawColorCalibratedProfileId="
+            << (calibratedProfile != nullptr ? calibratedProfile->profileId : std::string("none"))
+            << "; rawColorCalibratedProfileSourcePriority="
+            << (calibratedProfile != nullptr ? calibratedProfile->sourcePriority : 0)
+            << "; rawColorCalibratedProfileResolutionStatus=" << calibratedProfileResolution.status
+            << "; rawColorCalibratedProfileMatrixShapeDistance="
+            << calibratedProfileResolution.matrixShapeDistance
+            << "; rawColorCalibratedProfileSecondMatrixShapeDistance="
+            << calibratedProfileResolution.secondBestMatrixShapeDistance
+            << "; rawColorCalibratedProfileSceneCctKelvin="
+            << calibratedProfileResolution.sceneCctKelvin
+            << "; rawColorCalibratedProfileWbFitLogRmse=" << calibratedProfileResolution.wbFitLogRmse
+            << "; rawColorCalibratedProfileWeightFirst=" << calibratedProfileResolution.hueSatWeightFirst
+            << "; rawColorCalibratedProfileWeightSecond=" << calibratedProfileResolution.hueSatWeightSecond
+            << "; rawColorDngForwardTransformStatus=" << calibratedForwardTransform.status
+            << "; rawColorDngForwardNeutralD50Error=" << calibratedForwardTransform.neutralD50Error
+            << "; rawColorHueSatMapRequested="
+            << (phase9ColorDebug.calibratedHueSatMapRequested ? "true" : "false")
+            << "; rawColorHueSatMapApplied="
+            << (phase9ColorDebug.calibratedHueSatMapApplied ? "true" : "false")
+            << "; rawColorHueSatMapAppliedPixels=" << phase9ColorDebug.calibratedHueSatMapAppliedPixels
+            << "; rawColorHueSatMapProfileBytes=" << phase9ColorDebug.calibratedHueSatMapProfileBytes
+            << "; rawColorHueSatMapRuntimeWeightFirst=" << phase9ColorDebug.calibratedHueSatMapWeightFirst
+            << "; rawColorHueSatMapRuntimeWeightSecond=" << phase9ColorDebug.calibratedHueSatMapWeightSecond
+            << "; rawColorCameraProfileRenderOwner="
+            << (cameraCharacterizationPlan.legacyPresentationApply
+                    ? "POST_CCM_OKLAB_CHROMA_PRE_AGX" : "DISABLED_SINGLE_OWNER_CONTRACT")
+            << "; rawColorCameraProfileHuePolicy="
+            << (cameraCharacterizationPlan.legacyPresentationApply
+                    ? "HUE_PRESERVING_NO_SYNTHETIC_SENSOR_HUES" : "CALIBRATED_PROFILE_OWNS_CAMERA_HUE")
             << "; rawColorCameraProfileRenderEnabled="
             << (cameraProfileRenderPlan.enabled ? "true" : "false")
             << "; rawColorCameraProfileRenderStrength=" << cameraProfileRenderPlan.renderStrength
@@ -17950,6 +18242,14 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << phase9ColorDebug.sourceRawPartialConfidencePixels
             << "; phase9SourceRawDemosaicDisagreementPixels="
             << phase9ColorDebug.sourceRawDemosaicDisagreementPixels
+            << "; phase9CalibratedHueSatMapRequested="
+            << (phase9ColorDebug.calibratedHueSatMapRequested ? "true" : "false")
+            << "; phase9CalibratedHueSatMapApplied="
+            << (phase9ColorDebug.calibratedHueSatMapApplied ? "true" : "false")
+            << "; phase9CalibratedHueSatMapAppliedPixels="
+            << phase9ColorDebug.calibratedHueSatMapAppliedPixels
+            << "; phase9CalibratedHueSatMapProfileBytes="
+            << phase9ColorDebug.calibratedHueSatMapProfileBytes
             << "; phase9SourceRawConfidencePropagation=2X2_BAYER_CELL_MIN_CONFIDENCE_PLUS_BOUNDED_3X3_DEMOSAIC_FOOTPRINT"
             << "; phase9LegacyDemosaicConfidenceRole=DIAGNOSTIC_AND_TYPED_CPU_FALLBACK_ONLY"
             << "; phase9SingleChannelSensorClipPixels=" << phase9ColorDebug.singleChannelSensorClipPixels

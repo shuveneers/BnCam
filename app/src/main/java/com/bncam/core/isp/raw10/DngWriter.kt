@@ -93,7 +93,12 @@ object DngWriter {
                 capturedHeader = auditOut.capturedBytes(),
                 orientationExif = exifOrientation,
                 contract = rawDomainContract,
-                characteristics = characteristics
+                characteristics = characteristics,
+                calibrationProfileId = calibration?.base?.calibrationProfileId ?: "unknown",
+                discoveryEffectiveCcm = calibration?.effectiveColorMatrix?.copyOf()
+            )
+            RawCameraColorProfileRepository.installDiscoveredProfile(
+                DngSemanticAuditor.lastCameraColorProfileSnapshot()
             )
             auditOut.bytesWritten
         } catch (t: Throwable) {

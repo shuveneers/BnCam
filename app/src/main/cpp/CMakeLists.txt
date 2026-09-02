@@ -79,6 +79,9 @@ set(BNCAM_VULKAN_PREP_SOURCES
         vulkan/VulkanSpectraPass3PlannerBackend.cpp
         vulkan/VulkanSpectraRawFinalizeBackend.cpp
         vulkan/VulkanSpectraResidentToneBackend.cpp
+        RawCameraColorProfileRegistry.cpp
+        RawCameraColorProfileResolver.cpp
+        RawCameraDngForwardTransform.cpp
 )
 
 

@@ -35,13 +35,95 @@ data class DngAuditReport(
     }
 }
 
+data class DngHueSatMapProfileSnapshot(
+    val available: Boolean = false,
+    val valid: Boolean = false,
+    val hueDivisions: Int = 0,
+    val saturationDivisions: Int = 0,
+    val valueDivisions: Int = 0,
+    val encoding: Int = 0,
+    val data1: FloatArray? = null,
+    val data2: FloatArray? = null,
+    val data3: FloatArray? = null,
+    val status: String = "NOT_PRESENT"
+) {
+    fun copied(): DngHueSatMapProfileSnapshot = copy(
+        data1 = data1?.copyOf(),
+        data2 = data2?.copyOf(),
+        data3 = data3?.copyOf()
+    )
+}
+
+
+data class DngCameraColorProfileSnapshot(
+    val available: Boolean = false,
+    val valid: Boolean = false,
+    val source: String = "OEM_DNGCREATOR",
+    val calibrationProfileId: String = "unknown",
+    val calibrationIlluminant1: Int = 0,
+    val calibrationIlluminant2: Int = 0,
+    val colorMatrix1: FloatArray? = null,
+    val colorMatrix2: FloatArray? = null,
+    val cameraCalibration1: FloatArray? = null,
+    val cameraCalibration2: FloatArray? = null,
+    val forwardMatrix1: FloatArray? = null,
+    val forwardMatrix2: FloatArray? = null,
+    val analogBalance: FloatArray = floatArrayOf(1.0f, 1.0f, 1.0f),
+    val analogBalanceFromTag: Boolean = false,
+    val discoveryEffectiveCcm: FloatArray? = null,
+    val hueSatMap: DngHueSatMapProfileSnapshot = DngHueSatMapProfileSnapshot(),
+    val status: String = "NOT_PRESENT"
+) {
+    fun copied(): DngCameraColorProfileSnapshot = copy(
+        colorMatrix1 = colorMatrix1?.copyOf(),
+        colorMatrix2 = colorMatrix2?.copyOf(),
+        cameraCalibration1 = cameraCalibration1?.copyOf(),
+        cameraCalibration2 = cameraCalibration2?.copyOf(),
+        forwardMatrix1 = forwardMatrix1?.copyOf(),
+        forwardMatrix2 = forwardMatrix2?.copyOf(),
+        analogBalance = analogBalance.copyOf(),
+        discoveryEffectiveCcm = discoveryEffectiveCcm?.copyOf(),
+        hueSatMap = hueSatMap.copied()
+    )
+}
+
 object DngSemanticAuditor {
     private const val TAG = "DngSemanticAuditor"
 
     @Volatile
     private var lastReport: DngAuditReport? = null
 
+    @Volatile
+    private var lastHueSatMapProfile: DngHueSatMapProfileSnapshot = DngHueSatMapProfileSnapshot()
+
+    @Volatile
+    private var lastCameraColorProfile: DngCameraColorProfileSnapshot = DngCameraColorProfileSnapshot()
+
     fun lastReportString(): String = lastReport?.compact() ?: "DNG_AUDIT:status=NOT_RUN"
+
+    fun lastHueSatMapProfileSnapshot(): DngHueSatMapProfileSnapshot =
+        lastHueSatMapProfile.copied()
+
+    fun lastCameraColorProfileSnapshot(): DngCameraColorProfileSnapshot =
+        lastCameraColorProfile.copied()
+
+    fun parseCameraColorProfileBytes(
+        bytes: ByteArray,
+        calibrationProfileId: String,
+        discoveryEffectiveCcm: FloatArray?,
+        source: String
+    ): DngCameraColorProfileSnapshot {
+        val tags = TiffHeaderParser.parse(bytes)
+            ?: return DngCameraColorProfileSnapshot(source = source, calibrationProfileId = calibrationProfileId, status = "TIFF_HEADER_UNAVAILABLE")
+        val hueSatMap = buildHueSatMapSnapshot(tags)
+        return buildCameraColorProfileSnapshot(
+            tags = tags,
+            hueSatMap = hueSatMap,
+            calibrationProfileId = calibrationProfileId,
+            discoveryEffectiveCcm = discoveryEffectiveCcm,
+            source = source
+        )
+    }
 
     fun audit(
         width: Int,
@@ -51,7 +133,9 @@ object DngSemanticAuditor {
         capturedHeader: ByteArray,
         orientationExif: Int,
         contract: RawDomainContract?,
-        characteristics: CameraCharacteristics?
+        characteristics: CameraCharacteristics?,
+        calibrationProfileId: String = "unknown",
+        discoveryEffectiveCcm: FloatArray? = null
     ): DngAuditReport {
         val items = mutableListOf<DngAuditItem>()
         items += DngSemanticRules.validatePayload(
@@ -65,6 +149,8 @@ object DngSemanticAuditor {
 
         val tags = TiffHeaderParser.parse(capturedHeader)
         if (tags == null) {
+            lastHueSatMapProfile = DngHueSatMapProfileSnapshot(status = "TIFF_HEADER_UNAVAILABLE")
+            lastCameraColorProfile = DngCameraColorProfileSnapshot(status = "TIFF_HEADER_UNAVAILABLE")
             items += DngAuditItem("TIFF header", false, "header_not_parseable_or_ifd_not_captured")
         } else {
             items += DngSemanticRules.validateTags(
@@ -83,6 +169,41 @@ object DngSemanticAuditor {
                 expectedWhiteLevel = contract?.payloadWhiteLevel,
                 expectedBlackLevels = contract?.payloadBlackLevels
             )
+            // Phase 2 / DELTA 0143: DngCreator receives the complete CameraCharacteristics and
+            // CaptureResult internally, including system-only RAW profile metadata that normal app
+            // code cannot query directly. Probe the actual DNG bytes rather than reflecting hidden
+            // Camera2 keys. Absence is valid (the tags are optional); malformed presence fails the
+            // semantic audit and is never promoted into a camera profile.
+            val hueSatSnapshot = buildHueSatMapSnapshot(tags)
+            lastHueSatMapProfile = hueSatSnapshot
+            items += DngAuditItem(
+                name = "HueSatMap profile",
+                passed = !hueSatSnapshot.available || hueSatSnapshot.valid,
+                detail = "available=${hueSatSnapshot.available},valid=${hueSatSnapshot.valid}," +
+                    "dims=${hueSatSnapshot.hueDivisions}x${hueSatSnapshot.saturationDivisions}x${hueSatSnapshot.valueDivisions}," +
+                    "encoding=${hueSatSnapshot.encoding},tables=" +
+                    listOf(hueSatSnapshot.data1, hueSatSnapshot.data2, hueSatSnapshot.data3).count { it != null } +
+                    ",status=${hueSatSnapshot.status}"
+            )
+            val cameraProfile = buildCameraColorProfileSnapshot(
+                tags = tags,
+                hueSatMap = hueSatSnapshot,
+                calibrationProfileId = calibrationProfileId,
+                discoveryEffectiveCcm = discoveryEffectiveCcm,
+                source = "OEM_DNGCREATOR"
+            )
+            lastCameraColorProfile = cameraProfile
+            items += DngAuditItem(
+                name = "Camera color profile",
+                passed = !cameraProfile.available || cameraProfile.valid,
+                detail = "available=${cameraProfile.available},valid=${cameraProfile.valid}," +
+                    "profileId=${cameraProfile.calibrationProfileId}," +
+                    "illuminants=${cameraProfile.calibrationIlluminant1}/${cameraProfile.calibrationIlluminant2}," +
+                    "colorMatrices=${listOf(cameraProfile.colorMatrix1, cameraProfile.colorMatrix2).count { it != null }}," +
+                    "forwardMatrices=${listOf(cameraProfile.forwardMatrix1, cameraProfile.forwardMatrix2).count { it != null }}," +
+                    "status=${cameraProfile.status}"
+            )
+
             val geometrySnapshot = DngTagSnapshot(
                 presentTagIds = tags.keys,
                 blackLevels = tags[50714]?.valuesAsLongs(16).orEmpty(),
@@ -176,6 +297,269 @@ private data class TiffTag(
         }
         return values
     }
+
+    fun valuesAsFloats(maxValues: Int): FloatArray? {
+        if (type != 11 || count <= 0L || count > Int.MAX_VALUE.toLong()) return null
+        val size = 4
+        val totalSize = count * size
+        val base = if (totalSize <= 4L) inlineValueOffset else valueOffset
+        if (base < 0 || base >= data.size) return null
+        val capped = minOf(count, maxValues.toLong()).toInt()
+        val out = FloatArray(capped)
+        for (i in 0 until capped) {
+            val offset = base + i * size
+            if (offset + size > data.size) return null
+            out[i] = Float.fromBits(readUInt(data, offset, order).toInt())
+            if (!out[i].isFinite()) return null
+        }
+        return out
+    }
+
+    fun valuesAsDoubles(maxValues: Int): DoubleArray? {
+        val size = typeSize(type) ?: return null
+        if (count <= 0L || count > Int.MAX_VALUE.toLong()) return null
+        val totalSize = count * size
+        val base = if (totalSize <= 4L) inlineValueOffset else valueOffset
+        if (base < 0 || base >= data.size) return null
+        val capped = minOf(count, maxValues.toLong()).toInt()
+        val out = DoubleArray(capped)
+        for (i in 0 until capped) {
+            val offset = base + i * size
+            if (offset + size > data.size) return null
+            val value = when (type) {
+                3 -> readUShort(data, offset, order).toDouble()
+                4 -> readUInt(data, offset, order).toDouble()
+                5 -> {
+                    if (offset + 8 > data.size) return null
+                    val num = readUInt(data, offset, order).toDouble()
+                    val den = readUInt(data, offset + 4, order).toDouble()
+                    if (den == 0.0) return null
+                    num / den
+                }
+                9 -> readInt32(data, offset, order).toDouble()
+                10 -> {
+                    if (offset + 8 > data.size) return null
+                    val num = readInt32(data, offset, order).toDouble()
+                    val den = readInt32(data, offset + 4, order).toDouble()
+                    if (den == 0.0) return null
+                    num / den
+                }
+                11 -> Float.fromBits(readUInt(data, offset, order).toInt()).toDouble()
+                12 -> Double.fromBits(readUInt64(data, offset, order))
+                else -> return null
+            }
+            if (!value.isFinite()) return null
+            out[i] = value
+        }
+        return out
+    }
+
+}
+
+private fun buildHueSatMapSnapshot(tags: Map<Int, TiffTag>): DngHueSatMapProfileSnapshot {
+    val dimsTag = tags[50937] ?: return DngHueSatMapProfileSnapshot(status = "NOT_PRESENT")
+    val dims = dimsTag.valuesAsLongs(3)
+        ?: return DngHueSatMapProfileSnapshot(available = true, status = "DIMS_UNREADABLE")
+    if (dims.size !in 2..3) return DngHueSatMapProfileSnapshot(available = true, status = "DIMS_COUNT_INVALID")
+    val h = dims[0].toInt()
+    val s = dims[1].toInt()
+    val v = if (dims.size >= 3) dims[2].toInt() else 1
+    if (h < 1 || s < 2 || v < 1) {
+        return DngHueSatMapProfileSnapshot(true, false, h, s, v, status = "DIMS_INVALID")
+    }
+    val entries = h.toLong() * s.toLong() * v.toLong()
+    val fullFloatCountLong = entries * 3L
+    val skippedSat0FloatCountLong = h.toLong() * (s - 1).toLong() * v.toLong() * 3L
+    if (fullFloatCountLong <= 0L || fullFloatCountLong > Int.MAX_VALUE.toLong()) {
+        return DngHueSatMapProfileSnapshot(true, false, h, s, v, status = "TABLE_SIZE_OVERFLOW")
+    }
+    val fullFloatCount = fullFloatCountLong.toInt()
+
+    fun readTable(tag: Int): FloatArray? {
+        val t = tags[tag] ?: return null
+        if (t.type != 11) return FloatArray(0)
+        if (t.count == fullFloatCountLong) {
+            return t.valuesAsFloats(fullFloatCount) ?: FloatArray(0)
+        }
+        // DNG SDK also accepts tables that omit saturation index 0. Reconstruct the implicit
+        // identity cells so native/GPU consumers always see one canonical dense layout.
+        if (t.count == skippedSat0FloatCountLong) {
+            val compact = t.valuesAsFloats(skippedSat0FloatCountLong.toInt()) ?: return FloatArray(0)
+            val dense = FloatArray(fullFloatCount)
+            var src = 0
+            for (valueIndex in 0 until v) {
+                for (hueIndex in 0 until h) {
+                    var dst = ((valueIndex * h + hueIndex) * s) * 3
+                    dense[dst] = 0.0f
+                    dense[dst + 1] = 1.0f
+                    dense[dst + 2] = 1.0f
+                    dst += 3
+                    repeat(s - 1) {
+                        dense[dst] = compact[src]
+                        dense[dst + 1] = compact[src + 1]
+                        dense[dst + 2] = compact[src + 2]
+                        src += 3
+                        dst += 3
+                    }
+                }
+            }
+            return dense
+        }
+        return FloatArray(0)
+    }
+
+    val data1 = readTable(50938)
+    val data2 = readTable(50939)
+    val data3 = readTable(52537)
+    if (data1 == null) return DngHueSatMapProfileSnapshot(true, false, h, s, v, status = "DATA1_MISSING")
+    if (data1.size != fullFloatCount || data2?.size == 0 || data3?.size == 0) {
+        return DngHueSatMapProfileSnapshot(true, false, h, s, v, status = "TABLE_TYPE_COUNT_OR_RANGE_INVALID")
+    }
+    if (data3 != null && data2 == null) {
+        return DngHueSatMapProfileSnapshot(true, false, h, s, v, status = "DATA3_WITHOUT_DATA2")
+    }
+    val encoding = tags[51107]?.valuesAsLongs(1)?.firstOrNull()?.toInt() ?: 0
+    if (encoding !in 0..1) return DngHueSatMapProfileSnapshot(true, false, h, s, v, encoding, status = "ENCODING_UNSUPPORTED")
+
+    fun tableValid(table: FloatArray): Boolean {
+        if (table.size != fullFloatCount) return false
+        for (i in table.indices step 3) {
+            val hueShift = table[i]
+            val satScale = table[i + 1]
+            val valueScale = table[i + 2]
+            if (!hueShift.isFinite() || !satScale.isFinite() || !valueScale.isFinite()) return false
+            if (satScale < 0.0f || valueScale < 0.0f) return false
+        }
+        for (valueIndex in 0 until v) {
+            for (hueIndex in 0 until h) {
+                val cell = ((valueIndex * h + hueIndex) * s) * 3
+                if (kotlin.math.abs(table[cell + 2] - 1.0f) > 1.0e-5f) return false
+            }
+        }
+        return true
+    }
+    if (!tableValid(data1) || (data2 != null && !tableValid(data2)) || (data3 != null && !tableValid(data3))) {
+        return DngHueSatMapProfileSnapshot(true, false, h, s, v, encoding, status = "TABLE_DATA_INVALID")
+    }
+    return DngHueSatMapProfileSnapshot(
+        available = true, valid = true,
+        hueDivisions = h, saturationDivisions = s, valueDivisions = v,
+        encoding = encoding, data1 = data1, data2 = data2, data3 = data3,
+        status = if (data3 != null) "VALID_TRIPLE_TABLE" else if (data2 != null) "VALID_DUAL_TABLE" else "VALID_SINGLE_TABLE"
+    )
+}
+
+private fun buildCameraColorProfileSnapshot(
+    tags: Map<Int, TiffTag>,
+    hueSatMap: DngHueSatMapProfileSnapshot,
+    calibrationProfileId: String,
+    discoveryEffectiveCcm: FloatArray?,
+    source: String = "OEM_DNGCREATOR"
+): DngCameraColorProfileSnapshot {
+    if (!hueSatMap.available) return DngCameraColorProfileSnapshot(source = source, calibrationProfileId = calibrationProfileId, status = "HUESATMAP_NOT_PRESENT")
+    if (!hueSatMap.valid) return DngCameraColorProfileSnapshot(
+        available = true, source = source, calibrationProfileId = calibrationProfileId, hueSatMap = hueSatMap,
+        status = "HUESATMAP_INVALID"
+    )
+    fun matrix(tagId: Int): FloatArray? {
+        val values = tags[tagId]?.valuesAsDoubles(9) ?: return null
+        if (values.size != 9 || values.any { !it.isFinite() || kotlin.math.abs(it) > 64.0 }) return null
+        return FloatArray(9) { values[it].toFloat() }
+    }
+    val illuminant1 = tags[50778]?.valuesAsLongs(1)?.firstOrNull()?.toInt() ?: 0
+    val illuminant2 = tags[50779]?.valuesAsLongs(1)?.firstOrNull()?.toInt() ?: 0
+    val cm1 = matrix(50721)
+    val cm2 = matrix(50722)
+    val cc1 = matrix(50723)
+    val cc2 = matrix(50724)
+    val fm1 = matrix(50964)
+    val fm2 = matrix(50965)
+    val analogBalanceTag = tags[50727]
+    val analogBalanceValues = analogBalanceTag?.valuesAsDoubles(3)
+    val analogBalanceMalformed = analogBalanceTag != null && (
+        analogBalanceValues == null || analogBalanceValues.size != 3 ||
+            analogBalanceValues.any { !it.isFinite() || it <= 0.0 || it > 64.0 }
+    )
+    val analogBalance = if (analogBalanceTag == null) {
+        // DNG 1.7.1: AnalogBalance defaults to all 1.0 when the tag is absent.
+        floatArrayOf(1.0f, 1.0f, 1.0f)
+    } else if (!analogBalanceMalformed) {
+        FloatArray(3) { analogBalanceValues!![it].toFloat() }
+    } else {
+        floatArrayOf(1.0f, 1.0f, 1.0f)
+    }
+    val analogBalanceFromTag = analogBalanceTag != null && !analogBalanceMalformed
+    val discoveryCcm = discoveryEffectiveCcm?.takeIf { it.size == 9 && it.all(Float::isFinite) }?.copyOf()
+
+    if (analogBalanceMalformed) {
+        return DngCameraColorProfileSnapshot(
+            available = true, source = source, calibrationProfileId = calibrationProfileId,
+            calibrationIlluminant1 = illuminant1, calibrationIlluminant2 = illuminant2,
+            colorMatrix1 = cm1, colorMatrix2 = cm2, cameraCalibration1 = cc1, cameraCalibration2 = cc2,
+            forwardMatrix1 = fm1, forwardMatrix2 = fm2, analogBalance = analogBalance,
+            analogBalanceFromTag = false, discoveryEffectiveCcm = discoveryCcm, hueSatMap = hueSatMap,
+            status = "ANALOG_BALANCE_MALFORMED"
+        )
+    }
+
+    if (hueSatMap.data3 != null) {
+        return DngCameraColorProfileSnapshot(
+            available = true, source = source, calibrationProfileId = calibrationProfileId,
+            calibrationIlluminant1 = illuminant1, calibrationIlluminant2 = illuminant2,
+            colorMatrix1 = cm1, colorMatrix2 = cm2,
+            cameraCalibration1 = cc1, cameraCalibration2 = cc2,
+            forwardMatrix1 = fm1, forwardMatrix2 = fm2,
+            analogBalance = analogBalance, analogBalanceFromTag = analogBalanceFromTag,
+            discoveryEffectiveCcm = discoveryCcm, hueSatMap = hueSatMap,
+            status = "TRIPLE_ILLUMINANT_CHARACTERIZATION_NOT_EXPOSED_BY_ANDROID_CONTRACT"
+        )
+    }
+    if (illuminant1 == 0 || cm1 == null) {
+        return DngCameraColorProfileSnapshot(
+            available = true, source = source, calibrationProfileId = calibrationProfileId,
+            calibrationIlluminant1 = illuminant1, calibrationIlluminant2 = illuminant2,
+            colorMatrix1 = cm1, colorMatrix2 = cm2,
+            cameraCalibration1 = cc1, cameraCalibration2 = cc2,
+            forwardMatrix1 = fm1, forwardMatrix2 = fm2,
+            analogBalance = analogBalance, analogBalanceFromTag = analogBalanceFromTag,
+            discoveryEffectiveCcm = discoveryCcm, hueSatMap = hueSatMap,
+            status = "PRIMARY_CHARACTERIZATION_INCOMPLETE"
+        )
+    }
+    val dual = hueSatMap.data2 != null
+    if (dual && (illuminant2 == 0 || cm2 == null)) {
+        return DngCameraColorProfileSnapshot(
+            available = true, source = source, calibrationProfileId = calibrationProfileId,
+            calibrationIlluminant1 = illuminant1, calibrationIlluminant2 = illuminant2,
+            colorMatrix1 = cm1, colorMatrix2 = cm2,
+            cameraCalibration1 = cc1, cameraCalibration2 = cc2,
+            forwardMatrix1 = fm1, forwardMatrix2 = fm2,
+            analogBalance = analogBalance, analogBalanceFromTag = analogBalanceFromTag,
+            discoveryEffectiveCcm = discoveryCcm, hueSatMap = hueSatMap,
+            status = "DUAL_HUESATMAP_WITHOUT_DUAL_CHARACTERIZATION"
+        )
+    }
+    if (discoveryCcm == null) {
+        return DngCameraColorProfileSnapshot(
+            available = true, source = source, calibrationProfileId = calibrationProfileId,
+            calibrationIlluminant1 = illuminant1, calibrationIlluminant2 = illuminant2,
+            colorMatrix1 = cm1, colorMatrix2 = cm2,
+            cameraCalibration1 = cc1, cameraCalibration2 = cc2,
+            forwardMatrix1 = fm1, forwardMatrix2 = fm2,
+            analogBalance = analogBalance, analogBalanceFromTag = analogBalanceFromTag,
+            hueSatMap = hueSatMap, status = "DISCOVERY_CCM_MISSING"
+        )
+    }
+    return DngCameraColorProfileSnapshot(
+        available = true, valid = true, source = source, calibrationProfileId = calibrationProfileId,
+        calibrationIlluminant1 = illuminant1, calibrationIlluminant2 = illuminant2,
+        colorMatrix1 = cm1, colorMatrix2 = cm2,
+        cameraCalibration1 = cc1, cameraCalibration2 = cc2,
+        forwardMatrix1 = fm1, forwardMatrix2 = fm2,
+        analogBalance = analogBalance, analogBalanceFromTag = analogBalanceFromTag,
+        discoveryEffectiveCcm = discoveryCcm, hueSatMap = hueSatMap,
+        status = if (dual) "VALID_DUAL_ILLUMINANT_CAMERA_PROFILE" else "VALID_SINGLE_ILLUMINANT_CAMERA_PROFILE"
+    )
 }
 
 private object TiffHeaderParser {
@@ -239,4 +623,18 @@ private fun readUInt(data: ByteArray, offset: Int, order: ByteOrder): Long {
     } else {
         (b0 shl 24) or (b1 shl 16) or (b2 shl 8) or b3
     }
+}
+
+private fun readInt32(data: ByteArray, offset: Int, order: ByteOrder): Int =
+    readUInt(data, offset, order).toInt()
+
+private fun readUInt64(data: ByteArray, offset: Int, order: ByteOrder): Long {
+    if (offset + 8 > data.size) return 0L
+    var out = 0L
+    if (order == ByteOrder.LITTLE_ENDIAN) {
+        for (i in 0 until 8) out = out or ((data[offset + i].toLong() and 0xFFL) shl (8 * i))
+    } else {
+        for (i in 0 until 8) out = (out shl 8) or (data[offset + i].toLong() and 0xFFL)
+    }
+    return out
 }
