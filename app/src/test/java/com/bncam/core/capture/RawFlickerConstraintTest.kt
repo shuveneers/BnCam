@@ -11,9 +11,10 @@ class RawFlickerConstraintTest {
     }
 
     @Test
-    fun `60hz long shutter quantizes down to half cycle multiple`() {
+    fun `60hz uses rational light period without accumulated nanosecond drift`() {
         val c = RawFlickerConstraint(RawFlickerFrequency.HZ_60, "TEST")
-        assertEquals(24_999_999L, c.constrainExposureNs(30_000_000L, 100_000L, 250_000_000L))
+        assertEquals(25_000_000L, c.constrainExposureNs(30_000_000L, 100_000L, 250_000_000L))
+        assertEquals(16_666_667L, c.constrainExposureNs(17_000_000L, 100_000L, 250_000_000L))
     }
 
     @Test

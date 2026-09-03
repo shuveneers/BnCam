@@ -68,20 +68,12 @@ data class DefaultRawShutterPriorityPlan(
 
 object DefaultRawShutterPriorityPolicy {
     /**
-     * Exposure may recover more slowly after a motion event, but a newly tighter motion ceiling is
-     * obeyed immediately. This gives the controller fast safety attack / slow quality release and
-     * prevents alternating motion estimates from pumping the live exposure brighter/darker.
+     * Outside a resolved flicker environment, longer-shutter recovery keeps the existing 0.25 EV
+     * attack/release behaviour. Under 50/60 Hz authority, release is instead one exact light-period
+     * step at a time so every intermediate shutter remains flicker-safe.
      */
     private const val MAX_RELEASE_STEP_EV = 0.25
     private val MAX_RELEASE_RATIO = 2.0.pow(MAX_RELEASE_STEP_EV)
-
-    /**
-     * Flicker quantization is a preference, not permission to introduce a large exposure step.
-     * A floor from e.g. 14.9 ms to 10 ms is ~0.58 EV and was visibly pumping AE. We only snap when
-     * the flicker-safe value is already close to the physically selected shutter.
-     */
-    private const val MAX_FLICKER_SNAP_EV = 0.25
-    private val MIN_FLICKER_SNAP_RATIO = 2.0.pow(-MAX_FLICKER_SNAP_EV)
 
     fun resolve(
         measuredIso: Int?,
@@ -138,49 +130,92 @@ object DefaultRawShutterPriorityPolicy {
         val exposureAtMinIso = ceil(targetProduct / bounds.minIso.toDouble())
             .toLong()
             .coerceIn(bounds.minExposureNs, bounds.maxExposureNs)
-
         val physicallyDesiredExposure = min(safeCeiling, exposureAtMinIso)
             .coerceIn(bounds.minExposureNs, bounds.maxExposureNs)
 
-        // Never delay a safety-motivated shutter reduction. On recovery toward a longer shutter,
-        // however, limit each closed-loop Camera2 step to 0.25 EV so AE has time to realize ISO.
-        val releaseLimitedExposure = if (physicallyDesiredExposure > referenceExposure) {
-            min(
-                physicallyDesiredExposure,
-                (referenceExposure.toDouble() * MAX_RELEASE_RATIO).toLong().coerceAtLeast(referenceExposure + 1L)
-            )
-        } else {
-            physicallyDesiredExposure
-        }.coerceIn(bounds.minExposureNs, bounds.maxExposureNs)
-        val releaseLimited = releaseLimitedExposure != physicallyDesiredExposure
+        val flickerResolved = flickerConstraint.frequency != RawFlickerFrequency.NONE
+        val targetExposure: Long
+        val releaseLimited: Boolean
+        val flickerAdjusted: Boolean
 
-        val flickerCandidate = flickerConstraint.constrainExposureNs(
-            releaseLimitedExposure,
-            bounds.minExposureNs,
-            bounds.maxExposureNs
-        )
-        val flickerRatio = if (releaseLimitedExposure > 0L) {
-            flickerCandidate.toDouble() / releaseLimitedExposure.toDouble()
-        } else 1.0
-        val flickerSnapAccepted = flickerCandidate != releaseLimitedExposure &&
-            flickerRatio >= MIN_FLICKER_SNAP_RATIO
-        val targetExposure = if (flickerSnapAccepted) flickerCandidate else releaseLimitedExposure
+        if (flickerResolved) {
+            // A tighter motion ceiling attacks immediately. A longer quality-seeking shutter is
+            // released by at most one complete light period per update. ISO absorbs the exposure-
+            // product difference, so aligning 14.9 ms -> 10 ms does not become a brightness pulse.
+            val flickerTarget = when {
+                physicallyDesiredExposure < referenceExposure ->
+                    flickerConstraint.constrainExposureNs(
+                        physicallyDesiredExposure,
+                        bounds.minExposureNs,
+                        bounds.maxExposureNs
+                    )
+                physicallyDesiredExposure > referenceExposure &&
+                    flickerConstraint.isExposureAligned(referenceExposure) ->
+                    flickerConstraint.nextLongerAlignedExposureNs(
+                        currentNs = referenceExposure,
+                        desiredNs = physicallyDesiredExposure,
+                        minExposureNs = bounds.minExposureNs,
+                        maxExposureNs = bounds.maxExposureNs
+                    )
+                physicallyDesiredExposure > referenceExposure ->
+                    // Enter the nearest complete-period shutter around the Camera2 AE baseline.
+                    // Unlike a blind floor this can use 20 ms for an 18 ms 50 Hz baseline when the
+                    // physical ceiling permits it, minimizing the ISO compensation step.
+                    flickerConstraint.closestAlignedExposureNs(
+                        candidateNs = referenceExposure,
+                        maxAllowedNs = physicallyDesiredExposure,
+                        minExposureNs = bounds.minExposureNs,
+                        maxExposureNs = bounds.maxExposureNs
+                    )
+                else ->
+                    flickerConstraint.constrainExposureNs(
+                        physicallyDesiredExposure,
+                        bounds.minExposureNs,
+                        bounds.maxExposureNs
+                    )
+            }
+            targetExposure = flickerTarget.coerceAtMost(safeCeiling).coerceAtLeast(bounds.minExposureNs)
+            releaseLimited = physicallyDesiredExposure > referenceExposure &&
+                targetExposure < physicallyDesiredExposure
+            flickerAdjusted = targetExposure != physicallyDesiredExposure ||
+                flickerConstraint.isExposureAligned(targetExposure)
+        } else {
+            val releaseLimitedExposure = if (physicallyDesiredExposure > referenceExposure) {
+                min(
+                    physicallyDesiredExposure,
+                    (referenceExposure.toDouble() * MAX_RELEASE_RATIO).toLong()
+                        .coerceAtLeast(referenceExposure + 1L)
+                )
+            } else {
+                physicallyDesiredExposure
+            }.coerceIn(bounds.minExposureNs, bounds.maxExposureNs)
+            targetExposure = releaseLimitedExposure
+            releaseLimited = releaseLimitedExposure != physicallyDesiredExposure
+            flickerAdjusted = false
+        }
 
         val expectedIsoUnclamped = ceil(targetProduct / targetExposure.toDouble()).toInt()
         val expectedIso = expectedIsoUnclamped.coerceIn(bounds.minIso, bounds.maxIso)
 
+        val completeFlickerPeriodFits = flickerConstraint.periodNs?.let { targetExposure >= it } ?: false
         val limitingConstraint = when {
+            flickerResolved && !completeFlickerPeriodFits ->
+                "FLICKER_UNAVOIDABLE_SHORT_EXPOSURE"
+            flickerResolved && flickerConstraint.isExposureAligned(targetExposure) ->
+                "FLICKER_${flickerConstraint.frequency.name}"
             releaseLimited -> "AE_TRANSITION_RELEASE_RATE"
-            flickerSnapAccepted -> "FLICKER_${flickerConstraint.frequency.name}"
             exposureAtMinIso <= safeCeiling -> "MIN_ISO"
             else -> strictest.first
         }
         val reason = when {
-            expectedIsoUnclamped > bounds.maxIso -> "iso_max_limits_target_sensitivity"
+            flickerResolved && !completeFlickerPeriodFits ->
+                "motion_ceiling_shorter_than_one_light_period_flicker_cannot_be_fully_cancelled"
+            expectedIsoUnclamped > bounds.maxIso -> "iso_max_limits_flicker_safe_target_sensitivity"
+            flickerResolved && releaseLimited ->
+                "flicker_locked_slow_release_iso_preserves_exposure_product"
+            flickerResolved && flickerAdjusted ->
+                "strict_flicker_safe_shutter_iso_preserves_exposure_product"
             releaseLimited -> "gradual_longer_shutter_release_preserves_ae_realization"
-            flickerCandidate != releaseLimitedExposure && !flickerSnapAccepted ->
-                "flicker_snap_skipped_to_avoid_large_exposure_step"
-            flickerSnapAccepted -> "nearby_flicker_safe_shutter_preserves_reference_sensitivity"
             exposureAtMinIso <= safeCeiling -> "minimum_iso_reached_before_motion_ceiling"
             else -> "longest_safe_shutter_preserves_reference_sensitivity"
         }

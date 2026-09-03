@@ -53,6 +53,11 @@ import com.bncam.core.capture.WarmRawMotionSampler
 import com.bncam.core.capture.RawShutterSafetyCeilings
 import com.bncam.core.capture.RawFlickerConstraint
 import com.bncam.core.capture.RawFlickerFrequency
+import com.bncam.core.capture.RawFlickerObservation
+import com.bncam.core.capture.RawFlickerStabilitySnapshot
+import com.bncam.core.capture.RawFlickerStabilityTracker
+import com.bncam.core.capture.FlickerFpsRange
+import com.bncam.core.capture.RawFlickerCadencePolicy
 import com.bncam.core.capture.MeteringMode
 import com.bncam.core.capture.MeteringPlan
 import com.bncam.core.capture.NormalizedMeteringRegion
@@ -943,6 +948,17 @@ class BnCameraManager(private val context: Context) {
 
     @Volatile
     private var activeResolvedAntibandingMode: Int? = null
+
+    // One stabilized Camera2 flicker authority per active pipeline generation. The raw HAL
+    // statistic is deliberately not allowed to rewrite shutter/FPS on a single-frame observation.
+    private val rawFlickerStabilityTracker = RawFlickerStabilityTracker()
+
+    @Volatile
+    private var rawFlickerTrackerGeneration: Int = -1
+
+    @Volatile
+    private var latestRawFlickerSnapshot: RawFlickerStabilitySnapshot =
+        rawFlickerStabilityTracker.current()
 
     @Volatile
     private var defaultRawShutterManualFallbackActive: Boolean = false
@@ -2910,6 +2926,58 @@ class BnCameraManager(private val context: Context) {
         }
     }
 
+    private fun resetRawFlickerAuthority(reason: String, generation: Int = pipelineGeneration) {
+        rawFlickerTrackerGeneration = generation
+        latestRawFlickerSnapshot = rawFlickerStabilityTracker.reset()
+        Log.i(tag, "RAW_FLICKER_AUTHORITY_RESET generation=$generation reason=$reason")
+    }
+
+    private fun updateRawFlickerAuthority(result: TotalCaptureResult, generation: Int) {
+        if (generation != pipelineGeneration ||
+            activeResolvedAntibandingMode != CaptureRequest.CONTROL_AE_ANTIBANDING_MODE_AUTO
+        ) return
+
+        if (rawFlickerTrackerGeneration != generation) {
+            resetRawFlickerAuthority("PIPELINE_GENERATION_CHANGED", generation)
+        }
+
+        val physicalId = synchronized(pipelineLock) {
+            activePipelineIdentity
+                ?.takeIf { it.cameraRouteKind == CameraRouteKind.LOGICAL_PHYSICAL }
+                ?.physicalCameraId
+        }
+        val physicalResult = physicalCaptureResultOrNull(result, physicalId)
+        val physicalReported = physicalResult?.get(CaptureResult.STATISTICS_SCENE_FLICKER)
+        val reported = physicalReported ?: result.get(CaptureResult.STATISTICS_SCENE_FLICKER)
+        val resultOwner = if (physicalReported != null) "PHYSICAL:${physicalId ?: "unknown"}" else "LOGICAL"
+        val observation = when (reported) {
+            CameraMetadata.STATISTICS_SCENE_FLICKER_50HZ -> RawFlickerObservation.HZ_50
+            CameraMetadata.STATISTICS_SCENE_FLICKER_60HZ -> RawFlickerObservation.HZ_60
+            CameraMetadata.STATISTICS_SCENE_FLICKER_NONE -> RawFlickerObservation.NONE_DETECTED
+            null -> RawFlickerObservation.UNAVAILABLE
+            else -> RawFlickerObservation.NONE_DETECTED
+        }
+        val previous = latestRawFlickerSnapshot
+        val next = rawFlickerStabilityTracker.observe(
+            observation = observation,
+            nowNs = android.os.SystemClock.elapsedRealtimeNanos()
+        )
+        latestRawFlickerSnapshot = next
+
+        val authorityChanged = previous.stableFrequency != next.stableFrequency ||
+            previous.fallbackActive != next.fallbackActive
+        if (!authorityChanged) return
+
+        Log.i(
+            tag,
+            "RAW_FLICKER_AUTHORITY_CHANGED generation=$generation observation=$observation resultOwner=$resultOwner " +
+                "frequency=${next.stableFrequency} fallback=${next.fallbackActive} source=${next.source}"
+        )
+        enqueuePreviewControl("flicker_cadence", "FLICKER_AUTHORITY_CHANGED:${next.stableFrequency}") {
+            updatePreviewRepeatingRequest()
+        }
+    }
+
     private fun resolveDefaultRawFlickerConstraint(): RawFlickerConstraint {
         return when (activeResolvedAntibandingMode) {
             CaptureRequest.CONTROL_AE_ANTIBANDING_MODE_50HZ -> RawFlickerConstraint(
@@ -2921,23 +2989,14 @@ class BnCameraManager(private val context: Context) {
                 source = "RESOLVED_ANTIBANDING_60HZ"
             )
             CaptureRequest.CONTROL_AE_ANTIBANDING_MODE_AUTO -> {
-                val sceneFlicker = lastCaptureResult
-                    ?.takeIf { lastCaptureResultGeneration == pipelineGeneration }
-                    ?.get(CaptureResult.STATISTICS_SCENE_FLICKER)
-                when (sceneFlicker) {
-                    CameraMetadata.STATISTICS_SCENE_FLICKER_50HZ -> RawFlickerConstraint(
-                        frequency = RawFlickerFrequency.HZ_50,
-                        source = "AUTO_SCENE_FLICKER_50HZ"
-                    )
-                    CameraMetadata.STATISTICS_SCENE_FLICKER_60HZ -> RawFlickerConstraint(
-                        frequency = RawFlickerFrequency.HZ_60,
-                        source = "AUTO_SCENE_FLICKER_60HZ"
-                    )
-                    else -> RawFlickerConstraint(
-                        frequency = RawFlickerFrequency.NONE,
-                        source = "AUTO_SCENE_FLICKER_UNRESOLVED"
-                    )
+                val stable = latestRawFlickerSnapshot.takeIf {
+                    rawFlickerTrackerGeneration == pipelineGeneration
                 }
+                RawFlickerConstraint(
+                    frequency = stable?.stableFrequency ?: RawFlickerFrequency.NONE,
+                    source = stable?.source ?: "AUTO_SCENE_FLICKER_AWAITING_RESULT",
+                    fallbackActive = stable?.fallbackActive ?: false
+                )
             }
             CaptureRequest.CONTROL_AE_ANTIBANDING_MODE_OFF -> RawFlickerConstraint(
                 frequency = RawFlickerFrequency.NONE,
@@ -3051,7 +3110,9 @@ class BnCameraManager(private val context: Context) {
         }
 
         val now = android.os.SystemClock.elapsedRealtimeNanos()
-        if (now - defaultRawShutterFallbackLastAdaptationNs < 250_000_000L) return
+        val flickerResolved = resolveDefaultRawFlickerConstraint().frequency != RawFlickerFrequency.NONE
+        val minimumAdaptationIntervalNs = if (flickerResolved) 500_000_000L else 250_000_000L
+        if (now - defaultRawShutterFallbackLastAdaptationNs < minimumAdaptationIntervalNs) return
         val previous = defaultRawShutterFallbackPlan ?: return
         val safeCeiling = defaultRawShutterLastSafeExposureCeilingNs.takeIf { it > 0L } ?: return
         val deviceId = cameraDevice?.id ?: return
@@ -3348,6 +3409,17 @@ class BnCameraManager(private val context: Context) {
             val availableRanges = chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES) ?: return
             if (availableRanges.isEmpty()) return
 
+            val flickerConstraint = resolveDefaultRawFlickerConstraint()
+            fun flickerRangeFor(sustainableUpperFps: Int?): Pair<android.util.Range<Int>?, String> {
+                val plan = RawFlickerCadencePolicy.resolve(
+                    availableRanges = availableRanges.map { FlickerFpsRange(it.lower, it.upper) },
+                    sustainableUpperFps = sustainableUpperFps?.takeIf { it > 0 },
+                    frequency = flickerConstraint.frequency
+                )
+                val selected = plan.selected?.let { android.util.Range(it.lower, it.upper) }
+                return selected to plan.strategy
+            }
+
             val identity = synchronized(pipelineLock) { activePipelineIdentity }
             val rawIdentity = identity?.takeIf { candidate ->
                 candidate.bufferFormat == ImageFormat.RAW10 ||
@@ -3380,17 +3452,26 @@ class BnCameraManager(private val context: Context) {
                     0
                 }
 
+                // A resolved flicker frequency must never overrule RAW stream-completeness truth.
+                // Without an exact min-frame-duration contract, preserve the old conservative RAW
+                // cadence and let shutter integration provide anti-flicker protection.
+                val (flickerSelected, flickerStrategy) = if (sustainableUpperFps > 0) {
+                    flickerRangeFor(sustainableUpperFps)
+                } else {
+                    null to "RAW_FLICKER_CADENCE_WITHHELD_NO_STREAM_DURATION_CONTRACT"
+                }
                 val rawCompatibleRanges = if (sustainableUpperFps > 0) {
                     availableRanges.filter { range -> range.upper <= sustainableUpperFps }
                 } else {
                     emptyList()
                 }
-                val selectedRawRange = rawCompatibleRanges
-                    .sortedWith(
-                        compareByDescending<android.util.Range<Int>> { it.upper }
-                            .thenBy { it.lower }
-                    )
-                    .firstOrNull()
+                val selectedRawRange = flickerSelected
+                    ?: rawCompatibleRanges
+                        .sortedWith(
+                            compareByDescending<android.util.Range<Int>> { it.upper }
+                                .thenBy { it.lower }
+                        )
+                        .firstOrNull()
                     // If the HAL reports no usable min-duration contract, prioritize sensor
                     // completeness over preview cadence by taking its least aggressive AE range.
                     ?: availableRanges
@@ -3402,9 +3483,16 @@ class BnCameraManager(private val context: Context) {
 
                 if (selectedRawRange != null) {
                     builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, selectedRawRange)
+                    val strategy = when {
+                        flickerSelected != null -> flickerStrategy
+                        minimumFrameDurationNs <= 0L -> "RAW_STREAM_CONSERVATIVE_NO_DURATION_CONTRACT"
+                        else -> "RAW_STREAM_MIN_FRAME_DURATION"
+                    }
                     Log.i(
                         tag,
-                        "AE_TARGET_FPS_RANGE_SELECTED range=$selectedRawRange strategy=RAW_STREAM_MIN_FRAME_DURATION " +
+                        "AE_TARGET_FPS_RANGE_SELECTED range=$selectedRawRange strategy=$strategy " +
+                            "flicker=${flickerConstraint.frequency} flickerSource=${flickerConstraint.source} " +
+                            "fallback=${flickerConstraint.fallbackActive} " +
                             "format=${formatName(rawIdentity.bufferFormat)} size=${rawIdentity.width}x${rawIdentity.height} " +
                             "streamCamera=$streamCharacteristicsId minFrameDurationNs=$minimumFrameDurationNs " +
                             "sustainableUpperFps=$sustainableUpperFps"
@@ -3454,14 +3542,16 @@ class BnCameraManager(private val context: Context) {
                         ((1_000_000_000.0 / minimumFrameDurationNs.toDouble()) + 0.5)
                             .toInt()
                             .coerceAtLeast(1)
+                    val (flickerSelected, flickerStrategy) = flickerRangeFor(sustainableUpperFps)
                     val compatibleRanges = availableRanges
                         .filter { range -> range.upper <= sustainableUpperFps }
-                    val selectedYuvRange = compatibleRanges
-                        .sortedWith(
-                            compareByDescending<android.util.Range<Int>> { it.upper }
-                                .thenBy { it.lower }
-                        )
-                        .firstOrNull()
+                    val selectedYuvRange = flickerSelected
+                        ?: compatibleRanges
+                            .sortedWith(
+                                compareByDescending<android.util.Range<Int>> { it.upper }
+                                    .thenBy { it.lower }
+                            )
+                            .firstOrNull()
                         ?: availableRanges
                             .sortedWith(
                                 compareBy<android.util.Range<Int>> { it.upper }
@@ -3471,10 +3561,13 @@ class BnCameraManager(private val context: Context) {
 
                     if (selectedYuvRange != null) {
                         builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, selectedYuvRange)
+                        val strategy = if (flickerSelected != null) flickerStrategy else
+                            "YUV_FULL_FOV_STREAM_MIN_FRAME_DURATION"
                         Log.i(
                             tag,
-                            "AE_TARGET_FPS_RANGE_SELECTED range=$selectedYuvRange " +
-                                "strategy=YUV_FULL_FOV_STREAM_MIN_FRAME_DURATION " +
+                            "AE_TARGET_FPS_RANGE_SELECTED range=$selectedYuvRange strategy=$strategy " +
+                                "flicker=${flickerConstraint.frequency} flickerSource=${flickerConstraint.source} " +
+                                "fallback=${flickerConstraint.fallbackActive} " +
                                 "imageReaderSize=${identity.width}x${identity.height} " +
                                 "previewSize=${previewSize?.let { "${it.width}x${it.height}" } ?: "unknown"} " +
                                 "streamCamera=$streamCharacteristicsId " +
@@ -3486,6 +3579,20 @@ class BnCameraManager(private val context: Context) {
                         return
                     }
                 }
+            }
+
+            // If exact stream-duration truth is unavailable, a resolved mains frequency still gets
+            // a stable advertised cadence before the generic high-FPS viewfinder policy.
+            val (genericFlickerRange, genericFlickerStrategy) = flickerRangeFor(null)
+            if (genericFlickerRange != null) {
+                builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, genericFlickerRange)
+                Log.i(
+                    tag,
+                    "AE_TARGET_FPS_RANGE_SELECTED range=$genericFlickerRange strategy=$genericFlickerStrategy " +
+                        "flicker=${flickerConstraint.frequency} flickerSource=${flickerConstraint.source} " +
+                        "fallback=${flickerConstraint.fallbackActive} streamContract=unavailable"
+                )
+                return
             }
 
             // Last-resort YUV/viewfinder fallback when the HAL gives no exact stream-duration
@@ -8000,6 +8107,11 @@ class BnCameraManager(private val context: Context) {
                     )
                 }
             )
+            if (activeResolvedAntibandingMode != resolvedAntibanding) {
+                resetRawFlickerAuthority(
+                    reason = "ANTIBANDING_MODE_CHANGED:${activeResolvedAntibandingMode ?: "UNSET"}->${resolvedAntibanding ?: "UNSET"}"
+                )
+            }
             activeResolvedAntibandingMode = resolvedAntibanding
             resolvedAntibanding?.let {
                 requestBuilder.set(CaptureRequest.CONTROL_AE_ANTIBANDING_MODE, it)
@@ -8502,6 +8614,7 @@ class BnCameraManager(private val context: Context) {
 
                         lastCaptureResult = result
                         lastCaptureResultGeneration = sessionGeneration
+                        updateRawFlickerAuthority(result, sessionGeneration)
                         updateDefaultRawExposureRealizationTruth(request, result, sessionGeneration)
                         validateMeteringResultEcho(result)
                         updateAutoWhiteBalanceState(result, sessionGeneration)
@@ -10701,6 +10814,9 @@ class BnCameraManager(private val context: Context) {
 
         private fun applyExposurePolicy(builder: CaptureRequest.Builder) {
             val deviceId = cameraDevice?.id ?: return
+            // Cadence and shutter are one acquisition contract. Resolve FPS first so the exposure
+            // planner sees the same frame timing that the repeating request will actually submit.
+            applyOptimalAeTargetFpsRange(builder, deviceId)
             val characteristics = runCatching { cameraManager.getCameraCharacteristics(deviceId) }.getOrNull() ?: return
             val explicitManual = requestedManualIso != null || requestedManualExposureNs != null
             val profilePlan = if (!explicitManual) resolveProfileExposurePriorityPlan(characteristics) else null
@@ -14989,8 +15105,10 @@ class BnCameraManager(private val context: Context) {
                 ringBuffer.selectionExposureConstraintSnapshot().summary(),
             "resolvedAntibandingMode" to activeResolvedAntibandingMode,
             "defaultRawFlickerConstraint" to resolveDefaultRawFlickerConstraint().let { constraint ->
-                "frequency=${constraint.frequency};periodNs=${constraint.periodNs ?: "unresolved"};source=${constraint.source}"
+                "frequency=${constraint.frequency};periodNs=${constraint.periodNs ?: "unresolved"};" +
+                    "fallback=${constraint.fallbackActive};source=${constraint.source}"
             },
+            "defaultRawFlickerStableSnapshot" to latestRawFlickerSnapshot.toString(),
             "measuredSceneFlicker" to result?.get(CaptureResult.STATISTICS_SCENE_FLICKER),
             "rawCadenceReport" to RawPreviewCadenceDiagnostics.latestReport(),
             "rawActivationReport" to com.bncam.core.debug.RawPreviewFirstActivationTrace.latestReport(),
