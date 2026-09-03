@@ -9,9 +9,9 @@ namespace bncam::luma_nr {
  * Physical single-frame luminance baseline in the resident RGB residual domain.
  *
  * The input sigma must already be propagated through every linear/non-linear stage that
- * precedes this filter. In the current RAW route that includes the Phase-5 positive spatial
- * exposure gain contract. This policy therefore never reconstructs noise from ISO, RAW
- * container type, or rendered brightness.
+ * precedes this filter: lens shading, BnCam spatial exposure, demosaic, AWB, CCM, linear
+ * detail and tone. This policy therefore never reconstructs noise from ISO, RAW container
+ * type, or rendered brightness.
  */
 struct ResidualLumaPlan {
     bool active = false;
@@ -51,11 +51,8 @@ inline ResidualLumaPlan resolveResidualLumaPlan(
     plan.inputResidualSigma = sigma;
     plan.modelConfidence = confidence;
 
-    // Phase 6: make baseline authority depend on the propagated physical residual itself.
-    // The former confidence-only 0.45..0.64 fraction treated a bright/high-SNR residual and a
-    // dark/noisy residual almost identically. Work in sigma stops so the policy remains scale
-    // smooth across the useful RAW range and continues to respond correctly after Phase-5
-    // positive spatial exposure propagation.
+    // Phase 4: baseline authority depends on the propagated physical residual itself.
+    // Work in sigma stops so the mapping stays smooth across the useful RAW range.
     constexpr float kLowResidualSigma = 0.0025f;
     const float sigmaStops = std::max(
             0.0f,
@@ -64,11 +61,9 @@ inline ResidualLumaPlan resolveResidualLumaPlan(
     plan.residualNoisePressure = residualLumaSmoothstep(
             0.0f, kHighResidualStops, sigmaStops);
 
-    // Phase 6 late-envelope hardening: a trustworthy model is not, by itself, evidence that a
-    // clean propagated residual needs material smoothing. Keep only a very small baseline at
-    // pressure zero, then open authority monotonically as the propagated S/O residual rises.
-    // This mirrors the pre-demosaic pressure envelope while preserving the late pass as the
-    // owner of exposure-amplified residual noise.
+    // Model confidence alone is not evidence that a clean residual needs smoothing. Keep a
+    // very small baseline at pressure zero and open authority monotonically with propagated
+    // residual noise. The resident shader makes the final local noise-vs-structure decision.
     const float confidenceScale = 0.72f + 0.28f * confidence;
     const float pressureFraction = 0.08f + 0.70f * plan.residualNoisePressure;
     plan.baselineFraction = std::clamp(
@@ -76,8 +71,6 @@ inline ResidualLumaPlan resolveResidualLumaPlan(
             0.05f,
             0.78f);
 
-    // The resident Vulkan shader remains the local structure/texture owner. targetSigma is only
-    // the physically justified residual envelope supplied to that spatially adaptive filter.
     plan.targetSigma = std::clamp(
             sigma * plan.baselineFraction,
             0.0f,

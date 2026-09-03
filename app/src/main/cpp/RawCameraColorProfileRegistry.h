@@ -30,12 +30,18 @@ struct RawCameraNativeHueSatProfile {
     int saturationDivisions = 0;
     int valueDivisions = 0;
     int encoding = 0;
+    // Optional genuine DNG/DCP profile augmentation. Empty tables are valid for a matrix-only
+    // Camera2/DNG characterization and must never be populated with synthesized scene tuning.
     std::vector<float> hueSatData1;
     std::vector<float> hueSatData2;
     std::uint64_t installGeneration = 0;
 
     bool valid() const noexcept;
-    bool dualIlluminant() const noexcept { return !hueSatData2.empty(); }
+    bool hasHueSatMap() const noexcept { return !hueSatData1.empty(); }
+    bool dualHueSatMap() const noexcept { return !hueSatData2.empty(); }
+    bool dualCharacterization() const noexcept {
+        return calibrationIlluminant2 != 0 && hasColorMatrix2 && hasForwardMatrix2;
+    }
 };
 
 struct RawCameraProfileRegistrySnapshot {

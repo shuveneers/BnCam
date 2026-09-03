@@ -6,15 +6,12 @@ import android.hardware.camera2.DngCreator
 import android.util.Log
 import android.util.Size
 import com.bncam.core.isp.raw.RawDomainContract
+import java.io.ByteArrayOutputStream
 import java.io.OutputStream
 import java.nio.ByteBuffer
 
-
 object DngWriter {
     private const val TAG = "DngWriter"
-    private const val BOOTSTRAP_CAPTURE_LIMIT_BYTES = 8 * 1024 * 1024
-
-
 
     /**
      * Streams a virtual RAW16/Bayer buffer directly to an OutputStream.
@@ -33,7 +30,7 @@ object DngWriter {
         dngMergeStats: String,
         lensHardwareDescription: String = "",
         outputStream: OutputStream,
-        calibration: com.bncam.core.quality.FinalSensorCalibration? = null, // Optioneel om build errors in callers te voorkomen
+        calibration: com.bncam.core.quality.FinalSensorCalibration? = null,
         rawDomainContract: RawDomainContract? = null
     ): Long? {
         return try {
@@ -42,7 +39,6 @@ object DngWriter {
                 return null
             }
 
-            // Stage D Non-Destructive Column Statistics Audit
             com.bncam.core.isp.raw.RawColumnStatsAuditor.auditRaw16ByteArray(
                 stage = "Stage-D (Pre-DngCreator)",
                 raw16Bytes = raw16Bytes,
@@ -53,19 +49,19 @@ object DngWriter {
             val pixSize = characteristics.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE)
             val preCorrRect = characteristics.get(CameraCharacteristics.SENSOR_INFO_PRE_CORRECTION_ACTIVE_ARRAY_SIZE)
             val actRect = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
-            Log.i(TAG, "DngCreator Geometry Audit: pixelArraySize=$pixSize preCorrectionActiveArraySize=$preCorrRect activeArraySize=$actRect streamBufferDimensions=${width}x$height byteBufferCapacity=${raw16Bytes.size}")
+            Log.i(
+                TAG,
+                "DngCreator Geometry Audit: pixelArraySize=$pixSize preCorrectionActiveArraySize=$preCorrRect " +
+                    "activeArraySize=$actRect streamBufferDimensions=${width}x$height byteBufferCapacity=${raw16Bytes.size}"
+            )
 
             val auditOut = CountingAuditOutputStream(outputStream)
             val exifOrientation = degreesToExifOrientation(orientation)
             DngCreator(characteristics, metadata).useSafely { dngCreator ->
                 dngCreator.setOrientation(exifOrientation)
-
-                // Description remains human-readable debug only. Semantic correctness is checked
-                // by DngSemanticAuditor against real DNG tags and the RAW payload domain.
                 val description = buildString {
                     append("BnCam DNG Engine V2")
                     append(" | Semantic audit enabled")
-
                     if (calibration != null) {
                         append(" | BASE: BL=[${calibration.base.baseBlackLevels.joinToString(",")}] WL=${calibration.base.baseWhiteLevel}")
                         append(" | OVERRIDE: BL Mode=${calibration.override.blackLevelMode}")
@@ -78,7 +74,6 @@ object DngWriter {
                     append(dngMergeStats)
                 }
                 dngCreator.setDescription(description)
-
                 dngCreator.writeByteBuffer(
                     auditOut,
                     Size(width, height),
@@ -108,16 +103,15 @@ object DngWriter {
         }
     }
 
-
     /**
-     * One-time pre-render OEM colour-profile discovery. This deliberately does not publish a DNG
-     * and does not materialize the native RAW16 payload into a managed ByteArray. DngCreator is
-     * fed a duplicate of the existing direct RAW16 buffer; only a bounded TIFF/DNG prefix is kept
-     * long enough for [DngSemanticAuditor] to read camera characterization tags.
+     * One-time, pre-render camera-colour bootstrap used even when the visible output policy is
+     * JPEG-only. The RAW16 frame is already available to BnCam's JPEG renderer, so this creates a
+     * complete private DNG in memory, extracts only its DNG profile metadata and immediately drops
+     * the DNG bytes. Nothing is inserted into MediaStore and no RAW/DNG URI is published.
      *
-     * DngCreator normally continues with the full image payload after the metadata prefix. The
-     * bootstrap stream intentionally stops that private write once [BOOTSTRAP_CAPTURE_LIMIT_BYTES]
-     * has been captured. A prefix-limit exception is therefore expected and is not a capture error.
+     * Keeping the complete private DNG is intentional. ProfileHueSatMap data and other profile tags
+     * are TIFF-offset based and are not guaranteed to live inside an arbitrary prefix. Truncating
+     * the write can therefore turn a present profile into a false NOT_PRESENT result.
      */
     internal fun discoverCameraColorProfileFromVirtualRaw16(
         width: Int,
@@ -134,9 +128,9 @@ object DngWriter {
         ) {
             Log.i(
                 TAG,
-                "pre-render colour bootstrap skipped: invalid contract " +
-                    "size=${width}x$height profileId=$calibrationProfileId " +
-                    "direct=${raw16Buffer.isDirect} ccmSize=${discoveryEffectiveCcm?.size ?: 0}"
+                "pre-render colour bootstrap skipped: invalid contract size=${width}x$height " +
+                    "profileId=$calibrationProfileId direct=${raw16Buffer.isDirect} " +
+                    "ccmSize=${discoveryEffectiveCcm?.size ?: 0}"
             )
             return null
         }
@@ -146,53 +140,43 @@ object DngWriter {
         ) {
             Log.w(
                 TAG,
-                "pre-render colour bootstrap skipped: RAW16 capacity=${raw16Buffer.capacity()} " +
-                    "expected=$expectedBytes"
+                "pre-render colour bootstrap skipped: RAW16 capacity=${raw16Buffer.capacity()} expected=$expectedBytes"
             )
             return null
         }
 
-        val prefixOut = PrefixCaptureOutputStream(BOOTSTRAP_CAPTURE_LIMIT_BYTES)
         return try {
-            try {
-                DngCreator(characteristics, metadata).useSafely { dngCreator ->
-                    dngCreator.setDescription("BnCam internal pre-render camera colour bootstrap")
-                    val source = raw16Buffer.duplicate()
-                    source.clear()
-                    dngCreator.writeByteBuffer(
-                        prefixOut,
-                        Size(width, height),
-                        source,
-                        0L
-                    )
-                }
-            } catch (writeFailure: Throwable) {
-                if (!prefixOut.limitReached) throw writeFailure
-                Log.i(
-                    TAG,
-                    "pre-render DNG prefix capture stopped intentionally at " +
-                        "${prefixOut.capturedSize} bytes"
+            val privateDng = ByteArrayOutputStream(256 * 1024)
+            DngCreator(characteristics, metadata).useSafely { dngCreator ->
+                dngCreator.setDescription("BnCam internal unpublished camera colour bootstrap")
+                val source = raw16Buffer.duplicate()
+                source.clear()
+                dngCreator.writeByteBuffer(
+                    privateDng,
+                    Size(width, height),
+                    source,
+                    0L
                 )
             }
-
+            val dngBytes = privateDng.toByteArray()
             DngSemanticAuditor.parseCameraColorProfileBytes(
-                bytes = prefixOut.capturedBytes(),
+                bytes = dngBytes,
                 calibrationProfileId = calibrationProfileId,
                 discoveryEffectiveCcm = discoveryEffectiveCcm.copyOf(),
                 source = "OEM_DNGCREATOR_BOOTSTRAP"
             ).also { snapshot ->
                 Log.i(
                     TAG,
-                    "pre-render colour bootstrap parsed: id=$calibrationProfileId " +
+                    "pre-render unpublished DNG parsed: id=$calibrationProfileId " +
                         "available=${snapshot.available} valid=${snapshot.valid} " +
                         "hsm=${snapshot.hueSatMap.available}/${snapshot.hueSatMap.valid} " +
                         "dims=${snapshot.hueSatMap.hueDivisions}x" +
                         "${snapshot.hueSatMap.saturationDivisions}x${snapshot.hueSatMap.valueDivisions} " +
-                        "capturedBytes=${prefixOut.capturedSize}"
+                        "dngBytes=${dngBytes.size}"
                 )
             }
         } catch (failure: Throwable) {
-            Log.w(TAG, "pre-render OEM colour-profile discovery failed", failure)
+            Log.w(TAG, "pre-render unpublished DNG colour-profile discovery failed", failure)
             null
         }
     }
@@ -229,52 +213,11 @@ object DngWriter {
         }
     }
 
-    private class PrefixCaptureOutputStream(
-        private val captureLimit: Int
-    ) : OutputStream() {
-        private val captured = java.io.ByteArrayOutputStream(minOf(captureLimit, 256 * 1024))
-        var limitReached: Boolean = false
-            private set
-        val capturedSize: Int get() = captured.size()
-
-        fun capturedBytes(): ByteArray = captured.toByteArray()
-
-        override fun write(b: Int) {
-            if (limitReached || captured.size() >= captureLimit) {
-                limitReached = true
-                throw BootstrapPrefixCompleteException()
-            }
-            captured.write(b)
-            if (captured.size() >= captureLimit) {
-                limitReached = true
-                throw BootstrapPrefixCompleteException()
-            }
-        }
-
-        override fun write(b: ByteArray, off: Int, len: Int) {
-            if (limitReached || captured.size() >= captureLimit) {
-                limitReached = true
-                throw BootstrapPrefixCompleteException()
-            }
-            val remaining = captureLimit - captured.size()
-            val copyLength = minOf(len, remaining)
-            if (copyLength > 0) captured.write(b, off, copyLength)
-            if (copyLength < len || captured.size() >= captureLimit) {
-                limitReached = true
-                throw BootstrapPrefixCompleteException()
-            }
-        }
-    }
-
-    private class BootstrapPrefixCompleteException : java.io.IOException(
-        "BnCam internal DNG metadata prefix complete"
-    )
-
     private class CountingAuditOutputStream(
         private val delegate: OutputStream
     ) : OutputStream() {
         private val captureLimit = 64 * 1024 * 1024
-        private val captured = java.io.ByteArrayOutputStream(16 * 1024 * 1024)
+        private val captured = ByteArrayOutputStream(16 * 1024 * 1024)
         var bytesWritten: Long = 0L
             private set
 

@@ -8,7 +8,7 @@ namespace bncam::singleframe {
 /**
  * Physical pre-demosaic single-frame RAW luminance denoise policy.
  *
- * Phase-6 ownership contract:
+ * Phase-4 ownership contract:
  * - authority is derived only from calibrated sensor variance V(x)=S*x+O evidence;
  * - RAW container type and capture ISO are deliberately absent from the API;
  * - this owner controls luminance cleanup only;
@@ -110,11 +110,10 @@ inline RawDenoisePlan resolveRawDenoisePlan(
     const float c = plan.modelConfidence;
     const float confidenceScale = 0.70f + 0.30f * c;
 
-    // Phase 6: remove the former fixed denoise floor in physically clean captures. The
-    // calibrated S/O pressure now owns how much pre-demosaic cleanup is permitted: near-zero
-    // pressure is deliberately close to identity, while high physical pressure retains the
-    // strong single-frame cleanup envelope. Local structure/texture decisions still remain
-    // entirely inside the resident Vulkan Pass1 shader.
+    // Phase 4: calibrated S/O pressure owns how much pre-demosaic luma cleanup is
+    // permitted. Near-zero pressure stays close to identity; high physical pressure opens
+    // the single-frame cleanup envelope. Local structure/texture decisions remain inside
+    // the resident Vulkan CFA pass.
     plan.lumaAuthority = std::clamp(
             (0.04f + 0.86f * p) * confidenceScale,
             0.02f,

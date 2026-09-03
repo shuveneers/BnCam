@@ -20,7 +20,7 @@ object RawCameraColorProfileNativeBridge {
         saturationDivisions: Int,
         valueDivisions: Int,
         encoding: Int,
-        hueSatData1: FloatArray,
+        hueSatData1: FloatArray?,
         hueSatData2: FloatArray?
     ): Boolean
 }

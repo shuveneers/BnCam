@@ -91,7 +91,7 @@ RawCameraDngForwardTransformResult resolveRawCameraDngForwardTransform(
         out.status = "ILLUMINANT_WEIGHTS_INVALID";
         return out;
     }
-    const bool useSecond = p->dualIlluminant() && w2 > 1.0e-5f;
+    const bool useSecond = p->dualCharacterization() && w2 > 1.0e-5f;
     if (!p->hasForwardMatrix1 || (useSecond && !p->hasForwardMatrix2)) {
         out.status = "PAIRED_FORWARD_MATRIX_UNAVAILABLE";
         return out;

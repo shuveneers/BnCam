@@ -4,29 +4,14 @@
 #include <cmath>
 
 int main() {
-    using bncam::spectra2::resolvePhysicalBaselineNr;
     using bncam::spectra2::resolvePhysicalChromaBaseStrength;
     using bncam::spectra2::resolveNoiseTruthDynamicHeadroomFraction;
-
-    const auto off = resolvePhysicalBaselineNr(0.010f, 0.020f, true, false);
-    assert(off.active);
-    assert(std::abs(off.lumaSigma - 0.0078f) < 1.0e-6f);
-    assert(std::abs(off.chromaSigma - 0.0216f) < 1.0e-6f);
-    assert(off.lumaFraction < 1.0f && off.chromaFraction > 1.0f && off.chromaFraction <= 1.10f);
-
-    const auto on = resolvePhysicalBaselineNr(0.010f, 0.020f, true, true);
-    assert(!on.active);
-    const auto missing = resolvePhysicalBaselineNr(0.010f, 0.020f, false, false);
-    assert(!missing.active);
-    const auto invalid = resolvePhysicalBaselineNr(NAN, 0.020f, true, false);
-    assert(!invalid.active);
 
     // No physical model => no invented ISO/format-based physical authority.
     const auto noModel = resolvePhysicalChromaBaseStrength(0.0f, 1.0f, 1.0f);
     assert(!noModel.modelDriven);
     assert(noModel.baseStrength == 0.0f);
 
-    // Device-regression variance points from the Phase-2 verification captures.
     const auto low = resolvePhysicalChromaBaseStrength(3.30312e-06f, 1.0f, 1.0f);
     const auto mid = resolvePhysicalChromaBaseStrength(1.31565e-05f, 1.0f, 1.0f);
     const auto high = resolvePhysicalChromaBaseStrength(1.93349e-04f, 1.0f, 1.0f);
@@ -36,7 +21,7 @@ int main() {
     assert(high.baseStrength > mid.baseStrength);
     assert(high.baseStrength <= 0.400001f);
 
-    // Format is intentionally absent from the API: the same S/O variance has one authority.
+    // RAW container type is intentionally absent: equal normalized S/O variance => equal authority.
     const auto samePhysicalTruthA = resolvePhysicalChromaBaseStrength(1.74249e-04f, 1.0f, 1.0f);
     const auto samePhysicalTruthB = resolvePhysicalChromaBaseStrength(1.74249e-04f, 1.0f, 1.0f);
     assert(std::abs(samePhysicalTruthA.baseStrength - samePhysicalTruthB.baseStrength) < 1.0e-7f);
@@ -48,7 +33,7 @@ int main() {
     const auto lowConfidence = resolvePhysicalChromaBaseStrength(1.31565e-05f, 1.0f, 0.25f);
     assert(lowConfidence.baseStrength < mid.baseStrength);
 
-    // Dynamic ISO consumes headroom only when the physical model reports pressure.
+    // Dynamic ISO consumes SPECTRA chroma headroom only when physical noise truth reports pressure.
     assert(resolveNoiseTruthDynamicHeadroomFraction(1.0f, 0.0f, 5.0f) == 0.0f);
     assert(resolveNoiseTruthDynamicHeadroomFraction(0.0f, 1.0f, 5.0f) == 0.0f);
     assert(resolveNoiseTruthDynamicHeadroomFraction(1.0f, 1.0f, 0.0f) == 0.0f);
@@ -57,6 +42,5 @@ int main() {
     const float d100 = resolveNoiseTruthDynamicHeadroomFraction(1.00f, 0.8f, 4.0f);
     assert(d25 > 0.0f && d25 < d50 && d50 < d100);
     assert(std::abs(d100 - 0.64f) < 1.0e-6f);
-
     return 0;
 }

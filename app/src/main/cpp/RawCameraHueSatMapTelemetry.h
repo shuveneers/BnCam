@@ -66,7 +66,7 @@ inline RawCameraHueSatMapTelemetrySummary summarizeRawCameraHueSatMapProfile(
 
     float w1 = std::isfinite(weightFirst) ? std::clamp(weightFirst, 0.0f, 1.0f) : 1.0f;
     float w2 = std::isfinite(weightSecond) ? std::clamp(weightSecond, 0.0f, 1.0f) : 0.0f;
-    const bool hasSecond = profile->dualIlluminant() && profile->hueSatData2.size() == floatCount;
+    const bool hasSecond = profile->dualHueSatMap() && profile->hueSatData2.size() == floatCount;
     if (!hasSecond) {
         w1 = 1.0f;
         w2 = 0.0f;

@@ -5,16 +5,6 @@
 
 namespace bncam::spectra2 {
 
-struct PhysicalBaselineNrPlan {
-    bool active = false;
-    float lumaSigma = 0.0f;
-    float chromaSigma = 0.0f;
-    float lumaFraction = 0.0f;
-    float chromaFraction = 0.0f;
-    float upstreamLumaReduction = 0.0f;
-    float upstreamChromaReduction = 0.0f;
-};
-
 
 struct PhysicalPreToneChromaPlan {
     bool enabled = false;
@@ -91,10 +81,6 @@ struct PhysicalChromaBaseStrengthPlan {
     float rawNoiseSigma = 0.0f;
     float calibratedNoiseSigma = 0.0f;
     float modelConfidence = 0.0f;
-    // Compatibility telemetry fields. Render gain and capture ISO no longer determine
-    // physical denoise authority; combinedNoisePressure is the calibrated S/O pressure.
-    float renderGainPressure = 0.0f;
-    float captureIsoPressure = 0.0f;
     float combinedNoisePressure = 0.0f;
     float baseStrength = 0.0f;
 };
@@ -109,8 +95,7 @@ inline float physicalBaselineSmoothstep(float edge0, float edge1, float value) {
 
 /**
  * Resolve the early-ISP physical chroma baseline directly from the calibrated sensor
- * variance model. RAW10 and RAW_SENSOR are deliberately not inputs: after Phase-2
- * normalization both represent the same scene-linear sensor signal and therefore the same
+ * variance model. RAW10 and RAW_SENSOR are deliberately not inputs: after RAW normalization both represent the same scene-linear sensor signal and therefore the same
  * S/O model must yield the same physical authority.
  *
  * `meanSensorNoiseVariance` is the compact GPU-evaluated mean V(x)=S*x+O in normalized
@@ -178,58 +163,5 @@ inline float resolveNoiseTruthDynamicHeadroomFraction(
     return std::clamp(safeCoefficient * safePressure * normalizedAuthority, 0.0f, 1.0f);
 }
 
-inline float resolvePhysicalPreToneLumaAuthority(float preToneChromaStrength) {
-    const float strength = std::clamp(
-            std::isfinite(preToneChromaStrength) ? preToneChromaStrength : 0.0f,
-            0.0f, 1.0f);
-    // Luma is deliberately much more conservative than chroma. It only supplies a
-    // physical flat-region grain baseline; profile Luminance NR remains the creative control.
-    return std::clamp(0.08f + 0.28f * strength, 0.0f, 0.34f);
-}
-
-/**
- * Conventional physical-noise baseline used only while SPECTRA Context Fusion is Off.
- * It prevents "SPECTRA Off" from meaning "ignore the sensor variance model", while leaving
- * full physical sigma plus the pre-demosaic/context-aware SPECTRA stages as a clear On benefit.
- */
-inline PhysicalBaselineNrPlan resolvePhysicalBaselineNr(
-        float physicalLumaSigma,
-        float physicalChromaSigma,
-        bool physicalNoiseModelAvailable,
-        bool spectraContextFusionActive,
-        float upstreamLumaReduction = 0.0f,
-        float upstreamChromaReduction = 0.0f,
-        float preToneChromaStrength = 0.0f) {
-    PhysicalBaselineNrPlan plan{};
-    if (!physicalNoiseModelAvailable || spectraContextFusionActive ||
-        !std::isfinite(physicalLumaSigma) || !std::isfinite(physicalChromaSigma) ||
-        physicalLumaSigma <= 0.0f || physicalChromaSigma <= 0.0f) {
-        return plan;
-    }
-
-    // SPECTRA Off is a real photographic baseline, not a deliberately noisy comparison mode.
-    // Keep luma conservative to preserve microtexture, while allowing a modestly super-physical
-    // chroma sigma because post-demosaic opponent noise is visually objectionable and can be
-    // suppressed more strongly than luminance grain without softening edges.
-    plan.active = true;
-    plan.upstreamLumaReduction = std::clamp(
-            std::isfinite(upstreamLumaReduction) ? upstreamLumaReduction : 0.0f, 0.0f, 1.0f);
-    plan.upstreamChromaReduction = std::clamp(
-            std::isfinite(upstreamChromaReduction) ? upstreamChromaReduction : 0.0f, 0.0f, 1.0f);
-    const float preTone = std::clamp(
-            std::isfinite(preToneChromaStrength) ? preToneChromaStrength : 0.0f, 0.0f, 1.0f);
-
-    // The post-demosaic stage owns residual cleanup only. As the pre-demosaic VST/opponent
-    // passes remove measured noise, its fraction decreases instead of applying a second full
-    // physical sigma. Keep conservative floors so demosaic/WB/CCM-created residuals remain covered.
-    plan.lumaFraction = std::clamp(
-            0.78f * (1.0f - 0.72f * plan.upstreamLumaReduction), 0.24f, 0.78f);
-    const float chromaHeadroom =
-            (1.0f - 0.70f * plan.upstreamChromaReduction) * (1.0f - 0.48f * preTone);
-    plan.chromaFraction = std::clamp(1.08f * chromaHeadroom, 0.34f, 1.08f);
-    plan.lumaSigma = std::clamp(physicalLumaSigma * plan.lumaFraction, 0.0f, 0.15f);
-    plan.chromaSigma = std::clamp(physicalChromaSigma * plan.chromaFraction, 0.0f, 0.35f);
-    return plan;
-}
 
 }  // namespace bncam::spectra2

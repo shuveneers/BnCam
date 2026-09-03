@@ -1,6 +1,10 @@
 #include "RawPreview.h"
 #include "ProfileToneRenderPolicy.h"
 #include "PhysicalAwbEstimator.h"
+#include "RawCameraColorCharacterizationOwnership.h"
+#include "RawCameraColorProfileRegistry.h"
+#include "RawCameraColorProfileResolver.h"
+#include "RawCameraDngForwardTransform.h"
 #include "vulkan/VulkanRuntime.h"
 
 #if defined(BNCAM_ENABLE_RAW_PREVIEW_CPU_REFERENCE)
@@ -490,8 +494,70 @@ RawPreviewResult renderRawPreviewRgba(
             parameters.quality.wbRed / previewGreen,
             1.0f,
             parameters.quality.wbBlue / previewGreen};
+
+    // RAW preview consumes the same physical DNG camera characterization as capture. Resolve the
+    // registered profile against the unmodified effective Camera2 CCM + current physical WB, then
+    // replace only the matrix transport with the paired DNG ForwardMatrix result. A genuine
+    // ProfileHueSatMap is optional augmentation of that same owner; no synthetic preview LUT is
+    // created when the profile is matrix-only.
+    std::array<float, 9> previewEffectiveCcm{};
     std::copy(std::begin(parameters.quality.colorMatrix),
-              std::end(parameters.quality.colorMatrix), previewRequest.colorMatrix.begin());
+              std::end(parameters.quality.colorMatrix), previewEffectiveCcm.begin());
+    const auto previewProfileRegistry =
+            bncam::color::RawCameraColorProfileRegistry::instance().snapshot();
+    const auto previewProfileResolution = bncam::color::resolveRawCameraColorProfile(
+            previewProfileRegistry, {previewEffectiveCcm, previewRequest.wbRgb});
+    const bncam::color::RawCameraNativeHueSatProfile* previewProfile = nullptr;
+    if (previewProfileResolution.profileIndex < previewProfileRegistry.profiles.size()) {
+        previewProfile = &previewProfileRegistry.profiles[previewProfileResolution.profileIndex];
+    }
+    const bool previewProfileConfiguredForCurrentRoute = previewProfile != nullptr;
+    bncam::color::RawCameraDngForwardTransformResult previewForwardTransform{};
+    if (previewProfileConfiguredForCurrentRoute && previewProfileResolution.ready) {
+        previewForwardTransform = bncam::color::resolveRawCameraDngForwardTransform({
+                previewProfile,
+                previewProfileResolution.hueSatWeightFirst,
+                previewProfileResolution.hueSatWeightSecond,
+                previewRequest.wbRgb});
+    } else {
+        previewForwardTransform.status = previewProfileConfiguredForCurrentRoute
+                ? "PROFILE_RESOLUTION_NOT_READY"
+                : "NO_MATCHING_PROFILE_FOR_CURRENT_ROUTE";
+    }
+    const bool previewHueSatMapAvailable = previewProfile != nullptr && previewProfile->hasHueSatMap();
+    const auto previewCharacterizationPlan =
+            bncam::color::resolveRawCameraColorCharacterizationOwnership({
+                    previewProfileConfiguredForCurrentRoute,
+                    previewProfileResolution.ready,
+                    previewProfile != nullptr && previewProfile->valid(),
+                    previewForwardTransform.ready,
+                    previewHueSatMapAvailable,
+                    previewHueSatMapAvailable && previewProfile != nullptr && previewProfile->valid(),
+                    true});
+    const bool previewCalibratedMatrixActive = previewCharacterizationPlan.calibratedMatrixApply;
+    const bool previewCalibratedHueSatMapActive = previewCharacterizationPlan.calibratedHueSatMapApply;
+    previewRequest.colorMatrix = previewCalibratedMatrixActive
+            ? previewForwardTransform.postWbToLinearSrgb
+            : previewEffectiveCcm;
+    previewRequest.calibratedHueSatMapEnabled = previewCalibratedHueSatMapActive;
+    if (previewCalibratedHueSatMapActive && previewProfile != nullptr) {
+        previewRequest.hueSatHueDivisions = static_cast<std::uint32_t>(
+                std::max(0, previewProfile->hueDivisions));
+        previewRequest.hueSatSaturationDivisions = static_cast<std::uint32_t>(
+                std::max(0, previewProfile->saturationDivisions));
+        previewRequest.hueSatValueDivisions = static_cast<std::uint32_t>(
+                std::max(0, previewProfile->valueDivisions));
+        previewRequest.hueSatEncoding = static_cast<std::uint32_t>(
+                std::clamp(previewProfile->encoding, 0, 1));
+        previewRequest.hueSatData1 = previewProfile->hueSatData1.data();
+        previewRequest.hueSatData1FloatCount = previewProfile->hueSatData1.size();
+        if (previewProfile->dualHueSatMap()) {
+            previewRequest.hueSatData2 = previewProfile->hueSatData2.data();
+            previewRequest.hueSatData2FloatCount = previewProfile->hueSatData2.size();
+        }
+        previewRequest.hueSatWeightFirst = previewProfileResolution.hueSatWeightFirst;
+        previewRequest.hueSatWeightSecond = previewProfileResolution.hueSatWeightSecond;
+    }
     previewRequest.profileSaturation = parameters.quality.profileColorSaturation;
     previewRequest.profileContrast = parameters.quality.profileColorContrast;
     previewRequest.profileVibrance = parameters.quality.profilePresenceVibrance;

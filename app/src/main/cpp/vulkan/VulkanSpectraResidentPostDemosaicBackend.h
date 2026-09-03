@@ -55,8 +55,9 @@ struct SpectraResidentPostDemosaicRequest {
     float chromaNrStrength = 0.0f;
     float chromaUserScale = 1.0f;
     float downstreamChromaAuthority = 1.0f;
-    float noiseModelMultiplier = 1.0f;
-    float configuredDynamicIsoCoeff = 0.0f;
+    // Phase 4: absolute propagated luma residual sigma in the post-tone input domain.
+    // This replaces the old late-luma noise/ISO heuristic inputs.
+    float inputResidualLumaSigma = 0.0f;
     float downstreamLumaAuthority = 1.0f;
     float profileSpectraLuma = 0.0f;
     float profileSpectraDetail = 0.0f;

@@ -21,14 +21,9 @@ import java.util.concurrent.atomic.AtomicBoolean
 /**
  * Trusted camera colour-characterization repository with a pre-render session freeze.
  *
- * [beginSession] loads persisted profiles. If the selected sensor has no trusted active profile, one
- * bounded OEM DngCreator bootstrap may fill that missing profile before the first RAW render. Once
- * that profile is sealed by [sealForRendering], later discoveries for it are staged for the next
- * process and can never replace its active native owner. Distinct sensor profile IDs may bootstrap
- * independently before their own first render.
- *
- * Priority is provenance, not aesthetics: OEM DngCreator > explicit BnCam calibration > external
- * DNG/DCP. No API in this repository can synthesize a HueSatMap from scene statistics or tuning.
+ * A physical DNG camera profile remains useful even when ProfileHueSatMap is absent. Matrix,
+ * CameraCalibration and ForwardMatrix characterization are therefore validated independently from
+ * the optional HueSatMap payload. A present but malformed HueSatMap still fails closed.
  */
 object RawCameraColorProfileRepository {
     private const val TAG = "RawCameraColorProfileRepo"
@@ -37,17 +32,14 @@ object RawCameraColorProfileRepository {
     private const val PRIORITY_EXTERNAL = 100
     private const val MAGIC = 0x424E4350 // BNCP
     private const val VERSION = 1
-    private const val MAX_ARRAY_FLOATS = (1 shl 20) * 3 // Mirrors native registry hard bound.
+    private const val MAX_ARRAY_FLOATS = (1 shl 20) * 3
     private const val STORE_DIR = "raw_camera_color_profiles_v1"
     private const val BOOTSTRAP_RENDER_WAIT_MS = 1_500L
 
     private data class Entry(val snapshot: DngCameraColorProfileSnapshot, val priority: Int)
 
-    /** Active-session camera-colour candidates. */
     private val profiles = ConcurrentHashMap<String, Entry>()
-    /** Newly learned profiles that may become active only after a new process begins. */
     private val pendingProfiles = ConcurrentHashMap<String, Entry>()
-    /** Profiles already accepted by the native registry during this process. */
     private val nativeInstalled = ConcurrentHashMap.newKeySet<String>()
     private val sessionStarted = AtomicBoolean(false)
     private val sessionNativeReady = AtomicBoolean(false)
@@ -63,11 +55,6 @@ object RawCameraColorProfileRepository {
     @Volatile private var bootstrapStatus: String = "NOT_ATTEMPTED"
     @Volatile private var lastRenderSealSource: String = "NOT_SEALED"
 
-    /**
-     * Load the trusted persisted profile set for this process. Calling this again during
-     * navigation/activity recreation is a no-op. Each calibration-profile owner is sealed at that
-     * profile's first RAW render.
-     */
     fun beginSession(context: Context) {
         if (!sessionStarted.compareAndSet(false, true)) return
         synchronized(lock) {
@@ -83,17 +70,12 @@ object RawCameraColorProfileRepository {
             sessionLoadCount = profiles.size
             Log.i(
                 TAG,
-                "session loaded: persistedCandidates=${profiles.size}; " +
-                    "missing OEM profile may bootstrap only before first RAW render"
+                "session loaded: persistedCandidates=${profiles.size}; missing OEM profile may bootstrap before first RAW render"
             )
         }
         ensureSessionProfilesInstalled()
     }
 
-    /**
-     * Retry native activation of the frozen session set. Safe to call immediately before any known
-     * native ISP warm-up; this also covers app startup ordering where libbncam was not loaded yet.
-     */
     fun ensureSessionProfilesInstalled(): Boolean {
         if (!sessionStarted.get()) return false
         return synchronized(lock) {
@@ -111,19 +93,9 @@ object RawCameraColorProfileRepository {
         }
     }
 
-    /**
-     * OEM discovery during an active session is persisted but never activated in that same process.
-     * If no session was started (e.g. a focused host/integration caller), legacy immediate behavior
-     * remains available and still passes through the same native validator.
-     */
     fun installDiscoveredProfile(snapshot: DngCameraColorProfileSnapshot): Boolean =
         accept(snapshot.copy(source = "OEM_DNGCREATOR"), PRIORITY_OEM)
 
-    /**
-     * Claims the one-time discovery slot for a missing sensor profile before any RAW render starts.
-     * The claim is per calibration profile so switching to another physical sensor before the render
-     * seal may still discover its own OEM characterization.
-     */
     fun shouldBootstrapBeforeFirstRender(calibrationProfileId: String): Boolean = synchronized(lock) {
         if (!sessionStarted.get() || renderedProfileIds.contains(calibrationProfileId) ||
             calibrationProfileId.isBlank() || calibrationProfileId == "unknown" ||
@@ -140,7 +112,6 @@ object RawCameraColorProfileRepository {
         claimed
     }
 
-    /** Marks a claimed bootstrap finished, whether it discovered a valid OEM profile or not. */
     fun completeBootstrapAttempt(calibrationProfileId: String) {
         val profileId = calibrationProfileId.ifBlank { "unknown" }
         bootstrapCompletionSignals[profileId]?.countDown()
@@ -151,11 +122,6 @@ object RawCameraColorProfileRepository {
         }
     }
 
-    /**
-     * The only active-session path allowed to install a newly discovered profile. It is legal only
-     * before the first RAW render is sealed. Validation, native installation and persistence use the
-     * same trusted OEM path as normal DNG discovery; no synthetic profile can enter here.
-     */
     fun installBootstrapDiscoveredProfile(snapshot: DngCameraColorProfileSnapshot): Boolean {
         val entry = validateEntry(
             snapshot.copy(source = "OEM_DNGCREATOR_BOOTSTRAP"),
@@ -194,17 +160,13 @@ object RawCameraColorProfileRepository {
             bootstrapStatus = "INSTALLED:$profileId"
             Log.i(
                 TAG,
-                "pre-render OEM colour profile installed: id=$profileId " +
-                    "source=${entry.snapshot.source} status=${entry.snapshot.status}"
+                "pre-render OEM colour profile installed: id=$profileId source=${entry.snapshot.source} " +
+                    "status=${entry.snapshot.status} hsm=${entry.snapshot.hueSatMap.available}/${entry.snapshot.hueSatMap.valid}"
             )
             true
         }
     }
 
-    /**
-     * Permanently closes the same-process discovery window for this calibration profile before its
-     * RAW16 object is returned to a renderer. Other physical-sensor profile IDs remain independent.
-     */
     fun sealForRendering(
         calibrationProfileId: String,
         source: String = "RAW_RENDER"
@@ -219,8 +181,7 @@ object RawCameraColorProfileRepository {
                 synchronized(lock) { bootstrapStatus = "WAIT_TIMEOUT:$profileId" }
                 Log.w(
                     TAG,
-                    "pre-render colour bootstrap wait timed out: id=$profileId " +
-                        "waitMs=$BOOTSTRAP_RENDER_WAIT_MS; sealing current owner"
+                    "pre-render colour bootstrap wait timed out: id=$profileId waitMs=$BOOTSTRAP_RENDER_WAIT_MS; sealing current owner"
                 )
             }
         }
@@ -229,9 +190,8 @@ object RawCameraColorProfileRepository {
             lastRenderSealSource = source.ifBlank { "RAW_RENDER" }
             Log.i(
                 TAG,
-                "camera colour owner sealed for rendering: id=$profileId " +
-                    "source=$lastRenderSealSource activeProfiles=${profiles.size} " +
-                    "bootstrapStatus=$bootstrapStatus"
+                "camera colour owner sealed for rendering: id=$profileId source=$lastRenderSealSource " +
+                    "activeProfiles=${profiles.size} bootstrapStatus=$bootstrapStatus"
             )
         }
         ensureSessionProfilesInstalled()
@@ -265,10 +225,9 @@ object RawCameraColorProfileRepository {
 
     fun debugSummary(): String =
         "sessionStarted=${sessionStarted.get()}; renderedProfileOwners=${renderedProfileIds.size}; " +
-            "lastRenderSealSource=$lastRenderSealSource; " +
-            "persistedLoaded=$sessionLoadCount; activeProfiles=${profiles.size}; " +
-            "nativeInstalled=${nativeInstalled.size}; nativeReady=${sessionNativeReady.get()}; " +
-            "preRenderBootstrapAttempts=${bootstrapAttemptedProfileIds.size}; " +
+            "lastRenderSealSource=$lastRenderSealSource; persistedLoaded=$sessionLoadCount; " +
+            "activeProfiles=${profiles.size}; nativeInstalled=${nativeInstalled.size}; " +
+            "nativeReady=${sessionNativeReady.get()}; preRenderBootstrapAttempts=${bootstrapAttemptedProfileIds.size}; " +
             "preRenderBootstrapInstalled=$bootstrapInstallCount; bootstrapStatus=$bootstrapStatus; " +
             "pendingNextProcess=${pendingProfiles.size}; persistenceError=$lastPersistenceError"
 
@@ -307,25 +266,58 @@ object RawCameraColorProfileRepository {
 
     private fun validateEntry(snapshot: DngCameraColorProfileSnapshot, priority: Int): Entry? {
         if (!snapshot.available || !snapshot.valid || snapshot.calibrationProfileId.isBlank() ||
-            snapshot.calibrationProfileId == "unknown") {
+            snapshot.calibrationProfileId == "unknown"
+        ) {
             Log.i(
                 TAG,
                 "profile rejected: id=${snapshot.calibrationProfileId} source=${snapshot.source} status=${snapshot.status}"
             )
             return null
         }
-        val hsm = snapshot.hueSatMap
+
         val cm1 = snapshot.colorMatrix1 ?: return null
+        val fm1 = snapshot.forwardMatrix1 ?: return null
         val discovery = snapshot.discoveryEffectiveCcm ?: return null
+        if (cm1.size != 9 || fm1.size != 9 || discovery.size != 9 || snapshot.analogBalance.size != 3) return null
+        if (cm1.any { !it.isFinite() } || fm1.any { !it.isFinite() } || discovery.any { !it.isFinite() }) return null
+        if (snapshot.analogBalance.any { !it.isFinite() || it <= 0f || it > 64f }) return null
+        if (snapshot.calibrationIlluminant1 == 0) return null
+
+        val hasSecondCharacterization = snapshot.colorMatrix2 != null ||
+            snapshot.cameraCalibration2 != null || snapshot.forwardMatrix2 != null ||
+            snapshot.calibrationIlluminant2 != 0
+        if (hasSecondCharacterization &&
+            (snapshot.colorMatrix2?.size != 9 || snapshot.forwardMatrix2?.size != 9 ||
+                snapshot.calibrationIlluminant2 == 0)
+        ) return null
+
+        listOf(
+            snapshot.colorMatrix2,
+            snapshot.cameraCalibration1,
+            snapshot.cameraCalibration2,
+            snapshot.forwardMatrix1,
+            snapshot.forwardMatrix2
+        ).forEach { matrix ->
+            if (matrix != null && (matrix.size != 9 || matrix.any { !it.isFinite() })) return null
+        }
+
+        val hsm = snapshot.hueSatMap
+        if (!hsm.available) {
+            if (hsm.valid || hsm.data1 != null || hsm.data2 != null || hsm.data3 != null ||
+                hsm.hueDivisions != 0 || hsm.saturationDivisions != 0 || hsm.valueDivisions != 0
+            ) return null
+            return Entry(snapshot.copied(), priority)
+        }
+
+        if (!hsm.valid || hsm.data3 != null) return null
         val data1 = hsm.data1 ?: return null
-        if (cm1.size != 9 || discovery.size != 9 || snapshot.analogBalance.size < 3) return null
-        if (hsm.data3 != null) return null // DELTA 0144: unverified triple characterization rejected.
         if (hsm.hueDivisions <= 0 || hsm.saturationDivisions <= 0 || hsm.valueDivisions <= 0) return null
         val expectedTriplets = hsm.hueDivisions.toLong() * hsm.saturationDivisions.toLong() * hsm.valueDivisions.toLong()
         val expectedFloats = expectedTriplets * 3L
         if (expectedFloats <= 0L || expectedFloats > MAX_ARRAY_FLOATS || data1.size.toLong() != expectedFloats) return null
         if (hsm.data2 != null && hsm.data2.size.toLong() != expectedFloats) return null
         if (data1.any { !it.isFinite() } || hsm.data2?.any { !it.isFinite() } == true) return null
+        if (hsm.data2 != null && !hasSecondCharacterization) return null
         return Entry(snapshot.copied(), priority)
     }
 
@@ -334,7 +326,6 @@ object RawCameraColorProfileRepository {
         val hsm = snapshot.hueSatMap
         val cm1 = snapshot.colorMatrix1 ?: return false
         val discovery = snapshot.discoveryEffectiveCcm ?: return false
-        val data1 = hsm.data1 ?: return false
         return runCatching {
             RawCameraColorProfileNativeBridge.nativeInstallProfile(
                 profileId = snapshot.calibrationProfileId,
@@ -349,11 +340,11 @@ object RawCameraColorProfileRepository {
                 forwardMatrix2 = snapshot.forwardMatrix2,
                 analogBalance = snapshot.analogBalance,
                 discoveryEffectiveCcm = discovery,
-                hueDivisions = hsm.hueDivisions,
-                saturationDivisions = hsm.saturationDivisions,
-                valueDivisions = hsm.valueDivisions,
-                encoding = hsm.encoding,
-                hueSatData1 = data1,
+                hueDivisions = if (hsm.available) hsm.hueDivisions else 0,
+                saturationDivisions = if (hsm.available) hsm.saturationDivisions else 0,
+                valueDivisions = if (hsm.available) hsm.valueDivisions else 0,
+                encoding = if (hsm.available) hsm.encoding else 0,
+                hueSatData1 = hsm.data1,
                 hueSatData2 = hsm.data2
             )
         }.getOrElse {

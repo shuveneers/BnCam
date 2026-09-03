@@ -54,8 +54,7 @@ struct alignas(16) PushConstants {
     float chromaNrStrength = 0.0f;
     float chromaUserScale = 1.0f;
     float downstreamChromaAuthority = 1.0f;
-    float noiseModelMultiplier = 1.0f;
-    float configuredDynamicIsoCoeff = 0.0f;
+    float inputResidualLumaSigma = 0.0f;
     float downstreamLumaAuthority = 1.0f;
     float visibleSigmaY = 0.0f;
     float visibleAuthority = 0.0f;
@@ -718,8 +717,7 @@ VulkanSpectraResidentPostDemosaicBackend::execute(
     spatialPush.chromaNrStrength = std::clamp(request.chromaNrStrength, 0.0f, 1.0f);
     spatialPush.chromaUserScale = request.chromaUserScale;
     spatialPush.downstreamChromaAuthority = std::clamp(request.downstreamChromaAuthority, 0.0f, 1.0f);
-    spatialPush.noiseModelMultiplier = request.noiseModelMultiplier;
-    spatialPush.configuredDynamicIsoCoeff = std::clamp(request.configuredDynamicIsoCoeff, 0.0f, 1.0f);
+    spatialPush.inputResidualLumaSigma = std::max(0.0f, request.inputResidualLumaSigma);
     spatialPush.downstreamLumaAuthority = std::clamp(request.downstreamLumaAuthority, 0.0f, 1.0f);
     spatialPush.visibleSigmaY = std::clamp(request.profileNrLuminance, 0.0f, 1.0f);
     spatialPush.visibleAuthority = std::clamp(request.profileNrLuminanceDetail, 0.0f, 1.0f);

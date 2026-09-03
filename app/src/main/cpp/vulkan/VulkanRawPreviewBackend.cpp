@@ -1,7 +1,10 @@
 #include "VulkanRawPreviewBackend.h"
 #include "VulkanPipelineCacheRegistry.h"
 
+#include <algorithm>
+#include <chrono>
 #include <cstring>
+#include <limits>
 
 #ifndef BNCAM_VMA_HEADER_AVAILABLE
 #define BNCAM_VMA_HEADER_AVAILABLE 0
@@ -42,6 +45,36 @@ using Clock = std::chrono::steady_clock;
 float elapsedMs(Clock::time_point started) {
     return static_cast<float>(
             std::chrono::duration<double, std::milli>(Clock::now() - started).count());
+}
+
+constexpr std::uint64_t kHueSatHeaderFloats = 16u;
+
+bool hueSatTableValid(const RawPreviewGpuRequest& request, const float* table,
+                      std::size_t floatCount) noexcept {
+    if (table == nullptr || request.hueSatHueDivisions < 1u ||
+        request.hueSatSaturationDivisions < 2u || request.hueSatValueDivisions < 1u ||
+        request.hueSatEncoding > 1u) return false;
+    const std::uint64_t entries = static_cast<std::uint64_t>(request.hueSatHueDivisions) *
+            request.hueSatSaturationDivisions * request.hueSatValueDivisions;
+    if (entries == 0u || entries > (1u << 20) || floatCount != entries * 3u) return false;
+    for (std::uint64_t i = 0u; i < entries; ++i) {
+        const float h = table[i * 3u + 0u];
+        const float sat = table[i * 3u + 1u];
+        const float val = table[i * 3u + 2u];
+        if (!std::isfinite(h) || !std::isfinite(sat) || !std::isfinite(val) ||
+            sat < 0.0f || val < 0.0f) return false;
+    }
+    // DNG requires the zero-saturation value scale to remain identity. Enforce the same strict
+    // invariant as capture so malformed profile data can never become preview-only colour truth.
+    for (std::uint32_t v = 0u; v < request.hueSatValueDivisions; ++v) {
+        for (std::uint32_t h = 0u; h < request.hueSatHueDivisions; ++h) {
+            const std::uint64_t cell =
+                    (static_cast<std::uint64_t>(v) * request.hueSatHueDivisions + h) *
+                    request.hueSatSaturationDivisions;
+            if (std::abs(table[cell * 3u + 2u] - 1.0f) > 1.0e-5f) return false;
+        }
+    }
+    return true;
 }
 
 struct alignas(16) PushConstants {
@@ -520,8 +553,8 @@ bool VulkanRawPreviewBackend::initializeLocked(
         return false;
     }
     const auto descriptorLayoutStarted = Clock::now();
-    VkDescriptorSetLayoutBinding bindings[5]{};
-    for (std::uint32_t index = 0u; index < 5u; ++index) {
+    VkDescriptorSetLayoutBinding bindings[6]{};
+    for (std::uint32_t index = 0u; index < 6u; ++index) {
         bindings[index].binding = index;
         bindings[index].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         bindings[index].descriptorCount = 1u;
@@ -529,7 +562,7 @@ bool VulkanRawPreviewBackend::initializeLocked(
     }
     VkDescriptorSetLayoutCreateInfo descriptorInfo{};
     descriptorInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    descriptorInfo.bindingCount = 5u;
+    descriptorInfo.bindingCount = 6u;
     descriptorInfo.pBindings = bindings;
     if (vkCreateDescriptorSetLayout(device, &descriptorInfo, nullptr, &descriptorSetLayout_) != VK_SUCCESS) {
         failureReason = "vkCreateDescriptorSetLayout_raw_preview_failed";
@@ -537,7 +570,7 @@ bool VulkanRawPreviewBackend::initializeLocked(
     }
 
 #if BNCAM_RAW_PREVIEW_IMAGE_SHADER_AVAILABLE
-    VkDescriptorSetLayoutBinding imageBindings[5]{};
+    VkDescriptorSetLayoutBinding imageBindings[6]{};
     imageBindings[0] = bindings[0];
     imageBindings[1].binding = 1u;
     imageBindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
@@ -546,9 +579,10 @@ bool VulkanRawPreviewBackend::initializeLocked(
     imageBindings[2] = bindings[2];
     imageBindings[3] = bindings[3];
     imageBindings[4] = bindings[4];
+    imageBindings[5] = bindings[5];
     VkDescriptorSetLayoutCreateInfo imageDescriptorInfo{};
     imageDescriptorInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    imageDescriptorInfo.bindingCount = 5u;
+    imageDescriptorInfo.bindingCount = 6u;
     imageDescriptorInfo.pBindings = imageBindings;
     if (vkCreateDescriptorSetLayout(device, &imageDescriptorInfo, nullptr, &imageDescriptorSetLayout_) != VK_SUCCESS) {
         failureReason = "vkCreateDescriptorSetLayout_raw_preview_image_failed";
@@ -648,8 +682,8 @@ bool VulkanRawPreviewBackend::initializeLocked(
     const auto descriptorCommandResourcesStarted = Clock::now();
     VkDescriptorPoolSize poolSizes[2]{};
     poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    // Legacy sets: 5 storage buffers each. Image sets: input + statistics + tone + local base = 4.
-    poolSizes[0].descriptorCount = 9u * RAW_PREVIEW_FRAMES_IN_FLIGHT;
+    // Legacy sets: 6 storage buffers each. Image sets: input + statistics + tone + local base + HSM = 5.
+    poolSizes[0].descriptorCount = 11u * RAW_PREVIEW_FRAMES_IN_FLIGHT;
     poolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     poolSizes[1].descriptorCount = RAW_PREVIEW_FRAMES_IN_FLIGHT;
     VkDescriptorPoolCreateInfo poolInfo{};
@@ -848,6 +882,28 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
     const std::uint64_t rawBytes = static_cast<std::uint64_t>(request.sourceRowStrideBytes) * request.sourceHeight;
     const std::uint64_t inputBytes = (rawBytes + 3u) & ~std::uint64_t{3u};
     constexpr std::uint64_t toneLutBytes = 4096u * sizeof(float);
+    const bool hueSatData1Valid = request.calibratedHueSatMapEnabled &&
+            hueSatTableValid(request, request.hueSatData1, request.hueSatData1FloatCount);
+    const bool hueSatSecondRequested = request.hueSatData2 != nullptr ||
+            request.hueSatData2FloatCount != 0u || request.hueSatWeightSecond > 1.0e-6f;
+    const bool hueSatData2Valid = !hueSatSecondRequested ||
+            hueSatTableValid(request, request.hueSatData2, request.hueSatData2FloatCount);
+    const float hueSatWeightFirst = std::clamp(request.hueSatWeightFirst, 0.0f, 1.0f);
+    const float hueSatWeightSecond = std::clamp(request.hueSatWeightSecond, 0.0f, 1.0f);
+    const bool hueSatWeightsValid = std::isfinite(request.hueSatWeightFirst) &&
+            std::isfinite(request.hueSatWeightSecond) &&
+            std::abs((hueSatWeightFirst + hueSatWeightSecond) - 1.0f) <= 1.0e-3f;
+    const bool hueSatMapContractValid = request.calibratedHueSatMapEnabled && hueSatData1Valid &&
+            hueSatData2Valid && hueSatWeightsValid;
+    const std::uint64_t hueSatEntryCount = hueSatMapContractValid
+            ? static_cast<std::uint64_t>(request.hueSatHueDivisions) *
+                    request.hueSatSaturationDivisions * request.hueSatValueDivisions
+            : 0u;
+    const std::uint64_t hueSatTableFloats = hueSatEntryCount * 3u;
+    const std::uint64_t hueSatProfileFloats = kHueSatHeaderFloats + hueSatTableFloats +
+            (hueSatSecondRequested && hueSatMapContractValid ? hueSatTableFloats : 0u);
+    const std::uint64_t hueSatProfileBytes = std::max<std::uint64_t>(
+            kHueSatHeaderFloats * sizeof(float), hueSatProfileFloats * sizeof(float));
     const std::uint32_t analysisWidth = (request.previewWidth / 4u) & ~1u;
     const std::uint32_t analysisHeight = (request.previewHeight / 4u) & ~1u;
     const std::uint64_t analysisPixels = static_cast<std::uint64_t>(analysisWidth) * analysisHeight;
@@ -919,6 +975,12 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
         result.totalMs = elapsedMs(totalStarted);
         return result;
     }
+    if (!ensureBufferLocked(allocator, hueSatProfileBytes, writeAccess, hueSatProfile_, reallocated, failure)) {
+        releaseUnsubmittedDirectInput();
+        result.failureReason = failure;
+        result.totalMs = elapsedMs(totalStarted);
+        return result;
+    }
 
     bool gpuResidentOutput = false;
     if (hasGpuResidentOutput && imagePipeline_ != VK_NULL_HANDLE && slot.imageDescriptorSet != VK_NULL_HANDLE) {
@@ -974,6 +1036,9 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
     VkDescriptorBufferInfo localToneInfo{};
     localToneInfo.buffer = localToneBase_.buffer;
     localToneInfo.range = static_cast<VkDeviceSize>(localToneMapBytes);
+    VkDescriptorBufferInfo hueSatInfo{};
+    hueSatInfo.buffer = hueSatProfile_.buffer;
+    hueSatInfo.range = static_cast<VkDeviceSize>(hueSatProfileBytes);
 
     VkPipeline activePipeline = pipeline_;
     VkPipelineLayout activePipelineLayout = pipelineLayout_;
@@ -982,7 +1047,7 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
         VkDescriptorImageInfo outputImageInfo{};
         outputImageInfo.imageView = slot.importedOutput.view;
         outputImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-        VkWriteDescriptorSet writes[5]{};
+        VkWriteDescriptorSet writes[6]{};
         writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[0].dstSet = slot.imageDescriptorSet;
         writes[0].dstBinding = 0u;
@@ -1013,7 +1078,13 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
         writes[4].descriptorCount = 1u;
         writes[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         writes[4].pBufferInfo = &localToneInfo;
-        vkUpdateDescriptorSets(device, 5u, writes, 0u, nullptr);
+        writes[5].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[5].dstSet = slot.imageDescriptorSet;
+        writes[5].dstBinding = 5u;
+        writes[5].descriptorCount = 1u;
+        writes[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[5].pBufferInfo = &hueSatInfo;
+        vkUpdateDescriptorSets(device, 6u, writes, 0u, nullptr);
         activePipeline = imagePipeline_;
         activePipelineLayout = imagePipelineLayout_;
         activeDescriptorSet = slot.imageDescriptorSet;
@@ -1021,9 +1092,9 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
         VkDescriptorBufferInfo outputInfo{};
         outputInfo.buffer = slot.deviceOutput.buffer;
         outputInfo.range = VK_WHOLE_SIZE;
-        VkDescriptorBufferInfo infos[5]{inputInfo, outputInfo, statisticsInfo, toneInfo, localToneInfo};
-        VkWriteDescriptorSet writes[5]{};
-        for (std::uint32_t index = 0u; index < 5u; ++index) {
+        VkDescriptorBufferInfo infos[6]{inputInfo, outputInfo, statisticsInfo, toneInfo, localToneInfo, hueSatInfo};
+        VkWriteDescriptorSet writes[6]{};
+        for (std::uint32_t index = 0u; index < 6u; ++index) {
             writes[index].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             writes[index].dstSet = slot.descriptorSet;
             writes[index].dstBinding = index;
@@ -1031,7 +1102,7 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
             writes[index].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             writes[index].pBufferInfo = &infos[index];
         }
-        vkUpdateDescriptorSets(device, 5u, writes, 0u, nullptr);
+        vkUpdateDescriptorSets(device, 6u, writes, 0u, nullptr);
     }
 
     const auto packingStarted = Clock::now();
@@ -1100,6 +1171,31 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
     }
     std::memcpy(toneLutBuffer_.mapped, request.toneLut, static_cast<std::size_t>(toneLutBytes));
     vmaFlushAllocation(allocator, toneLutBuffer_.allocation, 0u, static_cast<VkDeviceSize>(toneLutBytes));
+
+    // Same 16-float header + dense table ABI as the capture colour backend. Invalid/missing
+    // profile data produces an all-zero disabled header rather than a preview-specific fallback.
+    float* hueSatPacked = static_cast<float*>(hueSatProfile_.mapped);
+    std::fill(hueSatPacked,
+              hueSatPacked + static_cast<std::ptrdiff_t>(hueSatProfileBytes / sizeof(float)), 0.0f);
+    hueSatPacked[0] = hueSatMapContractValid ? 1.0f : 0.0f;
+    if (hueSatMapContractValid) {
+        hueSatPacked[1] = static_cast<float>(request.hueSatHueDivisions);
+        hueSatPacked[2] = static_cast<float>(request.hueSatSaturationDivisions);
+        hueSatPacked[3] = static_cast<float>(request.hueSatValueDivisions);
+        hueSatPacked[4] = static_cast<float>(request.hueSatEncoding);
+        hueSatPacked[5] = hueSatWeightFirst;
+        hueSatPacked[6] = hueSatWeightSecond;
+        hueSatPacked[7] = hueSatSecondRequested ? 1.0f : 0.0f;
+        hueSatPacked[8] = static_cast<float>(hueSatEntryCount);
+        std::memcpy(hueSatPacked + kHueSatHeaderFloats, request.hueSatData1,
+                    static_cast<std::size_t>(hueSatTableFloats) * sizeof(float));
+        if (hueSatSecondRequested) {
+            std::memcpy(hueSatPacked + kHueSatHeaderFloats + hueSatTableFloats, request.hueSatData2,
+                        static_cast<std::size_t>(hueSatTableFloats) * sizeof(float));
+        }
+    }
+    vmaFlushAllocation(allocator, hueSatProfile_.allocation, 0u,
+                       static_cast<VkDeviceSize>(hueSatProfileBytes));
     result.inputPackingMs = elapsedMs(packingStarted);
 
     vkResetFences(device, 1u, &slot.fence);
@@ -1231,6 +1327,18 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
     vkCmdPipelineBarrier(slot.commandBuffer, VK_PIPELINE_STAGE_HOST_BIT,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr,
                          1u, &toneInputBarrier, 0u, nullptr);
+
+    VkBufferMemoryBarrier hueSatInputBarrier{};
+    hueSatInputBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    hueSatInputBarrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+    hueSatInputBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    hueSatInputBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    hueSatInputBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    hueSatInputBarrier.buffer = hueSatProfile_.buffer;
+    hueSatInputBarrier.size = static_cast<VkDeviceSize>(hueSatProfileBytes);
+    vkCmdPipelineBarrier(slot.commandBuffer, VK_PIPELINE_STAGE_HOST_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr,
+                         1u, &hueSatInputBarrier, 0u, nullptr);
 
     VkBufferMemoryBarrier statsInputBarrier{};
     statsInputBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
@@ -1663,7 +1771,8 @@ void VulkanRawPreviewBackend::destroyLocked(VkDevice device) noexcept {
             }
             readback = {};
         }
-        for (PersistentBuffer* buffer : {&inputStaging_, &deviceInput_, &toneLutBuffer_, &deviceStatistics_, &localToneBase_}) {
+        for (PersistentBuffer* buffer : {&inputStaging_, &deviceInput_, &toneLutBuffer_,
+                                         &deviceStatistics_, &localToneBase_, &hueSatProfile_}) {
             if (buffer->buffer != VK_NULL_HANDLE && buffer->allocation != nullptr) {
                 vmaDestroyBuffer(allocator_, buffer->buffer, buffer->allocation);
             }

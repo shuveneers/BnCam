@@ -1,12 +1,13 @@
 package com.bncam.core.quality
 
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
 
 class ProfileToneNativeConsumptionSourceContractTest {
     @Test
-    fun profileToneCrossesJniAndIsConsumedByPhase10ToneArchitecture() {
+    fun profileToneCrossesJniAndIsConsumedAfterPbrNeutral() {
         val imageUtils = source("app/src/main/java/com/bncam/core/engine/ImageUtils.kt")
         val nativeLib = source("app/src/main/cpp/native-lib.cpp")
         val nativeConfig = source("app/src/main/cpp/NativeRenderQualityConfig.h")
@@ -22,25 +23,23 @@ class ProfileToneNativeConsumptionSourceContractTest {
             assertTrue("Native config must own $key", nativeConfig.contains(key))
             assertTrue("IspCore must consume $key", ispCore.contains(key))
         }
+
         assertTrue(ispCore.contains("profileTonePlan.exposureMultiplier"))
+        assertTrue(ispCore.contains("lookLuma * profileExposureGain"))
         assertTrue(ispCore.contains("applyProfileTonalRanges(curvedLuma, profileTonePlan)"))
-        assertTrue(ispCore.contains("profileTonePlan.blackRangeDelta") ||
-            ispCore.contains("applyProfileTonalRanges(curvedLuma, profileTonePlan)"))
-        assertTrue(ispCore.contains("profileTonePlan.localToneStrengthScale"))
-        assertTrue(ispCore.contains("automaticExposureGain * profileTonePlan.exposureMultiplier"))
-        assertTrue(toneShader.contains("rgb = applyAgXTonemap(rgb);"))
+        assertTrue(toneShader.contains("rgb = pbrNeutralToneMapping(rgb);"))
         assertTrue(toneShader.contains("rgb = applyToneLookLut(rgb);"))
-        assertTrue(toneShader.contains("toneLut[lutIdx * 2u + 0u]"))
+        assertTrue(toneShader.contains("rgb = applyProfileColor(rgb);"))
         assertTrue(
-            "Explicit profile tone look must remain after the sole automatic AgX DRT",
+            "Explicit profile tone must remain after Khronos PBR Neutral",
             toneShader.indexOf("rgb = applyToneLookLut(rgb);") >
-                toneShader.indexOf("rgb = applyAgXTonemap(rgb);")
+                toneShader.indexOf("rgb = pbrNeutralToneMapping(rgb);")
         )
-        assertTrue(ispCore.contains("toneMapperRequested="))
-        assertTrue(ispCore.contains("AGX_VULKAN_RESIDENT"))
-        assertTrue(ispCore.contains("toneProfileLookLutApplied="))
-        assertTrue(ispCore.contains("POST_AGX_DISPLAY_LINEAR"))
-        assertTrue(ispCore.contains("profileHighlightsExecution=DISPLAY_LINEAR_TONE_LUT"))
+        assertTrue(ispCore.contains("toneMapperRequested=KHRONOS_PBR_NEUTRAL") ||
+            ispCore.contains("toneMapperRequested=\" << \"KHRONOS_PBR_NEUTRAL"))
+        assertTrue(ispCore.contains("POST_PBR_NEUTRAL_DISPLAY_LINEAR"))
+        assertFalse(toneShader.contains("applyAgXTonemap"))
+        assertFalse(ispCore.contains("GTM_SCENE_PLACEMENT"))
     }
 
     private fun source(path: String): String {

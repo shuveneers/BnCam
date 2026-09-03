@@ -34,9 +34,10 @@ struct RawCameraColorProfileResolution {
  * Safety rules:
  * - profile identity is inferred from the actual effective CCM shape, never from recency alone;
  * - an ambiguous or materially different matrix fails closed;
- * - a dual-illuminant HSM requires a physically consistent WB fit to the paired DNG
- *   ColorMatrix/CameraCalibration characterization;
- * - HSM weights are linear in reciprocal temperature, matching the DNG profile model.
+ * - dual-illuminant DNG matrix characterization requires a physically consistent WB fit to the
+ *   paired ColorMatrix/CameraCalibration characterization;
+ * - illuminant weights are linear in reciprocal temperature and are reused by HueSatMap only when
+ *   genuine profile tables are present.
  */
 RawCameraColorProfileResolution resolveRawCameraColorProfile(
         const RawCameraProfileRegistrySnapshot& registry,

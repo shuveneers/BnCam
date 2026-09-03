@@ -91,28 +91,31 @@ struct SpectraResidentToneRequest {
     std::uint32_t frameHeight = 0;
     std::uint64_t residentSceneGeneration = 0u;
     float exposureGain = 1.0f;
+    // Mode-specific transport slots remain in the 128-byte shader ABI for the scene observer/YUV
+    // compatibility path. RAW Phase 5 does not use them for automatic colour or display tone.
     float rawJpegBaseVibrance = 1.0f;
     float shoulderStart = 0.68f;
     float shoulderStrength = 1.0f;
-    // Legacy local-tone fields are retained temporarily for source compatibility during Phase 10;
-    // the final RAW production path is replaced by the FLLF contract below.
+    // Legacy YUV local-tone fields are source-compatible only; RAW uses the FLLF contract below.
     float localToneStrength = 0.0f;
     float localToneSceneKey = 0.125f;
     float localToneMaxLiftEv = 0.25f;
     float localToneMaxCompressEv = 0.15f;
-    // Phase 10: Fast Local Laplacian local exposure field in scene-referred log luminance.
+    // Phase 5: primary automatic RAW tone authority in pure scene-referred log2 luminance.
     bool fllfEnabled = false;
     float fllfStrength = 0.0f;
     float fllfSceneKey = 0.150f;
-    float fllfMaxLiftEv = 0.55f;
-    float fllfMaxCompressEv = 0.55f;
+    float fllfMaxLiftEv = 0.18f;
+    float fllfMaxCompressEv = 0.20f;
     float fllfEdgeStopEv = 0.62f;
     float fllfRefinement = 0.10f;
-    float fllfShadowLiftNoiseGuardPressure = 0.0f;
+    // Physical post-detail luma sigma propagated through LSC -> spatial exposure -> demosaic ->
+    // AWB -> CCM -> detail. Vulkan converts it to log2-luma sigma for correction coring.
+    float fllfPhysicalNoiseSigmaY = 0.0f;
     std::uint32_t fllfPyramidLevels = 6u;
     // Phase 11: scene-linear capture detail recovery. The physical S/O-derived luma sigma
     // and shot/read-noise mix are resolved by IspCore; all per-pixel significance, edge and
-    // halo decisions execute on the resident GPU scene before GTM/FLLF/AgX.
+    // halo decisions execute on the resident GPU scene before Phase-5 FLLF/display mapping.
     bool linearDetailEnabled = false;
     float linearDetailAuthority = 0.0f;
     float linearDetailRadius = 1.0f;
@@ -178,7 +181,9 @@ struct SpectraResidentToneResult {
     std::uint64_t fllfEdgeProtectedSamples = 0u;
     float fllfMeanAbsCorrectionEv = 0.0f;
     float fllfMaxAbsCorrectionEv = 0.0f;
-    float fllfShadowLiftNoiseGuardPressure = 0.0f;
+    // Physical post-detail luma sigma propagated through LSC -> spatial exposure -> demosaic ->
+    // AWB -> CCM -> detail. Vulkan converts it to log2-luma sigma for correction coring.
+    float fllfPhysicalNoiseSigmaY = 0.0f;
     float fllfPyramidBuildMs = 0.0f;
     float fllfRemapReconstructMs = 0.0f;
     std::uint64_t fllfResidentBytes = 0u;
@@ -239,7 +244,7 @@ struct SpectraResidentToneResult {
  * The backend consumes the post-CCM device buffer owned by the resident demosaic backend.
  * Upstream Phase-9-protected RGB, pre-tone 4:4:4 cleanup, compact scene sampling and the
  * complete pointwise tone/vibrance/profile-colour loop execute on Vulkan. Only compact scene samples cross to the CPU before
- * the exposure governor. The tone result can remain resident for the next post-demosaic stage.
+ * the scalar scene planner. The tone result can remain resident for the next post-demosaic stage.
  */
 class VulkanSpectraResidentToneBackend final {
 public:
@@ -325,9 +330,9 @@ private:
     PersistentBuffer ultraHdrGainmapPacked_;
     PersistentBuffer portraitMask_;
     PersistentBuffer portraitBlurRgb_;
-    // Legacy quarter-resolution local-tone base. Retired from RAW production later in Phase 10.
+    // Legacy quarter-resolution YUV local-tone base. Not used by RAW Phase 5.
     PersistentBuffer localToneBase_;
-    // Phase 10 FLLF: packed half-resolution Gaussian pyramid and reconstructed local-exposure
+    // Phase 5 FLLF: packed half-resolution Gaussian pyramid and reconstructed log-luma tone
     // correction pyramid. Two scalar buffers keep memory bounded and avoid full-resolution RGB
     // intermediates.
     PersistentBuffer fllfGaussian_;

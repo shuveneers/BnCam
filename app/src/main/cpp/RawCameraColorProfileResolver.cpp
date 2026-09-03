@@ -102,7 +102,7 @@ bool estimateSceneCct(
         float& w2) noexcept {
     const auto t1 = rawCameraDngIlluminantTemperature(p.calibrationIlluminant1);
     const auto t2 = rawCameraDngIlluminantTemperature(p.calibrationIlluminant2);
-    if (!t1.available || !t2.available || !p.dualIlluminant()) return false;
+    if (!t1.available || !t2.available || !p.dualCharacterization()) return false;
     const float lo = std::min(t1.kelvin, t2.kelvin);
     const float hi = std::max(t1.kelvin, t2.kelvin);
     if (!(hi > lo)) return false;
@@ -178,7 +178,7 @@ bool rawCameraPredictProfileWbRgb(
     if (!p.valid() || !std::isfinite(sceneCctKelvin) || sceneCctKelvin <= 0.0f) return false;
     Mat3 cm = p.colorMatrix1;
     Mat3 cc = p.hasCameraCalibration1 ? p.cameraCalibration1 : identity3();
-    if (p.dualIlluminant()) {
+    if (p.dualCharacterization()) {
         const auto weights = rawCameraResolveDngDualWeight(
                 p.calibrationIlluminant1, p.calibrationIlluminant2, sceneCctKelvin);
         if (!weights.ready) return false;
@@ -236,11 +236,11 @@ RawCameraColorProfileResolution resolveRawCameraColorProfile(
     out.profileIndex = bestIndex;
     out.profileId = selected.profileId;
     out.sourcePriority = selected.sourcePriority;
-    if (!selected.dualIlluminant()) {
+    if (!selected.dualCharacterization()) {
         out.ready = true;
         out.hueSatWeightFirst = 1.0f;
         out.hueSatWeightSecond = 0.0f;
-        out.status = "READY_SINGLE_ILLUMINANT_HUESATMAP";
+        out.status = "READY_SINGLE_ILLUMINANT_DNG_CHARACTERIZATION";
         return out;
     }
 
@@ -255,7 +255,7 @@ RawCameraColorProfileResolution resolveRawCameraColorProfile(
     out.hueSatWeightFirst = w1;
     out.hueSatWeightSecond = w2;
     out.ready = true;
-    out.status = "READY_DUAL_ILLUMINANT_ADAPTIVE_HUESATMAP";
+    out.status = "READY_DUAL_ILLUMINANT_DNG_CHARACTERIZATION";
     return out;
 }
 

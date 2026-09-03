@@ -7,51 +7,72 @@ import kotlin.test.assertTrue
 
 class Phase4SingleFrameRawDenoiseSourceContractTest {
     @Test
-    fun physicalPolicyIsSensorVarianceDrivenNotFormatOrIsoDriven() {
+    fun physicalPreDemosaicPolicyIsLumaOnlyAndSensorVarianceDriven() {
         val policy = File("src/main/cpp/SingleFrameRawDenoisePolicy.h").readText()
         assertTrue(policy.contains("meanSensorNoiseVariance"))
-        assertTrue(policy.contains("resolvePhysicalChromaBaseStrength"))
-        assertFalse(policy.contains("isRaw10"))
-        assertFalse(policy.contains("RAW_SENSOR"))
+        assertTrue(policy.contains("lumaAuthority"))
+        assertFalse(policy.contains("chromaAuthority"))
+        assertFalse(policy.contains("lowFrequencyChromaAuthority"))
         assertFalse(policy.contains("captureIso"))
         assertFalse(policy.contains("effectiveIso"))
+        assertFalse(policy.contains("isRaw10"))
     }
 
     @Test
-    fun spectraOffPhysicalBaselineUsesResidentPass1AndPass2() {
+    fun physicalCfaLumaUsesUnbiasedGeneralizedAnscombeInverseApproximation() {
+        val shader = File("src/main/cpp/vulkan/shaders/spectra_pass1_resident.comp").readText()
+        assertTrue(shader.contains("inverseVstUnbiasedApprox"))
+        assertTrue(shader.contains("Mäkitalo-Foi"))
+        assertFalse(shader.contains("float inverseVst(float y"))
+        assertTrue(shader.contains("pc.physicalBaselineMode == 0u && midRing.valid"))
+        assertTrue(shader.contains("pc.physicalBaselineMode != 0u\n            ? 1.0"))
+    }
+
+    @Test
+    fun lateLumaUsesPropagatedResidualAndNoIsoOrRenderGainHeuristic() {
+        val shader = File("src/main/cpp/vulkan/shaders/spectra_post_demosaic_resident.comp").readText()
+        val backend = File("src/main/cpp/vulkan/VulkanSpectraResidentPostDemosaicBackend.h").readText()
         val isp = File("src/main/cpp/IspCore.cpp").readText()
-        val runtime = File("src/main/cpp/vulkan/VulkanRuntime.cpp").readText()
-        assertTrue(isp.contains("physicalRawDenoiseActive"))
-        assertTrue(isp.contains("CAMERA2_SO_PHYSICAL_BASELINE"))
-        assertTrue(isp.contains("pass1State.physicalBaselineMode = true"))
-        assertTrue(isp.contains("pass2State.physicalBaselineMode = true"))
-        assertTrue(runtime.contains("executeSpectraResidentPreDemosaicPass1FromRawNormalize"))
-        assertTrue(isp.contains("PHYSICAL_SINGLE_FRAME_COMPACT_OBSERVER_READY"))
+
+        assertTrue(shader.contains("inputResidualLumaSigma"))
+        assertTrue(shader.contains("predictedResidualVariance"))
+        assertTrue(shader.contains("estimatedSignalVariance"))
+        assertTrue(shader.contains("noiseDominance"))
+        assertTrue(shader.contains("correctionFraction"))
+        assertTrue(shader.contains("microDetailConfidence"))
+        assertFalse(shader.contains("lumaUserBoost"))
+        assertFalse(shader.contains("noiseModelMultiplier"))
+        assertFalse(shader.contains("configuredDynamicIsoCoeff"))
+
+        assertTrue(backend.contains("inputResidualLumaSigma"))
+        assertFalse(backend.contains("noiseModelMultiplier"))
+        assertFalse(backend.contains("configuredDynamicIsoCoeff"))
+        assertTrue(isp.contains("spectraResidualNr.inputLumaSigma"))
+        assertTrue(isp.contains("postToneResidualLumaSigma"))
     }
 
     @Test
-    fun downstreamPhysicalCleanupConsumesMeasuredResidualHeadroom() {
+    fun deadPhysicalLumaOwnersAreRemovedRatherThanDisabled() {
         val isp = File("src/main/cpp/IspCore.cpp").readText()
         val physical = File("src/main/cpp/SpectraPhysicalBaselineNr.h").readText()
-        assertTrue(isp.contains("physicalPreDemosaicLumaReduction"))
-        assertTrue(isp.contains("physicalPreDemosaicChromaReduction"))
-        assertTrue(physical.contains("upstreamLumaReduction"))
-        assertTrue(physical.contains("upstreamChromaReduction"))
-        assertTrue(physical.contains("residualHeadroom"))
+        assertFalse(physical.contains("PhysicalBaselineNrPlan"))
+        assertFalse(physical.contains("resolvePhysicalBaselineNr"))
+        assertFalse(physical.contains("resolvePhysicalPreToneLumaAuthority"))
+        assertFalse(physical.contains("renderGainPressure"))
+        assertFalse(physical.contains("captureIsoPressure"))
+        assertFalse(isp.contains("galoshPreToneLumaBaselineAuthority"))
+        assertFalse(isp.contains("residualLumaStrengthScale"))
     }
 
     @Test
-    fun physicalLowFrequencyChromaUsesSoAuthorityAndNeverSceneProxyBanding() {
+    fun separatePhysicalChromaOwnersRemainConnected() {
         val isp = File("src/main/cpp/IspCore.cpp").readText()
+        val physical = File("src/main/cpp/SpectraPhysicalBaselineNr.h").readText()
+        assertTrue(physical.contains("resolvePhysicalChromaBaseStrength"))
+        assertTrue(physical.contains("resolvePhysicalPreToneChroma"))
         assertTrue(isp.contains("PHYSICAL_SINGLE_FRAME_LOW_FREQUENCY_CHROMA_READY"))
-        assertTrue(isp.contains("singleFrameRawDenoise.lowFrequencyChromaAuthority"))
-        assertTrue(isp.contains("pass3State.physicalBaselineMode = true"))
         assertTrue(isp.contains("pass3State.applyRowBanding = false"))
         assertTrue(isp.contains("pass3State.applyColBanding = false"))
-        assertTrue(isp.contains("pass3State.bandingAuthority = 0.0f"))
-        assertTrue(isp.contains("singleFrameRawPass3Physical="))
-        assertTrue(isp.contains("singleFrameRawPass3LowFreqApplied="))
-        assertTrue(isp.contains("singleFrameRawPass3RowBandingApplied="))
-        assertTrue(isp.contains("singleFrameRawPass3ColBandingApplied="))
+        assertTrue(isp.contains("state.bandingAuthority = 0.0f"))
     }
 }

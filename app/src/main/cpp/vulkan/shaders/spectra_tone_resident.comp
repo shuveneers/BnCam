@@ -13,7 +13,7 @@ layout(std430, binding = 7) buffer UltraHdrGainmapPacked { uint ultraHdrGainmapP
 layout(std430, binding = 8) readonly buffer PortraitMask { float portraitMask[]; };
 layout(std430, binding = 9) buffer PortraitBlurRgb { float portraitBlurRgb[]; };
 layout(std430, binding = 10) buffer LocalToneBase { float localToneBase[]; };
-// Phase 10 packed scalar FLLF pyramids. Level 0 is half-resolution; higher levels are
+// Phase 5 packed scalar FLLF pyramids. Level 0 is half-resolution; higher levels are
 // concatenated. No RGB pyramid and no CPU roundtrip are used.
 layout(std430, binding = 11) buffer FllfGaussian { float fllfGaussian[]; };
 layout(std430, binding = 12) buffer FllfCorrection { float fllfCorrection[]; };
@@ -97,99 +97,6 @@ float smoothstepFast(float edge0, float invRange, float value) {
     return u * u * (3.0 - 2.0 * u);
 }
 
-// RAW color render camera-profile render works in Oklab after the calibrated sensor->linear-sRGB
-// transform. It changes chroma only; hue and BT.709 scene luminance are kept stable.
-vec3 rawColorLinearSrgbToOklab(vec3 c) {
-    float l = 0.4122214708 * c.r + 0.5363325363 * c.g + 0.0514459929 * c.b;
-    float m = 0.2119034982 * c.r + 0.6806995451 * c.g + 0.1073969566 * c.b;
-    float s = 0.0883024619 * c.r + 0.2817188376 * c.g + 0.6299787005 * c.b;
-    vec3 p = sign(vec3(l, m, s)) * pow(abs(vec3(l, m, s)), vec3(1.0 / 3.0));
-    return vec3(
-            0.2104542553 * p.x + 0.7936177850 * p.y - 0.0040720468 * p.z,
-            1.9779984951 * p.x - 2.4285922050 * p.y + 0.4505937099 * p.z,
-            0.0259040371 * p.x + 0.7827717662 * p.y - 0.8086757660 * p.z);
-}
-
-vec3 rawColorOklabToLinearSrgb(vec3 lab) {
-    float lp = lab.x + 0.3963377774 * lab.y + 0.2158037573 * lab.z;
-    float mp = lab.x - 0.1055613458 * lab.y - 0.0638541728 * lab.z;
-    float sp = lab.x - 0.0894841775 * lab.y - 1.2914855480 * lab.z;
-    float l = lp * lp * lp;
-    float m = mp * mp * mp;
-    float s = sp * sp * sp;
-    return vec3(
-            4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
-            -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
-            -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s);
-}
-
-vec3 applyRawCameraProfileRender(vec3 rgb) {
-    float strength = clamp(pc.rawJpegBaseVibrance - 1.0, 0.0, 0.16);
-    if (strength <= 1.0e-5 || any(isnan(rgb)) || any(isinf(rgb))) return rgb;
-    float y = lumaOf(rgb);
-    if (y <= 1.0e-7) return rgb;
-
-    vec3 lab = rawColorLinearSrgbToOklab(rgb);
-    float chroma = length(lab.yz);
-    float shadowGate = smoothstep(0.018, 0.085, y);
-    float highlightGate = 1.0 - smoothstep(0.62, 1.10, y);
-    float chromaGuard = 1.0 - 0.82 * smoothstep(0.16, 0.34, chroma);
-    float midtoneGate = smoothstep(0.045, 0.16, y) *
-            (1.0 - smoothstep(0.50, 0.95, y));
-    float authority = strength * shadowGate * highlightGate * chromaGuard *
-            (0.42 + 0.58 * midtoneGate);
-    lab.yz *= 1.0 + authority;
-
-    vec3 candidate = rawColorOklabToLinearSrgb(lab);
-    if (any(isnan(candidate)) || any(isinf(candidate))) return rgb;
-    float candidateY = lumaOf(candidate);
-    if (candidateY > 1.0e-7) candidate *= y / candidateY;
-
-    // Never create a new negative scene-linear component by clipping. Reduce only this chroma
-    // proposal along the original->candidate segment; Phase 9 remains the lower-gamut owner.
-    float safe = 1.0;
-    for (int c = 0; c < 3; ++c) {
-        float delta = candidate[c] - rgb[c];
-        if (delta < 0.0 && candidate[c] < 0.0) {
-            safe = min(safe, rgb[c] / max(1.0e-8, -delta));
-        }
-    }
-    return mix(rgb, candidate, clamp(0.995 * safe, 0.0, 1.0));
-}
-
-bool rawColorInsideUnitGamut(vec3 rgb) {
-    return !any(isnan(rgb)) && !any(isinf(rgb)) &&
-            min(rgb.r, min(rgb.g, rgb.b)) >= 0.0 &&
-            max(rgb.r, max(rgb.g, rgb.b)) <= 1.0;
-}
-
-vec3 rawColorCompressToUnitGamutPerceptual(vec3 rgb) {
-    if (any(isnan(rgb)) || any(isinf(rgb))) return vec3(0.0);
-    if (rawColorInsideUnitGamut(rgb)) return rgb;
-
-    vec3 lab = rawColorLinearSrgbToOklab(rgb);
-    if (any(isnan(lab)) || any(isinf(lab))) return vec3(0.0);
-    lab.x = clamp(lab.x, 0.0, 1.0);
-    float chroma = length(lab.yz);
-    if (chroma <= 1.0e-7) {
-        return clamp(rawColorOklabToLinearSrgb(vec3(lab.x, 0.0, 0.0)), vec3(0.0), vec3(1.0));
-    }
-
-    vec2 hue = lab.yz / chroma;
-    float low = 0.0;
-    float high = chroma;
-    // Five iterations are sufficient for 8-bit JPEG output and execute only on pixels that
-    // actually leave the unit sRGB gamut. Hue and Oklab lightness remain invariant.
-    for (int i = 0; i < 5; ++i) {
-        float mid = 0.5 * (low + high);
-        vec3 candidate = rawColorOklabToLinearSrgb(vec3(lab.x, hue * mid));
-        if (rawColorInsideUnitGamut(candidate)) low = mid;
-        else high = mid;
-    }
-    vec3 result = rawColorOklabToLinearSrgb(vec3(lab.x, hue * low));
-    return clamp(result, vec3(0.0), vec3(1.0));
-}
-
 vec3 compressToUnitGamutPreserveLuma(vec3 rgb) {
     // One final output-gamut owner. Work from the signed RGB vector so negative
     // outset components are compressed toward the same luminance instead of being
@@ -222,19 +129,19 @@ float profileContrastCurve(float value, float signedControl) {
     return 1.0 - 0.5 * pow(max(0.0, 2.0 * (1.0 - v)), factor);
 }
 
-vec3 applyProfileColor(vec3 rgb, bool perceptualGamut) {
-    float satControl = clamp(pc.profileSaturation, -1.0, 1.0);
+vec3 applyExplicitProfileToneContrast(vec3 rgb) {
     float contrastControl = clamp(pc.profileContrast, -1.0, 1.0);
+    if (abs(contrastControl) < 1.0e-4) return rgb;
     float y = max(0.0, lumaOf(rgb));
+    float mappedY = profileContrastCurve(y, contrastControl);
+    float scale = y > 1.0e-6 ? mappedY / y : 1.0;
+    return rgb * scale;
+}
 
-    if (abs(contrastControl) >= 1.0e-4) {
-        float mappedY = profileContrastCurve(y, contrastControl);
-        float scale = y > 1.0e-6 ? mappedY / y : 1.0;
-        rgb *= scale;
-        y = mappedY;
-    }
-    // Automatic camera rendering happens in scene-linear Oklab before AgX. This function is
-    // explicit profile intent only, so a neutral user profile remains neutral.
+vec3 applyProfileColor(vec3 rgb) {
+    float y = max(0.0, lumaOf(rgb));
+    // Calibrated camera colour is owned upstream. This stage contains only explicit
+    // user colour controls and therefore runs after all automatic tone placement.
     float vibranceControl = clamp(pc.profileVibrance, -1.0, 1.0);
     if (abs(vibranceControl) >= 1.0e-4) {
         float maximum = max(rgb.r, max(rgb.g, rgb.b));
@@ -246,12 +153,11 @@ vec3 applyProfileColor(vec3 rgb, bool perceptualGamut) {
                 : vibranceControl * (0.55 + 0.45 * protection);
         rgb = vec3(y) + (rgb - vec3(y)) * exp2(authority * 0.90);
     }
-    if (abs(satControl) >= 1.0e-4) {
-        float factor = exp2(satControl * 0.85);
-        rgb = vec3(y) + (rgb - vec3(y)) * factor;
+    float saturationControl = clamp(pc.profileSaturation, -1.0, 1.0);
+    if (abs(saturationControl) >= 1.0e-4) {
+        rgb = vec3(y) + (rgb - vec3(y)) * exp2(saturationControl * 0.85);
     }
-    return perceptualGamut ? rawColorCompressToUnitGamutPerceptual(rgb)
-            : compressToUnitGamutPreserveLuma(rgb);
+    return compressToUnitGamutPreserveLuma(rgb);
 }
 
 // QUALITY DELTA 0008/0012 — full-resolution (4:4:4) GALOSH-style residual cleanup.
@@ -680,8 +586,8 @@ uint fllfDestinationWidth() { return max(1u, pc.ultraHdrSourceMapWidth); }
 uint fllfDestinationHeight() { return max(1u, pc.ultraHdrSourceMapHeight); }
 
 float fllfSceneLogLumaAt(int x, int y) {
-    vec3 rgb = workingAt(x, y) * pc.exposureGain;
-    return log2(max(1.0e-6, lumaOf(rgb)) + 0.0025);
+    vec3 rgb = workingAt(x, y);
+    return log2(max(1.0e-6, lumaOf(rgb)));
 }
 
 void buildFllfGaussianLevel0(uvec2 gid) {
@@ -752,48 +658,41 @@ float fllfBilinearCorrection(uint offset, uint width, uint height, vec2 p) {
 }
 
 float fllfRequestedCorrection(float localLogLuma) {
-    float strength = clamp(fllfParam(8u, 0.0), 0.0, 0.90);
-    float sceneKey = clamp(fllfParam(9u, 0.150), 0.10, 0.20);
-    float maxLiftEv = clamp(fllfParam(10u, 0.55), 0.0, 1.25);
-    float maxCompressEv = clamp(fllfParam(11u, 0.55), 0.0, 0.90);
-    float localLuma = max(1.0e-6, exp2(localLogLuma) - 0.0025);
+    float strength = clamp(fllfParam(8u, 0.0), 0.0, 0.92);
+    float sceneKey = clamp(fllfParam(9u, 0.158), 0.12, 0.18);
+    float maxLiftEv = clamp(fllfParam(10u, 1.00), 0.0, 1.80);
+    float maxCompressEv = clamp(fllfParam(11u, 0.70), 0.0, 1.10);
+    float localLuma = max(1.0e-6, exp2(localLogLuma));
+    float requested = clamp(log2(sceneKey / localLuma), -maxCompressEv, maxLiftEv);
+    float need = smoothstep(0.055, 0.30, abs(requested));
 
-    // FLLF is intentionally asymmetric. Shadows may move toward the scene key, but highlights
-    // must never be normalized toward mid-grey. The previous symmetric log2(sceneKey/localLuma)
-    // request caused bright displays/lamps inside dark scenes to receive ~0.9 EV negative local
-    // exposure and become visibly darker than their surroundings.
-    float correctionEv = 0.0;
-    if (localLuma < sceneKey) {
-        float rawLiftEv = log2(sceneKey / localLuma);
-        float liftNeed = smoothstep(0.08, 0.38, rawLiftEv);
-        correctionEv = min(maxLiftEv, rawLiftEv * strength * liftNeed);
-    } else {
-        // Preserve ordinary upper-midtones. Compression begins only in a true bright zone, and
-        // the target is a highlight pivot rather than sceneKey. A second floor invariant prevents
-        // even maximum policy authority from turning a bright island into a midtone island.
-        float highlightPivot = clamp(max(0.34, sceneKey * 2.40), 0.34, 0.46);
-        if (localLuma > highlightPivot) {
-            float excessEv = max(0.0, log2(localLuma / highlightPivot));
-            float highlightNeed = smoothstep(highlightPivot, min(1.10, highlightPivot * 1.75), localLuma);
-            float shapedCompressEv = excessEv * strength * mix(0.24, 0.58, highlightNeed);
+    // telemetry[19] carries the propagated physical post-detail luma sigma. Convert the linear
+    // sigma into the same log2-luminance domain as FLLF: d(log2 Y)/dY = 1/(Y ln 2). This makes
+    // the coring threshold physically tied to LSC -> spatial exposure -> demosaic -> AWB -> CCM
+    // -> detail covariance instead of ISO/device heuristics.
+    float physicalSigmaY = max(0.0, fllfParam(19u, 0.0));
+    float sigmaEv = physicalSigmaY > 0.0
+            ? physicalSigmaY / (max(localLuma, 1.0e-4) * 0.69314718056)
+            : 0.0;
+    float coreEv = clamp(0.90 * sigmaEv, 0.0, 0.22);
+    float coredMagnitude = max(0.0, abs(requested) - coreEv);
+    requested = sign(requested) * coredMagnitude;
 
-            float highlightFloor = clamp(max(0.30, sceneKey * 2.05), 0.30, 0.40);
-            float floorLimitedEv = max(0.0, log2(localLuma / highlightFloor));
-            float permittedEv = min(maxCompressEv, 0.82 * floorLimitedEv);
-            correctionEv = -min(shapedCompressEv, permittedEv);
-        }
-    }
-
-    // telemetry[19] is an immutable scalar copied from the calibrated S/O-derived physical
-    // noise pressure. Noise gates only positive deep-shadow lift. Negative bright-zone
-    // compression remains available, but is bounded above by the highlight-zone invariants.
-    float noisePressure = clamp(fllfParam(19u, 0.0), 0.0, 1.0);
-    float shadowLiftStart = mix(0.010, 0.026, noisePressure);
-    float shadowLiftFull = mix(0.045, 0.090, noisePressure);
-    float deepBlackGuard = correctionEv > 0.0
-            ? smoothstep(shadowLiftStart, shadowLiftFull, localLuma)
+    // Positive local lift is permitted for real dark structure even when its absolute scene-linear
+    // level is low. Protect only the physically unresolved black/noise floor: an absolute 0.045
+    // guard incorrectly classified valid dark furniture/fabric as "black" and prevented local
+    // tone placement in backlit scenes.
+    float localSnr = physicalSigmaY > 1.0e-8 ? localLuma / physicalSigmaY : 1.0e6;
+    float shadowNoiseGate = requested > 0.0
+            ? smoothstep(1.35, 4.25, localSnr)
             : 1.0;
-    return correctionEv * deepBlackGuard;
+    float physicalBlackFloor = max(0.0025, 2.25 * physicalSigmaY);
+    float blackGateStart = min(0.040, 1.35 * physicalBlackFloor);
+    float blackGateFull = min(0.085, max(0.018, 4.25 * physicalBlackFloor));
+    float deepBlackGuard = requested > 0.0
+            ? smoothstep(blackGateStart, blackGateFull, localLuma)
+            : 1.0;
+    return requested * strength * need * shadowNoiseGate * deepBlackGuard;
 }
 
 void seedFllfCoarseCorrection(uvec2 gid) {
@@ -824,7 +723,7 @@ void reconstructFllfCorrectionLevel(uvec2 gid) {
     float refineNeed = smoothstep(0.12, 0.55, abs(localRequested - upCorrection));
     float correction = mix(upCorrection, localRequested, refinement * refineNeed * (1.0 - edge));
     correction *= 1.0 - 0.84 * edge;
-    correction = clamp(correction, -fllfParam(11u, 0.55), fllfParam(10u, 0.55));
+    correction = clamp(correction, -fllfParam(11u, 0.20), fllfParam(10u, 0.18));
     if (edge > 0.55 && abs(upCorrection) > 0.015) atomicAdd(telemetry[15], 1u);
     fllfCorrection[fllfDestinationOffset() + gid.y * dstW + gid.x] = correction;
 }
@@ -844,9 +743,14 @@ vec3 applyFllfLocalExposure(uvec2 gid, vec3 sceneRgb) {
         atomicAdd(telemetry[18], 1u);
     }
     atomicMax(telemetry[17], floatBitsToUint(max(0.0, abs(correctionEv))));
-    // One scalar exposure factor is applied to RGB. Hue and neutral balance are therefore not
-    // independently remapped by the local stage.
-    return sceneRgb * exp2(correctionEv);
+
+    // Strict luminance-ratio reconstruction, alpha = 1.0. FLLF changes Y only; the original RGB
+    // chromaticity is transported by one scalar Ynew/Yold multiplication.
+    float yOld = max(1.0e-6, lumaOf(sceneRgb));
+    float logYNew = log2(yOld) + correctionEv;
+    float yNew = max(1.0e-6, exp2(logYNew));
+    float ratio = yNew / yOld;
+    return sceneRgb * ratio;
 }
 
 const vec2 kLocalToneDirections[12] = vec2[12](
@@ -916,12 +820,12 @@ vec3 applyLocalTone(uvec2 gid, vec3 exposedRgb) {
     float localBase = max(0.006, sampleLocalToneBase(gid));
     float requestedEv = clamp(log2(sceneKey / localBase), -maxCompressEv, maxLiftEv);
 
-    // Do not reveal black-level/noise texture as local brightness, and do not use positive LTM
+    // Do not reveal black-level/noise texture as local brightness, and do not use positive local-tone
     // gain to fight the global highlight shoulder. Negative local compression remains available
     // for broad bright regions.
     float deepBlackGuard = smoothstep(0.014, 0.055, centerLuma);
     float positiveHighlightGuard = 1.0 - 0.88 * smoothstep(0.48, 0.90, centerLuma);
-    // LTM should act only where the local base materially disagrees with the scene key. Without
+    // Local tone should act only where the local base materially disagrees with the scene key. Without
     // this need gate tiny positive/negative requests touched most of the frame and created haze.
     float localNeedGate = smoothstep(0.045, 0.16, abs(requestedEv));
     float authority = deepBlackGuard * localNeedGate *
@@ -931,84 +835,23 @@ vec3 applyLocalTone(uvec2 gid, vec3 exposedRgb) {
     return exposedRgb * exp2(appliedEv);
 }
 
-// Troy Sobotka / Blender AgX Display Rendering Transform (DRT)
-const mat3 AGX_INSET_MATRIX = mat3(
-    0.842479062253094, 0.0423282422610123, 0.0423756549057051,
-    0.0784335999999992, 0.878468636469772, 0.0784336,
-    0.0792237451477643, 0.0791661274605434, 0.879142973793104
-);
-
-const mat3 AGX_OUTSET_MATRIX = mat3(
-    1.19687902425898, -0.0528968517594562, -0.0529716355084938,
-    -0.0980208811401368, 1.15190312990417, -0.0980434501171241,
-    -0.0990297440797205, -0.0989611768448433, 1.15107367264116
-);
-
-vec3 agxDefaultContrastApprox(vec3 x) {
-    vec3 x2 = x * x;
-    vec3 x4 = x2 * x2;
-    return + 15.5 * x4 * x2
-           - 40.14 * x4 * x
-           + 31.96 * x4
-           - 6.868 * x2 * x
-           + 0.4298 * x2
-           + 0.1191 * x
-           - 0.00232;
-}
-
-// RAW display transform fix: preserve post-CCM camera chromaticity through the
-// automatic scene-to-display mapping. AgX still owns display luminance placement,
-// but no longer runs its non-linear curve independently on R/G/B for RAW.
-// That previous per-channel application compressed channel separation strongly and
-// was the measured source of the pastel / hue-drifting RAW render.
-// Phase-10 RAW presentation repair: AgX reserves compositor headroom that normalized mobile
-// RAW rarely occupies. DynamicRangeTonePolicy resolves this endpoint-preserving placement
-// per scene and feeds it through the existing RAW-only push slots. AgX remains the single
-// scene-to-display owner; this is not a second exposure or tone-compression pass.
-float applyRawAgxDisplayWhitePlacement(float displayLuma) {
-    float x = clamp(displayLuma, 0.0, 1.0);
-    // RAW Phase-10 reuses the legacy shoulder push slots for these two values. They are resolved
-    // from actual scene statistics in DynamicRangeTonePolicy: more genuine sensor clipping moves
-    // the knee later and reduces expansion; recoverable bright range can use more display headroom.
-    float knee = clamp(pc.shoulderStart, 0.50, 0.65);
-    float exponent = clamp(pc.shoulderStrength, 1.0, 2.50);
-    if (x <= knee || exponent <= 1.0001) return x;
-    float u = clamp((x - knee) / (1.0 - knee), 0.0, 1.0);
-    float expanded = 1.0 - pow(1.0 - u, exponent);
-    return clamp(knee + (1.0 - knee) * expanded, 0.0, 1.0);
-}
-
-float applyAgXLumaValue(float yLinear) {
-    // AgX allocation bounds are absolute log2(linear BT.709) values.
-    // The published -10/+6.5 EV span is relative to 18% middle grey, so
-    // log2(0.18) is included in the shader-domain bounds.
-    const float min_ev = -12.47393;
-    const float max_ev = +4.026069;
-
-    // Neutral input stays neutral through inset/outset. Running the established
-    // AgX math on a neutral triplet therefore gives the DRT luminance response
-    // without rotating or compressing scene chromaticity.
-    vec3 val = AGX_INSET_MATRIX * vec3(max(yLinear, 1.0e-6));
-    vec3 logVal = clamp(log2(val), vec3(min_ev), vec3(max_ev));
-    val = (logVal - vec3(min_ev)) / (max_ev - min_ev);
-    val = clamp(agxDefaultContrastApprox(val), vec3(0.0), vec3(1.0));
-    val = AGX_OUTSET_MATRIX * val;
-    val = sign(val) * pow(abs(val), vec3(2.2));
-    float displayY = max(0.0, lumaOf(val));
-    return applyRawAgxDisplayWhitePlacement(displayY);
-}
-
-vec3 applyAgXTonemap(vec3 colorLinear) {
-    vec3 scene = max(colorLinear, vec3(0.0));
-    float sceneY = lumaOf(scene);
-    if (sceneY <= 1.0e-7) return vec3(0.0);
-
-    // Black-level ownership is pre-demosaic. AgX must not contain a second
-    // scene-derived black subtraction; it only maps the calibrated scene luma.
-    // AgX owns the tone response; scene RGB ratios carry the camera colour.
-    float mappedY = applyAgXLumaValue(sceneY);
-    float scale = mappedY / max(sceneY, 1.0e-7);
-    return scene * scale;
+// Khronos PBR Neutral tone mapper. This is the sole automatic scene-to-display mapper on RAW.
+// FLLF has already performed scene-referred local tone placement in log2(Y); this function adds
+// no preceding global S-curve and contains no camera-colour look.
+vec3 pbrNeutralToneMapping(vec3 color) {
+    const float startCompression = 0.8 - 0.04;
+    const float desaturation = 0.15;
+    color = max(color, vec3(0.0));
+    float x = min(color.r, min(color.g, color.b));
+    float offset = x < 0.08 ? x - 6.25 * x * x : 0.04;
+    color -= vec3(offset);
+    float peak = max(color.r, max(color.g, color.b));
+    if (peak < startCompression) return max(color, vec3(0.0));
+    const float d = 1.0 - startCompression;
+    float newPeak = 1.0 - d * d / (peak + d - startCompression);
+    color *= newPeak / max(peak, 1.0e-8);
+    float g = 1.0 - 1.0 / (desaturation * (peak - newPeak) + 1.0);
+    return mix(color, vec3(newPeak), g);
 }
 
 vec3 applyToneLookLut(vec3 rgb) {
@@ -1030,37 +873,27 @@ vec3 applyToneLookLut(vec3 rgb) {
     return rgb * scale;
 }
 
-// Phase 9: the former RAW post-tone magenta/near-white neutralizer was removed from
-// production. At this point AgX/tone have already changed the physical signal, so inferring
-// sensor clipping here is not valid. YUV retains its separate presentation heuristic below
-// because it has no RAW sensor-domain evidence and is outside the Phase-9 RAW owner.
+// Phase 9: the former RAW post-tone magenta/near-white neutralizer remains retired. Sensor
+// clipping is owned upstream in the source-RAW domain; no display-stage heuristic may infer it.
+// YUV retains its separate presentation heuristic because it has no RAW sensor-domain evidence.
 
 void runTone(uvec2 gid) {
     if (gid.x >= pc.frameWidth || gid.y >= pc.frameHeight) return;
     uint base = (gid.y * pc.frameWidth + gid.x) * 3u;
     vec3 rgb = vec3(workingRgb[base + 0u], workingRgb[base + 1u], workingRgb[base + 2u]);
-    rgb *= pc.exposureGain;
     if (pc.isRawBayer != 0u) {
-        // In tone mode presenceReserved0 is the explicit FLLF-active bit. FLLF pyramid
-        // construction modes reuse the same slot for sourceHeight, but their dispatches are
-        // complete before this mode-3 push. Never sample binding 12 when the policy disabled FLLF.
+        // RAW production order:
+        // calibrated scene-linear -> log2(Y) FLLF -> strict Ynew/Yold ratio -> explicit profile
+        // Exposure (scene-linear) -> Khronos PBR Neutral -> explicit tonal ranges/curves ->
+        // explicit profile colour -> one final gamut owner.
         if (pc.presenceReserved0 != 0u) rgb = applyFllfLocalExposure(gid, rgb);
-        // RAW color render: bounded, hue-preserving camera-profile render after calibrated CCM and local
-        // scene-linear contrast, before the display transform. This is not an exposure owner.
-        rgb = applyRawCameraProfileRender(rgb);
-        // Scene-linear RAW Bayer path: AgX is the sole automatic scene-to-display DRT.
-        // The following display-linear LUT is automatically identity in RAW Phase 10 and exists
-        // only for explicit profile tonal ranges/curves.
-        rgb = applyAgXTonemap(rgb);
-        // RAW clipping colour has one owner upstream in Phase 9: source-Bayer confidence
-        // is applied after WB+CCM in scene-linear RGB. Do not infer sensor clipping or
-        // desaturate highlights again after AgX.
-        // The LUT is identity for automatic RAW rendering in Phase 10; only explicit profile
-        // tonal ranges/curves remain. Profile color is explicit user look intent, not automatic
-        // compensation. Final unit-gamut placement is performed by applyProfileColor.
+        rgb *= max(0.0, pc.exposureGain);
+        rgb = pbrNeutralToneMapping(rgb);
         rgb = applyToneLookLut(rgb);
-        rgb = applyProfileColor(rgb, true);
+        rgb = applyExplicitProfileToneContrast(rgb);
+        rgb = applyProfileColor(rgb);
     } else {
+        rgb *= pc.exposureGain;
         rgb = applyLocalTone(gid, rgb);
         // YUV capture path (already ISP-tonemapped by HAL)
         float preShoulderY = max(1.0e-6, lumaOf(rgb));
@@ -1121,7 +954,8 @@ void runTone(uvec2 gid) {
         float shadowLimit = negativeDeviation > 1.0e-6 ? finalLuma / negativeDeviation : requestedSaturationFactor;
         float saturationFactor = max(1.0, min(requestedSaturationFactor, min(highlightLimit, shadowLimit)));
         rgb = max(vec3(0.0), vec3(finalLuma) + (rgb - vec3(finalLuma)) * saturationFactor);
-        rgb = applyProfileColor(rgb, false);
+        rgb = applyExplicitProfileToneContrast(rgb);
+        rgb = applyProfileColor(rgb);
     }
 
     workingRgb[base + 0u] = rgb.r;
@@ -1507,7 +1341,7 @@ void proposePerceptualDetail(uvec2 gid) {
     vec3 proposedRgb = centerRgb;
     if (centerY > 1.0e-5) {
         proposedRgb = centerRgb * clamp(proposedY / centerY, 0.88, 1.12);
-        proposedRgb = rawColorCompressToUnitGamutPerceptual(proposedRgb);
+        proposedRgb = compressToUnitGamutPreserveLuma(proposedRgb);
     }
     writeLinearDetailScratch(gid, proposedRgb);
 

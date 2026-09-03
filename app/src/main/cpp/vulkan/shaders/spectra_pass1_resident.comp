@@ -261,9 +261,25 @@ float forwardVst(float x, float S, float O) {
     float arg = S * x + O + 0.375 * S * S;
     return (2.0 / S) * sqrt(max(arg, 1.0e-20));
 }
-float inverseVst(float y, float S, float O) {
-    float sy2 = 0.5 * S * y;
-    return (sy2 * sy2 - O - 0.375 * S * S) / S;
+// Phase 4: Mäkitalo-Foi closed-form approximation of the unbiased inverse for the
+// generalized Anscombe transform. The former algebraic inverse is biased in the low-count
+// regime and can leave a coarse, signal-dependent luma texture after VST-domain shrinkage.
+// Here D = 2*sqrt(x/S + O/S^2 + 3/8), so the normalized inverse is multiplied by S.
+float inverseVstUnbiasedApprox(float D, float S, float O) {
+    if (!vstValid(S, O) || !finite1(D)) return 0.0;
+    const float sqrtThreeHalves = 1.224744871391589;
+    float safeD = max(D, sqrtThreeHalves);
+    float invD = 1.0 / safeD;
+    float invD2 = invD * invD;
+    float invD3 = invD2 * invD;
+    float sigma2 = O / max(S * S, 1.0e-20);
+    float normalized =
+            0.25 * safeD * safeD +
+            0.25 * sqrtThreeHalves * invD -
+            1.375 * invD2 +
+            0.625 * sqrtThreeHalves * invD3 -
+            0.125 - sigma2;
+    return max(0.0, S * normalized);
 }
 
 float lensGainAt(int channel, int x, int y) {
@@ -658,9 +674,8 @@ void pass1Pixel() {
     // a free-standing blur across gradients or coherent texture.
     SameCfaRingEstimate midRing = sameCfaRingEstimate(x, y, 4, S, O);
     SameCfaRingEstimate coarseRing = sameCfaRingEstimate(x, y, 8, S, O);
-    // Phase-6 physical baseline ownership: the S/O-driven SPECTRA-Off path stays local.
-    // Radius-4/8 consensus is an optional SPECTRA contextual enhancement; allowing it to
-    // steer the physical baseline correlated fine sensor grain into broad low-light mottling.
+    // The physical luma baseline stays local. Radius-4/8 consensus is an optional SPECTRA
+    // contextual enhancement and must not correlate fine sensor grain into broad mottling.
     if (pc.physicalBaselineMode == 0u && midRing.valid && coarseRing.valid) {
         float persistentStructureZ = max(
                 multiscaleContext.coherentStructureZ,
@@ -689,10 +704,8 @@ void pass1Pixel() {
     float lensGain = lensGainAt(ch, x, y);
     float shadingAuthority = clamp(0.90 + 0.20 * (lensGain - 1.0), 0.90, 1.38);
     float isolatedNoiseEvidence = smoothstepSpectra(0.55, 2.75, impulseScore) * flatContext;
-    // Physical SPECTRA-Off denoise may use multiscale evidence to *protect* structure, but
-    // it must not receive >1 contextual/surface boosts. SPECTRA retains the established
-    // contextual boost envelope. This preserves strong local VST/Wiener cleanup without
-    // turning defocused/noisy regions into spatially correlated blotches.
+    // Physical single-frame luma may use multiscale evidence to protect structure, but it
+    // must not receive >1 contextual/surface boosts. SPECTRA retains the wider context envelope.
     float contextBoost = pc.physicalBaselineMode != 0u
             ? 1.0
             : mix(0.90, 1.34, flatContext * (0.70 + 0.30 * isolatedNoiseEvidence));
@@ -710,7 +723,7 @@ void pass1Pixel() {
     if (contextBoost > 1.15) atomicAdd(telemetry[83], 1u);
 
     float boundedVstDelta = clamp((target - center) * authority, -pc.maxPixelShift, pc.maxPixelShift);
-    float candidate = inverseVst(center + boundedVstDelta, S, O);
+    float candidate = inverseVstUnbiasedApprox(center + boundedVstDelta, S, O);
     if (!finite1(candidate)) {
         candidateMosaic[index] = original;
         return;
@@ -750,8 +763,6 @@ void pass0Pixel() {
     }
     int ch = cfaChannel(x, y);
     float bias = ch == 0 ? pc.s0 : (ch == 1 ? pc.s1 : (ch == 2 ? pc.s2 : pc.s3));
-    // RAW-normalize already clips the metadata-subtracted floor at zero. Residual
-    // black calibration must not reintroduce negative sensor values.
     candidateMosaic[index] = max(0.0, original + bias);
     atomicAdd(telemetry[0], 1u);
     if (abs(bias) > 1.0e-12) atomicAdd(telemetry[1], 1u);

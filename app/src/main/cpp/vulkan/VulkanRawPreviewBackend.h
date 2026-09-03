@@ -61,6 +61,19 @@ struct RawPreviewGpuRequest {
     std::array<float, 9> colorMatrix{1.0f, 0.0f, 0.0f,
                                      0.0f, 1.0f, 0.0f,
                                      0.0f, 0.0f, 1.0f};
+    // Same trusted DNG ProfileHueSatMap contract as the resident capture colour backend. The
+    // paired ForwardMatrix is already carried by colorMatrix; the HSM is optional augmentation.
+    bool calibratedHueSatMapEnabled = false;
+    std::uint32_t hueSatHueDivisions = 0u;
+    std::uint32_t hueSatSaturationDivisions = 0u;
+    std::uint32_t hueSatValueDivisions = 0u;
+    std::uint32_t hueSatEncoding = 0u;
+    const float* hueSatData1 = nullptr;
+    std::size_t hueSatData1FloatCount = 0u;
+    const float* hueSatData2 = nullptr;
+    std::size_t hueSatData2FloatCount = 0u;
+    float hueSatWeightFirst = 1.0f;
+    float hueSatWeightSecond = 0.0f;
     float profileSaturation = 0.0f;
     float profileContrast = 0.0f;
     float profileVibrance = 0.0f;
@@ -297,6 +310,9 @@ private:
     PersistentBuffer toneLutBuffer_;
     PersistentBuffer deviceStatistics_;
     PersistentBuffer localToneBase_;
+    // Header (16 floats) + one or two validated dense DNG HSM tables. Kept resident/reused across
+    // preview frames; the CPU only uploads compact immutable profile data when executing a frame.
+    PersistentBuffer hueSatProfile_;
 };
 
 }  // namespace bncam::vulkan

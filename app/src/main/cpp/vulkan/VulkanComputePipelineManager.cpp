@@ -304,27 +304,7 @@ bool VulkanComputePipelineManager::initializePipelines(VkDevice device) {
         }
     }
 
-    // 15. ISP Exposure & Tone Pipeline
-    const auto& ietSpirv = getIspExposureToneSpirv();
-    VkShaderModuleCreateInfo ietModInfo{};
-    ietModInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-    ietModInfo.codeSize = ietSpirv.size() * sizeof(std::uint32_t);
-    ietModInfo.pCode = ietSpirv.data();
-
-    if (vkCreateShaderModule(device, &ietModInfo, nullptr, &ispExposureToneShaderModule_) == VK_SUCCESS) {
-        VkComputePipelineCreateInfo pipeInfo{};
-        pipeInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-        pipeInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        pipeInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        pipeInfo.stage.module = ispExposureToneShaderModule_;
-        pipeInfo.stage.pName = "main";
-        pipeInfo.layout = pipelineLayout_;
-        if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &ispExposureTonePipeline_) == VK_SUCCESS) {
-            pipelineCreationCount_++;
-        }
-    }
-
-    // 16. ISP Contrast & Vibrance Pipeline
+    // 15. ISP Contrast & Vibrance Pipeline
     const auto& icvSpirv = getIspContrastVibranceSpirv();
     VkShaderModuleCreateInfo icvModInfo{};
     icvModInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
@@ -434,14 +414,6 @@ void VulkanComputePipelineManager::destroyPipelines(VkDevice device) {
     if (ispContrastVibranceShaderModule_ != VK_NULL_HANDLE) {
         vkDestroyShaderModule(device, ispContrastVibranceShaderModule_, nullptr);
         ispContrastVibranceShaderModule_ = VK_NULL_HANDLE;
-    }
-    if (ispExposureTonePipeline_ != VK_NULL_HANDLE) {
-        vkDestroyPipeline(device, ispExposureTonePipeline_, nullptr);
-        ispExposureTonePipeline_ = VK_NULL_HANDLE;
-    }
-    if (ispExposureToneShaderModule_ != VK_NULL_HANDLE) {
-        vkDestroyShaderModule(device, ispExposureToneShaderModule_, nullptr);
-        ispExposureToneShaderModule_ = VK_NULL_HANDLE;
     }
     if (ispChromaDenoisePipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(device, ispChromaDenoisePipeline_, nullptr);
@@ -1570,46 +1542,6 @@ ComputeExecutionResult VulkanComputePipelineManager::executeIspChromaDenoise(
 
     if (!initialized_ || device == VK_NULL_HANDLE || inputRgbBuffer == VK_NULL_HANDLE) {
         result.failureReason = "Compute pipeline manager uninitialized or invalid handles for chroma denoise.";
-        result.diagnostics.failureReason = result.failureReason;
-        return result;
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        pipelineReuseCount_++;
-    }
-
-    result.success = true;
-    result.diagnostics.success = true;
-    return result;
-}
-
-ComputeExecutionResult VulkanComputePipelineManager::executeIspExposureTone(
-    VkDevice device,
-    VulkanAllocatorOwner& allocatorOwner,
-    VkQueue computeQueue,
-    VkCommandPool commandPool,
-    VkBuffer inputRgbBuffer,
-    std::uint32_t width,
-    std::uint32_t height,
-    float exposureGain,
-    float gamma,
-    std::uint64_t generationId
-) {
-    ComputeExecutionResult result{};
-    result.diagnostics.stageId = "EXPOSURE_TONE";
-    result.diagnostics.shaderVersion = "SPIR-V 1.0 (GLSL 450)";
-    result.diagnostics.pipelineIdentity = "vulkan-isp-exposure-tone-pipeline";
-    result.diagnostics.inputResourceIdentity = "rgba32f-input-" + std::to_string(generationId);
-    result.diagnostics.outputResourceIdentity = "tone-mapped-rgba32f-" + std::to_string(generationId);
-    result.diagnostics.inputBytes = static_cast<std::uint64_t>(width) * height * 16u;
-    result.diagnostics.outputBytes = static_cast<std::uint64_t>(width) * height * 16u;
-    result.diagnostics.readbackBytes = 0u;
-    result.diagnostics.dispatchDimensions = "(" + std::to_string((width + 15) / 16) + ", " + std::to_string((height + 15) / 16) + ", 1)";
-    result.diagnostics.fallback = false;
-
-    if (!initialized_ || device == VK_NULL_HANDLE || inputRgbBuffer == VK_NULL_HANDLE) {
-        result.failureReason = "Compute pipeline manager uninitialized or invalid handles for exposure tone.";
         result.diagnostics.failureReason = result.failureReason;
         return result;
     }

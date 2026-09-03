@@ -85,21 +85,33 @@ std::string readString(JNIEnv* env, jstring s) {
 } // namespace
 
 bool RawCameraNativeHueSatProfile::valid() const noexcept {
-    if (profileId.empty() || sourcePriority <= 0 || hueDivisions < 1 || saturationDivisions < 2 ||
-        valueDivisions < 1 || (encoding != 0 && encoding != 1)) return false;
+    if (profileId.empty() || sourcePriority <= 0 || calibrationIlluminant1 == 0) return false;
     if (!finiteMatrix(colorMatrix1) || !finiteMatrix(discoveryEffectiveCcm)) return false;
+    if (!hasForwardMatrix1 || !finiteMatrix(forwardMatrix1)) return false;
     if (hasColorMatrix2 && !finiteMatrix(colorMatrix2)) return false;
     if (hasCameraCalibration1 && !finiteMatrix(cameraCalibration1)) return false;
     if (hasCameraCalibration2 && !finiteMatrix(cameraCalibration2)) return false;
-    if (hasForwardMatrix1 && !finiteMatrix(forwardMatrix1)) return false;
     if (hasForwardMatrix2 && !finiteMatrix(forwardMatrix2)) return false;
     for (float v : analogBalance) {
         if (!std::isfinite(v) || v <= 0.0f || v > 64.0f) return false;
     }
+
+    const bool anySecondary = calibrationIlluminant2 != 0 || hasColorMatrix2 ||
+            hasCameraCalibration2 || hasForwardMatrix2;
+    if (anySecondary && !dualCharacterization()) return false;
+
+    // DNG matrix characterization is independently valid. ProfileHueSatMap is optional profile
+    // data and must not be fabricated merely to make the physical ForwardMatrix route usable.
+    if (!hasHueSatMap()) {
+        return hueDivisions == 0 && saturationDivisions == 0 && valueDivisions == 0 &&
+                hueSatData2.empty();
+    }
+    if (hueDivisions < 1 || saturationDivisions < 2 || valueDivisions < 1 ||
+        (encoding != 0 && encoding != 1)) return false;
     if (!tableValid(*this, hueSatData1)) return false;
-    if (!hueSatData2.empty() && !tableValid(*this, hueSatData2)) return false;
-    if (!hueSatData2.empty() && (!hasColorMatrix2 || calibrationIlluminant2 == 0)) return false;
-    return calibrationIlluminant1 != 0;
+    if (dualHueSatMap() && !tableValid(*this, hueSatData2)) return false;
+    if (dualHueSatMap() && !dualCharacterization()) return false;
+    return true;
 }
 
 RawCameraColorProfileRegistry& RawCameraColorProfileRegistry::instance() noexcept {

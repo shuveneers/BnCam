@@ -136,13 +136,6 @@ struct IspChromaDenoisePushConstants {
     float chromaStrength;
 };
 
-struct IspExposureTonePushConstants {
-    std::uint32_t width;
-    std::uint32_t height;
-    float exposureGain;
-    float gamma;
-};
-
 struct IspContrastVibrancePushConstants {
     std::uint32_t width;
     std::uint32_t height;
@@ -323,19 +316,6 @@ public:
         std::uint64_t generationId
     );
 
-    ComputeExecutionResult executeIspExposureTone(
-        VkDevice device,
-        VulkanAllocatorOwner& allocatorOwner,
-        VkQueue computeQueue,
-        VkCommandPool commandPool,
-        VkBuffer inputRgbBuffer,
-        std::uint32_t width,
-        std::uint32_t height,
-        float exposureGain,
-        float gamma,
-        std::uint64_t generationId
-    );
-
     ComputeExecutionResult executeIspContrastVibrance(
         VkDevice device,
         VulkanAllocatorOwner& allocatorOwner,
@@ -432,9 +412,6 @@ private:
 
     VkShaderModule ispChromaDenoiseShaderModule_ = VK_NULL_HANDLE;
     VkPipeline ispChromaDenoisePipeline_ = VK_NULL_HANDLE;
-
-    VkShaderModule ispExposureToneShaderModule_ = VK_NULL_HANDLE;
-    VkPipeline ispExposureTonePipeline_ = VK_NULL_HANDLE;
 
     VkShaderModule ispContrastVibranceShaderModule_ = VK_NULL_HANDLE;
     VkPipeline ispContrastVibrancePipeline_ = VK_NULL_HANDLE;

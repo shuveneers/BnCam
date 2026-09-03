@@ -24,8 +24,7 @@ class LightroomLegacyToneLaneFullRemovalSourceContractTest {
             "src/main/cpp/NativeRenderQualityConfig.h",
             "src/main/cpp/native-lib.cpp",
             "src/main/cpp/IspCore.cpp",
-            "src/main/cpp/GpuIsp.cpp",
-            "src/main/cpp/DynamicRangeTonePolicy.h"
+            "src/main/cpp/GpuIsp.cpp"
         ).joinToString("\n") { source(it) }
 
         listOf(

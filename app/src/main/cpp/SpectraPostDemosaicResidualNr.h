@@ -31,23 +31,20 @@ struct PostDemosaicResidualNrPlan {
 /**
  * Residual-only late cleanup.
  *
- * Phase-6 ownership:
+ * Phase-4 ownership:
  * - the physical luminance baseline is resolved by PhysicalLumaDenoisePolicy;
- * - this wrapper only combines that independent baseline with optional SPECTRA residual
- *   enhancement and the pre-existing chroma residual contract;
- * - the input sigma values are propagated residuals, never reconstructed from ISO.
+ * - this wrapper combines that independent baseline with optional SPECTRA residual
+ *   enhancement and the existing chroma residual contract;
+ * - input sigma values are propagated residuals, never reconstructed from ISO or from the
+ *   original Camera2 S/O model.
  *
- * The input sigma values must represent the actual production path up to this resident
- * filter:
+ * The input covariance represents the actual production path up to this resident filter:
  *
- *   CFA cleanup -> Phase-5 spatial exposure -> demosaic -> AWB -> CCM -> detail/tone.
+ *   CFA cleanup -> lens shading/spatial exposure -> demosaic -> AWB -> CCM -> detail -> tone.
  *
- * That propagated covariance is the boundary which prevents double denoise. In particular,
- * positive spatial exposure amplification is already present in residualLumaSigma; this
- * function must not multiply it a second time.
- *
- * Luma validity is intentionally independent from chroma validity. A missing/zero chroma
- * residual must not disable a trustworthy propagated physical luminance baseline.
+ * That propagated covariance is the boundary which prevents double denoise. Luma validity is
+ * intentionally independent from chroma validity: an unavailable chroma residual must not
+ * disable a trustworthy propagated physical luminance baseline.
  */
 inline PostDemosaicResidualNrPlan resolvePostDemosaicResidualNr(
         float residualLumaSigma,
@@ -96,20 +93,16 @@ inline PostDemosaicResidualNrPlan resolvePostDemosaicResidualNr(
     plan.inputChromaSigma = validChromaResidual ? residualChromaSigma : 0.0f;
     plan.modelConfidence = confidence;
 
-    // Luma baseline ownership is external and independent from SPECTRA.
     plan.baselineLumaFraction = physicalLuma.baselineFraction;
 
-    // Chroma is deliberately unchanged in Phase 6. If its propagated residual is unavailable,
-    // leave only this wrapper's chroma contribution at zero instead of suppressing luma.
+    // Phase 4 changes luminance ownership only. Keep the established propagated-chroma
+    // residual envelope independent from the luma refinement.
     const float confidenceScale = 0.72f + 0.28f * confidence;
     plan.baselineChromaFraction = validChromaResidual
             ? std::clamp(0.78f * confidenceScale, 0.54f, 0.78f)
             : 0.0f;
 
     if (spectraContextFusionActive) {
-        // Strength=0 remains the calibrated neutral SPECTRA master authority.
-        // These terms are optional residual increments only; they do not determine
-        // whether the physical luma baseline exists.
         const float overall = std::exp2(
                 std::clamp(std::isfinite(profileStrength) ? profileStrength : 0.0f,
                            -1.0f, 1.0f) * 0.20f);
@@ -159,8 +152,8 @@ inline PostDemosaicResidualNrPlan resolvePostDemosaicResidualNr(
                     0.96f)
             : 0.0f;
 
-    // Use the externally resolved physical target for the baseline, then add only the
-    // optional SPECTRA residual increment. This keeps the baseline invariant to SPECTRA.
+    // Use the independently resolved physical luma target, then add only the optional
+    // SPECTRA residual increment. This keeps the physical baseline invariant to SPECTRA.
     const float spectraLumaSigma =
             plan.inputLumaSigma * plan.spectraLumaFraction;
     plan.lumaSigma = std::clamp(

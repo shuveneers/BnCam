@@ -828,22 +828,22 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
     }
     if (fllfRequested) {
         const float fllfValues[6] = {
-                std::clamp(request.fllfStrength, 0.0f, 0.90f),
-                std::clamp(request.fllfSceneKey, 0.10f, 0.20f),
-                std::clamp(request.fllfMaxLiftEv, 0.0f, 1.25f),
-                std::clamp(request.fllfMaxCompressEv, 0.0f, 1.50f),
+                std::clamp(request.fllfStrength, 0.0f, 0.92f),
+                std::clamp(request.fllfSceneKey, 0.12f, 0.18f),
+                std::clamp(request.fllfMaxLiftEv, 0.0f, 1.80f),
+                std::clamp(request.fllfMaxCompressEv, 0.0f, 1.10f),
                 std::clamp(request.fllfEdgeStopEv, 0.40f, 0.90f),
                 std::clamp(request.fllfRefinement, 0.0f, 0.22f)};
-        const float fllfShadowLiftNoiseGuardPressure = std::clamp(
-                request.fllfShadowLiftNoiseGuardPressure, 0.0f, 1.0f);
+        const float fllfPhysicalNoiseSigmaY = std::clamp(
+                request.fllfPhysicalNoiseSigmaY, 0.0f, 0.50f);
         std::uint32_t fllfBits[6]{};
         std::memcpy(fllfBits, fllfValues, sizeof(fllfBits));
         vkCmdUpdateBuffer(commandBuffer_, telemetry_.buffer,
                           8u * sizeof(std::uint32_t), sizeof(fllfBits), fllfBits);
         vkCmdUpdateBuffer(commandBuffer_, telemetry_.buffer,
                           19u * sizeof(std::uint32_t),
-                          sizeof(fllfShadowLiftNoiseGuardPressure),
-                          &fllfShadowLiftNoiseGuardPressure);
+                          sizeof(fllfPhysicalNoiseSigmaY),
+                          &fllfPhysicalNoiseSigmaY);
     }
     if (linearDetailRequested) {
         const float detailValues[11] = {
@@ -1165,7 +1165,7 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
         if (!fllfRequested) vkCmdResetQueryPool(commandBuffer_, queryPool_, 0u, 8u);
         vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, fllfRequested ? 4u : 0u);
     }
-    // Phase 10 final invariant: in mode 3 this reused field is a boolean FLLF-active flag.
+    // Phase 5 invariant: in mode 3 this reused field is the boolean RAW FLLF-active flag.
     // It prevents the tone kernel from interpreting the compact fallback descriptor as a
     // full FLLF correction pyramid when policy evidence did not request local processing.
     push.presenceReserved0 = fllfRequested ? 1u : 0u;
@@ -1407,8 +1407,8 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
             : 0.0f;
     std::uint32_t fllfMaxBits = telemetry[17];
     std::memcpy(&result.fllfMaxAbsCorrectionEv, &fllfMaxBits, sizeof(float));
-    result.fllfShadowLiftNoiseGuardPressure = std::clamp(
-            request.fllfShadowLiftNoiseGuardPressure, 0.0f, 1.0f);
+    result.fllfPhysicalNoiseSigmaY = std::clamp(
+            request.fllfPhysicalNoiseSigmaY, 0.0f, 0.50f);
     result.fllfApplied = fllfRequested && result.fllfAdjustedPixels > 0u;
     result.linearDetailEvaluatedPixels = telemetry[31];
     result.linearDetailChangedPixels = telemetry[32];

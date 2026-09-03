@@ -4,6 +4,7 @@ import android.hardware.camera2.CameraCharacteristics
 import android.util.Log
 import com.bncam.core.isp.raw.RawDomainContract
 import java.nio.ByteOrder
+import java.util.ArrayDeque
 
 data class DngAuditItem(
     val name: String,
@@ -53,7 +54,6 @@ data class DngHueSatMapProfileSnapshot(
         data3 = data3?.copyOf()
     )
 }
-
 
 data class DngCameraColorProfileSnapshot(
     val available: Boolean = false,
@@ -114,7 +114,11 @@ object DngSemanticAuditor {
         source: String
     ): DngCameraColorProfileSnapshot {
         val tags = TiffHeaderParser.parse(bytes)
-            ?: return DngCameraColorProfileSnapshot(source = source, calibrationProfileId = calibrationProfileId, status = "TIFF_HEADER_UNAVAILABLE")
+            ?: return DngCameraColorProfileSnapshot(
+                source = source,
+                calibrationProfileId = calibrationProfileId,
+                status = "TIFF_HEADER_UNAVAILABLE"
+            )
         val hueSatMap = buildHueSatMapSnapshot(tags)
         return buildCameraColorProfileSnapshot(
             tags = tags,
@@ -169,11 +173,7 @@ object DngSemanticAuditor {
                 expectedWhiteLevel = contract?.payloadWhiteLevel,
                 expectedBlackLevels = contract?.payloadBlackLevels
             )
-            // Phase 2 / DELTA 0143: DngCreator receives the complete CameraCharacteristics and
-            // CaptureResult internally, including system-only RAW profile metadata that normal app
-            // code cannot query directly. Probe the actual DNG bytes rather than reflecting hidden
-            // Camera2 keys. Absence is valid (the tags are optional); malformed presence fails the
-            // semantic audit and is never promoted into a camera profile.
+
             val hueSatSnapshot = buildHueSatMapSnapshot(tags)
             lastHueSatMapProfile = hueSatSnapshot
             items += DngAuditItem(
@@ -201,6 +201,7 @@ object DngSemanticAuditor {
                     "illuminants=${cameraProfile.calibrationIlluminant1}/${cameraProfile.calibrationIlluminant2}," +
                     "colorMatrices=${listOf(cameraProfile.colorMatrix1, cameraProfile.colorMatrix2).count { it != null }}," +
                     "forwardMatrices=${listOf(cameraProfile.forwardMatrix1, cameraProfile.forwardMatrix2).count { it != null }}," +
+                    "hsm=${cameraProfile.hueSatMap.available}/${cameraProfile.hueSatMap.valid}," +
                     "status=${cameraProfile.status}"
             )
 
@@ -233,7 +234,10 @@ object DngSemanticAuditor {
         val stripOffset = tags?.get(273)?.valuesAsLongs(1)?.firstOrNull()?.toInt() ?: -1
         val stripByteCount = tags?.get(279)?.valuesAsLongs(1)?.firstOrNull()?.toInt() ?: (width * height * 2)
 
-        val dngPayloadBytes: ByteArray = if (stripOffset > 0 && stripOffset + stripByteCount <= capturedHeader.size) {
+        val dngPayloadBytes: ByteArray = if (
+            stripOffset > 0 && stripByteCount >= 0 &&
+            stripOffset.toLong() + stripByteCount.toLong() <= capturedHeader.size.toLong()
+        ) {
             capturedHeader.copyOfRange(stripOffset, stripOffset + stripByteCount)
         } else {
             raw16Bytes
@@ -260,7 +264,6 @@ object DngSemanticAuditor {
         com.bncam.core.debug.DeviceTelemetryLogger.logEvent("DNG_SEMANTIC_AUDIT", report.compact())
         return report
     }
-
 }
 
 private data class TiffTag(
@@ -281,11 +284,11 @@ private data class TiffTag(
         val capped = minOf(count, maxValues.toLong()).toInt()
         for (i in 0 until capped) {
             val offset = base + i * size
-            if (offset + size > data.size) return null
+            if (offset < 0 || offset + size > data.size) return null
             values += when (type) {
                 1, 7 -> data[offset].toInt().and(0xFF).toLong()
                 3 -> readUShort(data, offset, order).toLong()
-                4 -> readUInt(data, offset, order)
+                4, 13 -> readUInt(data, offset, order)
                 5 -> {
                     if (offset + 8 > data.size) return null
                     val num = readUInt(data, offset, order)
@@ -308,7 +311,7 @@ private data class TiffTag(
         val out = FloatArray(capped)
         for (i in 0 until capped) {
             val offset = base + i * size
-            if (offset + size > data.size) return null
+            if (offset < 0 || offset + size > data.size) return null
             out[i] = Float.fromBits(readUInt(data, offset, order).toInt())
             if (!out[i].isFinite()) return null
         }
@@ -325,10 +328,10 @@ private data class TiffTag(
         val out = DoubleArray(capped)
         for (i in 0 until capped) {
             val offset = base + i * size
-            if (offset + size > data.size) return null
+            if (offset < 0 || offset + size > data.size) return null
             val value = when (type) {
                 3 -> readUShort(data, offset, order).toDouble()
-                4 -> readUInt(data, offset, order).toDouble()
+                4, 13 -> readUInt(data, offset, order).toDouble()
                 5 -> {
                     if (offset + 8 > data.size) return null
                     val num = readUInt(data, offset, order).toDouble()
@@ -353,14 +356,15 @@ private data class TiffTag(
         }
         return out
     }
-
 }
 
 private fun buildHueSatMapSnapshot(tags: Map<Int, TiffTag>): DngHueSatMapProfileSnapshot {
     val dimsTag = tags[50937] ?: return DngHueSatMapProfileSnapshot(status = "NOT_PRESENT")
     val dims = dimsTag.valuesAsLongs(3)
         ?: return DngHueSatMapProfileSnapshot(available = true, status = "DIMS_UNREADABLE")
-    if (dims.size !in 2..3) return DngHueSatMapProfileSnapshot(available = true, status = "DIMS_COUNT_INVALID")
+    if (dims.size !in 2..3) {
+        return DngHueSatMapProfileSnapshot(available = true, status = "DIMS_COUNT_INVALID")
+    }
     val h = dims[0].toInt()
     val s = dims[1].toInt()
     val v = if (dims.size >= 3) dims[2].toInt() else 1
@@ -381,8 +385,6 @@ private fun buildHueSatMapSnapshot(tags: Map<Int, TiffTag>): DngHueSatMapProfile
         if (t.count == fullFloatCountLong) {
             return t.valuesAsFloats(fullFloatCount) ?: FloatArray(0)
         }
-        // DNG SDK also accepts tables that omit saturation index 0. Reconstruct the implicit
-        // identity cells so native/GPU consumers always see one canonical dense layout.
         if (t.count == skippedSat0FloatCountLong) {
             val compact = t.valuesAsFloats(skippedSat0FloatCountLong.toInt()) ?: return FloatArray(0)
             val dense = FloatArray(fullFloatCount)
@@ -411,7 +413,9 @@ private fun buildHueSatMapSnapshot(tags: Map<Int, TiffTag>): DngHueSatMapProfile
     val data1 = readTable(50938)
     val data2 = readTable(50939)
     val data3 = readTable(52537)
-    if (data1 == null) return DngHueSatMapProfileSnapshot(true, false, h, s, v, status = "DATA1_MISSING")
+    if (data1 == null) {
+        return DngHueSatMapProfileSnapshot(true, false, h, s, v, status = "DATA1_MISSING")
+    }
     if (data1.size != fullFloatCount || data2?.size == 0 || data3?.size == 0) {
         return DngHueSatMapProfileSnapshot(true, false, h, s, v, status = "TABLE_TYPE_COUNT_OR_RANGE_INVALID")
     }
@@ -419,7 +423,9 @@ private fun buildHueSatMapSnapshot(tags: Map<Int, TiffTag>): DngHueSatMapProfile
         return DngHueSatMapProfileSnapshot(true, false, h, s, v, status = "DATA3_WITHOUT_DATA2")
     }
     val encoding = tags[51107]?.valuesAsLongs(1)?.firstOrNull()?.toInt() ?: 0
-    if (encoding !in 0..1) return DngHueSatMapProfileSnapshot(true, false, h, s, v, encoding, status = "ENCODING_UNSUPPORTED")
+    if (encoding !in 0..1) {
+        return DngHueSatMapProfileSnapshot(true, false, h, s, v, encoding, status = "ENCODING_UNSUPPORTED")
+    }
 
     fun tableValid(table: FloatArray): Boolean {
         if (table.size != fullFloatCount) return false
@@ -442,9 +448,15 @@ private fun buildHueSatMapSnapshot(tags: Map<Int, TiffTag>): DngHueSatMapProfile
         return DngHueSatMapProfileSnapshot(true, false, h, s, v, encoding, status = "TABLE_DATA_INVALID")
     }
     return DngHueSatMapProfileSnapshot(
-        available = true, valid = true,
-        hueDivisions = h, saturationDivisions = s, valueDivisions = v,
-        encoding = encoding, data1 = data1, data2 = data2, data3 = data3,
+        available = true,
+        valid = true,
+        hueDivisions = h,
+        saturationDivisions = s,
+        valueDivisions = v,
+        encoding = encoding,
+        data1 = data1,
+        data2 = data2,
+        data3 = data3,
         status = if (data3 != null) "VALID_TRIPLE_TABLE" else if (data2 != null) "VALID_DUAL_TABLE" else "VALID_SINGLE_TABLE"
     )
 }
@@ -456,16 +468,12 @@ private fun buildCameraColorProfileSnapshot(
     discoveryEffectiveCcm: FloatArray?,
     source: String = "OEM_DNGCREATOR"
 ): DngCameraColorProfileSnapshot {
-    if (!hueSatMap.available) return DngCameraColorProfileSnapshot(source = source, calibrationProfileId = calibrationProfileId, status = "HUESATMAP_NOT_PRESENT")
-    if (!hueSatMap.valid) return DngCameraColorProfileSnapshot(
-        available = true, source = source, calibrationProfileId = calibrationProfileId, hueSatMap = hueSatMap,
-        status = "HUESATMAP_INVALID"
-    )
     fun matrix(tagId: Int): FloatArray? {
         val values = tags[tagId]?.valuesAsDoubles(9) ?: return null
         if (values.size != 9 || values.any { !it.isFinite() || kotlin.math.abs(it) > 64.0 }) return null
         return FloatArray(9) { values[it].toFloat() }
     }
+
     val illuminant1 = tags[50778]?.valuesAsLongs(1)?.firstOrNull()?.toInt() ?: 0
     val illuminant2 = tags[50779]?.valuesAsLongs(1)?.firstOrNull()?.toInt() ?: 0
     val cm1 = matrix(50721)
@@ -479,9 +487,8 @@ private fun buildCameraColorProfileSnapshot(
     val analogBalanceMalformed = analogBalanceTag != null && (
         analogBalanceValues == null || analogBalanceValues.size != 3 ||
             analogBalanceValues.any { !it.isFinite() || it <= 0.0 || it > 64.0 }
-    )
+        )
     val analogBalance = if (analogBalanceTag == null) {
-        // DNG 1.7.1: AnalogBalance defaults to all 1.0 when the tag is absent.
         floatArrayOf(1.0f, 1.0f, 1.0f)
     } else if (!analogBalanceMalformed) {
         FloatArray(3) { analogBalanceValues!![it].toFloat() }
@@ -489,80 +496,62 @@ private fun buildCameraColorProfileSnapshot(
         floatArrayOf(1.0f, 1.0f, 1.0f)
     }
     val analogBalanceFromTag = analogBalanceTag != null && !analogBalanceMalformed
-    val discoveryCcm = discoveryEffectiveCcm?.takeIf { it.size == 9 && it.all(Float::isFinite) }?.copyOf()
+    val discoveryCcm = discoveryEffectiveCcm
+        ?.takeIf { it.size == 9 && it.all(Float::isFinite) }
+        ?.copyOf()
 
-    if (analogBalanceMalformed) {
-        return DngCameraColorProfileSnapshot(
-            available = true, source = source, calibrationProfileId = calibrationProfileId,
-            calibrationIlluminant1 = illuminant1, calibrationIlluminant2 = illuminant2,
-            colorMatrix1 = cm1, colorMatrix2 = cm2, cameraCalibration1 = cc1, cameraCalibration2 = cc2,
-            forwardMatrix1 = fm1, forwardMatrix2 = fm2, analogBalance = analogBalance,
-            analogBalanceFromTag = false, discoveryEffectiveCcm = discoveryCcm, hueSatMap = hueSatMap,
-            status = "ANALOG_BALANCE_MALFORMED"
+    fun snapshot(status: String, valid: Boolean = false): DngCameraColorProfileSnapshot =
+        DngCameraColorProfileSnapshot(
+            available = cm1 != null || illuminant1 != 0 || hueSatMap.available,
+            valid = valid,
+            source = source,
+            calibrationProfileId = calibrationProfileId,
+            calibrationIlluminant1 = illuminant1,
+            calibrationIlluminant2 = illuminant2,
+            colorMatrix1 = cm1,
+            colorMatrix2 = cm2,
+            cameraCalibration1 = cc1,
+            cameraCalibration2 = cc2,
+            forwardMatrix1 = fm1,
+            forwardMatrix2 = fm2,
+            analogBalance = analogBalance,
+            analogBalanceFromTag = analogBalanceFromTag,
+            discoveryEffectiveCcm = discoveryCcm,
+            hueSatMap = hueSatMap,
+            status = status
         )
-    }
 
+    if (hueSatMap.available && !hueSatMap.valid) return snapshot("HUESATMAP_INVALID")
+    if (analogBalanceMalformed) return snapshot("ANALOG_BALANCE_MALFORMED")
     if (hueSatMap.data3 != null) {
-        return DngCameraColorProfileSnapshot(
-            available = true, source = source, calibrationProfileId = calibrationProfileId,
-            calibrationIlluminant1 = illuminant1, calibrationIlluminant2 = illuminant2,
-            colorMatrix1 = cm1, colorMatrix2 = cm2,
-            cameraCalibration1 = cc1, cameraCalibration2 = cc2,
-            forwardMatrix1 = fm1, forwardMatrix2 = fm2,
-            analogBalance = analogBalance, analogBalanceFromTag = analogBalanceFromTag,
-            discoveryEffectiveCcm = discoveryCcm, hueSatMap = hueSatMap,
-            status = "TRIPLE_ILLUMINANT_CHARACTERIZATION_NOT_EXPOSED_BY_ANDROID_CONTRACT"
-        )
+        return snapshot("TRIPLE_ILLUMINANT_CHARACTERIZATION_NOT_EXPOSED_BY_ANDROID_CONTRACT")
     }
-    if (illuminant1 == 0 || cm1 == null) {
-        return DngCameraColorProfileSnapshot(
-            available = true, source = source, calibrationProfileId = calibrationProfileId,
-            calibrationIlluminant1 = illuminant1, calibrationIlluminant2 = illuminant2,
-            colorMatrix1 = cm1, colorMatrix2 = cm2,
-            cameraCalibration1 = cc1, cameraCalibration2 = cc2,
-            forwardMatrix1 = fm1, forwardMatrix2 = fm2,
-            analogBalance = analogBalance, analogBalanceFromTag = analogBalanceFromTag,
-            discoveryEffectiveCcm = discoveryCcm, hueSatMap = hueSatMap,
-            status = "PRIMARY_CHARACTERIZATION_INCOMPLETE"
-        )
+    if (illuminant1 == 0 || cm1 == null || fm1 == null) {
+        return snapshot("PRIMARY_CHARACTERIZATION_INCOMPLETE")
     }
-    val dual = hueSatMap.data2 != null
-    if (dual && (illuminant2 == 0 || cm2 == null)) {
-        return DngCameraColorProfileSnapshot(
-            available = true, source = source, calibrationProfileId = calibrationProfileId,
-            calibrationIlluminant1 = illuminant1, calibrationIlluminant2 = illuminant2,
-            colorMatrix1 = cm1, colorMatrix2 = cm2,
-            cameraCalibration1 = cc1, cameraCalibration2 = cc2,
-            forwardMatrix1 = fm1, forwardMatrix2 = fm2,
-            analogBalance = analogBalance, analogBalanceFromTag = analogBalanceFromTag,
-            discoveryEffectiveCcm = discoveryCcm, hueSatMap = hueSatMap,
-            status = "DUAL_HUESATMAP_WITHOUT_DUAL_CHARACTERIZATION"
-        )
+
+    val secondaryAny = illuminant2 != 0 || cm2 != null || cc2 != null || fm2 != null
+    val secondaryComplete = illuminant2 != 0 && cm2 != null && fm2 != null
+    if (secondaryAny && !secondaryComplete) return snapshot("SECONDARY_CHARACTERIZATION_INCOMPLETE")
+    if (hueSatMap.data2 != null && !secondaryComplete) {
+        return snapshot("DUAL_HUESATMAP_WITHOUT_DUAL_CHARACTERIZATION")
     }
-    if (discoveryCcm == null) {
-        return DngCameraColorProfileSnapshot(
-            available = true, source = source, calibrationProfileId = calibrationProfileId,
-            calibrationIlluminant1 = illuminant1, calibrationIlluminant2 = illuminant2,
-            colorMatrix1 = cm1, colorMatrix2 = cm2,
-            cameraCalibration1 = cc1, cameraCalibration2 = cc2,
-            forwardMatrix1 = fm1, forwardMatrix2 = fm2,
-            analogBalance = analogBalance, analogBalanceFromTag = analogBalanceFromTag,
-            hueSatMap = hueSatMap, status = "DISCOVERY_CCM_MISSING"
-        )
+    if (discoveryCcm == null) return snapshot("DISCOVERY_CCM_MISSING")
+
+    val status = when {
+        hueSatMap.available && hueSatMap.data2 != null -> "VALID_DUAL_HUESATMAP_CAMERA_PROFILE"
+        hueSatMap.available -> "VALID_CAMERA_PROFILE_WITH_SINGLE_HUESATMAP"
+        secondaryComplete -> "VALID_DUAL_MATRIX_CAMERA_PROFILE_NO_HUESATMAP"
+        else -> "VALID_SINGLE_MATRIX_CAMERA_PROFILE_NO_HUESATMAP"
     }
-    return DngCameraColorProfileSnapshot(
-        available = true, valid = true, source = source, calibrationProfileId = calibrationProfileId,
-        calibrationIlluminant1 = illuminant1, calibrationIlluminant2 = illuminant2,
-        colorMatrix1 = cm1, colorMatrix2 = cm2,
-        cameraCalibration1 = cc1, cameraCalibration2 = cc2,
-        forwardMatrix1 = fm1, forwardMatrix2 = fm2,
-        analogBalance = analogBalance, analogBalanceFromTag = analogBalanceFromTag,
-        discoveryEffectiveCcm = discoveryCcm, hueSatMap = hueSatMap,
-        status = if (dual) "VALID_DUAL_ILLUMINANT_CAMERA_PROFILE" else "VALID_SINGLE_ILLUMINANT_CAMERA_PROFILE"
-    )
+    return snapshot(status = status, valid = true)
 }
 
 private object TiffHeaderParser {
+    private const val MAX_IFDS = 64
+    private const val MAX_ENTRIES_PER_IFD = 4096
+    private const val MAX_SUB_IFDS_PER_IFD = 32
+
     fun parse(data: ByteArray): Map<Int, TiffTag>? {
         if (data.size < 8) return null
         val order = when {
@@ -571,49 +560,87 @@ private object TiffHeaderParser {
             else -> return null
         }
         if (readUShort(data, 2, order) != 42) return null
-        val ifdOffset = readUInt(data, 4, order).toInt()
-        if (ifdOffset < 8 || ifdOffset + 2 > data.size) return null
-        val entryCount = readUShort(data, ifdOffset, order)
+        val firstIfd = readUInt(data, 4, order)
+        if (firstIfd < 8L || firstIfd > Int.MAX_VALUE.toLong()) return null
+
+        val queue = ArrayDeque<Int>()
+        queue.add(firstIfd.toInt())
+        val visited = HashSet<Int>()
         val tags = linkedMapOf<Int, TiffTag>()
-        var entryOffset = ifdOffset + 2
-        repeat(entryCount) {
-            if (entryOffset + 12 > data.size) return@repeat
-            val tag = readUShort(data, entryOffset, order)
-            val type = readUShort(data, entryOffset + 2, order)
-            val count = readUInt(data, entryOffset + 4, order)
-            val value = readUInt(data, entryOffset + 8, order).toInt()
-            tags[tag] = TiffTag(
-                id = tag,
-                type = type,
-                count = count,
-                valueOffset = value,
-                inlineValueOffset = entryOffset + 8,
-                data = data,
-                order = order
-            )
-            entryOffset += 12
+
+        while (queue.isNotEmpty() && visited.size < MAX_IFDS) {
+            val ifdOffset = queue.removeFirst()
+            if (!visited.add(ifdOffset)) continue
+            if (ifdOffset < 8 || ifdOffset.toLong() + 2L > data.size.toLong()) continue
+
+            val entryCount = readUShort(data, ifdOffset, order)
+            if (entryCount > MAX_ENTRIES_PER_IFD) continue
+            val entriesStart = ifdOffset.toLong() + 2L
+            val entriesBytes = entryCount.toLong() * 12L
+            val nextOffsetLocation = entriesStart + entriesBytes
+            if (nextOffsetLocation + 4L > data.size.toLong()) continue
+
+            var entryOffset = entriesStart.toInt()
+            val localTags = mutableListOf<TiffTag>()
+            repeat(entryCount) {
+                if (entryOffset.toLong() + 12L > data.size.toLong()) return@repeat
+                val tag = readUShort(data, entryOffset, order)
+                val type = readUShort(data, entryOffset + 2, order)
+                val count = readUInt(data, entryOffset + 4, order)
+                val valueLong = readUInt(data, entryOffset + 8, order)
+                val value = if (valueLong <= Int.MAX_VALUE.toLong()) valueLong.toInt() else -1
+                val parsed = TiffTag(
+                    id = tag,
+                    type = type,
+                    count = count,
+                    valueOffset = value,
+                    inlineValueOffset = entryOffset + 8,
+                    data = data,
+                    order = order
+                )
+                localTags += parsed
+                tags.putIfAbsent(tag, parsed)
+                entryOffset += 12
+            }
+
+            val nextIfdLong = readUInt(data, nextOffsetLocation.toInt(), order)
+            if (nextIfdLong in 8L..Int.MAX_VALUE.toLong()) {
+                val next = nextIfdLong.toInt()
+                if (next !in visited) queue.add(next)
+            }
+
+            localTags.firstOrNull { it.id == 330 }
+                ?.valuesAsLongs(MAX_SUB_IFDS_PER_IFD)
+                .orEmpty()
+                .forEach { offset ->
+                    if (offset in 8L..Int.MAX_VALUE.toLong()) {
+                        val child = offset.toInt()
+                        if (child !in visited) queue.add(child)
+                    }
+                }
         }
-        return tags
+
+        return tags.takeIf { it.isNotEmpty() }
     }
 }
 
 private fun typeSize(type: Int): Int? = when (type) {
     1, 2, 6, 7 -> 1
     3, 8 -> 2
-    4, 9, 11 -> 4
+    4, 9, 11, 13 -> 4
     5, 10, 12 -> 8
     else -> null
 }
 
 private fun readUShort(data: ByteArray, offset: Int, order: ByteOrder): Int {
-    if (offset + 2 > data.size) return 0
+    if (offset < 0 || offset + 2 > data.size) return 0
     val a = data[offset].toInt() and 0xFF
     val b = data[offset + 1].toInt() and 0xFF
     return if (order == ByteOrder.LITTLE_ENDIAN) a or (b shl 8) else (a shl 8) or b
 }
 
 private fun readUInt(data: ByteArray, offset: Int, order: ByteOrder): Long {
-    if (offset + 4 > data.size) return 0
+    if (offset < 0 || offset + 4 > data.size) return 0
     val b0 = data[offset].toLong() and 0xFF
     val b1 = data[offset + 1].toLong() and 0xFF
     val b2 = data[offset + 2].toLong() and 0xFF
@@ -629,7 +656,7 @@ private fun readInt32(data: ByteArray, offset: Int, order: ByteOrder): Int =
     readUInt(data, offset, order).toInt()
 
 private fun readUInt64(data: ByteArray, offset: Int, order: ByteOrder): Long {
-    if (offset + 8 > data.size) return 0L
+    if (offset < 0 || offset + 8 > data.size) return 0L
     var out = 0L
     if (order == ByteOrder.LITTLE_ENDIAN) {
         for (i in 0 until 8) out = out or ((data[offset + i].toLong() and 0xFFL) shl (8 * i))

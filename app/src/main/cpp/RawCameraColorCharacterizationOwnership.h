@@ -1,8 +1,5 @@
 #pragma once
 
-#include "RawCameraHueSatMap.h"
-#include "RawCameraHueSatMapColorDomain.h"
-
 #include <cstdint>
 #include <string>
 
@@ -10,20 +7,23 @@ namespace bncam::color {
 
 enum class RawCameraColorCharacterizationOwner : std::uint8_t {
     NONE = 0,
-    CALIBRATED_HUESATMAP = 1,
+    CALIBRATED_DNG_PROFILE = 1,
     LEGACY_HUE_PRESERVING_PRESENTATION = 2
 };
 
 struct RawCameraColorCharacterizationInput {
     bool calibratedProfileConfigured = false;
-    bool hueSatMapResolved = false;
+    bool calibratedProfileResolved = false;
+    bool calibratedProfileProductEligible = false;
+    bool forwardTransformReady = false;
+    bool hueSatMapAvailable = false;
     bool hueSatMapProductEligible = false;
-    bool domainPlanReady = false;
     bool legacyPresentationAvailable = false;
 };
 
 struct RawCameraColorCharacterizationPlan {
     RawCameraColorCharacterizationOwner owner = RawCameraColorCharacterizationOwner::NONE;
+    bool calibratedMatrixApply = false;
     bool calibratedHueSatMapApply = false;
     bool legacyPresentationApply = false;
     bool failClosed = false;
@@ -31,33 +31,43 @@ struct RawCameraColorCharacterizationPlan {
 };
 
 /**
- * Single-owner contract for camera-specific non-linear color characterization.
- * A calibrated HueSatMap is physical/profile characterization. The older hue-preserving OKLab
- * chroma transport is presentation fallback only and must never stack with it.
+ * Single-owner contract for camera-specific colour characterization.
+ *
+ * A DNG ForwardMatrix characterization is the physical camera-colour owner and is valid without a
+ * ProfileHueSatMap. A genuine HueSatMap, when present, augments that same owner. The legacy OKLab
+ * renderer is presentation fallback only and must never stack with either calibrated route.
  */
 inline RawCameraColorCharacterizationPlan resolveRawCameraColorCharacterizationOwnership(
         const RawCameraColorCharacterizationInput& in) noexcept {
     RawCameraColorCharacterizationPlan out{};
 
     if (in.calibratedProfileConfigured) {
-        if (!in.hueSatMapResolved) {
+        if (!in.calibratedProfileResolved) {
             out.failClosed = true;
-            out.reason = "CALIBRATED_PROFILE_CONFIGURED_BUT_HUESATMAP_UNRESOLVED";
+            out.reason = "CALIBRATED_PROFILE_CONFIGURED_BUT_UNRESOLVED";
             return out;
         }
-        if (!in.hueSatMapProductEligible) {
+        if (!in.calibratedProfileProductEligible) {
             out.failClosed = true;
-            out.reason = "CALIBRATED_HUESATMAP_NOT_PRODUCT_ELIGIBLE";
+            out.reason = "CALIBRATED_PROFILE_NOT_PRODUCT_ELIGIBLE";
             return out;
         }
-        if (!in.domainPlanReady) {
+        if (!in.forwardTransformReady) {
             out.failClosed = true;
-            out.reason = "CALIBRATED_HUESATMAP_PCS_PAIRING_NOT_READY";
+            out.reason = "CALIBRATED_DNG_FORWARD_TRANSFORM_NOT_READY";
             return out;
         }
-        out.owner = RawCameraColorCharacterizationOwner::CALIBRATED_HUESATMAP;
-        out.calibratedHueSatMapApply = true;
-        out.reason = "CALIBRATED_HUESATMAP_SINGLE_OWNER";
+        if (in.hueSatMapAvailable && !in.hueSatMapProductEligible) {
+            out.failClosed = true;
+            out.reason = "CALIBRATED_HUESATMAP_PRESENT_BUT_NOT_PRODUCT_ELIGIBLE";
+            return out;
+        }
+        out.owner = RawCameraColorCharacterizationOwner::CALIBRATED_DNG_PROFILE;
+        out.calibratedMatrixApply = true;
+        out.calibratedHueSatMapApply = in.hueSatMapAvailable;
+        out.reason = in.hueSatMapAvailable
+                ? "CALIBRATED_DNG_PROFILE_WITH_HUESATMAP_SINGLE_OWNER"
+                : "CALIBRATED_DNG_MATRIX_PROFILE_NO_HUESATMAP_SINGLE_OWNER";
         return out;
     }
 

@@ -115,8 +115,9 @@ object SingleRaw16FrameBuilder {
             if (bootstrapClaimed) {
                 RawCameraColorProfileRepository.completeBootstrapAttempt(profileId)
             }
-            // From this point onward no newly discovered profile may alter the current-process
-            // colour owner. A concurrent first capture waits for the claimed bootstrap to finish.
+            // The unpublished DNG bootstrap completes before this RAW16 object is exposed to the
+            // JPEG renderer. The current process therefore sees one frozen physical-colour owner,
+            // while JPEG-only remains JPEG-only at the publication boundary.
             RawCameraColorProfileRepository.sealForRendering(
                 calibrationProfileId = profileId,
                 source = if (sourceFormat == ImageFormat.RAW10) "SINGLE_RAW10" else "SINGLE_RAW_SENSOR"
