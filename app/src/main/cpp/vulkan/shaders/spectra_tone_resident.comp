@@ -14,7 +14,8 @@ layout(std430, binding = 8) readonly buffer PortraitMask { float portraitMask[];
 layout(std430, binding = 9) buffer PortraitBlurRgb { float portraitBlurRgb[]; };
 layout(std430, binding = 10) buffer LocalToneBase { float localToneBase[]; };
 // Phase 5 packed scalar FLLF pyramids. Level 0 is half-resolution; higher levels are
-// concatenated. No RGB pyramid and no CPU roundtrip are used.
+// concatenated. No RGB pyramid and no CPU roundtrip are used. Binding 12 keeps its historical
+// ABI name, but stores the reconstructed filtered log2-luminance pyramid (not an exposure field).
 layout(std430, binding = 11) buffer FllfGaussian { float fllfGaussian[]; };
 layout(std430, binding = 12) buffer FllfCorrection { float fllfCorrection[]; };
 
@@ -573,7 +574,22 @@ float telemetryFloat(uint index, float fallbackValue) {
     return (isnan(value) || isinf(value)) ? fallbackValue : value;
 }
 
-// PHASE 10 — FLLF packed Gaussian pyramid.
+// PHASE 10 / DELTA 0189 — true scene-referred Fast Local Laplacian reconstruction.
+//
+// The old implementation built a Gaussian pyramid but then propagated a sceneKey-driven EV
+// correction field. That made the coarsest level a hidden global exposure owner and did not
+// reconstruct remapped Laplacian coefficients. This path is now a genuine log2-luminance
+// Gaussian/Laplacian pyramid:
+//   G_l      = Gaussian log2(Y) level l
+//   L_l      = G_l - upsample(G_l+1)
+//   B_N      = broadGaussian(G_N)                (implicit final Gaussian / DC anchor)
+//   R_N      = B_N + remap(G_N - B_N)
+//   R_l      = upsample(R_l+1) + remap(L_l)
+//   delta_l  = R_l - G_l
+// Only signed local Laplacian bands are remapped. A constant/global offset has zero Laplacian
+// energy at every level, including the implicit broad base, so FLLF cannot create global EV.
+// Full-resolution RGB is changed only by one Ynew/Yold scalar ratio.
+//
 // Mode-specific push aliases used only by modes 10/11:
 // sampleStep=sourceOffset, sampleCount=destinationOffset, displayOffsetFloats=sourceWidth,
 // presenceReserved0=sourceHeight, ultraHdrSourceMapWidth=destinationWidth,
@@ -590,22 +606,38 @@ float fllfSceneLogLumaAt(int x, int y) {
     return log2(max(1.0e-6, lumaOf(rgb)));
 }
 
-void buildFllfGaussianLevel0(uvec2 gid) {
-    uint dstW = fllfDestinationWidth();
-    uint dstH = fllfDestinationHeight();
-    if (gid.x >= dstW || gid.y >= dstH) return;
-    int x0 = int(gid.x * 2u);
-    int y0 = int(gid.y * 2u);
-    float v = 0.25 * (
-            fllfSceneLogLumaAt(x0, y0) + fllfSceneLogLumaAt(x0 + 1, y0) +
-            fllfSceneLogLumaAt(x0, y0 + 1) + fllfSceneLogLumaAt(x0 + 1, y0 + 1));
-    fllfGaussian[fllfDestinationOffset() + gid.y * dstW + gid.x] = v;
+float fllfParam(uint index, float fallbackValue) {
+    return telemetryFloat(index, fallbackValue);
 }
 
 float fllfGaussianAt(uint offset, uint width, uint height, int x, int y) {
     int sx = clamp(x, 0, int(width) - 1);
     int sy = clamp(y, 0, int(height) - 1);
     return fllfGaussian[offset + uint(sy) * width + uint(sx)];
+}
+
+float fllfReconstructedAt(uint offset, uint width, uint height, int x, int y) {
+    int sx = clamp(x, 0, int(width) - 1);
+    int sy = clamp(y, 0, int(height) - 1);
+    return fllfCorrection[offset + uint(sy) * width + uint(sx)];
+}
+
+// Level 0 must be a real Gaussian reduction as well. The previous 2x2 box introduced a
+// different transfer function at the first octave and made the pyramid internally inconsistent.
+void buildFllfGaussianLevel0(uvec2 gid) {
+    uint dstW = fllfDestinationWidth();
+    uint dstH = fllfDestinationHeight();
+    if (gid.x >= dstW || gid.y >= dstH) return;
+    int cx = int(gid.x * 2u);
+    int cy = int(gid.y * 2u);
+    float sum = 0.0;
+    const float k[3] = float[3](1.0, 2.0, 1.0);
+    for (int j = -1; j <= 1; ++j) {
+        for (int i = -1; i <= 1; ++i) {
+            sum += k[i + 1] * k[j + 1] * fllfSceneLogLumaAt(cx + i, cy + j);
+        }
+    }
+    fllfGaussian[fllfDestinationOffset() + gid.y * dstW + gid.x] = sum * (1.0 / 16.0);
 }
 
 void buildFllfGaussianDownsample(uvec2 gid) {
@@ -627,16 +659,6 @@ void buildFllfGaussianDownsample(uvec2 gid) {
     fllfGaussian[fllfDestinationOffset() + gid.y * dstW + gid.x] = sum * (1.0 / 16.0);
 }
 
-float fllfParam(uint index, float fallbackValue) {
-    return telemetryFloat(index, fallbackValue);
-}
-
-float fllfCorrectionAt(uint offset, uint width, uint height, int x, int y) {
-    int sx = clamp(x, 0, int(width) - 1);
-    int sy = clamp(y, 0, int(height) - 1);
-    return fllfCorrection[offset + uint(sy) * width + uint(sx)];
-}
-
 float fllfBilinearGaussian(uint offset, uint width, uint height, vec2 p) {
     ivec2 p0 = ivec2(floor(p));
     vec2 f = fract(p);
@@ -647,60 +669,161 @@ float fllfBilinearGaussian(uint offset, uint width, uint height, vec2 p) {
     return mix(a, b, f.y);
 }
 
-float fllfBilinearCorrection(uint offset, uint width, uint height, vec2 p) {
+float fllfNodeDelta(uint offset, uint width, uint height, int x, int y) {
+    return fllfReconstructedAt(offset, width, height, x, y) -
+           fllfGaussianAt(offset, width, height, x, y);
+}
+
+// Joint upsampling is applied only to the accumulated tone delta, not to the original Gaussian
+// signal. This keeps the mathematical Gaussian/Laplacian decomposition intact while preventing a
+// correction from one side of a hard luminance edge from being interpolated onto the other side.
+float fllfJointDelta(
+        uint offset, uint width, uint height, vec2 p, float guideLog, float edgeStopEv) {
     ivec2 p0 = ivec2(floor(p));
     vec2 f = fract(p);
-    float a = mix(fllfCorrectionAt(offset, width, height, p0.x, p0.y),
-                  fllfCorrectionAt(offset, width, height, p0.x + 1, p0.y), f.x);
-    float b = mix(fllfCorrectionAt(offset, width, height, p0.x, p0.y + 1),
-                  fllfCorrectionAt(offset, width, height, p0.x + 1, p0.y + 1), f.x);
+    float spatial[4] = float[4](
+            (1.0 - f.x) * (1.0 - f.y),
+            f.x * (1.0 - f.y),
+            (1.0 - f.x) * f.y,
+            f.x * f.y);
+    ivec2 coord[4] = ivec2[4](
+            p0,
+            p0 + ivec2(1, 0),
+            p0 + ivec2(0, 1),
+            p0 + ivec2(1, 1));
+    float sigma = clamp(0.42 * edgeStopEv, 0.11, 0.32);
+    float inv2SigmaSq = 1.0 / max(2.0 * sigma * sigma, 1.0e-6);
+    float weighted = 0.0;
+    float weightSum = 0.0;
+    for (int i = 0; i < 4; ++i) {
+        float sampleLog = fllfGaussianAt(offset, width, height, coord[i].x, coord[i].y);
+        float d = sampleLog - guideLog;
+        float w = spatial[i] * exp(-d * d * inv2SigmaSq);
+        weighted += w * fllfNodeDelta(offset, width, height, coord[i].x, coord[i].y);
+        weightSum += w;
+    }
+    if (weightSum > 1.0e-5) return weighted / weightSum;
+
+    float a = mix(fllfNodeDelta(offset, width, height, p0.x, p0.y),
+                  fllfNodeDelta(offset, width, height, p0.x + 1, p0.y), f.x);
+    float b = mix(fllfNodeDelta(offset, width, height, p0.x, p0.y + 1),
+                  fllfNodeDelta(offset, width, height, p0.x + 1, p0.y + 1), f.x);
     return mix(a, b, f.y);
 }
 
-float fllfRequestedCorrection(float localLogLuma) {
+float fllfGaussianGradientEv(uint offset, uint width, uint height, int x, int y) {
+    float gx = 0.5 * (fllfGaussianAt(offset, width, height, x + 1, y) -
+                      fllfGaussianAt(offset, width, height, x - 1, y));
+    float gy = 0.5 * (fllfGaussianAt(offset, width, height, x, y + 1) -
+                      fllfGaussianAt(offset, width, height, x, y - 1));
+    return sqrt(max(0.0, gx * gx + gy * gy));
+}
+
+float fllfScalePixels(uint levelWidth, uint levelHeight) {
+    float sx = float(pc.frameWidth) / float(max(levelWidth, 1u));
+    float sy = float(pc.frameHeight) / float(max(levelHeight, 1u));
+    return max(1.0, 0.5 * (sx + sy));
+}
+
+// Remap one signed Laplacian coefficient. Negative coefficients represent a region darker than
+// its coarser surround; reducing their magnitude creates local lift. Positive coefficients create
+// local compression. The sign is never allowed to flip. Fine detail is nearly identity, medium /
+// broad spatial scales carry tone placement, and true spatial edges release back to identity.
+float fllfRemapBand(
+        float band, float fineLog, float gradientEv, uint levelWidth, uint levelHeight) {
+    float magnitude = abs(band);
     float strength = clamp(fllfParam(8u, 0.0), 0.0, 0.92);
-    float sceneKey = clamp(fllfParam(9u, 0.158), 0.12, 0.18);
+    if (strength <= 1.0e-5 || magnitude <= 1.0e-6) return band;
+
     float maxLiftEv = clamp(fllfParam(10u, 1.00), 0.0, 1.80);
     float maxCompressEv = clamp(fllfParam(11u, 0.70), 0.0, 1.10);
-    float localLuma = max(1.0e-6, exp2(localLogLuma));
-    float requested = clamp(log2(sceneKey / localLuma), -maxCompressEv, maxLiftEv);
-    float need = smoothstep(0.055, 0.30, abs(requested));
+    float edgeStopEv = clamp(fllfParam(12u, 0.62), 0.40, 0.90);
+    float refinement = clamp(fllfParam(13u, 0.10), 0.0, 0.22);
 
-    // telemetry[19] carries the propagated physical post-detail luma sigma. Convert the linear
-    // sigma into the same log2-luminance domain as FLLF: d(log2 Y)/dY = 1/(Y ln 2). This makes
-    // the coring threshold physically tied to LSC -> spatial exposure -> demosaic -> AWB -> CCM
-    // -> detail covariance instead of ISO/device heuristics.
+    float scalePx = fllfScalePixels(levelWidth, levelHeight);
+    float scaleStops = log2(max(scalePx, 1.0));
+    // Half-resolution level 0 intentionally carries almost no tone authority. Local tone ramps
+    // in from ~4 px and reaches full authority around 24-32 px, keeping texture/microcontrast out
+    // of the tone operator. Refinement can add a small amount of mid-scale participation only.
+    float scaleAuthority = smoothstep(1.65, 4.75, scaleStops);
+    scaleAuthority = clamp(scaleAuthority + refinement * 0.28 * smoothstep(1.25, 3.25, scaleStops),
+                           0.0, 1.0);
+
+    // Weak coefficients are detail/texture, not tone. Strong spatial edges are also preserved.
+    // Edge protection is driven by the spatial Gaussian gradient rather than band magnitude, so a
+    // broad dark or bright region can still be locally balanced without flattening hard borders.
+    float toneNeed = smoothstep(0.075, 0.34, magnitude);
+    float edge = smoothstep(0.52 * edgeStopEv, 1.18 * edgeStopEv, gradientEv);
+    float edgeRelease = 1.0 - 0.96 * edge;
+
+    float localLuma = max(1.0e-6, exp2(fineLog));
     float physicalSigmaY = max(0.0, fllfParam(19u, 0.0));
-    float sigmaEv = physicalSigmaY > 0.0
-            ? physicalSigmaY / (max(localLuma, 1.0e-4) * 0.69314718056)
+    float scaleNoiseReduction = max(1.0, 0.72 * scalePx);
+    float sigmaYAtScale = physicalSigmaY / scaleNoiseReduction;
+    float localSnr = sigmaYAtScale > 1.0e-8 ? localLuma / sigmaYAtScale : 1.0e6;
+    float sigmaEvAtScale = sigmaYAtScale > 0.0
+            ? sigmaYAtScale / (max(localLuma, 1.0e-4) * 0.69314718056)
             : 0.0;
-    float coreEv = clamp(0.90 * sigmaEv, 0.0, 0.22);
-    float coredMagnitude = max(0.0, abs(requested) - coreEv);
-    requested = sign(requested) * coredMagnitude;
+    float coherentBand = sigmaEvAtScale > 0.0
+            ? smoothstep(0.60 * sigmaEvAtScale, 2.20 * sigmaEvAtScale, magnitude)
+            : 1.0;
 
-    // Positive local lift is permitted for real dark structure even when its absolute scene-linear
-    // level is low. Protect only the physically unresolved black/noise floor: an absolute 0.045
-    // guard incorrectly classified valid dark furniture/fabric as "black" and prevented local
-    // tone placement in backlit scenes.
-    float localSnr = physicalSigmaY > 1.0e-8 ? localLuma / physicalSigmaY : 1.0e6;
-    float shadowNoiseGate = requested > 0.0
-            ? smoothstep(1.35, 4.25, localSnr)
+    // Only a negative Laplacian band can create positive local lift. Noise/SNR guards therefore
+    // constrain that branch only; bright-region compression is safe and remains available.
+    float shadowLiftGate = band < 0.0
+            ? smoothstep(1.25, 3.75, localSnr) * mix(0.58, 1.0, coherentBand)
             : 1.0;
-    float physicalBlackFloor = max(0.0025, 2.25 * physicalSigmaY);
-    float blackGateStart = min(0.040, 1.35 * physicalBlackFloor);
-    float blackGateFull = min(0.085, max(0.018, 4.25 * physicalBlackFloor));
-    float deepBlackGuard = requested > 0.0
-            ? smoothstep(blackGateStart, blackGateFull, localLuma)
-            : 1.0;
-    return requested * strength * need * shadowNoiseGate * deepBlackGuard;
+
+    float authority = clamp(strength * scaleAuthority * toneNeed * edgeRelease * shadowLiftGate,
+                            0.0, 0.94);
+    if (authority <= 1.0e-6) return band;
+
+    // Monotonic soft-knee compression of the Laplacian magnitude. It keeps coefficient sign and
+    // ordering intact; authority decides how far the coefficient moves toward the compressed
+    // target. A slightly stronger negative-band fraction gives shadows the intended local lift
+    // while PBR Neutral remains the sole final highlight/display shoulder owner.
+    float knee = mix(0.20, 0.34, clamp(scaleStops / 5.5, 0.0, 1.0));
+    float compressedMagnitude = knee * log(1.0 + magnitude / knee);
+    float targetMagnitude = mix(magnitude, compressedMagnitude, band < 0.0 ? 0.62 : 0.54);
+    float remappedMagnitude = mix(magnitude, targetMagnitude, authority);
+
+    float proposed = sign(band) * remappedMagnitude;
+    float delta = proposed - band;
+    delta = clamp(delta, -maxCompressEv, maxLiftEv);
+    float remapped = band + delta;
+    if (band > 0.0) remapped = max(0.0, remapped);
+    if (band < 0.0) remapped = min(0.0, remapped);
+    return remapped;
+}
+
+// The resident backend intentionally caps the stored pyramid at six levels. To keep broad local
+// tone from collapsing to only ~64-pixel structures, the coarsest stored Gaussian is decomposed
+// once more against an implicit 9x9 binomial Gaussian. This extends the local support without a
+// new buffer or CPU pass. The implicit broad base itself remains untouched, so DC/global exposure
+// is still an exact identity.
+float fllfBroadCoarseGaussian(uint offset, uint width, uint height, int x, int y) {
+    const float k[9] = float[9](1.0, 8.0, 28.0, 56.0, 70.0, 56.0, 28.0, 8.0, 1.0);
+    float sum = 0.0;
+    for (int j = -4; j <= 4; ++j) {
+        for (int i = -4; i <= 4; ++i) {
+            sum += k[i + 4] * k[j + 4] * fllfGaussianAt(offset, width, height, x + i, y + j);
+        }
+    }
+    return sum * (1.0 / 65536.0);
 }
 
 void seedFllfCoarseCorrection(uvec2 gid) {
     uint w = fllfDestinationWidth();
     uint h = fllfDestinationHeight();
     if (gid.x >= w || gid.y >= h) return;
-    uint index = fllfDestinationOffset() + gid.y * w + gid.x;
-    fllfCorrection[index] = fllfRequestedCorrection(fllfGaussian[index]);
+    uint offset = fllfDestinationOffset();
+    uint index = offset + gid.y * w + gid.x;
+    float coarseLog = fllfGaussian[index];
+    float broadBase = fllfBroadCoarseGaussian(offset, w, h, int(gid.x), int(gid.y));
+    float coarseBand = coarseLog - broadBase;
+    float gradientEv = fllfGaussianGradientEv(offset, w, h, int(gid.x), int(gid.y));
+    float remappedBand = fllfRemapBand(coarseBand, coarseLog, gradientEv, w, h);
+    fllfCorrection[index] = broadBase + remappedBand;
 }
 
 void reconstructFllfCorrectionLevel(uvec2 gid) {
@@ -709,30 +832,56 @@ void reconstructFllfCorrectionLevel(uvec2 gid) {
     uint dstW = fllfDestinationWidth();
     uint dstH = fllfDestinationHeight();
     if (gid.x >= dstW || gid.y >= dstH) return;
-    vec2 coarseP = (vec2(gid) + vec2(0.5)) * vec2(srcW, srcH) / vec2(dstW, dstH) - vec2(0.5);
+
+    vec2 coarseP = (vec2(gid) + vec2(0.5)) * vec2(srcW, srcH) /
+                   vec2(dstW, dstH) - vec2(0.5);
+    uint dstIndex = fllfDestinationOffset() + gid.y * dstW + gid.x;
+    float fineLog = fllfGaussian[dstIndex];
     float coarseLog = fllfBilinearGaussian(fllfSourceOffset(), srcW, srcH, coarseP);
-    float fineLog = fllfGaussian[fllfDestinationOffset() + gid.y * dstW + gid.x];
-    // fineLog - upsample(coarseLog) is the local Laplacian band. Strong bands stop the
-    // propagation of a broad exposure field, which preserves edge polarity and avoids halos.
     float laplacianBand = fineLog - coarseLog;
+
     float edgeStopEv = clamp(fllfParam(12u, 0.62), 0.40, 0.90);
-    float edge = smoothstep(0.62 * edgeStopEv, 1.28 * edgeStopEv, abs(laplacianBand));
-    float upCorrection = fllfBilinearCorrection(fllfSourceOffset(), srcW, srcH, coarseP);
-    float localRequested = fllfRequestedCorrection(fineLog);
-    float refinement = clamp(fllfParam(13u, 0.10), 0.0, 0.22);
-    float refineNeed = smoothstep(0.12, 0.55, abs(localRequested - upCorrection));
-    float correction = mix(upCorrection, localRequested, refinement * refineNeed * (1.0 - edge));
-    correction *= 1.0 - 0.84 * edge;
-    correction = clamp(correction, -fllfParam(11u, 0.20), fllfParam(10u, 0.18));
-    if (edge > 0.55 && abs(upCorrection) > 0.015) atomicAdd(telemetry[15], 1u);
-    fllfCorrection[fllfDestinationOffset() + gid.y * dstW + gid.x] = correction;
+    float coarseDelta = fllfJointDelta(
+            fllfSourceOffset(), srcW, srcH, coarseP, fineLog, edgeStopEv);
+    float gradientEv = fllfGaussianGradientEv(
+            fllfDestinationOffset(), dstW, dstH, int(gid.x), int(gid.y));
+    float remappedBand = fllfRemapBand(laplacianBand, fineLog, gradientEv, dstW, dstH);
+
+    // R_l = upsample(G_l+1) + accumulated coarse delta + remapped L_l.
+    // This is equivalent to upsample(R_l+1) + remapped L_l while joint-sampling only the
+    // correction delta, which avoids cross-edge tone leakage without changing the Gaussian base.
+    float reconstructedLog = coarseLog + coarseDelta + remappedBand;
+    fllfCorrection[dstIndex] = reconstructedLog;
+
+    float localDelta = remappedBand - laplacianBand;
+    if (gradientEv > 0.65 * edgeStopEv && abs(localDelta) < 0.25 * abs(laplacianBand)) {
+        atomicAdd(telemetry[15], 1u);
+    }
 }
 
 float sampleFllfFullResolutionCorrection(uvec2 gid) {
     uint w = (pc.frameWidth + 1u) / 2u;
     uint h = (pc.frameHeight + 1u) / 2u;
     vec2 p = (vec2(gid) + vec2(0.5)) * 0.5 - vec2(0.5);
-    return fllfBilinearCorrection(0u, w, h, p);
+    float guideLog = fllfSceneLogLumaAt(int(gid.x), int(gid.y));
+    float edgeStopEv = clamp(fllfParam(12u, 0.62), 0.40, 0.90);
+    float correctionEv = fllfJointDelta(0u, w, h, p, guideLog, edgeStopEv);
+
+    // Final cumulative ownership bounds. Per-level remapping can contribute at several spatial
+    // scales, but the sum can never exceed the policy's local lift/compression envelope.
+    float maxLiftEv = clamp(fllfParam(10u, 1.00), 0.0, 1.80);
+    float maxCompressEv = clamp(fllfParam(11u, 0.70), 0.0, 1.10);
+    correctionEv = clamp(correctionEv, -maxCompressEv, maxLiftEv);
+
+    // Do not turn unresolved sensor black/noise into visible grey. This gate is physical-SNR based
+    // only; there is deliberately no absolute rendered-black threshold and no sceneKey.
+    if (correctionEv > 0.0) {
+        float y = max(1.0e-6, exp2(guideLog));
+        float physicalSigmaY = max(0.0, fllfParam(19u, 0.0));
+        float snr = physicalSigmaY > 1.0e-8 ? y / physicalSigmaY : 1.0e6;
+        correctionEv *= smoothstep(1.10, 3.20, snr);
+    }
+    return correctionEv;
 }
 
 vec3 applyFllfLocalExposure(uvec2 gid, vec3 sceneRgb) {
