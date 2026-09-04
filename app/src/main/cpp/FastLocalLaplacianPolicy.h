@@ -110,16 +110,16 @@ inline FastLocalLaplacianPlan resolveFastLocalLaplacianPlan(
 
     // FLLF is the primary automatic brightness/DR owner. Software exposure remains neutral; the
     // local log-luma field therefore needs enough positive range to place a valid dark foreground
-    // before PBR Neutral applies its display toe. This is still local tone mapping, not a hidden
-    // global exposure offset.
-    const float shadowKeyLift = 0.018f * out.shadowPressure;
+    // before PBR Neutral applies its display toe. Shadow-pressure key lift is intentionally local:
+    // it raises underexposed foreground structure without introducing a hidden global EV offset.
+    const float shadowKeyLift = 0.030f * out.shadowPressure;
     const float highDrKeyLift = 0.010f * out.dynamicRangePressure;
     const float lowLightReduction = input.lowLightScene
             ? 0.010f * out.noisePressure * (1.0f - 0.55f * out.dynamicRangePressure)
             : 0.0f;
     out.sceneKey = std::clamp(
             0.150f + shadowKeyLift + highDrKeyLift - lowLightReduction,
-            0.138f, 0.180f);
+            0.138f, 0.185f);
 
     float strength = 0.50f +
             0.24f * out.dynamicRangePressure +
@@ -135,7 +135,7 @@ inline FastLocalLaplacianPlan resolveFastLocalLaplacianPlan(
     // per-pixel application is further guarded in the Vulkan shader by propagated physical sigma,
     // local SNR and multiscale edge stopping.
     float lift = 0.62f +
-            0.72f * out.shadowPressure +
+            0.88f * out.shadowPressure +
             0.42f * out.dynamicRangePressure;
     lift *= 1.0f - (input.lowLightScene ? 0.58f : 0.30f) * out.noisePressure;
     out.maxLiftEv = std::clamp(lift, 0.45f, 1.80f);

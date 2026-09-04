@@ -22,4 +22,16 @@ class RawFlickerConstraintTest {
         val c = RawFlickerConstraint(RawFlickerFrequency.HZ_50, "TEST")
         assertEquals(5_000_000L, c.constrainExposureNs(5_000_000L, 100_000L, 250_000_000L))
     }
+
+    @Test
+    fun `50hz does not force frame duration to 25fps`() {
+        val c = RawFlickerConstraint(RawFlickerFrequency.HZ_50, "TEST")
+        assertEquals(16_666_667L, c.stableFrameDurationNs(10_000_000L, 16_666_667L))
+    }
+
+    @Test
+    fun `60hz does not force frame duration to 30fps`() {
+        val c = RawFlickerConstraint(RawFlickerFrequency.HZ_60, "TEST")
+        assertEquals(16_666_667L, c.stableFrameDurationNs(8_333_333L, 16_666_667L))
+    }
 }

@@ -51,4 +51,19 @@ class DefaultRawShutterManualFallbackPolicyTest {
         assertEquals(20_000_000L, moved.exposureTimeNs)
         assertEquals(3_200, moved.sensitivityIso)
     }
+
+    @Test
+    fun `50hz manual fallback no longer imposes a 40ms frame cadence`() {
+        val flicker = RawFlickerConstraint(RawFlickerFrequency.HZ_50, "TEST")
+        val plan = DefaultRawShutterManualFallbackPolicy.initial(
+            referenceExposureProduct = 800.0 * 10_000_000.0,
+            targetLuma = 0.18f,
+            safeExposureCeilingNs = 10_000_000L,
+            bounds = bounds,
+            flickerConstraint = flicker
+        )!!
+
+        assertEquals(10_000_000L, plan.exposureTimeNs)
+        assertEquals(10_000_000L, plan.frameDurationNs)
+    }
 }

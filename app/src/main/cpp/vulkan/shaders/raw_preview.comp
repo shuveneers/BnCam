@@ -632,14 +632,14 @@ vec3 resolvePreviewFllfPolicy(
     float referenceSignal = max(0.025, min(0.22, 0.65*p50 + 0.35*p75));
     float noisePressure = previewPhysicalNoisePressure(referenceSignal);
 
-    float sceneKey = clamp(0.148 + 0.012*dynamicRangePressure -
-            (lowLight ? 0.018*(1.0-dynamicRangePressure) : 0.0), 0.128, 0.164);
+    float sceneKey = clamp(0.148 + 0.010*shadowPressure + 0.012*dynamicRangePressure -
+            (lowLight ? 0.018*(1.0-dynamicRangePressure) : 0.0), 0.128, 0.174);
     float strength = 0.30 + 0.24*dynamicRangePressure + 0.10*shadowPressure + 0.08*highlightPressure;
     strength *= 1.0 - (lowLight ? 0.34 : 0.16) * noisePressure;
     strength = clamp(strength, 0.26, 0.70);
-    float lift = 0.34 + 0.34*shadowPressure + 0.15*dynamicRangePressure;
+    float lift = 0.34 + 0.44*shadowPressure + 0.15*dynamicRangePressure;
     lift *= 1.0 - (lowLight ? 0.78 : 0.42) * noisePressure;
-    float maxLiftEv = clamp(lift, 0.12, 0.78);
+    float maxLiftEv = clamp(lift, 0.12, 0.88);
     float maxCompressEv = clamp(0.38 + 0.48*highlightPressure + 0.24*dynamicRangePressure, 0.34, 1.10);
 
     statsBuffer[TONE_SCENE_KEY_INDEX] = floatBitsToUint(sceneKey);
@@ -651,8 +651,14 @@ void exposurePass() {
     if (gl_GlobalInvocationID.x != 0u || gl_GlobalInvocationID.y != 0u) return;
     uint total = 0u;
     for (uint bin=0u; bin<HISTOGRAM_SIZE; ++bin) total += statsBuffer[bin];
-    statsBuffer[EXPOSURE_INDEX] = floatBitsToUint(1.0); // no automatic global gain owner
+
+    // Display-only global exposure owner. C++ seeds EXPOSURE_INDEX with the previous frame's
+    // applied gain before this pass. Preserve that value across transient empty histograms and
+    // smooth in EV space so the RAW viewfinder becomes usable without touching sensor AE/DNG.
+    float previousGain = uintBitsToFloat(statsBuffer[EXPOSURE_INDEX]);
+    bool previousGainValid = !isnan(previousGain) && !isinf(previousGain) && previousGain >= 0.5;
     if (total == 0u) {
+        statsBuffer[EXPOSURE_INDEX] = floatBitsToUint(previousGainValid ? clamp(previousGain, 1.0, 2.55) : 1.0);
         statsBuffer[MIDTONE_INDEX] = floatBitsToUint(0.0);
         statsBuffer[TONE_SCENE_KEY_INDEX] = floatBitsToUint(0.148);
         statsBuffer[TONE_DYNAMIC_RANGE_PRESSURE_INDEX] = floatBitsToUint(0.0);
@@ -676,6 +682,42 @@ void exposurePass() {
     uint nearWhiteCount=0u;
     for (uint bin=250u;bin<HISTOGRAM_SIZE;++bin) nearWhiteCount+=statsBuffer[bin];
     float nearWhiteFraction=float(nearWhiteCount)/float(max(1u,total));
+
+    // Keep normal scenes around a useful linear midtone while being more conservative when
+    // exposure time/ISO already say that the sensor is light-starved. The caps mirror the old
+    // preview reference policy but remain entirely in the Vulkan display path.
+    float targetMidtone = lowLight ? 0.100 : 0.115;
+    bool raw10 = sourceFormat() == RAW10_FORMAT;
+    float maxGain = lowLight ? (raw10 ? 1.95 : 2.15) : (raw10 ? 2.35 : 2.55);
+    float noisePressure = previewPhysicalNoisePressure(max(0.025, midtone));
+    maxGain = mix(maxGain, max(1.60, maxGain * 0.84), 0.45 * noisePressure);
+
+    float desiredGain = clamp(targetMidtone / midtone, 1.0, maxGain);
+    // Allow the neutral mapper to shoulder-compress a bright tail, but do not lift a scene so
+    // far that the robust p95 itself is driven deep into clipping.
+    float highlightHeadroomCap = clamp(1.30 / max(p95, 0.02), 1.0, maxGain);
+    float clipPressure = max(
+            smoothstep(0.30, 2.00, saturatedPct),
+            smoothstep(0.02, 0.15, nearWhiteFraction));
+    float clipCap = mix(maxGain, 1.10, clipPressure);
+    float targetGain = clamp(min(desiredGain, min(highlightHeadroomCap, clipCap)), 1.0, maxGain);
+
+    float appliedGain = targetGain;
+    if (previousGainValid) {
+        float boundedPrevious = clamp(previousGain, 1.0, maxGain);
+        float previousEv = log2(max(1.0e-4, boundedPrevious));
+        float targetEv = log2(max(1.0e-4, targetGain));
+        float deltaEv = targetEv - previousEv;
+        if (abs(deltaEv) < 0.025) {
+            appliedGain = boundedPrevious;
+        } else {
+            // Lift deliberately smoothly to avoid pumping; shed gain faster when highlights enter.
+            float alpha = deltaEv > 0.0 ? 0.18 : 0.32;
+            appliedGain = exp2(previousEv + alpha * deltaEv);
+        }
+    }
+    statsBuffer[EXPOSURE_INDEX] = floatBitsToUint(clamp(appliedGain, 1.0, maxGain));
+
     vec3 plan=resolvePreviewFllfPolicy(p50,p75,p95,p99,saturatedPct,nearWhiteFraction,lowLight);
     statsBuffer[MIDTONE_INDEX]=floatBitsToUint(midtone);
     statsBuffer[FLLF_STRENGTH_INDEX]=floatBitsToUint(plan.x);
@@ -824,6 +866,12 @@ uint previewLocalToneMapHeight() {
     return (pc.previewHeight + PREVIEW_LOCAL_TONE_DECIMATION - 1u) / PREVIEW_LOCAL_TONE_DECIMATION;
 }
 
+float previewAutomaticExposureMultiplier() {
+    float gain = uintBitsToFloat(statsBuffer[EXPOSURE_INDEX]);
+    if (isnan(gain) || isinf(gain)) return 1.0;
+    return clamp(gain, 1.0, 2.55);
+}
+
 float previewProfileExposureMultiplier() {
     float control = clamp(uintBitsToFloat(statsBuffer[PROFILE_TONE_EXPOSURE_INDEX]), -1.0, 1.0);
     return exp2(2.0 * control);
@@ -835,7 +883,8 @@ float previewExposedLumaAt(int x, int y) {
     float calibratedLuma = max(1.0e-4, dot(calibratedLumaRgb, vec3(0.2126, 0.7152, 0.0722)));
     uvec2 gid = uvec2(uint(clamp(x, 0, int(pc.previewWidth)-1)),
                       uint(clamp(y, 0, int(pc.previewHeight)-1)));
-    return max(1.0e-4, calibratedLuma * exp2(spatialExposureEvAtPreview(gid)));
+    return max(1.0e-4, calibratedLuma * previewAutomaticExposureMultiplier() *
+            exp2(spatialExposureEvAtPreview(gid)));
 }
 
 void buildPreviewFllfBase(uvec2 gid) {
@@ -892,9 +941,9 @@ vec3 applyPreviewFllf(uvec2 gid, vec3 exposedRgb) {
     // Real-time Phase-10 FLLF proxy. Capture owns the full packed multiscale pyramid; preview
     // reuses its existing resident single-scale base but uses the same correction semantics,
     // deep-black gate and Laplacian edge-stop. RGB receives one scalar exposure factor.
-    float sceneKey = clamp(uintBitsToFloat(statsBuffer[TONE_SCENE_KEY_INDEX]), 0.125, 0.170);
+    float sceneKey = clamp(uintBitsToFloat(statsBuffer[TONE_SCENE_KEY_INDEX]), 0.125, 0.178);
     float strength = clamp(uintBitsToFloat(statsBuffer[FLLF_STRENGTH_INDEX]), 0.02, 0.90);
-    float maxLiftEv = clamp(uintBitsToFloat(statsBuffer[FLLF_MAX_LIFT_EV_INDEX]), 0.035, 0.62);
+    float maxLiftEv = clamp(uintBitsToFloat(statsBuffer[FLLF_MAX_LIFT_EV_INDEX]), 0.035, 0.74);
     float maxCompressEv = clamp(uintBitsToFloat(statsBuffer[FLLF_MAX_COMPRESS_EV_INDEX]), 0.08, 0.70);
 
     float centerLuma = max(1.0e-6, dot(exposedRgb, vec3(0.2126, 0.7152, 0.0722)));
@@ -1283,6 +1332,9 @@ void renderPass() {
              previewProfileLumaDetail(int(gid.x), int(gid.y))) * sharpeningScale;
     float sharpenedLuma = max(0.0, denoisedLuma + previewDetailDelta);
     rgb *= sharpenedLuma / max(denoisedLuma, 1.0e-6);
+    // Automatic preview exposure is display-only and remains separate from explicit profile
+    // Exposure. It runs after physical NR/detail but before local/global tone shaping.
+    rgb *= previewAutomaticExposureMultiplier();
     // Same semantic order as RAW capture: automatic log-luma FLLF first, then explicit profile
     // Exposure, one neutral display mapper, explicit tonal look, explicit colour and final gamut.
     rgb = applyPreviewFllf(gid, rgb);

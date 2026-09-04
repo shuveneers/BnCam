@@ -1,8 +1,5 @@
 package com.bncam.core.capture
 
-import kotlin.math.ceil
-import kotlin.math.max
-
 /**
  * Frequency of the light-output modulation relevant to exposure integration.
  * 50 Hz mains produces a 100 Hz light period; 60 Hz mains produces a 120 Hz light period.
@@ -21,7 +18,7 @@ enum class RawFlickerFrequency(val lightPeriodsPerSecond: Long?) {
 
 /**
  * Flicker-safe sensor timing contract. The frequency is already temporally stabilized by the
- * Camera2 owner; this class only performs deterministic shutter/frame timing math.
+ * Camera2 owner; this class only performs deterministic shutter timing math.
  */
 data class RawFlickerConstraint(
     val frequency: RawFlickerFrequency = RawFlickerFrequency.NONE,
@@ -118,22 +115,17 @@ data class RawFlickerConstraint(
     }
 
     /**
-     * Manual-sensor cadence on the same phase raster. Four light periods gives 25 fps at 50 Hz and
-     * 30 fps at 60 Hz; longer shutters advance to the next complete light-period frame duration.
+     * Frame cadence is not part of the flicker raster. Flicker suppression is obtained by the
+     * exposure-integration interval and Camera2 anti-banding; forcing frame duration to four light
+     * periods needlessly limits 50 Hz acquisition to 25 fps and 60 Hz acquisition to 30 fps.
+     *
+     * Request the shortest frame duration admitted by the caller. Camera2/HAL remains authoritative
+     * for the configured stream's physical minimum frame duration and exposure/readout overhead.
      */
     fun stableFrameDurationNs(
         exposureNs: Long,
         minFrameDurationNs: Long = 0L
-    ): Long {
-        val minimum = max(exposureNs, minFrameDurationNs).coerceAtLeast(1L)
-        val rate = frequency.lightPeriodsPerSecond ?: return minimum
-        val base = durationForPeriods(MIN_STABLE_FRAME_PERIODS, rate)
-        val needed = max(minimum, base)
-        val periods = ceil(needed.toDouble() * rate.toDouble() / NANOS_PER_SECOND.toDouble())
-            .toLong()
-            .coerceAtLeast(MIN_STABLE_FRAME_PERIODS)
-        return durationForPeriods(periods, rate)
-    }
+    ): Long = maxOf(exposureNs, minFrameDurationNs, 1L)
 
     fun changed(candidateNs: Long, minExposureNs: Long, maxExposureNs: Long): Boolean =
         constrainExposureNs(candidateNs, minExposureNs, maxExposureNs) !=
@@ -142,7 +134,6 @@ data class RawFlickerConstraint(
     companion object {
         private const val NANOS_PER_SECOND = 1_000_000_000L
         private const val ALIGNMENT_TOLERANCE_NS = 100_000L
-        private const val MIN_STABLE_FRAME_PERIODS = 4L
 
         private fun durationForPeriods(periods: Long, rate: Long): Long =
             (periods * NANOS_PER_SECOND + rate / 2L) / rate
