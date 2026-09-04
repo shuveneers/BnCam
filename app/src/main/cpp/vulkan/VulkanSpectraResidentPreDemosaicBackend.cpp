@@ -78,6 +78,14 @@ static_assert(sizeof(TileStatsGpu) == 32u, "GLSL TileStats layout mismatch");
 constexpr std::uint64_t kTelemetryWordCount = 96u;
 constexpr std::uint64_t kTelemetryBytes = kTelemetryWordCount * sizeof(std::uint32_t);
 
+// Pass-0/Pass-1 are the dominant full-resolution RAW capture kernels. Bound each queue
+// submission to 384 rows (24 complete 16x16 workgroups) so live RAW preview gets a real
+// GPU scheduling boundary well inside its ~33 ms full-resolution source-frame budget.
+constexpr std::uint32_t kPreDemosaicWorkgroupRows = 16u;
+constexpr std::uint32_t kPreDemosaicStripeRows = 384u;
+static_assert(kPreDemosaicStripeRows % kPreDemosaicWorkgroupRows == 0u,
+              "pre-demosaic stripes must preserve workgroup and Bayer-row alignment");
+
 
 float percentile(std::vector<float> values, float quantile) {
     if (values.empty()) return 0.0f;
@@ -868,7 +876,152 @@ SpectraResidentPreDemosaicResult VulkanSpectraResidentPreDemosaicBackend::execut
             std::isfinite(request.combinedNoisePressure) ? request.combinedNoisePressure : 0.0f,
             0.0f, 1.0f);
 
-    // Submission 1: full-frame Pass 1 candidate followed by compact tile statistics.
+    // Submission 1 is deliberately cooperative. The former single full-frame Pass-0/Pass-1
+    // dispatch measured ~113 ms on device and could starve the independent RAW preview queue.
+    // Pixel math remains identical: only the aligned row origin and submission boundaries change.
+    result.timestampQueryUsed = queryPool_ != VK_NULL_HANDLE;
+    double timestampToMs = 0.0;
+    if (result.timestampQueryUsed) {
+        VkPhysicalDeviceProperties properties{};
+        vkGetPhysicalDeviceProperties(physicalDevice, &properties);
+        timestampToMs = static_cast<double>(properties.limits.timestampPeriod) / 1.0e6;
+    }
+
+    for (std::uint32_t stripeRow = 0u; stripeRow < request.frameHeight;
+         stripeRow += kPreDemosaicStripeRows) {
+        const std::uint32_t stripeRows = std::min(
+                kPreDemosaicStripeRows, request.frameHeight - stripeRow);
+        vkResetFences(device, 1u, &fence_);
+        vkResetCommandBuffer(commandBuffer_, 0u);
+        VkCommandBufferBeginInfo begin{};
+        begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        if (vkBeginCommandBuffer(commandBuffer_, &begin) != VK_SUCCESS) {
+            result.status = "PRE_DEMOSAIC_STRIPE_COMMAND_RECORDING_FAILED";
+            result.failureReason = "vkBeginCommandBuffer_pass1_stripe_failed";
+            result.totalMs = elapsedMs(totalStarted);
+            return result;
+        }
+
+        if (stripeRow == 0u) {
+            VkBufferMemoryBarrier hostToCompute[4]{};
+            std::uint32_t hostBarrierCount = 0u;
+            auto appendHostBarrier = [&](VkBuffer buffer, VkDeviceSize size) {
+                auto& barrier = hostToCompute[hostBarrierCount++];
+                barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+                barrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+                barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+                barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                barrier.buffer = buffer;
+                barrier.offset = 0u;
+                barrier.size = size;
+            };
+            if (hostInputRequested) {
+                appendHostBarrier(input_.buffer, static_cast<VkDeviceSize>(result.inputBytes));
+            }
+            if (!request.pass0Only) {
+                appendHostBarrier(tensor_.buffer, static_cast<VkDeviceSize>(result.tensorBytes));
+                appendHostBarrier(lensShading_.buffer, static_cast<VkDeviceSize>(result.lensShadingBytes));
+            }
+            appendHostBarrier(telemetry_.buffer, static_cast<VkDeviceSize>(kTelemetryBytes));
+            if (hostBarrierCount > 0u) {
+                vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_HOST_BIT,
+                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u,
+                                     0u, nullptr, hostBarrierCount, hostToCompute, 0u, nullptr);
+            }
+            if (residentInputRequested) {
+                VkBufferMemoryBarrier residentToCompute{};
+                residentToCompute.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+                residentToCompute.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+                residentToCompute.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                residentToCompute.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                residentToCompute.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                residentToCompute.buffer = sourceBuffer;
+                residentToCompute.offset = 0u;
+                residentToCompute.size = static_cast<VkDeviceSize>(result.inputBytes);
+                vkCmdPipelineBarrier(commandBuffer_,
+                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u,
+                                     0u, nullptr, 1u, &residentToCompute, 0u, nullptr);
+            }
+        } else {
+            // Continue the frame-wide telemetry atomics across submissions. The previous fence
+            // has completed; this explicit dependency also makes those shader writes available
+            // to the next stripe before it accumulates into the same counters.
+            VkBufferMemoryBarrier telemetryContinue{};
+            telemetryContinue.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            telemetryContinue.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            telemetryContinue.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            telemetryContinue.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            telemetryContinue.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            telemetryContinue.buffer = telemetry_.buffer;
+            telemetryContinue.offset = 0u;
+            telemetryContinue.size = static_cast<VkDeviceSize>(kTelemetryBytes);
+            vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u,
+                                 0u, nullptr, 1u, &telemetryContinue, 0u, nullptr);
+        }
+
+        if (result.timestampQueryUsed) {
+            vkCmdResetQueryPool(commandBuffer_, queryPool_, 0u, 2u);
+            vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queryPool_, 0u);
+        }
+        vkCmdBindPipeline(commandBuffer_, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
+        vkCmdBindDescriptorSets(commandBuffer_, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_,
+                                0u, 1u, &descriptorSet_, 0u, nullptr);
+        push.mode = request.pass0Only ? 5u : 0u;
+        // Mode 0/5 only: observationOffset transports the global stripe row origin. 384 is a
+        // multiple of both the 16-row workgroup and Bayer period, so CFA phase is unchanged.
+        push.observationOffset = stripeRow;
+        vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
+                           0u, sizeof(push), &push);
+        vkCmdDispatch(commandBuffer_, (request.frameWidth + 15u) / 16u,
+                      (stripeRows + 15u) / 16u, 1u);
+        if (result.timestampQueryUsed) {
+            vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 1u);
+        }
+        if (vkEndCommandBuffer(commandBuffer_) != VK_SUCCESS) {
+            result.status = "PRE_DEMOSAIC_STRIPE_COMMAND_RECORDING_FAILED";
+            result.failureReason = "vkEndCommandBuffer_pass1_stripe_failed";
+            result.totalMs = elapsedMs(totalStarted);
+            return result;
+        }
+        VkSubmitInfo submit{};
+        submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submit.commandBufferCount = 1u;
+        submit.pCommandBuffers = &commandBuffer_;
+        const auto syncStarted = Clock::now();
+        if (vkQueueSubmit(computeQueue, 1u, &submit, fence_) != VK_SUCCESS ||
+            vkWaitForFences(device, 1u, &fence_, VK_TRUE, 3'000'000'000ull) != VK_SUCCESS) {
+            VulkanRuntime::instance().markGpuStalled("Pass1_CooperativeStripe");
+            result.status = "GPU_STALLED";
+            result.failureReason = "pass1_stripe_queue_submit_or_wait_timeout";
+            result.totalMs = elapsedMs(totalStarted);
+            return result;
+        }
+        result.synchronizationMs += elapsedMs(syncStarted);
+
+        if (result.timestampQueryUsed) {
+            std::uint64_t stripeTs[2]{};
+            if (vkGetQueryPoolResults(device, queryPool_, 0u, 2u, sizeof(stripeTs), stripeTs,
+                                      sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS &&
+                stripeTs[1] >= stripeTs[0]) {
+                const float stripeKernelMs = static_cast<float>(
+                        (stripeTs[1] - stripeTs[0]) * timestampToMs);
+                if (request.pass0Only) result.pass0KernelMs += stripeKernelMs;
+                else result.pass1KernelMs += stripeKernelMs;
+            } else {
+                result.timestampQueryUsed = false;
+                result.pass0KernelMs = 0.0f;
+                result.pass1KernelMs = 0.0f;
+            }
+        }
+    }
+
+    // Candidate statistics are compact and run only after all row stripes are complete. Keeping
+    // this in its own short submission preserves the original No-Regret decision exactly while
+    // avoiding any full-frame catch-up batch after the cooperative primary pass.
     {
         vkResetFences(device, 1u, &fence_);
         vkResetCommandBuffer(commandBuffer_, 0u);
@@ -876,64 +1029,10 @@ SpectraResidentPreDemosaicResult VulkanSpectraResidentPreDemosaicBackend::execut
         begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         if (vkBeginCommandBuffer(commandBuffer_, &begin) != VK_SUCCESS) {
-            result.status = "PRE_DEMOSAIC_COMMAND_RECORDING_FAILED";
-            result.failureReason = "vkBeginCommandBuffer_pass1_failed";
+            result.status = "PRE_DEMOSAIC_TILE_STATS_COMMAND_RECORDING_FAILED";
+            result.failureReason = "vkBeginCommandBuffer_pass1_tile_stats_failed";
             result.totalMs = elapsedMs(totalStarted);
             return result;
-        }
-        result.timestampQueryUsed = queryPool_ != VK_NULL_HANDLE;
-        if (result.timestampQueryUsed) {
-            vkCmdResetQueryPool(commandBuffer_, queryPool_, 0u, 7u);
-            vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queryPool_, 0u);
-        }
-        VkBufferMemoryBarrier hostToCompute[4]{};
-        std::uint32_t hostBarrierCount = 0u;
-        auto appendHostBarrier = [&](VkBuffer buffer, VkDeviceSize size) {
-            auto& barrier = hostToCompute[hostBarrierCount++];
-            barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-            barrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
-            barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-            barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            barrier.buffer = buffer;
-            barrier.offset = 0u;
-            barrier.size = size;
-        };
-        if (hostInputRequested) appendHostBarrier(input_.buffer, static_cast<VkDeviceSize>(result.inputBytes));
-        if (!request.pass0Only) {
-            appendHostBarrier(tensor_.buffer, static_cast<VkDeviceSize>(result.tensorBytes));
-            appendHostBarrier(lensShading_.buffer, static_cast<VkDeviceSize>(result.lensShadingBytes));
-        }
-        appendHostBarrier(telemetry_.buffer, static_cast<VkDeviceSize>(kTelemetryBytes));
-        if (hostBarrierCount > 0u) {
-            vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_HOST_BIT,
-                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u,
-                                 0u, nullptr, hostBarrierCount, hostToCompute, 0u, nullptr);
-        }
-        if (residentInputRequested) {
-            VkBufferMemoryBarrier residentToCompute{};
-            residentToCompute.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-            residentToCompute.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
-            residentToCompute.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-            residentToCompute.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            residentToCompute.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            residentToCompute.buffer = sourceBuffer;
-            residentToCompute.offset = 0u;
-            residentToCompute.size = static_cast<VkDeviceSize>(result.inputBytes);
-            vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u,
-                                 0u, nullptr, 1u, &residentToCompute, 0u, nullptr);
-        }
-        vkCmdBindPipeline(commandBuffer_, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
-        vkCmdBindDescriptorSets(commandBuffer_, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_,
-                                0u, 1u, &descriptorSet_, 0u, nullptr);
-        push.mode = request.pass0Only ? 5u : 0u;
-        vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
-                           0u, sizeof(push), &push);
-        vkCmdDispatch(commandBuffer_, (request.frameWidth + 15u) / 16u,
-                      (request.frameHeight + 15u) / 16u, 1u);
-        if (result.timestampQueryUsed) {
-            vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 1u);
         }
         VkBufferMemoryBarrier candidateBarrier{};
         candidateBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
@@ -947,7 +1046,15 @@ SpectraResidentPreDemosaicResult VulkanSpectraResidentPreDemosaicBackend::execut
         vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u,
                              0u, nullptr, 1u, &candidateBarrier, 0u, nullptr);
+        if (result.timestampQueryUsed) {
+            vkCmdResetQueryPool(commandBuffer_, queryPool_, 1u, 2u);
+            vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queryPool_, 1u);
+        }
+        vkCmdBindPipeline(commandBuffer_, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
+        vkCmdBindDescriptorSets(commandBuffer_, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_,
+                                0u, 1u, &descriptorSet_, 0u, nullptr);
         push.mode = 1u;
+        push.observationOffset = 0u;
         vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
                            0u, sizeof(push), &push);
         const std::uint32_t tileCount32 = static_cast<std::uint32_t>(tileCount);
@@ -968,11 +1075,11 @@ SpectraResidentPreDemosaicResult VulkanSpectraResidentPreDemosaicBackend::execut
         hostBarriers[1].buffer = telemetry_.buffer;
         hostBarriers[1].size = static_cast<VkDeviceSize>(kTelemetryBytes);
         vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                             VK_PIPELINE_STAGE_HOST_BIT, 0u, 0u, nullptr,
-                             2u, hostBarriers, 0u, nullptr);
+                             VK_PIPELINE_STAGE_HOST_BIT, 0u,
+                             0u, nullptr, 2u, hostBarriers, 0u, nullptr);
         if (vkEndCommandBuffer(commandBuffer_) != VK_SUCCESS) {
-            result.status = "PRE_DEMOSAIC_COMMAND_RECORDING_FAILED";
-            result.failureReason = "vkEndCommandBuffer_pass1_failed";
+            result.status = "PRE_DEMOSAIC_TILE_STATS_COMMAND_RECORDING_FAILED";
+            result.failureReason = "vkEndCommandBuffer_pass1_tile_stats_failed";
             result.totalMs = elapsedMs(totalStarted);
             return result;
         }
@@ -983,13 +1090,27 @@ SpectraResidentPreDemosaicResult VulkanSpectraResidentPreDemosaicBackend::execut
         const auto syncStarted = Clock::now();
         if (vkQueueSubmit(computeQueue, 1u, &submit, fence_) != VK_SUCCESS ||
             vkWaitForFences(device, 1u, &fence_, VK_TRUE, 3'000'000'000ull) != VK_SUCCESS) {
-            VulkanRuntime::instance().markGpuStalled("Pass1_Submission1");
+            VulkanRuntime::instance().markGpuStalled("Pass1_TileStatistics");
             result.status = "GPU_STALLED";
-            result.failureReason = "pass1_queue_submit_or_wait_timeout";
+            result.failureReason = "pass1_tile_stats_queue_submit_or_wait_timeout";
             result.totalMs = elapsedMs(totalStarted);
             return result;
         }
         result.synchronizationMs += elapsedMs(syncStarted);
+        if (result.timestampQueryUsed) {
+            std::uint64_t statsTs[2]{};
+            if (vkGetQueryPoolResults(device, queryPool_, 1u, 2u, sizeof(statsTs), statsTs,
+                                      sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS &&
+                statsTs[1] >= statsTs[0]) {
+                result.tileStatisticsKernelMs = static_cast<float>(
+                        (statsTs[1] - statsTs[0]) * timestampToMs);
+            } else {
+                result.timestampQueryUsed = false;
+                result.pass0KernelMs = 0.0f;
+                result.pass1KernelMs = 0.0f;
+                result.tileStatisticsKernelMs = 0.0f;
+            }
+        }
     }
 
     vmaInvalidateAllocation(allocator_, tileStatistics_.allocation, 0u, result.tileStatisticsBytes);
@@ -1024,6 +1145,7 @@ SpectraResidentPreDemosaicResult VulkanSpectraResidentPreDemosaicBackend::execut
             return result;
         }
         if (result.timestampQueryUsed) {
+            vkCmdResetQueryPool(commandBuffer_, queryPool_, 3u, 2u);
             vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queryPool_, 3u);
         }
         VkBufferMemoryBarrier blendInputs[2]{};
@@ -1103,6 +1225,7 @@ SpectraResidentPreDemosaicResult VulkanSpectraResidentPreDemosaicBackend::execut
             return result;
         }
         if (result.timestampQueryUsed) {
+            vkCmdResetQueryPool(commandBuffer_, queryPool_, 5u, 2u);
             vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queryPool_, 5u);
         }
         VkBufferMemoryBarrier observationInputs[3]{};
@@ -1221,28 +1344,30 @@ SpectraResidentPreDemosaicResult VulkanSpectraResidentPreDemosaicBackend::execut
     }
 
     if (result.timestampQueryUsed) {
-        std::uint64_t timestamps[7]{};
-        if (vkGetQueryPoolResults(device, queryPool_, 0u, 7u, sizeof(timestamps), timestamps,
+        std::uint64_t timestamps[4]{};
+        if (vkGetQueryPoolResults(device, queryPool_, 3u, 4u, sizeof(timestamps), timestamps,
                 sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS &&
-            timestamps[1] >= timestamps[0] && timestamps[2] >= timestamps[1] && timestamps[4] >= timestamps[3]) {
-            VkPhysicalDeviceProperties properties{};
-            vkGetPhysicalDeviceProperties(physicalDevice, &properties);
-            const double toMs = static_cast<double>(properties.limits.timestampPeriod) / 1.0e6;
-            const float primaryKernelMs = static_cast<float>((timestamps[1] - timestamps[0]) * toMs);
-            if (request.pass0Only) result.pass0KernelMs = primaryKernelMs;
-            else result.pass1KernelMs = primaryKernelMs;
-            result.tileStatisticsKernelMs = static_cast<float>((timestamps[2] - timestamps[1]) * toMs);
-            result.noRegretBlendKernelMs = static_cast<float>((timestamps[4] - timestamps[3]) * toMs);
-            if (timestamps[6] >= timestamps[5]) {
-                result.compactObservationKernelMs = static_cast<float>((timestamps[6] - timestamps[5]) * toMs);
-            }
-            result.gpuKernelMs = result.pass0KernelMs + result.pass1KernelMs + result.tileStatisticsKernelMs +
-                    result.noRegretBlendKernelMs + result.compactObservationKernelMs;
+            timestamps[1] >= timestamps[0] && timestamps[3] >= timestamps[2]) {
+            result.noRegretBlendKernelMs = static_cast<float>(
+                    (timestamps[1] - timestamps[0]) * timestampToMs);
+            result.compactObservationKernelMs = static_cast<float>(
+                    (timestamps[3] - timestamps[2]) * timestampToMs);
+            result.gpuKernelMs = result.pass0KernelMs + result.pass1KernelMs +
+                    result.tileStatisticsKernelMs + result.noRegretBlendKernelMs +
+                    result.compactObservationKernelMs;
         } else {
             result.timestampQueryUsed = false;
         }
     }
-    if (!result.timestampQueryUsed) result.gpuKernelMs = result.synchronizationMs;
+    if (!result.timestampQueryUsed) {
+        // Do not expose a partially accumulated timestamp picture as if it were authoritative.
+        result.pass0KernelMs = 0.0f;
+        result.pass1KernelMs = 0.0f;
+        result.tileStatisticsKernelMs = 0.0f;
+        result.noRegretBlendKernelMs = 0.0f;
+        result.compactObservationKernelMs = 0.0f;
+        result.gpuKernelMs = result.synchronizationMs;
+    }
 
     {
         const auto readbackStarted = Clock::now();

@@ -67,6 +67,15 @@ static_assert(sizeof(PushConstants) == 128u, "resident tone push constants misma
 [[maybe_unused]] constexpr std::uint32_t kTelemetryWords = 64u;
 constexpr std::size_t kToneLutFloats = 4096u * 2u;
 
+// Capture-time RAW preview survival: mode-0 scene preparation is a full-resolution, expensive
+// 16x16 compute kernel. Keep each capture submission well below one 33 ms RAW-preview frame
+// budget so the higher-priority preview queue gets real scheduling boundaries during capture.
+// 384 rows = 24 complete workgroups and eight stripes for the common 3072-row RAW stream.
+constexpr std::uint32_t kSceneObserverWorkgroupRows = 16u;
+constexpr std::uint32_t kSceneObserverStripeRows = 384u;
+static_assert(kSceneObserverStripeRows % kSceneObserverWorkgroupRows == 0u,
+              "scene observer stripes must preserve 16-row workgroup alignment");
+
 constexpr std::uint32_t kFllfMaxLevels = 6u;
 struct FllfLevelLayout {
     std::uint32_t width = 1u;
@@ -441,43 +450,6 @@ SpectraResidentSceneObserverResult VulkanSpectraResidentToneBackend::executeScen
             fllfGaussian_.capacityBytes + fllfCorrection_.capacityBytes;
     updateDescriptorsLocked(device, residentInputBuffer);
 
-    vkResetFences(device, 1u, &fence_);
-    vkResetCommandBuffer(commandBuffer_, 0u);
-    VkCommandBufferBeginInfo bi{};
-    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    if (vkBeginCommandBuffer(commandBuffer_, &bi) != VK_SUCCESS) {
-        result.status = "GPU_SCENE_OBSERVER_COMMAND_BEGIN_FAILED";
-        result.failureReason = "vkBeginCommandBuffer_failed";
-        result.totalMs = elapsedMs(totalStart);
-        return result;
-    }
-    vkCmdFillBuffer(commandBuffer_, telemetry_.buffer, 0u, VK_WHOLE_SIZE, 0u);
-    VkBufferMemoryBarrier inputBarrier{};
-    inputBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-    inputBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
-    inputBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    inputBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    inputBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    inputBarrier.buffer = residentInputBuffer;
-    inputBarrier.size = static_cast<VkDeviceSize>(rgbBytes);
-    VkBufferMemoryBarrier telemetryBarrier{};
-    telemetryBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-    telemetryBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    telemetryBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-    telemetryBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    telemetryBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    telemetryBarrier.buffer = telemetry_.buffer;
-    telemetryBarrier.size = VK_WHOLE_SIZE;
-    VkBufferMemoryBarrier initial[2]{inputBarrier, telemetryBarrier};
-    vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr, 2u, initial, 0u, nullptr);
-    if (queryPool_ != VK_NULL_HANDLE) {
-        vkCmdResetQueryPool(commandBuffer_, queryPool_, 0u, 4u);
-        vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 0u);
-    }
-    vkCmdBindPipeline(commandBuffer_, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
-    vkCmdBindDescriptorSets(commandBuffer_, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_, 0u, 1u, &descriptorSet_, 0u, nullptr);
     PushConstants push{};
     push.frameWidth = request.frameWidth;
     push.frameHeight = request.frameHeight;
@@ -504,10 +476,146 @@ SpectraResidentSceneObserverResult VulkanSpectraResidentToneBackend::executeScen
     // all demosaic-family / RAW-format authority heuristics from Phase 9.
     push.shoulderStart = std::clamp(request.preToneChromaNoisePressure, 0.0f, 1.0f);
     push.shoulderStrength = std::clamp(request.preToneChromaWbCcmPressure, 0.0f, 1.0f);
-    vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0u, sizeof(push), &push);
-    vkCmdDispatch(commandBuffer_, (request.frameWidth + 15u) / 16u, (request.frameHeight + 15u) / 16u, 1u);
-    if (queryPool_ != VK_NULL_HANDLE) vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 1u);
 
+    double timestampToMs = 0.0;
+    if (queryPool_ != VK_NULL_HANDLE) {
+        VkPhysicalDeviceProperties props{};
+        vkGetPhysicalDeviceProperties(physicalDevice, &props);
+        timestampToMs = static_cast<double>(props.limits.timestampPeriod) / 1.0e6;
+    }
+
+    // The old path submitted mode 0 as one 4096x3072 dispatch. On the target device that kernel
+    // occupied the capture queue for ~100 ms, and the RAW preview queue could consequently wait
+    // hundreds of milliseconds during rapid shots. Split only this independent-per-workgroup pass
+    // into aligned row stripes. Pixel math and full-frame geometry are unchanged; the boundaries
+    // exist solely so the dedicated, higher-priority preview queue can be scheduled between them.
+    for (std::uint32_t stripeRow = 0u; stripeRow < request.frameHeight;
+         stripeRow += kSceneObserverStripeRows) {
+        const std::uint32_t stripeRows = std::min(
+                kSceneObserverStripeRows, request.frameHeight - stripeRow);
+        vkResetFences(device, 1u, &fence_);
+        vkResetCommandBuffer(commandBuffer_, 0u);
+        VkCommandBufferBeginInfo begin{};
+        begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        if (vkBeginCommandBuffer(commandBuffer_, &begin) != VK_SUCCESS) {
+            result.status = "GPU_SCENE_OBSERVER_STRIPE_COMMAND_BEGIN_FAILED";
+            result.failureReason = "vkBeginCommandBuffer_scene_observer_stripe_failed";
+            result.totalMs = elapsedMs(totalStart);
+            return result;
+        }
+
+        if (stripeRow == 0u) {
+            vkCmdFillBuffer(commandBuffer_, telemetry_.buffer, 0u, VK_WHOLE_SIZE, 0u);
+            VkBufferMemoryBarrier inputBarrier{};
+            inputBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            inputBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+            inputBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            inputBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            inputBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            inputBarrier.buffer = residentInputBuffer;
+            inputBarrier.size = static_cast<VkDeviceSize>(rgbBytes);
+            VkBufferMemoryBarrier telemetryBarrier{};
+            telemetryBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            telemetryBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            telemetryBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            telemetryBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            telemetryBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            telemetryBarrier.buffer = telemetry_.buffer;
+            telemetryBarrier.size = VK_WHOLE_SIZE;
+            VkBufferMemoryBarrier initial[2]{inputBarrier, telemetryBarrier};
+            vkCmdPipelineBarrier(commandBuffer_,
+                                 VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u,
+                                 0u, nullptr, 2u, initial, 0u, nullptr);
+        } else {
+            // Telemetry atomics are accumulated over all stripes. Fence completion makes the
+            // previous submission complete; keep an explicit shader memory dependency as well.
+            VkBufferMemoryBarrier telemetryContinue{};
+            telemetryContinue.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            telemetryContinue.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            telemetryContinue.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            telemetryContinue.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            telemetryContinue.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            telemetryContinue.buffer = telemetry_.buffer;
+            telemetryContinue.size = VK_WHOLE_SIZE;
+            vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u,
+                                 0u, nullptr, 1u, &telemetryContinue, 0u, nullptr);
+        }
+
+        if (queryPool_ != VK_NULL_HANDLE) {
+            vkCmdResetQueryPool(commandBuffer_, queryPool_, 0u, 2u);
+            vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                queryPool_, 0u);
+        }
+        vkCmdBindPipeline(commandBuffer_, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
+        vkCmdBindDescriptorSets(commandBuffer_, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_,
+                                0u, 1u, &descriptorSet_, 0u, nullptr);
+        // Mode-0-only alias: the shader adds this aligned row origin to globalInvocationID.y.
+        // executeTone() builds a fresh PushConstants object, so Ultra HDR/FLLF semantics are
+        // untouched outside this scene-observer pass.
+        push.ultraHdrSourceMapHeight = stripeRow;
+        push.mode = 0u;
+        vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
+                           0u, sizeof(push), &push);
+        vkCmdDispatch(commandBuffer_, (request.frameWidth + 15u) / 16u,
+                      (stripeRows + 15u) / 16u, 1u);
+        if (queryPool_ != VK_NULL_HANDLE) {
+            vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                queryPool_, 1u);
+        }
+        if (vkEndCommandBuffer(commandBuffer_) != VK_SUCCESS) {
+            result.status = "GPU_SCENE_OBSERVER_STRIPE_COMMAND_END_FAILED";
+            result.failureReason = "vkEndCommandBuffer_scene_observer_stripe_failed";
+            result.totalMs = elapsedMs(totalStart);
+            return result;
+        }
+
+        VkSubmitInfo submit{};
+        submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submit.commandBufferCount = 1u;
+        submit.pCommandBuffers = &commandBuffer_;
+        const auto stripeWaitStart = Clock::now();
+        if (vkQueueSubmit(computeQueue, 1u, &submit, fence_) != VK_SUCCESS ||
+            vkWaitForFences(device, 1u, &fence_, VK_TRUE, 1'500'000'000ull) != VK_SUCCESS) {
+            VulkanRuntime::instance().markGpuStalled("SceneObserverStripe");
+            result.status = "GPU_STALLED";
+            result.failureReason = "scene_observer_stripe_submit_or_wait_timeout";
+            result.totalMs = elapsedMs(totalStart);
+            return result;
+        }
+        result.synchronizationMs += elapsedMs(stripeWaitStart);
+
+        if (queryPool_ != VK_NULL_HANDLE) {
+            std::uint64_t stripeTs[2]{};
+            if (vkGetQueryPoolResults(device, queryPool_, 0u, 2u, sizeof(stripeTs), stripeTs,
+                                      sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS &&
+                stripeTs[1] >= stripeTs[0]) {
+                result.highlightKernelMs += static_cast<float>(
+                        (stripeTs[1] - stripeTs[0]) * timestampToMs);
+            }
+        }
+    }
+
+    if (preToneChroma444Requested) {
+        result.preToneChroma444Applied = true;
+        result.preToneChroma444Strength = preToneChroma444Strength;
+    }
+
+    // Compact scene sampling is tiny compared with mode 0. Keep it as one final submission after
+    // every stripe has completed. This also establishes the full workingRgb write->read dependency.
+    vkResetFences(device, 1u, &fence_);
+    vkResetCommandBuffer(commandBuffer_, 0u);
+    VkCommandBufferBeginInfo compactBegin{};
+    compactBegin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    compactBegin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkBeginCommandBuffer(commandBuffer_, &compactBegin) != VK_SUCCESS) {
+        result.status = "GPU_SCENE_OBSERVER_COMPACT_COMMAND_BEGIN_FAILED";
+        result.failureReason = "vkBeginCommandBuffer_scene_observer_compact_failed";
+        result.totalMs = elapsedMs(totalStart);
+        return result;
+    }
     VkBufferMemoryBarrier workingBarrier{};
     workingBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
     workingBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -517,22 +625,29 @@ SpectraResidentSceneObserverResult VulkanSpectraResidentToneBackend::executeScen
     workingBarrier.buffer = workingRgb_.buffer;
     workingBarrier.size = static_cast<VkDeviceSize>(rgbBytes);
     vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr, 1u, &workingBarrier, 0u, nullptr);
-    // Phase 9: mode 0 is no longer a highlight-recovery owner. It keeps the existing physical
-    // 4:4:4 pre-tone cleanup fused against the immutable Phase-9-protected post-AWB/CCM input;
-    // no extra full-frame scratch allocation or in-place neighbour race is introduced.
-    if (preToneChroma444Requested) {
-        result.preToneChroma444Applied = true;
-        result.preToneChroma444Strength = preToneChroma444Strength;
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u,
+                         0u, nullptr, 1u, &workingBarrier, 0u, nullptr);
+    if (queryPool_ != VK_NULL_HANDLE) {
+        vkCmdResetQueryPool(commandBuffer_, queryPool_, 2u, 2u);
+        vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            queryPool_, 2u);
     }
-    if (queryPool_ != VK_NULL_HANDLE) vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 2u);
+    vkCmdBindPipeline(commandBuffer_, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
+    vkCmdBindDescriptorSets(commandBuffer_, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_,
+                            0u, 1u, &descriptorSet_, 0u, nullptr);
+    push.ultraHdrSourceMapHeight = 0u;
     push.mode = 1u;
-    vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0u, sizeof(push), &push);
+    vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0u, sizeof(push), &push);
     vkCmdDispatch(commandBuffer_, (result.sampleCount + 15u) / 16u, 1u, 1u);
     push.mode = 2u;
-    vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0u, sizeof(push), &push);
+    vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0u, sizeof(push), &push);
     vkCmdDispatch(commandBuffer_, 2u, 2u, 1u);
-    if (queryPool_ != VK_NULL_HANDLE) vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 3u);
+    if (queryPool_ != VK_NULL_HANDLE) {
+        vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            queryPool_, 3u);
+    }
 
     VkBufferMemoryBarrier hostBarriers[2]{};
     for (auto& b : hostBarriers) {
@@ -546,36 +661,35 @@ SpectraResidentSceneObserverResult VulkanSpectraResidentToneBackend::executeScen
     hostBarriers[0].buffer = compact_.buffer;
     hostBarriers[1].buffer = telemetry_.buffer;
     vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                         VK_PIPELINE_STAGE_HOST_BIT, 0u, 0u, nullptr, 2u, hostBarriers, 0u, nullptr);
+                         VK_PIPELINE_STAGE_HOST_BIT, 0u,
+                         0u, nullptr, 2u, hostBarriers, 0u, nullptr);
     if (vkEndCommandBuffer(commandBuffer_) != VK_SUCCESS) {
-        result.status = "GPU_SCENE_OBSERVER_COMMAND_END_FAILED";
-        result.failureReason = "vkEndCommandBuffer_failed";
+        result.status = "GPU_SCENE_OBSERVER_COMPACT_COMMAND_END_FAILED";
+        result.failureReason = "vkEndCommandBuffer_scene_observer_compact_failed";
         result.totalMs = elapsedMs(totalStart);
         return result;
     }
-    VkSubmitInfo si{};
-    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    si.commandBufferCount = 1u;
-    si.pCommandBuffers = &commandBuffer_;
-    const auto waitStart = Clock::now();
-    if (vkQueueSubmit(computeQueue, 1u, &si, fence_) != VK_SUCCESS ||
+    VkSubmitInfo compactSubmit{};
+    compactSubmit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    compactSubmit.commandBufferCount = 1u;
+    compactSubmit.pCommandBuffers = &commandBuffer_;
+    const auto compactWaitStart = Clock::now();
+    if (vkQueueSubmit(computeQueue, 1u, &compactSubmit, fence_) != VK_SUCCESS ||
         vkWaitForFences(device, 1u, &fence_, VK_TRUE, 1'500'000'000ull) != VK_SUCCESS) {
-        VulkanRuntime::instance().markGpuStalled("SceneObserver");
+        VulkanRuntime::instance().markGpuStalled("SceneObserverCompact");
         result.status = "GPU_STALLED";
-        result.failureReason = "scene_observer_submit_or_wait_timeout";
+        result.failureReason = "scene_observer_compact_submit_or_wait_timeout";
         result.totalMs = elapsedMs(totalStart);
         return result;
     }
-    result.synchronizationMs = elapsedMs(waitStart);
+    result.synchronizationMs += elapsedMs(compactWaitStart);
     if (queryPool_ != VK_NULL_HANDLE) {
-        std::uint64_t ts[4]{};
-        if (vkGetQueryPoolResults(device, queryPool_, 0u, 4u, sizeof(ts), ts, sizeof(std::uint64_t),
-                                  VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
-            VkPhysicalDeviceProperties props{};
-            vkGetPhysicalDeviceProperties(physicalDevice, &props);
-            const double ms = static_cast<double>(props.limits.timestampPeriod) / 1.0e6;
-            if (ts[1] >= ts[0]) result.highlightKernelMs = static_cast<float>((ts[1] - ts[0]) * ms);
-            if (ts[3] >= ts[2]) result.sampleKernelMs = static_cast<float>((ts[3] - ts[2]) * ms);
+        std::uint64_t compactTs[2]{};
+        if (vkGetQueryPoolResults(device, queryPool_, 2u, 2u, sizeof(compactTs), compactTs,
+                                  sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS &&
+            compactTs[1] >= compactTs[0]) {
+            result.sampleKernelMs = static_cast<float>(
+                    (compactTs[1] - compactTs[0]) * timestampToMs);
         }
     }
     const auto readStart = Clock::now();

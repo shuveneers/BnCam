@@ -1390,6 +1390,11 @@ void packUltraHdrGainmap(uvec2 gid) {
 void main() {
     uvec2 gid = gl_GlobalInvocationID.xy;
     if (pc.mode == 0u) {
+        // DELTA 0183: mode-0-only cooperative capture stripe origin. The host submits aligned
+        // 384-row pieces so the higher-priority RAW-preview queue gets scheduling boundaries
+        // during capture processing. ultraHdrSourceMapHeight is otherwise unused by mode 0;
+        // executeTone() uses a fresh push block, so Ultra HDR/FLLF ABI semantics stay unchanged.
+        gid.y += pc.ultraHdrSourceMapHeight;
         runPreTonePreparation(gid);
     } else if (pc.mode == 1u) {
         if (gid.y == 0u) writeSceneSample(gid.x);

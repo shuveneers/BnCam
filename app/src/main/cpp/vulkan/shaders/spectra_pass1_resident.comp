@@ -513,7 +513,9 @@ SameCfaRingEstimate sameCfaRingEstimate(int x, int y, int radius, float S, float
 
 void pass1Pixel() {
     int x = int(gl_GlobalInvocationID.x);
-    int y = int(gl_GlobalInvocationID.y);
+    // DELTA 0183 mode-0-only alias: observationOffset is the aligned capture stripe row origin.
+    // Modes 3/4 retain their existing compact-observation offset semantics.
+    int y = int(gl_GlobalInvocationID.y) + int(pc.observationOffset);
     if (x >= int(pc.frameWidth) || y >= int(pc.frameHeight)) return;
     uint index = linearIndex(x, y);
     float original = sourceMosaic[index];
@@ -753,7 +755,9 @@ void pass1Pixel() {
 
 void pass0Pixel() {
     int x = int(gl_GlobalInvocationID.x);
-    int y = int(gl_GlobalInvocationID.y);
+    // Mode 5 shares the same cooperative stripe transport as mode 0. Stripe origins are multiples
+    // of 16 (and therefore preserve Bayer row parity); all CFA/neighbour coordinates remain global.
+    int y = int(gl_GlobalInvocationID.y) + int(pc.observationOffset);
     if (x >= int(pc.frameWidth) || y >= int(pc.frameHeight)) return;
     uint index = linearIndex(x, y);
     float original = sourceMosaic[index];
