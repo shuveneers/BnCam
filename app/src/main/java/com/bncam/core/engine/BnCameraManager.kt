@@ -30,6 +30,7 @@ import androidx.lifecycle.LifecycleOwner
 import android.view.WindowManager
 import com.bncam.core.buffer.FrameRingBuffer
 import com.bncam.core.buffer.CaptureBufferBudget
+import com.bncam.core.buffer.NearZslEligibilityPolicy
 import com.bncam.core.capture.CameraExposurePolicy
 import com.bncam.core.capture.AfCoordinateMapper
 import com.bncam.core.capture.ExposureStatistics
@@ -74,6 +75,7 @@ import com.bncam.core.capture.RepeatedCaptureValidator
 import com.bncam.core.capture.ReadinessState
 import com.bncam.core.capture.WarmBufferReadinessPolicy
 import com.bncam.core.capture.WarmBufferReadinessRequirement
+import com.bncam.core.capture.NearZslAnchorAdmissionPolicy
 import com.bncam.core.capture.CaptureCapabilities
 import com.bncam.core.capture.CaptureMode
 import com.bncam.core.capture.NightCapturePlan
@@ -286,6 +288,21 @@ private data class PendingPipelineResetRequest(
     val profileId: String,
     val forceSessionRebuild: Boolean,
     val reason: String
+)
+
+private data class DeferredSelectionExposureConstraintUpdate(
+    val exposureTargetNs: Long?,
+    val source: String,
+    val isoTarget: Int?
+)
+
+private data class NearZslSingleAnchorReservation(
+    val candidate: FrameRingBuffer.LeasedCandidate,
+    val temporalClass: String,
+    val effectiveShutterTimestampNs: Long,
+    val effectiveShutterTimestampDomain: String,
+    val waitMs: Double,
+    val physicalAgeAtUserShutterMs: Double?
 )
 
 
@@ -1281,6 +1298,16 @@ class BnCameraManager(private val context: Context) {
     private val captureAttempts = CaptureAttemptCoordinator { event, detail ->
         Log.i("BnCamCaptureLifecycle", "$event $detail")
     }
+
+    // Shutter admission freezes only the *selection* exposure contract, never Camera2 itself.
+    // This prevents a preview/anti-flicker control update that happens after the user's press from
+    // retroactively making every already-captured Near-ZSL frame ineligible. The repeating producer
+    // stays live and keeps filling the ring while admission/processing proceeds.
+    private val captureSelectionConstraintLock = Any()
+    @Volatile private var captureSelectionConstraintFreezeAttemptId: Long? = null
+    private var deferredSelectionExposureConstraintUpdate: DeferredSelectionExposureConstraintUpdate? = null
+    private var frozenSelectionExposureConstraintSnapshot:
+        com.bncam.core.buffer.FrameSelectionExposureConstraintSnapshot? = null
 
     init {
         // Manager-lifetime collector: keep it under an owned scope so Activity teardown can cancel
@@ -2816,7 +2843,7 @@ class BnCameraManager(private val context: Context) {
         return format == ImageFormat.RAW10 || format == ImageFormat.RAW_SENSOR
     }
 
-    private fun updateDefaultRawFrameSelectionExposureConstraint(
+    private fun applyDefaultRawFrameSelectionExposureConstraintNow(
         exposureTargetNs: Long?,
         source: String,
         isoTarget: Int? = null
@@ -2840,6 +2867,391 @@ class BnCameraManager(private val context: Context) {
         )
     }
 
+    private fun updateDefaultRawFrameSelectionExposureConstraint(
+        exposureTargetNs: Long?,
+        source: String,
+        isoTarget: Int? = null
+    ) {
+        var deferredAttemptId: Long? = null
+        synchronized(captureSelectionConstraintLock) {
+            val frozenAttemptId = captureSelectionConstraintFreezeAttemptId
+            if (frozenAttemptId != null) {
+                // Keep only the newest requested state. It will be applied atomically after the
+                // synchronous shutter-admission scope releases its pinned Near-ZSL anchor.
+                deferredSelectionExposureConstraintUpdate =
+                    DeferredSelectionExposureConstraintUpdate(exposureTargetNs, source, isoTarget)
+                deferredAttemptId = frozenAttemptId
+            } else {
+                // Apply while holding the same mutex used by freeze/release. Without this, an
+                // updater could observe "not frozen", get descheduled, and mutate the ring after a
+                // shutter has already frozen its selection contract.
+                applyDefaultRawFrameSelectionExposureConstraintNow(exposureTargetNs, source, isoTarget)
+            }
+        }
+        deferredAttemptId?.let { attemptId ->
+            traceCaptureRuntime(
+                "SELECTION_EXPOSURE_DEFER attemptId=$attemptId source=$source " +
+                    "targetNs=${exposureTargetNs ?: 0L} iso=${isoTarget ?: 0}"
+            )
+        }
+    }
+
+    private fun freezeSelectionExposureConstraintForCapture(attemptId: Long) {
+        val snapshot = synchronized(captureSelectionConstraintLock) {
+            // Snapshot and freeze are one transaction with respect to every manager-owned selection
+            // update. The ring itself is independently synchronized.
+            ringBuffer.selectionExposureConstraintSnapshot().also { current ->
+                captureSelectionConstraintFreezeAttemptId = attemptId
+                deferredSelectionExposureConstraintUpdate = null
+                frozenSelectionExposureConstraintSnapshot = current
+            }
+        }
+        traceCaptureRuntime(
+            "SELECTION_EXPOSURE_FREEZE attemptId=$attemptId snapshot=${snapshot.summary()}"
+        )
+    }
+
+    private fun relaxSelectionExposureConstraintForGuaranteedAnchor(
+        attemptId: Long,
+        reason: String
+    ) {
+        var preserved = "none"
+        val relaxed = synchronized(captureSelectionConstraintLock) {
+            if (captureSelectionConstraintFreezeAttemptId != attemptId) {
+                false
+            } else {
+                preserved = frozenSelectionExposureConstraintSnapshot?.summary() ?: "none"
+                ringBuffer.clearSelectionExposureConstraint("GUARANTEED_ANCHOR:$reason")
+                true
+            }
+        }
+        if (relaxed) {
+            traceCaptureRuntime(
+                "SELECTION_EXPOSURE_RELAX attemptId=$attemptId reason=$reason preservedSnapshot=$preserved"
+            )
+        }
+    }
+
+    private fun releaseSelectionExposureConstraintAfterCapture(attemptId: Long) {
+        var releaseTrace: String? = null
+        synchronized(captureSelectionConstraintLock) {
+            if (captureSelectionConstraintFreezeAttemptId != attemptId) return
+            val deferred = deferredSelectionExposureConstraintUpdate
+            val frozen = frozenSelectionExposureConstraintSnapshot
+
+            // Keep the mutex until the final ring state is restored. A new live preview update may
+            // otherwise overtake this release and then be overwritten by an older deferred state.
+            captureSelectionConstraintFreezeAttemptId = null
+            deferredSelectionExposureConstraintUpdate = null
+            frozenSelectionExposureConstraintSnapshot = null
+
+            when {
+                deferred != null -> {
+                    applyDefaultRawFrameSelectionExposureConstraintNow(
+                        exposureTargetNs = deferred.exposureTargetNs,
+                        source = "${deferred.source}:DEFERRED_AFTER_CAPTURE",
+                        isoTarget = deferred.isoTarget
+                    )
+                }
+                frozen?.active == true &&
+                    frozen.pipelineGeneration == pipelineGeneration &&
+                    frozen.requestedExposureTargetNs != null &&
+                    frozen.requestedExposureTargetNs > 0L -> {
+                    ringBuffer.setSelectionExposureConstraint(
+                        generationId = frozen.pipelineGeneration,
+                        expectedFormat = frozen.expectedFormat,
+                        exposureTargetNs = frozen.requestedExposureTargetNs,
+                        isoTarget = frozen.requestedIsoTarget,
+                        source = "${frozen.source}:RESTORED_AFTER_CAPTURE"
+                    )
+                }
+                frozen?.active == false -> {
+                    ringBuffer.clearSelectionExposureConstraint("RESTORE_INACTIVE_AFTER_CAPTURE")
+                }
+            }
+            releaseTrace =
+                "SELECTION_EXPOSURE_RELEASE attemptId=$attemptId deferred=${deferred != null} " +
+                    "restoreFrozen=${deferred == null && frozen?.active == true}"
+        }
+        releaseTrace?.let(::traceCaptureRuntime)
+    }
+
+    private fun nearZslPhysicalAgeAtShutterMs(
+        candidate: FrameRingBuffer.LeasedCandidate,
+        userShutterTimestampNs: Long
+    ): Double? {
+        val frame = candidate.frame
+        if (userShutterTimestampNs <= 0L) return null
+        return if (frame.sensorTimestampComparableToElapsedRealtime) {
+            (userShutterTimestampNs - NearZslEligibilityPolicy.calculateFullExposureEndNs(frame)) / 1_000_000.0
+        } else {
+            val completedElapsedNs = frame.pairCompleteElapsedNs.takeIf { it > 0L }
+                ?: maxOf(frame.imageArrivalElapsedNs, frame.metadataArrivalElapsedNs)
+            if (completedElapsedNs > 0L) {
+                (userShutterTimestampNs - completedElapsedNs) / 1_000_000.0
+            } else null
+        }
+    }
+
+    private fun leasePreShutterAnchor(
+        userShutterTimestampNs: Long,
+        expectedGeneration: Int,
+        expectedFormat: Int,
+        maximumAgeMs: Double,
+        genuineOnly: Boolean
+    ): FrameRingBuffer.LeasedCandidate? {
+        if (pipelineGeneration != expectedGeneration || ringBuffer.currentGeneration() != expectedGeneration) {
+            return null
+        }
+        // This is the shutter-time atomic ownership operation. Lease every currently eligible pair
+        // for the few microseconds needed to choose the newest valid anchor, then immediately release
+        // all non-winners. With the production caps (<=35) this avoids a query->overwrite->lease race
+        // without materially reducing ImageReader headroom.
+        val leased = ringBuffer.queryAndLeaseCandidates(
+            userShutterTimestampNs = userShutterTimestampNs,
+            maxCount = ringBuffer.currentCapacity().coerceAtLeast(1),
+            shutterTimestampDomain = "ELAPSED_REALTIME",
+            expectedFormat = expectedFormat
+        )
+        if (leased.isEmpty()) return null
+
+        val chosen = leased
+            .asSequence()
+            .filter { candidate ->
+                candidate.frame.generationId == expectedGeneration &&
+                    candidate.frame.format == expectedFormat
+            }
+            .map { candidate -> candidate to nearZslPhysicalAgeAtShutterMs(candidate, userShutterTimestampNs) }
+            .filter { (_, ageMs) ->
+                if (genuineOnly) {
+                    NearZslAnchorAdmissionPolicy.isGenuinePreShutterAge(ageMs)
+                } else {
+                    NearZslAnchorAdmissionPolicy.isUsableDegradedPreShutterAge(ageMs, maximumAgeMs)
+                }
+            }
+            .minByOrNull { (_, ageMs) -> ageMs ?: Double.MAX_VALUE }
+            ?.first
+
+        leased.forEach { candidate ->
+            if (candidate !== chosen) candidate.lease.release()
+        }
+        return chosen
+    }
+
+    private fun leaseFreshPreShutterAnchor(
+        userShutterTimestampNs: Long,
+        expectedGeneration: Int,
+        expectedFormat: Int
+    ): FrameRingBuffer.LeasedCandidate? =
+        leasePreShutterAnchor(
+            userShutterTimestampNs = userShutterTimestampNs,
+            expectedGeneration = expectedGeneration,
+            expectedFormat = expectedFormat,
+            maximumAgeMs = Double.MAX_VALUE,
+            genuineOnly = true
+        )
+
+    private fun leaseFreshRepeatingAnchorAfterShutter(
+        userShutterTimestampNs: Long,
+        expectedGeneration: Int,
+        expectedFormat: Int,
+        maximumTransportAgeMs: Double,
+        maximumDegradedPreShutterAgeMs: Double
+    ): FrameRingBuffer.LeasedCandidate? {
+        if (pipelineGeneration != expectedGeneration || ringBuffer.currentGeneration() != expectedGeneration) {
+            return null
+        }
+        val nowNs = android.os.SystemClock.elapsedRealtimeNanos()
+        val leased = ringBuffer.queryAndLeaseCandidates(
+            userShutterTimestampNs = 0L,
+            maxCount = ringBuffer.currentCapacity().coerceAtLeast(1),
+            shutterTimestampDomain = "ELAPSED_REALTIME",
+            expectedFormat = expectedFormat
+        )
+        if (leased.isEmpty()) return null
+
+        val chosen = leased
+            .asSequence()
+            .mapNotNull { candidate ->
+                val frame = candidate.frame
+                if (frame.generationId != expectedGeneration || frame.format != expectedFormat) {
+                    return@mapNotNull null
+                }
+                // The cold/reliability fallback is still sourced exclusively from the existing
+                // Camera2 repeating producer. A one-shot/burst result is never allowed to masquerade
+                // as the warm-buffer continuation frame.
+                if (frame.requestProvenance?.snapshot?.submissionType != CameraRequestSubmissionType.REPEATING) {
+                    return@mapNotNull null
+                }
+                val completionNs = frame.pairCompleteElapsedNs.takeIf { it > 0L }
+                    ?: maxOf(frame.imageArrivalElapsedNs, frame.metadataArrivalElapsedNs)
+                if (frame.sensorTimestampComparableToElapsedRealtime) {
+                    val physicalAgeMs =
+                        nearZslPhysicalAgeAtShutterMs(candidate, userShutterTimestampNs)
+                    if (!NearZslAnchorAdmissionPolicy.isAdmissibleFirstValidPhysicalAge(
+                            physicalAgeAtUserShutterMs = physicalAgeMs,
+                            maximumDegradedPreShutterAgeMs = maximumDegradedPreShutterAgeMs
+                        )
+                    ) {
+                        return@mapNotNull null
+                    }
+                }
+                if (completionNs <= 0L || !NearZslAnchorAdmissionPolicy.isFreshFirstValidCompletion(
+                        pairCompleteElapsedNs = completionNs,
+                        userShutterTimestampNs = userShutterTimestampNs,
+                        nowElapsedNs = nowNs,
+                        maximumTransportAgeMs = maximumTransportAgeMs
+                    )
+                ) {
+                    return@mapNotNull null
+                }
+                candidate to completionNs
+            }
+            // First valid means first completed pair after the accepted shutter, not whichever
+            // frame happened to be newest when this coroutine resumed. This keeps cold-start
+            // latency deterministic and prevents a short scheduling stall from skipping ahead.
+            .minByOrNull { (_, completionNs) -> completionNs }
+            ?.first
+
+        leased.forEach { candidate ->
+            if (candidate !== chosen) candidate.lease.release()
+        }
+        return chosen
+    }
+
+    private fun effectiveShutterForRepeatingAnchor(
+        candidate: FrameRingBuffer.LeasedCandidate,
+        userShutterTimestampNs: Long
+    ): Pair<Long, String> {
+        val frame = candidate.frame
+        val completionNs = frame.pairCompleteElapsedNs.takeIf { it > 0L }
+            ?: maxOf(frame.imageArrivalElapsedNs, frame.metadataArrivalElapsedNs)
+        val resolved = NearZslAnchorAdmissionPolicy.effectiveShutterForFirstValidRepeatingFrame(
+            userShutterTimestampNs = userShutterTimestampNs,
+            fullExposureEndNs = if (frame.sensorTimestampComparableToElapsedRealtime) {
+                NearZslEligibilityPolicy.calculateFullExposureEndNs(frame)
+            } else null,
+            pairCompleteElapsedNs = completionNs,
+            sensorTimestampComparableToElapsedRealtime = frame.sensorTimestampComparableToElapsedRealtime
+        )
+        return resolved.timestampNs to resolved.domain
+    }
+
+    private suspend fun awaitSingleNearZslAnchor(
+        attemptId: Long,
+        userShutterTimestampNs: Long,
+        expectedGeneration: Int,
+        expectedFormat: Int,
+        coldStartAtUserShutter: Boolean
+    ): NearZslSingleAnchorReservation? {
+        val startNs = android.os.SystemClock.elapsedRealtimeNanos()
+        val timing = ringBuffer.streamTimingEstimate()
+        val budget = NearZslAnchorAdmissionPolicy.resolveBudget(
+            frameDurationMedianMs = timing.frameDurationMedianMs,
+            pairCompletionLagMedianMs = timing.pairCompletionLagMedianMs,
+            coldStartAtUserShutter = coldStartAtUserShutter
+        )
+        val preShutterPairingGraceMs = budget.preShutterPairingGraceMs
+        val firstValidWaitMs = budget.firstValidRepeatingFrameWaitMs
+        val maximumTransportAgeMs = budget.maximumTransportAgeMs
+
+        // The strict exposure-product selector was already given one atomic chance at the exact
+        // shutter entry. If it yielded no anchor, exposure matching becomes a quality preference:
+        // relax it *before* waiting for late image/metadata pairing so a genuine pre-shutter pair
+        // cannot be overwritten while admission waits for a selector target that no longer exists.
+        relaxSelectionExposureConstraintForGuaranteedAnchor(
+            attemptId = attemptId,
+            reason = if (coldStartAtUserShutter) "COLD_START_FIRST_VALID_FRAME" else "NO_IMMEDIATE_GENUINE_PRE_SHUTTER_FRAME"
+        )
+
+        fun elapsedMs(): Double =
+            (android.os.SystemClock.elapsedRealtimeNanos() - startNs).coerceAtLeast(0L) / 1_000_000.0
+
+        var eventSequence = ringBuffer.currentEventSequence()
+        val preShutterDeadlineNs = startNs + preShutterPairingGraceMs * 1_000_000L
+        while (preShutterPairingGraceMs > 0L &&
+            android.os.SystemClock.elapsedRealtimeNanos() <= preShutterDeadlineNs
+        ) {
+            leaseFreshPreShutterAnchor(
+                userShutterTimestampNs,
+                expectedGeneration,
+                expectedFormat
+            )?.let { candidate ->
+                return NearZslSingleAnchorReservation(
+                    candidate = candidate,
+                    temporalClass = "GENUINE_PRE_SHUTTER_LATE_PAIR",
+                    effectiveShutterTimestampNs = userShutterTimestampNs,
+                    effectiveShutterTimestampDomain = "ELAPSED_REALTIME",
+                    waitMs = elapsedMs(),
+                    physicalAgeAtUserShutterMs =
+                        nearZslPhysicalAgeAtShutterMs(candidate, userShutterTimestampNs)
+                )
+            }
+            if (pipelineGeneration != expectedGeneration || ringBuffer.currentGeneration() != expectedGeneration) {
+                return null
+            }
+            kotlinx.coroutines.withTimeoutOrNull(25L) { ringBuffer.awaitEventAfter(eventSequence) }
+            eventSequence = ringBuffer.currentEventSequence()
+        }
+
+        // Before accepting anything temporally after the press, make one reliability-floor pass
+        // over still-valid pre-shutter pairs with the exposure-selection preference relaxed. This
+        // preserves Near-ZSL semantics for ordinary warm operation even when the latest 120 ms pair
+        // missed a transient shutter/ISO selection constraint. Very stale frames remain forbidden.
+        if (!coldStartAtUserShutter) {
+            leasePreShutterAnchor(
+                userShutterTimestampNs = userShutterTimestampNs,
+                expectedGeneration = expectedGeneration,
+                expectedFormat = expectedFormat,
+                maximumAgeMs = budget.maximumDegradedPreShutterAgeMs,
+                genuineOnly = false
+            )?.let { candidate ->
+                return NearZslSingleAnchorReservation(
+                    candidate = candidate,
+                    temporalClass = "DEGRADED_PRE_SHUTTER_ANCHOR",
+                    effectiveShutterTimestampNs = userShutterTimestampNs,
+                    effectiveShutterTimestampDomain = "ELAPSED_REALTIME",
+                    waitMs = elapsedMs(),
+                    physicalAgeAtUserShutterMs =
+                        nearZslPhysicalAgeAtShutterMs(candidate, userShutterTimestampNs)
+                )
+            }
+        }
+
+        // Keep the same continuously repeating warm producer and accept its first complete, fresh
+        // frame instead of issuing a dedicated still request or failing the shutter. This is an
+        // explicitly degraded temporal class, not fake Near-ZSL.
+        val fallbackDeadlineNs =
+            android.os.SystemClock.elapsedRealtimeNanos() + firstValidWaitMs * 1_000_000L
+        while (android.os.SystemClock.elapsedRealtimeNanos() <= fallbackDeadlineNs) {
+            leaseFreshRepeatingAnchorAfterShutter(
+                userShutterTimestampNs = userShutterTimestampNs,
+                expectedGeneration = expectedGeneration,
+                expectedFormat = expectedFormat,
+                maximumTransportAgeMs = maximumTransportAgeMs,
+                maximumDegradedPreShutterAgeMs = budget.maximumDegradedPreShutterAgeMs
+            )?.let { candidate ->
+                val (effectiveTimestamp, domain) =
+                    effectiveShutterForRepeatingAnchor(candidate, userShutterTimestampNs)
+                return NearZslSingleAnchorReservation(
+                    candidate = candidate,
+                    temporalClass = "FIRST_VALID_WARM_REPEATING_FRAME",
+                    effectiveShutterTimestampNs = effectiveTimestamp,
+                    effectiveShutterTimestampDomain = domain,
+                    waitMs = elapsedMs(),
+                    physicalAgeAtUserShutterMs =
+                        nearZslPhysicalAgeAtShutterMs(candidate, userShutterTimestampNs)
+                )
+            }
+            if (pipelineGeneration != expectedGeneration || ringBuffer.currentGeneration() != expectedGeneration) {
+                return null
+            }
+            kotlinx.coroutines.withTimeoutOrNull(30L) { ringBuffer.awaitEventAfter(eventSequence) }
+            eventSequence = ringBuffer.currentEventSequence()
+        }
+        return null
+    }
+
     private fun shouldRequestDefaultRawShutterMotionAnalysis(): Boolean =
         isActiveRawWarmProducer() &&
             requestedManualIso == null && requestedManualExposureNs == null &&
@@ -2847,7 +3259,11 @@ class BnCameraManager(private val context: Context) {
             currentFlashMode == "Off"
 
     private fun clearDefaultRawShutterPriorityState(resetMotion: Boolean) {
-        ringBuffer.clearSelectionExposureConstraint("DEFAULT_RAW_STATE_CLEAR")
+        updateDefaultRawFrameSelectionExposureConstraint(
+            exposureTargetNs = null,
+            source = "DEFAULT_RAW_STATE_CLEAR",
+            isoTarget = null
+        )
         defaultRawShutterAeBaselineIso = null
         defaultRawShutterAeBaselineExposureNs = null
         defaultRawShutterAeBaselineGeneration = -1
@@ -14259,86 +14675,117 @@ class BnCameraManager(private val context: Context) {
                 ringBufferFrameCount = ringBuffer.completeFrameCount()
             )
         )
-        val healthAtEntry = ringBuffer.healthDiagnostics(userShutterTimestampNs)
-        Log.i(
-            "NearZslTiming",
-            "event=CAPTURE_ENTRY_BUFFER_HEALTH " +
-                    "targetCapacity=${healthAtEntry.targetCapacity} " +
-                    "completeFrames=${healthAtEntry.completeFrames} " +
-                    "leasedFrames=${healthAtEntry.leasedFrames} " +
-                    "writableSlots=${healthAtEntry.writableSlots} " +
-                    "pendingPairs=${healthAtEntry.pendingPairs} " +
-                    "acquiredImageCount=${healthAtEntry.acquiredImageCount} " +
-                    "imageReaderMaxImages=${healthAtEntry.imageReaderMaxImages} " +
-                    "actualProducerHeadroom=${healthAtEntry.actualProducerHeadroom} " +
-                    "evictions=${healthAtEntry.evictions} " +
-                    "droppedIncomingFrames=${healthAtEntry.droppedIncomingFrames} " +
-                    "leaseHighWatermark=${healthAtEntry.leaseHighWatermark} " +
-                    "bufferRefillLatencyMs=${healthAtEntry.bufferRefillLatencyMs?.let { String.format(java.util.Locale.US, "%.3f", it) } ?: "null"} " +
-                    "bufferRefillState=${healthAtEntry.bufferRefillState} " +
-                    "captureReady=${healthAtEntry.captureReady} " +
-                    "bufferState=${healthAtEntry.bufferState} " +
-                    "validCompleteFrameCount=${healthAtEntry.validCompleteFrameCount} " +
-                    "fullyPreShutterCandidateCount=${healthAtEntry.fullyPreShutterCandidateCount} " +
-                    "frameAgeClockBasis=${healthAtEntry.frameAgeClockBasis} " +
-                    "timeToFirstCompleteFrameMs=${healthAtEntry.timeToFirstCompleteFrameMs?.let { String.format(java.util.Locale.US, "%.3f", it) } ?: "null"} " +
-                    "generationToSessionConfiguredMs=${healthAtEntry.generationToSessionConfiguredMs?.let { String.format(java.util.Locale.US, "%.3f", it) } ?: "null"} " +
-                    "sessionConfiguredToFirstImageMs=${healthAtEntry.sessionConfiguredToFirstImageMs?.let { String.format(java.util.Locale.US, "%.3f", it) } ?: "null"} " +
-                    "sessionConfiguredToFirstMetadataMs=${healthAtEntry.sessionConfiguredToFirstMetadataMs?.let { String.format(java.util.Locale.US, "%.3f", it) } ?: "null"} " +
-                    "sessionConfiguredToFirstCompleteFrameMs=${healthAtEntry.sessionConfiguredToFirstCompleteFrameMs?.let { String.format(java.util.Locale.US, "%.3f", it) } ?: "null"} " +
-                    "startupPairingState=${healthAtEntry.startupPairingState} " +
-                    "coldStartWaitMs=${healthAtEntry.coldStartWaitMs?.let { String.format(java.util.Locale.US, "%.3f", it) } ?: "null"} " +
-                    "warmTargetProgress=${String.format(java.util.Locale.US, "%.3f", healthAtEntry.warmTargetProgress)} " +
-                    "selectionFailureReason=${healthAtEntry.selectionFailureReason ?: "none"}"
-        )
-
-        com.bncam.core.debug.RawRecoveryTrace.log(
-            "EXECUTE_CAPTURE_ENTRY",
-            "format=${formatName(activeZslFormat)}, strategy=${activeProfile.captureStrategy}, userShutterTs=$userShutterTimestampNs, " +
-                    "captureReady=${healthAtEntry.captureReady}, bufferState=${healthAtEntry.bufferState}, validComplete=${healthAtEntry.validCompleteFrameCount}, " +
-                    "fullyPreShutter=${healthAtEntry.fullyPreShutterCandidateCount}, failureReason=${healthAtEntry.selectionFailureReason ?: "none"}"
-        )
-
-        traceCaptureRuntime(
-            "CAPTURE_BEGIN attemptId=${attemptId ?: "none"} profile=${activeProfile.id} " +
-                "viewfinderMode=$viewfinderMode profileMode=${activeProfile.captureStrategy} lens=${activeLens.id} " +
-                "activeFormat=${formatName(activeZslFormat)} generation=$pipelineGeneration " +
-                "cameraState=${cameraState.value} ringFrames=${ringBuffer.completeFrameCount()}"
-        )
-
         if (attemptId == null) {
             Log.w(tag, "Capture ignored: previous capture is still running.")
             traceCaptureRuntime("CAPTURE_REJECT previous_capture_running")
             _captureContractError.value = "Capture is still being admitted; the duplicate shutter press was ignored."
             return@withContext null
         }
-        // Preview and capture have independent lifetimes. Never suppress RAW preview offers for
-        // the duration of a still-capture attempt; processing may continue asynchronously for
-        // seconds after acquisition has completed.
-        if (targetViewfinderSource != ViewfinderEffectiveSource.YUV) {
-            capturePreviewContinuityTracker.begin(
-                attemptId = attemptId,
-                sessionEpoch = activeConfiguredSessionEpoch,
-                repeatingRequestActive = captureSession != null && currentCaptureRequest != null
-            )
-        }
-        captureAttempts.captureRequestSubmitted(attemptId)
+
         var finalOutputUri: Uri? = null
         var finishReason = "capture did not produce an output"
-        // Normal Multi-Frame Near-ZSL may pin one exact pre-shutter anchor as soon as the
-        // effective route is resolved. Ownership transfers to MultiFrameRunner only after its
-        // execute() call returns; every earlier failure path is released by this scope's finally.
+        // All shutter-time leases are declared before entering the ownership scope so the finally
+        // block can release them even if freezing, diagnostics, or route resolution fails.
         var preleasedNormalMultiAnchor: FrameRingBuffer.LeasedCandidate? = null
-
-        // Consume prior immediately so it decays after one shot
-        lastShotVerdictHighDrRisk = false
-        lastShotExposureNs = 0L
-        lastShotIso = 0
-        backgroundHandler?.post {
-            updatePreviewRepeatingRequest()
-        }
+        var preleasedProvisionalNearZslAnchor: FrameRingBuffer.LeasedCandidate? = null
+        var preleasedSingleAnchor: FrameRingBuffer.LeasedCandidate? = null
+        var singleAnchorTemporalClass = "UNRESOLVED"
+        var singleAnchorEffectiveShutterTimestampNs = userShutterTimestampNs
+        var singleAnchorEffectiveShutterTimestampDomain = "ELAPSED_REALTIME"
 
         try {
+            // This must be the first accepted-shutter ownership transaction. Freeze the live RAW
+            // selection contract and atomically pin one current-generation complete pre-shutter pair
+            // before diagnostics, settings Flow reads, recipe construction, or any other suspend
+            // point can advance the ring or mutate exposure-selection authority.
+            freezeSelectionExposureConstraintForCapture(attemptId)
+            preleasedProvisionalNearZslAnchor = leaseFreshPreShutterAnchor(
+                userShutterTimestampNs = userShutterTimestampNs,
+                expectedGeneration = pipelineGeneration,
+                expectedFormat = activeZslFormat
+            )
+
+            val healthAtEntry = ringBuffer.healthDiagnostics(userShutterTimestampNs)
+            Log.i(
+                "NearZslTiming",
+                "event=CAPTURE_ENTRY_BUFFER_HEALTH " +
+                        "targetCapacity=${healthAtEntry.targetCapacity} " +
+                        "completeFrames=${healthAtEntry.completeFrames} " +
+                        "leasedFrames=${healthAtEntry.leasedFrames} " +
+                        "writableSlots=${healthAtEntry.writableSlots} " +
+                        "pendingPairs=${healthAtEntry.pendingPairs} " +
+                        "acquiredImageCount=${healthAtEntry.acquiredImageCount} " +
+                        "imageReaderMaxImages=${healthAtEntry.imageReaderMaxImages} " +
+                        "actualProducerHeadroom=${healthAtEntry.actualProducerHeadroom} " +
+                        "evictions=${healthAtEntry.evictions} " +
+                        "droppedIncomingFrames=${healthAtEntry.droppedIncomingFrames} " +
+                        "leaseHighWatermark=${healthAtEntry.leaseHighWatermark} " +
+                        "bufferRefillLatencyMs=${healthAtEntry.bufferRefillLatencyMs?.let { String.format(java.util.Locale.US, "%.3f", it) } ?: "null"} " +
+                        "bufferRefillState=${healthAtEntry.bufferRefillState} " +
+                        "captureReady=${healthAtEntry.captureReady} " +
+                        "bufferState=${healthAtEntry.bufferState} " +
+                        "validCompleteFrameCount=${healthAtEntry.validCompleteFrameCount} " +
+                        "fullyPreShutterCandidateCount=${healthAtEntry.fullyPreShutterCandidateCount} " +
+                        "frameAgeClockBasis=${healthAtEntry.frameAgeClockBasis} " +
+                        "timeToFirstCompleteFrameMs=${healthAtEntry.timeToFirstCompleteFrameMs?.let { String.format(java.util.Locale.US, "%.3f", it) } ?: "null"} " +
+                        "generationToSessionConfiguredMs=${healthAtEntry.generationToSessionConfiguredMs?.let { String.format(java.util.Locale.US, "%.3f", it) } ?: "null"} " +
+                        "sessionConfiguredToFirstImageMs=${healthAtEntry.sessionConfiguredToFirstImageMs?.let { String.format(java.util.Locale.US, "%.3f", it) } ?: "null"} " +
+                        "sessionConfiguredToFirstMetadataMs=${healthAtEntry.sessionConfiguredToFirstMetadataMs?.let { String.format(java.util.Locale.US, "%.3f", it) } ?: "null"} " +
+                        "sessionConfiguredToFirstCompleteFrameMs=${healthAtEntry.sessionConfiguredToFirstCompleteFrameMs?.let { String.format(java.util.Locale.US, "%.3f", it) } ?: "null"} " +
+                        "startupPairingState=${healthAtEntry.startupPairingState} " +
+                        "coldStartWaitMs=${healthAtEntry.coldStartWaitMs?.let { String.format(java.util.Locale.US, "%.3f", it) } ?: "null"} " +
+                        "warmTargetProgress=${String.format(java.util.Locale.US, "%.3f", healthAtEntry.warmTargetProgress)} " +
+                        "selectionFailureReason=${healthAtEntry.selectionFailureReason ?: "none"}"
+            )
+
+            com.bncam.core.debug.RawRecoveryTrace.log(
+                "EXECUTE_CAPTURE_ENTRY",
+                "format=${formatName(activeZslFormat)}, strategy=${activeProfile.captureStrategy}, userShutterTs=$userShutterTimestampNs, " +
+                        "captureReady=${healthAtEntry.captureReady}, bufferState=${healthAtEntry.bufferState}, validComplete=${healthAtEntry.validCompleteFrameCount}, " +
+                        "fullyPreShutter=${healthAtEntry.fullyPreShutterCandidateCount}, failureReason=${healthAtEntry.selectionFailureReason ?: "none"}"
+            )
+
+            traceCaptureRuntime(
+                "CAPTURE_BEGIN attemptId=$attemptId profile=${activeProfile.id} " +
+                    "viewfinderMode=$viewfinderMode profileMode=${activeProfile.captureStrategy} lens=${activeLens.id} " +
+                    "activeFormat=${formatName(activeZslFormat)} generation=$pipelineGeneration " +
+                    "cameraState=${cameraState.value} ringFrames=${ringBuffer.completeFrameCount()}"
+            )
+
+            // Preview and capture have independent lifetimes. Never suppress RAW preview offers for
+            // the duration of a still-capture attempt; processing may continue asynchronously for
+            // seconds after acquisition has completed.
+            if (targetViewfinderSource != ViewfinderEffectiveSource.YUV) {
+                capturePreviewContinuityTracker.begin(
+                    attemptId = attemptId,
+                    sessionEpoch = activeConfiguredSessionEpoch,
+                    repeatingRequestActive = captureSession != null && currentCaptureRequest != null
+                )
+            }
+            captureAttempts.captureRequestSubmitted(attemptId)
+
+            if (preleasedProvisionalNearZslAnchor != null) {
+                traceCaptureRuntime(
+                    "SHUTTER_ENTRY_ANCHOR_PIN attemptId=$attemptId " +
+                        "frameVersion=${preleasedProvisionalNearZslAnchor?.frameVersion ?: 0L} " +
+                        "frameTimestamp=${preleasedProvisionalNearZslAnchor?.timestampNs ?: 0L} " +
+                        "physicalAgeMs=${preleasedProvisionalNearZslAnchor?.let { nearZslPhysicalAgeAtShutterMs(it, userShutterTimestampNs) } ?: Double.NaN}"
+                )
+            } else {
+                traceCaptureRuntime(
+                    "SHUTTER_ENTRY_ANCHOR_PENDING attemptId=$attemptId " +
+                        "reason=no_genuine_pre_shutter_pair_at_entry"
+                )
+            }
+
+            // Consume the previous-shot prior only after the shutter anchor owns its frame. Do not
+            // mutate Camera2 repeating controls while this shutter is still securing its Near-ZSL
+            // source frame; the request refresh is deferred to finally after selection ownership is
+            // released.
+            lastShotVerdictHighDrRisk = false
+            lastShotExposureNs = 0L
+            lastShotIso = 0
+
             val settingsRepo = SettingsRepository(context)
             // LIVE UPDATE: Use the latest capture strategy before RAW_SENSOR acquisition,
             // because RAW_SENSOR single frame needs 1 still while RAW_SENSOR multi frame needs up to 5 stills.
@@ -14411,6 +14858,36 @@ class BnCameraManager(private val context: Context) {
             val effectiveCaptureStrategy = authorityResolution.effectiveCaptureStrategy
             Log.i("BnCameraManager", "AUTHORITY_RESOLUTION: userHdr=$computationalHdrUserRequested liveStrategy=$liveCaptureStrategy resolvedStrategy=$effectiveCaptureStrategy runner=${authorityResolution.actualRunner} routeEnabled=$computationalHdrRouteEnabled")
 
+            if (effectiveCaptureStrategy == CaptureStrategy.SINGLE_FRAME_ZSL &&
+                !computationalHdrRouteEnabled &&
+                !dedicatedFlashStill
+            ) {
+                preleasedSingleAnchor = preleasedProvisionalNearZslAnchor
+                    ?: leaseFreshPreShutterAnchor(
+                        userShutterTimestampNs = userShutterTimestampNs,
+                        expectedGeneration = pipelineGeneration,
+                        expectedFormat = activeZslFormat
+                    )
+                if (preleasedSingleAnchor === preleasedProvisionalNearZslAnchor) {
+                    preleasedProvisionalNearZslAnchor = null
+                }
+                if (preleasedSingleAnchor != null) {
+                    singleAnchorTemporalClass = "GENUINE_PRE_SHUTTER_IMMEDIATE"
+                    traceCaptureRuntime(
+                        "SINGLE_SHUTTER_ANCHOR_PIN attemptId=$attemptId temporalClass=$singleAnchorTemporalClass " +
+                            "frameVersion=${preleasedSingleAnchor?.frameVersion ?: 0L} " +
+                            "frameTimestamp=${preleasedSingleAnchor?.timestampNs ?: 0L} " +
+                            "physicalAgeMs=${preleasedSingleAnchor?.let { nearZslPhysicalAgeAtShutterMs(it, userShutterTimestampNs) } ?: Double.NaN}"
+                    )
+                } else {
+                    traceCaptureRuntime(
+                        "SINGLE_SHUTTER_ANCHOR_PENDING attemptId=$attemptId reason=no_fresh_pre_shutter_pair_at_entry " +
+                            "completeFrames=${ringBuffer.completeFrameCount()} " +
+                            "selection=${ringBuffer.selectionExposureConstraintSnapshot().summary()}"
+                    )
+                }
+            }
+
             // Preserve the exact normal Multi-Frame shutter anchor before recipe resolution,
             // readiness checks and any other suspend points can let the warm ring advance. This is
             // deliberately limited to the normal Near-ZSL route: deliberate HDR/flash owners carry
@@ -14426,18 +14903,34 @@ class BnCameraManager(private val context: Context) {
                     FrameOrigin.RAW_SENSOR -> ImageFormat.RAW_SENSOR
                 }
             ) {
-                preleasedNormalMultiAnchor = ringBuffer.queryAndLeaseCandidates(
-                    userShutterTimestampNs = userShutterTimestampNs,
-                    maxCount = 1,
-                    shutterTimestampDomain = "ELAPSED_REALTIME",
-                    expectedFormat = activeZslFormat
-                ).lastOrNull()
+                preleasedNormalMultiAnchor = preleasedProvisionalNearZslAnchor
+                    ?: ringBuffer.queryAndLeaseCandidates(
+                        userShutterTimestampNs = userShutterTimestampNs,
+                        maxCount = 1,
+                        shutterTimestampDomain = "ELAPSED_REALTIME",
+                        expectedFormat = activeZslFormat
+                    ).lastOrNull()
+                if (preleasedNormalMultiAnchor === preleasedProvisionalNearZslAnchor) {
+                    preleasedProvisionalNearZslAnchor = null
+                }
                 traceCaptureRuntime(
                     "MULTI_SHUTTER_ANCHOR_PIN attemptId=$attemptId pinned=${preleasedNormalMultiAnchor != null} " +
                         "frameVersion=${preleasedNormalMultiAnchor?.frameVersion ?: 0L} " +
                         "frameTimestamp=${preleasedNormalMultiAnchor?.timestampNs ?: 0L} " +
                         "generation=${preleasedNormalMultiAnchor?.frame?.generationId ?: -1}"
                 )
+            }
+
+            // A provisional shutter-entry lease is only a Near-ZSL admission resource. Dedicated
+            // HDR/flash/non-ZSL routes have their own exact capture ownership and must not pin an
+            // unrelated warm frame for the rest of this attempt.
+            preleasedProvisionalNearZslAnchor?.let { unused ->
+                traceCaptureRuntime(
+                    "SHUTTER_ENTRY_ANCHOR_RELEASE_UNUSED attemptId=$attemptId " +
+                        "effectiveStrategy=$effectiveCaptureStrategy frameVersion=${unused.frameVersion}"
+                )
+                unused.lease.release()
+                preleasedProvisionalNearZslAnchor = null
             }
 
             val profileNightFrameCount = if (viewfinderMode == ViewfinderMode.NIGHT) {
@@ -14607,15 +15100,15 @@ class BnCameraManager(private val context: Context) {
                     requestedFrameCount = requestedRouteFrameCount,
                     bufferCapacity = ringBuffer.currentCapacity()
                 ).let { req ->
-                    val mode = CaptureMode.from(effectiveCaptureStrategy)
-                    if (recipe.computationalHdrRouteEnabled || mode == CaptureMode.SINGLE || mode == CaptureMode.EXPERIMENTAL) {
+                    if (recipe.computationalHdrRouteEnabled) {
                         // HDR Enhanced needs one valid pre-shutter frame only as a planning
                         // snapshot. Its processing frames are deliberate post-shutter RAW requests.
                         req.copy(requiredCompleteFrames = 1)
                     } else req
                 }
 
-            val pinnedAnchorReadinessReason = preleasedNormalMultiAnchor?.let { pinned ->
+            val preleasedAdmissionAnchor = preleasedSingleAnchor ?: preleasedNormalMultiAnchor
+            val pinnedAnchorReadinessReason = preleasedAdmissionAnchor?.let { pinned ->
                 if (pinned.frame.generationId == pipelineGeneration && pinned.frame.format == activeZslFormat) {
                     pipelineReadinessReason(
                         requestedProfileId = activeProfile.id,
@@ -14644,8 +15137,10 @@ class BnCameraManager(private val context: Context) {
                 pipelineCaptureGateWaitMs = 0L
                 pipelineCaptureGateResetTriggered = false
                 traceCaptureRuntime(
-                    "MULTI_PINNED_ANCHOR_ADMISSION attemptId=$attemptId " +
-                        "sourceReason=$pinnedAnchorReadinessReason frameVersion=${preleasedNormalMultiAnchor?.frameVersion ?: 0L}"
+                    "PINNED_SHUTTER_ANCHOR_ADMISSION attemptId=$attemptId " +
+                        "route=${if (preleasedSingleAnchor != null) "SINGLE" else "MULTI"} " +
+                        "sourceReason=$pinnedAnchorReadinessReason " +
+                        "frameVersion=${preleasedAdmissionAnchor?.frameVersion ?: 0L}"
                 )
                 true
             } else {
@@ -14703,6 +15198,83 @@ class BnCameraManager(private val context: Context) {
                 }
             }
 
+            preleasedSingleAnchor?.let { pinned ->
+                if (pinned.frame.generationId != pipelineGeneration || pinned.frame.format != activeZslFormat) {
+                    traceCaptureRuntime(
+                        "SINGLE_SHUTTER_ANCHOR_INVALIDATED attemptId=$attemptId " +
+                            "pinnedGeneration=${pinned.frame.generationId} activeGeneration=$pipelineGeneration " +
+                            "pinnedFormat=${formatName(pinned.frame.format)} activeFormat=${formatName(activeZslFormat)}"
+                    )
+                    pinned.lease.release()
+                    preleasedSingleAnchor = null
+                    singleAnchorTemporalClass = "INVALIDATED_BY_PIPELINE_CHANGE"
+                }
+            }
+
+            if (effectiveCaptureStrategy == CaptureStrategy.SINGLE_FRAME_ZSL &&
+                !computationalHdrRouteEnabled &&
+                !dedicatedFlashStill &&
+                preleasedSingleAnchor == null
+            ) {
+                val reservation = awaitSingleNearZslAnchor(
+                    attemptId = attemptId,
+                    userShutterTimestampNs = userShutterTimestampNs,
+                    expectedGeneration = pipelineGeneration,
+                    expectedFormat = activeZslFormat,
+                    coldStartAtUserShutter = healthAtEntry.completeFrames == 0
+                )
+                if (reservation == null) {
+                    // One controlled repeating-request kick is allowed. It does not create a still
+                    // request and therefore preserves the warm Near-ZSL architecture. Any selection
+                    // exposure update produced by the kick is deferred until this shutter is owned.
+                    traceCaptureRuntime(
+                        "SINGLE_SHUTTER_ANCHOR_RECOVERY_KICK attemptId=$attemptId " +
+                            "completeFrames=${ringBuffer.completeFrameCount()} " +
+                            "eventSequence=${ringBuffer.currentEventSequence()}"
+                    )
+                    backgroundHandler?.post { updatePreviewRepeatingRequest() }
+                    val retryReservation = awaitSingleNearZslAnchor(
+                        attemptId = attemptId,
+                        userShutterTimestampNs = userShutterTimestampNs,
+                        expectedGeneration = pipelineGeneration,
+                        expectedFormat = activeZslFormat,
+                        coldStartAtUserShutter = false
+                    )
+                    if (retryReservation == null) {
+                        finishReason = "single_near_zsl_anchor_unavailable_after_repeating_recovery"
+                        _captureContractError.value =
+                            "Camera stream did not provide a complete capture frame."
+                        traceCaptureRuntime(
+                            "SINGLE_SHUTTER_ANCHOR_FAILURE attemptId=$attemptId reason=$finishReason " +
+                                "health=${ringBuffer.healthDiagnostics(userShutterTimestampNs)}"
+                        )
+                        finishCaptureAttempt(attemptId, null, finishReason)
+                        return@withContext null
+                    }
+                    preleasedSingleAnchor = retryReservation.candidate
+                    singleAnchorTemporalClass = retryReservation.temporalClass
+                    singleAnchorEffectiveShutterTimestampNs = retryReservation.effectiveShutterTimestampNs
+                    singleAnchorEffectiveShutterTimestampDomain = retryReservation.effectiveShutterTimestampDomain
+                    traceCaptureRuntime(
+                        "SINGLE_SHUTTER_ANCHOR_RESERVED attemptId=$attemptId recovery=true " +
+                            "temporalClass=$singleAnchorTemporalClass waitMs=${retryReservation.waitMs} " +
+                            "physicalAgeMs=${retryReservation.physicalAgeAtUserShutterMs ?: Double.NaN} " +
+                            "frameVersion=${retryReservation.candidate.frameVersion}"
+                    )
+                } else {
+                    preleasedSingleAnchor = reservation.candidate
+                    singleAnchorTemporalClass = reservation.temporalClass
+                    singleAnchorEffectiveShutterTimestampNs = reservation.effectiveShutterTimestampNs
+                    singleAnchorEffectiveShutterTimestampDomain = reservation.effectiveShutterTimestampDomain
+                    traceCaptureRuntime(
+                        "SINGLE_SHUTTER_ANCHOR_RESERVED attemptId=$attemptId recovery=false " +
+                            "temporalClass=$singleAnchorTemporalClass waitMs=${reservation.waitMs} " +
+                            "physicalAgeMs=${reservation.physicalAgeAtUserShutterMs ?: Double.NaN} " +
+                            "frameVersion=${reservation.candidate.frameVersion}"
+                    )
+                }
+            }
+
             // Explicit-touch autofocus is completed during the live tap transaction. Do not run a
             // second image-space/manual-lens autofocus solver at shutter time: capture must preserve
             // the focus state that the photographer already verified in the viewfinder.
@@ -14745,10 +15317,22 @@ class BnCameraManager(private val context: Context) {
                 if (recipe.executionSettings.cameraSoundEnabled && !managerShutdownRequested.get()) {
                     mediaActionSound.play(MediaActionSound.SHUTTER_CLICK)
                 }
-                shutterTimestampNs = userShutterTimestampNs
-                shutterTimestampDomain = "ELAPSED_REALTIME"
+                if (effectiveCaptureStrategy == CaptureStrategy.SINGLE_FRAME_ZSL &&
+                    preleasedSingleAnchor != null
+                ) {
+                    shutterTimestampNs = singleAnchorEffectiveShutterTimestampNs
+                    shutterTimestampDomain = singleAnchorEffectiveShutterTimestampDomain
+                } else {
+                    shutterTimestampNs = userShutterTimestampNs
+                    shutterTimestampDomain = "ELAPSED_REALTIME"
+                }
                 currentSubmittedControlRequestEpochAtShutter =
                     currentSubmittedControlRequestEpoch()
+                traceCaptureRuntime(
+                    "SHUTTER_TEMPORAL_AUTHORITY attemptId=$attemptId userShutterNs=$userShutterTimestampNs " +
+                        "effectiveShutterNs=$shutterTimestampNs domain=$shutterTimestampDomain " +
+                        "singleAnchorTemporalClass=$singleAnchorTemporalClass"
+                )
             }
 
             var hdrBracket: HdrBracketCaptureContext? = null
@@ -14795,6 +15379,28 @@ class BnCameraManager(private val context: Context) {
             // Keep feedback non-owning so a queued RAW job cannot retain a retired BnCameraManager.
             val asyncRenderHealthOwner = java.lang.ref.WeakReference(this@BnCameraManager)
 
+            // SingleFrameRunner's legacy parameter named userShutterTimestampNs is also its hard
+            // eligibility boundary. For the one explicitly degraded cold/transport fallback, the
+            // selected frame necessarily completed after the physical press, so feed the runner the
+            // effective repeating-frame boundary while keeping the real physical press separately
+            // and explicitly in the capture policy telemetry below. Normal warm Near-ZSL and the
+            // bounded degraded PRE-shutter tier continue to use the real user shutter unchanged.
+            val singleRunnerEligibilityTimestampNs =
+                if (singleAnchorTemporalClass == "FIRST_VALID_WARM_REPEATING_FRAME") {
+                    singleAnchorEffectiveShutterTimestampNs
+                } else {
+                    userShutterTimestampNs
+                }
+            val singleRunnerExposurePolicySummary =
+                lastExposurePlanSummary +
+                    ";nearZslPhysicalUserShutterTimestampNs=$userShutterTimestampNs" +
+                    ";nearZslRunnerEligibilityTimestampNs=$singleRunnerEligibilityTimestampNs" +
+                    ";nearZslAnchorTemporalClass=$singleAnchorTemporalClass" +
+                    ";nearZslAnchorIsGenuinePreShutter=${
+                        singleAnchorTemporalClass.startsWith("GENUINE_PRE_SHUTTER")
+                    }" +
+                    ";nearZslNoDedicatedStillFallback=${!dedicatedFlashStill}"
+
             val submissionResult = try {
                 withTimeout(60_000L) {
                     when (effectiveCaptureStrategy) {
@@ -14820,7 +15426,7 @@ class BnCameraManager(private val context: Context) {
                                     currentSubmittedControlRequestEpochAtShutter,
                                 aeStateBeforeCapture = lastAeState,
                                 meteringPolicySummary = lastMeteringPlanSummary,
-                                exposurePolicySummary = lastExposurePlanSummary,
+                                exposurePolicySummary = singleRunnerExposurePolicySummary,
                                 postShutterStillCaptureUsed = postShutterStillCaptureUsed,
                                 captureStageListener = captureAttempts.listenerFor(attemptId),
                                 onRawProcessingFeedback = { feedback ->
@@ -14834,7 +15440,7 @@ class BnCameraManager(private val context: Context) {
                                     }
                                 },
                                 temporaryPreviewPath = temporaryPreviewPath,
-                                userShutterTimestampNs = userShutterTimestampNs,
+                                userShutterTimestampNs = singleRunnerEligibilityTimestampNs,
                                 stableAutoWhiteBalance = stableAutoWhiteBalanceAtShutter,
                                 focusCaptureContext = focusCaptureContextAtShutter,
                                 portraitCaptureContext = portraitCaptureContextAtShutter
@@ -15024,6 +15630,26 @@ class BnCameraManager(private val context: Context) {
             finishCaptureAttempt(attemptId, null, finishReason)
             null
         } finally {
+            preleasedProvisionalNearZslAnchor?.let { provisional ->
+                traceCaptureRuntime(
+                    "SHUTTER_ENTRY_ANCHOR_RELEASE_SCOPE attemptId=$attemptId frameVersion=${provisional.frameVersion}"
+                )
+                provisional.lease.release()
+                preleasedProvisionalNearZslAnchor = null
+            }
+            preleasedSingleAnchor?.let { pinned ->
+                traceCaptureRuntime(
+                    "SINGLE_SHUTTER_ANCHOR_RELEASE_SCOPE attemptId=$attemptId " +
+                        "temporalClass=$singleAnchorTemporalClass frameVersion=${pinned.frameVersion}"
+                )
+                pinned.lease.release()
+                preleasedSingleAnchor = null
+            }
+            releaseSelectionExposureConstraintAfterCapture(attemptId)
+            // Re-apply the live repeating control state only after shutter-time selection authority
+            // is unfrozen. This prevents a post-press AE/flicker update from retroactively making
+            // the frame that existed at shutter time ineligible.
+            backgroundHandler?.post { updatePreviewRepeatingRequest() }
             preleasedNormalMultiAnchor?.let { orphanLease ->
                 traceCaptureRuntime(
                     "MULTI_SHUTTER_ANCHOR_RELEASE_SCOPE attemptId=$attemptId " +

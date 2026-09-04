@@ -7,7 +7,7 @@ import org.junit.Test
 
 class WarmBufferReadinessPolicyTest {
     @Test
-    fun singleFrameRequirementsAreFormatAwareAndCentralized() {
+    fun singleFrameAdmissionRequiresExactlyOneCompletePairForEveryProductionFormat() {
         val yuv = WarmBufferReadinessPolicy.captureRoute(
             format = ImageFormat.YUV_420_888,
             captureMode = CaptureMode.SINGLE,
@@ -27,9 +27,16 @@ class WarmBufferReadinessPolicyTest {
             bufferCapacity = 6
         )
 
-        assertEquals(3, yuv.requiredCompleteFrames)
-        assertEquals(3, raw10.requiredCompleteFrames)
-        assertEquals(2, rawSensor.requiredCompleteFrames)
+        assertEquals(1, yuv.requiredCompleteFrames)
+        assertEquals(1, raw10.requiredCompleteFrames)
+        assertEquals(1, rawSensor.requiredCompleteFrames)
+    }
+
+    @Test
+    fun streamHealthStillUsesMultipleFramesIndependentlyFromShutterAdmission() {
+        assertEquals(3, WarmBufferReadinessPolicy.streamHealth(ImageFormat.YUV_420_888).requiredCompleteFrames)
+        assertEquals(3, WarmBufferReadinessPolicy.streamHealth(ImageFormat.RAW10).requiredCompleteFrames)
+        assertEquals(2, WarmBufferReadinessPolicy.streamHealth(ImageFormat.RAW_SENSOR).requiredCompleteFrames)
     }
 
     @Test

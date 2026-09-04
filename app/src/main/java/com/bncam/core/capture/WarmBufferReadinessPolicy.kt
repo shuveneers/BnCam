@@ -40,8 +40,12 @@ object WarmBufferReadinessPolicy {
         val capacity = bufferCapacity.coerceAtLeast(1)
         val required = when (captureMode) {
             CaptureMode.SINGLE,
-            CaptureMode.EXPERIMENTAL ->
-                streamHealth(format, capacity).requiredCompleteFrames
+            CaptureMode.EXPERIMENTAL -> {
+                // Shutter admission needs exactly one complete frame. Stream-health still keeps its
+                // own 2/3-frame requirement above, but a healthy Near-ZSL shutter must never wait
+                // for extra frames once one exact Image+metadata pair exists.
+                1
+            }
             CaptureMode.MULTI -> {
                 val routeMaximum =
                     FrameCapacityPolicy.maximumProcessingFrames(
