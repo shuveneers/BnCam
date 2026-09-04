@@ -333,7 +333,7 @@ object RawPreviewCadenceDiagnostics {
             appendLine("advertisedMinFrameDurationMs=${snapshot.advertisedMinFrameDurationNs / 1e6} requestedFpsRanges=$fpsRanges duplicateOffers=${snapshot.frames.sumOf { (it.offerCount - 1).coerceAtLeast(0) }} duplicateOffersRejected=${snapshot.duplicateOffersRejected}")
             appendLine("presentationFrameIntervalMeanMs=$presentationFrameIntervalMeanMs presentationFrameIntervalP95Ms=$presentationFrameIntervalP95Ms presentationFrameIntervalP99Ms=$presentationFrameIntervalP99Ms")
             appendLine("sensorToPresentLatencyP50Ms=$sensorToPresentLatencyP50Ms sensorToPresentLatencyP95Ms=$sensorToPresentLatencyP95Ms")
-            appendLine("droppedSourceFrames=$droppedSource droppedGpuBusyFrames=$droppedGpuBusy repeatedPresentedFrames=0 framesInFlight=3 maxQueueDepth=1")
+            appendLine("droppedSourceFrames=$droppedSource droppedGpuBusyFrames=$droppedGpuBusy repeatedPresentedFrames=0 framesInFlight=3 maxQueueDepth=2")
             appendLine(
                 "cpuVisibleRgbaHandoffBytes=$cpuVisibleRgbaHandoffBytes " +
                     "glFullFrameUploadBytes=$fullFrameGlUploadBytes " +

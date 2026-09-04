@@ -12,6 +12,7 @@ import kotlinx.coroutines.withTimeoutOrNull
 import java.io.Closeable
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.ArrayDeque
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledThreadPoolExecutor
@@ -178,8 +179,10 @@ class RawPreviewFrame internal constructor(
 }
 
 /**
- * One-pending-frame RAW viewfinder renderer. The input handle is an independently retained native
+ * Bounded-jitter RAW viewfinder renderer. The input handle is an independently retained native
  * AHardwareBuffer reference; neither this class nor native code owns the Image/ring-buffer handle.
+ * Two pending frames absorb Camera2 delivery jitter while overflow still drops the oldest queued
+ * request, so backlog can never grow without bound or silently trade cadence for latency.
  */
 class RawPreviewRenderer(
     private val onFrame: (RawPreviewFrame) -> Unit
@@ -195,7 +198,7 @@ class RawPreviewRenderer(
     )
 
     private val executor = ScheduledThreadPoolExecutor(1) { runnable ->
-        Thread(runnable, "BnCamRawPreview").apply { priority = Thread.NORM_PRIORITY - 1 }
+        Thread(runnable, "BnCamRawPreview").apply { priority = Thread.NORM_PRIORITY }
     }.apply {
         removeOnCancelPolicy = true
         setExecuteExistingDelayedTasksAfterShutdownPolicy(false)
@@ -204,7 +207,8 @@ class RawPreviewRenderer(
     private val backendWarmupExecutor = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "BnCamRawPreviewWarmup").apply { priority = Thread.NORM_PRIORITY }
     }
-    private val pendingRequest = AtomicReference<Request?>(null)
+    private val pendingRequestLock = Any()
+    private val pendingRequests = ArrayDeque<Request>(MAX_PENDING_REQUESTS)
     private val drainScheduled = AtomicBoolean(false)
     private val configRevision = AtomicLong(0L)
     private val backendPrepareScheduled = AtomicBoolean(false)
@@ -311,6 +315,44 @@ class RawPreviewRenderer(
 
     init {
         allOutputSlots.forEach(availableOutputSlots::offer)
+    }
+
+    private fun enqueuePendingRequest(request: Request) {
+        var stale: Request? = null
+        synchronized(pendingRequestLock) {
+            if (pendingRequests.size >= MAX_PENDING_REQUESTS) {
+                stale = pendingRequests.removeFirst()
+            }
+            pendingRequests.addLast(request)
+        }
+        stale?.let { dropped ->
+            droppedBusy++
+            exactFrameColorPairs.remove(dropped.sensorTimestampNs)
+            releaseRequest(dropped)
+        }
+    }
+
+    private fun pollPendingRequest(): Request? = synchronized(pendingRequestLock) {
+        pendingRequests.pollFirst()
+    }
+
+    private fun hasPendingRequest(): Boolean = synchronized(pendingRequestLock) {
+        pendingRequests.isNotEmpty()
+    }
+
+    private fun pendingRequestCount(): Int = synchronized(pendingRequestLock) {
+        pendingRequests.size
+    }
+
+    private fun clearPendingRequests() {
+        val stale = ArrayList<Request>(MAX_PENDING_REQUESTS)
+        synchronized(pendingRequestLock) {
+            while (pendingRequests.isNotEmpty()) stale.add(pendingRequests.removeFirst())
+        }
+        stale.forEach { request ->
+            exactFrameColorPairs.remove(request.sensorTimestampNs)
+            releaseRequest(request)
+        }
     }
 
     private fun ensureGpuFallbackScratchRgba(): ByteBuffer {
@@ -477,7 +519,7 @@ class RawPreviewRenderer(
             autoWhiteBalanceColorPair.set(null)
             configRevision.incrementAndGet()
             latestOfferedSensorTimestampNs.set(Long.MIN_VALUE)
-            pendingRequest.getAndSet(null)?.let(::releaseRequest)
+            clearPendingRequests()
             if (config == null || config.source == ViewfinderEffectiveSource.YUV) {
                 gpuFallbackScratchRgba = null
                 allOutputSlots.forEach(OutputSlot::releaseCpuBufferReferences)
@@ -557,11 +599,7 @@ class RawPreviewRenderer(
             sourceWidth = buffer.width,
             sourceHeight = buffer.height
         )
-        val replaced = pendingRequest.getAndSet(request)
-        replaced?.let { stale ->
-            droppedBusy++
-            releaseRequest(stale)
-        }
+        enqueuePendingRequest(request)
         scheduleDrain()
     }
 
@@ -575,14 +613,14 @@ class RawPreviewRenderer(
 
     private fun drainLatest() {
         if (closed) return
-        val request = pendingRequest.getAndSet(null) ?: return
+        val request = pollPendingRequest() ?: return
         reclaimCompletedGpuOutputSlots()
         val slot = availableOutputSlots.poll()
         if (slot == null) {
             droppedBusy++
             releaseRequest(request)
             logDiagnostics()
-            if (pendingRequest.get() != null) scheduleDrain()
+            if (hasPendingRequest()) scheduleDrain()
             return
         }
 
@@ -952,7 +990,7 @@ class RawPreviewRenderer(
                 slot.clearCpuRgbaBuffer()
                 availableOutputSlots.offer(slot)
             }
-            if (pendingRequest.get() != null) scheduleDrain()
+            if (hasPendingRequest()) scheduleDrain()
         }
     }
 
@@ -984,7 +1022,7 @@ class RawPreviewRenderer(
                 Log.e(TAG, "RAW_PREVIEW_GPU_OUTPUT_QUARANTINED slot=${slot.id} reason=gl_fence_unavailable")
             }
         }
-        if (pendingRequest.get() != null) scheduleDrain()
+        if (hasPendingRequest()) scheduleDrain()
     }
 
     private fun reclaimCompletedGpuOutputSlots() {
@@ -1121,7 +1159,7 @@ class RawPreviewRenderer(
                 "gpuOutputFailures=$gpuOutputFailures " +
                 "resolutionPolicy=FIXED_QUALITY max=${PREVIEW_MAX_WIDTH}x${PREVIEW_MAX_HEIGHT} " +
                 "renderEmaMs=$renderCostEmaMs glUploadEmaMs=$glUploadCostEmaMs " +
-                "RAW_PREVIEW_DROPPED_BUSY=$droppedBusy rendered=$rendered " +
+                "RAW_PREVIEW_DROPPED_BUSY=$droppedBusy pendingQueue=${pendingRequestCount()}/$MAX_PENDING_REQUESTS rendered=$rendered " +
                 "retainFailures=$retainFailures renderFailures=$renderFailures " +
                 "generation=${activeConfig?.pipelineGeneration ?: -1}"
         )
@@ -1154,7 +1192,7 @@ class RawPreviewRenderer(
         if (closed) return
         closed = true
         configRevision.incrementAndGet()
-        pendingRequest.getAndSet(null)?.let(::releaseRequest)
+        clearPendingRequests()
         executor.shutdownNow()
         backendWarmupExecutor.shutdownNow()
         gpuFallbackScratchRgba = null
@@ -1176,6 +1214,7 @@ class RawPreviewRenderer(
         const val PREVIEW_MAX_HEIGHT = RawPreviewResolutionPolicy.QUALITY_MAX_HEIGHT
         const val RGBA_BYTES_PER_PIXEL = 4
         const val OUTPUT_SLOT_COUNT = 3
+        const val MAX_PENDING_REQUESTS = 2
         const val MAX_OUTPUT_BYTES = PREVIEW_MAX_WIDTH * PREVIEW_MAX_HEIGHT * RGBA_BYTES_PER_PIXEL
         const val MAX_ANALYSIS_NV21_BYTES = ((PREVIEW_MAX_WIDTH / 4) * (PREVIEW_MAX_HEIGHT / 4) * 3) / 2
         const val DIAGNOSTIC_INTERVAL_MS = 2_000L
