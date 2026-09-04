@@ -835,18 +835,25 @@ vec3 applyLocalTone(uvec2 gid, vec3 exposedRgb) {
     return exposedRgb * exp2(appliedEv);
 }
 
-// Khronos PBR Neutral tone mapper. This is the sole automatic scene-to-display mapper on RAW.
-// FLLF has already performed scene-referred local tone placement in log2(Y); this function adds
-// no preceding global S-curve and contains no camera-colour look.
+// Shadow-neutral PBR Neutral display mapper. FLLF is the sole automatic owner of
+// scene-referred shadow placement. The canonical Khronos minimum-channel offset is therefore
+// suppressed below the highlight shoulder instead of acting as a second black/toe owner.
+// It fades back in only near the shoulder so the established highlight compression/desaturation
+// remains essentially unchanged. True scene black remains 0; no black lift or hidden EV is added.
 vec3 pbrNeutralToneMapping(vec3 color) {
     const float startCompression = 0.8 - 0.04;
     const float desaturation = 0.15;
+    const float shoulderPrepStart = 0.60;
     color = max(color, vec3(0.0));
+
+    float inputPeak = max(color.r, max(color.g, color.b));
     float x = min(color.r, min(color.g, color.b));
-    float offset = x < 0.08 ? x - 6.25 * x * x : 0.04;
-    color -= vec3(offset);
+    float canonicalOffset = x < 0.08 ? x - 6.25 * x * x : 0.04;
+    float shoulderPrepAuthority = smoothstep(shoulderPrepStart, startCompression, inputPeak);
+    color -= vec3(canonicalOffset * shoulderPrepAuthority);
+
     float peak = max(color.r, max(color.g, color.b));
-    if (peak < startCompression) return max(color, vec3(0.0));
+    if (peak < startCompression) return color;
     const float d = 1.0 - startCompression;
     float newPeak = 1.0 - d * d / (peak + d - startCompression);
     color *= newPeak / max(peak, 1.0e-8);

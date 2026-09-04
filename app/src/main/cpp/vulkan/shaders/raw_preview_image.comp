@@ -834,17 +834,24 @@ void recordDisplayAnalysis(uvec2 gid, vec3 displayRgb) {
     }
 }
 
-// Sole RAW preview scene-to-display mapper. The automatic local tone stage has already
-// operated on log2 luminance and reconstructed RGB with one scalar ratio.
+// Shadow-neutral RAW preview scene-to-display mapper. FLLF owns automatic shadow placement.
+// The canonical Khronos minimum-channel offset is suppressed below the highlight shoulder so it
+// cannot re-crush shadows after FLLF. It fades back in only near the shoulder to preserve the
+// established highlight compression/desaturation. True scene black remains 0; no hidden EV is added.
 vec3 pbrNeutralToneMapping(vec3 color) {
     const float startCompression = 0.76;
     const float desaturation = 0.15;
+    const float shoulderPrepStart = 0.60;
     color = max(color, vec3(0.0));
+
+    float inputPeak = max(color.r, max(color.g, color.b));
     float x = min(color.r, min(color.g, color.b));
-    float offset = x < 0.08 ? x - 6.25*x*x : 0.04;
-    color -= vec3(offset);
+    float canonicalOffset = x < 0.08 ? x - 6.25*x*x : 0.04;
+    float shoulderPrepAuthority = smoothstep(shoulderPrepStart, startCompression, inputPeak);
+    color -= vec3(canonicalOffset * shoulderPrepAuthority);
+
     float peak = max(color.r, max(color.g, color.b));
-    if (peak < startCompression) return max(color, vec3(0.0));
+    if (peak < startCompression) return color;
     const float d = 1.0 - startCompression;
     float newPeak = 1.0 - d*d/(peak + d - startCompression);
     color *= newPeak / max(peak,1.0e-8);
