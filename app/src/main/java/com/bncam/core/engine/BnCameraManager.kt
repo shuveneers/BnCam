@@ -48,6 +48,8 @@ import com.bncam.core.capture.DefaultRawShutterManualFallbackPolicy
 import com.bncam.core.capture.DefaultRawExposureRoute
 import com.bncam.core.capture.DefaultRawExposureRealizationTruth
 import com.bncam.core.capture.DefaultRawExposureRealizationEvaluator
+import com.bncam.core.capture.DefaultRawApi36AuthorityAction
+import com.bncam.core.capture.DefaultRawApi36AuthorityTracker
 import com.bncam.core.capture.RawMotionMeasurement
 import com.bncam.core.capture.RawPreviewMotionMeter
 import com.bncam.core.capture.WarmRawMotionSampler
@@ -988,6 +990,8 @@ class BnCameraManager(private val context: Context) {
 
     @Volatile
     private var lastDefaultRawExposureTruthLogKey: String = ""
+
+    private val defaultRawApi36AuthorityTracker = DefaultRawApi36AuthorityTracker()
 
     @Volatile
     private var defaultRawShutterFallbackPlan: DefaultRawManualFallbackPlan? = null
@@ -3285,6 +3289,35 @@ class BnCameraManager(private val context: Context) {
         }
     }
 
+    private fun restartDefaultRawAeReference(
+        reason: String,
+        preserveRealizationTruth: Boolean
+    ): Boolean {
+        if (!shouldRequestDefaultRawShutterMotionAnalysis()) return false
+        val retainedTruth = latestDefaultRawExposureTruth.takeIf { preserveRealizationTruth }
+        clearDefaultRawShutterPriorityState(resetMotion = false)
+        if (retainedTruth != null) latestDefaultRawExposureTruth = retainedTruth
+        defaultRawShutterAwaitingAeBaseline = true
+        defaultRawShutterBootstrapMinControlEpoch =
+            controlRequestEpochTracker.currentSubmittedEpoch() + 1L
+        Log.i(
+            tag,
+            "DEFAULT_RAW_AE_REFERENCE_RESTART reason=$reason generation=$pipelineGeneration " +
+                "minEpoch=$defaultRawShutterBootstrapMinControlEpoch"
+        )
+        return true
+    }
+
+    /**
+     * A metering-domain change invalidates the scene brightness reference used by default RAW
+     * shutter-priority. Reusing the pre-change ISO x exposure product can pin exposure time to a
+     * target from another AE region while Camera2 is already at an ISO bound, which presents as a
+     * full-frame exposure pulse/hunt. Keep motion evidence, but reacquire brightness truth from a
+     * fresh repeating Camera2-AE epoch before shutter-priority resumes.
+     */
+    private fun restartDefaultRawAeReferenceForMeteringChange(reason: String): Boolean =
+        restartDefaultRawAeReference(reason, preserveRealizationTruth = false)
+
     private fun updateDefaultRawExposureRealizationTruth(
         request: CaptureRequest,
         result: TotalCaptureResult,
@@ -3338,6 +3371,40 @@ class BnCameraManager(private val context: Context) {
                 Log.w(tag, "DEFAULT_RAW_EXPOSURE_REALIZATION ${truth.summary()}")
             } else {
                 Log.i(tag, "DEFAULT_RAW_EXPOSURE_REALIZATION ${truth.summary()}")
+            }
+        }
+
+        if (route == DefaultRawExposureRoute.API36_EXPOSURE_TIME_PRIORITY && generation == pipelineGeneration) {
+            val identity = synchronized(pipelineLock) { activePipelineIdentity }
+            val sensitivityCameraId = identity?.physicalCameraId ?: identity?.logicalCameraId ?: cameraDevice?.id
+            val minIso = sensitivityCameraId?.let { id ->
+                runCatching {
+                    cameraManager.getCameraCharacteristics(id)
+                        .get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)?.lower
+                }.getOrNull()
+            }
+            val decision = defaultRawApi36AuthorityTracker.observe(
+                currentGeneration = generation,
+                repeatingResult = snapshot.submissionType == CameraRequestSubmissionType.REPEATING,
+                realizationStatus = truth.status,
+                aeSearching = result.get(CaptureResult.CONTROL_AE_STATE) == CaptureResult.CONTROL_AE_STATE_SEARCHING,
+                actualIso = truth.actualIso,
+                minIso = minIso
+            )
+            if (decision.action != DefaultRawApi36AuthorityAction.KEEP_PRIORITY) {
+                Log.w(tag, "DEFAULT_RAW_API36_AUTHORITY ${decision.summary()}")
+                if (!defaultRawShutterAwaitingAeBaseline) {
+                    val reason = when (decision.action) {
+                        DefaultRawApi36AuthorityAction.REBOOTSTRAP_AE_REFERENCE ->
+                            "API36_AE_SEARCHING_AT_MIN_ISO"
+                        DefaultRawApi36AuthorityAction.REJECT_API36_PRIORITY ->
+                            "API36_PRIORITY_NOT_REALIZED"
+                        DefaultRawApi36AuthorityAction.KEEP_PRIORITY -> "API36_KEEP"
+                    }
+                    if (restartDefaultRawAeReference(reason, preserveRealizationTruth = true)) {
+                        backgroundHandler?.post { updatePreviewRepeatingRequest() }
+                    }
+                }
             }
         }
     }
@@ -10364,6 +10431,7 @@ class BnCameraManager(private val context: Context) {
             clearTouchAeOverride()
             Log.i(tag, "Metering Style updated to: $currentMeteringStyle")
             enqueuePreviewControl("preview_policy", "SET_METERING_STYLE") {
+                restartDefaultRawAeReferenceForMeteringChange("METERING_STYLE_CHANGED")
                 Log.i(tag, "Metering updated in-place for active generation=$pipelineGeneration.")
                 updatePreviewRepeatingRequest()
             }
@@ -11290,13 +11358,19 @@ class BnCameraManager(private val context: Context) {
                     builder.set(CaptureRequest.SENSOR_SENSITIVITY, null)
                     builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, null)
                     builder.set(CaptureRequest.SENSOR_FRAME_DURATION, null)
+                    val bootstrapPrioritySupported = supportsExposureTimePriority(characteristics)
+                    val bootstrapPriorityAllowed = bootstrapPrioritySupported &&
+                        defaultRawApi36AuthorityTracker.isAllowed(pipelineGeneration)
                     lastExposurePlanSummary =
-                        "defaultRawPriority=true;priorityModeSupported=${supportsExposureTimePriority(characteristics)};" +
-                            defaultRawPlan.summary()
+                        "defaultRawPriority=true;priorityModeSupported=$bootstrapPrioritySupported;" +
+                            "priorityModeAllowed=$bootstrapPriorityAllowed;" + defaultRawPlan.summary()
                     return
                 }
 
-                if (supportsExposureTimePriority(characteristics)) {
+                val priorityModeSupported = supportsExposureTimePriority(characteristics)
+                val priorityModeAllowed = priorityModeSupported &&
+                    defaultRawApi36AuthorityTracker.isAllowed(pipelineGeneration)
+                if (priorityModeAllowed) {
                     defaultRawShutterManualFallbackActive = false
                     defaultRawShutterFallbackTargetLuma = null
                     defaultRawShutterFallbackPlan = null
@@ -11322,8 +11396,8 @@ class BnCameraManager(private val context: Context) {
                     builder.set(CaptureRequest.SENSOR_SENSITIVITY, null)
                     builder.set(CaptureRequest.SENSOR_FRAME_DURATION, null)
                     lastExposurePlanSummary =
-                        "defaultRawPriority=true;priorityModeSupported=true;priorityModeRequested=EXPOSURE_TIME;" +
-                            defaultRawPlan.summary()
+                        "defaultRawPriority=true;priorityModeSupported=true;priorityModeAllowed=true;" +
+                            "priorityModeRequested=EXPOSURE_TIME;" + defaultRawPlan.summary()
                     Log.d(tag, "Camera2 default RAW shutter-priority $lastExposurePlanSummary")
                     return
                 }
@@ -11349,7 +11423,8 @@ class BnCameraManager(private val context: Context) {
                     builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, null)
                     builder.set(CaptureRequest.SENSOR_FRAME_DURATION, null)
                     lastExposurePlanSummary =
-                        "defaultRawPriority=true;priorityModeSupported=false;fallback=AE_LUMA_ANCHOR_BOOTSTRAP;" +
+                        "defaultRawPriority=true;priorityModeSupported=$priorityModeSupported;" +
+                            "priorityModeAllowed=$priorityModeAllowed;fallback=AE_LUMA_ANCHOR_BOOTSTRAP;" +
                             defaultRawPlan.summary()
                     return
                 }
@@ -11387,7 +11462,8 @@ class BnCameraManager(private val context: Context) {
                     builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, null)
                     builder.set(CaptureRequest.SENSOR_FRAME_DURATION, null)
                     lastExposurePlanSummary =
-                        "defaultRawPriority=true;priorityModeSupported=false;fallback=INVALID_FALLBACK_PLAN"
+                        "defaultRawPriority=true;priorityModeSupported=$priorityModeSupported;" +
+                            "priorityModeAllowed=$priorityModeAllowed;fallback=INVALID_FALLBACK_PLAN"
                     return
                 }
 
@@ -11405,7 +11481,8 @@ class BnCameraManager(private val context: Context) {
                 builder.set(CaptureRequest.SENSOR_SENSITIVITY, fallbackPlan.sensitivityIso)
                 builder.set(CaptureRequest.SENSOR_FRAME_DURATION, fallbackPlan.frameDurationNs)
                 lastExposurePlanSummary =
-                    "defaultRawPriority=true;priorityModeSupported=false;${fallbackPlan.summary()};" +
+                    "defaultRawPriority=true;priorityModeSupported=$priorityModeSupported;" +
+                        "priorityModeAllowed=$priorityModeAllowed;${fallbackPlan.summary()};" +
                         defaultRawPlan.summary()
                 Log.d(tag, "Camera2 default RAW shutter manual fallback $lastExposurePlanSummary")
                 return
@@ -11735,6 +11812,7 @@ class BnCameraManager(private val context: Context) {
             pointLockJob = null
             transitionFocusOwner(FocusOwner.AUTO, if (preserveAeState) "tap_timeout" else "configured_af_restore")
 
+            val retiringTouchAeOverride = !preserveAeState && activeTapAeRegion != null
             if (!preserveAeState) {
                 clearTouchAeOverride()
             }
@@ -11766,6 +11844,9 @@ class BnCameraManager(private val context: Context) {
                 request.set(CaptureRequest.CONTROL_AE_LOCK, false)
                 isTorchActive = false
                 applyMeteringPolicy(request)
+                if (retiringTouchAeOverride) {
+                    restartDefaultRawAeReferenceForMeteringChange("TOUCH_AE_REGION_RETIRED")
+                }
                 applyExposurePolicy(request)
             }
 
@@ -12078,6 +12159,12 @@ class BnCameraManager(private val context: Context) {
                     activeTapAeRegion = appliedAeRegion
                     activeTapAePhysicalCameraId = null
                     request.set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(appliedAeRegion))
+                }
+                if (restartDefaultRawAeReferenceForMeteringChange("TOUCH_AE_REGION_APPLIED")) {
+                    // Remove the old shutter-priority request before starting tap AE. The new
+                    // touch region must first converge under ordinary Camera2 AE; only that fresh
+                    // repeating epoch may become the next shutter-priority brightness reference.
+                    applyExposurePolicy(request)
                 }
             } else {
                 clearTouchAeOverride()
@@ -15727,6 +15814,7 @@ class BnCameraManager(private val context: Context) {
             "defaultRawRequestedIso" to latestDefaultRawExposureTruth?.requestedIso,
             "defaultRawActualIso" to latestDefaultRawExposureTruth?.actualIso,
             "defaultRawExposureTruthStatus" to latestDefaultRawExposureTruth?.status,
+            "defaultRawApi36PriorityAllowed" to defaultRawApi36AuthorityTracker.isAllowed(pipelineGeneration),
             "defaultRawFrameSelectionExposureConstraint" to
                 ringBuffer.selectionExposureConstraintSnapshot().summary(),
             "resolvedAntibandingMode" to activeResolvedAntibandingMode,
