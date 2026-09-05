@@ -3,8 +3,15 @@ package com.bncam.core.capture
 /**
  * Runtime trust gate for Camera2 API-36 exposure-time-priority on the default RAW repeating route.
  *
- * Advertising the capability is only static evidence. This tracker consumes request/result truth
- * from repeating frames and separates two failure classes:
+ * Exposure-time priority deliberately leaves SENSOR_SENSITIVITY to Camera2 AE. That is useful when
+ * shutter ownership alone is sufficient, but it cannot guarantee BnCam's low-gain acquisition
+ * policy. The default RAW production route therefore keeps this optional authority disabled and
+ * uses the existing adaptive AE-OFF manual feedback path after Camera2 AE bootstrap, where BnCam
+ * owns both shutter and ISO. The tracker remains available for explicit capability experiments by
+ * constructing it with [priorityEnabled] = true.
+ *
+ * When enabled, advertising the capability is only static evidence. This tracker consumes
+ * request/result truth from repeating frames and separates two failure classes:
  * 1) the requested priority/shutter is not realized -> reject this API route for the generation;
  * 2) the shutter is realized, but AE remains SEARCHING at minimum ISO -> the brightness reference
  *    is no longer solvable at that shutter, so reacquire a fresh ordinary-AE reference.
@@ -30,7 +37,8 @@ data class DefaultRawApi36AuthorityDecision(
 
 class DefaultRawApi36AuthorityTracker(
     private val realizationFailureThreshold: Int = 3,
-    private val minIsoSearchingThreshold: Int = 3
+    private val minIsoSearchingThreshold: Int = 3,
+    private val priorityEnabled: Boolean = false
 ) {
     private var generation: Int = -1
     private var realizationFailures: Int = 0
@@ -40,7 +48,7 @@ class DefaultRawApi36AuthorityTracker(
     @Synchronized
     fun isAllowed(currentGeneration: Int): Boolean {
         ensureGeneration(currentGeneration)
-        return !rejected
+        return priorityEnabled && !rejected
     }
 
     @Synchronized
@@ -61,8 +69,22 @@ class DefaultRawApi36AuthorityTracker(
         minIso: Int?
     ): DefaultRawApi36AuthorityDecision {
         ensureGeneration(currentGeneration)
+
+        // Keep observation side-effect free when production deliberately uses deterministic
+        // AE-OFF sensor control. Returning KEEP prevents a stale/non-API36 result from triggering a
+        // rebootstrap loop, while api36Allowed remains false in diagnostics.
+        if (!priorityEnabled) {
+            return decision(
+                DefaultRawApi36AuthorityAction.KEEP_PRIORITY,
+                "api36_exposure_time_priority_disabled_for_deterministic_iso_ownership"
+            )
+        }
+
         if (rejected) {
-            return decision(DefaultRawApi36AuthorityAction.REJECT_API36_PRIORITY, "already_rejected_for_generation")
+            return decision(
+                DefaultRawApi36AuthorityAction.REJECT_API36_PRIORITY,
+                "already_rejected_for_generation"
+            )
         }
         if (!repeatingResult) {
             return decision(DefaultRawApi36AuthorityAction.KEEP_PRIORITY, "non_repeating_result_ignored")
@@ -116,7 +138,7 @@ class DefaultRawApi36AuthorityTracker(
             generation = generation,
             consecutiveRealizationFailures = realizationFailures,
             consecutiveMinIsoSearchingFrames = minIsoSearchingFrames,
-            api36Allowed = !rejected,
+            api36Allowed = priorityEnabled && !rejected,
             reason = reason
         )
 }

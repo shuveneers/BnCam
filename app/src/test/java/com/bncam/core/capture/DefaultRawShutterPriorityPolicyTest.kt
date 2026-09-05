@@ -4,7 +4,6 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
-import kotlin.math.pow
 
 class DefaultRawShutterPriorityPolicyTest {
     private val bounds = ExposureBounds(
@@ -15,7 +14,7 @@ class DefaultRawShutterPriorityPolicyTest {
     )
 
     @Test
-    fun `static scene lengthens shutter gradually before lowering iso further`() {
+    fun `static scene immediately uses longest safe shutter to reduce gain`() {
         val plan = DefaultRawShutterPriorityPolicy.resolve(
             measuredIso = 1_600,
             measuredExposureNs = 40_000_000L,
@@ -27,15 +26,15 @@ class DefaultRawShutterPriorityPolicyTest {
             )
         )
 
-        val expectedExposure = (40_000_000.0 * 2.0.pow(0.25)).toLong()
         assertTrue(plan.ready)
-        assertEquals(expectedExposure, plan.targetExposureNs)
-        assertEquals(1_346, plan.expectedIso)
-        assertEquals("AE_TRANSITION_RELEASE_RATE", plan.limitingConstraint)
+        assertEquals(100_000_000L, plan.targetExposureNs)
+        assertEquals(640, plan.expectedIso)
+        assertEquals("CAMERA_MOTION", plan.limitingConstraint)
+        assertEquals("photon_first_longest_safe_shutter_minimizes_gain", plan.reason)
     }
 
     @Test
-    fun `moving scene shortens shutter immediately and lets iso absorb requirement`() {
+    fun `moving scene still shortens shutter immediately and lets iso absorb requirement`() {
         val plan = DefaultRawShutterPriorityPolicy.resolve(
             measuredIso = 1_600,
             measuredExposureNs = 40_000_000L,
@@ -54,7 +53,7 @@ class DefaultRawShutterPriorityPolicyTest {
     }
 
     @Test
-    fun `minimum iso target is approached gradually instead of one exposure jump`() {
+    fun `minimum iso is reached directly when safe shutter permits it`() {
         val plan = DefaultRawShutterPriorityPolicy.resolve(
             measuredIso = 100,
             measuredExposureNs = 20_000_000L,
@@ -65,15 +64,14 @@ class DefaultRawShutterPriorityPolicyTest {
             )
         )
 
-        val expectedExposure = (20_000_000.0 * 2.0.pow(0.25)).toLong()
         assertTrue(plan.ready)
-        assertEquals(expectedExposure, plan.targetExposureNs)
-        assertEquals(85, plan.expectedIso)
-        assertEquals("AE_TRANSITION_RELEASE_RATE", plan.limitingConstraint)
+        assertEquals(40_000_000L, plan.targetExposureNs)
+        assertEquals(50, plan.expectedIso)
+        assertEquals("MIN_ISO", plan.limitingConstraint)
     }
 
     @Test
-    fun `lens fallback alone cannot activate default strategy`() {
+    fun `lens fallback alone cannot activate default strategy unless explicitly allowed`() {
         val plan = DefaultRawShutterPriorityPolicy.resolve(
             measuredIso = 1_600,
             measuredExposureNs = 40_000_000L,
@@ -89,7 +87,7 @@ class DefaultRawShutterPriorityPolicyTest {
     }
 
     @Test
-    fun `stream cadence extension is approached gradually`() {
+    fun `ae fps lower bound does not cap manual low light shutter`() {
         val plan = DefaultRawShutterPriorityPolicy.resolve(
             measuredIso = 2_000,
             measuredExposureNs = 25_000_000L,
@@ -101,33 +99,95 @@ class DefaultRawShutterPriorityPolicyTest {
             )
         )
 
-        val expectedExposure = (25_000_000.0 * 2.0.pow(0.25)).toLong()
         assertTrue(plan.ready)
-        assertEquals(expectedExposure, plan.targetExposureNs)
-        assertEquals(1_682, plan.expectedIso)
-        assertEquals("AE_TRANSITION_RELEASE_RATE", plan.limitingConstraint)
+        assertEquals(90_000_000L, plan.targetExposureNs)
+        assertEquals(556, plan.expectedIso)
+        assertEquals("SCENE_MOTION", plan.limitingConstraint)
     }
 
     @Test
-    fun `lens fallback with allowLensStabilityFallback activates default strategy`() {
+    fun `lens fallback with allow flag supplies calm wide angle shutter when motion is unavailable`() {
         val plan = DefaultRawShutterPriorityPolicy.resolve(
             measuredIso = 1_600,
-            measuredExposureNs = 40_000_000L,
+            measuredExposureNs = 10_000_000L,
             bounds = bounds,
             ceilings = RawShutterSafetyCeilings(
                 streamCadenceNs = 80_000_000L,
-                lensStabilityNs = 50_000_000L,
+                lensStabilityNs = 42_000_000L,
                 allowLensStabilityFallback = true
             )
         )
 
         assertTrue(plan.ready)
-        assertTrue(plan.targetExposureNs != null)
-        assertTrue(plan.targetExposureNs!! in bounds.minExposureNs..50_000_000L)
+        assertEquals(42_000_000L, plan.targetExposureNs)
+        assertEquals(381, plan.expectedIso)
+        assertEquals("LENS_STABILITY_FALLBACK", plan.limitingConstraint)
     }
 
     @Test
-    fun `raw near clip reduces target product and exposure time`() {
+    fun `measured motion replaces lens heuristic instead of being capped by it`() {
+        val plan = DefaultRawShutterPriorityPolicy.resolve(
+            measuredIso = 2_000,
+            measuredExposureNs = 10_000_000L,
+            bounds = bounds,
+            ceilings = RawShutterSafetyCeilings(
+                cameraMotionNs = 40_000_000L,
+                sceneMotionNs = 50_000_000L,
+                streamCadenceNs = 60_000_000L,
+                lensStabilityNs = 10_000_000L,
+                allowLensStabilityFallback = true
+            )
+        )
+
+        assertTrue(plan.ready)
+        assertEquals(40_000_000L, plan.targetExposureNs)
+        assertEquals(500, plan.expectedIso)
+        assertEquals("CAMERA_MOTION", plan.limitingConstraint)
+    }
+
+    @Test
+    fun `ten millisecond bootstrap is not permanently pinned to first release step`() {
+        val plan = DefaultRawShutterPriorityPolicy.resolve(
+            measuredIso = 8_000,
+            measuredExposureNs = 10_000_000L,
+            bounds = bounds,
+            ceilings = RawShutterSafetyCeilings(
+                cameraMotionNs = 50_000_000L,
+                sceneMotionNs = 60_000_000L,
+                streamCadenceNs = 60_000_000L
+            )
+        )
+
+        assertTrue(plan.ready)
+        assertEquals(50_000_000L, plan.targetExposureNs)
+        assertEquals(1_600, plan.expectedIso)
+    }
+
+    @Test
+    fun `50hz photon first allocation selects longest complete light period below ceiling`() {
+        val plan = DefaultRawShutterPriorityPolicy.resolve(
+            measuredIso = 8_000,
+            measuredExposureNs = 10_000_000L,
+            bounds = bounds,
+            ceilings = RawShutterSafetyCeilings(
+                cameraMotionNs = 47_000_000L,
+                sceneMotionNs = 60_000_000L,
+                streamCadenceNs = 60_000_000L
+            ),
+            flickerConstraint = RawFlickerConstraint(
+                frequency = RawFlickerFrequency.HZ_50,
+                source = "TEST"
+            )
+        )
+
+        assertTrue(plan.ready)
+        assertEquals(40_000_000L, plan.targetExposureNs)
+        assertEquals(2_000, plan.expectedIso)
+        assertTrue(plan.limitingConstraint.startsWith("FLICKER_HZ_50"))
+    }
+
+    @Test
+    fun `raw near clip reduces target product and expected gain`() {
         val normalPlan = DefaultRawShutterPriorityPolicy.resolve(
             measuredIso = 1_600,
             measuredExposureNs = 40_000_000L,
@@ -149,5 +209,6 @@ class DefaultRawShutterPriorityPolicyTest {
             rawNearClipFraction = 0.05f
         )
         assertTrue(ettrPlan.referenceExposureProduct!! < normalPlan.referenceExposureProduct!!)
+        assertTrue(ettrPlan.expectedIso!! < normalPlan.expectedIso!!)
     }
 }

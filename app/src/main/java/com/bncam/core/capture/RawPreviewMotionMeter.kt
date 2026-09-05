@@ -12,6 +12,11 @@ import kotlin.math.sqrt
  * frame). A pyramidal/CNN optical-flow stack would be excessive for a repeating control loop;
  * this implementation uses Lucas-Kanade normal equations globally and in a small block grid.
  * Direction is discarded after solving because acquisition only needs predicted blur magnitude.
+ *
+ * Exposure authority deliberately requires stronger evidence than flow estimation itself. In low
+ * light, sensor noise can still produce a mathematically solvable but weak optical-flow result. Such
+ * weak flow is useful diagnostically, but it must not force the shutter down to 1/100 s and make the
+ * sensor pay the brightness difference with high gain.
  */
 data class RawMotionMeasurement(
     val ready: Boolean,
@@ -33,11 +38,26 @@ data class RawMotionMeasurement(
 
 class RawPreviewMotionMeter(
     private val maxAnalysisDimension: Int = 160,
-    /** Blur budget is expressed in full-resolution output pixels, not downsampled analysis pixels. */
+    /** Legacy/default subject blur budget retained for source compatibility. */
     private val allowedBlurPixels: Float = 2.0f,
+    // Keep the original positional constructor order intact. New policy knobs are appended below.
     private val blockColumns: Int = 4,
-    private val blockRows: Int = 3
+    private val blockRows: Int = 3,
+    /**
+     * Camera shake gets a computational-photography blur budget. By default it is twice the subject
+     * budget (4 full-resolution px): in low light, trading a small amount of global camera-motion
+     * blur for 1-2 EV more photons is preferable to extreme ISO gain.
+     */
+    private val cameraBlurBudgetPixels: Float = allowedBlurPixels * 2.0f,
+    /** Real subject motion remains stricter because it cannot be removed by OIS or global alignment. */
+    private val sceneBlurBudgetPixels: Float = allowedBlurPixels,
+    /** Flow may be estimated below this, but only stronger evidence may constrain exposure. */
+    private val exposureAuthorityMinConfidence: Float = 0.18f
 ) {
+    companion object {
+        private const val FLOW_MIN_CONFIDENCE = 0.08f
+    }
+
     private data class Sample(
         val luma: FloatArray,
         val width: Int,
@@ -122,8 +142,10 @@ class RawPreviewMotionMeter(
             return unavailable("invalid_temporal_interval", dtNs)
         }
 
-        val global = solveFlow(prior.luma, current.luma, current.width, current.height, 1, 1,
-            current.width - 1, current.height - 1)
+        val global = solveFlow(
+            prior.luma, current.luma, current.width, current.height,
+            1, 1, current.width - 1, current.height - 1
+        )
         val blockFlows = ArrayList<Flow>(blockColumns * blockRows)
         val blockWidth = max(6, current.width / blockColumns)
         val blockHeight = max(6, current.height / blockRows)
@@ -134,14 +156,16 @@ class RawPreviewMotionMeter(
                 val right = min(current.width - 1, max(left + 2, (bx + 1) * current.width / blockColumns))
                 val bottom = min(current.height - 1, max(top + 2, (by + 1) * current.height / blockRows))
                 if (right - left >= blockWidth / 2 && bottom - top >= blockHeight / 2) {
-                    val flow = solveFlow(prior.luma, current.luma, current.width, current.height,
-                        left, top, right, bottom)
-                    if (flow.confidence >= 0.08f) blockFlows += flow
+                    val flow = solveFlow(
+                        prior.luma, current.luma, current.width, current.height,
+                        left, top, right, bottom
+                    )
+                    if (flow.confidence >= FLOW_MIN_CONFIDENCE) blockFlows += flow
                 }
             }
         }
 
-        if (global.confidence < 0.08f && blockFlows.size < 3) {
+        if (global.confidence < FLOW_MIN_CONFIDENCE && blockFlows.size < 3) {
             return RawMotionMeasurement(
                 ready = false,
                 cameraMotionPxPerSecond = 0f,
@@ -160,9 +184,11 @@ class RawPreviewMotionMeter(
         val scaleY = current.fullHeight.toFloat() / current.height.toFloat()
         val cameraDxFull = global.u * scaleX
         val cameraDyFull = global.v * scaleY
-        val cameraSpeed = if (global.confidence >= 0.08f) {
+        val cameraSpeed = if (global.confidence >= FLOW_MIN_CONFIDENCE) {
             (sqrt(cameraDxFull * cameraDxFull + cameraDyFull * cameraDyFull) / dtSeconds).toFloat()
-        } else 0f
+        } else {
+            0f
+        }
 
         val residualSpeeds = blockFlows.map { block ->
             val du = (block.u - global.u) * scaleX
@@ -173,17 +199,36 @@ class RawPreviewMotionMeter(
             // Upper percentile reacts to a moving subject without letting one unstable block own the result.
             val index = ((residualSpeeds.size - 1) * 0.80f).toInt().coerceIn(0, residualSpeeds.lastIndex)
             residualSpeeds[index]
-        } else 0f
-        val sceneConfidence = if (blockFlows.isEmpty()) 0f else
+        } else {
+            0f
+        }
+        val sceneConfidence = if (blockFlows.isEmpty()) {
+            0f
+        } else {
             (blockFlows.map { it.confidence }.average().toFloat() *
                 (blockFlows.size.toFloat() / (blockColumns * blockRows).toFloat())).coerceIn(0f, 1f)
+        }
 
         filteredCameraSpeed = asymmetricMotionFilter(filteredCameraSpeed, cameraSpeed)
         filteredSceneSpeed = asymmetricMotionFilter(filteredSceneSpeed, sceneSpeed)
 
-        val cameraCeiling = exposureCeilingNs(filteredCameraSpeed, global.confidence)
-        val sceneCeiling = exposureCeilingNs(filteredSceneSpeed, sceneConfidence)
+        val cameraCeiling = exposureCeilingNs(
+            filteredCameraSpeed,
+            global.confidence,
+            cameraBlurBudgetPixels
+        )
+        val sceneCeiling = exposureCeilingNs(
+            filteredSceneSpeed,
+            sceneConfidence,
+            sceneBlurBudgetPixels
+        )
         val ready = cameraCeiling != null || sceneCeiling != null
+        val reason = when {
+            ready -> "compact_luma_motion_meter_photon_first"
+            global.confidence >= FLOW_MIN_CONFIDENCE || sceneConfidence >= FLOW_MIN_CONFIDENCE ->
+                "flow_detected_below_exposure_authority_confidence"
+            else -> "motion_confidence_below_threshold"
+        }
         return RawMotionMeasurement(
             ready = ready,
             cameraMotionPxPerSecond = filteredCameraSpeed,
@@ -193,7 +238,7 @@ class RawPreviewMotionMeter(
             cameraExposureCeilingNs = cameraCeiling,
             sceneExposureCeilingNs = sceneCeiling,
             sampleIntervalNs = dtNs,
-            reason = if (ready) "compact_luma_motion_meter" else "motion_confidence_below_threshold"
+            reason = reason
         )
     }
 
@@ -301,10 +346,18 @@ class RawPreviewMotionMeter(
         return (0.80f * previous + 0.20f * current).coerceAtLeast(0f)
     }
 
-    private fun exposureCeilingNs(speedPxPerSecond: Float, confidence: Float): Long? {
-        if (!speedPxPerSecond.isFinite() || speedPxPerSecond < 0f || confidence < 0.08f) return null
+    private fun exposureCeilingNs(
+        speedPxPerSecond: Float,
+        confidence: Float,
+        blurBudgetPixels: Float
+    ): Long? {
+        if (!speedPxPerSecond.isFinite() || speedPxPerSecond < 0f ||
+            !confidence.isFinite() || confidence < exposureAuthorityMinConfidence
+        ) {
+            return null
+        }
         if (speedPxPerSecond < 0.25f) return 1_000_000_000L
-        val seconds = allowedBlurPixels.coerceIn(0.5f, 8f) / speedPxPerSecond
+        val seconds = blurBudgetPixels.coerceIn(0.5f, 8f) / speedPxPerSecond
         return (seconds * 1_000_000_000.0).toLong().coerceIn(1_000_000L, 1_000_000_000L)
     }
 

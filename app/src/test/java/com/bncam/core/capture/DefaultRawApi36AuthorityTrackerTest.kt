@@ -7,8 +7,29 @@ import org.junit.Test
 
 class DefaultRawApi36AuthorityTrackerTest {
     @Test
-    fun `realized shutter searching at minimum iso reboots reference after stable evidence`() {
+    fun `production default rejects api36 exposure time priority so bncam owns iso`() {
         val tracker = DefaultRawApi36AuthorityTracker()
+        assertFalse(tracker.isAllowed(1))
+
+        val observation = tracker.observe(
+            currentGeneration = 1,
+            repeatingResult = true,
+            realizationStatus = "API36_EXPOSURE_REALIZED",
+            aeSearching = false,
+            actualIso = 400,
+            minIso = 100
+        )
+        assertEquals(DefaultRawApi36AuthorityAction.KEEP_PRIORITY, observation.action)
+        assertFalse(observation.api36Allowed)
+        assertEquals(
+            "api36_exposure_time_priority_disabled_for_deterministic_iso_ownership",
+            observation.reason
+        )
+    }
+
+    @Test
+    fun `explicit api36 trial can still reboot reference after minimum iso search`() {
+        val tracker = DefaultRawApi36AuthorityTracker(priorityEnabled = true)
 
         repeat(2) {
             val decision = tracker.observe(
@@ -28,8 +49,8 @@ class DefaultRawApi36AuthorityTrackerTest {
     }
 
     @Test
-    fun `converged frame clears minimum iso searching evidence`() {
-        val tracker = DefaultRawApi36AuthorityTracker()
+    fun `explicit api36 trial clears minimum iso evidence after convergence`() {
+        val tracker = DefaultRawApi36AuthorityTracker(priorityEnabled = true)
         tracker.observe(3, true, "API36_EXPOSURE_REALIZED", true, 100, 100)
         tracker.observe(3, true, "API36_EXPOSURE_REALIZED", true, 100, 100)
 
@@ -39,8 +60,8 @@ class DefaultRawApi36AuthorityTrackerTest {
     }
 
     @Test
-    fun `repeated priority realization failure rejects api36 for the generation`() {
-        val tracker = DefaultRawApi36AuthorityTracker()
+    fun `repeated priority realization failure rejects explicit api36 trial`() {
+        val tracker = DefaultRawApi36AuthorityTracker(priorityEnabled = true)
         repeat(2) {
             val decision = tracker.observe(
                 9, true, "API36_EXPOSURE_NOT_REALIZED_SHORT", false, 400, 100
@@ -55,16 +76,22 @@ class DefaultRawApi36AuthorityTrackerTest {
     }
 
     @Test
-    fun `new pipeline generation gets a fresh capability trial`() {
-        val tracker = DefaultRawApi36AuthorityTracker(realizationFailureThreshold = 1)
+    fun `new pipeline generation gets fresh capability trial when explicitly enabled`() {
+        val tracker = DefaultRawApi36AuthorityTracker(
+            realizationFailureThreshold = 1,
+            priorityEnabled = true
+        )
         tracker.observe(4, true, "API36_PRIORITY_MODE_MISMATCH", false, 400, 100)
         assertFalse(tracker.isAllowed(4))
         assertTrue(tracker.isAllowed(5))
     }
 
     @Test
-    fun `one shot results cannot poison repeating route trust`() {
-        val tracker = DefaultRawApi36AuthorityTracker(realizationFailureThreshold = 1)
+    fun `one shot results cannot poison explicit repeating route trust`() {
+        val tracker = DefaultRawApi36AuthorityTracker(
+            realizationFailureThreshold = 1,
+            priorityEnabled = true
+        )
         val decision = tracker.observe(
             2, false, "API36_EXPOSURE_NOT_REALIZED_SHORT", true, 100, 100
         )
