@@ -9,7 +9,7 @@ class Phase1CaptureStabilityRecoveryTest {
     private val bounds = ExposureBounds(50, 12_800, 100_000L, 250_000_000L)
 
     @Test
-    fun `50hz quantization does not turn 14 point 9ms into 10ms`() {
+    fun `50hz quantization snaps 14 point 9ms to strict 10ms flicker period`() {
         val plan = DefaultRawShutterPriorityPolicy.resolve(
             measuredIso = 3200,
             measuredExposureNs = 20_000_000L,
@@ -22,8 +22,8 @@ class Phase1CaptureStabilityRecoveryTest {
             flickerConstraint = RawFlickerConstraint(RawFlickerFrequency.HZ_50, "TEST")
         )
         assertTrue(plan.ready)
-        assertEquals(14_920_000L, plan.targetExposureNs)
-        assertEquals("flicker_snap_skipped_to_avoid_large_exposure_step", plan.reason)
+        assertEquals(10_000_000L, plan.targetExposureNs)
+        assertEquals("strict_flicker_safe_shutter_iso_preserves_exposure_product", plan.reason)
     }
 
     @Test

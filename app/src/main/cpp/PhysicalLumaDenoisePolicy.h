@@ -65,11 +65,11 @@ inline ResidualLumaPlan resolveResidualLumaPlan(
     // very small baseline at pressure zero and open authority monotonically with propagated
     // residual noise. The resident shader makes the final local noise-vs-structure decision.
     const float confidenceScale = 0.72f + 0.28f * confidence;
-    const float pressureFraction = 0.08f + 0.70f * plan.residualNoisePressure;
+    const float pressureFraction = 0.18f + 0.76f * plan.residualNoisePressure;
     plan.baselineFraction = std::clamp(
             pressureFraction * confidenceScale,
-            0.05f,
-            0.78f);
+            0.15f,
+            0.85f);
 
     plan.targetSigma = std::clamp(
             sigma * plan.baselineFraction,

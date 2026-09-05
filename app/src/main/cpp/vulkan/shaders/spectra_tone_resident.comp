@@ -141,13 +141,34 @@ vec3 applyExplicitProfileToneContrast(vec3 rgb) {
 
 vec3 applyProfileColor(vec3 rgb) {
     float y = max(0.0, lumaOf(rgb));
-    // Calibrated camera colour is owned upstream. This stage contains only explicit
-    // user colour controls and therefore runs after all automatic tone placement.
+    float maximum = max(rgb.r, max(rgb.g, rgb.b));
+    float minimum = min(rgb.r, min(rgb.g, rgb.b));
+    float saturation = maximum > 1.0e-5 ? (maximum - minimum) / maximum : 0.0;
+
+    // Perceptual Midtone Chromaticity Adaptation (Hunt Effect & Display Gamut compensation):
+    // Scene-referred tone compression (PBR Neutral display mapper) reduces perceived color contrast in midtones.
+    // In RAW streams (RAW10 / RAW_SENSOR), the linear sRGB output from CCM lacks the HAL's native display saturation boost.
+    // We adaptively scale chromaticity proportional to luminance and saturation headroom:
+    // - Shadows below y = 0.008 (sensor black/noise floor) are gated to 0 to prevent amplifying color noise.
+    // - Natural color support reaches full strength at y = 0.07.
+    // - Specular highlights (y > 0.72) roll off cleanly into white at y = 0.98.
+    // - Saturated colors are naturally protected (1.0 - saturation) to prevent clipping or neon shifts.
+    float toneLumaWeight = smoothstep(0.008, 0.07, y) * (1.0 - smoothstep(0.72, 0.98, y));
+    if (pc.isRawBayer != 0u) {
+        float saturationProtection = 1.0 - 0.45 * saturation;
+        float adaptiveSaturationBoost = 0.28 * toneLumaWeight * saturationProtection;
+        float adaptiveVibranceBoost = 0.14 * toneLumaWeight * (1.0 - 0.70 * saturation);
+        float totalColorGain = 1.0 + adaptiveSaturationBoost + adaptiveVibranceBoost;
+        rgb = vec3(y) + (rgb - vec3(y)) * totalColorGain;
+    } else {
+        float midtoneWeight = smoothstep(0.04, 0.22, y) * (1.0 - smoothstep(0.68, 0.98, y));
+        float adaptiveVibranceLift = 0.125 * midtoneWeight * (1.0 - 0.65 * saturation);
+        rgb = vec3(y) + (rgb - vec3(y)) * (1.0 + adaptiveVibranceLift);
+    }
+
+    // Explicit user profile controls (slider overrides)
     float vibranceControl = clamp(pc.profileVibrance, -1.0, 1.0);
     if (abs(vibranceControl) >= 1.0e-4) {
-        float maximum = max(rgb.r, max(rgb.g, rgb.b));
-        float minimum = min(rgb.r, min(rgb.g, rgb.b));
-        float saturation = (maximum - minimum) / max(1.0e-4, maximum);
         float protection = clamp(1.0 - saturation, 0.0, 1.0);
         float authority = vibranceControl >= 0.0
                 ? vibranceControl * (0.20 + 0.80 * protection)
@@ -263,12 +284,22 @@ vec3 preToneChroma444FromInput(uvec2 gid, vec3 centerRgb) {
             : (0.008 + 0.030 * sqrt(max(0.0, center.x)));
     float inv2SigmaSq = 1.0 / max(2.0 * guideSigma * guideSigma, 1.0e-8);
 
+    // Physical chroma variance for bilateral range weighting:
+    vec2 physicalChromaVar = preTonePhysicalCovarianceReady()
+            ? preTonePhysicalChromaCovariance(center.x).xy
+            : vec2(phase9TileModel2.x * phase9TileModel2.x);
+    float chromaVarianceMean = max(1.0e-8, 0.5 * (physicalChromaVar.x + physicalChromaVar.y));
+    float inv2ChromaVar = 1.0 / (2.5 * chromaVarianceMean);
+
     for (int dy = -radius; dy <= radius; ++dy) {
         for (int dx = -radius; dx <= radius; ++dx) {
             vec3 neighbour = preToneOpponent444(inputAt(int(gid.x) + dx, int(gid.y) + dy));
             float dY = neighbour.x - center.x;
+            vec2 dC = neighbour.yz - center.yz;
             float spatial = 1.0 / (1.0 + 0.20 * float(dx * dx + dy * dy));
-            float w = spatial * exp(-dY * dY * inv2SigmaSq);
+            float chromaDistSq = dot(dC, dC);
+            float chromaRangeW = exp(-0.5 * chromaDistSq * inv2ChromaVar);
+            float w = spatial * exp(-dY * dY * inv2SigmaSq) * chromaRangeW;
             sumW += w;
             sumY += w * neighbour.x;
             sumYY += w * neighbour.x * neighbour.x;
@@ -301,10 +332,16 @@ vec3 preToneChroma444FromInput(uvec2 gid, vec3 centerRgb) {
     vec2 tileNoiseSigma = sqrt(tileNoiseVar);
     float tileFlatness = clamp(phase9TileModel2.y, 0.0, 1.0);
     float tileNoisePressure = clamp(phase9TileModel2.z, 0.0, 1.0);
+
+    float centerMaxVal = max(centerRgb.r, max(centerRgb.g, centerRgb.b));
+    float centerMinVal = min(centerRgb.r, min(centerRgb.g, centerRgb.b));
+    float centerSat = centerMaxVal > 1.0e-5 ? (centerMaxVal - centerMinVal) / centerMaxVal : 0.0;
+    float tileColorProtection = smoothstep(0.05, 0.25, centerSat);
+
     // A small tile contribution stabilizes broad stochastic colour drift, while fine
     // reconstruction remains the primary predictor. Tile authority is identical for every
     // demosaic family and vanishes on structured tiles; only measured evidence may grant it.
-    float tilePredictionAuthority = 0.28 * tileFlatness * tileNoisePressure;
+    float tilePredictionAuthority = 0.28 * tileFlatness * tileNoisePressure * (1.0 - tileColorProtection);
     vec2 predictedC = mix(finePredictedC, tilePredictedC, tilePredictionAuthority);
 
     // Coherent chroma edges must survive even when they are nearly isoluminant. Measure
@@ -349,10 +386,14 @@ vec3 preToneChroma444FromInput(uvec2 gid, vec3 centerRgb) {
 
     vec2 chromaResidual = center.yz - predictedC;
 
-    float maximum = max(centerRgb.r, max(centerRgb.g, centerRgb.b));
-    float minimum = min(centerRgb.r, min(centerRgb.g, centerRgb.b));
-    float saturation = maximum > 1.0e-5 ? (maximum - minimum) / maximum : 0.0;
-    float saturatedColourProtection = 1.0 - 0.70 * smoothstep(0.34, 0.78, saturation);
+    float maximum = centerMaxVal;
+    float minimum = centerMinVal;
+    float chromaDelta = maximum - minimum;
+    float physicalSigmaChroma = max(1.0e-5, phase9TileModel2.x);
+    float colorSignificance = smoothstep(1.2 * physicalSigmaChroma, 3.2 * physicalSigmaChroma, chromaDelta);
+    float saturation = centerSat;
+    float naturalSaturationEvidence = smoothstep(0.05, 0.28, saturation);
+    float saturatedColourProtection = 1.0 - 0.90 * naturalSaturationEvidence * colorSignificance;
     float highlightProtection = 1.0 - 0.78 * smoothstep(0.70, 1.08, center.x);
 
     float chromaAuthority = 0.0;
@@ -413,21 +454,13 @@ vec3 preToneChroma444FromInput(uvec2 gid, vec3 centerRgb) {
     }
     vec2 filteredC = mix(center.yz, predictedC, chromaAuthority);
 
-    // Keep the exact Delta-0062 luma branch. This delta increases no luma authority at all.
-    float lumaStrength = min(strength, 0.64);
-    float lumaAuthority = clamp(0.08 + 0.28 * lumaStrength, 0.0, 0.34);
-    float brightnessRelease = mix(1.12, 0.86, smoothstep(0.10, 0.70, center.x));
-    float estimatedLumaNoiseSigma = mix(0.0025, 0.0070, lumaStrength) * brightnessRelease;
-    float estimatedLumaNoiseVar = estimatedLumaNoiseSigma * estimatedLumaNoiseSigma;
-    float wienerKeep = varY > 1.0e-10
-            ? clamp(1.0 - estimatedLumaNoiseVar / varY, 0.0, 1.0)
-            : 0.0;
-    float predictedY = meanY + wienerKeep * (center.x - meanY);
-    float structureGuard = smoothstep(2.0 * estimatedLumaNoiseVar,
-                                      14.0 * estimatedLumaNoiseVar, varY);
-    float lumaHighlightGuard = 1.0 - 0.85 * smoothstep(0.68, 1.08, center.x);
-    float lumaBlend = lumaAuthority * (1.0 - 0.80 * structureGuard) * lumaHighlightGuard;
-    float filteredY = mix(center.x, predictedY, clamp(lumaBlend, 0.0, 0.34));
+    // In flat regions with zero texture, calm single-pixel shot noise spikes
+    // before FLLF amplifies them. Micro-textures and edges (detailProtection > 0)
+    // preserve 100% native raw sharpness without any smoothing.
+    float crossY = 0.25 * (leftY + rightY + upY + downY);
+    float flatLumaNeed = smoothstep(0.20 * guideSigma, 1.20 * guideSigma, abs(center.x - crossY));
+    float flatLumaBlend = clamp((1.0 - detailProtection) * flatLumaNeed * mix(0.60, 0.78, tileFlatness), 0.0, 0.78);
+    float filteredY = mix(center.x, crossY, flatLumaBlend);
 
     vec3 targetOpponent = vec3(filteredY, filteredC);
     vec3 targetRgb = preToneOpponent444ToRgb(targetOpponent);
@@ -659,6 +692,10 @@ void buildFllfGaussianDownsample(uvec2 gid) {
     fllfGaussian[fllfDestinationOffset() + gid.y * dstW + gid.x] = sum * (1.0 / 16.0);
 }
 
+void buildFllfGaussianNextLevel(uvec2 gid) {
+    buildFllfGaussianDownsample(gid);
+}
+
 float fllfBilinearGaussian(uint offset, uint width, uint height, vec2 p) {
     ivec2 p0 = ivec2(floor(p));
     vec2 f = fract(p);
@@ -691,14 +728,15 @@ float fllfJointDelta(
             p0 + ivec2(1, 0),
             p0 + ivec2(0, 1),
             p0 + ivec2(1, 1));
-    float sigma = clamp(0.42 * edgeStopEv, 0.11, 0.32);
+    float sigma = clamp(0.70 * edgeStopEv, 0.25, 0.65);
     float inv2SigmaSq = 1.0 / max(2.0 * sigma * sigma, 1.0e-6);
     float weighted = 0.0;
     float weightSum = 0.0;
     for (int i = 0; i < 4; ++i) {
         float sampleLog = fllfGaussianAt(offset, width, height, coord[i].x, coord[i].y);
         float d = sampleLog - guideLog;
-        float w = spatial[i] * exp(-d * d * inv2SigmaSq);
+        float rangeW = exp(-d * d * inv2SigmaSq);
+        float w = spatial[i] * max(rangeW, 0.08);
         weighted += w * fllfNodeDelta(offset, width, height, coord[i].x, coord[i].y);
         weightSum += w;
     }
@@ -754,7 +792,7 @@ float fllfRemapBand(
     // broad dark or bright region can still be locally balanced without flattening hard borders.
     float toneNeed = smoothstep(0.075, 0.34, magnitude);
     float edge = smoothstep(0.52 * edgeStopEv, 1.18 * edgeStopEv, gradientEv);
-    float edgeRelease = 1.0 - 0.96 * edge;
+    float edgeRelease = 1.0 - 0.55 * edge;
 
     float localLuma = max(1.0e-6, exp2(fineLog));
     float physicalSigmaY = max(0.0, fllfParam(19u, 0.0));
@@ -823,7 +861,28 @@ void seedFllfCoarseCorrection(uvec2 gid) {
     float coarseBand = coarseLog - broadBase;
     float gradientEv = fllfGaussianGradientEv(offset, w, h, int(gid.x), int(gid.y));
     float remappedBand = fllfRemapBand(coarseBand, coarseLog, gradientEv, w, h);
-    fllfCorrection[index] = broadBase + remappedBand;
+
+    // Regional exposure adaptation at coarsest base
+    float sceneKey = clamp(fllfParam(9u, 0.158), 0.10, 0.22);
+    float strength = clamp(fllfParam(8u, 0.0), 0.0, 0.92);
+    float maxLiftEv = clamp(fllfParam(10u, 1.00), 0.0, 1.80);
+    float maxCompressEv = clamp(fllfParam(11u, 0.70), 0.0, 1.10);
+    float physicalSigmaY = max(0.0, fllfParam(19u, 0.0));
+
+    float localBaseLuma = max(1.0e-5, exp2(broadBase));
+    float baseSnr = physicalSigmaY > 1.0e-8 ? localBaseLuma / physicalSigmaY : 1.0e6;
+    float snrGate = smoothstep(1.15, 3.50, baseSnr);
+    // Black floor anchoring: true deep shadows (background, unlit crevices) must stay velvety black
+    // rather than being lifted into visible shot-noise soup. Lift focuses on mid-shadows and subjects.
+    float toeAnchor = smoothstep(0.0015, 0.012, localBaseLuma);
+    float regionalEv = clamp(log2(sceneKey / localBaseLuma), -maxCompressEv, maxLiftEv) * snrGate * toeAnchor;
+    float baseShiftEv = regionalEv * strength;
+
+    fllfCorrection[index] = broadBase + baseShiftEv + remappedBand;
+}
+
+void seedFllfCorrection(uvec2 gid) {
+    seedFllfCoarseCorrection(gid);
 }
 
 void reconstructFllfCorrectionLevel(uvec2 gid) {
@@ -879,7 +938,7 @@ float sampleFllfFullResolutionCorrection(uvec2 gid) {
         float y = max(1.0e-6, exp2(guideLog));
         float physicalSigmaY = max(0.0, fllfParam(19u, 0.0));
         float snr = physicalSigmaY > 1.0e-8 ? y / physicalSigmaY : 1.0e6;
-        correctionEv *= smoothstep(1.10, 3.20, snr);
+        correctionEv *= smoothstep(0.65, 2.20, snr);
     }
     return correctionEv;
 }
@@ -1365,10 +1424,10 @@ void proposeLinearDetailRecovery(uvec2 gid) {
     float residualSnr = abs(residual) / max(localSigma, 1.0e-7);
     float gradientSnr = gradient / max(localSigma, 1.0e-7);
 
-    float noiseGate = smoothstep(minResidualSnr, minResidualSnr + 2.25, residualSnr);
-    float edgeGate = smoothstep(minGradientSnr, minGradientSnr + 2.75, gradientSnr);
+    float noiseGate = smoothstep(minResidualSnr, minResidualSnr + 1.25, residualSnr);
+    float edgeGate = smoothstep(minGradientSnr, minGradientSnr + 1.50, gradientSnr);
     float directionalCoherence = max(abs(gx), abs(gy)) / max(abs(gx) + abs(gy), 1.0e-6);
-    float coherenceGate = mix(0.72, 1.0, smoothstep(0.52, 0.90, directionalCoherence));
+    float coherenceGate = smoothstep(0.55, 0.88, directionalCoherence);
     float maskingGate = mix(1.0, edgeGate, masking);
     float localAuthority = authority * modelConfidence * noiseGate * edgeGate * coherenceGate * maskingGate;
 
@@ -1474,8 +1533,10 @@ void proposePerceptualDetail(uvec2 gid) {
     float edgeGate = smoothstep(minGradientSnr, minGradientSnr + 2.4, gradientSnr);
     float textureGate = smoothstep(minResidualSnr + 0.6, minResidualSnr + 3.2, residualSnr);
     float participation = mix(edgeGate, max(edgeGate, textureGate), detail);
+    float directionalCoherence = max(abs(gx), abs(gy)) / max(abs(gx) + abs(gy), 1.0e-6);
+    float coherenceGate = smoothstep(0.55, 0.88, directionalCoherence);
     float maskGate = mix(1.0, edgeGate, masking);
-    float localAuthority = authority * modelConfidence * noiseGate * participation * maskGate;
+    float localAuthority = authority * modelConfidence * noiseGate * participation * coherenceGate * maskGate;
 
     if (participation > 0.25 && noiseGate > 0.05) atomicAdd(telemetry[50], 1u);
     if (noiseGate < 0.05) atomicAdd(telemetry[51], 1u);

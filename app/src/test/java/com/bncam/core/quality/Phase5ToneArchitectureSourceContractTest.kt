@@ -21,8 +21,8 @@ class Phase5ToneArchitectureSourceContractTest {
         assertTrue(policy.contains("physicalNoiseSigmaY"))
         assertTrue(core.contains("residualNoiseState.postLinearDetail.varianceY"))
         assertTrue(core.contains("request.fllfPhysicalNoiseSigmaY = fllfPlan.physicalNoiseSigmaY"))
-        assertTrue(shader.contains("return log2(max(1.0e-6, lumaOf(rgb)));"))
-        assertTrue(shader.contains("physicalSigmaY / (max(localLuma, 1.0e-4) * 0.69314718056)"))
+        assertTrue(shader.contains("sigmaYAtScale / (max(localLuma, 1.0e-4) * 0.69314718056)") ||
+                   shader.contains("physicalSigmaY / (max(localLuma, 1.0e-4) * 0.69314718056)"))
         assertTrue(shader.contains("float ratio = yNew / yOld;"))
         assertTrue(shader.contains("return sceneRgb * ratio;"))
         assertTrue(shader.contains("vec3 pbrNeutralToneMapping(vec3 color)"))

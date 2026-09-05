@@ -760,22 +760,21 @@ float phase9SourceRawConfidenceCell(int cellX, int cellY) {
 }
 
 float phase9SourceRawColorConfidence(int x, int y) {
-    // The map is one scalar per physical 2x2 Bayer cell. Demosaic kernels draw support
-    // from neighbouring cells, so extend lost-color confidence over a bounded 3x3 cell
-    // footprint. This is provenance propagation, not a post-tone highlight heuristic.
-    int cellX = x >> 1;
-    int cellY = y >> 1;
-    float confidence = phase9SourceRawConfidenceCell(cellX, cellY);
-    for (int dy = -1; dy <= 1; ++dy) {
-        for (int dx = -1; dx <= 1; ++dx) {
-            if (dx == 0 && dy == 0) continue;
-            float neighbour = phase9SourceRawConfidenceCell(cellX + dx, cellY + dy);
-            float weight = (dx == 0 || dy == 0) ? 0.72 : 0.50;
-            // A zero-confidence adjacent cell lowers local confidence to 0.28 axially
-            // or 0.50 diagonally; intact neighbours never reduce the centre.
-            confidence = min(confidence, mix(1.0, neighbour, weight));
-        }
-    }
+    // Bilinear interpolation across the 2x2 Bayer cell confidence map eliminates
+    // pixel-block quantization, giving continuous C0 confidence transitions.
+    float cx = float(x) * 0.5 - 0.25;
+    float cy = float(y) * 0.5 - 0.25;
+    int x0 = int(floor(cx));
+    int y0 = int(floor(cy));
+    float fx = fract(cx);
+    float fy = fract(cy);
+    float c00 = phase9SourceRawConfidenceCell(x0, y0);
+    float c10 = phase9SourceRawConfidenceCell(x0 + 1, y0);
+    float c01 = phase9SourceRawConfidenceCell(x0, y0 + 1);
+    float c11 = phase9SourceRawConfidenceCell(x0 + 1, y0 + 1);
+    float centerConf = mix(mix(c00, c10, fx), mix(c01, c11, fx), fy);
+    float minNeighbour = min(min(c00, c10), min(c01, c11));
+    float confidence = mix(centerConf, min(centerConf, minNeighbour), 0.35);
     return clamp(confidence, 0.0, 1.0);
 }
 
@@ -786,7 +785,10 @@ vec3 phase9ApplyClippingAwareHighlightColor(
     float confidence = clamp(colorConfidence, 0.0, 1.0);
     if (confidence >= 0.999999) return postCcmLinearRgb;
     float y = phase9Luma(postCcmLinearRgb);
-    vec3 safeRgb = mix(vec3(y), postCcmLinearRgb, confidence);
+    // Smooth S-curve transition so confidence rolloff is soft and natural,
+    // preventing posterized white patches and letting Khronos smoothly desaturate specular peaks.
+    float t = smoothstep(0.0, 1.0, confidence);
+    vec3 safeRgb = mix(vec3(y), postCcmLinearRgb, t);
     applied = any(greaterThan(abs(safeRgb - postCcmLinearRgb), vec3(1.0e-7)));
     // No upper clamp: neutral highlights above 1.0 remain valid scene-linear headroom.
     return safeRgb;

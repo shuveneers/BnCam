@@ -22,7 +22,9 @@ data class RawShutterSafetyCeilings(
     /** Maximum exposure admitted by viewfinder / warm-buffer cadence. */
     val streamCadenceNs: Long? = null,
     /** Optional conservative lens/stabilisation fallback, never a substitute for measured motion. */
-    val lensStabilityNs: Long? = null
+    val lensStabilityNs: Long? = null,
+    /** When enabled, lens stability ceiling can satisfy readiness when real-time motion evidence is calm/missing. */
+    val allowLensStabilityFallback: Boolean = false
 ) {
     fun validValues(bounds: ExposureBounds): List<Pair<String, Long>> = buildList {
         fun addIfValid(name: String, value: Long?) {
@@ -38,7 +40,8 @@ data class RawShutterSafetyCeilings(
 
     fun hasMotionEvidence(): Boolean =
         (cameraMotionNs != null && cameraMotionNs > 0L) ||
-            (sceneMotionNs != null && sceneMotionNs > 0L)
+            (sceneMotionNs != null && sceneMotionNs > 0L) ||
+            (allowLensStabilityFallback && lensStabilityNs != null && lensStabilityNs > 0L)
 }
 
 data class DefaultRawShutterPriorityPlan(
@@ -80,7 +83,8 @@ object DefaultRawShutterPriorityPolicy {
         measuredExposureNs: Long?,
         bounds: ExposureBounds,
         ceilings: RawShutterSafetyCeilings,
-        flickerConstraint: RawFlickerConstraint = RawFlickerConstraint()
+        flickerConstraint: RawFlickerConstraint = RawFlickerConstraint(),
+        rawNearClipFraction: Float? = null
     ): DefaultRawShutterPriorityPlan {
         if (bounds.minIso <= 0 || bounds.maxIso < bounds.minIso ||
             bounds.minExposureNs <= 0L || bounds.maxExposureNs < bounds.minExposureNs
@@ -108,7 +112,13 @@ object DefaultRawShutterPriorityPolicy {
 
         val referenceIso = measuredIso.coerceIn(bounds.minIso, bounds.maxIso)
         val referenceExposure = measuredExposureNs.coerceIn(bounds.minExposureNs, bounds.maxExposureNs)
-        val targetProduct = referenceIso.toDouble() * referenceExposure.toDouble()
+        val baseProduct = referenceIso.toDouble() * referenceExposure.toDouble()
+        val targetProduct = if (rawNearClipFraction != null && rawNearClipFraction > 0.005f) {
+            val clipPenaltyEv = ((rawNearClipFraction - 0.005f) * 10f).coerceIn(0.1f, 2.0f)
+            baseProduct / 2.0.pow(clipPenaltyEv.toDouble())
+        } else {
+            baseProduct
+        }
 
         val constraints = ceilings.validValues(bounds)
         if (constraints.isEmpty()) {

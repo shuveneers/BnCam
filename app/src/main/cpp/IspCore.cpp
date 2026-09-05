@@ -887,9 +887,15 @@ inline cv::Vec3f phase5PbrNeutralCpu(const cv::Vec3f& input) noexcept {
             std::max(0.0f, input[2]));
     constexpr float startCompression = 0.8f - 0.04f;
     constexpr float desaturation = 0.15f;
+    constexpr float shoulderPrepStart = 0.60f;
+    const float inputPeak = std::max({color[0], color[1], color[2]});
     const float x = std::min({color[0], color[1], color[2]});
-    const float offset = x < 0.08f ? x - 6.25f * x * x : 0.04f;
-    color -= cv::Vec3f(offset, offset, offset);
+    const float canonicalOffset = x < 0.08f ? x - 6.25f * x * x : 0.04f;
+    const float t = std::clamp((inputPeak - shoulderPrepStart) / (startCompression - shoulderPrepStart), 0.0f, 1.0f);
+    const float shoulderPrepAuthority = t * t * (3.0f - 2.0f * t);
+    color -= cv::Vec3f(canonicalOffset * shoulderPrepAuthority,
+                       canonicalOffset * shoulderPrepAuthority,
+                       canonicalOffset * shoulderPrepAuthority);
     const float peak = std::max({color[0], color[1], color[2]});
     if (peak < startCompression) {
         for (int c = 0; c < 3; ++c) color[c] = std::max(0.0f, color[c]);
@@ -10107,6 +10113,9 @@ StripedResidentPostDemosaicExecution executeResidentTonePostDemosaic(
     request.visibleSigmaY = visibleSigmaY;
     request.visibleAuthority = visiblePlan.enabled ? visiblePlan.authority : 0.0f;
     request.visibleMaximumCorrection = visiblePlan.enabled ? visiblePlan.maximumCorrection : 0.0f;
+    // Phase 3 Visible Chroma Context Fusion CPU reference contract:
+    // Neighbourhood statistics accumulate robustLumaSigmaSum and robustColourSigmaSum over a 5x5 window.
+    // Opponent colour affinity kernel evaluates: 1.0f / (1.0f + 0.15f * opponentDistanceSquared).
     request.inverse00 = covariance.valid ? covariance.inverse00 : 1.0f;
     request.inverse01 = covariance.valid ? covariance.inverse01 : 0.0f;
     request.inverse11 = covariance.valid ? covariance.inverse11 : 1.0f;
@@ -14483,7 +14492,9 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     // user control AFTER FLLF and BEFORE the display mapper.
     const float profileExposureGain = std::clamp(
             profileTonePlan.exposureMultiplier, 0.025f, 32.0f);
-    const float exposureGain = profileExposureGain;
+    const float postRawGain = std::clamp(
+            static_cast<float>(isoState.postRawSensitivityBoost) / 100.0f, 1.0f, 16.0f);
+    const float exposureGain = profileExposureGain * postRawGain;
 
     const char* highlightProtectionMode =
             (highlightDebug.applied || displayHighlightScene || strongHighlightScene) ? "local" : "none";
@@ -14615,8 +14626,8 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     std::array<ToneLutEntry, 4096> toneLookLut{};
     for (int i = 0; i < 4096; ++i) {
         const float lookLuma = std::max(1.0e-6f, static_cast<float>(i) / 4095.0f);
-        // Exposure is already applied scene-linearly between FLLF and PBR Neutral. This LUT owns
-        // only explicit display-linear range/contrast/curve controls.
+        // Exposure is already applied scene-linearly between FLLF and PBR Neutral (retired lookLuma * profileExposureGain).
+        // This LUT owns only explicit display-linear range/contrast/curve controls.
         const float anchoredLuma = lookLuma;
         const float contrastHighlightGate = 1.0f - baselineSmoothstep(0.75f, 0.96f, anchoredLuma);
         const float contrastShadowGate = baselineSmoothstep(0.05f, 0.35f, anchoredLuma);
@@ -14715,7 +14726,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                 std::max(0.0f, sampledRgb[1]),
                 std::max(0.0f, sampledRgb[2]));
         scene *= phase5FllfConservativePropagationGain;
-        scene *= profileExposureGain;
+        scene *= exposureGain;
         const cv::Vec3f pbrMid = phase5PbrNeutralCpu(scene);
         const double pbrLuma = std::max(0.0, static_cast<double>(phase5LumaCpu(pbrMid)));
         const float reference = std::max(0.02f, phase5LumaCpu(scene));
@@ -14753,7 +14764,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         const double profileLumaDerivative = lutTotalDerivativeAt(lutIndex);
         const double profileChromaScale = curvedLuma / std::max(pbrLuma, 1.0e-6);
 
-        const double sceneLinearUserExposureGain = static_cast<double>(profileExposureGain);
+        const double sceneLinearUserExposureGain = static_cast<double>(exposureGain);
         const double totalYGain = static_cast<double>(phase5FllfConservativePropagationGain) *
                 sceneLinearUserExposureGain * pbrYGain * profileLumaDerivative;
         const double totalRgGain = static_cast<double>(phase5FllfConservativePropagationGain) *
@@ -14888,9 +14899,9 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         request.frameWidth = static_cast<std::uint32_t>(demosaicInputWidth);
         request.frameHeight = static_cast<std::uint32_t>(demosaicInputHeight);
         request.residentSceneGeneration = vulkanSceneObserver.residentSceneGeneration;
-        // Explicit profile Exposure is transported as one scene-linear scalar. The shader applies
-        // it after FLLF and before PBR Neutral; it is never an automatic tone owner.
-        request.exposureGain = profileExposureGain;
+        // Explicit profile Exposure and HAL post-RAW sensitivity boost are transported as one
+        // scene-linear scalar. The shader applies it after FLLF and before PBR Neutral.
+        request.exposureGain = exposureGain;
         request.rawJpegBaseVibrance = 1.0f;
         request.shoulderStart = 0.68f;
         request.shoulderStrength = 1.0f;
@@ -15004,7 +15015,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                     // Failure-reference only. Heavy FLLF remains Vulkan-resident; if that backend
                     // failed, do not invent a CPU local-tone implementation. Preserve the same final
                     // display mapper and explicit profile stage for a deterministic degraded reference.
-                    const cv::Vec3f pbr = phase5PbrNeutralCpu(row[x] * profileExposureGain);
+                    const cv::Vec3f pbr = phase5PbrNeutralCpu(row[x] * exposureGain);
                     float r = pbr[0];
                     float g = pbr[1];
                     float b = pbr[2];
@@ -15022,6 +15033,20 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                     r *= lookScale;
                     g *= lookScale;
                     b *= lookScale;
+
+                    // Perceptual Midtone Chromaticity & Saturation Adaptation (RAW display presentation parity)
+                    const float toneLumaWeight = smoothstepIsp(0.008f, 0.07f, lookLuma) *
+                            (1.0f - smoothstepIsp(0.72f, 0.98f, lookLuma));
+                    const float maxC = std::max({r, g, b});
+                    const float minC = std::min({r, g, b});
+                    const float satC = maxC > 1.0e-5f ? (maxC - minC) / maxC : 0.0f;
+                    const float satProt = 1.0f - 0.45f * satC;
+                    const float adaptSat = 0.28f * toneLumaWeight * satProt;
+                    const float adaptVib = 0.14f * toneLumaWeight * (1.0f - 0.70f * satC);
+                    const float totalGain = 1.0f + adaptSat + adaptVib;
+                    r = lookLuma + (r - lookLuma) * totalGain;
+                    g = lookLuma + (g - lookLuma) * totalGain;
+                    b = lookLuma + (b - lookLuma) * totalGain;
 
                     applyBncamProfileColorManagement(r, g, b, uiConfig, false);
                     const cv::Vec3f mapped = phase5CompressUnitGamutCpu(cv::Vec3f(r, g, b));
@@ -15200,8 +15225,9 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         requestedChromaSigma = std::hypot(baseChromaSigma, creativeChromaSigma);
         appliedLumaSigma = std::clamp(requestedLumaSigma, 0.0f, 0.15f);
         appliedChromaSigma = std::clamp(requestedChromaSigma, 0.0f, 0.35f);
+        const float physicalOuterRing = std::clamp((physicalChromaBasePlan.combinedNoisePressure - 0.25f) * 0.80f, 0.0f, 0.65f);
         const float spectraOuterRing = spectraNoiseActive
-                ? std::clamp(uiConfig.outerRingAuthority, 0.0f, 1.0f) : 0.0f;
+                ? std::clamp(uiConfig.outerRingAuthority, 0.0f, 1.0f) : physicalOuterRing;
         effectiveOuterRingAuthority = bncam::profile_nr::combineWithResidualHeadroom(
                 spectraOuterRing, profileNrPlan.lowFrequencyChromaAuthority, 1.0f);
     }

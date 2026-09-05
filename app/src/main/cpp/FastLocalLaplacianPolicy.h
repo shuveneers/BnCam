@@ -79,17 +79,17 @@ inline FastLocalLaplacianPlan resolveFastLocalLaplacianPlan(
             0.38f * (1.0f - fllfSmoothstep(0.13f, 0.38f, p75)),
             0.0f, 1.0f);
 
-    const float brightTail = std::clamp(
+    const float recoverableHighlightPressure = std::clamp(
             0.50f * fllfSmoothstep(0.58f, 0.92f, p95) +
             0.30f * fllfSmoothstep(0.76f, 1.04f, p99) +
             0.20f * fllfSmoothstep(0.0025f, 0.045f, nearWhite),
             0.0f, 1.0f);
-    const float sensorClip = std::clamp(
+    const float sensorClipPressure = std::clamp(
             0.70f * fllfSmoothstep(0.05f, 0.60f, saturatedPct) +
             0.30f * fllfSmoothstep(0.60f, 2.00f, saturatedPct),
             0.0f, 1.0f);
     out.highlightPressure = std::clamp(
-            std::max(brightTail, 0.80f * sensorClip), 0.0f, 1.0f);
+            std::max(recoverableHighlightPressure, 0.80f * sensorClipPressure), 0.0f, 1.0f);
 
     const float rangeLow = std::max(0.006f, p50);
     const float rangeHigh = std::max(rangeLow, p95);

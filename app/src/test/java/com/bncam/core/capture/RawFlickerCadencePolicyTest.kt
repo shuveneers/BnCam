@@ -49,4 +49,11 @@ class RawFlickerCadencePolicyTest {
         assertNull(plan.selected)
         assertNull(plan.targetFps)
     }
+
+    @Test
+    fun `prefer adaptive lower selects fifteen thirty under fifty hz`() {
+        val plan = RawFlickerCadencePolicy.resolve(ranges, 30, RawFlickerFrequency.HZ_50, preferAdaptiveLower = true)
+        assertEquals(FlickerFpsRange(15, 30), plan.selected)
+        assertEquals(30, plan.targetFps)
+    }
 }

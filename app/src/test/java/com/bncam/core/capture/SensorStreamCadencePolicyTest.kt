@@ -69,4 +69,14 @@ class SensorStreamCadencePolicyTest {
         assertNull(plan.selected)
         assertNull(plan.sustainableUpperFps)
     }
+
+    @Test
+    fun `prefer adaptive lower selects fifteen thirty over fixed thirty`() {
+        val plan = SensorStreamCadencePolicy.resolveFromSustainableUpperFps(
+            availableRanges = ranges,
+            sustainableUpperFps = 30,
+            preferAdaptiveLower = true
+        )
+        assertEquals(FlickerFpsRange(15, 30), plan.selected)
+    }
 }

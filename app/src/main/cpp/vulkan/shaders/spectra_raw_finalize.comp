@@ -612,9 +612,9 @@ void applyExposurePixel() {
     outputMosaic[index] = sceneClamp(value * exp2(ev));
 }
 
-const float PHASE9_SOURCE_CLIP_CONFIDENCE_START = 0.960;
-const float PHASE9_SOURCE_CLIP_CONFIDENCE_ZERO = 0.995;
-const float PHASE9_SOURCE_HARD_CLIP = 0.985;
+const float PHASE9_SOURCE_CLIP_CONFIDENCE_START = 0.940;
+const float PHASE9_SOURCE_CLIP_CONFIDENCE_ZERO = 1.000;
+const float PHASE9_SOURCE_HARD_CLIP = 0.990;
 
 float sourceClipSampleConfidence(float value) {
     if (!finite1(value)) return 0.0;
@@ -640,14 +640,15 @@ void writeSourceClipConfidenceCell(int x, int y) {
                     (v10 >= PHASE9_SOURCE_HARD_CLIP ? 1 : 0) +
                     (v01 >= PHASE9_SOURCE_HARD_CLIP ? 1 : 0) +
                     (v11 >= PHASE9_SOURCE_HARD_CLIP ? 1 : 0);
-    // Color ratios become unreliable as soon as any Bayer phase approaches the sensor
-    // ceiling. Taking the minimum per-sensel confidence is equivalent to using the peak
-    // for finite values, but also fails safely to zero if any source sample is non-finite.
-    // It cannot let three valid phases hide one lost channel. Fully hard-clipped 2x2 cells
-    // are explicitly zero-authority; partial clipping remains continuous through smoothstep.
-    float confidence = min(
-            min(sourceClipSampleConfidence(v00), sourceClipSampleConfidence(v10)),
-            min(sourceClipSampleConfidence(v01), sourceClipSampleConfidence(v11)));
+    // Combine minimum and average confidence so isolated single-channel saturation
+    // rolls off smoothly without hard rectangular block dropouts.
+    float c00 = sourceClipSampleConfidence(v00);
+    float c10 = sourceClipSampleConfidence(v10);
+    float c01 = sourceClipSampleConfidence(v01);
+    float c11 = sourceClipSampleConfidence(v11);
+    float minConf = min(min(c00, c10), min(c01, c11));
+    float avgConf = 0.25 * (c00 + c10 + c01 + c11);
+    float confidence = mix(minConf, avgConf, 0.45);
     if (hardCount == 4) confidence = 0.0;
     uint framePixels = pc.frameWidth * pc.frameHeight;
     outputMosaic[framePixels + cellY * clipWidth + cellX] = clamp(confidence, 0.0, 1.0);

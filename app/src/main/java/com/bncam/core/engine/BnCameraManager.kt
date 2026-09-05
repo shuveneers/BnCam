@@ -61,6 +61,7 @@ import com.bncam.core.capture.RawFlickerStabilitySnapshot
 import com.bncam.core.capture.RawFlickerStabilityTracker
 import com.bncam.core.capture.FlickerFpsRange
 import com.bncam.core.capture.RawFlickerCadencePolicy
+import com.bncam.core.capture.DynamicSensorProfile
 import com.bncam.core.capture.MeteringMode
 import com.bncam.core.capture.MeteringPlan
 import com.bncam.core.capture.NormalizedMeteringRegion
@@ -726,12 +727,10 @@ class BnCameraManager(private val context: Context) {
     @Volatile private var lastWarmBufferWatchdogRebuildMs: Long = 0L
     @Volatile private var warmBufferWatchdogRebuildAttemptsSinceHealthy: Int = 0
     private val rawPreviewRenderer = RawPreviewRenderer rawPreviewFrame@{ frame ->
-        // A render may finish after the user has already requested YUV (or another RAW route).
-        // Never let that stale completion overwrite the last-known-good texture during a display
-        // handoff. The target route, not merely the pipeline generation, owns publication.
+        // A render may finish after the pipeline generation has advanced.
+        // Drop stale completions immediately to preserve generation integrity.
         if (frame.pipelineGeneration != pipelineGeneration ||
-            frame.pipelineGeneration != targetViewfinderGeneration ||
-            frame.source != targetViewfinderSource
+            frame.pipelineGeneration != targetViewfinderGeneration
         ) {
             frame.close()
             return@rawPreviewFrame
@@ -747,14 +746,21 @@ class BnCameraManager(private val context: Context) {
             generation = frame.pipelineGeneration,
             sensorTimestampNs = frame.sensorTimestampNs
         )
-        // A RAW route becomes visible only after Vulkan has produced a valid frame for the exact
-        // target generation. Until this point FocusPeakingView keeps drawing the previous texture.
-        commitRawViewfinderFrameIfReady(
-            frame.source,
-            frame.pipelineGeneration,
-            frame.sensorTimestampNs
-        )
-        rawPreviewFrameListener?.invoke(frame) ?: frame.close()
+        // A render may finish after the user has already requested YUV (or another RAW route).
+        // Never let that completion overwrite the last-known-good texture during a display handoff.
+        // The target route owns viewfinder publication; non-viewfinder frames are closed after analysis.
+        if (frame.source == targetViewfinderSource) {
+            // A RAW route becomes visible only after Vulkan has produced a valid frame for the exact
+            // target generation. Until this point FocusPeakingView keeps drawing the previous texture.
+            commitRawViewfinderFrameIfReady(
+                frame.source,
+                frame.pipelineGeneration,
+                frame.sensorTimestampNs
+            )
+            rawPreviewFrameListener?.invoke(frame) ?: frame.close()
+        } else {
+            frame.close()
+        }
     }
 
     @Volatile
@@ -3289,6 +3295,16 @@ class BnCameraManager(private val context: Context) {
         }
     }
 
+    /**
+     * A metering-domain change invalidates the scene brightness reference used by default RAW
+     * shutter-priority. Reusing the pre-change ISO x exposure product can pin exposure time to a
+     * target from another AE region while Camera2 is already at an ISO bound, which presents as a
+     * full-frame exposure pulse/hunt. Keep motion evidence, but reacquire brightness truth from a
+     * fresh repeating Camera2-AE epoch before shutter-priority resumes.
+     */
+    private fun restartDefaultRawAeReferenceForMeteringChange(reason: String): Boolean =
+        restartDefaultRawAeReference(reason, preserveRealizationTruth = false)
+
     private fun restartDefaultRawAeReference(
         reason: String,
         preserveRealizationTruth: Boolean
@@ -3307,16 +3323,6 @@ class BnCameraManager(private val context: Context) {
         )
         return true
     }
-
-    /**
-     * A metering-domain change invalidates the scene brightness reference used by default RAW
-     * shutter-priority. Reusing the pre-change ISO x exposure product can pin exposure time to a
-     * target from another AE region while Camera2 is already at an ISO bound, which presents as a
-     * full-frame exposure pulse/hunt. Keep motion evidence, but reacquire brightness truth from a
-     * fresh repeating Camera2-AE epoch before shutter-priority resumes.
-     */
-    private fun restartDefaultRawAeReferenceForMeteringChange(reason: String): Boolean =
-        restartDefaultRawAeReference(reason, preserveRealizationTruth = false)
 
     private fun updateDefaultRawExposureRealizationTruth(
         request: CaptureRequest,
@@ -3570,7 +3576,8 @@ class BnCameraManager(private val context: Context) {
 
     private fun needsLiveExposureStatistics(): Boolean =
         histogramAnalysisEnabled || needsProfileExposureStatistics() ||
-            needsDefaultRawShutterFallbackStatistics()
+            needsDefaultRawShutterFallbackStatistics() ||
+            shouldRequestDefaultRawShutterMotionAnalysis()
 
     private fun maybeAdaptDefaultRawShutterFallback(statistics: ExposureStatistics) {
         if (!needsDefaultRawShutterFallbackStatistics() || isCapturing || statistics.sampleCount <= 0) return
@@ -3897,7 +3904,8 @@ class BnCameraManager(private val context: Context) {
                 val plan = RawFlickerCadencePolicy.resolve(
                     availableRanges = availableRanges.map { FlickerFpsRange(it.lower, it.upper) },
                     sustainableUpperFps = sustainableUpperFps?.takeIf { it > 0 },
-                    frequency = flickerConstraint.frequency
+                    frequency = flickerConstraint.frequency,
+                    preferAdaptiveLower = true
                 )
                 val selected = plan.selected?.let { android.util.Range(it.lower, it.upper) }
                 return selected to plan.strategy
@@ -3952,6 +3960,7 @@ class BnCameraManager(private val context: Context) {
                     ?: rawCompatibleRanges
                         .sortedWith(
                             compareByDescending<android.util.Range<Int>> { it.upper }
+                                .thenByDescending { it.lower in 7..20 && it.lower < it.upper }
                                 .thenBy { it.lower }
                         )
                         .firstOrNull()
@@ -11281,6 +11290,10 @@ class BnCameraManager(private val context: Context) {
                 max(baselineExposure, 1_000_000_000L / fps.toLong())
                     .coerceIn(exposureRange.lower, exposureRange.upper)
             }
+            val profile = DynamicSensorProfile.fromCharacteristics(characteristics)
+            val lensStability = profile.maxHandheldShutterNs.coerceIn(exposureRange.lower, exposureRange.upper)
+            val nearClip = latestExposureStatistics?.rawNearClipFraction
+
             return DefaultRawShutterPriorityPolicy.resolve(
                 measuredIso = defaultRawShutterAeBaselineIso,
                 measuredExposureNs = baselineExposure,
@@ -11290,9 +11303,12 @@ class BnCameraManager(private val context: Context) {
                 ceilings = RawShutterSafetyCeilings(
                     cameraMotionNs = motion?.cameraExposureCeilingNs,
                     sceneMotionNs = motion?.sceneExposureCeilingNs,
-                    streamCadenceNs = cadenceCeiling
+                    streamCadenceNs = cadenceCeiling,
+                    lensStabilityNs = lensStability,
+                    allowLensStabilityFallback = true
                 ),
-                flickerConstraint = resolveDefaultRawFlickerConstraint()
+                flickerConstraint = resolveDefaultRawFlickerConstraint(),
+                rawNearClipFraction = nearClip
             )
         }
 
@@ -11407,6 +11423,7 @@ class BnCameraManager(private val context: Context) {
                 // bounded manual feedback loop.
                 defaultRawShutterManualFallbackActive = true
                 val targetLuma = defaultRawShutterFallbackTargetLuma
+                    ?: latestExposureStatistics?.exposureControllerLuma()?.takeIf { it.isFinite() && it > 0f }
                 val isoRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
                 val exposureRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
                 val safeCeiling = defaultRawPlan.safeExposureCeilingNs
@@ -11482,7 +11499,7 @@ class BnCameraManager(private val context: Context) {
                 builder.set(CaptureRequest.SENSOR_FRAME_DURATION, fallbackPlan.frameDurationNs)
                 lastExposurePlanSummary =
                     "defaultRawPriority=true;priorityModeSupported=$priorityModeSupported;" +
-                        "priorityModeAllowed=$priorityModeAllowed;${fallbackPlan.summary()};" +
+                        "priorityModeAllowed=$priorityModeAllowed;fallback=MANUAL_LINEAR_LUMA_FEEDBACK;${fallbackPlan.summary()};" +
                         defaultRawPlan.summary()
                 Log.d(tag, "Camera2 default RAW shutter manual fallback $lastExposurePlanSummary")
                 return

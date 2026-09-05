@@ -28,7 +28,8 @@ object SensorStreamCadencePolicy {
 
     fun resolve(
         availableRanges: List<FlickerFpsRange>,
-        outputs: List<StreamCadenceOutput>
+        outputs: List<StreamCadenceOutput>,
+        preferAdaptiveLower: Boolean = false
     ): SensorStreamCadencePlan {
         val limiting = outputs
             .asSequence()
@@ -45,7 +46,8 @@ object SensorStreamCadencePolicy {
             availableRanges = availableRanges,
             sustainableUpperFps = sustainableUpperFps,
             limitingOutput = limiting?.name,
-            limitingMinFrameDurationNs = limiting?.minFrameDurationNs
+            limitingMinFrameDurationNs = limiting?.minFrameDurationNs,
+            preferAdaptiveLower = preferAdaptiveLower
         )
     }
 
@@ -53,7 +55,8 @@ object SensorStreamCadencePolicy {
         availableRanges: List<FlickerFpsRange>,
         sustainableUpperFps: Int?,
         limitingOutput: String? = null,
-        limitingMinFrameDurationNs: Long? = null
+        limitingMinFrameDurationNs: Long? = null,
+        preferAdaptiveLower: Boolean = false
     ): SensorStreamCadencePlan {
         val validRanges = availableRanges
             .filter { it.lower > 0 && it.upper >= it.lower }
@@ -100,6 +103,11 @@ object SensorStreamCadencePolicy {
                 // If two ranges lead to the same physical cadence, prefer the one completely inside
                 // the stream contract. Example: at a 30 FPS ceiling choose [30,30], not [30,60].
                 .thenBy { if (it.fullyWithinContract) 1 else 0 }
+                // When adaptive lower is preferred (e.g. for low-light photography headroom),
+                // prefer an adaptive range that can fall back toward 15-20 FPS instead of forcing a fixed framerate.
+                .thenBy {
+                    if (preferAdaptiveLower && !it.range.fixed && it.range.lower <= 20) 1 else 0
+                }
                 // Above 30 FPS, prefer an adaptive range that can fall back toward 30 when exposure
                 // genuinely requires it instead of forcing a fixed high-FPS request.
                 .thenBy {

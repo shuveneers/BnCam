@@ -107,4 +107,47 @@ class DefaultRawShutterPriorityPolicyTest {
         assertEquals(1_682, plan.expectedIso)
         assertEquals("AE_TRANSITION_RELEASE_RATE", plan.limitingConstraint)
     }
+
+    @Test
+    fun `lens fallback with allowLensStabilityFallback activates default strategy`() {
+        val plan = DefaultRawShutterPriorityPolicy.resolve(
+            measuredIso = 1_600,
+            measuredExposureNs = 40_000_000L,
+            bounds = bounds,
+            ceilings = RawShutterSafetyCeilings(
+                streamCadenceNs = 80_000_000L,
+                lensStabilityNs = 50_000_000L,
+                allowLensStabilityFallback = true
+            )
+        )
+
+        assertTrue(plan.ready)
+        assertTrue(plan.targetExposureNs != null)
+        assertTrue(plan.targetExposureNs!! in bounds.minExposureNs..50_000_000L)
+    }
+
+    @Test
+    fun `raw near clip reduces target product and exposure time`() {
+        val normalPlan = DefaultRawShutterPriorityPolicy.resolve(
+            measuredIso = 1_600,
+            measuredExposureNs = 40_000_000L,
+            bounds = bounds,
+            ceilings = RawShutterSafetyCeilings(
+                cameraMotionNs = 100_000_000L,
+                sceneMotionNs = 100_000_000L
+            ),
+            rawNearClipFraction = 0f
+        )
+        val ettrPlan = DefaultRawShutterPriorityPolicy.resolve(
+            measuredIso = 1_600,
+            measuredExposureNs = 40_000_000L,
+            bounds = bounds,
+            ceilings = RawShutterSafetyCeilings(
+                cameraMotionNs = 100_000_000L,
+                sceneMotionNs = 100_000_000L
+            ),
+            rawNearClipFraction = 0.05f
+        )
+        assertTrue(ettrPlan.referenceExposureProduct!! < normalPlan.referenceExposureProduct!!)
+    }
 }

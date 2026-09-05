@@ -17,11 +17,11 @@ struct Plan {
     bool enabled = false;
     float authority = 0.0f;
     float radius = 1.0f;
-    float detailEmphasis = 0.25f;
+    float detailEmphasis = 0.40f;
     float masking = 0.15f;
-    float minimumResidualSnr = 1.65f;
-    float minimumGradientSnr = 1.10f;
-    float hardHaloLimit = 0.018f;
+    float minimumResidualSnr = 0.85f;
+    float minimumGradientSnr = 0.65f;
+    float hardHaloLimit = 0.022f;
     float preToneLumaSigma = 0.0f;
     float referenceSignal = 0.10f;
     float shotNoiseFraction = 0.5f;
@@ -63,20 +63,19 @@ inline Plan resolve(PhysicalNoiseEvidence noise) noexcept {
         return out;
     }
 
-    // Preserve the validated Phase-11 strength envelope near its prior neutral-profile result,
-    // while making it exclusively physical and slightly more selective in noisy/flat regions.
+    // Recover crisp flagship micro-detail calibrated against the physical sensor noise model.
     const float confidenceScale = 0.35f + 0.65f * noise.modelConfidence;
-    out.authority = std::clamp(0.225f * confidenceScale, 0.0f, 0.225f);
+    out.authority = std::clamp(0.32f * confidenceScale, 0.0f, 0.32f);
     out.radius = 1.0f;
-    out.detailEmphasis = 0.25f;
-    out.masking = 0.15f;
-    out.minimumResidualSnr = 1.65f;
-    out.minimumGradientSnr = 1.10f;
-    out.hardHaloLimit = 0.018f;
+    out.detailEmphasis = 0.40f;
+    out.masking = 0.35f;
+    out.minimumResidualSnr = 1.85f;
+    out.minimumGradientSnr = 1.50f;
+    out.hardHaloLimit = 0.022f;
     out.predictedLumaVarianceGain = std::clamp(
             1.0f + 0.52f * out.authority * out.authority,
             1.0f,
-            1.04f);
+            1.06f);
     out.enabled = out.authority > 1.0e-4f;
     out.authoritySource = "PHYSICAL_SO_CAPTURE_RECOVERY";
     return out;

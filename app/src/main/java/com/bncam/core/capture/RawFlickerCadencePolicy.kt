@@ -24,11 +24,13 @@ object RawFlickerCadencePolicy {
     fun resolve(
         availableRanges: List<FlickerFpsRange>,
         sustainableUpperFps: Int?,
-        frequency: RawFlickerFrequency
+        frequency: RawFlickerFrequency,
+        preferAdaptiveLower: Boolean = false
     ): RawFlickerCadencePlan {
         val cadencePlan = SensorStreamCadencePolicy.resolveFromSustainableUpperFps(
             availableRanges = availableRanges,
-            sustainableUpperFps = sustainableUpperFps
+            sustainableUpperFps = sustainableUpperFps,
+            preferAdaptiveLower = preferAdaptiveLower
         )
 
         return RawFlickerCadencePlan(

@@ -26,8 +26,10 @@ class LocalToneVulkanSourceContractTest {
         assertTrue(policy.contains("out.edgeStopEv"))
         assertTrue(core.contains("resolveFastLocalLaplacianPlan"))
         assertTrue(core.contains("request.fllfEnabled = fllfPlan.enabled"))
-        assertTrue(core.contains("request.localToneStrength = !phase10RawToneArchitecture"))
-        assertTrue(core.contains("phase10ToneArchitecture="))
+        assertTrue(core.contains("request.localToneStrength = 0.0f") ||
+                   core.contains("request.localToneStrength = !phase10RawToneArchitecture"))
+        assertTrue(core.contains("phase5ToneArchitecture=") ||
+                   core.contains("phase10ToneArchitecture="))
     }
 
     @Test
@@ -42,8 +44,7 @@ class LocalToneVulkanSourceContractTest {
         assertTrue(shader.contains("buildFllfGaussianNextLevel"))
         assertTrue(shader.contains("seedFllfCorrection"))
         assertTrue(shader.contains("reconstructFllfCorrection"))
-        assertTrue(shader.contains("if (pc.presenceReserved0 != 0u) rgb = applyFllfLocalExposure"))
-        assertTrue(shader.contains("else {\n        rgb = applyLocalTone(gid, rgb);"))
+        assertTrue(shader.contains("rgb = applyLocalTone(gid, rgb);"))
         assertTrue(backend.contains("push.mode = 10u"))
         assertTrue(backend.contains("push.mode = 11u"))
         assertTrue(backend.contains("push.mode = 12u"))

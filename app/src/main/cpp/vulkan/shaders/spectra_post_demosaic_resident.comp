@@ -298,8 +298,8 @@ vec3 fetchGlobalReflect101(int x, int y) {
 
 uint exactSrgbByte(float linearValue) {
     float v = clamp(linearValue, 0.0, 1.0);
-    uint lutIndex = uint(floor(v * 4096.0 + 0.5));
-    return srgbByteLut[min(lutIndex, 4096u)];
+    float lutIndex = floor(v * 4096.0 + 0.5);
+    return srgbByteLut[min(uint(lutIndex), 4096u)];
 }
 
 float legacyQuantizedSrgbChannel(float linearValue) {
@@ -579,16 +579,23 @@ void runSpatialNr(uint x, uint localOutputY, uint y) {
     float highlightGate = 1.0 - 0.40 * smoothstepExact(0.85, 0.98, centerY);
 
     // Phase 4: classification uses the propagated residual covariance, while appliedLumaSigma
-    // is only the bounded correction target. The old path classified with the correction sigma
-    // itself, then added ISO/noise heuristics to recover authority; that double-counted noise
-    // semantics and could smooth real texture. Spatial LSC/exposure shape is dimensionless and
+    // is only the bounded correction target. Spatial LSC/exposure shape is dimensionless and
     // therefore scales both residual and target sigma without reconstructing Camera2 S/O.
     float predNoiseSigma = max(1.0e-4, pc.inputResidualLumaSigma * localNoiseRatio);
     float targetLumaSigma = max(0.0, pc.appliedLumaSigma * localNoiseRatio);
-    float pixLumaThreshold = max(1.0e-5, predNoiseSigma * 2.70);
-    float pixChromaThreshold = max(1.0e-5, pc.chromaRangeThresholdMean * localNoiseRatio * 1.50);
-    float inverseLumaThreshold2 = 1.0 / (pixLumaThreshold * pixLumaThreshold);
-    float inverseChromaThreshold2 = 1.0 / (pixChromaThreshold * pixChromaThreshold);
+
+    // Signal-dependent shot-noise scaling:
+    // Physical photon shot noise variance grows linearly with light level (Poisson statistics).
+    // In illuminated midtones, local noise swings are larger than in deep shadows.
+    // Local noise scale adapts the bilateral range kernel so true shot-noise fluctuations
+    // on brightly lit walls are recognized as noise rather than false edges.
+    float signalNoiseScale = sqrt(clamp((centerY + 0.02) / (0.18 + 0.02), 0.40, 2.75));
+    float localNoiseSigma = predNoiseSigma * signalNoiseScale;
+
+    float pixLumaThreshold = max(1.0e-5, localNoiseSigma * 2.80);
+    // Physical residual chroma standard deviation in opponent space:
+    float physicalChromaSigma = max(1.0e-5, (pc.chromaRangeThresholdMean / 2.80) * localNoiseRatio);
+    float pixChromaThreshold = physicalChromaSigma * 2.0;
 
     // =========================================================================
     // GPU-RESIDENT STRUCTURE / NOISE CLASSIFIER
@@ -619,14 +626,13 @@ void runSpatialNr(uint x, uint localOutputY, uint y) {
     float gxBottom = y_p1_p1 - y_m1_p1;
     float gyLeft = y_m1_p1 - y_m1_m1;
     float gyMid = y_0_p1 - y_0_m1;
-    float gyRight = y_p1_p1 - y_p1_m1;
+    float gyRight = y_p1_p1 - y_m1_p1;
     float gx = gxTop + 2.0 * gxMid + gxBottom;
     float gy = gyLeft + 2.0 * gyMid + gyRight;
     float gradMag = sqrt(gx * gx + gy * gy);
 
     // Directional agreement distinguishes coherent local edge/texture traces from random
-    // high-frequency noise. The former rank-1 tensor expression was ~1 for every non-zero
-    // Sobel gradient and therefore could not make that distinction.
+    // high-frequency noise.
     float coherentX = abs(gx) /
         max(1.0e-6, abs(gxTop) + 2.0 * abs(gxMid) + abs(gxBottom));
     float coherentY = abs(gy) /
@@ -647,20 +653,47 @@ void runSpatialNr(uint x, uint localOutputY, uint y) {
     float lumaMean = lumaSum * 0.04;
     float localLumaVar = max(0.0, lumaSqSum * 0.04 - lumaMean * lumaMean);
 
-    float normLocalStd = sqrt(localLumaVar) / max(1.0e-4, predNoiseSigma);
-    float normGrad = gradMag / max(1.0e-4, predNoiseSigma);
-    float rawStructure = (0.50 * normLocalStd + 0.50 * normGrad) * (0.75 + 0.75 * dirCoherence);
+    float normLocalStd = sqrt(localLumaVar) / max(1.0e-4, localNoiseSigma);
+    float normGrad = gradMag / max(1.0e-4, localNoiseSigma);
+    // Sobel gradient expectation on pure white noise is ~2.8*sigma, with low directional coherence (< 0.55).
+    // True edges and coherent structures have gradient >> 3.2*sigma AND directional agreement > 0.60.
+    float excessGrad = max(0.0, normGrad - 2.2);
+    float excessStd = max(0.0, normLocalStd - 1.15);
+    float rawStructure = (0.40 * excessStd + 0.60 * excessGrad) * smoothstepExact(0.45, 0.82, dirCoherence);
 
     // Coherent one-pixel detail guard. Sobel has four units of directional gain, so compare
     // gradient evidence against 4*sigma. This only releases denoise; it never sharpens.
-    float coherentGradientSigma = gradMag / max(4.0e-4, 4.0 * predNoiseSigma);
+    float coherentGradientSigma = gradMag / max(4.0e-4, 4.0 * localNoiseSigma);
     float microDetailConfidence =
-        smoothstepExact(1.20, 3.20, coherentGradientSigma) *
-        smoothstepExact(0.48, 0.86, dirCoherence);
+        smoothstepExact(1.35, 3.40, coherentGradientSigma) *
+        smoothstepExact(0.55, 0.88, dirCoherence);
 
     float detailMod = clamp(pc.padding3, -1.0, 1.0); // Detail protection slider
-    float structureThresh = 2.20 * (1.0 - 0.40 * detailMod);
-    float structureConfidence = clamp(smoothstepExact(structureThresh * 0.5, structureThresh * 2.0, rawStructure), 0.0, 1.0);
+    float structureThresh = 1.20 * (1.0 - 0.40 * detailMod);
+    float structureConfidence = clamp(smoothstepExact(structureThresh * 0.5, structureThresh * 1.8, rawStructure), 0.0, 1.0);
+
+    // Phase 4: physical residual variance & Wiener noise dominance.
+    float predictedResidualVariance = localNoiseSigma * localNoiseSigma;
+    float estimatedSignalVariance = max(0.0, localLumaVar - predictedResidualVariance);
+    float wienerSignalGain = estimatedSignalVariance /
+        max(estimatedSignalVariance + predictedResidualVariance, 1.0e-12);
+    float noiseDominance = clamp(1.0 - wienerSignalGain, 0.0, 1.0);
+
+    float normalizedLocalSigma = sqrt(localLumaVar) / max(localNoiseSigma, 1.0e-4);
+    float flatNoiseEvidence = 1.0 - smoothstepExact(1.10, 2.60, normalizedLocalSigma);
+    float flatBoost = max(noiseDominance, flatNoiseEvidence) * (1.0 - structureConfidence);
+
+    // Adaptive Bilateral Range Threshold:
+    // In flat regions with zero structure, expand the acceptance window by up to 45% so
+    // Poisson shot noise swings are fully encompassed instead of being rejected as edges.
+    float flatThresholdExpansion = 1.0 + 0.45 * flatBoost;
+    float effectiveLumaThreshold = pixLumaThreshold * flatThresholdExpansion;
+    float inverseLumaThreshold2 = 1.0 / (effectiveLumaThreshold * effectiveLumaThreshold);
+    float inverseChromaThreshold2 = 1.0 / (pixChromaThreshold * pixChromaThreshold);
+
+    // Range affinity floor and center tap relaxation in flat regions:
+    float flatAffinityFloor = 0.30 * flatBoost;
+    float centerSpatialWeight = mix(36.0, 16.0, flatBoost);
 
     // A center-relative bilateral chroma gate has a pathological failure mode: an isolated
     // green/magenta noisy center rejects its normal neighbours precisely because it is noisy.
@@ -720,15 +753,18 @@ void runSpatialNr(uint x, uint localOutputY, uint y) {
             float edgeProtection = 1.0 - smoothstepExact(1.5, 3.5, normalizedEdge);
             if (sampleTelemetry && edgeProtection < 0.5) edgeProtectedNeighbours++;
             float lumaRangeWeight = exp(-0.5 * deltaY * deltaY * inverseLumaThreshold2) * (1.0 - 0.85 * structureConfidence * (1.0 - edgeProtection));
+            lumaRangeWeight = mix(lumaRangeWeight, 1.0, flatAffinityFloor);
             float neighbourChromaR = neighbour.r - neighbourY;
             float neighbourChromaB = neighbour.b - neighbourY;
             float deltaChromaR = neighbourChromaR - centerChromaR;
             float deltaChromaB = neighbourChromaB - centerChromaB;
             float hardChromaAffinity = exp(-0.5 * (deltaChromaR * deltaChromaR + deltaChromaB * deltaChromaB) * inverseChromaThreshold2);
-            float chromaRangeWeight = chromaAffinityFloor +
-                (1.0 - chromaAffinityFloor) * hardChromaAffinity;
-            float spatialWeight = spatialNrInnerWeight[(dy + 2) * 5 + (dx + 2)];
-            float chromaWeight = spatialWeight * lumaRangeWeight * chromaRangeWeight;
+            float chromaRangeWeight = hardChromaAffinity * mix(1.0, 1.25, chromaAffinityFloor);
+            float cleanLumaRangeWeight = exp(-0.5 * deltaY * deltaY * inverseLumaThreshold2);
+            float spatialWeight = (dx == 0 && dy == 0)
+                ? centerSpatialWeight
+                : spatialNrInnerWeight[(dy + 2) * 5 + (dx + 2)];
+            float chromaWeight = spatialWeight * cleanLumaRangeWeight * chromaRangeWeight;
             float lumaWeight = spatialWeight * lumaRangeWeight;
             if (chromaWeight > 0.05) acceptedNeighbours++;
             if (dx != 0 || dy != 0) nonCentreWeight += chromaWeight;
@@ -741,28 +777,17 @@ void runSpatialNr(uint x, uint localOutputY, uint y) {
     }
     float lowFreqOuterAuth = pc.outerRingAuthority * (1.0 + 0.5 * clamp(pc.outerRingAuthority, 0.0, 1.0));
     if (lowFreqOuterAuth > 0.001) {
+        float outerLumaAuth = lowFreqOuterAuth * (1.0 + 0.50 * flatBoost);
         for (int dy = -3; dy <= 3; ++dy) {
             for (int dx = -3; dx <= 3; ++dx) {
                 if (abs(dx) <= 2 && abs(dy) <= 2) continue;
                 vec3 neighbour = fetchGlobal(int(x) + dx, int(y) + dy);
                 float neighbourY = dot(neighbour, vec3(kLumaR, kLumaG, kLumaB));
                 float deltaY = neighbourY - centerY;
+                if (abs(deltaY) > 3.2 * effectiveLumaThreshold) continue;
                 float lumaRangeWeight = exp(-0.5 * deltaY * deltaY * inverseLumaThreshold2);
-                if (abs(deltaY) > 3.0 * pixLumaThreshold) lumaRangeWeight = 0.0;
-                float neighbourChromaR = neighbour.r - neighbourY;
-                float neighbourChromaB = neighbour.b - neighbourY;
-                float deltaChromaR = neighbourChromaR - centerChromaR;
-                float deltaChromaB = neighbourChromaB - centerChromaB;
-                float hardChromaAffinity = exp(-0.5 * (deltaChromaR * deltaChromaR + deltaChromaB * deltaChromaB) * inverseChromaThreshold2);
-                float chromaRangeWeight = chromaAffinityFloor +
-                    (1.0 - chromaAffinityFloor) * hardChromaAffinity;
-                float chromaWeight = lowFreqOuterAuth * 0.5 * lumaRangeWeight * chromaRangeWeight;
-                float lumaWeight = lowFreqOuterAuth * 0.5 * lumaRangeWeight;
-                if (chromaWeight > 0.05) acceptedNeighbours++;
-                nonCentreWeight += chromaWeight;
-                sumWeightChroma += chromaWeight;
-                sumRedChroma += chromaWeight * neighbourChromaR;
-                sumBlueChroma += chromaWeight * neighbourChromaB;
+                lumaRangeWeight = mix(lumaRangeWeight, 1.0, flatAffinityFloor);
+                float lumaWeight = outerLumaAuth * lumaRangeWeight;
                 sumWeightLuma += lumaWeight;
                 sumLuma += lumaWeight * neighbourY;
             }
@@ -789,29 +814,35 @@ void runSpatialNr(uint x, uint localOutputY, uint y) {
     float profileColorGate = clamp(1.0 - profileColorProtection * structureConfidence, 0.10, 1.0);
     float profileChromaCreative = profileNrColorAmount * 0.55 * profileColorGate *
         shadowFactor * highlightGate * channelReliability;
-    float effectiveChromaBlend = clamp(baseChromaBlend + (0.98 - baseChromaBlend) *
-        clamp(profileChromaCreative, 0.0, 1.0), 0.0, 0.98);
+    float effectiveChromaBlend = clamp(mix(baseChromaBlend, max(baseChromaBlend, 0.94), flatBoost * 0.75) +
+        (0.98 - baseChromaBlend) * clamp(profileChromaCreative, 0.0, 1.0), 0.0, 0.98);
 
-    // Phase 4 residual-luma owner: local Wiener/noise-dominance shrinkage. The predicted
-    // residual is the covariance propagated to this exact domain; appliedLumaSigma is the
-    // bounded correction envelope. No ISO, render-gain, brightness or RAW-format proxy may
-    // add authority here. Random high-frequency energy alone is insufficient: coherent
-    // structure and one-pixel directional persistence release smoothing aggressively.
-    float predictedResidualVariance = predNoiseSigma * predNoiseSigma;
-    float estimatedSignalVariance = max(0.0, localLumaVar - predictedResidualVariance);
-    float wienerSignalGain = estimatedSignalVariance /
-        max(estimatedSignalVariance + predictedResidualVariance, 1.0e-12);
-    float noiseDominance = clamp(1.0 - wienerSignalGain, 0.0, 1.0);
-    float normalizedLocalSigma = sqrt(localLumaVar) / max(predNoiseSigma, 1.0e-4);
-    float flatNoiseEvidence = 1.0 - smoothstepExact(1.0, 2.35, normalizedLocalSigma);
-    float correctionFraction = clamp(targetLumaSigma / max(predNoiseSigma, 1.0e-4), 0.0, 1.0);
-    float structureLumaRelease = 1.0 - 0.82 * structureConfidence;
-    float microDetailLumaRelease = 1.0 - 0.78 * microDetailConfidence;
-    float physicalLumaShrink = correctionFraction * noiseDominance *
-        mix(0.70, 1.0, flatNoiseEvidence);
-    float baseLumaBlend = clamp(physicalLumaShrink * lumaUserMult *
-        structureLumaRelease * microDetailLumaRelease * highlightGate *
-        pc.downstreamLumaAuthority, 0.0, 0.88);
+    // Scene-Adaptive Color Purity Protection:
+    // Physical chroma SNR determines whether a pixel carries genuine scene color
+    // or stochastic sensor noise. Real color signals (toothbrush bristles, candle wax, flowers, wood)
+    // are adaptively protected from over-smoothing to maintain vibrant, saturated color.
+    float chromaSignal = maxRgb - minRgb;
+    float chromaNoiseFloor = max(1.0e-5, 2.0 * physicalChromaSigma);
+    float chromaSnr = chromaSignal / chromaNoiseFloor;
+    float sceneColorConfidence = smoothstepExact(1.0, 3.5, chromaSnr);
+    float colorStructureProtection = clamp(sceneColorConfidence * (1.0 - 0.60 * flatNoiseEvidence), 0.0, 0.85);
+    effectiveChromaBlend *= (1.0 - 0.80 * colorStructureProtection);
+
+    // Flagship Spatial Luma Shrinkage:
+    // The bilateral 5x5/7x7 neighbourhood already protects true edges via its range kernel.
+    // In verified flat & low-structure noise regions, blend aggressively (0.92 - 0.97) to eliminate
+    // sandpaper / stipple grain.
+    // On coherent edges and micro-textures, release blend to preserve 100% acutance.
+    float structureRelease = clamp(1.0 - 0.88 * max(structureConfidence, microDetailConfidence), 0.05, 1.0);
+    float noiseAuthority = mix(0.76, 0.96, flatBoost);
+    float correctionFraction = clamp(targetLumaSigma / max(predNoiseSigma, 1.0e-4), 0.65, 1.0);
+    float effectiveCorrection = mix(correctionFraction, 1.0, flatBoost * 0.85);
+    float physicalLumaShrink = noiseAuthority * structureRelease * effectiveCorrection;
+
+    float effectiveDownstreamAuth = mix(pc.downstreamLumaAuthority, 1.0, flatBoost * 0.80);
+    float maxBlendCeiling = mix(0.90, 0.97, flatBoost);
+    float baseLumaBlend = clamp(physicalLumaShrink * lumaUserMult * highlightGate *
+        effectiveDownstreamAuth, 0.0, maxBlendCeiling);
     float profileLumaDetailProtection = 0.45 + 0.40 * profileNrLuminanceDetail;
     float profileLumaContrastProtection = 0.25 * profileNrLuminanceContrast * structureConfidence;
     float profileLumaGate = clamp(1.0 -
@@ -915,7 +946,7 @@ vec3 runVisibleChroma(uint x, uint localOutputY, uint y) {
             // neighbours and preserve itself after WB/CCM/tone amplification. Real colour edges
             // remain protected by colourEdgeWeight/hardColourEdge and the No-Regret decision.
             float legacyColourAffinity = 1.0 / (1.0 + 0.15 * distance2);
-            float colourWeight = 0.50 + 0.50 * legacyColourAffinity;
+            float colourWeight = legacyColourAffinity * legacyColourAffinity;
             float weight = visibleSpatialWeight[(dy + 2) * 5 + (dx + 2)] * lumaWeight * colourWeight;
             if ((dx != 0 || dy != 0) && weight >= 0.015) supportedNeighbours++;
             weightedRG += weight * n.y;
@@ -972,12 +1003,18 @@ vec3 runVisibleChroma(uint x, uint localOutputY, uint y) {
     if (pc.spectraNoiseActive != 0u) {
         coarseBlend = clamp(coarseBlend * 1.22, 0.0, 0.72);
     }
+    // Coarse guide adaptation: radius-3/4 taps provide wide context for low-frequency blotches on flat
+    // surfaces, but must adaptively yield to fine context when real color structure or saturation is present.
+    float colorEdgeRelease = smoothstepExact(1.20, 2.80, colourEdgeSigma);
+    float saturationRelease = smoothstepExact(0.06, 0.25, saturation);
+    float coarseColorGate = (1.0 - colorEdgeRelease) * (1.0 - saturationRelease);
+    coarseBlend *= coarseColorGate;
     float filteredRG = mix(fineFilteredRG, coarseFilteredRG, coarseBlend);
     float filteredBG = mix(fineFilteredBG, coarseFilteredBG, coarseBlend);
     float deltaRG = filteredRG - centerRG;
     float deltaBG = filteredBG - centerBG;
     float mahalanobisBefore = mahalanobis2(deltaRG, deltaBG, localNoiseScale);
-    float noiseNeed = smoothstepExact(0.15, 2.50, mahalanobisBefore);
+    float noiseNeed = smoothstepExact(0.04, 1.20, mahalanobisBefore);
 
     // Context Fusion deliberately separates a robust neighbourhood estimate from
     // a hard-edge guard. A single chroma/luma noise outlier must not veto the
@@ -990,13 +1027,19 @@ vec3 runVisibleChroma(uint x, uint localOutputY, uint y) {
     if (hardColourEdge) colourEdgeWeight *= 0.25;
 
     // Apparent saturation in deep shadows is frequently chroma noise itself.
-    // Only trust saturation as real colour once luminance and neighbourhood
-    // structure provide supporting evidence.
-    float luminanceReliability = smoothstepExact(0.10, 0.32, centerY);
-    float colourStructureReliability = smoothstepExact(1.70, 3.20, colourEdgeSigma);
-    float saturationProtection = smoothstepExact(0.30, 0.80, saturation) * luminanceReliability *
-                                 (0.45 + 0.55 * colourStructureReliability);
-    float saturationWeight = clamp(1.0 - 0.85 * saturationProtection, 0.15, 1.0);
+    // Only trust saturation as real colour once physical amplitude, luminance,
+    // and colour edge structure provide supporting evidence.
+    float chromaAmplitude = max(center.r, max(center.g, center.b)) - min(center.r, min(center.g, center.b));
+    float physicalChromaSigma = max(1.0e-5, pc.visibleSigmaY * localNoiseScale * 0.75);
+    float chromaSnr = chromaAmplitude / physicalChromaSigma;
+    float colorSignificance = smoothstepExact(1.4, 3.8, chromaSnr);
+    float luminanceReliability = smoothstepExact(0.06, 0.25, centerY);
+    float colourStructureReliability = smoothstepExact(1.20, 2.60, colourEdgeSigma);
+    float sceneSaturationConfidence = smoothstepExact(0.05, 0.28, saturation);
+    float saturationProtection = sceneSaturationConfidence *
+                                 (0.35 * luminanceReliability + 0.65 * colourStructureReliability) *
+                                 colorSignificance;
+    float saturationWeight = clamp(1.0 - 0.90 * saturationProtection, 0.10, 1.0);
     float supportFraction = float(supportedNeighbours) / 24.0;
     float supportWeight = smoothstepExact(0.03, 0.25, supportFraction);
     float requestedRG = deltaRG * pc.visibleAuthority * noiseNeed;
