@@ -139,11 +139,56 @@ vec3 applyExplicitProfileToneContrast(vec3 rgb) {
     return rgb * scale;
 }
 
-vec3 applyProfileColor(vec3 rgb) {
-    float y = max(0.0, lumaOf(rgb));
+float profileColorRelativeSaturation(vec3 rgb) {
     float maximum = max(rgb.r, max(rgb.g, rgb.b));
     float minimum = min(rgb.r, min(rgb.g, rgb.b));
-    float saturation = maximum > 1.0e-5 ? (maximum - minimum) / maximum : 0.0;
+    return clamp((maximum - minimum) / max(abs(maximum), 1.0e-4), 0.0, 1.0);
+}
+
+float profileColorChromaRange(vec3 rgb) {
+    return max(0.0, max(rgb.r, max(rgb.g, rgb.b)) - min(rgb.r, min(rgb.g, rgb.b)));
+}
+
+float profileColorLumaWindow(float y) {
+    return smoothstep(0.025, 0.12, y) * (1.0 - smoothstep(0.82, 0.98, y));
+}
+
+vec3 applyProfileColorRecovery(vec3 rgb, float signedControl) {
+    float control = clamp(signedControl, -1.0, 1.0);
+    if (abs(control) < 1.0e-4) return rgb;
+
+    float y = max(0.0, lumaOf(rgb));
+    float chroma = profileColorChromaRange(rgb);
+    float saturation = profileColorRelativeSaturation(rgb);
+    // Color Recovery acts only on real but muted chroma. It does not invent colour in neutrals,
+    // amplify the physical shadow noise floor or push already-saturated colours harder.
+    float evidence = smoothstep(0.012, 0.055, chroma);
+    float mutedHeadroom = 1.0 - smoothstep(0.40, 0.78, saturation);
+    float authority = control * evidence * mutedHeadroom * profileColorLumaWindow(y);
+    float stops = authority * (control >= 0.0 ? 0.48 : 0.36);
+    return vec3(y) + (rgb - vec3(y)) * exp2(stops);
+}
+
+vec3 applyProfilePop(vec3 rgb, float signedControl) {
+    float control = clamp(signedControl, -1.0, 1.0);
+    if (abs(control) < 1.0e-4) return rgb;
+
+    float y = max(0.0, lumaOf(rgb));
+    float chroma = profileColorChromaRange(rgb);
+    float saturation = profileColorRelativeSaturation(rgb);
+    float evidence = smoothstep(0.008, 0.032, chroma);
+    float saturationHeadroom = clamp(1.0 - saturation, 0.0, 1.0);
+    float protection = control >= 0.0
+            ? 0.28 + 0.72 * saturationHeadroom
+            : 0.62 + 0.38 * saturationHeadroom;
+    float authority = control * evidence * profileColorLumaWindow(y) * protection;
+    float stops = authority * (control >= 0.0 ? 0.60 : 0.50);
+    return vec3(y) + (rgb - vec3(y)) * exp2(stops);
+}
+
+vec3 applyProfileColor(vec3 rgb) {
+    float y = max(0.0, lumaOf(rgb));
+    float saturation = profileColorRelativeSaturation(rgb);
 
     // Perceptual Midtone Chromaticity Adaptation (Hunt Effect & Display Gamut compensation):
     // Scene-referred tone compression (PBR Neutral display mapper) reduces perceived color contrast in midtones.
@@ -166,18 +211,16 @@ vec3 applyProfileColor(vec3 rgb) {
         rgb = vec3(y) + (rgb - vec3(y)) * (1.0 + adaptiveVibranceLift);
     }
 
-    // Explicit user profile controls (slider overrides)
-    float vibranceControl = clamp(pc.profileVibrance, -1.0, 1.0);
-    if (abs(vibranceControl) >= 1.0e-4) {
-        float protection = clamp(1.0 - saturation, 0.0, 1.0);
-        float authority = vibranceControl >= 0.0
-                ? vibranceControl * (0.20 + 0.80 * protection)
-                : vibranceControl * (0.55 + 0.45 * protection);
-        rgb = vec3(y) + (rgb - vec3(y)) * exp2(authority * 0.90);
+    // Compatibility transport slots: profileSaturation = Color Recovery, profileVibrance = Pop.
+    // Apply recovery first so Pop can add the final perceptual vividness without turning either
+    // control into a second global saturation authority.
+    float colorRecoveryControl = clamp(pc.profileSaturation, -1.0, 1.0);
+    float popControl = clamp(pc.profileVibrance, -1.0, 1.0);
+    if (abs(colorRecoveryControl) >= 1.0e-4) {
+        rgb = applyProfileColorRecovery(rgb, colorRecoveryControl);
     }
-    float saturationControl = clamp(pc.profileSaturation, -1.0, 1.0);
-    if (abs(saturationControl) >= 1.0e-4) {
-        rgb = vec3(y) + (rgb - vec3(y)) * exp2(saturationControl * 0.85);
+    if (abs(popControl) >= 1.0e-4) {
+        rgb = applyProfilePop(rgb, popControl);
     }
     return compressToUnitGamutPreserveLuma(rgb);
 }

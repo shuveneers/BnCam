@@ -327,6 +327,8 @@ data class ProfileNoiseReductionTuning(
 }
 
 data class ProfileColorTuning(
+    // Field names remain transport-compatible with the established native ABI. DELTA 0208 maps
+    // vibrance -> Pop and saturation -> Color Recovery; they are not duplicate legacy controls.
     val vibrance: Float = 0f,
     val saturation: Float = 0f,
     val contrast: Float = 0f
@@ -338,8 +340,8 @@ data class ProfileColorTuning(
     )
 
     fun debugPairs(): List<Pair<String, String>> = listOf(
-        "Profile Presence Vibrance" to String.format(Locale.US, "%+.2f", vibrance),
-        "Profile Presence Saturation" to String.format(Locale.US, "%+.2f", saturation),
+        "Profile Color Pop" to String.format(Locale.US, "%+.2f", vibrance),
+        "Profile Color Recovery" to String.format(Locale.US, "%+.2f", saturation),
         "Live Color Contrast Offset" to String.format(Locale.US, "%+.2f", contrast)
     )
 }
@@ -532,8 +534,8 @@ data class RenderQualityConfig(
                 localToneBias = 0f
             ).sanitized()
             val baseColorTuning = ProfileColorTuning(
-                vibrance = readProfileFloatOrFallback(repo, profileId, ProfileIspKeys.PRESENCE_VIBRANCE, 0f, -1f..1f),
-                saturation = readProfileFloatOrFallback(repo, profileId, ProfileIspKeys.PRESENCE_SATURATION, 0f, -1f..1f),
+                vibrance = readProfileFloatOrFallback(repo, profileId, ProfileIspKeys.PRESENCE_POP, 0f, -1f..1f),
+                saturation = readProfileFloatOrFallback(repo, profileId, ProfileIspKeys.PRESENCE_COLOR_RECOVERY, 0f, -1f..1f),
                 // Profile tonal contrast is owned by ProfileToneTuning/GTM. Keep this RGB lane
                 // neutral; ViewfinderLiveTuning may still apply a temporary live override.
                 contrast = 0f
