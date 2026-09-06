@@ -844,6 +844,7 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
     result.linearDetailRequested = linearDetailRequested;
     const bool perceptualDetailRequested = request.isRawBayer && request.perceptualDetailEnabled &&
             (std::abs(request.perceptualDetailAuthority) > 1.0e-4f ||
+             std::abs(request.perceptualDetailRadius) > 1.0e-4f || // Phase 4 Legibility transport.
              std::abs(request.perceptualDetailEmphasis) > 1.0e-4f ||
              std::abs(request.perceptualDetailMasking) > 1.0e-4f);
     result.perceptualDetailRequested = perceptualDetailRequested;
@@ -981,7 +982,7 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
     if (perceptualDetailRequested) {
         const float perceptualValues[9] = {
                 std::clamp(request.perceptualDetailAuthority, -1.0f, 1.0f),
-                1.0f, // Global Sharpness owns a fixed internal kernel; Radius is independent.
+                std::clamp(request.perceptualDetailRadius, -1.0f, 1.0f), // Phase 4 signed Legibility.
                 std::clamp(request.perceptualDetailEmphasis, -1.0f, 1.0f), // Phase 3 standalone signed Detail.
                 std::clamp(request.perceptualDetailMasking, -1.0f, 1.0f), // Phase 2 signed standalone Edge authority.
                 std::max(1.0f / 255.0f, request.perceptualDetailNoiseSigmaY),

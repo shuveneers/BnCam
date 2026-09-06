@@ -525,7 +525,7 @@ fun ProfileSharpnessSettingsScreen(
                     profileId = profileId,
                     key = ProfileIspKeys.DETAIL_SHARPENING_EDGE,
                     title = "Edge",
-                    description = "Standalone signed structural-edge control. -1.00 strongly smooths qualified coherent edges, 0.00 is exact neutral, and +1.00 strongly increases edge acutance. It is independent from Global Sharpness and Detail.",
+                    description = "Standalone signed structural-edge transition control. -1.00 broadens/smooths qualified contour transitions, 0.00 preserves the natural transition, and +1.00 compresses them into a sharper edge. Neighbour reconstruction suppresses halos/double lines; detected text is excluded.",
                     defaultValue = ProfilePlannedDefaults.EDGE_SHARPNESS,
                     valueRange = -1f..1f,
                     formatter = { value -> String.format(Locale.US, "%+.2f", value) }
@@ -535,8 +535,18 @@ fun ProfileSharpnessSettingsScreen(
                     profileId = profileId,
                     key = ProfileIspKeys.DETAIL_SHARPENING_DETAIL,
                     title = "Detail",
-                    description = "Standalone signed microdetail control. -1.00 reduces qualified fine texture without softening structural edges, 0.00 is exact neutral, and +1.00 restores/enhances credible microtexture. Edge remains independent and Global Sharpness is applied afterwards.",
+                    description = "Standalone signed microdetail control. It targets credible fine texture plus narrow natural ridges/creases such as hair, fabric structure, petal veins/seams and fine material grooves. -1.00 reduces them, 0.00 is neutral, and +1.00 enhances them; text and broad structural contours are excluded.",
                     defaultValue = ProfileDetailDefaults.DETAIL,
+                    valueRange = -1f..1f,
+                    formatter = { value -> String.format(Locale.US, "%+.2f", value) }
+                )
+                ProfileRangeSlider(
+                    repo = repo,
+                    profileId = profileId,
+                    key = ProfileIspKeys.DETAIL_SHARPENING_LEGIBILITY,
+                    title = "Legibility",
+                    description = "Text/glyph-only sharpness ownership. -1.00 softens detected letter and symbol strokes, 0.00 preserves their natural transition, and +1.00 sharpens/compresses those strokes. Detected text is excluded from Edge, Detail and Global Sharpness to prevent stacking.",
+                    defaultValue = ProfilePlannedDefaults.LEGIBILITY,
                     valueRange = -1f..1f,
                     formatter = { value -> String.format(Locale.US, "%+.2f", value) }
                 )
@@ -576,6 +586,7 @@ fun ProfileSharpnessSettingsScreen(
                         ProfileSettingSpec(ProfileIspKeys.DETAIL_SHARPENING_RADIUS, ProfileSettingValueType.FLOAT),
                         ProfileSettingSpec(ProfileIspKeys.DETAIL_SHARPENING_EDGE, ProfileSettingValueType.FLOAT),
                         ProfileSettingSpec(ProfileIspKeys.DETAIL_SHARPENING_DETAIL, ProfileSettingValueType.FLOAT),
+                        ProfileSettingSpec(ProfileIspKeys.DETAIL_SHARPENING_LEGIBILITY, ProfileSettingValueType.FLOAT),
                         ProfileSettingSpec(ProfileIspKeys.DETAIL_SHARPENING_MASKING, ProfileSettingValueType.FLOAT),
                         ProfileSettingSpec(ProfileIspKeys.POLYSHARP_GAIN, ProfileSettingValueType.FLOAT),
                         ProfileSettingSpec(ProfileIspKeys.POLYSHARP_MACRO_GAIN, ProfileSettingValueType.FLOAT),

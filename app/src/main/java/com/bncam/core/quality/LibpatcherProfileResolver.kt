@@ -166,6 +166,7 @@ object LibpatcherProfileResolver {
             add(f(ProfileIspKeys.DETAIL_SHARPENING_AMOUNT, ProfileDetailDefaults.AMOUNT))
             add(f(ProfileIspKeys.DETAIL_SHARPENING_RADIUS, ProfileDetailDefaults.RADIUS))
             add(f(ProfileIspKeys.DETAIL_SHARPENING_DETAIL, ProfileDetailDefaults.DETAIL))
+            add(f(ProfileIspKeys.DETAIL_SHARPENING_LEGIBILITY, ProfilePlannedDefaults.LEGIBILITY))
             add(f(ProfileIspKeys.DETAIL_SHARPENING_MASKING, ProfileDetailDefaults.MASKING))
 
             // Complete profile AWB tuple.

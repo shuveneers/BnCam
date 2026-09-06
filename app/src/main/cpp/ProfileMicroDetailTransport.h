@@ -2,41 +2,88 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 
 namespace bncam::profile_microdetail_transport {
 
-// Phase 3 compatibility transport.
+// Phase 4 compatibility transport.
 //
-// Retired RAW publication/preview consumers still interpret profileDetailDetail as the old
-// unsigned Lightroom Detail value and clamp it to [0, 1]. Every encoded signed value therefore
-// stays <= 0 so those consumers resolve to their existing neutral value (0), while the production
-// Detail owner can recover the complete user range [-1, +1]. Exact transport 0 is reserved for
-// user-neutral 0, which also makes default-constructed/native legacy-neutral callers safe.
+// The old profileDetailDetail ABI field is still consumed by retired publication/preview code as
+// an unsigned Lightroom-style Detail value and clamped to [0, 1]. The production sharpness owner
+// now needs TWO independent signed controls in that one ABI field: Phase-3 microdetail and Phase-4
+// Legibility. Both are therefore quantized to 10-bit signed values and packed into one strictly
+// negative float. Legacy unsigned consumers collapse every non-neutral packed value to 0, while
+// the production owner recovers Detail and Legibility independently. Exact transport 0 remains the
+// joint neutral value, preserving default/legacy bypass semantics.
 //
-// Negative user values: [-1, 0) -> [-1, -0.5)
-// Neutral user value:     0    ->  0
-// Positive user values: (0, +1] -> (-0.5, 0), with +1 -> -0.5
+// The packed payload is 20 bits (2 x 10), safely below float's exact integer precision. Code 512
+// represents exact signed zero; negative and positive sides use 512 and 511 steps respectively.
 inline float sanitizeUser(float value) noexcept {
     return std::clamp(std::isfinite(value) ? value : 0.0f, -1.0f, 1.0f);
 }
 
+inline std::uint32_t quantizeSigned10(float value) noexcept {
+    const float user = sanitizeUser(value);
+    if (user >= 0.0f) {
+        return static_cast<std::uint32_t>(512 + std::lround(user * 511.0f));
+    }
+    return static_cast<std::uint32_t>(512 - std::lround((-user) * 512.0f));
+}
+
+inline float decodeSigned10(std::uint32_t code) noexcept {
+    code = std::min<std::uint32_t>(code, 1023u);
+    if (code >= 512u) {
+        return std::clamp(static_cast<float>(code - 512u) / 511.0f, 0.0f, 1.0f);
+    }
+    return std::clamp((static_cast<float>(code) - 512.0f) / 512.0f, -1.0f, 0.0f);
+}
+
+inline float encodePair(float detail, float legibility) noexcept {
+    const float safeDetail = sanitizeUser(detail);
+    const float safeLegibility = sanitizeUser(legibility);
+    if (std::abs(safeDetail) <= 1.0e-7f && std::abs(safeLegibility) <= 1.0e-7f) return 0.0f;
+
+    constexpr std::uint32_t kAxisBits = 10u;
+    constexpr std::uint32_t kAxisMask = (1u << kAxisBits) - 1u;
+    constexpr float kTransportDenominator = 1048577.0f; // 2^20 + 1; keeps payload strictly > -1.
+    const std::uint32_t detailCode = quantizeSigned10(safeDetail) & kAxisMask;
+    const std::uint32_t legibilityCode = quantizeSigned10(safeLegibility) & kAxisMask;
+    const std::uint32_t packed = detailCode | (legibilityCode << kAxisBits);
+    return -static_cast<float>(packed + 1u) / kTransportDenominator;
+}
+
+inline bool decodePacked(float transportValue, std::uint32_t& packedOut) noexcept {
+    if (!std::isfinite(transportValue) || transportValue >= -1.0e-7f) {
+        packedOut = 0u;
+        return false;
+    }
+    constexpr float kTransportDenominator = 1048577.0f;
+    const float packedFloat = (-std::clamp(transportValue, -1.0f, 0.0f) * kTransportDenominator) - 1.0f;
+    const long rounded = std::lround(std::clamp(packedFloat, 0.0f, 1048575.0f));
+    packedOut = static_cast<std::uint32_t>(rounded);
+    return true;
+}
+
+inline float decodeDetail(float transportValue) noexcept {
+    std::uint32_t packed = 0u;
+    if (!decodePacked(transportValue, packed)) return 0.0f;
+    return decodeSigned10(packed & 1023u);
+}
+
+inline float decodeLegibility(float transportValue) noexcept {
+    std::uint32_t packed = 0u;
+    if (!decodePacked(transportValue, packed)) return 0.0f;
+    return decodeSigned10((packed >> 10u) & 1023u);
+}
+
+// Backwards source-level helpers: callers that only need Detail keep working and automatically
+// reserve the Legibility half of the payload at exact neutral.
 inline float encode(float userValue) noexcept {
-    const float user = sanitizeUser(userValue);
-    if (std::abs(user) <= 1.0e-7f) return 0.0f;
-    return user < 0.0f
-            ? (-0.5f + 0.5f * user)
-            : (-0.5f * user);
+    return encodePair(userValue, 0.0f);
 }
 
 inline float decode(float transportValue) noexcept {
-    if (!std::isfinite(transportValue)) return 0.0f;
-    // Positive values belong to the retired unsigned contract, never to Phase 3 transport.
-    if (transportValue > 0.0f) return 0.0f;
-    const float transport = std::clamp(transportValue, -1.0f, 0.0f);
-    if (std::abs(transport) <= 1.0e-7f) return 0.0f;
-    return transport < -0.5f
-            ? std::clamp(2.0f * (transport + 0.5f), -1.0f, 0.0f)
-            : std::clamp(-2.0f * transport, 0.0f, 1.0f);
+    return decodeDetail(transportValue);
 }
 
 } // namespace bncam::profile_microdetail_transport

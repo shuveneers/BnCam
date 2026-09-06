@@ -430,7 +430,8 @@ object ImageUtils {
                 profileColorContrast = qualityConfig?.profileColorTuning?.contrast ?: 0.0f,
                 profilePresenceVibrance = qualityConfig?.profileColorTuning?.vibrance ?: 0.0f,
                 profileDetailAmount = qualityConfig?.profileDetailTuning?.amount ?: com.bncam.data.settings.ProfileDetailDefaults.AMOUNT,
-                profileDetailRadius = qualityConfig?.profileDetailTuning?.radius ?: com.bncam.data.settings.ProfileDetailDefaults.RADIUS,
+                // Phase 4 transport compatibility: the retired Radius JNI slot carries signed Legibility.
+                profileDetailRadius = qualityConfig?.profileDetailTuning?.legibility ?: com.bncam.data.settings.ProfilePlannedDefaults.LEGIBILITY,
                 profileDetailDetail = qualityConfig?.profileDetailTuning?.detail ?: com.bncam.data.settings.ProfileDetailDefaults.DETAIL,
                 // Phase 2 transport compatibility: native profileDetailMasking is an ABI slot only.
                 // It carries standalone Edge authority; the Sharp Mask setting remains disconnected.
@@ -803,7 +804,8 @@ object ImageUtils {
                 profileColorContrast = qualityConfig?.profileColorTuning?.contrast ?: 0.0f,
                 profilePresenceVibrance = qualityConfig?.profileColorTuning?.vibrance ?: 0.0f,
                 profileDetailAmount = profileDetailTuning.amount,
-                profileDetailRadius = profileDetailTuning.radius,
+                // Phase 4 transport compatibility: the retired Radius JNI slot carries signed Legibility.
+                profileDetailRadius = profileDetailTuning.legibility,
                 profileDetailDetail = profileDetailTuning.detail,
                 // Phase 2 transport compatibility: this legacy JNI slot carries Edge only.
                 profileDetailMasking = profileDetailTuning.edge,

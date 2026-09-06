@@ -432,8 +432,12 @@ NativeRenderQualityConfig makeQualityConfig(
     cfg.profileColorContrast = std::isfinite(profileColorContrast) ? std::clamp(profileColorContrast, -1.0f, 1.0f) : 0.0f;
     cfg.profilePresenceVibrance = std::isfinite(profilePresenceVibrance) ? std::clamp(profilePresenceVibrance, -1.0f, 1.0f) : 0.0f;
     cfg.profileDetailAmount = std::isfinite(profileDetailAmount) ? std::clamp(profileDetailAmount, -1.0f, 1.0f) : bncam::profile_defaults::kDetailAmount;
-    cfg.profileDetailRadius = std::isfinite(profileDetailRadius) ? std::clamp(profileDetailRadius, bncam::profile_defaults::kDetailMinRadius, bncam::profile_defaults::kDetailMaxRadius) : bncam::profile_defaults::kDetailRadius;
-    cfg.profileDetailDetail = bncam::profile_microdetail_transport::encode(profileDetailDetail);
+    const float profileLegibility = std::isfinite(profileDetailRadius)
+            ? std::clamp(profileDetailRadius, -1.0f, 1.0f) : 0.0f;
+    // Retired radius consumers keep the previously effective default floor. Detail + Legibility
+    // share a negative-only packed transport so those old unsigned consumers remain neutral.
+    cfg.profileDetailRadius = bncam::profile_defaults::kDetailMinRadius;
+    cfg.profileDetailDetail = bncam::profile_microdetail_transport::encodePair(profileDetailDetail, profileLegibility);
     cfg.profileDetailMasking = std::isfinite(profileDetailMasking) ? std::clamp(profileDetailMasking, -1.0f, 1.0f) : bncam::profile_defaults::kDetailMasking;
 
     cfg.noiseModelCalibrationAdjustment = std::isfinite(noiseModelCalibrationAdjustment)
@@ -1854,12 +1858,11 @@ Java_com_bncam_core_engine_ImageUtils_renderRawPreviewNative(
     quality.profileDetailAmount = std::isfinite(profileDetailAmount)
             ? std::clamp(static_cast<float>(profileDetailAmount), -1.0f, 1.0f)
             : bncam::profile_defaults::kDetailAmount;
-    quality.profileDetailRadius = std::isfinite(profileDetailRadius)
-            ? std::clamp(static_cast<float>(profileDetailRadius),
-                         bncam::profile_defaults::kDetailMinRadius, bncam::profile_defaults::kDetailMaxRadius)
-            : bncam::profile_defaults::kDetailRadius;
-    quality.profileDetailDetail = bncam::profile_microdetail_transport::encode(
-            static_cast<float>(profileDetailDetail));
+    const float profileLegibility = std::isfinite(profileDetailRadius)
+            ? std::clamp(static_cast<float>(profileDetailRadius), -1.0f, 1.0f) : 0.0f;
+    quality.profileDetailRadius = bncam::profile_defaults::kDetailMinRadius;
+    quality.profileDetailDetail = bncam::profile_microdetail_transport::encodePair(
+            static_cast<float>(profileDetailDetail), profileLegibility);
     quality.profileDetailMasking = std::isfinite(profileDetailMasking)
             ? std::clamp(static_cast<float>(profileDetailMasking), -1.0f, 1.0f)
             : bncam::profile_defaults::kDetailMasking;
@@ -2352,10 +2355,11 @@ Java_com_bncam_core_engine_ImageUtils_processNativeYuv(
     yuvQuality.profileColorContrast = std::isfinite(profileColorContrast) ? std::clamp(profileColorContrast, -1.0f, 1.0f) : 0.0f;
     yuvQuality.profilePresenceVibrance = std::isfinite(profilePresenceVibrance) ? std::clamp(profilePresenceVibrance, -1.0f, 1.0f) : 0.0f;
     yuvQuality.profileDetailAmount = std::isfinite(profileDetailAmount) ? std::clamp(profileDetailAmount, -1.0f, 1.0f) : bncam::profile_defaults::kDetailAmount;
-    yuvQuality.profileDetailRadius = std::isfinite(profileDetailRadius)
-            ? std::clamp(profileDetailRadius, 0.0f, bncam::profile_defaults::kDetailMaxRadius)
-            : bncam::profile_defaults::kDetailRadius;
-    yuvQuality.profileDetailDetail = bncam::profile_microdetail_transport::encode(profileDetailDetail);
+    const float profileLegibility = std::isfinite(profileDetailRadius)
+            ? std::clamp(profileDetailRadius, -1.0f, 1.0f) : 0.0f;
+    yuvQuality.profileDetailRadius = bncam::profile_defaults::kDetailMinRadius;
+    yuvQuality.profileDetailDetail = bncam::profile_microdetail_transport::encodePair(
+            profileDetailDetail, profileLegibility);
     yuvQuality.profileDetailMasking = std::isfinite(profileDetailMasking) ? std::clamp(profileDetailMasking, -1.0f, 1.0f) : bncam::profile_defaults::kDetailMasking;
     yuvQuality.profileNrLuminance = std::isfinite(profileNrLuminance) ? std::clamp(profileNrLuminance, 0.0f, 1.0f) : 0.0f;
     yuvQuality.profileNrLuminanceDetail = std::isfinite(profileNrLuminanceDetail) ? std::clamp(profileNrLuminanceDetail, 0.0f, 1.0f) : 0.5f;
@@ -2834,13 +2838,16 @@ Java_com_bncam_core_engine_ImageUtils_processNativeYuv(
                   ? "true" : "false")
           << ";profileDetailApplied=" << (
                   std::abs(yuvQuality.profileDetailAmount) > 1.0e-6f ||
-                  std::abs(bncam::profile_microdetail_transport::decode(yuvQuality.profileDetailDetail)) > 1.0e-6f ||
+                  std::abs(bncam::profile_microdetail_transport::decodeDetail(yuvQuality.profileDetailDetail)) > 1.0e-6f ||
+                  std::abs(bncam::profile_microdetail_transport::decodeLegibility(yuvQuality.profileDetailDetail)) > 1.0e-6f ||
                   std::abs(yuvQuality.profileDetailMasking) > 1.0e-6f
                   ? "true" : "false")
           << ";profileDetailAmount=" << yuvQuality.profileDetailAmount
-          << ";profileDetailRadius=" << yuvQuality.profileDetailRadius
+          << ";profileLegibility="
+          << bncam::profile_microdetail_transport::decodeLegibility(yuvQuality.profileDetailDetail)
+          << ";profileDetailRadiusLegacyNeutral=" << yuvQuality.profileDetailRadius
           << ";profileDetailDetail="
-          << bncam::profile_microdetail_transport::decode(yuvQuality.profileDetailDetail)
+          << bncam::profile_microdetail_transport::decodeDetail(yuvQuality.profileDetailDetail)
           << ";profileDetailMasking=" << yuvQuality.profileDetailMasking
           << ";toneMode=CAMERA2_YUV_IDENTITY_LUMA"
           << ";rawToneDefaultsUsed=false"

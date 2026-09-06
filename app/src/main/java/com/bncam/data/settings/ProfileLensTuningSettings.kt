@@ -55,14 +55,15 @@ object ProfileIspKeys {
     const val PRESENCE_SATURATION = "presence_saturation"
     const val PRESENCE_COLOR_FRINGE_SUPPRESSION = "presence_color_fringe_suppression"
 
-    // Lightroom-style Detail > Sharpening controls. These four keys are the only portable
-    // profile authority for sharpening. The renderer may derive internal implementation
-    // coefficients from them, but those coefficients are never stored as profile settings.
+    // Profile-owned Normal Sharpness controls. Global, Edge, Detail and Legibility are
+    // independent signed authorities. The renderer may derive internal implementation
+    // coefficients/masks from them, but those coefficients are never stored as profile settings.
     const val DETAIL_SHARPENING_METHOD = "detail_sharpening_method"
     const val DETAIL_SHARPENING_AMOUNT = "detail_sharpening_amount"
     const val DETAIL_SHARPENING_RADIUS = "detail_sharpening_radius" // legacy Normal backend radius; hidden in V3 UI
     const val DETAIL_SHARPENING_EDGE = "detail_sharpening_edge"
     const val DETAIL_SHARPENING_DETAIL = "detail_sharpening_detail"
+    const val DETAIL_SHARPENING_LEGIBILITY = "detail_sharpening_legibility"
     const val DETAIL_SHARPENING_MASKING = "detail_sharpening_masking"
 
     const val POLYSHARP_GAIN = "polysharp_gain"
@@ -91,6 +92,7 @@ object ProfilePlannedDefaults {
     // Phase 12 baseline: every profile-owned sharpness control is neutral by default.
     // Capture-detail recovery is a separate physical Phase-11 owner and does not read these values.
     const val EDGE_SHARPNESS = 0.00f
+    const val LEGIBILITY = 0.00f
     const val POLYSHARP_GAIN = 0.00f
     const val POLYSHARP_MACRO_GAIN = 0.00f
     const val POLYSHARP_MICRO_GAIN = 0.00f

@@ -43,21 +43,25 @@ inline float finiteOr(float value, float fallback) noexcept {
  *
  * This is the standalone signed Global Sharpness stage. It does not build or remap a local-tone
  * base, so FLLF remains the sole local exposure/contrast owner. Amount alone controls the effect:
- * negative softens, zero is exact identity, positive sharpens. Radius remains separate. Phase 3
- * owns Detail as an independent signed microtexture authority; Phase 2 uses the legacy masking
- * transport field exclusively for signed standalone Edge authority. Neither scales Global Sharpness.
+ * negative softens, zero is exact identity, positive sharpens. Phase 4 retires the old Radius
+ * pixel meaning. Phase 3 Detail and Phase 4 Legibility are multiplexed into the old Detail ABI
+ * slot using a legacy-safe negative-only packed transport; old unsigned consumers therefore stay
+ * neutral. Phase 2 uses the masking transport field for signed standalone Edge authority. None
+ * scales Global Sharpness.
  * Physical noise is only an internal safety hint.
  */
 inline Plan resolve(Controls controls, NoiseEvidence noise) noexcept {
     controls.amount = std::clamp(finiteOr(controls.amount, 0.0f), -1.0f, 1.0f);
-    controls.detail = bncam::profile_microdetail_transport::decode(controls.detail);
+    const float packedDetailLegibility = controls.detail;
+    controls.detail = bncam::profile_microdetail_transport::decodeDetail(packedDetailLegibility);
+    controls.radius = bncam::profile_microdetail_transport::decodeLegibility(packedDetailLegibility);
     controls.masking = std::clamp(finiteOr(controls.masking, 0.0f), -1.0f, 1.0f);
     noise.displayLumaSigma = std::max(0.0f, finiteOr(noise.displayLumaSigma, 0.0f));
 
     Plan out{};
-    if (std::abs(controls.amount) <= 1.0e-4f && std::abs(controls.detail) <= 1.0e-4f &&
-        std::abs(controls.masking) <= 1.0e-4f) {
-        out.authoritySource = "PROFILE_SHARPNESS_EDGE_DETAIL_ZERO";
+    if (std::abs(controls.amount) <= 1.0e-4f && std::abs(controls.radius) <= 1.0e-4f &&
+        std::abs(controls.detail) <= 1.0e-4f && std::abs(controls.masking) <= 1.0e-4f) {
+        out.authoritySource = "PROFILE_SHARPNESS_EDGE_DETAIL_LEGIBILITY_ZERO";
         return out;
     }
 
@@ -66,7 +70,8 @@ inline Plan resolve(Controls controls, NoiseEvidence noise) noexcept {
     // Physical display-domain sigma is useful as an internal noise guard when available, but
     // missing metadata may not disable the user-requested effect.
     out.authority = controls.amount;
-    out.radius = 1.0f;
+    // Phase 4: signed text/glyph Legibility was decoded from the packed legacy Detail ABI field.
+    out.radius = controls.radius;
     // Phase 3: independent signed microtexture authority. It is transported alongside
     // Global Sharpness and Edge but does not multiply or gate either control.
     out.detail = controls.detail;
@@ -83,14 +88,21 @@ inline Plan resolve(Controls controls, NoiseEvidence noise) noexcept {
     out.modelConfidence = 1.0f;
 
     const float positiveSharpness = std::max(0.0f, controls.amount);
+    const float positiveLegibility = std::max(0.0f, controls.radius);
     const float positiveDetail = std::max(0.0f, controls.detail);
     out.predictedLumaVarianceGain = std::clamp(
             1.0f + 0.85f * positiveSharpness * positiveSharpness +
+                    0.24f * positiveLegibility * positiveLegibility +
                     0.42f * positiveDetail * positiveDetail,
             1.0f,
             2.10f);
     out.enabled = true;
-    if (std::abs(controls.detail) > 1.0e-4f && std::abs(controls.amount) <= 1.0e-4f &&
+    if (std::abs(controls.radius) > 1.0e-4f && std::abs(controls.amount) <= 1.0e-4f &&
+        std::abs(controls.detail) <= 1.0e-4f && std::abs(controls.masking) <= 1.0e-4f) {
+        out.authoritySource = controls.radius < 0.0f
+                ? "PROFILE_LEGIBILITY_SOFTEN"
+                : "PROFILE_LEGIBILITY_SHARPEN";
+    } else if (std::abs(controls.detail) > 1.0e-4f && std::abs(controls.amount) <= 1.0e-4f &&
         std::abs(controls.masking) <= 1.0e-4f) {
         out.authoritySource = controls.detail < 0.0f
                 ? "PROFILE_MICRODETAIL_REDUCE"

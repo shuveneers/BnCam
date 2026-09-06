@@ -486,10 +486,78 @@ float edgeNeutralYAtOutput(int outputX, int outputY) {
     return float(toneLut.values[index] & 0xffu) / 255.0;
 }
 
-float profileEdgeYAtOutput(uint outputX, uint outputY) {
+float decodeSigned10Yuv(uint code) {
+    code = min(code, 1023u);
+    return code >= 512u
+            ? clamp(float(code - 512u) / 511.0, 0.0, 1.0)
+            : clamp((float(code) - 512.0) / 512.0, -1.0, 0.0);
+}
+
+uint packedDetailLegibilityYuv(float transport) {
+    if (transport >= -1.0e-7) return 0u;
+    float payload = (-clamp(transport, -1.0, 0.0) * 1048577.0) - 1.0;
+    return uint(clamp(roundEven(payload), 0.0, 1048575.0));
+}
+
+float packedDetailAuthorityYuv(float transport) {
+    if (transport >= -1.0e-7) return 0.0;
+    return decodeSigned10Yuv(packedDetailLegibilityYuv(transport) & 1023u);
+}
+
+float packedLegibilityAuthorityYuv(float transport) {
+    if (transport >= -1.0e-7) return 0.0;
+    return decodeSigned10Yuv((packedDetailLegibilityYuv(transport) >> 10u) & 1023u);
+}
+
+float glyphTripletEvidenceYuv(float a, float b, float c, float sigma) {
+    float leftStep = b - a;
+    float rightStep = c - b;
+    float residual = abs(b - 0.5 * (a + c));
+    float contrast = abs(leftStep) + abs(rightStep);
+    float residualGate = smoothstep(max(0.006, 1.35 * sigma),
+                                    max(0.030, 4.50 * sigma), residual);
+    float opposingEnergy = max(0.0, -(leftStep * rightStep));
+    float opposingGate = smoothstep(pow(max(0.004, 0.90 * sigma), 2.0),
+                                    pow(max(0.020, 3.40 * sigma), 2.0), opposingEnergy);
+    float sideAsymmetry = abs(a - c) / max(contrast, 1.25 * sigma);
+    float symmetryGate = 1.0 - smoothstep(0.34, 0.92, sideAsymmetry);
+    return residualGate * opposingGate * symmetryGate;
+}
+
+// Two-pixel stroke/ridge evidence: bright-dark-dark-bright (or inverse). This lets Legibility
+// and Detail see thicker glyph strokes, flower veins and material seams without treating a
+// monotonic object boundary as a ridge.
+float pairedRidgeWidth2EvidenceYuv(float a, float b, float c, float d, float sigma) {
+    float core = 0.5 * (b + c);
+    float sides = 0.5 * (a + d);
+    float contrast = abs(core - sides);
+    float contrastGate = smoothstep(max(0.006, 1.35 * sigma),
+                                    max(0.030, 4.50 * sigma), contrast);
+    float coreMismatch = abs(b - c) / max(contrast, 1.25 * sigma);
+    float sideMismatch = abs(a - d) / max(contrast, 1.25 * sigma);
+    float coreGate = 1.0 - smoothstep(0.18, 0.72, coreMismatch);
+    float sideGate = 1.0 - smoothstep(0.24, 0.84, sideMismatch);
+    float opposingEnergy = max(0.0, -((b - a) * (d - c)));
+    float opposingGate = smoothstep(pow(max(0.004, 0.90 * sigma), 2.0),
+                                    pow(max(0.020, 3.40 * sigma), 2.0), opposingEnergy);
+    return contrastGate * coreGate * sideGate * opposingGate;
+}
+
+struct ProfileEdgeResult {
+    float y;
+    float textMask;
+    // Narrow paired-edge ridge/crease evidence (hair, petal vein, fabric seam, engraving).
+    // Actual glyphs are removed by textMask before Detail can own this class.
+    float microRidgeMask;
+};
+
+ProfileEdgeResult profileEdgeYAtOutput(uint outputX, uint outputY) {
     float authority = clamp(pc.profileDetailMasking, -1.0, 1.0);
+    float legibilityAuthority = packedLegibilityAuthorityYuv(pc.profileDetailDetail);
     float base = toneMappedYAtOutput(int(outputX), int(outputY));
-    if (abs(authority) <= 1.0e-6) return base;
+    bool anySharpnessOwner = abs(authority) > 1.0e-6 || abs(legibilityAuthority) > 1.0e-6 ||
+            abs(pc.profileDetailAmount) > 1.0e-6 || abs(pc.profileDetailDetail) > 1.0e-7;
+    if (!anySharpnessOwner) return ProfileEdgeResult(base, 0.0, 0.0);
 
     int x = int(outputX);
     int y = int(outputY);
@@ -541,6 +609,133 @@ float profileEdgeYAtOutput(uint outputX, uint outputY) {
             max(energy, 1.0e-8);
 
     float sigma = max(yuvMeasuredSigmaY(), 1.0 / 255.0);
+
+    // Phase 4 text/glyph ownership reuses the already loaded Edge neighbourhood, so YUV pays
+    // no additional texture/tone sampling. Paired polarity-reversing strokes are preferred;
+    // broad monotonic contours are rejected before the mask can suppress Edge/Detail/Global.
+    float glyphX = max(glyphTripletEvidenceYuv(w, c, e, sigma),
+                       max(glyphTripletEvidenceYuv(w2, w, c, sigma),
+                           glyphTripletEvidenceYuv(c, e, e2, sigma)));
+    glyphX = max(glyphX, 0.92 * max(
+            pairedRidgeWidth2EvidenceYuv(w2, w, c, e, sigma),
+            pairedRidgeWidth2EvidenceYuv(w, c, e, e2, sigma)));
+    float glyphY = max(glyphTripletEvidenceYuv(n, c, s, sigma),
+                       max(glyphTripletEvidenceYuv(n2, n, c, sigma),
+                           glyphTripletEvidenceYuv(c, s, s2, sigma)));
+    glyphY = max(glyphY, 0.92 * max(
+            pairedRidgeWidth2EvidenceYuv(n2, n, c, s, sigma),
+            pairedRidgeWidth2EvidenceYuv(n, c, s, s2, sigma)));
+    float glyphDiagA = glyphTripletEvidenceYuv(nw, c, se, sigma);
+    float glyphDiagB = glyphTripletEvidenceYuv(ne, c, sw, sigma);
+    float glyphPrimary = max(max(glyphX, glyphY), max(glyphDiagA, glyphDiagB));
+    float glyphSecondary = max(min(glyphX, glyphY),
+                               max(min(glyphX, max(glyphDiagA, glyphDiagB)),
+                                   min(glyphY, max(glyphDiagA, glyphDiagB))));
+    float glyphComplexity = max(0.46 * glyphPrimary, sqrt(max(0.0, glyphPrimary * glyphSecondary)));
+    float localMinGlyph = min(c, min(min(min(n, s), min(w, e)), min(min(nw, ne), min(sw, se))));
+    float localMaxGlyph = max(c, max(max(max(n, s), max(w, e)), max(max(nw, ne), max(sw, se))));
+    float glyphRange = max(0.0, localMaxGlyph - localMinGlyph);
+    float monotonicPersistence = broadGradient / max(gradient, 1.25 * sigma);
+    float broadMonotonicReject = smoothstep(0.34, 0.72, monotonicPersistence) *
+            smoothstep(max(0.010, 1.6 * sigma), max(0.042, 5.0 * sigma), gradient);
+    float glyphRangeGate = smoothstep(3.0, 7.0, glyphRange / sigma);
+    float glyphCrossMean = 0.25 * (n + s + w + e);
+    float glyphDiagMean = 0.25 * (nw + ne + sw + se);
+    float glyphCrossOscillation = abs(c - glyphCrossMean);
+    float glyphDiagonalEchoRatio = abs(c - glyphDiagMean) / max(glyphCrossOscillation, 1.25 * sigma);
+    float glyphAxisIsotropy = min(glyphX, glyphY) / max(max(glyphX, glyphY), 1.0e-6);
+    float glyphCheckerReject = smoothstep(max(0.006, 1.4 * sigma),
+                                          max(0.028, 4.5 * sigma), glyphCrossOscillation) *
+            (1.0 - smoothstep(0.12, 0.42, glyphDiagonalEchoRatio)) *
+            smoothstep(0.42, 0.82, glyphAxisIsotropy);
+    float glyphXFineOscillation = abs(c - 0.5 * (w + e));
+    float glyphYFineOscillation = abs(c - 0.5 * (n + s));
+    float glyphXEchoRatio = abs(c - 0.5 * (w2 + e2)) / max(glyphXFineOscillation, 1.25 * sigma);
+    float glyphYEchoRatio = abs(c - 0.5 * (n2 + s2)) / max(glyphYFineOscillation, 1.25 * sigma);
+    float glyphPeriod2Reject = max(
+            smoothstep(max(0.006, 1.4 * sigma), max(0.028, 4.5 * sigma), glyphXFineOscillation) *
+                    (1.0 - smoothstep(0.14, 0.48, glyphXEchoRatio)),
+            smoothstep(max(0.006, 1.4 * sigma), max(0.028, 4.5 * sigma), glyphYFineOscillation) *
+                    (1.0 - smoothstep(0.14, 0.48, glyphYEchoRatio)));
+    float glyphTextureReject = clamp(max(glyphCheckerReject, glyphPeriod2Reject), 0.0, 1.0);
+
+    // Precision-first text ownership with compact tangent-continuity rejection. A hair, wire
+    // or scratch can have the same cross-section as one letter stroke, but it normally stays
+    // unchanged along its tangent. Glyph corners/endings/junctions break that continuity. Keep
+    // this compact on YUV: all inputs are already resident Edge samples and no extra texture or
+    // tone lookup is performed here.
+    float glyphSimilarityLow = max(0.004, 1.15 * sigma);
+    float glyphSimilarityHigh = max(0.020, 3.60 * sigma);
+    float verticalTangentVariation = max(max(abs(n - c), abs(s - c)),
+            max(0.72 * max(abs(n2 - c), abs(s2 - c)), 0.46 * max(abs(n4 - c), abs(s4 - c))));
+    float horizontalTangentVariation = max(max(abs(w - c), abs(e - c)),
+            max(0.72 * max(abs(w2 - c), abs(e2 - c)), 0.46 * max(abs(w4 - c), abs(e4 - c))));
+    float verticalContinuity = 1.0 - smoothstep(glyphSimilarityLow, glyphSimilarityHigh,
+                                                verticalTangentVariation);
+    float horizontalContinuity = 1.0 - smoothstep(glyphSimilarityLow, glyphSimilarityHigh,
+                                                  horizontalTangentVariation);
+    float verticalCrossContrast = smoothstep(max(0.008, 1.5 * sigma), max(0.034, 4.8 * sigma),
+                                             0.5 * (abs(w - c) + abs(e - c)));
+    float horizontalCrossContrast = smoothstep(max(0.008, 1.5 * sigma), max(0.034, 4.8 * sigma),
+                                               0.5 * (abs(n - c) + abs(s - c)));
+    float verticalRidgeReject = smoothstep(0.58, 0.88, verticalContinuity) *
+            verticalCrossContrast * smoothstep(0.40, 0.78, glyphX);
+    float horizontalRidgeReject = smoothstep(0.58, 0.88, horizontalContinuity) *
+            horizontalCrossContrast * smoothstep(0.40, 0.78, glyphY);
+
+    float diagATangentVariation = max(abs(ne - c), abs(sw - c));
+    float diagBTangentVariation = max(abs(nw - c), abs(se - c));
+    float diagAContinuity = 1.0 - smoothstep(glyphSimilarityLow, glyphSimilarityHigh,
+                                             diagATangentVariation);
+    float diagBContinuity = 1.0 - smoothstep(glyphSimilarityLow, glyphSimilarityHigh,
+                                             diagBTangentVariation);
+    float diagonalRidgeReject = max(
+            smoothstep(0.68, 0.92, diagAContinuity) * smoothstep(0.40, 0.78, glyphDiagA),
+            smoothstep(0.68, 0.92, diagBContinuity) * smoothstep(0.40, 0.78, glyphDiagB));
+    float isolatedLineReject = clamp(max(max(verticalRidgeReject, horizontalRidgeReject),
+                                         diagonalRidgeReject), 0.0, 1.0);
+
+    float textMask = smoothstep(0.26, 0.62, glyphComplexity * glyphRangeGate) *
+            (1.0 - 0.92 * clamp(broadMonotonicReject, 0.0, 1.0)) *
+            (1.0 - glyphTextureReject) *
+            (1.0 - isolatedLineReject);
+    textMask = clamp(textMask, 0.0, 1.0);
+    // Once a candidate has credible glyph topology, turn it into ownership rather than allowing
+    // Edge/Detail/Global to stack partially on the same letter pixels.
+    textMask = smoothstep(0.16, 0.48, textMask);
+    float nonTextMask = 1.0 - textMask;
+
+    // Material micro-seam ownership. Reuse the paired-edge stroke evidence before the
+    // precision-first text line rejection: once true text is removed, a narrow symmetric ridge
+    // is exactly the structure Detail should retain (petal veins, fabric seams, hair, engraving,
+    // fine grooves). Broad monotonic object boundaries remain rejected.
+    float microRidgeMask = smoothstep(0.20, 0.58, glyphPrimary * glyphRangeGate) *
+            (1.0 - 0.88 * clamp(broadMonotonicReject, 0.0, 1.0)) *
+            (1.0 - 0.92 * glyphTextureReject) * nonTextMask;
+    microRidgeMask = clamp(microRidgeMask, 0.0, 1.0);
+
+    float legibilityY = base;
+    if (abs(legibilityAuthority) > 1.0e-6 && textMask > 1.0e-4) {
+        float crossMeanGlyph = 0.25 * (n + s + w + e);
+        float diagMeanGlyph = 0.25 * (nw + ne + sw + se);
+        float farMeanGlyph = 0.25 * (n2 + s2 + w2 + e2);
+        float glyphBase = 0.50 * crossMeanGlyph + 0.30 * diagMeanGlyph + 0.20 * farMeanGlyph;
+        float glyphResidual = c - glyphBase;
+        float strength = pow(abs(legibilityAuthority), 0.76) * textMask;
+        if (legibilityAuthority < 0.0) {
+            legibilityY = base - glyphResidual * (0.90 * strength);
+        } else {
+            float rawGlyphDelta = glyphResidual * (0.50 + 1.35 * legibilityAuthority) * strength;
+            float cap = min(0.090, 0.010 + 0.30 * glyphRange);
+            legibilityY = base + clamp(rawGlyphDelta, -cap, cap);
+        }
+        legibilityY = clamp(legibilityY, 0.0, 1.0);
+    }
+
+    if (abs(authority) <= 1.0e-6 || nonTextMask <= 1.0e-4) {
+        return ProfileEdgeResult(legibilityY, textMask, microRidgeMask);
+    }
+
     float fineGradientGate = smoothstep(max(0.012, 1.90 * sigma),
                                         max(0.045, 5.80 * sigma), gradient);
     float coarseGradientGate = smoothstep(max(0.008, 1.35 * sigma),
@@ -553,106 +748,147 @@ float profileEdgeYAtOutput(uint outputX, uint outputY) {
     float persistenceGate = smoothstep(0.20, 0.48, scalePersistence);
     float broadPersistenceGate = smoothstep(0.08, 0.22, broadPersistence);
 
-    // Resolve opposite sides of the edge normal and estimate their plateaus. Negative Edge
-    // increases the effective radius by trusting farther samples; positive Edge tightens it.
+    // Resolve the edge normal continuously. The previous hard cardinal/diagonal branch could
+    // flip orientation between adjacent pixels and create doubled contour lines. Blend cardinal
+    // and diagonal support instead, then reconstruct the immediate neighbours through the SAME
+    // transition model. The center is constrained to that reconstructed monotonic corridor.
     float ax = abs(gx);
     float ay = abs(gy);
-    float diagonalRatio = min(ax, ay) / max(max(ax, ay), 1.0e-6);
-    float minus1;
-    float plus1;
-    float minus2;
-    float plus2;
-    float minus4;
-    float plus4;
-    if (diagonalRatio > 0.58) {
-        if (gx * gy >= 0.0) {
-            if (gx >= 0.0) {
-                minus1 = nw; plus1 = se;
-                minus2 = 0.5 * (w2 + n2); plus2 = 0.5 * (e2 + s2);
-                minus4 = 0.5 * (w4 + n4); plus4 = 0.5 * (e4 + s4);
-            } else {
-                minus1 = se; plus1 = nw;
-                minus2 = 0.5 * (e2 + s2); plus2 = 0.5 * (w2 + n2);
-                minus4 = 0.5 * (e4 + s4); plus4 = 0.5 * (w4 + n4);
-            }
-        } else {
-            if (gx >= 0.0) {
-                minus1 = sw; plus1 = ne;
-                minus2 = 0.5 * (w2 + s2); plus2 = 0.5 * (e2 + n2);
-                minus4 = 0.5 * (w4 + s4); plus4 = 0.5 * (e4 + n4);
-            } else {
-                minus1 = ne; plus1 = sw;
-                minus2 = 0.5 * (e2 + n2); plus2 = 0.5 * (w2 + s2);
-                minus4 = 0.5 * (e4 + n4); plus4 = 0.5 * (w4 + s4);
-            }
-        }
-    } else if (ax >= ay) {
-        if (gx >= 0.0) {
-            minus1 = w; plus1 = e; minus2 = w2; plus2 = e2; minus4 = w4; plus4 = e4;
-        } else {
-            minus1 = e; plus1 = w; minus2 = e2; plus2 = w2; minus4 = e4; plus4 = w4;
-        }
+    float axisSum = max(ax + ay, 1.0e-6);
+    float wx = ax / axisSum;
+    float wy = ay / axisSum;
+    float diagonalBlend = 0.68 * smoothstep(0.18, 0.86, 2.0 * min(wx, wy));
+
+    float xMinus1 = gx >= 0.0 ? w : e;
+    float xPlus1 = gx >= 0.0 ? e : w;
+    float xMinus2 = gx >= 0.0 ? w2 : e2;
+    float xPlus2 = gx >= 0.0 ? e2 : w2;
+    float xMinus4 = gx >= 0.0 ? w4 : e4;
+    float xPlus4 = gx >= 0.0 ? e4 : w4;
+    float yMinus1 = gy >= 0.0 ? n : s;
+    float yPlus1 = gy >= 0.0 ? s : n;
+    float yMinus2 = gy >= 0.0 ? n2 : s2;
+    float yPlus2 = gy >= 0.0 ? s2 : n2;
+    float yMinus4 = gy >= 0.0 ? n4 : s4;
+    float yPlus4 = gy >= 0.0 ? s4 : n4;
+
+    float diagonalMinus1;
+    float diagonalPlus1;
+    if (gx >= 0.0) {
+        if (gy >= 0.0) { diagonalMinus1 = nw; diagonalPlus1 = se; }
+        else           { diagonalMinus1 = sw; diagonalPlus1 = ne; }
     } else {
-        if (gy >= 0.0) {
-            minus1 = n; plus1 = s; minus2 = n2; plus2 = s2; minus4 = n4; plus4 = s4;
-        } else {
-            minus1 = s; plus1 = n; minus2 = s2; plus2 = n2; minus4 = s4; plus4 = n4;
-        }
+        if (gy >= 0.0) { diagonalMinus1 = ne; diagonalPlus1 = sw; }
+        else           { diagonalMinus1 = se; diagonalPlus1 = nw; }
     }
 
+    float minus1 = mix(wx * xMinus1 + wy * yMinus1, diagonalMinus1, diagonalBlend);
+    float plus1 = mix(wx * xPlus1 + wy * yPlus1, diagonalPlus1, diagonalBlend);
+    float minus2 = wx * xMinus2 + wy * yMinus2;
+    float plus2 = wx * xPlus2 + wy * yPlus2;
+    float minus4 = wx * xMinus4 + wy * yMinus4;
+    float plus4 = wx * xPlus4 + wy * yPlus4;
+
     float radiusAuthority = pow(abs(authority), 0.78);
-    float farWeight = authority < 0.0
-            ? mix(0.38, 0.62, radiusAuthority)
-            : mix(0.38, 0.28, radiusAuthority);
-    float nearWeight = authority < 0.0
-            ? mix(0.22, 0.12, radiusAuthority)
-            : mix(0.22, 0.30, radiusAuthority);
+
+    // Negative Edge is a TRUE directional soft-radius operation, not a profile remap.
+    // Blur only across the detected edge normal; never along the tangent. This removes the
+    // hard original contour itself instead of drawing a softened mask beside it. The support
+    // deliberately reaches +/-4 px so -1.00 produces visibly broad, clean edge softness.
+    if (authority < 0.0) {
+        float softMinus1 = wx * xMinus1 + wy * yMinus1;
+        float softPlus1 = wx * xPlus1 + wy * yPlus1;
+        float softMinus2 = wx * xMinus2 + wy * yMinus2;
+        float softPlus2 = wx * xPlus2 + wy * yPlus2;
+        float softMinus4 = wx * xMinus4 + wy * yMinus4;
+        float softPlus4 = wx * xPlus4 + wy * yPlus4;
+
+        // Narrow and broad normalized 1D low-pass kernels. Both preserve DC exactly.
+        float narrowSoft = 0.52 * legibilityY +
+                0.19 * (softMinus1 + softPlus1) +
+                0.05 * (softMinus2 + softPlus2);
+        float broadSoft = 0.24 * legibilityY +
+                0.22 * (softMinus1 + softPlus1) +
+                0.12 * (softMinus2 + softPlus2) +
+                0.04 * (softMinus4 + softPlus4);
+        float softTarget = mix(narrowSoft, broadSoft, radiusAuthority);
+
+        // Use the actual cross-edge span for significance. Unlike the old transitionGate, this
+        // stays active on neighbouring transition pixels so the WHOLE edge is softened together.
+        float softStep = abs(0.50 * (softPlus2 + softPlus4) -
+                             0.50 * (softMinus2 + softMinus4));
+        float softStepGate = smoothstep(max(0.012, 1.80 * sigma),
+                                        max(0.052, 6.20 * sigma), softStep);
+        float supportGradient = max(gradient, 1.35 * coarseGradient);
+        float supportGradientGate = smoothstep(max(0.006, 1.05 * sigma),
+                                               max(0.028, 4.10 * sigma), supportGradient);
+        float directionSupport = smoothstep(0.42, 0.86,
+                                            max(gradientAlignment, broadAlignment));
+        float softStructuralGate = supportGradientGate * coarseGradientGate * broadGradientGate *
+                coherenceGate * directionSupport * softStepGate * nonTextMask;
+
+        float softMix = radiusAuthority * softStructuralGate;
+        float softenedY = mix(legibilityY, softTarget, softMix);
+        return ProfileEdgeResult(clamp(softenedY, 0.0, 1.0), textMask, microRidgeMask);
+    }
+
+    // Positive Edge keeps the approved transition-compression model.
+    float farWeight = mix(0.38, 0.28, radiusAuthority);
+    float nearWeight = mix(0.22, 0.30, radiusAuthority);
     float midWeight = 1.0 - nearWeight - farWeight;
     float plateauMinus = nearWeight * minus1 + midWeight * minus2 + farWeight * minus4;
     float plateauPlus = nearWeight * plus1 + midWeight * plus2 + farWeight * plus4;
+    float signedStep = plateauPlus - plateauMinus;
+    float stepHeight = abs(signedStep);
     float lowPlateau = min(plateauMinus, plateauPlus);
     float highPlateau = max(plateauMinus, plateauPlus);
-    float stepHeight = highPlateau - lowPlateau;
     float stepGate = smoothstep(max(0.014, 2.10 * sigma),
                                 max(0.060, 7.00 * sigma), stepHeight);
-    if (stepHeight <= 1.0e-6) return base;
+    if (stepHeight <= 1.0e-6) return ProfileEdgeResult(legibilityY, textMask, microRidgeMask);
 
-    float t = clamp((c - lowPlateau) / stepHeight, 0.0, 1.0);
+    float t = clamp((c - plateauMinus) / signedStep, 0.0, 1.0);
     float interior = min(t, 1.0 - t);
-    float transitionGate = smoothstep(0.015, 0.115, interior);
+    float transitionGate = smoothstep(0.035, 0.145, interior);
     float profile = 2.0 * t - 1.0;
-    float gamma = authority < 0.0
-            ? mix(1.0, 3.15, radiusAuthority)
-            : mix(1.0, 0.34, radiusAuthority);
+    float gamma = mix(1.0, 0.34, radiusAuthority);
     float remappedProfile = sign(profile) * pow(abs(profile), gamma);
     float targetT = 0.5 + 0.5 * remappedProfile;
-    float targetY = mix(lowPlateau, highPlateau, targetT);
+    float targetY = mix(plateauMinus, plateauPlus, targetT);
+
+    // Positive neighbour reconstruction / slope limiting prevents new double-line extrema.
+    float minusT = clamp((minus1 - plateauMinus) / signedStep, 0.0, 1.0);
+    float plusT = clamp((plus1 - plateauMinus) / signedStep, 0.0, 1.0);
+    float minusProfile = 2.0 * minusT - 1.0;
+    float plusProfile = 2.0 * plusT - 1.0;
+    float reconstructedMinus = mix(plateauMinus, plateauPlus,
+            0.5 + 0.5 * sign(minusProfile) * pow(abs(minusProfile), gamma));
+    float reconstructedPlus = mix(plateauMinus, plateauPlus,
+            0.5 + 0.5 * sign(plusProfile) * pow(abs(plusProfile), gamma));
+    float corridorMin = min(reconstructedMinus, reconstructedPlus);
+    float corridorMax = max(reconstructedMinus, reconstructedPlus);
+    targetY = clamp(targetY, corridorMin, corridorMax);
+
     float structuralGate = fineGradientGate * coarseGradientGate * broadGradientGate *
             coherenceGate * alignmentGate * broadAlignmentGate * persistenceGate *
-            broadPersistenceGate * stepGate * transitionGate;
+            broadPersistenceGate * stepGate * transitionGate * nonTextMask;
     float edgeDelta = (targetY - c) * structuralGate;
-    // Edge changes transition width only; no overshoot/halo is allowed on either sign.
-    return clamp(base + edgeDelta, lowPlateau, highPlateau);
+    float reconstructedY = clamp(legibilityY + edgeDelta, lowPlateau, highPlateau);
+    return ProfileEdgeResult(reconstructedY, textMask, microRidgeMask);
 }
 
 
 // Phase 3 standalone signed Detail. YUV uses a compact 3x3 microtexture classifier so the
 // stage remains lightweight enough for vendor Vulkan drivers. It explicitly prefers
 // high-curvature / low-step-persistence structure and rejects coherent step edges.
-float profileMicroDetailYAtOutput(uint outputX, uint outputY) {
-    // Compatibility transport: exact 0 is neutral; [-1,-0.5) encodes negative Detail and
-    // [-0.5,0) encodes positive Detail without reactivating retired unsigned consumers.
-    float detailTransport = clamp(pc.profileDetailDetail, -1.0, 0.0);
-    float authority = 0.0;
-    if (abs(detailTransport) > 1.0e-7) {
-        authority = detailTransport < -0.5
-                ? clamp(2.0 * (detailTransport + 0.5), -1.0, 0.0)
-                : clamp(-2.0 * detailTransport, 0.0, 1.0);
-    }
+float profileMicroDetailYAtOutput(uint outputX, uint outputY, ProfileEdgeResult edgeResult) {
+    // Phase 4 compatibility transport: signed Detail and signed Legibility share one
+    // negative-only 20-bit payload. Retired unsigned consumers still collapse it to neutral 0.
+    float authority = packedDetailAuthorityYuv(pc.profileDetailDetail);
 
-    // Strict stage order remains Edge -> Detail -> Global Sharpness.
-    float edgeY = profileEdgeYAtOutput(outputX, outputY);
-    if (abs(authority) <= 1.0e-6) return edgeY;
+    // Strict stage order is Legibility -> Edge -> Detail -> Global Sharpness.
+    float edgeY = edgeResult.y;
+    float nonTextMask = 1.0 - edgeResult.textMask;
+    if (abs(authority) <= 1.0e-6 || nonTextMask <= 1.0e-4) return edgeY;
 
     int x = int(outputX);
     int y = int(outputY);
@@ -709,7 +945,16 @@ float profileMicroDetailYAtOutput(uint outputX, uint outputY) {
     float coherentStep = smoothstep(0.50, 0.82, coherence) *
             smoothstep(1.3, 4.0, gradientSnr) *
             smoothstep(0.85, 2.10, firstToSecond);
-    float textureGate = residualGate * rangeGate * (1.0 - clamp(coherentStep, 0.0, 1.0));
+    float baseTextureGate = residualGate * rangeGate *
+            (1.0 - clamp(coherentStep, 0.0, 1.0)) * nonTextMask;
+
+    // Dedicated narrow crease/ridge class. This deliberately survives directional coherence:
+    // a petal vein or fabric seam can be long and directional, but unlike an object boundary it
+    // has opposing flanks around a local ridge/valley. Legibility has already removed glyphs.
+    float seamResidual = max(abs(c - crossMean), abs(c - diagMean));
+    float seamSnrGate = smoothstep(1.30, 3.10, seamResidual / sigma);
+    float seamTextureGate = edgeResult.microRidgeMask * seamSnrGate * rangeGate * nonTextMask;
+    float textureGate = max(baseTextureGate, seamTextureGate);
     float strength = pow(abs(authority), 0.78);
 
     if (authority < 0.0) {
@@ -743,9 +988,11 @@ float profileMicroDetailYAtOutput(uint outputX, uint outputY) {
 
 float profileDetailedYAtOutput(uint outputX, uint outputY) {
     float amount = clamp(pc.profileDetailAmount, -1.0, 1.0);
-    // Strict order: Edge -> Detail -> Global Sharpness.
-    float center = profileMicroDetailYAtOutput(outputX, outputY);
-    if (abs(amount) <= 1.0e-6) return center;
+    // Strict order: Legibility -> Edge -> Detail -> Global Sharpness.
+    ProfileEdgeResult edgeResult = profileEdgeYAtOutput(outputX, outputY);
+    float center = profileMicroDetailYAtOutput(outputX, outputY, edgeResult);
+    float nonTextMask = 1.0 - edgeResult.textMask;
+    if (abs(amount) <= 1.0e-6 || nonTextMask <= 1.0e-4) return center;
 
     int x = int(outputX);
     int y = int(outputY);
@@ -797,7 +1044,7 @@ float profileDetailedYAtOutput(uint outputX, uint outputY) {
         float softY = sum / max(weightSum, 1.0e-6);
         float broadY = 0.46 * softY + 0.34 * boxMean + 0.20 * farCross;
         float softBlend = 0.94 * pow(softness, 0.78);
-        return clamp(mix(center, broadY, softBlend), 0.0, 1.0);
+        return clamp(mix(center, broadY, softBlend * nonTextMask), 0.0, 1.0);
     }
 
     float fineMean = 0.68 * crossMean + 0.32 * boxMean;
@@ -814,7 +1061,7 @@ float profileDetailedYAtOutput(uint outputX, uint outputY) {
     float sharpStrength = amount * (1.05 + 1.75 * amount);
     float rawDelta = highPass * sharpStrength * structureGate;
     float adaptiveHalo = min(0.14, 0.018 + 0.46 * localRange);
-    float delta = clamp(rawDelta, -adaptiveHalo, adaptiveHalo);
+    float delta = clamp(rawDelta, -adaptiveHalo, adaptiveHalo) * nonTextMask;
     return clamp(center + delta, 0.0, 1.0);
 }
 
