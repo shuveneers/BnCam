@@ -534,8 +534,8 @@ fun ProfileSharpnessSettingsScreen(
                     repo = repo,
                     profileId = profileId,
                     key = ProfileIspKeys.DETAIL_SHARPENING_DETAIL,
-                    title = "Detail (not connected)",
-                    description = "Reserved for the separate Detail phase. It does not affect Global Sharpness.",
+                    title = "Detail",
+                    description = "Standalone signed microdetail control. -1.00 reduces qualified fine texture without softening structural edges, 0.00 is exact neutral, and +1.00 restores/enhances credible microtexture. Edge remains independent and Global Sharpness is applied afterwards.",
                     defaultValue = ProfileDetailDefaults.DETAIL,
                     valueRange = -1f..1f,
                     formatter = { value -> String.format(Locale.US, "%+.2f", value) }

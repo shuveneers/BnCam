@@ -24,6 +24,7 @@
 #include "DngMerger.h"
 #include "NativeRenderQualityConfig.h"
 #include "ProfileNoiseReductionPolicy.h"
+#include "ProfileMicroDetailTransport.h"
 #include "ProfileColorManagement.h"
 #include "IspCore.h"
 #include "RawCfaLevelMapping.h"
@@ -432,7 +433,7 @@ NativeRenderQualityConfig makeQualityConfig(
     cfg.profilePresenceVibrance = std::isfinite(profilePresenceVibrance) ? std::clamp(profilePresenceVibrance, -1.0f, 1.0f) : 0.0f;
     cfg.profileDetailAmount = std::isfinite(profileDetailAmount) ? std::clamp(profileDetailAmount, -1.0f, 1.0f) : bncam::profile_defaults::kDetailAmount;
     cfg.profileDetailRadius = std::isfinite(profileDetailRadius) ? std::clamp(profileDetailRadius, bncam::profile_defaults::kDetailMinRadius, bncam::profile_defaults::kDetailMaxRadius) : bncam::profile_defaults::kDetailRadius;
-    cfg.profileDetailDetail = std::isfinite(profileDetailDetail) ? std::clamp(profileDetailDetail, 0.0f, 1.0f) : bncam::profile_defaults::kDetailDetail;
+    cfg.profileDetailDetail = bncam::profile_microdetail_transport::encode(profileDetailDetail);
     cfg.profileDetailMasking = std::isfinite(profileDetailMasking) ? std::clamp(profileDetailMasking, -1.0f, 1.0f) : bncam::profile_defaults::kDetailMasking;
 
     cfg.noiseModelCalibrationAdjustment = std::isfinite(noiseModelCalibrationAdjustment)
@@ -1857,9 +1858,8 @@ Java_com_bncam_core_engine_ImageUtils_renderRawPreviewNative(
             ? std::clamp(static_cast<float>(profileDetailRadius),
                          bncam::profile_defaults::kDetailMinRadius, bncam::profile_defaults::kDetailMaxRadius)
             : bncam::profile_defaults::kDetailRadius;
-    quality.profileDetailDetail = std::isfinite(profileDetailDetail)
-            ? std::clamp(static_cast<float>(profileDetailDetail), 0.0f, 1.0f)
-            : bncam::profile_defaults::kDetailDetail;
+    quality.profileDetailDetail = bncam::profile_microdetail_transport::encode(
+            static_cast<float>(profileDetailDetail));
     quality.profileDetailMasking = std::isfinite(profileDetailMasking)
             ? std::clamp(static_cast<float>(profileDetailMasking), -1.0f, 1.0f)
             : bncam::profile_defaults::kDetailMasking;
@@ -2355,7 +2355,7 @@ Java_com_bncam_core_engine_ImageUtils_processNativeYuv(
     yuvQuality.profileDetailRadius = std::isfinite(profileDetailRadius)
             ? std::clamp(profileDetailRadius, 0.0f, bncam::profile_defaults::kDetailMaxRadius)
             : bncam::profile_defaults::kDetailRadius;
-    yuvQuality.profileDetailDetail = std::isfinite(profileDetailDetail) ? std::clamp(profileDetailDetail, 0.0f, 1.0f) : bncam::profile_defaults::kDetailDetail;
+    yuvQuality.profileDetailDetail = bncam::profile_microdetail_transport::encode(profileDetailDetail);
     yuvQuality.profileDetailMasking = std::isfinite(profileDetailMasking) ? std::clamp(profileDetailMasking, -1.0f, 1.0f) : bncam::profile_defaults::kDetailMasking;
     yuvQuality.profileNrLuminance = std::isfinite(profileNrLuminance) ? std::clamp(profileNrLuminance, 0.0f, 1.0f) : 0.0f;
     yuvQuality.profileNrLuminanceDetail = std::isfinite(profileNrLuminanceDetail) ? std::clamp(profileNrLuminanceDetail, 0.0f, 1.0f) : 0.5f;
@@ -2832,10 +2832,15 @@ Java_com_bncam_core_engine_ImageUtils_processNativeYuv(
                   std::abs(yuvQuality.profileColorContrast) > 1.0e-4f ||
                   std::abs(yuvQuality.profilePresenceVibrance) > 1.0e-4f
                   ? "true" : "false")
-          << ";profileDetailApplied=" << (std::abs(yuvQuality.profileDetailAmount) > 1.0e-6f ? "true" : "false")
+          << ";profileDetailApplied=" << (
+                  std::abs(yuvQuality.profileDetailAmount) > 1.0e-6f ||
+                  std::abs(bncam::profile_microdetail_transport::decode(yuvQuality.profileDetailDetail)) > 1.0e-6f ||
+                  std::abs(yuvQuality.profileDetailMasking) > 1.0e-6f
+                  ? "true" : "false")
           << ";profileDetailAmount=" << yuvQuality.profileDetailAmount
           << ";profileDetailRadius=" << yuvQuality.profileDetailRadius
-          << ";profileDetailDetail=" << yuvQuality.profileDetailDetail
+          << ";profileDetailDetail="
+          << bncam::profile_microdetail_transport::decode(yuvQuality.profileDetailDetail)
           << ";profileDetailMasking=" << yuvQuality.profileDetailMasking
           << ";toneMode=CAMERA2_YUV_IDENTITY_LUMA"
           << ";rawToneDefaultsUsed=false"

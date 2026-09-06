@@ -1496,8 +1496,9 @@ void proposePerceptualDetail(uvec2 gid) {
     vec3 centerRgb = workingAt(x, y);
     float centerY = clamp(lumaOf(centerRgb), 0.0, 1.0);
     float amount = clamp(telemetryFloat(39u, 0.0), -1.0, 1.0);
+    float detailAuthority = clamp(telemetryFloat(41u, 0.0), -1.0, 1.0);
     float edgeAuthority = clamp(telemetryFloat(42u, 0.0), -1.0, 1.0);
-    if (abs(amount) <= 1.0e-6 && abs(edgeAuthority) <= 1.0e-6) {
+    if (abs(amount) <= 1.0e-6 && abs(detailAuthority) <= 1.0e-6 && abs(edgeAuthority) <= 1.0e-6) {
         writeLinearDetailScratch(gid, centerRgb);
         return;
     }
@@ -1668,42 +1669,123 @@ void proposePerceptualDetail(uvec2 gid) {
         }
     }
 
-    // Global Sharpness is intentionally LAST. It sees the Edge-adjusted centre and applies
-    // broad image sharpness/softness afterwards. The controls remain separately authored:
-    // Edge defines contour transition width; Global Sharpness owns general image detail.
-    float proposedY = edgeY;
+    // Phase 3 — standalone signed Detail. Detail owns microtexture only. A candidate must be
+    // significant relative to the measured display noise floor, yet fail the multi-scale
+    // persistence pattern of a structural contour. This explicitly separates hair/fabric/foliage
+    // scale residuals from Edge and from Global Sharpness.
+    float detailY = edgeY;
+    if (abs(detailAuthority) > 1.0e-6) {
+        float gxFine = 0.5 * (r - l);
+        float gyFine = 0.5 * (d - u);
+        float fineGradient = sqrt(max(0.0, gxFine * gxFine + gyFine * gyFine));
+        float gxCoarse = 0.25 * (r2 - l2);
+        float gyCoarse = 0.25 * (d2 - u2);
+        float coarseGradient = sqrt(max(0.0, gxCoarse * gxCoarse + gyCoarse * gyCoarse));
+        float gxBroad = 0.125 * (r4 - l4);
+        float gyBroad = 0.125 * (d4 - u4);
+        float broadGradient = sqrt(max(0.0, gxBroad * gxBroad + gyBroad * gyBroad));
+
+        float microBase = 0.56 * boxMean + 0.29 * crossMean + 0.15 * farCross;
+        float microResidual = edgeY - microBase;
+        float residualSnr = abs(microResidual) / sigma;
+        float rangeSnr = localRange / sigma;
+        float residualGate = smoothstep(1.55, 3.60, residualSnr);
+        float rangeGate = smoothstep(3.6, 8.5, rangeSnr);
+
+        float coarseAlignment = clamp((gxFine * gxCoarse + gyFine * gyCoarse) /
+                max(fineGradient * coarseGradient, 1.0e-8), -1.0, 1.0);
+        float broadAlignment = clamp((gxFine * gxBroad + gyFine * gyBroad) /
+                max(fineGradient * broadGradient, 1.0e-8), -1.0, 1.0);
+        float coarsePersistence = coarseGradient / max(fineGradient + abs(microResidual), 1.0e-6);
+        float broadPersistence = broadGradient / max(fineGradient + abs(microResidual), 1.0e-6);
+        float centerContour = smoothstep(0.55, 0.88, coarseAlignment) *
+                smoothstep(0.48, 0.82, broadAlignment) *
+                smoothstep(0.10, 0.24, coarsePersistence) *
+                smoothstep(0.035, 0.10, broadPersistence) *
+                smoothstep(max(0.008, 1.30 * sigma), max(0.032, 4.50 * sigma), fineGradient);
+        // Dilate structural-edge rejection into the transition neighbourhood. Pixels one or two
+        // samples off a strong contour can have little fine gradient but a large micro residual
+        // because the 2/4-pixel support sees across the edge. Coarse+broad aligned gradients catch
+        // that case without rejecting narrow texture whose response disappears at the broad scale.
+        float coarseBroadAlignment = clamp((gxCoarse * gxBroad + gyCoarse * gyBroad) /
+                max(coarseGradient * broadGradient, 1.0e-8), -1.0, 1.0);
+        float edgeProximity = smoothstep(0.58, 0.90, coarseBroadAlignment) *
+                smoothstep(max(0.006, 0.80 * sigma), max(0.025, 2.50 * sigma), coarseGradient) *
+                smoothstep(max(0.004, 0.60 * sigma), max(0.016, 1.80 * sigma), broadGradient);
+        float coherentContour = max(centerContour, edgeProximity);
+        float edgeReject = 1.0 - clamp(coherentContour, 0.0, 1.0);
+
+        // Very noisy display residuals are allowed to survive naturally, but positive Detail may
+        // not turn them into synthetic texture. Negative Detail still reduces only qualified
+        // microtexture and therefore never becomes a broad denoise/blur stage.
+        float positiveNoiseSafety = 1.0 - 0.72 * smoothstep(0.018, 0.055, sigma);
+        float textureGate = residualGate * rangeGate * edgeReject;
+
+        // Do not boost period-2/Nyquist zipper structure. A true micro feature normally changes
+        // across scale; a demosaic/checker echo returns to the centre value two samples away.
+        // Negative Detail may still reduce this energy, but positive Detail never amplifies it.
+        float xFineOscillation = abs(edgeY - 0.5 * (l + r));
+        float yFineOscillation = abs(edgeY - 0.5 * (u + d));
+        float xEchoRatio = abs(edgeY - 0.5 * (l2 + r2)) / max(xFineOscillation, 1.0e-6);
+        float yEchoRatio = abs(edgeY - 0.5 * (u2 + d2)) / max(yFineOscillation, 1.0e-6);
+        float xNyquistEcho = smoothstep(max(0.006, 1.40 * sigma), max(0.025, 4.20 * sigma), xFineOscillation) *
+                (1.0 - smoothstep(0.16, 0.62, xEchoRatio));
+        float yNyquistEcho = smoothstep(max(0.006, 1.40 * sigma), max(0.025, 4.20 * sigma), yFineOscillation) *
+                (1.0 - smoothstep(0.16, 0.62, yEchoRatio));
+        float positiveTextureGate = textureGate * (1.0 - clamp(max(xNyquistEcho, yNyquistEcho), 0.0, 1.0));
+
+        float signedStrength = pow(abs(detailAuthority), 0.78);
+        if (detailAuthority > 0.0) {
+            float detailGain = (0.55 + 1.05 * detailAuthority) * signedStrength * positiveNoiseSafety;
+            float rawDetailDelta = microResidual * detailGain * positiveTextureGate;
+            float detailCap = min(0.080, 0.010 + 0.28 * localRange);
+            float detailDelta = clamp(rawDetailDelta, -detailCap, detailCap);
+            detailY = clamp(edgeY + detailDelta, localMin, localMax);
+            if (abs(detailDelta - rawDetailDelta) > 1.0e-7) atomicAdd(telemetry[52], 1u);
+        } else {
+            float reduceBlend = 0.90 * signedStrength * textureGate;
+            detailY = mix(edgeY, microBase, reduceBlend);
+        }
+        if (textureGate > 0.18) atomicAdd(telemetry[50], 1u);
+        if (residualGate < 0.05 || rangeGate < 0.05) atomicAdd(telemetry[51], 1u);
+    }
+
+    // Global Sharpness is intentionally LAST. It sees Edge first and then Detail. Global
+    // Sharpness may alter overall perceived sharpness, but it does not redefine which pixels
+    // qualify as microtexture or structural edges.
+    float proposedY = detailY;
     if (amount < 0.0) {
         float softness = pow(clamp(-amount, 0.0, 1.0), 0.72);
         float edgeSigma = mix(0.040, 0.115, softness);
         float inv2EdgeSigmaSq = 1.0 / max(2.0 * edgeSigma * edgeSigma, 1.0e-6);
         float centerWeight = mix(2.40, 0.65, softness);
-        float sum = edgeY * centerWeight;
+        float sum = detailY * centerWeight;
         float weightSum = centerWeight;
 
         float dv;
         float wgt;
-        dv = l - edgeY; wgt = 1.00 * exp(-dv * dv * inv2EdgeSigmaSq); sum += l * wgt; weightSum += wgt;
-        dv = r - edgeY; wgt = 1.00 * exp(-dv * dv * inv2EdgeSigmaSq); sum += r * wgt; weightSum += wgt;
-        dv = u - edgeY; wgt = 1.00 * exp(-dv * dv * inv2EdgeSigmaSq); sum += u * wgt; weightSum += wgt;
-        dv = d - edgeY; wgt = 1.00 * exp(-dv * dv * inv2EdgeSigmaSq); sum += d * wgt; weightSum += wgt;
-        dv = ul - edgeY; wgt = 0.72 * exp(-dv * dv * inv2EdgeSigmaSq); sum += ul * wgt; weightSum += wgt;
-        dv = ur - edgeY; wgt = 0.72 * exp(-dv * dv * inv2EdgeSigmaSq); sum += ur * wgt; weightSum += wgt;
-        dv = dl - edgeY; wgt = 0.72 * exp(-dv * dv * inv2EdgeSigmaSq); sum += dl * wgt; weightSum += wgt;
-        dv = dr - edgeY; wgt = 0.72 * exp(-dv * dv * inv2EdgeSigmaSq); sum += dr * wgt; weightSum += wgt;
-        dv = l2 - edgeY; wgt = 0.46 * exp(-dv * dv * inv2EdgeSigmaSq); sum += l2 * wgt; weightSum += wgt;
-        dv = r2 - edgeY; wgt = 0.46 * exp(-dv * dv * inv2EdgeSigmaSq); sum += r2 * wgt; weightSum += wgt;
-        dv = u2 - edgeY; wgt = 0.46 * exp(-dv * dv * inv2EdgeSigmaSq); sum += u2 * wgt; weightSum += wgt;
-        dv = d2 - edgeY; wgt = 0.46 * exp(-dv * dv * inv2EdgeSigmaSq); sum += d2 * wgt; weightSum += wgt;
+        dv = l - detailY; wgt = 1.00 * exp(-dv * dv * inv2EdgeSigmaSq); sum += l * wgt; weightSum += wgt;
+        dv = r - detailY; wgt = 1.00 * exp(-dv * dv * inv2EdgeSigmaSq); sum += r * wgt; weightSum += wgt;
+        dv = u - detailY; wgt = 1.00 * exp(-dv * dv * inv2EdgeSigmaSq); sum += u * wgt; weightSum += wgt;
+        dv = d - detailY; wgt = 1.00 * exp(-dv * dv * inv2EdgeSigmaSq); sum += d * wgt; weightSum += wgt;
+        dv = ul - detailY; wgt = 0.72 * exp(-dv * dv * inv2EdgeSigmaSq); sum += ul * wgt; weightSum += wgt;
+        dv = ur - detailY; wgt = 0.72 * exp(-dv * dv * inv2EdgeSigmaSq); sum += ur * wgt; weightSum += wgt;
+        dv = dl - detailY; wgt = 0.72 * exp(-dv * dv * inv2EdgeSigmaSq); sum += dl * wgt; weightSum += wgt;
+        dv = dr - detailY; wgt = 0.72 * exp(-dv * dv * inv2EdgeSigmaSq); sum += dr * wgt; weightSum += wgt;
+        dv = l2 - detailY; wgt = 0.46 * exp(-dv * dv * inv2EdgeSigmaSq); sum += l2 * wgt; weightSum += wgt;
+        dv = r2 - detailY; wgt = 0.46 * exp(-dv * dv * inv2EdgeSigmaSq); sum += r2 * wgt; weightSum += wgt;
+        dv = u2 - detailY; wgt = 0.46 * exp(-dv * dv * inv2EdgeSigmaSq); sum += u2 * wgt; weightSum += wgt;
+        dv = d2 - detailY; wgt = 0.46 * exp(-dv * dv * inv2EdgeSigmaSq); sum += d2 * wgt; weightSum += wgt;
 
         float softY = sum / max(weightSum, 1.0e-6);
         float broadY = 0.46 * softY + 0.34 * boxMean + 0.20 * farCross;
         float softBlend = 0.94 * pow(softness, 0.78);
-        proposedY = mix(edgeY, broadY, softBlend);
+        proposedY = mix(detailY, broadY, softBlend);
     } else if (amount > 0.0) {
         float fineMean = 0.68 * crossMean + 0.32 * boxMean;
         float mediumMean = 0.58 * boxMean + 0.42 * farCross;
-        float highPassFine = edgeY - fineMean;
-        float highPassMedium = edgeY - mediumMean;
+        float highPassFine = detailY - fineMean;
+        float highPassMedium = detailY - mediumMean;
         float highPass = 0.74 * highPassFine + 0.26 * highPassMedium;
 
         float gx = 0.5 * (r - l);
@@ -1721,7 +1803,7 @@ void proposePerceptualDetail(uvec2 gid) {
         float hardHalo = clamp(telemetryFloat(46u, 0.10), 0.025, 0.14);
         float adaptiveHalo = min(hardHalo, 0.018 + 0.46 * localRange);
         float delta = clamp(rawDelta, -adaptiveHalo, adaptiveHalo);
-        proposedY = clamp(edgeY + delta,
+        proposedY = clamp(detailY + delta,
                           max(0.0, localMin - adaptiveHalo),
                           min(1.0, localMax + adaptiveHalo));
         if (abs(delta - rawDelta) > 1.0e-7) atomicAdd(telemetry[52], 1u);

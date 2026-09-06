@@ -152,9 +152,12 @@ data class ProfileDetailSettings(
         return copy(
             amount = safeAmount,
             // Global Sharpness is a standalone signed control. Radius/Detail/Masking are persisted
-            // independently for their own future phases and never gate or scale Global Sharpness.
+            // independently and never gate or scale Global Sharpness.
             radius = storedRadius,
-            detail = detail.takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: ProfileDetailDefaults.DETAIL,
+            // Detail is a standalone signed microtexture control. It never scales Global
+            // Sharpness or Edge; 0 is exact neutral, negative reduces qualified microtexture,
+            // positive restores/enhances only statistically credible fine structure.
+            detail = detail.takeIf { it.isFinite() }?.coerceIn(-1f, 1f) ?: ProfileDetailDefaults.DETAIL,
             masking = masking.takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: ProfileDetailDefaults.MASKING
         )
     }

@@ -635,10 +635,116 @@ float profileEdgeYAtOutput(uint outputX, uint outputY) {
     return clamp(base + edgeDelta, lowPlateau, highPlateau);
 }
 
+
+// Phase 3 standalone signed Detail. YUV uses a compact 3x3 microtexture classifier so the
+// stage remains lightweight enough for vendor Vulkan drivers. It explicitly prefers
+// high-curvature / low-step-persistence structure and rejects coherent step edges.
+float profileMicroDetailYAtOutput(uint outputX, uint outputY) {
+    // Compatibility transport: exact 0 is neutral; [-1,-0.5) encodes negative Detail and
+    // [-0.5,0) encodes positive Detail without reactivating retired unsigned consumers.
+    float detailTransport = clamp(pc.profileDetailDetail, -1.0, 0.0);
+    float authority = 0.0;
+    if (abs(detailTransport) > 1.0e-7) {
+        authority = detailTransport < -0.5
+                ? clamp(2.0 * (detailTransport + 0.5), -1.0, 0.0)
+                : clamp(-2.0 * detailTransport, 0.0, 1.0);
+    }
+
+    // Strict stage order remains Edge -> Detail -> Global Sharpness.
+    float edgeY = profileEdgeYAtOutput(outputX, outputY);
+    if (abs(authority) <= 1.0e-6) return edgeY;
+
+    int x = int(outputX);
+    int y = int(outputY);
+    float c  = edgeNeutralYAtOutput(x, y);
+    float n  = edgeNeutralYAtOutput(x, y - 1);
+    float s  = edgeNeutralYAtOutput(x, y + 1);
+    float w  = edgeNeutralYAtOutput(x - 1, y);
+    float e  = edgeNeutralYAtOutput(x + 1, y);
+    float nw = edgeNeutralYAtOutput(x - 1, y - 1);
+    float ne = edgeNeutralYAtOutput(x + 1, y - 1);
+    float sw = edgeNeutralYAtOutput(x - 1, y + 1);
+    float se = edgeNeutralYAtOutput(x + 1, y + 1);
+
+    // 3x3 Gaussian residual: compact fine-structure evidence in the neutral YUV domain.
+    // The residual is transferred onto edgeY rather than rebuilding tone/denoise neighbours.
+    float crossMean = 0.25 * (n + s + w + e);
+    float diagMean = 0.25 * (nw + ne + sw + se);
+    float gaussianMean = 0.25 * c + 0.50 * crossMean + 0.25 * diagMean;
+    float microResidual = c - gaussianMean;
+
+    // Sobel structure tensor. A real object edge has a coherent first derivative; microtexture
+    // is selected primarily by curvature/residual energy rather than by directional gradient.
+    float gx = 0.125 * ((ne + 2.0 * e + se) - (nw + 2.0 * w + sw));
+    float gy = 0.125 * ((sw + 2.0 * s + se) - (nw + 2.0 * n + ne));
+    float gradient = sqrt(max(0.0, gx * gx + gy * gy));
+
+    float gxA = 0.5 * (e - w);
+    float gyA = 0.5 * (s - n);
+    float gxB = 0.5 * (ne - nw);
+    float gyB = 0.5 * (se - ne);
+    float gxC = 0.5 * (se - sw);
+    float gyC = 0.5 * (sw - nw);
+    float jxx = gxA * gxA + 0.50 * (gxB * gxB + gxC * gxC);
+    float jyy = gyA * gyA + 0.50 * (gyB * gyB + gyC * gyC);
+    float jxy = gxA * gyA + 0.50 * (gxB * gyB + gxC * gyC);
+    float energy = jxx + jyy;
+    float coherence = sqrt(max(0.0, (jxx - jyy) * (jxx - jyy) + 4.0 * jxy * jxy)) /
+            max(energy, 1.0e-8);
+
+    float localMin = min(c, min(min(min(n, s), min(w, e)), min(min(nw, ne), min(sw, se))));
+    float localMax = max(c, max(max(max(n, s), max(w, e)), max(max(nw, ne), max(sw, se))));
+    float localRange = max(0.0, localMax - localMin);
+    float sigma = max(yuvMeasuredSigmaY(), 1.0 / 255.0);
+    float residualSnr = abs(microResidual) / sigma;
+    float gradientSnr = gradient / sigma;
+
+    float residualGate = smoothstep(1.45, 3.40, residualSnr);
+    float rangeGate = smoothstep(3.2, 8.0, localRange / sigma);
+
+    // Step-edge rejection: coherent directional energy with a first derivative much stronger
+    // than local curvature is a contour, not microtexture. Fine lines/hair retain strong
+    // curvature and therefore do not get rejected merely for being directional.
+    float firstToSecond = gradient / max(abs(microResidual), 1.25 * sigma);
+    float coherentStep = smoothstep(0.50, 0.82, coherence) *
+            smoothstep(1.3, 4.0, gradientSnr) *
+            smoothstep(0.85, 2.10, firstToSecond);
+    float textureGate = residualGate * rangeGate * (1.0 - clamp(coherentStep, 0.0, 1.0));
+    float strength = pow(abs(authority), 0.78);
+
+    if (authority < 0.0) {
+        // Reduce only the qualified fine residual; do not broaden structural contours.
+        float targetY = edgeY - microResidual;
+        return mix(edgeY, targetY, 0.90 * strength * textureGate);
+    }
+
+    // Reject period-2/checker-like oscillation on the positive side. This protects demosaic/YUV
+    // artifacts and sensor grain from being promoted as texture while leaving irregular detail.
+    float crossOscillation = abs(c - crossMean);
+    float checkerContrast = abs(diagMean - crossMean);
+    float lowFirstDerivative = 1.0 - smoothstep(max(0.006, 1.5 * sigma),
+                                               max(0.030, 5.0 * sigma), gradient);
+    float diagonalEchoRatio = abs(c - diagMean) / max(crossOscillation, 1.25 * sigma);
+    float diagonalEcho = 1.0 - smoothstep(0.12, 0.42, diagonalEchoRatio);
+    float checkerEvidence = smoothstep(max(0.006, 1.4 * sigma),
+                                       max(0.028, 4.5 * sigma), crossOscillation) *
+            smoothstep(max(0.004, 1.0 * sigma),
+                       max(0.022, 3.5 * sigma), checkerContrast) *
+            diagonalEcho * lowFirstDerivative;
+    float positiveTextureGate = textureGate * (1.0 - 0.92 * clamp(checkerEvidence, 0.0, 1.0));
+
+    float positiveNoiseSafety = 1.0 - 0.72 * smoothstep(0.018, 0.055, sigma);
+    float rawDelta = microResidual * (0.55 + 1.05 * authority) * strength *
+            positiveNoiseSafety * positiveTextureGate;
+    float cap = min(0.075, 0.008 + 0.24 * localRange);
+    float delta = clamp(rawDelta, -cap, cap);
+    return clamp(edgeY + delta, edgeY - localRange, edgeY + localRange);
+}
+
 float profileDetailedYAtOutput(uint outputX, uint outputY) {
     float amount = clamp(pc.profileDetailAmount, -1.0, 1.0);
-    // Edge is the first operation. Global Sharpness is the final image-sharpness stage.
-    float center = profileEdgeYAtOutput(outputX, outputY);
+    // Strict order: Edge -> Detail -> Global Sharpness.
+    float center = profileMicroDetailYAtOutput(outputX, outputY);
     if (abs(amount) <= 1.0e-6) return center;
 
     int x = int(outputX);

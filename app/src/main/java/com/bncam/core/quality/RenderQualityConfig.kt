@@ -370,7 +370,7 @@ data class ProfileDetailTuning(
         "Global Sharpness" to String.format(Locale.US, "%+.2f", amount.coerceIn(-1f, 1f)),
         "Edge" to String.format(Locale.US, "%+.2f", edge.coerceIn(-1f, 1f)),
         "Detail Sharpening Radius" to String.format(Locale.US, "%.2f", radius),
-        "Detail Sharpening Detail" to String.format(Locale.US, "%.0f", detail.coerceIn(0f, 1f) * 100f),
+        "Detail" to String.format(Locale.US, "%+.2f", detail.coerceIn(-1f, 1f)),
         "Detail Sharpening Masking" to String.format(Locale.US, "%.0f", masking.coerceIn(0f, 1f) * 100f)
     )
 }
@@ -551,7 +551,7 @@ data class RenderQualityConfig(
                 amount = readProfileFloatOrFallback(repo, profileId, ProfileIspKeys.DETAIL_SHARPENING_AMOUNT, ProfileDetailDefaults.AMOUNT, -1f..1f),
                 edge = readProfileFloatOrFallback(repo, profileId, ProfileIspKeys.DETAIL_SHARPENING_EDGE, ProfilePlannedDefaults.EDGE_SHARPNESS, -1f..1f),
                 radius = readProfileFloatOrFallback(repo, profileId, ProfileIspKeys.DETAIL_SHARPENING_RADIUS, ProfileDetailDefaults.RADIUS, 0f..ProfileDetailDefaults.MAX_RADIUS),
-                detail = readProfileFloatOrFallback(repo, profileId, ProfileIspKeys.DETAIL_SHARPENING_DETAIL, ProfileDetailDefaults.DETAIL, 0f..1f),
+                detail = readProfileFloatOrFallback(repo, profileId, ProfileIspKeys.DETAIL_SHARPENING_DETAIL, ProfileDetailDefaults.DETAIL, -1f..1f),
                 masking = readProfileFloatOrFallback(repo, profileId, ProfileIspKeys.DETAIL_SHARPENING_MASKING, ProfileDetailDefaults.MASKING, 0f..1f)
             ).sanitized()
             // Polysharp owns sharpening exclusively when selected. Its pixel backend is deliberately

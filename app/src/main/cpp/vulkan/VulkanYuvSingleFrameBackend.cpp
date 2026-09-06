@@ -572,7 +572,9 @@ YuvSingleFrameIspResult VulkanYuvSingleFrameBackend::execute(
         std::clamp(request.vibrance, -1.0f, 1.0f),
         std::clamp(request.profileDetailAmount, -1.0f, 1.0f),
         std::clamp(request.profileDetailRadius, 0.0f, 3.00f),
-        std::clamp(request.profileDetailDetail, 0.0f, 1.0f),
+        // Phase 3 compatibility transport is intentionally non-positive; legacy/default
+        // unsigned values collapse to neutral 0 before the shader decodes signed Detail.
+        std::clamp(request.profileDetailDetail, -1.0f, 0.0f),
         std::clamp(request.profileDetailMasking, -1.0f, 1.0f),
         0u,
         gainmapWidth,
