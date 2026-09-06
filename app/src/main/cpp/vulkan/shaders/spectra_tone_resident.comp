@@ -1778,123 +1778,127 @@ void proposePerceptualDetail(uvec2 gid) {
         float persistenceGate = smoothstep(0.20, 0.48, scalePersistence);
         float broadPersistenceGate = smoothstep(0.08, 0.22, broadPersistence);
 
-        // Resolve the edge normal continuously. Hard cardinal/diagonal switching can select a
-        // different normal on adjacent pixels and manifest as doubled or jagged contour lines.
-        // Blend the available cardinal/diagonal support instead, then reconstruct neighbouring
-        // transition samples with the same signed profile before accepting the center result.
-        float ax = abs(gx0);
-        float ay = abs(gy0);
+        // DELTA 0205 — strict step-edge ownership with texture-preserving reconstruction.
+        // Stabilize the normal with multi-scale gradients. Cardinal interpolation varies
+        // continuously with that normal and avoids diagonal mode switches between neighbours.
+        float stableGx = 0.58 * gx0 + 0.29 * gx2 + 0.13 * gx4;
+        float stableGy = 0.58 * gy0 + 0.29 * gy2 + 0.13 * gy4;
+        float ax = abs(stableGx);
+        float ay = abs(stableGy);
         float axisSum = max(ax + ay, 1.0e-6);
         float wx = ax / axisSum;
         float wy = ay / axisSum;
-        float diagonalBlend = 0.68 * smoothstep(0.18, 0.86, 2.0 * min(wx, wy));
 
-        float xMinus1 = gx0 >= 0.0 ? l : r;
-        float xPlus1 = gx0 >= 0.0 ? r : l;
-        float xMinus2 = gx0 >= 0.0 ? l2 : r2;
-        float xPlus2 = gx0 >= 0.0 ? r2 : l2;
-        float xMinus4 = gx0 >= 0.0 ? l4 : r4;
-        float xPlus4 = gx0 >= 0.0 ? r4 : l4;
-        float yMinus1 = gy0 >= 0.0 ? u : d;
-        float yPlus1 = gy0 >= 0.0 ? d : u;
-        float yMinus2 = gy0 >= 0.0 ? u2 : d2;
-        float yPlus2 = gy0 >= 0.0 ? d2 : u2;
-        float yMinus4 = gy0 >= 0.0 ? u4 : d4;
-        float yPlus4 = gy0 >= 0.0 ? d4 : u4;
+        float xMinus1 = stableGx >= 0.0 ? l : r;
+        float xPlus1 = stableGx >= 0.0 ? r : l;
+        float xMinus2 = stableGx >= 0.0 ? l2 : r2;
+        float xPlus2 = stableGx >= 0.0 ? r2 : l2;
+        float xMinus4 = stableGx >= 0.0 ? l4 : r4;
+        float xPlus4 = stableGx >= 0.0 ? r4 : l4;
+        float yMinus1 = stableGy >= 0.0 ? u : d;
+        float yPlus1 = stableGy >= 0.0 ? d : u;
+        float yMinus2 = stableGy >= 0.0 ? u2 : d2;
+        float yPlus2 = stableGy >= 0.0 ? d2 : u2;
+        float yMinus4 = stableGy >= 0.0 ? u4 : d4;
+        float yPlus4 = stableGy >= 0.0 ? d4 : u4;
 
-        float diagonalMinus1;
-        float diagonalPlus1;
-        if (gx0 >= 0.0) {
-            if (gy0 >= 0.0) { diagonalMinus1 = ul; diagonalPlus1 = dr; }
-            else            { diagonalMinus1 = dl; diagonalPlus1 = ur; }
-        } else {
-            if (gy0 >= 0.0) { diagonalMinus1 = ur; diagonalPlus1 = dl; }
-            else            { diagonalMinus1 = dr; diagonalPlus1 = ul; }
-        }
-
-        float minus1 = mix(wx * xMinus1 + wy * yMinus1, diagonalMinus1, diagonalBlend);
-        float plus1 = mix(wx * xPlus1 + wy * yPlus1, diagonalPlus1, diagonalBlend);
+        float minus1 = wx * xMinus1 + wy * yMinus1;
+        float plus1 = wx * xPlus1 + wy * yPlus1;
         float minus2 = wx * xMinus2 + wy * yMinus2;
         float plus2 = wx * xPlus2 + wy * yPlus2;
         float minus4 = wx * xMinus4 + wy * yMinus4;
         float plus4 = wx * xPlus4 + wy * yPlus4;
 
-        float radiusAuthority = pow(abs(edgeAuthority), 0.78);
+        // Smooth only along the tangent to estimate the structural edge base. The difference
+        // centerY-structuralCenter is local material texture and is intentionally preserved.
+        float tangent1 = 0.50 * (wx * (u + d) + wy * (l + r));
+        float tangent2 = 0.50 * (wx * (u2 + d2) + wy * (l2 + r2));
+        float structuralCenter = 0.72 * tangent1 + 0.28 * tangent2;
+        float textureResidual = centerY - structuralCenter;
 
-        if (edgeAuthority < 0.0) {
-            // TRUE negative Edge radius: directional low-pass ACROSS the contour normal.
-            // This softens the original edge itself over +/-1/2/4 px. It does not remap only
-            // the center transition and therefore cannot leave a sharp line under a soft mask.
-            float softMinus1 = wx * xMinus1 + wy * yMinus1;
-            float softPlus1 = wx * xPlus1 + wy * yPlus1;
-            float softMinus2 = wx * xMinus2 + wy * yMinus2;
-            float softPlus2 = wx * xPlus2 + wy * yPlus2;
-            float softMinus4 = wx * xMinus4 + wy * yMinus4;
-            float softPlus4 = wx * xPlus4 + wy * yPlus4;
+        float plateauMinus = 0.15 * minus1 + 0.35 * minus2 + 0.50 * minus4;
+        float plateauPlus = 0.15 * plus1 + 0.35 * plus2 + 0.50 * plus4;
+        float signedStep = plateauPlus - plateauMinus;
+        float stepHeight = abs(signedStep);
 
-            float narrowSoft = 0.52 * legibilityY +
-                    0.19 * (softMinus1 + softPlus1) +
-                    0.05 * (softMinus2 + softPlus2);
-            float broadSoft = 0.24 * legibilityY +
-                    0.22 * (softMinus1 + softPlus1) +
-                    0.12 * (softMinus2 + softPlus2) +
-                    0.04 * (softMinus4 + softPlus4);
-            float softTarget = mix(narrowSoft, broadSoft, radiusAuthority);
-
-            float softStep = abs(0.50 * (softPlus2 + softPlus4) -
-                                 0.50 * (softMinus2 + softMinus4));
-            float softStepGate = smoothstep(max(0.012, 1.80 * sigma),
-                                            max(0.052, 6.20 * sigma), softStep);
-            float supportGradient = max(gradient, 1.35 * coarseGradient);
-            float supportGradientGate = smoothstep(max(0.006, 1.05 * sigma),
-                                                   max(0.028, 4.10 * sigma), supportGradient);
-            float directionSupport = smoothstep(0.42, 0.86,
-                                                max(gradientAlignment, broadAlignment));
-            float softStructuralGate = supportGradientGate * coarseGradientGate *
-                    broadGradientGate * coherenceGate * directionSupport * softStepGate * nonTextMask;
-            edgeY = mix(legibilityY, softTarget, radiusAuthority * softStructuralGate);
-            edgeY = clamp(edgeY, 0.0, 1.0);
-        } else {
-            // Positive Edge keeps the approved transition-compression model.
-            float farWeight = mix(0.38, 0.28, radiusAuthority);
-            float nearWeight = mix(0.22, 0.30, radiusAuthority);
-            float midWeight = 1.0 - nearWeight - farWeight;
-            float plateauMinus = nearWeight * minus1 + midWeight * minus2 + farWeight * minus4;
-            float plateauPlus = nearWeight * plus1 + midWeight * plus2 + farWeight * plus4;
-            float signedStep = plateauPlus - plateauMinus;
-            float stepHeight = abs(signedStep);
+        if (stepHeight > 1.0e-6) {
             float lowPlateau = min(plateauMinus, plateauPlus);
             float highPlateau = max(plateauMinus, plateauPlus);
             float stepGate = smoothstep(max(0.014, 2.10 * sigma),
                                         max(0.060, 7.00 * sigma), stepHeight);
 
-            if (stepHeight > 1.0e-6) {
-                float t = clamp((centerY - plateauMinus) / signedStep, 0.0, 1.0);
+            // Object edges are monotonic across their normal. Direction reversals are zipper/
+            // checker/detail evidence and must never be owned by Edge.
+            float stepSign = signedStep >= 0.0 ? 1.0 : -1.0;
+            float reverseEnergy =
+                    max(0.0, -stepSign * (minus2 - minus4)) +
+                    max(0.0, -stepSign * (minus1 - minus2)) +
+                    max(0.0, -stepSign * (structuralCenter - minus1)) +
+                    max(0.0, -stepSign * (plus1 - structuralCenter)) +
+                    max(0.0, -stepSign * (plus2 - plus1)) +
+                    max(0.0, -stepSign * (plus4 - plus2));
+            float reverseRatio = reverseEnergy / max(stepHeight, 5.0 * sigma);
+            float monotonicGate = 1.0 - smoothstep(0.035, 0.18, reverseRatio);
+
+            // Texture and natural paired-edge seams are owned by Detail. This gate is the key
+            // protection against +Edge flattening the internal grain/structure of a surface.
+            float textureRatio = abs(textureResidual) / max(stepHeight, 4.0 * sigma);
+            float textureCleanGate = 1.0 - smoothstep(0.10, 0.30, textureRatio);
+            float tangentScaleRatio = abs(tangent1 - tangent2) / max(stepHeight, 4.0 * sigma);
+            float tangentScaleGate = 1.0 - smoothstep(0.12, 0.34, tangentScaleRatio);
+            float ridgeReject = 1.0 - 0.96 * microRidgeMask;
+
+            float structuralOwnershipGate = coarseGradientGate * broadGradientGate *
+                    coherenceGate * alignmentGate * broadAlignmentGate * persistenceGate *
+                    broadPersistenceGate * stepGate * monotonicGate * textureCleanGate *
+                    tangentScaleGate * ridgeReject * nonTextMask;
+            float sharpStructuralGate = fineGradientGate * structuralOwnershipGate;
+            // Softening must reach neighbouring transition pixels; coarse coherent support
+            // expands the radius while the ownership gates still reject texture and zippers.
+            float softStructuralGate = max(fineGradientGate, 0.72 * coarseGradientGate) *
+                    structuralOwnershipGate;
+            float radiusAuthority = pow(abs(edgeAuthority), 0.78);
+
+            if (edgeAuthority < 0.0) {
+                // Soften the structural edge base only. Surface texture is retained because the
+                // correction is a base delta added to legibilityY, not a blur of raw pixel values.
+                float narrowBase = 0.46 * structuralCenter +
+                        0.22 * (minus1 + plus1) +
+                        0.05 * (minus2 + plus2);
+                float broadBase = 0.28 * structuralCenter +
+                        0.23 * (minus1 + plus1) +
+                        0.11 * (minus2 + plus2) +
+                        0.02 * (minus4 + plus4);
+                float softBase = mix(narrowBase, broadBase, radiusAuthority);
+                softBase = clamp(softBase, lowPlateau, highPlateau);
+
+                float softDelta = softBase - structuralCenter;
+                float softDeltaCap = 0.18 * stepHeight;
+                softDelta = clamp(softDelta, -softDeltaCap, softDeltaCap);
+                float supportGradient = max(gradient, 1.30 * coarseGradient);
+                float supportGate = smoothstep(max(0.006, 1.05 * sigma),
+                                               max(0.028, 4.10 * sigma), supportGradient);
+                float softGate = softStructuralGate * supportGate;
+                edgeY = legibilityY + softDelta * radiusAuthority * softGate;
+                edgeY = clamp(edgeY, 0.0, 1.0);
+            } else {
+                // Positive Edge changes only transition width. The texture residual is untouched.
+                float t = clamp((structuralCenter - plateauMinus) / signedStep, 0.0, 1.0);
                 float interior = min(t, 1.0 - t);
-                float transitionGate = smoothstep(0.035, 0.145, interior);
+                float transitionGate = smoothstep(0.025, 0.115, interior);
                 float profile = 2.0 * t - 1.0;
-                float gamma = mix(1.0, 0.34, radiusAuthority);
+                float gamma = mix(1.0, 0.52, radiusAuthority);
                 float remappedProfile = sign(profile) * pow(abs(profile), gamma);
                 float targetT = 0.5 + 0.5 * remappedProfile;
-                float targetY = mix(plateauMinus, plateauPlus, targetT);
+                float targetBase = mix(plateauMinus, plateauPlus, targetT);
+                targetBase = clamp(targetBase, lowPlateau, highPlateau);
 
-                float minusT = clamp((minus1 - plateauMinus) / signedStep, 0.0, 1.0);
-                float plusT = clamp((plus1 - plateauMinus) / signedStep, 0.0, 1.0);
-                float minusProfile = 2.0 * minusT - 1.0;
-                float plusProfile = 2.0 * plusT - 1.0;
-                float reconstructedMinus = mix(plateauMinus, plateauPlus,
-                        0.5 + 0.5 * sign(minusProfile) * pow(abs(minusProfile), gamma));
-                float reconstructedPlus = mix(plateauMinus, plateauPlus,
-                        0.5 + 0.5 * sign(plusProfile) * pow(abs(plusProfile), gamma));
-                float corridorMin = min(reconstructedMinus, reconstructedPlus);
-                float corridorMax = max(reconstructedMinus, reconstructedPlus);
-                targetY = clamp(targetY, corridorMin, corridorMax);
-
-                float structuralGate = fineGradientGate * coarseGradientGate * broadGradientGate *
-                        coherenceGate * alignmentGate * broadAlignmentGate * persistenceGate *
-                        broadPersistenceGate * stepGate * transitionGate * nonTextMask;
-                edgeY = mix(centerY, targetY, structuralGate);
-                edgeY = clamp(edgeY, lowPlateau, highPlateau);
+                float sharpenDelta = targetBase - structuralCenter;
+                float sharpenDeltaCap = 0.18 * stepHeight;
+                sharpenDelta = clamp(sharpenDelta, -sharpenDeltaCap, sharpenDeltaCap);
+                float sharpGate = sharpStructuralGate * transitionGate;
+                edgeY = legibilityY + sharpenDelta * radiusAuthority * sharpGate;
+                edgeY = clamp(edgeY, 0.0, 1.0);
             }
         }
     }
