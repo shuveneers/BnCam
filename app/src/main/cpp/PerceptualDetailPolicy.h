@@ -40,55 +40,49 @@ inline float finiteOr(float value, float fallback) noexcept {
 /**
  * Phase 12 profile-owned perceptual detail/output sharpening.
  *
- * This stage is deliberately narrow-band and pointwise-authority only: it does not build or
- * remap a local-tone base, so FLLF remains the sole local exposure/contrast owner. Profile Amount
- * is the master switch and defaults to zero. Physical propagated luma noise is mandatory; without
- * it the stage bypasses rather than sharpening an unqualified signal.
+ * This is the standalone signed Global Sharpness stage. It does not build or remap a local-tone
+ * base, so FLLF remains the sole local exposure/contrast owner. Amount alone controls the effect:
+ * negative softens, zero is exact identity, positive sharpens. Radius/Detail/Masking are separate
+ * controls and are intentionally ignored here. Physical noise, when available, is only an internal
+ * safety hint and never a prerequisite for the user-requested effect.
  */
 inline Plan resolve(Controls controls, NoiseEvidence noise) noexcept {
-    controls.amount = std::clamp(finiteOr(controls.amount, 0.0f), 0.0f, 1.0f);
-    controls.radius = std::clamp(finiteOr(controls.radius, 0.0f), 0.0f, 3.0f);
-    controls.detail = std::clamp(finiteOr(controls.detail, 0.0f), 0.0f, 1.0f);
-    controls.masking = std::clamp(finiteOr(controls.masking, 0.0f), 0.0f, 1.0f);
+    controls.amount = std::clamp(finiteOr(controls.amount, 0.0f), -1.0f, 1.0f);
     noise.displayLumaSigma = std::max(0.0f, finiteOr(noise.displayLumaSigma, 0.0f));
-    noise.modelConfidence = std::clamp(finiteOr(noise.modelConfidence, 0.0f), 0.0f, 1.0f);
 
     Plan out{};
-    out.detail = controls.detail;
-    out.masking = controls.masking;
-    out.displayLumaSigma = noise.displayLumaSigma;
-    out.modelConfidence = noise.modelConfidence;
-
-    if (controls.amount <= 1.0e-4f) {
-        out.authoritySource = "PROFILE_SHARPNESS_ZERO";
-        return out;
-    }
-    if (!noise.physicalModelAvailable || !(noise.displayLumaSigma > 0.0f)) {
-        out.authoritySource = "PHYSICAL_PROPAGATED_NOISE_UNAVAILABLE";
-        return out;
-    }
-    if (noise.modelConfidence < 0.15f) {
-        out.authoritySource = "PHYSICAL_NOISE_CONFIDENCE_TOO_LOW";
+    if (std::abs(controls.amount) <= 1.0e-4f) {
+        out.authoritySource = "PROFILE_GLOBAL_SHARPNESS_ZERO";
         return out;
     }
 
-    // Radius=0 is a valid neutral stored value. Once Amount is deliberately raised, resolve a
-    // compact perceptual kernel internally without changing the stored profile value.
-    out.radius = controls.radius > 1.0e-4f ? std::clamp(controls.radius, 0.50f, 3.0f) : 0.85f;
-    const float confidenceScale = 0.40f + 0.60f * noise.modelConfidence;
-    out.authority = std::clamp(controls.amount * 0.46f * confidenceScale, 0.0f, 0.46f);
-    out.minimumResidualSnr = 1.45f + 2.30f * controls.masking;
-    out.minimumGradientSnr = 0.90f + 1.70f * controls.masking;
-    out.hardHaloLimit = std::clamp(
-            (0.006f + 0.014f * controls.amount) * (1.0f - 0.45f * controls.masking),
-            0.004f,
-            0.018f);
+    // Global Sharpness is intentionally standalone. Radius, Detail and Masking belong to
+    // separate controls/phases and must never multiply, gate or disable this signed control.
+    // Physical display-domain sigma is useful as an internal noise guard when available, but
+    // missing metadata may not disable the user-requested effect.
+    out.authority = controls.amount;
+    out.radius = 1.0f;
+    out.detail = 0.0f;
+    out.masking = 0.0f;
+    out.displayLumaSigma = noise.displayLumaSigma > 1.0e-7f
+            ? noise.displayLumaSigma
+            : (1.0f / 255.0f);
+    out.minimumResidualSnr = 0.90f;
+    out.minimumGradientSnr = 0.75f;
+    out.hardHaloLimit = controls.amount > 0.0f
+            ? (0.055f + 0.085f * controls.amount)
+            : 0.0f;
+    out.modelConfidence = 1.0f;
+
+    const float positive = std::max(0.0f, controls.amount);
     out.predictedLumaVarianceGain = std::clamp(
-            1.0f + 0.42f * out.authority * out.authority,
+            1.0f + 0.85f * positive * positive,
             1.0f,
-            1.10f);
-    out.enabled = out.authority > 1.0e-4f;
-    out.authoritySource = "PROFILE_PERCEPTUAL_DETAIL_PHYSICAL_NOISE_GATED";
+            1.85f);
+    out.enabled = true;
+    out.authoritySource = controls.amount < 0.0f
+            ? "PROFILE_GLOBAL_SHARPNESS_SOFTEN"
+            : "PROFILE_GLOBAL_SHARPNESS_SHARPEN";
     return out;
 }
 

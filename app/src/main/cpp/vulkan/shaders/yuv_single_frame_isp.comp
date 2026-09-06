@@ -480,33 +480,119 @@ void finalizeYuvResidualModel() {
 }
 
 float profileDetailedYAtOutput(uint outputX, uint outputY) {
-    float amount = clamp(pc.profileDetailAmount, 0.0, 1.0);
+    float amount = clamp(pc.profileDetailAmount, -1.0, 1.0);
     float center = toneMappedYAtOutput(int(outputX), int(outputY));
-    if (amount <= 1.0e-6) return center;
+    if (abs(amount) <= 1.0e-6) return center;
 
-    float radius = clamp(pc.profileDetailRadius, 0.50, 3.00);
-    float detailControl = clamp(pc.profileDetailDetail, 0.0, 1.0);
-    float masking = clamp(pc.profileDetailMasking, 0.0, 1.0);
-    int stepPx = radius < 1.35 ? 1 : (radius < 2.20 ? 2 : 3);
-    float n = toneMappedYAtOutput(int(outputX), int(outputY) - stepPx);
-    float s = toneMappedYAtOutput(int(outputX), int(outputY) + stepPx);
-    float w = toneMappedYAtOutput(int(outputX) - stepPx, int(outputY));
-    float e = toneMappedYAtOutput(int(outputX) + stepPx, int(outputY));
-    float localMean = 0.25 * (n + s + w + e);
-    float highPass = center - localMean;
-    float edgeEnergy = 0.25 * (abs(center - n) + abs(center - s) + abs(center - w) + abs(center - e));
+    int x = int(outputX);
+    int y = int(outputY);
+    float n = toneMappedYAtOutput(x, y - 1);
+    float s = toneMappedYAtOutput(x, y + 1);
+    float w = toneMappedYAtOutput(x - 1, y);
+    float e = toneMappedYAtOutput(x + 1, y);
+    float nw = toneMappedYAtOutput(x - 1, y - 1);
+    float ne = toneMappedYAtOutput(x + 1, y - 1);
+    float sw = toneMappedYAtOutput(x - 1, y + 1);
+    float se = toneMappedYAtOutput(x + 1, y + 1);
+    float w2 = toneMappedYAtOutput(x - 2, y);
+    float e2 = toneMappedYAtOutput(x + 2, y);
+    float n2 = toneMappedYAtOutput(x, y - 2);
+    float s2 = toneMappedYAtOutput(x, y + 2);
 
-    float detailGain = mix(0.72, 1.32, detailControl);
-    float edge0 = mix(0.0035, 0.018, masking);
-    float edge1 = mix(0.016, 0.060, masking);
-    float maskGate = mix(1.0, smoothstep(edge0, edge1, edgeEnergy), masking);
-    float shadowGate = smoothstep(0.025, 0.11, center);
-    float highlightGate = 1.0 - smoothstep(0.78, 0.97, center);
-    float tonalGate = mix(0.22, 1.0, shadowGate) * mix(0.38, 1.0, highlightGate);
-    float authority = 0.24 * clamp(2.25 * amount, 0.0, 2.0) * detailGain * maskGate * tonalGate;
-    float overshootGuard = clamp(0.45 + 0.55 * masking, 0.0, 1.0);
-    float cap = 0.040 * (1.0 - 0.62 * overshootGuard);
-    return clamp(center + clamp(highPass * authority, -cap, cap), 0.0, 1.0);
+    float crossMean = 0.25 * (n + s + w + e);
+    float boxMean = 0.125 * (n + s + w + e + nw + ne + sw + se);
+    float farCross = 0.25 * (n2 + s2 + w2 + e2);
+    float localMin = min(center, min(min(min(n, s), min(w, e)), min(min(nw, ne), min(sw, se))));
+    float localMax = max(center, max(max(max(n, s), max(w, e)), max(max(nw, ne), max(sw, se))));
+    localMin = min(localMin, min(min(n2, s2), min(w2, e2)));
+    localMax = max(localMax, max(max(n2, s2), max(w2, e2)));
+    float localRange = max(0.0, localMax - localMin);
+
+    if (amount < 0.0) {
+        // Standalone negative Global Sharpness: deliberately strong edge-aware softening.
+        float softness = pow(clamp(-amount, 0.0, 1.0), 0.72);
+        float edgeSigma = mix(0.040, 0.115, softness);
+        float inv2EdgeSigmaSq = 1.0 / max(2.0 * edgeSigma * edgeSigma, 1.0e-6);
+        float centerWeight = mix(2.40, 0.65, softness);
+        float sum = center * centerWeight;
+        float weightSum = centerWeight;
+
+        float dv;
+        float bw;
+        dv = (n) - center;
+        bw = 1.00 * exp(-dv * dv * inv2EdgeSigmaSq);
+        sum += (n) * bw;
+        weightSum += bw;
+        dv = (s) - center;
+        bw = 1.00 * exp(-dv * dv * inv2EdgeSigmaSq);
+        sum += (s) * bw;
+        weightSum += bw;
+        dv = (w) - center;
+        bw = 1.00 * exp(-dv * dv * inv2EdgeSigmaSq);
+        sum += (w) * bw;
+        weightSum += bw;
+        dv = (e) - center;
+        bw = 1.00 * exp(-dv * dv * inv2EdgeSigmaSq);
+        sum += (e) * bw;
+        weightSum += bw;
+        dv = (nw) - center;
+        bw = 0.72 * exp(-dv * dv * inv2EdgeSigmaSq);
+        sum += (nw) * bw;
+        weightSum += bw;
+        dv = (ne) - center;
+        bw = 0.72 * exp(-dv * dv * inv2EdgeSigmaSq);
+        sum += (ne) * bw;
+        weightSum += bw;
+        dv = (sw) - center;
+        bw = 0.72 * exp(-dv * dv * inv2EdgeSigmaSq);
+        sum += (sw) * bw;
+        weightSum += bw;
+        dv = (se) - center;
+        bw = 0.72 * exp(-dv * dv * inv2EdgeSigmaSq);
+        sum += (se) * bw;
+        weightSum += bw;
+        dv = (n2) - center;
+        bw = 0.46 * exp(-dv * dv * inv2EdgeSigmaSq);
+        sum += (n2) * bw;
+        weightSum += bw;
+        dv = (s2) - center;
+        bw = 0.46 * exp(-dv * dv * inv2EdgeSigmaSq);
+        sum += (s2) * bw;
+        weightSum += bw;
+        dv = (w2) - center;
+        bw = 0.46 * exp(-dv * dv * inv2EdgeSigmaSq);
+        sum += (w2) * bw;
+        weightSum += bw;
+        dv = (e2) - center;
+        bw = 0.46 * exp(-dv * dv * inv2EdgeSigmaSq);
+        sum += (e2) * bw;
+        weightSum += bw;
+
+        float softY = sum / max(weightSum, 1.0e-6);
+        float broadY = 0.46 * softY + 0.34 * boxMean + 0.20 * farCross;
+        float softBlend = 0.94 * pow(softness, 0.78);
+        return clamp(mix(center, broadY, softBlend), 0.0, 1.0);
+    }
+
+    // Standalone positive Global Sharpness. Existing Detail/Masking/Radius values are ignored.
+    float fineMean = 0.68 * crossMean + 0.32 * boxMean;
+    float mediumMean = 0.58 * boxMean + 0.42 * farCross;
+    float highPass = 0.74 * (center - fineMean) + 0.26 * (center - mediumMean);
+    float gx = 0.5 * (e - w);
+    float gy = 0.5 * (s - n);
+    float gradient = sqrt(max(0.0, gx * gx + gy * gy));
+
+    float sigmaY = clamp(max(yuvMeasuredSigmaY(), 1.0 / 255.0), 1.0 / 255.0, 0.025);
+    float residualGate = smoothstep(0.80, 2.00, abs(highPass) / sigmaY);
+    float edgeGate = smoothstep(0.70, 1.85, gradient / sigmaY);
+    float rangeGate = smoothstep(0.004, 0.022, localRange);
+    float structureGate = max(rangeGate * 0.55, max(residualGate, edgeGate));
+
+    float sharpStrength = amount * (1.05 + 1.75 * amount);
+    float rawDelta = highPass * sharpStrength * structureGate;
+    float adaptiveHalo = min(0.14, 0.018 + 0.46 * localRange);
+    float delta = clamp(rawDelta, -adaptiveHalo, adaptiveHalo);
+    return clamp(center + delta, 0.0, 1.0);
 }
 
 vec3 renderRgbUnblurred(uint outputX, uint outputY) {

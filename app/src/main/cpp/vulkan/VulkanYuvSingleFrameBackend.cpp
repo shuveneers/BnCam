@@ -570,10 +570,8 @@ YuvSingleFrameIspResult VulkanYuvSingleFrameBackend::execute(
         std::clamp(request.saturation, -1.0f, 1.0f),
         std::clamp(request.contrast, -1.0f, 1.0f),
         std::clamp(request.vibrance, -1.0f, 1.0f),
-        std::clamp(request.profileDetailAmount, 0.0f, 1.0f),
-        request.profileDetailAmount > 1.0e-6f
-                ? std::clamp(request.profileDetailRadius, 0.50f, 3.00f)
-                : 0.0f,
+        std::clamp(request.profileDetailAmount, -1.0f, 1.0f),
+        std::clamp(request.profileDetailRadius, 0.0f, 3.00f),
         std::clamp(request.profileDetailDetail, 0.0f, 1.0f),
         std::clamp(request.profileDetailMasking, 0.0f, 1.0f),
         0u,

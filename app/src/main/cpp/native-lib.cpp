@@ -430,7 +430,7 @@ NativeRenderQualityConfig makeQualityConfig(
     cfg.profileColorSaturation = std::isfinite(profileColorSaturation) ? std::clamp(profileColorSaturation, -1.0f, 1.0f) : 0.0f;
     cfg.profileColorContrast = std::isfinite(profileColorContrast) ? std::clamp(profileColorContrast, -1.0f, 1.0f) : 0.0f;
     cfg.profilePresenceVibrance = std::isfinite(profilePresenceVibrance) ? std::clamp(profilePresenceVibrance, -1.0f, 1.0f) : 0.0f;
-    cfg.profileDetailAmount = std::isfinite(profileDetailAmount) ? std::clamp(profileDetailAmount, 0.0f, 1.0f) : bncam::profile_defaults::kDetailAmount;
+    cfg.profileDetailAmount = std::isfinite(profileDetailAmount) ? std::clamp(profileDetailAmount, -1.0f, 1.0f) : bncam::profile_defaults::kDetailAmount;
     cfg.profileDetailRadius = std::isfinite(profileDetailRadius) ? std::clamp(profileDetailRadius, bncam::profile_defaults::kDetailMinRadius, bncam::profile_defaults::kDetailMaxRadius) : bncam::profile_defaults::kDetailRadius;
     cfg.profileDetailDetail = std::isfinite(profileDetailDetail) ? std::clamp(profileDetailDetail, 0.0f, 1.0f) : bncam::profile_defaults::kDetailDetail;
     cfg.profileDetailMasking = std::isfinite(profileDetailMasking) ? std::clamp(profileDetailMasking, 0.0f, 1.0f) : bncam::profile_defaults::kDetailMasking;
@@ -947,16 +947,12 @@ struct YuvEncodeTiming {
 void applyYuvProfileDetailCpuFallback(cv::Mat& bgr, const NativeRenderQualityConfig& qualityConfig) {
     if (bgr.empty() || bgr.type() != CV_8UC3) return;
     const float amount = std::isfinite(qualityConfig.profileDetailAmount)
-            ? std::clamp(qualityConfig.profileDetailAmount, 0.0f, 1.0f) : bncam::profile_defaults::kDetailAmount;
-    if (amount <= 1.0e-6f) return;
-    const float radius = std::isfinite(qualityConfig.profileDetailRadius)
-            ? std::clamp(qualityConfig.profileDetailRadius, bncam::profile_defaults::kDetailMinRadius, bncam::profile_defaults::kDetailMaxRadius)
-            : bncam::profile_defaults::kDetailRadius;
-    const float detail = std::isfinite(qualityConfig.profileDetailDetail)
-            ? std::clamp(qualityConfig.profileDetailDetail, 0.0f, 1.0f) : bncam::profile_defaults::kDetailDetail;
-    const float masking = std::isfinite(qualityConfig.profileDetailMasking)
-            ? std::clamp(qualityConfig.profileDetailMasking, 0.0f, 1.0f) : bncam::profile_defaults::kDetailMasking;
+            ? std::clamp(qualityConfig.profileDetailAmount, -1.0f, 1.0f)
+            : bncam::profile_defaults::kDetailAmount;
+    if (std::abs(amount) <= 1.0e-6f) return;
 
+    // Failure-reference only: production YUV uses the Vulkan path. Keep the same standalone
+    // signed semantics here without reading Radius/Detail/Masking.
     cv::Mat rgb32;
     bgr.convertTo(rgb32, CV_32FC3, 1.0 / 255.0);
     cv::Mat luma(rgb32.rows, rgb32.cols, CV_32FC1);
@@ -965,41 +961,55 @@ void applyYuvProfileDetailCpuFallback(cv::Mat& bgr, const NativeRenderQualityCon
             const cv::Vec3f* src = rgb32.ptr<cv::Vec3f>(y);
             float* dst = luma.ptr<float>(y);
             for (int x = 0; x < rgb32.cols; ++x) {
-                dst[x] = std::clamp(0.0722f * src[x][0] + 0.7152f * src[x][1] + 0.2126f * src[x][2], 0.0f, 1.0f);
+                dst[x] = std::clamp(
+                        0.0722f * src[x][0] + 0.7152f * src[x][1] + 0.2126f * src[x][2],
+                        0.0f, 1.0f);
             }
         }
     });
+
     cv::Mat blurred;
-    cv::GaussianBlur(luma, blurred, cv::Size(), std::max(0.45f, radius * 0.72f), std::max(0.45f, radius * 0.72f), cv::BORDER_REPLICATE);
-    const float authorityBase = 0.24f * std::clamp(2.25f * amount, 0.0f, 2.0f) * (0.72f + 0.60f * detail);
-    const float overshootGuard = std::clamp(0.45f + 0.55f * masking, 0.0f, 1.0f);
-    const float cap = 0.040f * (1.0f - 0.62f * overshootGuard);
-    cv::parallel_for_(cv::Range(0, rgb32.rows), [&](const cv::Range& range) {
-        for (int y = range.start; y < range.end; ++y) {
-            cv::Vec3f* rgb = rgb32.ptr<cv::Vec3f>(y);
-            const float* lum = luma.ptr<float>(y);
-            const float* blur = blurred.ptr<float>(y);
-            for (int x = 0; x < rgb32.cols; ++x) {
-                const float center = lum[x];
-                const float hp = center - blur[x];
-                const float edge = std::abs(hp);
-                const float edge0 = 0.0035f + (0.018f - 0.0035f) * masking;
-                const float edge1 = 0.016f + (0.060f - 0.016f) * masking;
-                const float t = edge1 > edge0 ? std::clamp((edge - edge0) / (edge1 - edge0), 0.0f, 1.0f) : 1.0f;
-                const float smooth = t * t * (3.0f - 2.0f * t);
-                const float maskGate = (1.0f - masking) + masking * smooth;
-                const float shadow = std::clamp((center - 0.025f) / 0.085f, 0.0f, 1.0f);
-                const float highlight = 1.0f - std::clamp((center - 0.78f) / 0.19f, 0.0f, 1.0f);
-                const float tonal = (0.22f + 0.78f * shadow) * (0.38f + 0.62f * highlight);
-                const float delta = std::clamp(hp * authorityBase * maskGate * tonal, -cap, cap);
-                const float target = std::clamp(center + delta, 0.0f, 1.0f);
-                const float scale = center > 1.0e-5f ? target / center : 1.0f;
-                rgb[x][0] = std::clamp(rgb[x][0] * scale, 0.0f, 1.0f);
-                rgb[x][1] = std::clamp(rgb[x][1] * scale, 0.0f, 1.0f);
-                rgb[x][2] = std::clamp(rgb[x][2] * scale, 0.0f, 1.0f);
+    if (amount < 0.0f) {
+        const float softness = std::pow(-amount, 0.72f);
+        const float sigma = 0.85f + 1.55f * softness;
+        cv::GaussianBlur(luma, blurred, cv::Size(), sigma, sigma, cv::BORDER_REPLICATE);
+        const float blend = 0.94f * std::pow(softness, 0.78f);
+        cv::parallel_for_(cv::Range(0, rgb32.rows), [&](const cv::Range& range) {
+            for (int y = range.start; y < range.end; ++y) {
+                cv::Vec3f* rgb = rgb32.ptr<cv::Vec3f>(y);
+                const float* lum = luma.ptr<float>(y);
+                const float* blur = blurred.ptr<float>(y);
+                for (int x = 0; x < rgb32.cols; ++x) {
+                    const float center = lum[x];
+                    const float target = std::clamp(center + (blur[x] - center) * blend, 0.0f, 1.0f);
+                    const float scale = center > 1.0e-5f ? std::clamp(target / center, 0.30f, 2.60f) : 1.0f;
+                    rgb[x][0] = std::clamp(rgb[x][0] * scale, 0.0f, 1.0f);
+                    rgb[x][1] = std::clamp(rgb[x][1] * scale, 0.0f, 1.0f);
+                    rgb[x][2] = std::clamp(rgb[x][2] * scale, 0.0f, 1.0f);
+                }
             }
-        }
-    });
+        });
+    } else {
+        cv::GaussianBlur(luma, blurred, cv::Size(), 0.90, 0.90, cv::BORDER_REPLICATE);
+        const float sharpStrength = amount * (1.05f + 1.75f * amount);
+        cv::parallel_for_(cv::Range(0, rgb32.rows), [&](const cv::Range& range) {
+            for (int y = range.start; y < range.end; ++y) {
+                cv::Vec3f* rgb = rgb32.ptr<cv::Vec3f>(y);
+                const float* lum = luma.ptr<float>(y);
+                const float* blur = blurred.ptr<float>(y);
+                for (int x = 0; x < rgb32.cols; ++x) {
+                    const float center = lum[x];
+                    const float highPass = center - blur[x];
+                    const float delta = std::clamp(highPass * sharpStrength, -0.14f, 0.14f);
+                    const float target = std::clamp(center + delta, 0.0f, 1.0f);
+                    const float scale = center > 1.0e-5f ? std::clamp(target / center, 0.30f, 2.60f) : 1.0f;
+                    rgb[x][0] = std::clamp(rgb[x][0] * scale, 0.0f, 1.0f);
+                    rgb[x][1] = std::clamp(rgb[x][1] * scale, 0.0f, 1.0f);
+                    rgb[x][2] = std::clamp(rgb[x][2] * scale, 0.0f, 1.0f);
+                }
+            }
+        });
+    }
     rgb32.convertTo(bgr, CV_8UC3, 255.0);
 }
 
@@ -1841,7 +1851,7 @@ Java_com_bncam_core_engine_ImageUtils_renderRawPreviewNative(
     quality.profilePresenceVibrance = std::isfinite(profileVibrance)
             ? std::clamp(static_cast<float>(profileVibrance), -1.0f, 1.0f) : 0.0f;
     quality.profileDetailAmount = std::isfinite(profileDetailAmount)
-            ? std::clamp(static_cast<float>(profileDetailAmount), 0.0f, 1.0f)
+            ? std::clamp(static_cast<float>(profileDetailAmount), -1.0f, 1.0f)
             : bncam::profile_defaults::kDetailAmount;
     quality.profileDetailRadius = std::isfinite(profileDetailRadius)
             ? std::clamp(static_cast<float>(profileDetailRadius),
@@ -2341,12 +2351,10 @@ Java_com_bncam_core_engine_ImageUtils_processNativeYuv(
     yuvQuality.profileColorSaturation = std::isfinite(profileColorSaturation) ? std::clamp(profileColorSaturation, -1.0f, 1.0f) : 0.0f;
     yuvQuality.profileColorContrast = std::isfinite(profileColorContrast) ? std::clamp(profileColorContrast, -1.0f, 1.0f) : 0.0f;
     yuvQuality.profilePresenceVibrance = std::isfinite(profilePresenceVibrance) ? std::clamp(profilePresenceVibrance, -1.0f, 1.0f) : 0.0f;
-    yuvQuality.profileDetailAmount = std::isfinite(profileDetailAmount) ? std::clamp(profileDetailAmount, 0.0f, 1.0f) : bncam::profile_defaults::kDetailAmount;
-    yuvQuality.profileDetailRadius = yuvQuality.profileDetailAmount > 1.0e-6f
-            ? (std::isfinite(profileDetailRadius)
-                    ? std::clamp(profileDetailRadius, bncam::profile_defaults::kDetailMinRadius, bncam::profile_defaults::kDetailMaxRadius)
-                    : std::max(bncam::profile_defaults::kDetailRadius, bncam::profile_defaults::kDetailMinRadius))
-            : 0.0f;
+    yuvQuality.profileDetailAmount = std::isfinite(profileDetailAmount) ? std::clamp(profileDetailAmount, -1.0f, 1.0f) : bncam::profile_defaults::kDetailAmount;
+    yuvQuality.profileDetailRadius = std::isfinite(profileDetailRadius)
+            ? std::clamp(profileDetailRadius, 0.0f, bncam::profile_defaults::kDetailMaxRadius)
+            : bncam::profile_defaults::kDetailRadius;
     yuvQuality.profileDetailDetail = std::isfinite(profileDetailDetail) ? std::clamp(profileDetailDetail, 0.0f, 1.0f) : bncam::profile_defaults::kDetailDetail;
     yuvQuality.profileDetailMasking = std::isfinite(profileDetailMasking) ? std::clamp(profileDetailMasking, 0.0f, 1.0f) : bncam::profile_defaults::kDetailMasking;
     yuvQuality.profileNrLuminance = std::isfinite(profileNrLuminance) ? std::clamp(profileNrLuminance, 0.0f, 1.0f) : 0.0f;
@@ -2824,7 +2832,7 @@ Java_com_bncam_core_engine_ImageUtils_processNativeYuv(
                   std::abs(yuvQuality.profileColorContrast) > 1.0e-4f ||
                   std::abs(yuvQuality.profilePresenceVibrance) > 1.0e-4f
                   ? "true" : "false")
-          << ";profileDetailApplied=" << (yuvQuality.profileDetailAmount > 1.0e-6f ? "true" : "false")
+          << ";profileDetailApplied=" << (std::abs(yuvQuality.profileDetailAmount) > 1.0e-6f ? "true" : "false")
           << ";profileDetailAmount=" << yuvQuality.profileDetailAmount
           << ";profileDetailRadius=" << yuvQuality.profileDetailRadius
           << ";profileDetailDetail=" << yuvQuality.profileDetailDetail

@@ -843,8 +843,7 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
             request.linearDetailModelConfidence >= 0.15f;
     result.linearDetailRequested = linearDetailRequested;
     const bool perceptualDetailRequested = request.isRawBayer && request.perceptualDetailEnabled &&
-            request.perceptualDetailAuthority > 1.0e-4f && request.perceptualDetailNoiseSigmaY > 0.0f &&
-            request.perceptualDetailModelConfidence >= 0.15f;
+            std::abs(request.perceptualDetailAuthority) > 1.0e-4f;
     result.perceptualDetailRequested = perceptualDetailRequested;
     const FllfPyramidLayout fllfLayout = buildFllfPyramidLayout(
             request.frameWidth, request.frameHeight, request.fllfPyramidLevels);
@@ -979,15 +978,15 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
     }
     if (perceptualDetailRequested) {
         const float perceptualValues[9] = {
-                std::clamp(request.perceptualDetailAuthority, 0.0f, 0.46f),
-                std::clamp(request.perceptualDetailRadius, 0.50f, 3.00f),
-                std::clamp(request.perceptualDetailEmphasis, 0.0f, 1.0f),
-                std::clamp(request.perceptualDetailMasking, 0.0f, 1.0f),
-                std::max(1.0e-7f, request.perceptualDetailNoiseSigmaY),
-                std::max(0.5f, request.perceptualDetailMinimumResidualSnr),
-                std::max(0.4f, request.perceptualDetailMinimumGradientSnr),
-                std::clamp(request.perceptualDetailHardHaloLimit, 0.003f, 0.02f),
-                std::clamp(request.perceptualDetailModelConfidence, 0.0f, 1.0f)};
+                std::clamp(request.perceptualDetailAuthority, -1.0f, 1.0f),
+                1.0f, // Global Sharpness owns a fixed internal kernel; Radius is independent.
+                0.0f, // Detail is a separate future phase and does not scale Global Sharpness.
+                0.0f, // Masking is a separate future phase and does not gate Global Sharpness.
+                std::max(1.0f / 255.0f, request.perceptualDetailNoiseSigmaY),
+                0.90f,
+                0.75f,
+                std::clamp(request.perceptualDetailHardHaloLimit, 0.0f, 0.14f),
+                1.0f};
         std::uint32_t perceptualBits[9]{};
         std::memcpy(perceptualBits, perceptualValues, sizeof(perceptualBits));
         vkCmdUpdateBuffer(commandBuffer_, telemetry_.buffer,

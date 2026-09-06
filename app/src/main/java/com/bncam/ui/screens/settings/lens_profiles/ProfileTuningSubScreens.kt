@@ -509,17 +509,16 @@ fun ProfileSharpnessSettingsScreen(
         if (method == ProfileSharpnessMethods.NORMAL) {
             SettingsCard(
                 "Normal Sharpness",
-                "Phase 12 perceptual/output detail. It runs after the physical capture-detail and tone chain, is noise-aware and halo-limited, and defaults fully neutral."
+                "Standalone global output sharpness. Negative values soften the complete image, zero is exact identity, and positive values increase acutance. Other sharpness controls do not scale or gate this slider."
             ) {
-                ProfileRangeSlider(
+                ProfileSignedSlider(
                     repo = repo,
                     profileId = profileId,
                     key = ProfileIspKeys.DETAIL_SHARPENING_AMOUNT,
                     title = "Global Sharpness",
-                    description = "Perceptual/output sharpening authority. 0 is true identity.",
+                    description = "Standalone signed global sharpness. -1.00 is deliberately very soft, 0.00 is exact neutral/identity, and +1.00 is deliberately very sharp. The full range is intended to be clearly visible.",
                     defaultValue = ProfileDetailDefaults.AMOUNT,
-                    valueRange = 0f..1f,
-                    formatter = { value -> String.format(Locale.US, "%.0f", value * 100f) }
+                    formatter = { value -> String.format(Locale.US, "%+.2f", value) }
                 )
                 ProfileRangeSlider(
                     repo = repo,
@@ -535,8 +534,8 @@ fun ProfileSharpnessSettingsScreen(
                     repo = repo,
                     profileId = profileId,
                     key = ProfileIspKeys.DETAIL_SHARPENING_DETAIL,
-                    title = "Detail",
-                    description = "Fine-texture participation after physical noise qualification.",
+                    title = "Detail (not connected)",
+                    description = "Reserved for the separate Detail phase. It does not affect Global Sharpness.",
                     defaultValue = ProfileDetailDefaults.DETAIL,
                     valueRange = 0f..1f,
                     formatter = { value -> String.format(Locale.US, "%.0f", value * 100f) }
@@ -545,8 +544,8 @@ fun ProfileSharpnessSettingsScreen(
                     repo = repo,
                     profileId = profileId,
                     key = ProfileIspKeys.DETAIL_SHARPENING_MASKING,
-                    title = "Sharp Mask",
-                    description = "Masks smooth/noisy regions and reduces visible sharpening artefacts.",
+                    title = "Sharp Mask (not connected)",
+                    description = "Reserved for a separate masking phase. It does not affect Global Sharpness.",
                     defaultValue = ProfileDetailDefaults.MASKING,
                     valueRange = 0f..1f,
                     formatter = { value -> String.format(Locale.US, "%.0f", value * 100f) }

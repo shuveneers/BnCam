@@ -146,14 +146,14 @@ data class ProfileDetailSettings(
     val masking: Float = ProfileDetailDefaults.MASKING
 ) {
     fun sanitized(): ProfileDetailSettings {
-        val safeAmount = amount.takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: ProfileDetailDefaults.AMOUNT
+        val safeAmount = amount.takeIf { it.isFinite() }?.coerceIn(-1f, 1f) ?: ProfileDetailDefaults.AMOUNT
         val storedRadius = radius.takeIf { it.isFinite() }?.coerceIn(0f, ProfileDetailDefaults.MAX_RADIUS)
             ?: ProfileDetailDefaults.RADIUS
         return copy(
             amount = safeAmount,
-            // Zero is a real neutral profile value. A valid kernel radius is only resolved when
-            // Amount becomes active; this prevents a hidden radius boost on neutral profiles.
-            radius = if (safeAmount <= 1.0e-4f) 0f else storedRadius.coerceIn(ProfileDetailDefaults.MIN_RADIUS, ProfileDetailDefaults.MAX_RADIUS),
+            // Global Sharpness is a standalone signed control. Radius/Detail/Masking are persisted
+            // independently for their own future phases and never gate or scale Global Sharpness.
+            radius = storedRadius,
             detail = detail.takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: ProfileDetailDefaults.DETAIL,
             masking = masking.takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: ProfileDetailDefaults.MASKING
         )

@@ -1479,10 +1479,10 @@ void commitLinearDetailRecovery(uvec2 gid) {
     writeWorking(gid, linearDetailScratchAt(int(gid.x), int(gid.y)));
 }
 
-// Phase 12 — post-display perceptual detail/output sharpening.
-// This stage is intentionally narrow-band. It never builds a broad local-contrast base and thus
-// does not compete with FLLF. Proposal/commit reuse the full-resolution scratch buffer exactly as
-// Phase 11 does, but execute after the scene-to-display transform.
+// Phase 12 — standalone signed Global Sharpness.
+// Negative values use an edge-aware low-pass for real softness; positive values use bounded
+// multi-scale unsharp detail. Amount is the only user authority. Radius/Detail/Masking do not
+// participate. The stage runs after the scene-to-display transform and never owns exposure/tone.
 float perceptualDetailSigma() {
     return max(telemetryFloat(43u, 0.0), 1.0e-7);
 }
@@ -1495,15 +1495,11 @@ void proposePerceptualDetail(uvec2 gid) {
     int y = int(gid.y);
     vec3 centerRgb = workingAt(x, y);
     float centerY = clamp(lumaOf(centerRgb), 0.0, 1.0);
-    float authority = clamp(telemetryFloat(39u, 0.0), 0.0, 0.46);
-    float radius = clamp(telemetryFloat(40u, 0.85), 0.50, 3.0);
-    float detail = clamp(telemetryFloat(41u, 0.0), 0.0, 1.0);
-    float masking = clamp(telemetryFloat(42u, 0.0), 0.0, 1.0);
-    float sigma = perceptualDetailSigma();
-    float minResidualSnr = max(0.5, telemetryFloat(44u, 1.5));
-    float minGradientSnr = max(0.4, telemetryFloat(45u, 1.0));
-    float hardHalo = clamp(telemetryFloat(46u, 0.008), 0.003, 0.02);
-    float modelConfidence = clamp(telemetryFloat(47u, 0.0), 0.0, 1.0);
+    float amount = clamp(telemetryFloat(39u, 0.0), -1.0, 1.0);
+    if (abs(amount) <= 1.0e-6) {
+        writeLinearDetailScratch(gid, centerRgb);
+        return;
+    }
 
     float l = lumaOf(workingAt(x - 1, y));
     float r = lumaOf(workingAt(x + 1, y));
@@ -1513,52 +1509,130 @@ void proposePerceptualDetail(uvec2 gid) {
     float ur = lumaOf(workingAt(x + 1, y - 1));
     float dl = lumaOf(workingAt(x - 1, y + 1));
     float dr = lumaOf(workingAt(x + 1, y + 1));
+    float l2 = lumaOf(workingAt(x - 2, y));
+    float r2 = lumaOf(workingAt(x + 2, y));
+    float u2 = lumaOf(workingAt(x, y - 2));
+    float d2 = lumaOf(workingAt(x, y + 2));
 
     float crossMean = 0.25 * (l + r + u + d);
-    float boxMean = (l + r + u + d + ul + ur + dl + dr) * 0.125;
-    float farCross = 0.25 * (lumaOf(workingAt(x - 2, y)) + lumaOf(workingAt(x + 2, y)) +
-                             lumaOf(workingAt(x, y - 2)) + lumaOf(workingAt(x, y + 2)));
-    float radiusT = clamp((radius - 0.50) / 2.50, 0.0, 1.0);
-    float compactMean = mix(0.70 * crossMean + 0.30 * boxMean,
-                            0.52 * crossMean + 0.28 * boxMean + 0.20 * farCross,
-                            radiusT);
-    float residual = centerY - compactMean;
-    float gx = 0.5 * (r - l);
-    float gy = 0.5 * (d - u);
-    float gradient = sqrt(max(0.0, gx * gx + gy * gy));
-    float residualSnr = abs(residual) / sigma;
-    float gradientSnr = gradient / sigma;
-
-    float noiseGate = smoothstep(minResidualSnr, minResidualSnr + 2.0, residualSnr);
-    float edgeGate = smoothstep(minGradientSnr, minGradientSnr + 2.4, gradientSnr);
-    float textureGate = smoothstep(minResidualSnr + 0.6, minResidualSnr + 3.2, residualSnr);
-    float participation = mix(edgeGate, max(edgeGate, textureGate), detail);
-    float directionalCoherence = max(abs(gx), abs(gy)) / max(abs(gx) + abs(gy), 1.0e-6);
-    float coherenceGate = smoothstep(0.55, 0.88, directionalCoherence);
-    float maskGate = mix(1.0, edgeGate, masking);
-    float localAuthority = authority * modelConfidence * noiseGate * participation * coherenceGate * maskGate;
-
-    if (participation > 0.25 && noiseGate > 0.05) atomicAdd(telemetry[50], 1u);
-    if (noiseGate < 0.05) atomicAdd(telemetry[51], 1u);
-
+    float boxMean = 0.125 * (l + r + u + d + ul + ur + dl + dr);
+    float farCross = 0.25 * (l2 + r2 + u2 + d2);
     float localMin = min(centerY, min(min(min(l, r), min(u, d)), min(min(ul, ur), min(dl, dr))));
     float localMax = max(centerY, max(max(max(l, r), max(u, d)), max(max(ul, ur), max(dl, dr))));
+    localMin = min(localMin, min(min(l2, r2), min(u2, d2)));
+    localMax = max(localMax, max(max(l2, r2), max(u2, d2)));
     float localRange = max(0.0, localMax - localMin);
-    float fineGain = mix(0.85, 1.15, detail);
-    float delta = residual * localAuthority * fineGain;
-    float adaptiveHalo = min(hardHalo, 0.12 * localRange + 1.15 * sigma);
-    float rawDelta = delta;
-    delta = clamp(delta, -adaptiveHalo, adaptiveHalo);
-    float proposedY = clamp(centerY + delta,
-                            max(0.0, localMin - adaptiveHalo),
-                            min(1.0, localMax + adaptiveHalo));
-    delta = proposedY - centerY;
-    if (abs(delta - rawDelta) > 1.0e-7) atomicAdd(telemetry[52], 1u);
 
+    float proposedY = centerY;
+    if (amount < 0.0) {
+        // Standalone negative Global Sharpness: a real edge-aware low-pass, not inverse sharpening.
+        // Fine and medium detail are deliberately removed at -1 while large tonal boundaries remain
+        // protected by center-relative bilateral weights.
+        float softness = pow(clamp(-amount, 0.0, 1.0), 0.72);
+        float edgeSigma = mix(0.040, 0.115, softness);
+        float inv2EdgeSigmaSq = 1.0 / max(2.0 * edgeSigma * edgeSigma, 1.0e-6);
+        float centerWeight = mix(2.40, 0.65, softness);
+        float sum = centerY * centerWeight;
+        float weightSum = centerWeight;
+
+        float dv;
+        float wgt;
+        dv = (l) - centerY;
+        wgt = 1.00 * exp(-dv * dv * inv2EdgeSigmaSq);
+        sum += (l) * wgt;
+        weightSum += wgt;
+        dv = (r) - centerY;
+        wgt = 1.00 * exp(-dv * dv * inv2EdgeSigmaSq);
+        sum += (r) * wgt;
+        weightSum += wgt;
+        dv = (u) - centerY;
+        wgt = 1.00 * exp(-dv * dv * inv2EdgeSigmaSq);
+        sum += (u) * wgt;
+        weightSum += wgt;
+        dv = (d) - centerY;
+        wgt = 1.00 * exp(-dv * dv * inv2EdgeSigmaSq);
+        sum += (d) * wgt;
+        weightSum += wgt;
+        dv = (ul) - centerY;
+        wgt = 0.72 * exp(-dv * dv * inv2EdgeSigmaSq);
+        sum += (ul) * wgt;
+        weightSum += wgt;
+        dv = (ur) - centerY;
+        wgt = 0.72 * exp(-dv * dv * inv2EdgeSigmaSq);
+        sum += (ur) * wgt;
+        weightSum += wgt;
+        dv = (dl) - centerY;
+        wgt = 0.72 * exp(-dv * dv * inv2EdgeSigmaSq);
+        sum += (dl) * wgt;
+        weightSum += wgt;
+        dv = (dr) - centerY;
+        wgt = 0.72 * exp(-dv * dv * inv2EdgeSigmaSq);
+        sum += (dr) * wgt;
+        weightSum += wgt;
+        dv = (l2) - centerY;
+        wgt = 0.46 * exp(-dv * dv * inv2EdgeSigmaSq);
+        sum += (l2) * wgt;
+        weightSum += wgt;
+        dv = (r2) - centerY;
+        wgt = 0.46 * exp(-dv * dv * inv2EdgeSigmaSq);
+        sum += (r2) * wgt;
+        weightSum += wgt;
+        dv = (u2) - centerY;
+        wgt = 0.46 * exp(-dv * dv * inv2EdgeSigmaSq);
+        sum += (u2) * wgt;
+        weightSum += wgt;
+        dv = (d2) - centerY;
+        wgt = 0.46 * exp(-dv * dv * inv2EdgeSigmaSq);
+        sum += (d2) * wgt;
+        weightSum += wgt;
+
+        float softY = sum / max(weightSum, 1.0e-6);
+        // A second broad estimate increases visible softness without crossing hard edges.
+        float broadY = 0.46 * softY + 0.34 * boxMean + 0.20 * farCross;
+        float softBlend = 0.94 * pow(softness, 0.78);
+        proposedY = mix(centerY, broadY, softBlend);
+    } else {
+        // Standalone positive Global Sharpness: multi-scale unsharp detail with fixed internal
+        // semantics. No Radius/Detail/Masking/profile-confidence multiplier is allowed here.
+        float fineMean = 0.68 * crossMean + 0.32 * boxMean;
+        float mediumMean = 0.58 * boxMean + 0.42 * farCross;
+        float highPassFine = centerY - fineMean;
+        float highPassMedium = centerY - mediumMean;
+        float highPass = 0.74 * highPassFine + 0.26 * highPassMedium;
+
+        float gx = 0.5 * (r - l);
+        float gy = 0.5 * (d - u);
+        float gradient = sqrt(max(0.0, gx * gx + gy * gy));
+        float sigma = max(perceptualDetailSigma(), 1.0 / 255.0);
+        float residualSnr = abs(highPass) / sigma;
+        float gradientSnr = gradient / sigma;
+        float residualGate = smoothstep(0.80, 2.00, residualSnr);
+        float edgeGate = smoothstep(0.70, 1.85, gradientSnr);
+        float rangeGate = smoothstep(0.004, 0.022, localRange);
+        float structureGate = max(rangeGate * 0.55, max(residualGate, edgeGate));
+
+        // +1 is intentionally an extreme endpoint. +0.25 is already visibly sharper.
+        float sharpStrength = amount * (1.05 + 1.75 * amount);
+        float rawDelta = highPass * sharpStrength * structureGate;
+        float hardHalo = clamp(telemetryFloat(46u, 0.10), 0.025, 0.14);
+        float adaptiveHalo = min(hardHalo, 0.018 + 0.46 * localRange);
+        float delta = clamp(rawDelta, -adaptiveHalo, adaptiveHalo);
+        proposedY = clamp(centerY + delta,
+                          max(0.0, localMin - adaptiveHalo),
+                          min(1.0, localMax + adaptiveHalo));
+        if (abs(delta - rawDelta) > 1.0e-7) atomicAdd(telemetry[52], 1u);
+        if (structureGate > 0.20) atomicAdd(telemetry[50], 1u);
+        if (residualGate < 0.05 && edgeGate < 0.05) atomicAdd(telemetry[51], 1u);
+    }
+
+    proposedY = clamp(proposedY, 0.0, 1.0);
+    float delta = proposedY - centerY;
     vec3 proposedRgb = centerRgb;
     if (centerY > 1.0e-5) {
-        proposedRgb = centerRgb * clamp(proposedY / centerY, 0.88, 1.12);
+        proposedRgb = centerRgb * clamp(proposedY / centerY, 0.30, 2.60);
         proposedRgb = compressToUnitGamutPreserveLuma(proposedRgb);
+    } else if (proposedY > centerY) {
+        proposedRgb = vec3(proposedY);
     }
     writeLinearDetailScratch(gid, proposedRgb);
 
