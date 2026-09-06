@@ -524,11 +524,11 @@ fun ProfileSharpnessSettingsScreen(
                     repo = repo,
                     profileId = profileId,
                     key = ProfileIspKeys.DETAIL_SHARPENING_EDGE,
-                    title = "Edge Sharpness (not connected)",
-                    description = "Planned edge-selective sharpening authority. Stored in the profile but not yet applied by the renderer.",
+                    title = "Edge",
+                    description = "Standalone signed structural-edge control. -1.00 strongly smooths qualified coherent edges, 0.00 is exact neutral, and +1.00 strongly increases edge acutance. It is independent from Global Sharpness and Detail.",
                     defaultValue = ProfilePlannedDefaults.EDGE_SHARPNESS,
-                    valueRange = 0f..1f,
-                    formatter = { value -> String.format(Locale.US, "%.0f", value * 100f) }
+                    valueRange = -1f..1f,
+                    formatter = { value -> String.format(Locale.US, "%+.2f", value) }
                 )
                 ProfileRangeSlider(
                     repo = repo,
@@ -537,8 +537,8 @@ fun ProfileSharpnessSettingsScreen(
                     title = "Detail (not connected)",
                     description = "Reserved for the separate Detail phase. It does not affect Global Sharpness.",
                     defaultValue = ProfileDetailDefaults.DETAIL,
-                    valueRange = 0f..1f,
-                    formatter = { value -> String.format(Locale.US, "%.0f", value * 100f) }
+                    valueRange = -1f..1f,
+                    formatter = { value -> String.format(Locale.US, "%+.2f", value) }
                 )
                 ProfileRangeSlider(
                     repo = repo,
@@ -547,8 +547,8 @@ fun ProfileSharpnessSettingsScreen(
                     title = "Sharp Mask (not connected)",
                     description = "Reserved for a separate masking phase. It does not affect Global Sharpness.",
                     defaultValue = ProfileDetailDefaults.MASKING,
-                    valueRange = 0f..1f,
-                    formatter = { value -> String.format(Locale.US, "%.0f", value * 100f) }
+                    valueRange = -1f..1f,
+                    formatter = { value -> String.format(Locale.US, "%+.2f", value) }
                 )
             }
         } else {

@@ -843,7 +843,8 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
             request.linearDetailModelConfidence >= 0.15f;
     result.linearDetailRequested = linearDetailRequested;
     const bool perceptualDetailRequested = request.isRawBayer && request.perceptualDetailEnabled &&
-            std::abs(request.perceptualDetailAuthority) > 1.0e-4f;
+            (std::abs(request.perceptualDetailAuthority) > 1.0e-4f ||
+             std::abs(request.perceptualDetailMasking) > 1.0e-4f);
     result.perceptualDetailRequested = perceptualDetailRequested;
     const FllfPyramidLayout fllfLayout = buildFllfPyramidLayout(
             request.frameWidth, request.frameHeight, request.fllfPyramidLevels);
@@ -981,7 +982,7 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
                 std::clamp(request.perceptualDetailAuthority, -1.0f, 1.0f),
                 1.0f, // Global Sharpness owns a fixed internal kernel; Radius is independent.
                 0.0f, // Detail is a separate future phase and does not scale Global Sharpness.
-                0.0f, // Masking is a separate future phase and does not gate Global Sharpness.
+                std::clamp(request.perceptualDetailMasking, -1.0f, 1.0f), // Phase 2 signed standalone Edge authority.
                 std::max(1.0f / 255.0f, request.perceptualDetailNoiseSigmaY),
                 0.90f,
                 0.75f,

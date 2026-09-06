@@ -479,9 +479,166 @@ void finalizeYuvResidualModel() {
     ultraHdrTelemetry.values[kYuvConfidenceWord] = yuvQ24(confidence);
 }
 
+// Lightweight neutral YUV luma sample used only for standalone Edge qualification.
+// It deliberately avoids recursive denoise/tone calls for neighbouring edge samples.
+float edgeNeutralYAtOutput(int outputX, int outputY) {
+    uint index = uint(clamp(roundEven(inputYAtOutput(outputX, outputY) * 255.0), 0.0, 255.0));
+    return float(toneLut.values[index] & 0xffu) / 255.0;
+}
+
+float profileEdgeYAtOutput(uint outputX, uint outputY) {
+    float authority = clamp(pc.profileDetailMasking, -1.0, 1.0);
+    float base = toneMappedYAtOutput(int(outputX), int(outputY));
+    if (abs(authority) <= 1.0e-6) return base;
+
+    int x = int(outputX);
+    int y = int(outputY);
+    float c = edgeNeutralYAtOutput(x, y);
+    float n = edgeNeutralYAtOutput(x, y - 1);
+    float s = edgeNeutralYAtOutput(x, y + 1);
+    float w = edgeNeutralYAtOutput(x - 1, y);
+    float e = edgeNeutralYAtOutput(x + 1, y);
+    float nw = edgeNeutralYAtOutput(x - 1, y - 1);
+    float ne = edgeNeutralYAtOutput(x + 1, y - 1);
+    float sw = edgeNeutralYAtOutput(x - 1, y + 1);
+    float se = edgeNeutralYAtOutput(x + 1, y + 1);
+    float n2 = edgeNeutralYAtOutput(x, y - 2);
+    float s2 = edgeNeutralYAtOutput(x, y + 2);
+    float w2 = edgeNeutralYAtOutput(x - 2, y);
+    float e2 = edgeNeutralYAtOutput(x + 2, y);
+    float n4 = edgeNeutralYAtOutput(x, y - 4);
+    float s4 = edgeNeutralYAtOutput(x, y + 4);
+    float w4 = edgeNeutralYAtOutput(x - 4, y);
+    float e4 = edgeNeutralYAtOutput(x + 4, y);
+
+    float gx = 0.125 * ((ne + 2.0 * e + se) - (nw + 2.0 * w + sw));
+    float gy = 0.125 * ((sw + 2.0 * s + se) - (nw + 2.0 * n + ne));
+    float gradient = sqrt(max(0.0, gx * gx + gy * gy));
+    float gx2 = 0.25 * (e2 - w2);
+    float gy2 = 0.25 * (s2 - n2);
+    float coarseGradient = sqrt(max(0.0, gx2 * gx2 + gy2 * gy2));
+    float gx4 = 0.125 * (e4 - w4);
+    float gy4 = 0.125 * (s4 - n4);
+    float broadGradient = sqrt(max(0.0, gx4 * gx4 + gy4 * gy4));
+    float gradientAlignment = clamp((gx * gx2 + gy * gy2) /
+            max(gradient * coarseGradient, 1.0e-8), -1.0, 1.0);
+    float broadAlignment = clamp((gx * gx4 + gy * gy4) /
+            max(gradient * broadGradient, 1.0e-8), -1.0, 1.0);
+    float scalePersistence = coarseGradient / max(gradient, 1.0e-6);
+    float broadPersistence = broadGradient / max(gradient, 1.0e-6);
+
+    float gxA = 0.5 * (e - w);
+    float gyA = 0.5 * (s - n);
+    float gxB = 0.5 * (ne - nw);
+    float gyB = 0.5 * (se - ne);
+    float gxC = 0.5 * (se - sw);
+    float gyC = 0.5 * (sw - nw);
+    float jxx = gxA * gxA + 0.50 * (gxB * gxB + gxC * gxC);
+    float jyy = gyA * gyA + 0.50 * (gyB * gyB + gyC * gyC);
+    float jxy = gxA * gyA + 0.50 * (gxB * gyB + gxC * gyC);
+    float energy = jxx + jyy;
+    float coherence = sqrt(max(0.0, (jxx - jyy) * (jxx - jyy) + 4.0 * jxy * jxy)) /
+            max(energy, 1.0e-8);
+
+    float sigma = max(yuvMeasuredSigmaY(), 1.0 / 255.0);
+    float fineGradientGate = smoothstep(max(0.012, 1.90 * sigma),
+                                        max(0.045, 5.80 * sigma), gradient);
+    float coarseGradientGate = smoothstep(max(0.008, 1.35 * sigma),
+                                          max(0.030, 4.20 * sigma), coarseGradient);
+    float broadGradientGate = smoothstep(max(0.004, 1.00 * sigma),
+                                         max(0.016, 2.80 * sigma), broadGradient);
+    float coherenceGate = smoothstep(0.58, 0.90, coherence);
+    float alignmentGate = smoothstep(0.62, 0.94, gradientAlignment);
+    float broadAlignmentGate = smoothstep(0.55, 0.90, broadAlignment);
+    float persistenceGate = smoothstep(0.20, 0.48, scalePersistence);
+    float broadPersistenceGate = smoothstep(0.08, 0.22, broadPersistence);
+
+    // Resolve opposite sides of the edge normal and estimate their plateaus. Negative Edge
+    // increases the effective radius by trusting farther samples; positive Edge tightens it.
+    float ax = abs(gx);
+    float ay = abs(gy);
+    float diagonalRatio = min(ax, ay) / max(max(ax, ay), 1.0e-6);
+    float minus1;
+    float plus1;
+    float minus2;
+    float plus2;
+    float minus4;
+    float plus4;
+    if (diagonalRatio > 0.58) {
+        if (gx * gy >= 0.0) {
+            if (gx >= 0.0) {
+                minus1 = nw; plus1 = se;
+                minus2 = 0.5 * (w2 + n2); plus2 = 0.5 * (e2 + s2);
+                minus4 = 0.5 * (w4 + n4); plus4 = 0.5 * (e4 + s4);
+            } else {
+                minus1 = se; plus1 = nw;
+                minus2 = 0.5 * (e2 + s2); plus2 = 0.5 * (w2 + n2);
+                minus4 = 0.5 * (e4 + s4); plus4 = 0.5 * (w4 + n4);
+            }
+        } else {
+            if (gx >= 0.0) {
+                minus1 = sw; plus1 = ne;
+                minus2 = 0.5 * (w2 + s2); plus2 = 0.5 * (e2 + n2);
+                minus4 = 0.5 * (w4 + s4); plus4 = 0.5 * (e4 + n4);
+            } else {
+                minus1 = ne; plus1 = sw;
+                minus2 = 0.5 * (e2 + n2); plus2 = 0.5 * (w2 + s2);
+                minus4 = 0.5 * (e4 + n4); plus4 = 0.5 * (w4 + s4);
+            }
+        }
+    } else if (ax >= ay) {
+        if (gx >= 0.0) {
+            minus1 = w; plus1 = e; minus2 = w2; plus2 = e2; minus4 = w4; plus4 = e4;
+        } else {
+            minus1 = e; plus1 = w; minus2 = e2; plus2 = w2; minus4 = e4; plus4 = w4;
+        }
+    } else {
+        if (gy >= 0.0) {
+            minus1 = n; plus1 = s; minus2 = n2; plus2 = s2; minus4 = n4; plus4 = s4;
+        } else {
+            minus1 = s; plus1 = n; minus2 = s2; plus2 = n2; minus4 = s4; plus4 = n4;
+        }
+    }
+
+    float radiusAuthority = pow(abs(authority), 0.78);
+    float farWeight = authority < 0.0
+            ? mix(0.38, 0.62, radiusAuthority)
+            : mix(0.38, 0.28, radiusAuthority);
+    float nearWeight = authority < 0.0
+            ? mix(0.22, 0.12, radiusAuthority)
+            : mix(0.22, 0.30, radiusAuthority);
+    float midWeight = 1.0 - nearWeight - farWeight;
+    float plateauMinus = nearWeight * minus1 + midWeight * minus2 + farWeight * minus4;
+    float plateauPlus = nearWeight * plus1 + midWeight * plus2 + farWeight * plus4;
+    float lowPlateau = min(plateauMinus, plateauPlus);
+    float highPlateau = max(plateauMinus, plateauPlus);
+    float stepHeight = highPlateau - lowPlateau;
+    float stepGate = smoothstep(max(0.014, 2.10 * sigma),
+                                max(0.060, 7.00 * sigma), stepHeight);
+    if (stepHeight <= 1.0e-6) return base;
+
+    float t = clamp((c - lowPlateau) / stepHeight, 0.0, 1.0);
+    float interior = min(t, 1.0 - t);
+    float transitionGate = smoothstep(0.015, 0.115, interior);
+    float profile = 2.0 * t - 1.0;
+    float gamma = authority < 0.0
+            ? mix(1.0, 3.15, radiusAuthority)
+            : mix(1.0, 0.34, radiusAuthority);
+    float remappedProfile = sign(profile) * pow(abs(profile), gamma);
+    float targetT = 0.5 + 0.5 * remappedProfile;
+    float targetY = mix(lowPlateau, highPlateau, targetT);
+    float structuralGate = fineGradientGate * coarseGradientGate * broadGradientGate *
+            coherenceGate * alignmentGate * broadAlignmentGate * persistenceGate *
+            broadPersistenceGate * stepGate * transitionGate;
+    float edgeDelta = (targetY - c) * structuralGate;
+    // Edge changes transition width only; no overshoot/halo is allowed on either sign.
+    return clamp(base + edgeDelta, lowPlateau, highPlateau);
+}
+
 float profileDetailedYAtOutput(uint outputX, uint outputY) {
     float amount = clamp(pc.profileDetailAmount, -1.0, 1.0);
-    float center = toneMappedYAtOutput(int(outputX), int(outputY));
+    // Edge is the first operation. Global Sharpness is the final image-sharpness stage.
+    float center = profileEdgeYAtOutput(outputX, outputY);
     if (abs(amount) <= 1.0e-6) return center;
 
     int x = int(outputX);
@@ -509,7 +666,6 @@ float profileDetailedYAtOutput(uint outputX, uint outputY) {
     float localRange = max(0.0, localMax - localMin);
 
     if (amount < 0.0) {
-        // Standalone negative Global Sharpness: deliberately strong edge-aware softening.
         float softness = pow(clamp(-amount, 0.0, 1.0), 0.72);
         float edgeSigma = mix(0.040, 0.115, softness);
         float inv2EdgeSigmaSq = 1.0 / max(2.0 * edgeSigma * edgeSigma, 1.0e-6);
@@ -519,54 +675,18 @@ float profileDetailedYAtOutput(uint outputX, uint outputY) {
 
         float dv;
         float bw;
-        dv = (n) - center;
-        bw = 1.00 * exp(-dv * dv * inv2EdgeSigmaSq);
-        sum += (n) * bw;
-        weightSum += bw;
-        dv = (s) - center;
-        bw = 1.00 * exp(-dv * dv * inv2EdgeSigmaSq);
-        sum += (s) * bw;
-        weightSum += bw;
-        dv = (w) - center;
-        bw = 1.00 * exp(-dv * dv * inv2EdgeSigmaSq);
-        sum += (w) * bw;
-        weightSum += bw;
-        dv = (e) - center;
-        bw = 1.00 * exp(-dv * dv * inv2EdgeSigmaSq);
-        sum += (e) * bw;
-        weightSum += bw;
-        dv = (nw) - center;
-        bw = 0.72 * exp(-dv * dv * inv2EdgeSigmaSq);
-        sum += (nw) * bw;
-        weightSum += bw;
-        dv = (ne) - center;
-        bw = 0.72 * exp(-dv * dv * inv2EdgeSigmaSq);
-        sum += (ne) * bw;
-        weightSum += bw;
-        dv = (sw) - center;
-        bw = 0.72 * exp(-dv * dv * inv2EdgeSigmaSq);
-        sum += (sw) * bw;
-        weightSum += bw;
-        dv = (se) - center;
-        bw = 0.72 * exp(-dv * dv * inv2EdgeSigmaSq);
-        sum += (se) * bw;
-        weightSum += bw;
-        dv = (n2) - center;
-        bw = 0.46 * exp(-dv * dv * inv2EdgeSigmaSq);
-        sum += (n2) * bw;
-        weightSum += bw;
-        dv = (s2) - center;
-        bw = 0.46 * exp(-dv * dv * inv2EdgeSigmaSq);
-        sum += (s2) * bw;
-        weightSum += bw;
-        dv = (w2) - center;
-        bw = 0.46 * exp(-dv * dv * inv2EdgeSigmaSq);
-        sum += (w2) * bw;
-        weightSum += bw;
-        dv = (e2) - center;
-        bw = 0.46 * exp(-dv * dv * inv2EdgeSigmaSq);
-        sum += (e2) * bw;
-        weightSum += bw;
+        dv = n - center; bw = 1.00 * exp(-dv * dv * inv2EdgeSigmaSq); sum += n * bw; weightSum += bw;
+        dv = s - center; bw = 1.00 * exp(-dv * dv * inv2EdgeSigmaSq); sum += s * bw; weightSum += bw;
+        dv = w - center; bw = 1.00 * exp(-dv * dv * inv2EdgeSigmaSq); sum += w * bw; weightSum += bw;
+        dv = e - center; bw = 1.00 * exp(-dv * dv * inv2EdgeSigmaSq); sum += e * bw; weightSum += bw;
+        dv = nw - center; bw = 0.72 * exp(-dv * dv * inv2EdgeSigmaSq); sum += nw * bw; weightSum += bw;
+        dv = ne - center; bw = 0.72 * exp(-dv * dv * inv2EdgeSigmaSq); sum += ne * bw; weightSum += bw;
+        dv = sw - center; bw = 0.72 * exp(-dv * dv * inv2EdgeSigmaSq); sum += sw * bw; weightSum += bw;
+        dv = se - center; bw = 0.72 * exp(-dv * dv * inv2EdgeSigmaSq); sum += se * bw; weightSum += bw;
+        dv = n2 - center; bw = 0.46 * exp(-dv * dv * inv2EdgeSigmaSq); sum += n2 * bw; weightSum += bw;
+        dv = s2 - center; bw = 0.46 * exp(-dv * dv * inv2EdgeSigmaSq); sum += s2 * bw; weightSum += bw;
+        dv = w2 - center; bw = 0.46 * exp(-dv * dv * inv2EdgeSigmaSq); sum += w2 * bw; weightSum += bw;
+        dv = e2 - center; bw = 0.46 * exp(-dv * dv * inv2EdgeSigmaSq); sum += e2 * bw; weightSum += bw;
 
         float softY = sum / max(weightSum, 1.0e-6);
         float broadY = 0.46 * softY + 0.34 * boxMean + 0.20 * farCross;
@@ -574,20 +694,17 @@ float profileDetailedYAtOutput(uint outputX, uint outputY) {
         return clamp(mix(center, broadY, softBlend), 0.0, 1.0);
     }
 
-    // Standalone positive Global Sharpness. Existing Detail/Masking/Radius values are ignored.
     float fineMean = 0.68 * crossMean + 0.32 * boxMean;
     float mediumMean = 0.58 * boxMean + 0.42 * farCross;
     float highPass = 0.74 * (center - fineMean) + 0.26 * (center - mediumMean);
     float gx = 0.5 * (e - w);
     float gy = 0.5 * (s - n);
     float gradient = sqrt(max(0.0, gx * gx + gy * gy));
-
     float sigmaY = clamp(max(yuvMeasuredSigmaY(), 1.0 / 255.0), 1.0 / 255.0, 0.025);
     float residualGate = smoothstep(0.80, 2.00, abs(highPass) / sigmaY);
     float edgeGate = smoothstep(0.70, 1.85, gradient / sigmaY);
     float rangeGate = smoothstep(0.004, 0.022, localRange);
     float structureGate = max(rangeGate * 0.55, max(residualGate, edgeGate));
-
     float sharpStrength = amount * (1.05 + 1.75 * amount);
     float rawDelta = highPass * sharpStrength * structureGate;
     float adaptiveHalo = min(0.14, 0.018 + 0.46 * localRange);

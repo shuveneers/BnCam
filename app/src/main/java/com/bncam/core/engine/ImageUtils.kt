@@ -432,7 +432,9 @@ object ImageUtils {
                 profileDetailAmount = qualityConfig?.profileDetailTuning?.amount ?: com.bncam.data.settings.ProfileDetailDefaults.AMOUNT,
                 profileDetailRadius = qualityConfig?.profileDetailTuning?.radius ?: com.bncam.data.settings.ProfileDetailDefaults.RADIUS,
                 profileDetailDetail = qualityConfig?.profileDetailTuning?.detail ?: com.bncam.data.settings.ProfileDetailDefaults.DETAIL,
-                profileDetailMasking = qualityConfig?.profileDetailTuning?.masking ?: com.bncam.data.settings.ProfileDetailDefaults.MASKING,
+                // Phase 2 transport compatibility: native profileDetailMasking is an ABI slot only.
+                // It carries standalone Edge authority; the Sharp Mask setting remains disconnected.
+                profileDetailMasking = qualityConfig?.profileDetailTuning?.edge ?: com.bncam.data.settings.ProfilePlannedDefaults.EDGE_SHARPNESS,
                 profileNrLuminance = qualityConfig?.profileNoiseReductionTuning?.luminance ?: ProfileNoiseReductionDefaults.LUMINANCE,
                 profileNrLuminanceDetail = qualityConfig?.profileNoiseReductionTuning?.luminanceDetail ?: ProfileNoiseReductionDefaults.LUMINANCE_DETAIL,
                 profileNrLuminanceContrast = qualityConfig?.profileNoiseReductionTuning?.luminanceContrast ?: ProfileNoiseReductionDefaults.LUMINANCE_CONTRAST,
@@ -803,7 +805,8 @@ object ImageUtils {
                 profileDetailAmount = profileDetailTuning.amount,
                 profileDetailRadius = profileDetailTuning.radius,
                 profileDetailDetail = profileDetailTuning.detail,
-                profileDetailMasking = profileDetailTuning.masking,
+                // Phase 2 transport compatibility: this legacy JNI slot carries Edge only.
+                profileDetailMasking = profileDetailTuning.edge,
                 knownHotPixelMap = masterFrame.knownHotPixelMap.packedXy,
                 lensShadingMap = lensShadingMap.gains,
                 lensShadingColumns = lensShadingMap.columns,

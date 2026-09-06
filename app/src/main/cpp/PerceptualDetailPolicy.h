@@ -42,17 +42,18 @@ inline float finiteOr(float value, float fallback) noexcept {
  *
  * This is the standalone signed Global Sharpness stage. It does not build or remap a local-tone
  * base, so FLLF remains the sole local exposure/contrast owner. Amount alone controls the effect:
- * negative softens, zero is exact identity, positive sharpens. Radius/Detail/Masking are separate
- * controls and are intentionally ignored here. Physical noise, when available, is only an internal
- * safety hint and never a prerequisite for the user-requested effect.
+ * negative softens, zero is exact identity, positive sharpens. Radius/Detail remain separate.
+ * Phase 2 uses the legacy masking transport field exclusively for signed standalone Edge authority; it never
+ * scales Global Sharpness. Physical noise is only an internal safety hint.
  */
 inline Plan resolve(Controls controls, NoiseEvidence noise) noexcept {
     controls.amount = std::clamp(finiteOr(controls.amount, 0.0f), -1.0f, 1.0f);
+    controls.masking = std::clamp(finiteOr(controls.masking, 0.0f), -1.0f, 1.0f);
     noise.displayLumaSigma = std::max(0.0f, finiteOr(noise.displayLumaSigma, 0.0f));
 
     Plan out{};
-    if (std::abs(controls.amount) <= 1.0e-4f) {
-        out.authoritySource = "PROFILE_GLOBAL_SHARPNESS_ZERO";
+    if (std::abs(controls.amount) <= 1.0e-4f && std::abs(controls.masking) <= 1.0e-4f) {
+        out.authoritySource = "PROFILE_SHARPNESS_EDGE_ZERO";
         return out;
     }
 
@@ -63,7 +64,8 @@ inline Plan resolve(Controls controls, NoiseEvidence noise) noexcept {
     out.authority = controls.amount;
     out.radius = 1.0f;
     out.detail = 0.0f;
-    out.masking = 0.0f;
+    // Phase 2: independent signed Edge authority. This does not multiply Global Sharpness.
+    out.masking = controls.masking;
     out.displayLumaSigma = noise.displayLumaSigma > 1.0e-7f
             ? noise.displayLumaSigma
             : (1.0f / 255.0f);
@@ -80,9 +82,11 @@ inline Plan resolve(Controls controls, NoiseEvidence noise) noexcept {
             1.0f,
             1.85f);
     out.enabled = true;
-    out.authoritySource = controls.amount < 0.0f
-            ? "PROFILE_GLOBAL_SHARPNESS_SOFTEN"
-            : "PROFILE_GLOBAL_SHARPNESS_SHARPEN";
+    out.authoritySource = std::abs(controls.masking) > 1.0e-4f && std::abs(controls.amount) <= 1.0e-4f
+            ? (controls.masking < 0.0f ? "PROFILE_EDGE_SMOOTH" : "PROFILE_EDGE_SHARPEN")
+            : (controls.amount < 0.0f
+                    ? "PROFILE_GLOBAL_SHARPNESS_SOFTEN"
+                    : "PROFILE_GLOBAL_SHARPNESS_SHARPEN");
     return out;
 }
 

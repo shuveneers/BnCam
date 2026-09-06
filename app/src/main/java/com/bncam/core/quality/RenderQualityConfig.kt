@@ -13,6 +13,7 @@ import com.bncam.data.settings.ProfileDetailDefaults
 import com.bncam.data.settings.ProfileDetailSettings
 import com.bncam.data.settings.ProfileNoiseReductionDefaults
 import com.bncam.data.settings.ProfileNoiseReductionSettings
+import com.bncam.data.settings.ProfilePlannedDefaults
 import com.bncam.data.settings.ProfileSharpnessMethods
 import kotlinx.coroutines.flow.first
 import java.util.Locale
@@ -346,6 +347,7 @@ data class ProfileColorTuning(
 data class ProfileDetailTuning(
     val method: String = ProfileSharpnessMethods.NORMAL,
     val amount: Float = ProfileDetailDefaults.AMOUNT,
+    val edge: Float = ProfilePlannedDefaults.EDGE_SHARPNESS,
     val radius: Float = ProfileDetailDefaults.RADIUS,
     val detail: Float = ProfileDetailDefaults.DETAIL,
     val masking: Float = ProfileDetailDefaults.MASKING
@@ -355,6 +357,7 @@ data class ProfileDetailTuning(
         return copy(
             method = ProfileSharpnessMethods.sanitize(method),
             amount = safe.amount,
+            edge = edge.takeIf { it.isFinite() }?.coerceIn(-1f, 1f) ?: ProfilePlannedDefaults.EDGE_SHARPNESS,
             radius = safe.radius,
             detail = safe.detail,
             masking = safe.masking
@@ -365,6 +368,7 @@ data class ProfileDetailTuning(
     fun debugPairs(): List<Pair<String, String>> = listOf(
         "Detail Sharpening Method" to method,
         "Global Sharpness" to String.format(Locale.US, "%+.2f", amount.coerceIn(-1f, 1f)),
+        "Edge" to String.format(Locale.US, "%+.2f", edge.coerceIn(-1f, 1f)),
         "Detail Sharpening Radius" to String.format(Locale.US, "%.2f", radius),
         "Detail Sharpening Detail" to String.format(Locale.US, "%.0f", detail.coerceIn(0f, 1f) * 100f),
         "Detail Sharpening Masking" to String.format(Locale.US, "%.0f", masking.coerceIn(0f, 1f) * 100f)
@@ -545,6 +549,7 @@ data class RenderQualityConfig(
             val normalDetailTuning = ProfileDetailTuning(
                 method = sharpeningMethod,
                 amount = readProfileFloatOrFallback(repo, profileId, ProfileIspKeys.DETAIL_SHARPENING_AMOUNT, ProfileDetailDefaults.AMOUNT, -1f..1f),
+                edge = readProfileFloatOrFallback(repo, profileId, ProfileIspKeys.DETAIL_SHARPENING_EDGE, ProfilePlannedDefaults.EDGE_SHARPNESS, -1f..1f),
                 radius = readProfileFloatOrFallback(repo, profileId, ProfileIspKeys.DETAIL_SHARPENING_RADIUS, ProfileDetailDefaults.RADIUS, 0f..ProfileDetailDefaults.MAX_RADIUS),
                 detail = readProfileFloatOrFallback(repo, profileId, ProfileIspKeys.DETAIL_SHARPENING_DETAIL, ProfileDetailDefaults.DETAIL, 0f..1f),
                 masking = readProfileFloatOrFallback(repo, profileId, ProfileIspKeys.DETAIL_SHARPENING_MASKING, ProfileDetailDefaults.MASKING, 0f..1f)
@@ -552,7 +557,7 @@ data class RenderQualityConfig(
             // Polysharp owns sharpening exclusively when selected. Its pixel backend is deliberately
             // not connected yet, so Normal Sharpness is neutralized rather than silently stacking.
             val detailTuning = if (sharpeningMethod == ProfileSharpnessMethods.POLYSHARP) {
-                normalDetailTuning.copy(amount = 0f, radius = 0f, detail = 0f, masking = 0f)
+                normalDetailTuning.copy(amount = 0f, edge = 0f, radius = 0f, detail = 0f, masking = 0f)
             } else {
                 normalDetailTuning
             }

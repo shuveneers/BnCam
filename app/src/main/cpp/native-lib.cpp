@@ -433,7 +433,7 @@ NativeRenderQualityConfig makeQualityConfig(
     cfg.profileDetailAmount = std::isfinite(profileDetailAmount) ? std::clamp(profileDetailAmount, -1.0f, 1.0f) : bncam::profile_defaults::kDetailAmount;
     cfg.profileDetailRadius = std::isfinite(profileDetailRadius) ? std::clamp(profileDetailRadius, bncam::profile_defaults::kDetailMinRadius, bncam::profile_defaults::kDetailMaxRadius) : bncam::profile_defaults::kDetailRadius;
     cfg.profileDetailDetail = std::isfinite(profileDetailDetail) ? std::clamp(profileDetailDetail, 0.0f, 1.0f) : bncam::profile_defaults::kDetailDetail;
-    cfg.profileDetailMasking = std::isfinite(profileDetailMasking) ? std::clamp(profileDetailMasking, 0.0f, 1.0f) : bncam::profile_defaults::kDetailMasking;
+    cfg.profileDetailMasking = std::isfinite(profileDetailMasking) ? std::clamp(profileDetailMasking, -1.0f, 1.0f) : bncam::profile_defaults::kDetailMasking;
 
     cfg.noiseModelCalibrationAdjustment = std::isfinite(noiseModelCalibrationAdjustment)
             ? std::clamp(noiseModelCalibrationAdjustment, -1.0f, 1.0f) : 0.0f;
@@ -1861,7 +1861,7 @@ Java_com_bncam_core_engine_ImageUtils_renderRawPreviewNative(
             ? std::clamp(static_cast<float>(profileDetailDetail), 0.0f, 1.0f)
             : bncam::profile_defaults::kDetailDetail;
     quality.profileDetailMasking = std::isfinite(profileDetailMasking)
-            ? std::clamp(static_cast<float>(profileDetailMasking), 0.0f, 1.0f)
+            ? std::clamp(static_cast<float>(profileDetailMasking), -1.0f, 1.0f)
             : bncam::profile_defaults::kDetailMasking;
     quality.profileNrLuminance = std::isfinite(profileNrLuminance) ? std::clamp(static_cast<float>(profileNrLuminance), 0.0f, 1.0f) : 0.0f;
     quality.profileNrLuminanceDetail = std::isfinite(profileNrLuminanceDetail) ? std::clamp(static_cast<float>(profileNrLuminanceDetail), 0.0f, 1.0f) : 0.5f;
@@ -2356,7 +2356,7 @@ Java_com_bncam_core_engine_ImageUtils_processNativeYuv(
             ? std::clamp(profileDetailRadius, 0.0f, bncam::profile_defaults::kDetailMaxRadius)
             : bncam::profile_defaults::kDetailRadius;
     yuvQuality.profileDetailDetail = std::isfinite(profileDetailDetail) ? std::clamp(profileDetailDetail, 0.0f, 1.0f) : bncam::profile_defaults::kDetailDetail;
-    yuvQuality.profileDetailMasking = std::isfinite(profileDetailMasking) ? std::clamp(profileDetailMasking, 0.0f, 1.0f) : bncam::profile_defaults::kDetailMasking;
+    yuvQuality.profileDetailMasking = std::isfinite(profileDetailMasking) ? std::clamp(profileDetailMasking, -1.0f, 1.0f) : bncam::profile_defaults::kDetailMasking;
     yuvQuality.profileNrLuminance = std::isfinite(profileNrLuminance) ? std::clamp(profileNrLuminance, 0.0f, 1.0f) : 0.0f;
     yuvQuality.profileNrLuminanceDetail = std::isfinite(profileNrLuminanceDetail) ? std::clamp(profileNrLuminanceDetail, 0.0f, 1.0f) : 0.5f;
     yuvQuality.profileNrLuminanceContrast = std::isfinite(profileNrLuminanceContrast) ? std::clamp(profileNrLuminanceContrast, 0.0f, 1.0f) : 0.0f;
