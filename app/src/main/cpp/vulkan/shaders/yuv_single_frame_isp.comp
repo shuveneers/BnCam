@@ -499,6 +499,20 @@ uint packedDetailLegibilityYuv(float transport) {
     return uint(clamp(roundEven(payload), 0.0, 1048575.0));
 }
 
+
+uint packedEdgeZipperYuv(float transport) {
+    if (transport >= -1.0e-7) return 0u;
+    float payload = (-clamp(transport, -1.0, 0.0) * 1048577.0) - 1.0;
+    return uint(clamp(roundEven(payload), 0.0, 1048575.0));
+}
+float packedEdgeAuthorityYuv(float transport) {
+    if (transport >= -1.0e-7) return 0.0;
+    return decodeSigned10Yuv(packedEdgeZipperYuv(transport) & 1023u);
+}
+float packedAntiZipperAuthorityYuv(float transport) {
+    if (transport >= -1.0e-7) return 0.0;
+    return float((packedEdgeZipperYuv(transport) >> 10u) & 1023u) / 1023.0;
+}
 float packedDetailAuthorityYuv(float transport) {
     if (transport >= -1.0e-7) return 0.0;
     return decodeSigned10Yuv(packedDetailLegibilityYuv(transport) & 1023u);
@@ -552,10 +566,11 @@ struct ProfileEdgeResult {
 };
 
 ProfileEdgeResult profileEdgeYAtOutput(uint outputX, uint outputY) {
-    float authority = clamp(pc.profileDetailMasking, -1.0, 1.0);
+    float authority = packedEdgeAuthorityYuv(pc.profileDetailMasking);
+    float antiZipperAuthority = packedAntiZipperAuthorityYuv(pc.profileDetailMasking);
     float legibilityAuthority = packedLegibilityAuthorityYuv(pc.profileDetailDetail);
     float base = toneMappedYAtOutput(int(outputX), int(outputY));
-    bool anySharpnessOwner = abs(authority) > 1.0e-6 || abs(legibilityAuthority) > 1.0e-6 ||
+    bool anySharpnessOwner = abs(authority) > 1.0e-6 || antiZipperAuthority > 1.0e-6 || abs(legibilityAuthority) > 1.0e-6 ||
             abs(pc.profileDetailAmount) > 1.0e-6 || abs(pc.profileDetailDetail) > 1.0e-7;
     if (!anySharpnessOwner) return ProfileEdgeResult(base, 0.0, 0.0);
 
@@ -732,6 +747,9 @@ ProfileEdgeResult profileEdgeYAtOutput(uint outputX, uint outputY) {
         legibilityY = clamp(legibilityY, 0.0, 1.0);
     }
 
+    // Anti-zipper runs after the complete sharpening stack. Edge owns only its signed
+    // structural transition operation here; Anti-zipper must be able to see artifacts created
+    // by Edge, Detail or Global Sharpness before it decides to reconstruct anything.
     if (abs(authority) <= 1.0e-6 || nonTextMask <= 1.0e-4) {
         return ProfileEdgeResult(legibilityY, textMask, microRidgeMask);
     }
@@ -893,7 +911,7 @@ float profileMicroDetailYAtOutput(uint outputX, uint outputY, ProfileEdgeResult 
     // negative-only 20-bit payload. Retired unsigned consumers still collapse it to neutral 0.
     float authority = packedDetailAuthorityYuv(pc.profileDetailDetail);
 
-    // Strict stage order is Legibility -> Edge -> Detail -> Global Sharpness.
+    // Core sharpening order is Legibility -> Edge -> Detail -> Global Sharpness; Anti-zipper is the final artifact guard.
     float edgeY = edgeResult.y;
     float nonTextMask = 1.0 - edgeResult.textMask;
     if (abs(authority) <= 1.0e-6 || nonTextMask <= 1.0e-4) return edgeY;
@@ -996,26 +1014,57 @@ float profileMicroDetailYAtOutput(uint outputX, uint outputY, ProfileEdgeResult 
 
 float profileDetailedYAtOutput(uint outputX, uint outputY) {
     float amount = clamp(pc.profileDetailAmount, -1.0, 1.0);
-    // Strict order: Legibility -> Edge -> Detail -> Global Sharpness.
+    float antiZipperAuthority = packedAntiZipperAuthorityYuv(pc.profileDetailMasking);
+
+    // Strict ownership/order:
+    // Legibility -> Edge -> Detail -> Global Sharpness -> Anti-zipper.
+    // Anti-zipper is deliberately last so it can repair zipper/halo reversals introduced by any
+    // earlier sharpness owner without changing how those owners classify text, contours or detail.
     ProfileEdgeResult edgeResult = profileEdgeYAtOutput(outputX, outputY);
     float center = profileMicroDetailYAtOutput(outputX, outputY, edgeResult);
     float nonTextMask = 1.0 - edgeResult.textMask;
-    if (abs(amount) <= 1.0e-6 || nonTextMask <= 1.0e-4) return center;
+    bool globalActive = abs(amount) > 1.0e-6 && nonTextMask > 1.0e-4;
+    bool antiZipperActive = antiZipperAuthority > 1.0e-6 && nonTextMask > 1.0e-4;
+    if (!globalActive && !antiZipperActive) return center;
 
     int x = int(outputX);
     int y = int(outputY);
-    float n = toneMappedYAtOutput(x, y - 1);
-    float s = toneMappedYAtOutput(x, y + 1);
-    float w = toneMappedYAtOutput(x - 1, y);
-    float e = toneMappedYAtOutput(x + 1, y);
-    float nw = toneMappedYAtOutput(x - 1, y - 1);
-    float ne = toneMappedYAtOutput(x + 1, y - 1);
-    float sw = toneMappedYAtOutput(x - 1, y + 1);
-    float se = toneMappedYAtOutput(x + 1, y + 1);
-    float w2 = toneMappedYAtOutput(x - 2, y);
-    float e2 = toneMappedYAtOutput(x + 2, y);
-    float n2 = toneMappedYAtOutput(x, y - 2);
-    float s2 = toneMappedYAtOutput(x, y + 2);
+
+    // Preserve the approved Global Sharpness sampling when it is active. Anti-zipper-only uses
+    // the lightweight neutral LUT samples instead, avoiding a second expensive tone/denoise walk
+    // on YUV and keeping the vendor-GPU load close to the already-passed Edge/Detail configuration.
+    float n, s, w, e, nw, ne, sw, se, w2, e2, n2, s2, referenceCenter;
+    if (globalActive) {
+        // Do not add any extra center sample when Anti-zipper is off; the already-passed Global
+        // Sharpness path keeps its original sampling cost in the neutral Anti-zipper state.
+        referenceCenter = antiZipperActive ? toneMappedYAtOutput(x, y) : center;
+        n = toneMappedYAtOutput(x, y - 1);
+        s = toneMappedYAtOutput(x, y + 1);
+        w = toneMappedYAtOutput(x - 1, y);
+        e = toneMappedYAtOutput(x + 1, y);
+        nw = toneMappedYAtOutput(x - 1, y - 1);
+        ne = toneMappedYAtOutput(x + 1, y - 1);
+        sw = toneMappedYAtOutput(x - 1, y + 1);
+        se = toneMappedYAtOutput(x + 1, y + 1);
+        w2 = toneMappedYAtOutput(x - 2, y);
+        e2 = toneMappedYAtOutput(x + 2, y);
+        n2 = toneMappedYAtOutput(x, y - 2);
+        s2 = toneMappedYAtOutput(x, y + 2);
+    } else {
+        referenceCenter = edgeNeutralYAtOutput(x, y);
+        n = edgeNeutralYAtOutput(x, y - 1);
+        s = edgeNeutralYAtOutput(x, y + 1);
+        w = edgeNeutralYAtOutput(x - 1, y);
+        e = edgeNeutralYAtOutput(x + 1, y);
+        nw = edgeNeutralYAtOutput(x - 1, y - 1);
+        ne = edgeNeutralYAtOutput(x + 1, y - 1);
+        sw = edgeNeutralYAtOutput(x - 1, y + 1);
+        se = edgeNeutralYAtOutput(x + 1, y + 1);
+        w2 = edgeNeutralYAtOutput(x - 2, y);
+        e2 = edgeNeutralYAtOutput(x + 2, y);
+        n2 = edgeNeutralYAtOutput(x, y - 2);
+        s2 = edgeNeutralYAtOutput(x, y + 2);
+    }
 
     float crossMean = 0.25 * (n + s + w + e);
     float boxMean = 0.125 * (n + s + w + e + nw + ne + sw + se);
@@ -1026,7 +1075,8 @@ float profileDetailedYAtOutput(uint outputX, uint outputY) {
     localMax = max(localMax, max(max(n2, s2), max(w2, e2)));
     float localRange = max(0.0, localMax - localMin);
 
-    if (amount < 0.0) {
+    float finalY = center;
+    if (globalActive && amount < 0.0) {
         float softness = pow(clamp(-amount, 0.0, 1.0), 0.72);
         float edgeSigma = mix(0.040, 0.115, softness);
         float inv2EdgeSigmaSq = 1.0 / max(2.0 * edgeSigma * edgeSigma, 1.0e-6);
@@ -1052,25 +1102,115 @@ float profileDetailedYAtOutput(uint outputX, uint outputY) {
         float softY = sum / max(weightSum, 1.0e-6);
         float broadY = 0.46 * softY + 0.34 * boxMean + 0.20 * farCross;
         float softBlend = 0.94 * pow(softness, 0.78);
-        return clamp(mix(center, broadY, softBlend * nonTextMask), 0.0, 1.0);
+        finalY = clamp(mix(center, broadY, softBlend * nonTextMask), 0.0, 1.0);
+    } else if (globalActive && amount > 0.0) {
+        float fineMean = 0.68 * crossMean + 0.32 * boxMean;
+        float mediumMean = 0.58 * boxMean + 0.42 * farCross;
+        float highPass = 0.74 * (center - fineMean) + 0.26 * (center - mediumMean);
+        float gx = 0.5 * (e - w);
+        float gy = 0.5 * (s - n);
+        float gradient = sqrt(max(0.0, gx * gx + gy * gy));
+        float sigmaY = clamp(max(yuvMeasuredSigmaY(), 1.0 / 255.0), 1.0 / 255.0, 0.025);
+        float residualGate = smoothstep(0.80, 2.00, abs(highPass) / sigmaY);
+        float edgeGate = smoothstep(0.70, 1.85, gradient / sigmaY);
+        float rangeGate = smoothstep(0.004, 0.022, localRange);
+        float structureGate = max(rangeGate * 0.55, max(residualGate, edgeGate));
+        float sharpStrength = amount * (1.05 + 1.75 * amount);
+        float rawDelta = highPass * sharpStrength * structureGate;
+        float adaptiveHalo = min(0.14, 0.018 + 0.46 * localRange);
+        float delta = clamp(rawDelta, -adaptiveHalo, adaptiveHalo) * nonTextMask;
+        finalY = clamp(center + delta, 0.0, 1.0);
     }
 
-    float fineMean = 0.68 * crossMean + 0.32 * boxMean;
-    float mediumMean = 0.58 * boxMean + 0.42 * farCross;
-    float highPass = 0.74 * (center - fineMean) + 0.26 * (center - mediumMean);
-    float gx = 0.5 * (e - w);
-    float gy = 0.5 * (s - n);
-    float gradient = sqrt(max(0.0, gx * gx + gy * gy));
-    float sigmaY = clamp(max(yuvMeasuredSigmaY(), 1.0 / 255.0), 1.0 / 255.0, 0.025);
-    float residualGate = smoothstep(0.80, 2.00, abs(highPass) / sigmaY);
-    float edgeGate = smoothstep(0.70, 1.85, gradient / sigmaY);
-    float rangeGate = smoothstep(0.004, 0.022, localRange);
-    float structureGate = max(rangeGate * 0.55, max(residualGate, edgeGate));
-    float sharpStrength = amount * (1.05 + 1.75 * amount);
-    float rawDelta = highPass * sharpStrength * structureGate;
-    float adaptiveHalo = min(0.14, 0.018 + 0.46 * localRange);
-    float delta = clamp(rawDelta, -adaptiveHalo, adaptiveHalo) * nonTextMask;
-    return clamp(center + delta, 0.0, 1.0);
+    if (!antiZipperActive) return finalY;
+
+    // Final post-sharpen Anti-zipper. The neutral neighbourhood is the geometric reference; finalY
+    // is the result after Edge, Detail and Global Sharpness. A true zipper is therefore detected as
+    // newly/non-naturally non-monotone edge response instead of being inferred before sharpening.
+    float sigmaZ = max(yuvMeasuredSigmaY(), 1.0 / 255.0);
+    float gxFineZ = 0.5 * (e - w);
+    float gyFineZ = 0.5 * (s - n);
+    float gxCoarseZ = 0.25 * (e2 - w2);
+    float gyCoarseZ = 0.25 * (s2 - n2);
+    float gradFineZ = sqrt(max(0.0, gxFineZ * gxFineZ + gyFineZ * gyFineZ));
+    float gradCoarseZ = sqrt(max(0.0, gxCoarseZ * gxCoarseZ + gyCoarseZ * gyCoarseZ));
+    float alignZ = clamp((gxFineZ * gxCoarseZ + gyFineZ * gyCoarseZ) /
+            max(gradFineZ * gradCoarseZ, 1.0e-8), -1.0, 1.0);
+    float stableGxZ = 0.72 * gxFineZ + 0.28 * gxCoarseZ;
+    float stableGyZ = 0.72 * gyFineZ + 0.28 * gyCoarseZ;
+    float axZ = abs(stableGxZ);
+    float ayZ = abs(stableGyZ);
+    float axisSumZ = max(axZ + ayZ, 1.0e-6);
+    float wxZ = axZ / axisSumZ;
+    float wyZ = ayZ / axisSumZ;
+
+    float xm1Z = stableGxZ >= 0.0 ? w : e;
+    float xp1Z = stableGxZ >= 0.0 ? e : w;
+    float xm2Z = stableGxZ >= 0.0 ? w2 : e2;
+    float xp2Z = stableGxZ >= 0.0 ? e2 : w2;
+    float ym1Z = stableGyZ >= 0.0 ? n : s;
+    float yp1Z = stableGyZ >= 0.0 ? s : n;
+    float ym2Z = stableGyZ >= 0.0 ? n2 : s2;
+    float yp2Z = stableGyZ >= 0.0 ? s2 : n2;
+    float minus1Z = wxZ * xm1Z + wyZ * ym1Z;
+    float plus1Z = wxZ * xp1Z + wyZ * yp1Z;
+    float minus2Z = wxZ * xm2Z + wyZ * ym2Z;
+    float plus2Z = wxZ * xp2Z + wyZ * yp2Z;
+
+    float plateauMinusZ = 0.34 * minus1Z + 0.66 * minus2Z;
+    float plateauPlusZ = 0.34 * plus1Z + 0.66 * plus2Z;
+    float signedStepZ = plateauPlusZ - plateauMinusZ;
+    float stepHeightZ = abs(signedStepZ);
+    if (stepHeightZ <= 1.0e-6) return finalY;
+
+    float stepSignZ = signedStepZ >= 0.0 ? 1.0 : -1.0;
+    float edgePersistZ = smoothstep(max(0.008, 1.35 * sigmaZ), max(0.034, 4.4 * sigmaZ), gradCoarseZ) *
+            smoothstep(0.56, 0.90, alignZ) *
+            smoothstep(max(0.012, 2.0 * sigmaZ), max(0.050, 6.0 * sigmaZ), stepHeightZ);
+    float ownershipZ = edgePersistZ * nonTextMask * (1.0 - 0.98 * edgeResult.microRidgeMask);
+    if (ownershipZ <= 1.0e-5) return finalY;
+
+    // Permit the intended acutance change before declaring a reversal. The tolerance follows the
+    // actual signed Edge and positive Global controls, so Anti-zipper does not simply undo a valid
+    // sharp edge. Negative controls need almost no overshoot allowance because they soften inward.
+    float edgeAuthorityZ = packedEdgeAuthorityYuv(pc.profileDetailMasking);
+    float positiveAcutanceZ = max(0.0, edgeAuthorityZ) + 0.70 * max(0.0, amount);
+    float intendedExcursionZ = min(0.16 * stepHeightZ,
+            0.020 * positiveAcutanceZ + 0.10 * stepHeightZ * positiveAcutanceZ);
+    float toleranceZ = max(0.75 * sigmaZ, intendedExcursionZ);
+
+    float preViolationZ =
+            max(0.0, -stepSignZ * (minus1Z - minus2Z)) +
+            max(0.0, -stepSignZ * (referenceCenter - minus1Z)) +
+            max(0.0, -stepSignZ * (plus1Z - referenceCenter)) +
+            max(0.0, -stepSignZ * (plus2Z - plus1Z));
+    float postViolationZ =
+            max(0.0, -stepSignZ * (minus1Z - minus2Z) - toleranceZ) +
+            max(0.0, -stepSignZ * (finalY - minus1Z) - toleranceZ) +
+            max(0.0, -stepSignZ * (plus1Z - finalY) - toleranceZ) +
+            max(0.0, -stepSignZ * (plus2Z - plus1Z) - toleranceZ);
+
+    float plateauLoZ = min(plateauMinusZ, plateauPlusZ);
+    float plateauHiZ = max(plateauMinusZ, plateauPlusZ);
+    float overshootZ = max(0.0, plateauLoZ - finalY - toleranceZ) +
+            max(0.0, finalY - plateauHiZ - toleranceZ);
+    float introducedViolationZ = max(0.0, postViolationZ - 0.35 * preViolationZ);
+    float zipperEnergyZ = max(introducedViolationZ, 1.35 * overshootZ);
+
+    float searchLowZ = mix(max(0.010, 3.2 * sigmaZ), max(0.0035, 0.95 * sigmaZ), antiZipperAuthority);
+    float searchHighZ = mix(max(0.036, 6.8 * sigmaZ), max(0.013, 2.7 * sigmaZ), antiZipperAuthority);
+    float zipperEvidenceZ = smoothstep(searchLowZ, searchHighZ, zipperEnergyZ) * ownershipZ;
+    if (zipperEvidenceZ <= 1.0e-5) return finalY;
+
+    // Isotonic center reconstruction: project only the offending post-sharpen center back into a
+    // monotone corridor. No blur kernel is applied and the side plateaus are untouched, so texture
+    // and intended edge width survive while the zipper/halo reversal is removed.
+    float corridorLoZ = min(minus1Z, plus1Z) - toleranceZ;
+    float corridorHiZ = max(minus1Z, plus1Z) + toleranceZ;
+    float reconstructedZ = clamp(finalY, corridorLoZ, corridorHiZ);
+    reconstructedZ = clamp(reconstructedZ, plateauLoZ - toleranceZ, plateauHiZ + toleranceZ);
+    float repairZ = pow(antiZipperAuthority, 0.78) * zipperEvidenceZ;
+    return clamp(mix(finalY, reconstructedZ, repairZ), 0.0, 1.0);
 }
 
 vec3 renderRgbUnblurred(uint outputX, uint outputY) {

@@ -48,6 +48,17 @@ data class FrameCandidatePixelMetrics(
         }
 }
 
+private fun packEdgeAntiZipper(edge: Float, antiZipper: Float): Float {
+    val e = edge.takeIf { it.isFinite() }?.coerceIn(-1f, 1f) ?: 0f
+    val z = antiZipper.takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: 0f
+    if (kotlin.math.abs(e) <= 1.0e-7f && z <= 1.0e-7f) return 0f
+    val edgeCode = if (e >= 0f) 512 + kotlin.math.round(e * 511f).toInt()
+                   else 512 - kotlin.math.round((-e) * 512f).toInt()
+    val zipperCode = kotlin.math.round(z * 1023f).toInt().coerceIn(0, 1023)
+    val packed = (edgeCode.coerceIn(0, 1023) and 1023) or ((zipperCode and 1023) shl 10)
+    return -(packed + 1).toFloat() / 1048577f
+}
+
 object ImageUtils {
 
     data class UltraHdrGainmapArtifact(
@@ -435,7 +446,7 @@ object ImageUtils {
                 profileDetailDetail = qualityConfig?.profileDetailTuning?.detail ?: com.bncam.data.settings.ProfileDetailDefaults.DETAIL,
                 // Phase 2 transport compatibility: native profileDetailMasking is an ABI slot only.
                 // It carries standalone Edge authority; the Sharp Mask setting remains disconnected.
-                profileDetailMasking = qualityConfig?.profileDetailTuning?.edge ?: com.bncam.data.settings.ProfilePlannedDefaults.EDGE_SHARPNESS,
+                profileDetailMasking = qualityConfig?.profileDetailTuning?.let { packEdgeAntiZipper(it.edge, it.antiZipper) } ?: 0f,
                 profileNrLuminance = qualityConfig?.profileNoiseReductionTuning?.luminance ?: ProfileNoiseReductionDefaults.LUMINANCE,
                 profileNrLuminanceDetail = qualityConfig?.profileNoiseReductionTuning?.luminanceDetail ?: ProfileNoiseReductionDefaults.LUMINANCE_DETAIL,
                 profileNrLuminanceContrast = qualityConfig?.profileNoiseReductionTuning?.luminanceContrast ?: ProfileNoiseReductionDefaults.LUMINANCE_CONTRAST,
@@ -808,7 +819,7 @@ object ImageUtils {
                 profileDetailRadius = profileDetailTuning.legibility,
                 profileDetailDetail = profileDetailTuning.detail,
                 // Phase 2 transport compatibility: this legacy JNI slot carries Edge only.
-                profileDetailMasking = profileDetailTuning.edge,
+                profileDetailMasking = packEdgeAntiZipper(profileDetailTuning.edge, profileDetailTuning.antiZipper),
                 knownHotPixelMap = masterFrame.knownHotPixelMap.packedXy,
                 lensShadingMap = lensShadingMap.gains,
                 lensShadingColumns = lensShadingMap.columns,

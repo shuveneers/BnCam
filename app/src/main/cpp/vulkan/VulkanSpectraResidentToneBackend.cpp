@@ -1,4 +1,5 @@
 #include "VulkanSpectraResidentToneBackend.h"
+#include "../ProfileEdgeZipperTransport.h"
 #include "VulkanPipelineCacheRegistry.h"
 
 #ifndef BNCAM_VMA_HEADER_AVAILABLE
@@ -980,13 +981,15 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
                           20u * sizeof(std::uint32_t), sizeof(detailBits), detailBits);
     }
     if (perceptualDetailRequested) {
+        const float edgeAuthority = bncam::profile_edge_zipper_transport::decodeEdge(request.perceptualDetailMasking);
+        const float antiZipperAuthority = bncam::profile_edge_zipper_transport::decodeAntiZipper(request.perceptualDetailMasking);
         const float perceptualValues[9] = {
                 std::clamp(request.perceptualDetailAuthority, -1.0f, 1.0f),
                 std::clamp(request.perceptualDetailRadius, -1.0f, 1.0f), // Phase 4 signed Legibility.
                 std::clamp(request.perceptualDetailEmphasis, -1.0f, 1.0f), // Phase 3 standalone signed Detail.
-                std::clamp(request.perceptualDetailMasking, -1.0f, 1.0f), // Phase 2 signed standalone Edge authority.
+                edgeAuthority, // standalone signed Edge authority.
                 std::max(1.0f / 255.0f, request.perceptualDetailNoiseSigmaY),
-                0.90f,
+                antiZipperAuthority, // slot 44: 0..1 zipper detection/reconstruction authority.
                 0.75f,
                 std::clamp(request.perceptualDetailHardHaloLimit, 0.0f, 0.14f),
                 1.0f};

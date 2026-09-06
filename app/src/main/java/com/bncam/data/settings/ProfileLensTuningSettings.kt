@@ -62,6 +62,7 @@ object ProfileIspKeys {
     const val DETAIL_SHARPENING_AMOUNT = "detail_sharpening_amount"
     const val DETAIL_SHARPENING_RADIUS = "detail_sharpening_radius" // legacy Normal backend radius; hidden in V3 UI
     const val DETAIL_SHARPENING_EDGE = "detail_sharpening_edge"
+    const val DETAIL_SHARPENING_ANTI_ZIPPER = "detail_sharpening_anti_zipper"
     const val DETAIL_SHARPENING_DETAIL = "detail_sharpening_detail"
     const val DETAIL_SHARPENING_LEGIBILITY = "detail_sharpening_legibility"
     const val DETAIL_SHARPENING_MASKING = "detail_sharpening_masking"
@@ -92,6 +93,7 @@ object ProfilePlannedDefaults {
     // Phase 12 baseline: every profile-owned sharpness control is neutral by default.
     // Capture-detail recovery is a separate physical Phase-11 owner and does not read these values.
     const val EDGE_SHARPNESS = 0.00f
+    const val ANTI_ZIPPER = 0.00f
     const val LEGIBILITY = 0.00f
     const val POLYSHARP_GAIN = 0.00f
     const val POLYSHARP_MACRO_GAIN = 0.00f

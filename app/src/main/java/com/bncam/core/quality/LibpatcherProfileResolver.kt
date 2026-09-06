@@ -167,6 +167,7 @@ object LibpatcherProfileResolver {
             add(f(ProfileIspKeys.DETAIL_SHARPENING_RADIUS, ProfileDetailDefaults.RADIUS))
             add(f(ProfileIspKeys.DETAIL_SHARPENING_DETAIL, ProfileDetailDefaults.DETAIL))
             add(f(ProfileIspKeys.DETAIL_SHARPENING_LEGIBILITY, ProfilePlannedDefaults.LEGIBILITY))
+            add(f(ProfileIspKeys.DETAIL_SHARPENING_ANTI_ZIPPER, ProfilePlannedDefaults.ANTI_ZIPPER))
             add(f(ProfileIspKeys.DETAIL_SHARPENING_MASKING, ProfileDetailDefaults.MASKING))
 
             // Complete profile AWB tuple.
@@ -208,6 +209,7 @@ object LibpatcherProfileResolver {
         ProfileSettingSpec(ProfileIspKeys.TONE_CLARITY, ProfileSettingValueType.FLOAT, ProfilePlannedDefaults.CLARITY.toString()),
         ProfileSettingSpec(ProfileIspKeys.PRESENCE_COLOR_FRINGE_SUPPRESSION, ProfileSettingValueType.FLOAT, ProfilePlannedDefaults.COLOR_FRINGE_SUPPRESSION.toString()),
         ProfileSettingSpec(ProfileIspKeys.DETAIL_SHARPENING_EDGE, ProfileSettingValueType.FLOAT, ProfilePlannedDefaults.EDGE_SHARPNESS.toString()),
+        ProfileSettingSpec(ProfileIspKeys.DETAIL_SHARPENING_ANTI_ZIPPER, ProfileSettingValueType.FLOAT, ProfilePlannedDefaults.ANTI_ZIPPER.toString()),
         ProfileSettingSpec(ProfileIspKeys.POLYSHARP_GAIN, ProfileSettingValueType.FLOAT, ProfilePlannedDefaults.POLYSHARP_GAIN.toString()),
         ProfileSettingSpec(ProfileIspKeys.POLYSHARP_MACRO_GAIN, ProfileSettingValueType.FLOAT, ProfilePlannedDefaults.POLYSHARP_MACRO_GAIN.toString()),
         ProfileSettingSpec(ProfileIspKeys.POLYSHARP_MICRO_GAIN, ProfileSettingValueType.FLOAT, ProfilePlannedDefaults.POLYSHARP_MICRO_GAIN.toString()),

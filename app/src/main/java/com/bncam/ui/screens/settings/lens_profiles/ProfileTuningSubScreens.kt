@@ -533,6 +533,16 @@ fun ProfileSharpnessSettingsScreen(
                 ProfileRangeSlider(
                     repo = repo,
                     profileId = profileId,
+                    key = ProfileIspKeys.DETAIL_SHARPENING_ANTI_ZIPPER,
+                    title = "Anti-zipper",
+                    description = "Final post-sharpen contour-artifact repair. 0.00 is exact neutral/off. Higher values search progressively harder for zipper, stair-step, double-edge, halo and non-monotone oscillation created or exposed by Edge, Detail or Global Sharpness, then reconstruct only the offending contour samples into a clean monotone line.",
+                    defaultValue = ProfilePlannedDefaults.ANTI_ZIPPER,
+                    valueRange = 0f..1f,
+                    formatter = { value -> String.format(Locale.US, "%.2f", value) }
+                )
+                ProfileRangeSlider(
+                    repo = repo,
+                    profileId = profileId,
                     key = ProfileIspKeys.DETAIL_SHARPENING_DETAIL,
                     title = "Detail",
                     description = "Standalone signed microdetail control. It targets credible fine texture plus narrow natural ridges/creases such as hair, fabric structure, petal veins/seams and fine material grooves. -1.00 reduces them, 0.00 is neutral, and +1.00 enhances them; text and broad structural contours are excluded.",
@@ -585,6 +595,7 @@ fun ProfileSharpnessSettingsScreen(
                         ProfileSettingSpec(ProfileIspKeys.DETAIL_SHARPENING_AMOUNT, ProfileSettingValueType.FLOAT),
                         ProfileSettingSpec(ProfileIspKeys.DETAIL_SHARPENING_RADIUS, ProfileSettingValueType.FLOAT),
                         ProfileSettingSpec(ProfileIspKeys.DETAIL_SHARPENING_EDGE, ProfileSettingValueType.FLOAT),
+                        ProfileSettingSpec(ProfileIspKeys.DETAIL_SHARPENING_ANTI_ZIPPER, ProfileSettingValueType.FLOAT),
                         ProfileSettingSpec(ProfileIspKeys.DETAIL_SHARPENING_DETAIL, ProfileSettingValueType.FLOAT),
                         ProfileSettingSpec(ProfileIspKeys.DETAIL_SHARPENING_LEGIBILITY, ProfileSettingValueType.FLOAT),
                         ProfileSettingSpec(ProfileIspKeys.DETAIL_SHARPENING_MASKING, ProfileSettingValueType.FLOAT),

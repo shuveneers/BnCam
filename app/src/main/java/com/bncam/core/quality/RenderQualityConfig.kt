@@ -348,6 +348,7 @@ data class ProfileDetailTuning(
     val method: String = ProfileSharpnessMethods.NORMAL,
     val amount: Float = ProfileDetailDefaults.AMOUNT,
     val edge: Float = ProfilePlannedDefaults.EDGE_SHARPNESS,
+    val antiZipper: Float = ProfilePlannedDefaults.ANTI_ZIPPER,
     val legibility: Float = ProfilePlannedDefaults.LEGIBILITY,
     val radius: Float = ProfileDetailDefaults.RADIUS,
     val detail: Float = ProfileDetailDefaults.DETAIL,
@@ -359,6 +360,7 @@ data class ProfileDetailTuning(
             method = ProfileSharpnessMethods.sanitize(method),
             amount = safe.amount,
             edge = edge.takeIf { it.isFinite() }?.coerceIn(-1f, 1f) ?: ProfilePlannedDefaults.EDGE_SHARPNESS,
+            antiZipper = antiZipper.takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: ProfilePlannedDefaults.ANTI_ZIPPER,
             legibility = legibility.takeIf { it.isFinite() }?.coerceIn(-1f, 1f) ?: ProfilePlannedDefaults.LEGIBILITY,
             radius = safe.radius,
             detail = safe.detail,
@@ -371,6 +373,7 @@ data class ProfileDetailTuning(
         "Detail Sharpening Method" to method,
         "Global Sharpness" to String.format(Locale.US, "%+.2f", amount.coerceIn(-1f, 1f)),
         "Edge" to String.format(Locale.US, "%+.2f", edge.coerceIn(-1f, 1f)),
+        "Anti-zipper" to String.format(Locale.US, "%.2f", antiZipper.coerceIn(0f, 1f)),
         "Legibility" to String.format(Locale.US, "%+.2f", legibility.coerceIn(-1f, 1f)),
         "Detail Sharpening Radius" to String.format(Locale.US, "%.2f", radius),
         "Detail" to String.format(Locale.US, "%+.2f", detail.coerceIn(-1f, 1f)),
@@ -553,6 +556,7 @@ data class RenderQualityConfig(
                 method = sharpeningMethod,
                 amount = readProfileFloatOrFallback(repo, profileId, ProfileIspKeys.DETAIL_SHARPENING_AMOUNT, ProfileDetailDefaults.AMOUNT, -1f..1f),
                 edge = readProfileFloatOrFallback(repo, profileId, ProfileIspKeys.DETAIL_SHARPENING_EDGE, ProfilePlannedDefaults.EDGE_SHARPNESS, -1f..1f),
+                antiZipper = readProfileFloatOrFallback(repo, profileId, ProfileIspKeys.DETAIL_SHARPENING_ANTI_ZIPPER, ProfilePlannedDefaults.ANTI_ZIPPER, 0f..1f),
                 legibility = readProfileFloatOrFallback(repo, profileId, ProfileIspKeys.DETAIL_SHARPENING_LEGIBILITY, ProfilePlannedDefaults.LEGIBILITY, -1f..1f),
                 radius = readProfileFloatOrFallback(repo, profileId, ProfileIspKeys.DETAIL_SHARPENING_RADIUS, ProfileDetailDefaults.RADIUS, 0f..ProfileDetailDefaults.MAX_RADIUS),
                 detail = readProfileFloatOrFallback(repo, profileId, ProfileIspKeys.DETAIL_SHARPENING_DETAIL, ProfileDetailDefaults.DETAIL, -1f..1f),
@@ -561,7 +565,7 @@ data class RenderQualityConfig(
             // Polysharp owns sharpening exclusively when selected. Its pixel backend is deliberately
             // not connected yet, so Normal Sharpness is neutralized rather than silently stacking.
             val detailTuning = if (sharpeningMethod == ProfileSharpnessMethods.POLYSHARP) {
-                normalDetailTuning.copy(amount = 0f, edge = 0f, legibility = 0f, radius = 0f, detail = 0f, masking = 0f)
+                normalDetailTuning.copy(amount = 0f, edge = 0f, antiZipper = 0f, legibility = 0f, radius = 0f, detail = 0f, masking = 0f)
             } else {
                 normalDetailTuning
             }

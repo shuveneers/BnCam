@@ -1534,8 +1534,9 @@ void proposePerceptualDetail(uvec2 gid) {
     float legibilityAuthority = clamp(telemetryFloat(40u, 0.0), -1.0, 1.0);
     float detailAuthority = clamp(telemetryFloat(41u, 0.0), -1.0, 1.0);
     float edgeAuthority = clamp(telemetryFloat(42u, 0.0), -1.0, 1.0);
+    float antiZipperAuthority = clamp(telemetryFloat(44u, 0.0), 0.0, 1.0);
     if (abs(amount) <= 1.0e-6 && abs(legibilityAuthority) <= 1.0e-6 &&
-        abs(detailAuthority) <= 1.0e-6 && abs(edgeAuthority) <= 1.0e-6) {
+        abs(detailAuthority) <= 1.0e-6 && abs(edgeAuthority) <= 1.0e-6 && antiZipperAuthority <= 1.0e-6) {
         writeLinearDetailScratch(gid, centerRgb);
         return;
     }
@@ -1879,7 +1880,7 @@ void proposePerceptualDetail(uvec2 gid) {
                 float supportGate = smoothstep(max(0.006, 1.05 * sigma),
                                                max(0.028, 4.10 * sigma), supportGradient);
                 float softGate = softStructuralGate * supportGate;
-                edgeY = legibilityY + softDelta * radiusAuthority * softGate;
+                edgeY = edgeY + softDelta * radiusAuthority * softGate;
                 edgeY = clamp(edgeY, 0.0, 1.0);
             } else {
                 // Positive Edge changes only transition width. The texture residual is untouched.
@@ -1897,11 +1898,12 @@ void proposePerceptualDetail(uvec2 gid) {
                 float sharpenDeltaCap = 0.18 * stepHeight;
                 sharpenDelta = clamp(sharpenDelta, -sharpenDeltaCap, sharpenDeltaCap);
                 float sharpGate = sharpStructuralGate * transitionGate;
-                edgeY = legibilityY + sharpenDelta * radiusAuthority * sharpGate;
+                edgeY = edgeY + sharpenDelta * radiusAuthority * sharpGate;
                 edgeY = clamp(edgeY, 0.0, 1.0);
             }
         }
     }
+
 
     // Phase 3 — standalone signed Detail. Detail owns microtexture only. A candidate must be
     // significant relative to the measured display noise floor, yet fail the multi-scale
@@ -1993,8 +1995,8 @@ void proposePerceptualDetail(uvec2 gid) {
         if (residualGate < 0.05 || rangeGate < 0.05) atomicAdd(telemetry[51], 1u);
     }
 
-    // Global Sharpness is intentionally LAST. It sees Edge first and then Detail. Global
-    // Sharpness may alter overall perceived sharpness, but it does not redefine which pixels
+    // Global Sharpness is the final creative sharpness owner. It sees Edge first and then Detail;
+    // Anti-zipper follows only as a repair guard. Global Sharpness does not redefine which pixels
     // qualify as microtexture or structural edges.
     float proposedY = detailY;
     if (amount < 0.0) {
@@ -2058,6 +2060,95 @@ void proposePerceptualDetail(uvec2 gid) {
     // Legibility, so Edge/Detail/Global cannot stack on letters or symbols.
     proposedY = mix(detailY, proposedY, nonTextMask);
     proposedY = clamp(proposedY, 0.0, 1.0);
+
+    // DELTA 0207 — Anti-zipper is the FINAL sharpness artifact guard.
+    // It compares the completed Edge -> Detail -> Global result against the immutable pre-sharpen
+    // contour neighbourhood. Therefore it can repair zipper/halo reversals created by Edge itself,
+    // Detail, Global Sharpness, or their combination. Text and natural micro-ridges remain owned by
+    // Legibility/Detail and are explicitly excluded.
+    if (antiZipperAuthority > 1.0e-6 && nonTextMask > 1.0e-4) {
+        float gxFineZ = 0.5 * (r - l);
+        float gyFineZ = 0.5 * (d - u);
+        float gxCoarseZ = 0.25 * (r2 - l2);
+        float gyCoarseZ = 0.25 * (d2 - u2);
+        float gradFineZ = sqrt(max(0.0, gxFineZ * gxFineZ + gyFineZ * gyFineZ));
+        float gradCoarseZ = sqrt(max(0.0, gxCoarseZ * gxCoarseZ + gyCoarseZ * gyCoarseZ));
+        float alignZ = clamp((gxFineZ * gxCoarseZ + gyFineZ * gyCoarseZ) /
+                max(gradFineZ * gradCoarseZ, 1.0e-8), -1.0, 1.0);
+        float stableGxZ = 0.72 * gxFineZ + 0.28 * gxCoarseZ;
+        float stableGyZ = 0.72 * gyFineZ + 0.28 * gyCoarseZ;
+        float axZ = abs(stableGxZ);
+        float ayZ = abs(stableGyZ);
+        float axisSumZ = max(axZ + ayZ, 1.0e-6);
+        float wxZ = axZ / axisSumZ;
+        float wyZ = ayZ / axisSumZ;
+
+        float xm1Z = stableGxZ >= 0.0 ? l : r;
+        float xp1Z = stableGxZ >= 0.0 ? r : l;
+        float xm2Z = stableGxZ >= 0.0 ? l2 : r2;
+        float xp2Z = stableGxZ >= 0.0 ? r2 : l2;
+        float ym1Z = stableGyZ >= 0.0 ? u : d;
+        float yp1Z = stableGyZ >= 0.0 ? d : u;
+        float ym2Z = stableGyZ >= 0.0 ? u2 : d2;
+        float yp2Z = stableGyZ >= 0.0 ? d2 : u2;
+        float minus1Z = wxZ * xm1Z + wyZ * ym1Z;
+        float plus1Z = wxZ * xp1Z + wyZ * yp1Z;
+        float minus2Z = wxZ * xm2Z + wyZ * ym2Z;
+        float plus2Z = wxZ * xp2Z + wyZ * yp2Z;
+
+        float plateauMinusZ = 0.34 * minus1Z + 0.66 * minus2Z;
+        float plateauPlusZ = 0.34 * plus1Z + 0.66 * plus2Z;
+        float signedStepZ = plateauPlusZ - plateauMinusZ;
+        float stepHeightZ = abs(signedStepZ);
+        if (stepHeightZ > 1.0e-6) {
+            float stepSignZ = signedStepZ >= 0.0 ? 1.0 : -1.0;
+            float edgePersistZ = smoothstep(max(0.008, 1.35 * sigma), max(0.034, 4.4 * sigma), gradCoarseZ) *
+                    smoothstep(0.56, 0.90, alignZ) *
+                    smoothstep(max(0.012, 2.0 * sigma), max(0.050, 6.0 * sigma), stepHeightZ);
+            float ownershipZ = edgePersistZ * nonTextMask * (1.0 - 0.98 * microRidgeMask);
+
+            // Legitimate positive acutance is allowed before a sample is called a zipper. This is
+            // derived from the actual Edge and Global controls, so the guard cannot simply flatten
+            // a deliberately sharp contour. Negative controls soften inward and need little margin.
+            float positiveAcutanceZ = max(0.0, edgeAuthority) + 0.70 * max(0.0, amount);
+            float intendedExcursionZ = min(0.16 * stepHeightZ,
+                    0.020 * positiveAcutanceZ + 0.10 * stepHeightZ * positiveAcutanceZ);
+            float toleranceZ = max(0.75 * sigma, intendedExcursionZ);
+
+            float preViolationZ =
+                    max(0.0, -stepSignZ * (minus1Z - minus2Z)) +
+                    max(0.0, -stepSignZ * (centerY - minus1Z)) +
+                    max(0.0, -stepSignZ * (plus1Z - centerY)) +
+                    max(0.0, -stepSignZ * (plus2Z - plus1Z));
+            float postViolationZ =
+                    max(0.0, -stepSignZ * (minus1Z - minus2Z) - toleranceZ) +
+                    max(0.0, -stepSignZ * (proposedY - minus1Z) - toleranceZ) +
+                    max(0.0, -stepSignZ * (plus1Z - proposedY) - toleranceZ) +
+                    max(0.0, -stepSignZ * (plus2Z - plus1Z) - toleranceZ);
+
+            float plateauLoZ = min(plateauMinusZ, plateauPlusZ);
+            float plateauHiZ = max(plateauMinusZ, plateauPlusZ);
+            float overshootZ = max(0.0, plateauLoZ - proposedY - toleranceZ) +
+                    max(0.0, proposedY - plateauHiZ - toleranceZ);
+            float introducedViolationZ = max(0.0, postViolationZ - 0.35 * preViolationZ);
+            float zipperEnergyZ = max(introducedViolationZ, 1.35 * overshootZ);
+
+            float searchLowZ = mix(max(0.010, 3.2 * sigma), max(0.0035, 0.95 * sigma), antiZipperAuthority);
+            float searchHighZ = mix(max(0.036, 6.8 * sigma), max(0.013, 2.7 * sigma), antiZipperAuthority);
+            float zipperEvidenceZ = smoothstep(searchLowZ, searchHighZ, zipperEnergyZ) * ownershipZ;
+
+            if (zipperEvidenceZ > 1.0e-5) {
+                // Isotonic projection changes only the offending center. There is no blur kernel:
+                // side plateaus, surface texture, Detail ridges and glyphs remain untouched.
+                float corridorLoZ = min(minus1Z, plus1Z) - toleranceZ;
+                float corridorHiZ = max(minus1Z, plus1Z) + toleranceZ;
+                float reconstructedZ = clamp(proposedY, corridorLoZ, corridorHiZ);
+                reconstructedZ = clamp(reconstructedZ, plateauLoZ - toleranceZ, plateauHiZ + toleranceZ);
+                float repairZ = pow(antiZipperAuthority, 0.78) * zipperEvidenceZ;
+                proposedY = clamp(mix(proposedY, reconstructedZ, repairZ), 0.0, 1.0);
+            }
+        }
+    }
     float delta = proposedY - centerY;
     vec3 proposedRgb = centerRgb;
     if (centerY > 1.0e-5) {
