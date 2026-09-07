@@ -513,43 +513,6 @@ struct ResidentRawRenderInput {
     std::uint64_t rawNormalizeGeneration = 0u;
 };
 
-// Phase 13 resident orchestration checkpoint. This result carries only opaque GPU
-// generation ownership plus compact control/telemetry. It never owns a host full-frame mosaic.
-struct ResidentSpectraPreDemosaicPolicy {
-    bool allowPass1 = true;
-    bool pass2PlanProvided = false;
-    bool allowPass2 = true;
-    SpectraPass2State pass2State{};
-    bool pass3LowBandPlanProvided = false;
-    bool allowPass3 = true;
-    bncam::spectra2::ChromaBandPlan pass3LowBandPlan{};
-};
-
-struct ResidentSpectraPreDemosaicChainResult {
-    bool attempted = false;
-    bool success = false;
-    bool spectraEnabled = false;
-    bool pass0Dispatched = false;
-    bool pass1Dispatched = false;
-    bool pass2Dispatched = false;
-    bool pass3Dispatched = false;
-    bool pass3PlannerGpuUsed = false;
-    bool pass2PolicyProvided = false;
-    bool pass3PolicyProvided = false;
-    bool fullFrameCpuReadbackUsed = false;
-    std::uint64_t inputGeneration = 0u;
-    std::uint64_t outputGeneration = 0u;
-    std::uint64_t outputBytes = 0u;
-    std::string outputStage = "NONE";
-    std::string status = "NOT_RUN";
-    std::string failureReason = "none";
-    SpectraPass0State pass0State{};
-    SpectraPass1State pass1State{};
-    SpectraPass2State pass2State{};
-    SpectraPass3State pass3State{};
-    std::array<SpectraNoRegretResult, 4> noRegret{};
-};
-
 struct SpectraResidualNoiseState {
     std::string domain = "FINAL_JPEG_RGB";
     std::string valueStage = "FINAL_JPEG_PRE_ENCODE";
@@ -891,40 +854,6 @@ public:
             const LinearFloatRaw& raw,
             const IspFrameMetadata& meta,
             const NativeRenderQualityConfig& uiConfig
-    );
-
-    static bool computePass3StateVulkanCompact(
-            const LinearFloatRaw& raw,
-            const IspFrameMetadata& meta,
-            const NativeRenderQualityConfig& uiConfig,
-            std::uint64_t residentGeneration,
-            bool residentFromPass2,
-            SpectraPass3State& state,
-            bncam::spectra2::RawStatisticsSnapshot* residentStatistics = nullptr,
-            bncam::spectra2::ChromaBandEnergySnapshot* residentChromaBands = nullptr
-    );
-
-    // Phase 13 resident descriptor overload; compact GPU planner consumes opaque pixels.
-    static bool computePass3StateVulkanCompact(
-            const RawNormalizedSampleView& raw,
-            const IspFrameMetadata& meta,
-            const NativeRenderQualityConfig& uiConfig,
-            std::uint64_t residentGeneration,
-            bool residentFromPass2,
-            SpectraPass3State& state,
-            bncam::spectra2::RawStatisticsSnapshot* residentStatistics = nullptr,
-            bncam::spectra2::ChromaBandEnergySnapshot* residentChromaBands = nullptr
-    );
-
-    // Phase 13: isolated resident pre-demosaic SPECTRA chain proof. This helper is
-    // intentionally not JNI-wired yet. It consumes the opaque RAW-normalize generation,
-    // performs compact CPU planning only, and never materializes the full float mosaic.
-    static ResidentSpectraPreDemosaicChainResult executeResidentSpectraPreDemosaicChain(
-            const RawNormalizedSampleView& raw,
-            std::uint64_t rawNormalizeGeneration,
-            const IspFrameMetadata& meta,
-            const NativeRenderQualityConfig& uiConfig,
-            const ResidentSpectraPreDemosaicPolicy& policy
     );
 
     static void applySpectraPass3(
