@@ -230,8 +230,6 @@ RuntimeSnapshot VulkanRuntime::shutdown() noexcept {
     spectraPass3PlannerBackend_.destroy(handles_.device);
     spectraRawFinalizeBackend_.destroy(handles_.device);
     spectraResidentToneBackend_.destroy(handles_.device);
-    spectraVisibleChromaBackend_.destroy(handles_.device);
-    spectraOpponentBackend_.destroy(handles_.device);
     OwnedRuntimeHandles handlesToDestroy = std::move(handles_);
     lock.unlock();
     RuntimeFailure destroyFailure = VulkanRuntimeBootstrap::destroy(handlesToDestroy);
@@ -324,84 +322,6 @@ void VulkanRuntime::quarantineRuntime(const std::string& reason) noexcept {
 
 bool VulkanRuntime::isQuarantined() const noexcept {
     return quarantined_.load(std::memory_order_relaxed) || state_ == RuntimeState::QUARANTINED;
-}
-
-
-SpectraOpponentExecutionResult VulkanRuntime::executeSpectraOpponentFeatures(
-        const SpectraOpponentExecutionRequest& request
-) noexcept {
-    SpectraOpponentExecutionResult rejected{};
-    rejected.attempted = true;
-    VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
-    VkDevice device = VK_NULL_HANDLE;
-    VkQueue queue = VK_NULL_HANDLE;
-    VkCommandPool commandPool = VK_NULL_HANDLE;
-    VulkanAllocatorOwner* allocator = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (state_ != RuntimeState::READY || !handles_.complete()) {
-            rejected.status = "VULKAN_RUNTIME_NOT_READY";
-            rejected.failureReason = "Authoritative Vulkan runtime is not READY.";
-            return rejected;
-        }
-        inFlightSubmissionCount_.fetch_add(1, std::memory_order_acq_rel);
-        physicalDevice = handles_.physicalDevice;
-        device = handles_.device;
-        queue = handles_.computeQueue;
-        commandPool = handles_.commandPool;
-        allocator = &handles_.allocator;
-    }
-
-    SpectraOpponentExecutionResult result{};
-    {
-        // VkQueue and the authoritative command pool require external synchronization.
-        std::lock_guard<std::mutex> submitLock(submissionMutex_);
-        result = spectraOpponentBackend_.execute(
-                physicalDevice,
-                device,
-                queue,
-                commandPool,
-                *allocator,
-                request
-        );
-    }
-    completeSubmission();
-    return result;
-}
-
-SpectraVisibleChromaExecutionResult VulkanRuntime::executeSpectraVisibleChromaCandidate(
-        const SpectraVisibleChromaExecutionRequest& request
-) noexcept {
-    SpectraVisibleChromaExecutionResult rejected{};
-    rejected.attempted = true;
-    VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
-    VkDevice device = VK_NULL_HANDLE;
-    VkQueue queue = VK_NULL_HANDLE;
-    VkCommandPool commandPool = VK_NULL_HANDLE;
-    VulkanAllocatorOwner* allocator = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (state_ != RuntimeState::READY || !handles_.complete()) {
-            rejected.status = "VULKAN_RUNTIME_NOT_READY";
-            rejected.failureReason = "Authoritative Vulkan runtime is not READY.";
-            return rejected;
-        }
-        inFlightSubmissionCount_.fetch_add(1, std::memory_order_acq_rel);
-        physicalDevice = handles_.physicalDevice;
-        device = handles_.device;
-        queue = handles_.computeQueue;
-        commandPool = handles_.commandPool;
-        allocator = &handles_.allocator;
-    }
-    SpectraVisibleChromaExecutionResult result{};
-    {
-        std::lock_guard<std::mutex> submitLock(submissionMutex_);
-        result = spectraVisibleChromaBackend_.execute(
-                physicalDevice, device, queue, commandPool, *allocator, request
-        );
-    }
-    completeSubmission();
-    return result;
 }
 
 SpectraNoiseMapPlannerResult VulkanRuntime::executeRawNoiseMapPlannerFromNormalize(
@@ -1389,14 +1309,6 @@ RuntimeSnapshot VulkanRuntime::snapshotLocked() const {
     result.enabledFeatures = capabilities_.enabledFeatures;
     result.missingRequirements = capabilities_.missingRequirements;
     result.activeProductionStages.clear();
-    if (spectraOpponentBackend_.productionKernelConnected()) {
-        result.activeProductionStages.push_back("SPECTRA_FP32_OPPONENT_FEATURES");
-        result.activeProductionStages.push_back("SPECTRA_FP32_OPPONENT_FEATURES_STRIPED");
-    }
-    if (spectraVisibleChromaBackend_.productionKernelConnected()) {
-        result.activeProductionStages.push_back("SPECTRA_FP32_VISIBLE_CHROMA_CANDIDATE");
-        result.activeProductionStages.push_back("SPECTRA_FP32_VISIBLE_CHROMA_CANDIDATE_STRIPED");
-    }
     if (spectraPass3PlannerBackend_.productionKernelConnected()) {
         result.activeProductionStages.push_back("SPECTRA_FP32_PASS3_COMPACT_PLANNER_GPU_PRIMARY");
         result.activeProductionStages.push_back("SPECTRA_FP32_PASS3_ROW_COLUMN_LOWFREQ_NO_FULL_FRAME_SCAN");
@@ -1492,9 +1404,7 @@ std::string VulkanRuntime::diagnosticsHumanReadable() const {
         << "Camera/session ownership: forbidden\n"
         << "Compose ownership: forbidden\n"
         << "Production Vulkan stages: "
-        << (spectraOpponentBackend_.productionKernelConnected() ||
-                spectraVisibleChromaBackend_.productionKernelConnected() ||
-                spectraPass3PlannerBackend_.productionKernelConnected() ||
+        << (spectraPass3PlannerBackend_.productionKernelConnected() ||
                 spectraTemporalObserverBackend_.productionKernelConnected() ||
                 spectraRawFinalizeBackend_.productionKernelConnected() ||
                 spectraResidentDemosaicBackend_.productionKernelConnected() ||

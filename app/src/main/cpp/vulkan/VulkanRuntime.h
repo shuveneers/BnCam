@@ -3,8 +3,6 @@
 #include "VulkanRuntimeBootstrap.h"
 #include "VulkanRuntimeContracts.h"
 #include "VulkanValidationCollector.h"
-#include "VulkanSpectraOpponentBackend.h"
-#include "VulkanSpectraVisibleChromaBackend.h"
 #include "VulkanSpectraTemporalObserverBackend.h"
 #include "VulkanSpectraResidentDemosaicBackend.h"
 #include "VulkanRawPreviewBackend.h"
@@ -60,20 +58,6 @@ public:
     void resetShotCircuitBreaker() noexcept;
     void quarantineRuntime(const std::string& reason) noexcept;
     bool isQuarantined() const noexcept;
-
-
-    /**
-     * Milestone 8F striped, persistent-buffer SPECTRA FP32 opponent-feature stage.
-     * The method never exposes Vulkan handles and always returns a typed CPU fallback reason.
-     */
-    SpectraOpponentExecutionResult executeSpectraOpponentFeatures(
-            const SpectraOpponentExecutionRequest& request
-    ) noexcept;
-
-    /** Milestone 8G shadow/qualified visible-chroma candidate filter. */
-    SpectraVisibleChromaExecutionResult executeSpectraVisibleChromaCandidate(
-            const SpectraVisibleChromaExecutionRequest& request
-    ) noexcept;
 
     /** Phase 13 exact compact RAW noise-map observation from the resident JPEG-normalized mosaic. */
     SpectraNoiseMapPlannerResult executeRawNoiseMapPlannerFromNormalize(
@@ -204,8 +188,6 @@ private:
     RuntimeFailure lastFailure_;
     OwnedRuntimeHandles handles_;
     ValidationCollector validationCollector_;
-    VulkanSpectraOpponentBackend spectraOpponentBackend_;
-    VulkanSpectraVisibleChromaBackend spectraVisibleChromaBackend_;
     VulkanSpectraTemporalObserverBackend spectraTemporalObserverBackend_;
     VulkanSpectraResidentDemosaicBackend spectraResidentDemosaicBackend_;
     VulkanRawPreviewBackend rawPreviewBackend_;
