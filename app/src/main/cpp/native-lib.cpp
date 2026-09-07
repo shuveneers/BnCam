@@ -431,12 +431,14 @@ NativeRenderQualityConfig makeQualityConfig(
     cfg.profileSpectraChroma = std::isfinite(profileSpectraChroma) ? std::clamp(profileSpectraChroma, -1.0f, 1.0f) : 0.0f;
     cfg.profileSpectraDetailProtection = std::isfinite(profileSpectraDetailProtection) ? std::clamp(profileSpectraDetailProtection, -1.0f, 1.0f) : 0.0f;
     cfg.profileSpectraLowFrequency = std::isfinite(profileSpectraLowFrequency) ? std::clamp(profileSpectraLowFrequency, -1.0f, 1.0f) : 0.0f;
-    cfg.profileNrLuminance = std::isfinite(profileNrLuminance) ? std::clamp(profileNrLuminance, 0.0f, 1.0f) : 0.0f;
-    cfg.profileNrLuminanceDetail = std::isfinite(profileNrLuminanceDetail) ? std::clamp(profileNrLuminanceDetail, 0.0f, 1.0f) : 0.5f;
-    cfg.profileNrLuminanceContrast = std::isfinite(profileNrLuminanceContrast) ? std::clamp(profileNrLuminanceContrast, 0.0f, 1.0f) : 0.0f;
-    cfg.profileNrColor = std::isfinite(profileNrColor) ? std::clamp(profileNrColor, 0.0f, 1.0f) : 0.0f;
-    cfg.profileNrColorDetail = std::isfinite(profileNrColorDetail) ? std::clamp(profileNrColorDetail, 0.0f, 1.0f) : 0.5f;
-    cfg.profileNrColorSmoothness = std::isfinite(profileNrColorSmoothness) ? std::clamp(profileNrColorSmoothness, 0.0f, 1.0f) : 0.5f;
+    // N005: these six JNI slots are retained temporarily for Kotlin/native ABI compatibility only.
+    // Classical Profile NR no longer enters any RAW quality state; YUV owns the preserved policy.
+    (void)profileNrLuminance;
+    (void)profileNrLuminanceDetail;
+    (void)profileNrLuminanceContrast;
+    (void)profileNrColor;
+    (void)profileNrColorDetail;
+    (void)profileNrColorSmoothness;
     cfg.profileToneExposure = std::isfinite(profileToneExposure) ? std::clamp(profileToneExposure, -1.0f, 1.0f) : 0.0f;
     cfg.profileToneHighlights = std::isfinite(profileToneHighlights) ? std::clamp(profileToneHighlights, -1.0f, 1.0f) : 0.0f;
     cfg.profileToneShadows = std::isfinite(profileToneShadows) ? std::clamp(profileToneShadows, -1.0f, 1.0f) : 0.0f;
@@ -1881,12 +1883,14 @@ Java_com_bncam_core_engine_ImageUtils_renderRawPreviewNative(
     quality.profileDetailMasking = std::isfinite(profileDetailMasking)
             ? std::clamp(static_cast<float>(profileDetailMasking), -1.0f, 1.0f)
             : bncam::profile_defaults::kDetailMasking;
-    quality.profileNrLuminance = std::isfinite(profileNrLuminance) ? std::clamp(static_cast<float>(profileNrLuminance), 0.0f, 1.0f) : 0.0f;
-    quality.profileNrLuminanceDetail = std::isfinite(profileNrLuminanceDetail) ? std::clamp(static_cast<float>(profileNrLuminanceDetail), 0.0f, 1.0f) : 0.5f;
-    quality.profileNrLuminanceContrast = std::isfinite(profileNrLuminanceContrast) ? std::clamp(static_cast<float>(profileNrLuminanceContrast), 0.0f, 1.0f) : 0.0f;
-    quality.profileNrColor = std::isfinite(profileNrColor) ? std::clamp(static_cast<float>(profileNrColor), 0.0f, 1.0f) : 0.0f;
-    quality.profileNrColorDetail = std::isfinite(profileNrColorDetail) ? std::clamp(static_cast<float>(profileNrColorDetail), 0.0f, 1.0f) : 0.5f;
-    quality.profileNrColorSmoothness = std::isfinite(profileNrColorSmoothness) ? std::clamp(static_cast<float>(profileNrColorSmoothness), 0.0f, 1.0f) : 0.5f;
+    // N005: RAW preview must not inherit the retired classical Profile-NR controls. Keep the
+    // existing JNI parameters until the Neural controls replace this ABI, but do not store them.
+    (void)profileNrLuminance;
+    (void)profileNrLuminanceDetail;
+    (void)profileNrLuminanceContrast;
+    (void)profileNrColor;
+    (void)profileNrColorDetail;
+    (void)profileNrColorSmoothness;
     quality.toneCurve = extractCurveVector(env, toneCurveArray, 2, 64);
     quality.gammaCurve = extractCurveVector(env, gammaCurveArray, 2, 64);
     quality.sectionCurve = extractCurveVector(env, sectionCurveArray, 2, 64);
@@ -4525,7 +4529,7 @@ Java_com_bncam_core_engine_ImageUtils_getNativeStageHeartbeatJsonNative(JNIEnv* 
 
 extern "C"
 JNIEXPORT jstring JNICALL
-Java_com_bncam_core_engine_ImageUtils_getPreviewBufferTelemetryNative(JNIEnv* env, jclass clazz) {
+Java_com_bncam_core_engine_ImageUtils_getPreviewBufferTelemetryNative(JNIEnv* env, jobject /* thiz */) {
     char buf[512];
     snprintf(buf, sizeof(buf),
              "PREVIEW_BUFFER_TELEMETRY: previewAcquireCount=0 previewReleaseCount=0 previewInFlightReferences=0 releaseAfterGpuCompletionCount=0 releaseBeforeGpuCompletionCount=0 maxPreviewBuffersInFlight=0");

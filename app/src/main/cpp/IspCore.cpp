@@ -13,12 +13,7 @@
 #include "SpectraContextFusionNoRegret.h"
 #include "SpectraChromaNoRegretPolicy.h"
 #include "SpectraContextFusionChromaAuthority.h"
-#include "SpectraLowFrequencyOwnership.h"
-#include "SpectraPhysicalBaselineNr.h"
-#include "SingleFrameRawDenoisePolicy.h"
-#include "SpectraPostDemosaicResidualNr.h"
 #include "SpectraResidualSeedConfidence.h"
-#include "SpectraResidualChromaArtifact.h"
 #include "PhysicalAwbEstimator.h"
 #include "SensorColorScienceV2.h"
 #include "RawCameraColorCharacterizationOwnership.h"
@@ -33,17 +28,11 @@
 #include "SpectraMultiscaleResidualConsensus.h"
 #include "SpectraMultiscaleChromaContext.h"
 #include "SpectraCfaOrthonormalSupport.h"
-#include "SpectraGaloshChroma.h"
-#include "PhysicalNearBlackChromaPolicy.h"
 #include "SpectraCfaSurfaceClassifier.h"
 #include "Demosaic.h"
 #include "FastLocalLaplacianPolicy.h"
 #include "ProfileToneRenderPolicy.h"
-#include "LinearDetailRecoveryPolicy.h"
 #include "PerceptualDetailPolicy.h"
-#include "SpectraDownstreamDenoisePolicy.h"
-#include "ProfileNoiseReductionPolicy.h"
-#include "SpectraVulkanOpponentStripPlan.h"
 #include "SpectraCfaChromaConfidence.h"
 #include "vulkan/VulkanRuntime.h"
 #include "vulkan/NativeStageHeartbeat.h"
@@ -616,7 +605,7 @@ void sampleNoiseModelFromProductionRaw(
     stats.minSensorNoiseVariance = std::isfinite(varianceMin) ? varianceMin : 0.0;
     stats.maxSensorNoiseVariance = std::isfinite(varianceMax) ? varianceMax : 0.0;
     stats.noiseModelApplied = true;
-    stats.noiseModelReason = "applied_to_production_luma_and_chroma_denoise";
+    stats.noiseModelReason = "measurement_only_noise_model_no_classical_pixel_authority";
 }
 
 bool sampleNoiseModelFromResidentRaw(
@@ -774,13 +763,13 @@ bool sampleNoiseModelFromResidentRaw(
     stats.minSensorNoiseVariance = std::isfinite(varianceMin) ? varianceMin : 0.0;
     stats.maxSensorNoiseVariance = std::isfinite(varianceMax) ? varianceMax : 0.0;
     stats.noiseModelApplied = true;
-    stats.noiseModelReason = "applied_gpu_exact_compact_to_production_luma_and_chroma_denoise";
+    stats.noiseModelReason = "applied_gpu_exact_compact_measurement_only";
     if (failureReason != nullptr) failureReason->clear();
     return true;
 }
 
-// Physical S/O authority and Dynamic ISO headroom mapping live in
-// SpectraPhysicalBaselineNr.h so production and validation share one implementation.
+// Physical S/O remains measurement-only here. Filter authority is intentionally absent;
+// future SPECTRA Neural conditioning consumes the measured noise state explicitly.
 
 const char* noiseModelModeName(int mode) {
     switch (mode) {
@@ -2498,158 +2487,6 @@ LensShadingDebug applyLensShadingToJpegRaw(LinearFloatRaw& raw, const IspFrameMe
 // Phase 9 removed the legacy CPU post-CCM 3x3 highlight heuristic. Failure recovery now
 // rebuilds the same sensor-domain clip reconstruction + signed-CCM gamut contract used by Vulkan.
 
-struct LinearDetailCpuFallbackResult {
-    bool attempted = false;
-    bool applied = false;
-    std::uint64_t evaluatedPixels = 0u;
-    std::uint64_t changedPixels = 0u;
-    std::uint64_t edgeSupportedPixels = 0u;
-    std::uint64_t noiseRejectedPixels = 0u;
-    std::uint64_t haloClampedPixels = 0u;
-    float maxAbsCorrection = 0.0f;
-    float processingMs = 0.0f;
-};
-
-LinearDetailCpuFallbackResult applyLinearDetailRecoveryCpuFallback(
-        cv::Mat& linearRgb,
-        const bncam::detail_recovery::Plan& plan) {
-    LinearDetailCpuFallbackResult result{};
-    const auto started = IspClock::now();
-    result.attempted = plan.enabled;
-    if (!plan.enabled || linearRgb.empty() || linearRgb.type() != CV_32FC3) {
-        result.processingMs = elapsedMs(started);
-        return result;
-    }
-
-    const cv::Mat immutableInput = linearRgb;
-    cv::Mat output = linearRgb.clone();
-    std::atomic<std::uint64_t> evaluated{0u};
-    std::atomic<std::uint64_t> changed{0u};
-    std::atomic<std::uint64_t> edgeSupported{0u};
-    std::atomic<std::uint64_t> noiseRejected{0u};
-    std::atomic<std::uint64_t> haloClamped{0u};
-    std::mutex maximumMutex;
-    float maximumCorrection = 0.0f;
-    const auto sampleLuma = [&](int x, int y) noexcept -> float {
-        const int sx = std::clamp(x, 0, immutableInput.cols - 1);
-        const int sy = std::clamp(y, 0, immutableInput.rows - 1);
-        const cv::Vec3f& v = immutableInput.at<cv::Vec3f>(sy, sx);
-        return std::max(0.0f, 0.2126f * v[0] + 0.7152f * v[1] + 0.0722f * v[2]);
-    };
-
-    cv::parallel_for_(cv::Range(0, immutableInput.rows), [&](const cv::Range& range) {
-        std::uint64_t localEvaluated = 0u;
-        std::uint64_t localChanged = 0u;
-        std::uint64_t localEdgeSupported = 0u;
-        std::uint64_t localNoiseRejected = 0u;
-        std::uint64_t localHaloClamped = 0u;
-        float localMaximumCorrection = 0.0f;
-        for (int y = range.start; y < range.end; ++y) {
-            cv::Vec3f* outRow = output.ptr<cv::Vec3f>(y);
-            for (int x = 0; x < immutableInput.cols; ++x) {
-                ++localEvaluated;
-                const cv::Vec3f& centerRgb = immutableInput.at<cv::Vec3f>(y, x);
-                const float centerY = sampleLuma(x, y);
-                const float l = sampleLuma(x - 1, y);
-                const float r = sampleLuma(x + 1, y);
-                const float u = sampleLuma(x, y - 1);
-                const float d = sampleLuma(x, y + 1);
-                const float ul = sampleLuma(x - 1, y - 1);
-                const float ur = sampleLuma(x + 1, y - 1);
-                const float dl = sampleLuma(x - 1, y + 1);
-                const float dr = sampleLuma(x + 1, y + 1);
-                const float radiusT = std::clamp((plan.radius - 0.50f) / 2.50f, 0.0f, 1.0f);
-                const float axialWeight = 0.085f + (0.125f - 0.085f) * radiusT;
-                const float diagonalWeight = 0.035f + (0.060f - 0.035f) * radiusT;
-                const float centerWeight = std::max(
-                        0.05f, 1.0f - 4.0f * axialWeight - 4.0f * diagonalWeight);
-                const float psfBlur = centerWeight * centerY + axialWeight * (l + r + u + d) +
-                        diagonalWeight * (ul + ur + dl + dr);
-                const float broadCross = 0.25f * (sampleLuma(x - 2, y) + sampleLuma(x + 2, y) +
-                                                  sampleLuma(x, y - 2) + sampleLuma(x, y + 2));
-                const float broadMix = radiusT * 0.55f;
-                const float broadBlur = psfBlur * (1.0f - broadMix) +
-                        (0.58f * psfBlur + 0.42f * broadCross) * broadMix;
-                const float residual = centerY - broadBlur;
-                const float gx = 0.5f * (r - l);
-                const float gy = 0.5f * (d - u);
-                const float gradient = std::sqrt(std::max(0.0f, gx * gx + gy * gy));
-                const float signalRatio = std::clamp(
-                        centerY / std::max(plan.referenceSignal, 1.0e-4f), 0.05f, 16.0f);
-                const float varianceScale = (1.0f - plan.shotNoiseFraction) +
-                        plan.shotNoiseFraction * signalRatio;
-                const float localSigma = plan.preToneLumaSigma *
-                        std::sqrt(std::max(varianceScale, 0.05f));
-                const float residualSnr = std::abs(residual) / std::max(localSigma, 1.0e-7f);
-                const float gradientSnr = gradient / std::max(localSigma, 1.0e-7f);
-                const auto smooth = [](float edge0, float edge1, float value) noexcept {
-                    const float t = std::clamp((value - edge0) /
-                            std::max(edge1 - edge0, 1.0e-6f), 0.0f, 1.0f);
-                    return t * t * (3.0f - 2.0f * t);
-                };
-                const float noiseGate = smooth(
-                        plan.minimumResidualSnr, plan.minimumResidualSnr + 2.25f, residualSnr);
-                const float edgeGate = smooth(
-                        plan.minimumGradientSnr, plan.minimumGradientSnr + 2.75f, gradientSnr);
-                if (noiseGate < 0.05f) ++localNoiseRejected;
-                if (edgeGate > 0.25f && noiseGate > 0.05f) ++localEdgeSupported;
-                const float directionalCoherence = std::max(std::abs(gx), std::abs(gy)) /
-                        std::max(std::abs(gx) + std::abs(gy), 1.0e-6f);
-                const float coherenceGate = 0.72f + 0.28f * smooth(0.52f, 0.90f, directionalCoherence);
-                const float maskingGate = 1.0f + (edgeGate - 1.0f) * plan.masking;
-                const float localAuthority = plan.authority * plan.modelConfidence * noiseGate *
-                        edgeGate * coherenceGate * maskingGate;
-
-                const float localMin = std::min({centerY, l, r, u, d, ul, ur, dl, dr});
-                const float localMax = std::max({centerY, l, r, u, d, ul, ur, dl, dr});
-                const float localRange = std::max(0.0f, localMax - localMin);
-                const float highlightHeadroomGate = smooth(0.02f, 0.18f, 4.0f - localMax);
-                const float inverseStep = 0.82f + (1.18f - 0.82f) * plan.detailEmphasis;
-                float delta = residual * localAuthority * highlightHeadroomGate * inverseStep;
-                const float unclampedDelta = delta;
-                const float adaptiveHaloLimit = std::min(
-                        plan.hardHaloLimit, 0.16f * localRange + 1.25f * localSigma);
-                delta = std::clamp(delta, -adaptiveHaloLimit, adaptiveHaloLimit);
-                float proposedY = std::clamp(
-                        centerY + delta,
-                        std::max(0.0f, localMin - adaptiveHaloLimit),
-                        std::min(4.0f, localMax + adaptiveHaloLimit));
-                delta = proposedY - centerY;
-                if (std::abs(delta - unclampedDelta) > 1.0e-7f) ++localHaloClamped;
-                if (std::abs(delta) > 1.0e-7f) ++localChanged;
-                localMaximumCorrection = std::max(localMaximumCorrection, std::abs(delta));
-                if (centerY > 1.0e-5f) {
-                    const float scale = std::clamp(proposedY / centerY, 0.78f, 1.22f);
-                    outRow[x] = cv::Vec3f(
-                            std::clamp(centerRgb[0] * scale, 0.0f, 4.0f),
-                            std::clamp(centerRgb[1] * scale, 0.0f, 4.0f),
-                            std::clamp(centerRgb[2] * scale, 0.0f, 4.0f));
-                } else {
-                    outRow[x] = centerRgb;
-                }
-            }
-        }
-        evaluated.fetch_add(localEvaluated, std::memory_order_relaxed);
-        changed.fetch_add(localChanged, std::memory_order_relaxed);
-        edgeSupported.fetch_add(localEdgeSupported, std::memory_order_relaxed);
-        noiseRejected.fetch_add(localNoiseRejected, std::memory_order_relaxed);
-        haloClamped.fetch_add(localHaloClamped, std::memory_order_relaxed);
-        std::lock_guard<std::mutex> lock(maximumMutex);
-        maximumCorrection = std::max(maximumCorrection, localMaximumCorrection);
-    });
-
-    linearRgb = std::move(output);
-    result.evaluatedPixels = evaluated.load(std::memory_order_relaxed);
-    result.changedPixels = changed.load(std::memory_order_relaxed);
-    result.edgeSupportedPixels = edgeSupported.load(std::memory_order_relaxed);
-    result.noiseRejectedPixels = noiseRejected.load(std::memory_order_relaxed);
-    result.haloClampedPixels = haloClamped.load(std::memory_order_relaxed);
-    result.maxAbsCorrection = maximumCorrection;
-    result.applied = result.changedPixels > 0u;
-    result.processingMs = elapsedMs(started);
-    return result;
-}
-
 NativeRenderQualityConfig IspCore::resolveForRaw(const NativeRenderQualityConfig& uiConfig, bool isRaw10) {
     NativeRenderQualityConfig cfg = uiConfig;
     cfg.jpegQuality = safeJpegQuality(uiConfig.jpegQuality);
@@ -3953,13 +3790,13 @@ SpectraNoRegretResult IspCore::applySpectraNoRegretGate(
         auto risk = [&](float energy) -> float {
             const float ratio = std::max(0.04f, energy / target);
             if (passIndex >= 2) {
-                // Pass 2 & 3: Chroma and low-frequency residual cleanup.
+                // Retired Pass 2 & 3: legacy chroma/low-frequency suppression is measurement-only pending neural ownership.
                 // CFA opponent false-colour reduction at or below predicted target is desirable,
                 // while true texture/edge preservation is guarded by structureRetention.
                 return ratio > 1.0f ? std::log(ratio) : 0.0f;
             }
             if (ratio < 1.0f) {
-                // Pass 0 & 1: Luma spatial denoise. Mild sub-target penalty only for excessive flattening;
+                // Retired Pass 0 & 1: legacy luma suppression is measurement-only; keep objective scoring read-only;
                 // texture preservation is enforced by detailRetentionFloor.
                 return 0.35f * std::abs(std::log(std::max(0.40f, ratio)));
             }
@@ -8557,13 +8394,8 @@ bool computePass3StateVulkanCompactForDescriptor(
     if (residentStatistics != nullptr) *residentStatistics = {};
     if (residentChromaBands != nullptr) *residentChromaBands = {};
     state.spectraMode = meta.calibration.spectraProcessingMode;
-    const bool physicalBaselineEligible = state.spectraMode == 0 &&
-            meta.calibration.noiseModelMode != 0 &&
-            meta.calibration.hasNoiseProfile &&
-            meta.calibration.noiseProfileApplied &&
-            meta.calibration.signalModelConfidence >= 0.25f;
     state.plannerGpuAttempted = residentGeneration != 0u;
-    if ((!physicalBaselineEligible && state.spectraMode == 0) || residentGeneration == 0u ||
+    if (state.spectraMode == 0 || residentGeneration == 0u ||
         !inputAvailable || width < 32 || height < 32) {
         state.plannerStatus = "PASS3_GPU_COMPACT_PLANNER_NOT_ELIGIBLE";
         state.plannerFailureReason = "runtime_or_input_not_eligible";
@@ -8571,11 +8403,11 @@ bool computePass3StateVulkanCompactForDescriptor(
     }
     const float confidence = std::clamp(meta.calibration.signalModelConfidence, 0.0f, 1.0f);
     const SpectraIsoAdaptiveState isoState = IspCore::resolveSpectraIsoAdaptiveState(meta, uiConfig);
-    state.isoAuthority = physicalBaselineEligible ? 0.0f : isoState.lowFrequencyAuthority;
-    state.bandingAuthority = physicalBaselineEligible ? 0.0f : std::clamp(
+    state.isoAuthority = isoState.lowFrequencyAuthority;
+    state.bandingAuthority = std::clamp(
             (0.22f + 0.48f * confidence) * isoState.lowFrequencyAuthority,
             0.04f, 0.80f);
-    state.chromaAuthority = physicalBaselineEligible ? 0.0f : std::clamp(
+    state.chromaAuthority = std::clamp(
             (0.28f + 0.48f * confidence) * isoState.chromaAuthority,
             0.08f, 0.92f);
 
@@ -8623,7 +8455,7 @@ bool computePass3StateVulkanCompactForDescriptor(
     }
     state.plannerGpuUsed = true;
     state.plannerCpuFallbackUsed = false;
-    if ((!physicalBaselineEligible && !meta.calibration.spectraSnapshotPresent) ||
+    if (!meta.calibration.spectraSnapshotPresent ||
         meta.calibration.signalModelConfidence < 0.25f) {
         state.plannerStatus = "PASS3_GPU_COMPACT_OBSERVER_READY_PASS3_NOT_ELIGIBLE";
         state.plannerFailureReason = "pass3_mutation_or_model_not_eligible";
@@ -8799,25 +8631,8 @@ bool computePass3StateVulkanCompactForDescriptor(
             1.0e-9f, referenceSigma * referenceSigma / 16.0f);
     state.applyLowFreqChroma = state.lowFreqChromaConfidence >= 0.35f &&
             meanGridEnergy > lowFreqFloor;
-    if (physicalBaselineEligible) {
-        // Single-frame physical mode may use the S/O-gated low-frequency R-G/B-G field,
-        // but must never infer fixed row/column sensor pattern from ordinary scene content.
-        // Dedicated dark-frame calibration is required before those corrections gain authority.
-        state.physicalBaselineMode = true;
-        state.authoritySource = "CAMERA2_SO_PHYSICAL_BASELINE";
-        state.applyRowBanding = false;
-        state.applyColBanding = false;
-        state.bandingAuthority = 0.0f;
-        state.applied = state.applyLowFreqChroma;
-        state.plannerStatus = state.applied
-                ? "PHYSICAL_SINGLE_FRAME_LOW_FREQUENCY_CHROMA_READY"
-                : "PHYSICAL_SINGLE_FRAME_COMPACT_OBSERVER_READY_NO_LOW_FREQUENCY_PATTERN";
-        state.plannerFailureReason = "none";
-        state.fallbackReason = state.applied
-                ? "none"
-                : "no_confident_low_frequency_chroma_pattern";
-        return true;
-    }
+    // N001: compact Pass 3 mutation is SPECTRA-only. Camera2 S/O remains read-only
+    // physical evidence elsewhere and cannot activate this classical low-frequency owner.
     state.applied = state.applyRowBanding || state.applyColBanding || state.applyLowFreqChroma;
     state.fallbackReason = state.applied ? "none" : "no_confident_low_frequency_pattern";
     return true;
@@ -9479,720 +9294,9 @@ float IspCore::computeChromaResidualEnergy(const LinearFloatRaw& raw) {
 
 
 
-bncam::spectra2::VulkanOpponentStripPlan buildResidentPostDemosaicStripPlan(
-        int width,
-        int height,
-        int requestedOutputRows = 512,
-        int haloRows = 5,
-        std::uint64_t maximumTransientBytes = 192ull * 1024ull * 1024ull
-) {
-    bncam::spectra2::VulkanOpponentStripPlan plan{};
-    plan.width = width;
-    plan.height = height;
-    plan.haloRows = std::max(0, haloRows);
-    plan.maximumAllowedTransientBytes = maximumTransientBytes;
-    if (width <= 0 || height <= 0 || requestedOutputRows <= 0) {
-        plan.status = "INVALID_RESIDENT_POST_DEMOSAIC_FRAME_OR_STRIP_DIMENSIONS";
-        return plan;
-    }
-    constexpr std::uint64_t kRgbBytesPerPixel = 3u * sizeof(float);
-    const std::uint64_t bytesPerRow = static_cast<std::uint64_t>(width) * kRgbBytesPerPixel;
-    // Host-visible input/output plus one CPU readback vector are counted here.
-    // The intermediate between spatial NR and visible chroma remains device-local.
-    constexpr std::uint64_t kHostStripCopies = 3u;
-    if (bytesPerRow == 0u || bytesPerRow > maximumTransientBytes / kHostStripCopies) {
-        plan.status = "RESIDENT_POST_DEMOSAIC_STRIP_ROW_EXCEEDS_TRANSIENT_BUDGET";
-        return plan;
-    }
-    const std::uint64_t maximumInputRowsByBudget =
-            maximumTransientBytes / (bytesPerRow * kHostStripCopies);
-    if (maximumInputRowsByBudget <= 2u * static_cast<std::uint64_t>(plan.haloRows)) {
-        plan.status = "RESIDENT_POST_DEMOSAIC_BUDGET_TOO_SMALL_FOR_HALO";
-        return plan;
-    }
-    const int maximumOutputRowsByBudget = static_cast<int>(std::min<std::uint64_t>(
-            static_cast<std::uint64_t>(std::numeric_limits<int>::max()),
-            maximumInputRowsByBudget - 2u * static_cast<std::uint64_t>(plan.haloRows)
-    ));
-    plan.targetOutputRows = std::max(1, std::min({
-            requestedOutputRows,
-            height,
-            maximumOutputRowsByBudget
-    }));
-    for (int outputStart = 0; outputStart < height; outputStart += plan.targetOutputRows) {
-        bncam::spectra2::VulkanOpponentStrip strip{};
-        strip.outputStartY = outputStart;
-        strip.outputRowCount = std::min(plan.targetOutputRows, height - outputStart);
-        strip.inputStartY = std::max(0, outputStart - plan.haloRows);
-        const int outputEnd = outputStart + strip.outputRowCount;
-        const int inputEnd = std::min(height, outputEnd + plan.haloRows);
-        strip.inputRowCount = inputEnd - strip.inputStartY;
-        strip.topHaloRows = outputStart - strip.inputStartY;
-        strip.bottomHaloRows = inputEnd - outputEnd;
-        plan.maximumInputRows = std::max(plan.maximumInputRows, strip.inputRowCount);
-        plan.strips.push_back(strip);
-    }
-    if (plan.strips.empty()) {
-        plan.status = "NO_RESIDENT_POST_DEMOSAIC_STRIPS_GENERATED";
-        return plan;
-    }
-    plan.maximumStripInputBytes = bytesPerRow *
-            static_cast<std::uint64_t>(plan.maximumInputRows);
-    plan.maximumStripOutputBytes = bytesPerRow *
-            static_cast<std::uint64_t>(plan.targetOutputRows);
-    // The device-local intermediate can include the visible-chroma halo and is
-    // therefore bounded by the input strip, not by the smaller output strip.
-    plan.estimatedPeakTransientBytes = 2u * plan.maximumStripInputBytes +
-            plan.maximumStripOutputBytes;
-    if (plan.estimatedPeakTransientBytes > maximumTransientBytes) {
-        plan.status = "RESIDENT_POST_DEMOSAIC_STRIP_PLAN_EXCEEDS_TRANSIENT_BUDGET";
-        return plan;
-    }
-    int expectedOutputStart = 0;
-    for (const auto& strip : plan.strips) {
-        if (strip.outputStartY != expectedOutputStart || strip.outputRowCount <= 0 ||
-            strip.inputRowCount < strip.outputRowCount || strip.topHaloRows < 0 ||
-            strip.bottomHaloRows < 0 || strip.topHaloRows > plan.haloRows ||
-            strip.bottomHaloRows > plan.haloRows) {
-            plan.status = "INVALID_RESIDENT_POST_DEMOSAIC_STRIP_CONTINUITY";
-            return plan;
-        }
-        expectedOutputStart += strip.outputRowCount;
-    }
-    if (expectedOutputStart != height) {
-        plan.status = "RESIDENT_POST_DEMOSAIC_STRIP_PLAN_DOES_NOT_COVER_FRAME";
-        return plan;
-    }
-    plan.valid = true;
-    plan.status = "M8H_RESIDENT_POST_DEMOSAIC_STRIP_PLAN_READY";
-    return plan;
-}
+// N005: retired RAW post-demosaic/Profile-NR resident bridge removed.
+// The remaining legacy backend ABI is purged structurally in N006.
 
-struct StripedResidentPostDemosaicExecution {
-    bool success = false;
-    bool timestampQueryUsed = false;
-    bool persistentReuseObserved = false;
-    bool persistentReallocated = false;
-    int stripCount = 0;
-    int successfulStripCount = 0;
-    int persistentReuseHitCount = 0;
-    int persistentReallocationCount = 0;
-    float inputPackingMs = 0.0f;
-    float spatialKernelMs = 0.0f;
-    float visibleKernelMs = 0.0f;
-    float gpuKernelMs = 0.0f;
-    float synchronizationMs = 0.0f;
-    float readbackMs = 0.0f;
-    float transferAndSyncMs = 0.0f;
-    float totalMs = 0.0f;
-    std::uint64_t inputBytes = 0u;
-    std::uint64_t intermediateBytes = 0u;
-    std::uint64_t outputBytes = 0u;
-    std::uint64_t spatialMapBytes = 0u;
-    std::uint64_t persistentResidentBytes = 0u;
-    std::uint64_t persistentAllocationGeneration = 0u;
-    std::array<std::uint64_t, 16> spatialCounters{};
-    std::array<std::uint64_t, 16> visibleCounters{};
-    bncam::publication::Bgr8PublicationStats publicationStats{};
-    float maximumLumaDelta = 0.0f;
-    float maximumChromaDelta = 0.0f;
-    float maximumColourShift = 0.0f;
-    bool outputSrgbEncoded = false;
-    bool packedBgr8PublicationUsed = false;
-    bool floatPublicationFallbackUsed = false;
-    std::string status = "NOT_RUN";
-    std::string failureReason = "none";
-};
-
-bool copyResidentPostDemosaicPublicationToBgr8(
-        const bncam::vulkan::SpectraResidentPostDemosaicResult& execution,
-        cv::Mat& output,
-        int outputStartY,
-        int outputRows,
-        int width,
-        bool& packedPublicationUsed,
-        bool& floatFallbackUsed,
-        bncam::publication::Bgr8PublicationStats* publicationStats,
-        std::string& failureReason
-) {
-    if (execution.outputMappedPointer == nullptr || output.empty() || output.type() != CV_8UC3 ||
-        width <= 0 || outputRows <= 0 || outputStartY < 0 ||
-        outputStartY + outputRows > output.rows || output.cols != width) {
-        failureReason = "PUBLICATION_POINTER_OR_DESTINATION_INVALID";
-        return false;
-    }
-
-    const std::size_t publishedRowBytes = static_cast<std::size_t>(width) * 3u;
-    if (execution.packedBgr8Published) {
-        const std::size_t rowStride = static_cast<std::size_t>(execution.outputRowStrideBytes);
-        const std::uint64_t requiredBytes = static_cast<std::uint64_t>(rowStride) *
-                static_cast<std::uint64_t>(outputRows);
-        if (rowStride < publishedRowBytes || execution.outputBytes < requiredBytes) {
-            failureReason = "PACKED_BGR8_STRIDE_OR_SIZE_INVALID";
-            return false;
-        }
-        const auto* sourceData = static_cast<const std::uint8_t*>(execution.outputMappedPointer);
-        if (publicationStats != nullptr) {
-            std::atomic<std::uint64_t> pixelCount{0u};
-            std::atomic<std::uint64_t> redClipped{0u};
-            std::atomic<std::uint64_t> greenClipped{0u};
-            std::atomic<std::uint64_t> blueClipped{0u};
-            std::atomic<std::uint64_t> redSum{0u};
-            std::atomic<std::uint64_t> greenSum{0u};
-            std::atomic<std::uint64_t> blueSum{0u};
-            cv::parallel_for_(cv::Range(0, outputRows), [&](const cv::Range& range) {
-                bncam::publication::Bgr8PublicationStats localStats{};
-                for (int localY = range.start; localY < range.end; ++localY) {
-                    std::uint8_t* destination = output.ptr<std::uint8_t>(outputStartY + localY);
-                    const std::uint8_t* source = sourceData +
-                            static_cast<std::size_t>(localY) * rowStride;
-                    std::memcpy(destination, source, publishedRowBytes);
-                    // The exact final-output telemetry is consumed while the source row is
-                    // already cache-hot from the mandatory GPU->BGR8 publication copy.
-                    bncam::publication::accumulateBgr8Row(
-                            source, static_cast<std::size_t>(width), localStats);
-                }
-                pixelCount.fetch_add(localStats.pixelCount, std::memory_order_relaxed);
-                redClipped.fetch_add(localStats.redClipped, std::memory_order_relaxed);
-                greenClipped.fetch_add(localStats.greenClipped, std::memory_order_relaxed);
-                blueClipped.fetch_add(localStats.blueClipped, std::memory_order_relaxed);
-                redSum.fetch_add(localStats.redSum, std::memory_order_relaxed);
-                greenSum.fetch_add(localStats.greenSum, std::memory_order_relaxed);
-                blueSum.fetch_add(localStats.blueSum, std::memory_order_relaxed);
-            });
-            publicationStats->pixelCount = pixelCount.load(std::memory_order_relaxed);
-            publicationStats->redClipped = redClipped.load(std::memory_order_relaxed);
-            publicationStats->greenClipped = greenClipped.load(std::memory_order_relaxed);
-            publicationStats->blueClipped = blueClipped.load(std::memory_order_relaxed);
-            publicationStats->redSum = redSum.load(std::memory_order_relaxed);
-            publicationStats->greenSum = greenSum.load(std::memory_order_relaxed);
-            publicationStats->blueSum = blueSum.load(std::memory_order_relaxed);
-        } else {
-            for (int localY = 0; localY < outputRows; ++localY) {
-                std::uint8_t* destination = output.ptr<std::uint8_t>(outputStartY + localY);
-                const std::uint8_t* source = sourceData +
-                        static_cast<std::size_t>(localY) * rowStride;
-                std::memcpy(destination, source, publishedRowBytes);
-            }
-        }
-        packedPublicationUsed = true;
-        return true;
-    }
-
-    if (execution.floatOutputFallback) {
-        const std::size_t expectedFloatRowBytes = publishedRowBytes * sizeof(float);
-        const std::size_t rowStride = static_cast<std::size_t>(execution.outputRowStrideBytes);
-        const std::uint64_t requiredBytes = static_cast<std::uint64_t>(rowStride) *
-                static_cast<std::uint64_t>(outputRows);
-        if (rowStride < expectedFloatRowBytes || execution.outputBytes < requiredBytes) {
-            failureReason = "FP32_FALLBACK_STRIDE_OR_SIZE_INVALID";
-            return false;
-        }
-        const auto* sourceBytes = static_cast<const std::uint8_t*>(execution.outputMappedPointer);
-        bncam::publication::Bgr8PublicationStats fallbackStats{};
-        for (int localY = 0; localY < outputRows; ++localY) {
-            const auto* source = reinterpret_cast<const float*>(
-                    sourceBytes + static_cast<std::size_t>(localY) * rowStride);
-            std::uint8_t* destination = output.ptr<std::uint8_t>(outputStartY + localY);
-            for (int x = 0; x < width; ++x) {
-                const float r = source[static_cast<std::size_t>(x) * 3u + 0u];
-                const float g = source[static_cast<std::size_t>(x) * 3u + 1u];
-                const float b = source[static_cast<std::size_t>(x) * 3u + 2u];
-                destination[static_cast<std::size_t>(x) * 3u + 0u] = execution.outputSrgbEncoded
-                        ? cv::saturate_cast<std::uint8_t>(std::clamp(b, 0.0f, 1.0f) * 255.0f)
-                        : quantizeSrgb8(b);
-                destination[static_cast<std::size_t>(x) * 3u + 1u] = execution.outputSrgbEncoded
-                        ? cv::saturate_cast<std::uint8_t>(std::clamp(g, 0.0f, 1.0f) * 255.0f)
-                        : quantizeSrgb8(g);
-                destination[static_cast<std::size_t>(x) * 3u + 2u] = execution.outputSrgbEncoded
-                        ? cv::saturate_cast<std::uint8_t>(std::clamp(r, 0.0f, 1.0f) * 255.0f)
-                        : quantizeSrgb8(r);
-            }
-            if (publicationStats != nullptr) {
-                bncam::publication::accumulateBgr8Row(
-                        destination, static_cast<std::size_t>(width), fallbackStats);
-            }
-        }
-        if (publicationStats != nullptr) *publicationStats = fallbackStats;
-        floatFallbackUsed = true;
-        return true;
-    }
-
-    failureReason = "BACKEND_DID_NOT_DECLARE_PUBLICATION_FORMAT";
-    return false;
-}
-
-StripedResidentPostDemosaicExecution executeStripedResidentPostDemosaic(
-        const cv::Mat& immutableInput,
-        cv::Mat& output,
-        const bncam::spectra2::VulkanOpponentStripPlan& stripPlan,
-        float appliedLumaSigma,
-        float lumaRangeThresholdMean,
-        float chromaRangeThresholdMean,
-        float outerRingAuthority,
-        bool spectraNoiseActive,
-        float profileNrLuminance,
-        float profileNrLuminanceDetail,
-        float profileNrLuminanceContrast,
-        float profileNrColor,
-        float profileNrColorDetail,
-        float profileNrColorSmoothness,
-        float chromaNrStrength,
-        float chromaUserScale,
-        float downstreamChromaAuthority,
-        float inputResidualLumaSigma,
-        float downstreamLumaAuthority,
-        float visibleSigmaY,
-        const bncam::spectra2::VisibleChromaPlan& visiblePlan,
-        const bncam::spectra2::OpponentCovariance2& covariance,
-        float profileSpectraLuma = 0.0f,
-        float profileSpectraDetailProtection = 0.0f
-) {
-    StripedResidentPostDemosaicExecution aggregate{};
-    const auto totalStarted = IspClock::now();
-    if (immutableInput.empty() || immutableInput.type() != CV_32FC3 ||
-        output.empty() || output.type() != CV_8UC3 ||
-        immutableInput.size() != output.size() || !stripPlan.valid ||
-        stripPlan.width != immutableInput.cols || stripPlan.height != immutableInput.rows ||
-        (visiblePlan.enabled && (
-                !covariance.valid || !(visibleSigmaY > 0.0f) ||
-                !std::isfinite(visibleSigmaY)))) {
-        aggregate.status = "INVALID_RESIDENT_POST_DEMOSAIC_EXECUTION_INPUT";
-        aggregate.failureReason = stripPlan.valid
-                ? "FRAME_PLAN_OR_COVARIANCE_CONTRACT_FAILED"
-                : stripPlan.status;
-        aggregate.totalMs = elapsedMs(totalStarted);
-        return aggregate;
-    }
-
-    const float fallbackSpatialSigma = std::max(g_spatialNoiseMap.meanSigma, 1.0e-6f);
-    const float* spatialSigma = g_spatialNoiseMap.tileSigma.empty()
-            ? &fallbackSpatialSigma
-            : g_spatialNoiseMap.tileSigma.data();
-    const std::uint32_t gridWidth = g_spatialNoiseMap.tileSigma.empty()
-            ? 1u
-            : static_cast<std::uint32_t>(g_spatialNoiseMap.gridWidth);
-    const std::uint32_t gridHeight = g_spatialNoiseMap.tileSigma.empty()
-            ? 1u
-            : static_cast<std::uint32_t>(g_spatialNoiseMap.gridHeight);
-
-    aggregate.stripCount = static_cast<int>(stripPlan.strips.size());
-    std::uint64_t spatialGeneration = 1469598103934665603ull;
-    const auto hashBytes = [&](const void* data, std::size_t bytes) {
-        const auto* values = static_cast<const std::uint8_t*>(data);
-        for (std::size_t index = 0; index < bytes; ++index) {
-            spatialGeneration ^= values[index];
-            spatialGeneration *= 1099511628211ull;
-        }
-    };
-    hashBytes(spatialSigma, static_cast<std::size_t>(gridWidth) * gridHeight * sizeof(float));
-    hashBytes(&gridWidth, sizeof(gridWidth));
-    hashBytes(&gridHeight, sizeof(gridHeight));
-
-    bool allTimestampQueriesUsed = true;
-    std::vector<std::size_t> executionOrder;
-    executionOrder.reserve(stripPlan.strips.size());
-    const auto largestStrip = std::max_element(
-            stripPlan.strips.begin(), stripPlan.strips.end(),
-            [](const auto& lhs, const auto& rhs) {
-                return lhs.inputRowCount < rhs.inputRowCount;
-            }
-    );
-    if (largestStrip != stripPlan.strips.end()) {
-        executionOrder.push_back(static_cast<std::size_t>(
-                std::distance(stripPlan.strips.begin(), largestStrip)
-        ));
-    }
-    for (std::size_t index = 0; index < stripPlan.strips.size(); ++index) {
-        if (executionOrder.empty() || index != executionOrder.front()) {
-            executionOrder.push_back(index);
-        }
-    }
-
-    constexpr int kVisibleHaloRows = 2;
-    for (const std::size_t stripIndex : executionOrder) {
-        const auto& strip = stripPlan.strips[stripIndex];
-        const int outputEndY = strip.outputStartY + strip.outputRowCount;
-        const int intermediateOriginY = std::max(0, strip.outputStartY - kVisibleHaloRows);
-        const int intermediateEndY = std::min(
-                immutableInput.rows,
-                outputEndY + kVisibleHaloRows
-        );
-        const int intermediateRows = intermediateEndY - intermediateOriginY;
-        if (intermediateOriginY < strip.inputStartY ||
-            intermediateEndY > strip.inputStartY + strip.inputRowCount ||
-            intermediateRows <= 0) {
-            aggregate.status = "RESIDENT_POST_DEMOSAIC_INTERMEDIATE_RANGE_INVALID";
-            aggregate.failureReason = "COMBINED_HALO_PLAN_DOES_NOT_CONTAIN_INTERMEDIATE";
-            aggregate.totalMs = elapsedMs(totalStarted);
-            return aggregate;
-        }
-
-        const float* stripInput = immutableInput.ptr<float>(strip.inputStartY);
-        bncam::vulkan::SpectraResidentPostDemosaicRequest request{};
-        request.rgbData = stripInput;
-        request.frameWidth = static_cast<std::uint32_t>(immutableInput.cols);
-        request.frameHeight = static_cast<std::uint32_t>(immutableInput.rows);
-        request.rowStrideFloats = immutableInput.step1();
-        request.inputOriginY = static_cast<std::uint32_t>(strip.inputStartY);
-        request.inputRows = static_cast<std::uint32_t>(strip.inputRowCount);
-        request.intermediateOriginY = static_cast<std::uint32_t>(intermediateOriginY);
-        request.intermediateRows = static_cast<std::uint32_t>(intermediateRows);
-        request.outputOriginY = static_cast<std::uint32_t>(strip.outputStartY);
-        request.outputRows = static_cast<std::uint32_t>(strip.outputRowCount);
-        request.spatialSigma = spatialSigma;
-        request.gridWidth = gridWidth;
-        request.gridHeight = gridHeight;
-        request.meanSpatialSigma = fallbackSpatialSigma;
-        request.appliedLumaSigma = appliedLumaSigma;
-        request.lumaRangeThresholdMean = lumaRangeThresholdMean;
-        request.chromaRangeThresholdMean = chromaRangeThresholdMean;
-        request.outerRingAuthority = outerRingAuthority;
-        request.spectraNoiseActive = spectraNoiseActive;
-        request.visibleChromaEnabled = visiblePlan.enabled;
-        request.profileNrLuminance = profileNrLuminance;
-        request.profileNrLuminanceDetail = profileNrLuminanceDetail;
-        request.profileNrLuminanceContrast = profileNrLuminanceContrast;
-        request.profileNrColor = profileNrColor;
-        request.profileNrColorDetail = profileNrColorDetail;
-        request.profileNrColorSmoothness = profileNrColorSmoothness;
-        request.chromaNrStrength = chromaNrStrength;
-        request.chromaUserScale = chromaUserScale;
-        request.downstreamChromaAuthority = downstreamChromaAuthority;
-        request.inputResidualLumaSigma = inputResidualLumaSigma;
-        request.downstreamLumaAuthority = downstreamLumaAuthority;
-        request.profileSpectraLuma = profileSpectraLuma;
-        request.profileSpectraDetail = profileSpectraDetailProtection;
-        request.visibleSigmaY = visibleSigmaY;
-        request.visibleAuthority = visiblePlan.enabled ? visiblePlan.authority : 0.0f;
-        request.visibleMaximumCorrection =
-                visiblePlan.enabled ? visiblePlan.maximumCorrection : 0.0f;
-        // This SPECTRA-active striped path never applies the preserved legacy
-        // SPECTRA-off sharpener; keep the newly added request field explicit so
-        // later fields cannot shift when the request contract evolves.
-        request.inverse00 = covariance.valid ? covariance.inverse00 : 1.0f;
-        request.inverse01 = covariance.valid ? covariance.inverse01 : 0.0f;
-        request.inverse11 = covariance.valid ? covariance.inverse11 : 1.0f;
-        request.generationId = spatialGeneration;
-        // FASE 15 production contract: publish directly as packed BGR8/sRGB. FP32 remains
-        // available only when a caller explicitly sets this field false.
-        request.packedBgr8Publication = true;
-        bncam::vulkan::SpectraResidentPostDemosaicResult execution =
-                bncam::vulkan::VulkanRuntime::instance()
-                        .executeSpectraResidentPostDemosaic(request);
-        aggregate.inputPackingMs += execution.inputPackingMs;
-        aggregate.spatialKernelMs += execution.spatialKernelMs;
-        aggregate.visibleKernelMs += execution.visibleKernelMs;
-        aggregate.gpuKernelMs += execution.gpuKernelMs;
-        aggregate.synchronizationMs += execution.synchronizationMs;
-        aggregate.readbackMs += execution.readbackMs;
-        aggregate.transferAndSyncMs += execution.transferAndSyncMs;
-        aggregate.inputBytes += execution.inputBytes;
-        aggregate.intermediateBytes += execution.intermediateBytes;
-        aggregate.spatialMapBytes += execution.spatialMapBytes;
-        aggregate.persistentResidentBytes = std::max(
-                aggregate.persistentResidentBytes,
-                execution.persistentResidentBytes
-        );
-        aggregate.persistentAllocationGeneration = std::max(
-                aggregate.persistentAllocationGeneration,
-                execution.persistentAllocationGeneration
-        );
-        if (execution.persistentBufferReuseHit) {
-            aggregate.persistentReuseObserved = true;
-            aggregate.persistentReuseHitCount++;
-        }
-        if (execution.persistentBufferReallocated) {
-            aggregate.persistentReallocated = true;
-            aggregate.persistentReallocationCount++;
-        }
-        allTimestampQueriesUsed = allTimestampQueriesUsed && execution.timestampQueryUsed;
-        if (!execution.success) {
-            aggregate.status = "RESIDENT_POST_DEMOSAIC_STRIP_FAILED";
-            aggregate.failureReason = "strip_y_" + std::to_string(strip.outputStartY) + "_" +
-                    (execution.failureReason.empty() ? execution.status : execution.failureReason);
-            aggregate.totalMs = elapsedMs(totalStarted);
-            return aggregate;
-        }
-
-        std::string publicationFailure;
-        bncam::publication::Bgr8PublicationStats stripPublicationStats{};
-        if (!copyResidentPostDemosaicPublicationToBgr8(
-                    execution, output, strip.outputStartY, strip.outputRowCount,
-                    immutableInput.cols, aggregate.packedBgr8PublicationUsed,
-                    aggregate.floatPublicationFallbackUsed, &stripPublicationStats,
-                    publicationFailure)) {
-            aggregate.status = "RESIDENT_POST_DEMOSAIC_PUBLICATION_UNAVAILABLE";
-            aggregate.failureReason = publicationFailure;
-            aggregate.totalMs = elapsedMs(totalStarted);
-            return aggregate;
-        }
-        aggregate.outputBytes += execution.outputBytes;
-        aggregate.outputSrgbEncoded = true;
-        bncam::publication::mergeBgr8PublicationStats(
-                aggregate.publicationStats, stripPublicationStats);
-        for (std::size_t index = 0; index < aggregate.spatialCounters.size(); ++index) {
-            aggregate.spatialCounters[index] += execution.spatialCounters[index];
-            aggregate.visibleCounters[index] += execution.visibleCounters[index];
-        }
-        float stripMaximumLumaDelta = 0.0f;
-        float stripMaximumChromaDelta = 0.0f;
-        float stripMaximumColourShift = 0.0f;
-        const std::uint32_t maxLumaBits = execution.spatialCounters[6];
-        const std::uint32_t maxChromaBits = execution.spatialCounters[7];
-        const std::uint32_t maxColourBits = execution.visibleCounters[15];
-        std::memcpy(&stripMaximumLumaDelta, &maxLumaBits, sizeof(stripMaximumLumaDelta));
-        std::memcpy(&stripMaximumChromaDelta, &maxChromaBits, sizeof(stripMaximumChromaDelta));
-        std::memcpy(&stripMaximumColourShift, &maxColourBits, sizeof(stripMaximumColourShift));
-        if (std::isfinite(stripMaximumLumaDelta)) {
-            aggregate.maximumLumaDelta = std::max(
-                    aggregate.maximumLumaDelta, stripMaximumLumaDelta);
-        }
-        if (std::isfinite(stripMaximumChromaDelta)) {
-            aggregate.maximumChromaDelta = std::max(
-                    aggregate.maximumChromaDelta, stripMaximumChromaDelta);
-        }
-        if (std::isfinite(stripMaximumColourShift)) {
-            aggregate.maximumColourShift = std::max(
-                    aggregate.maximumColourShift, stripMaximumColourShift);
-        }
-        aggregate.successfulStripCount++;
-    }
-
-    aggregate.timestampQueryUsed = allTimestampQueriesUsed && aggregate.stripCount > 0;
-    aggregate.success = aggregate.successfulStripCount == aggregate.stripCount;
-    aggregate.status = aggregate.success
-            ? (aggregate.floatPublicationFallbackUsed
-                    ? "SPECTRA_POST_DEMOSAIC_GPU_RESIDENT_FLOAT_PUBLICATION_FALLBACK_READY"
-                    : "SPECTRA_POST_DEMOSAIC_GPU_RESIDENT_BGR8_PUBLICATION_READY")
-            : "RESIDENT_POST_DEMOSAIC_FRAME_INCOMPLETE";
-    aggregate.failureReason = aggregate.success
-            ? "none"
-            : "NOT_ALL_RESIDENT_POST_DEMOSAIC_STRIPS_COMPLETED";
-    aggregate.totalMs = elapsedMs(totalStarted);
-    return aggregate;
-}
-
-StripedResidentPostDemosaicExecution executeResidentTonePostDemosaic(
-        int width,
-        int height,
-        std::uint64_t residentToneGeneration,
-        cv::Mat& output,
-        const bncam::spectra2::VulkanOpponentStripPlan& stripPlan,
-        float appliedLumaSigma,
-        float lumaRangeThresholdMean,
-        float chromaRangeThresholdMean,
-        float outerRingAuthority,
-        bool spectraNoiseActive,
-        float profileNrLuminance,
-        float profileNrLuminanceDetail,
-        float profileNrLuminanceContrast,
-        float profileNrColor,
-        float profileNrColorDetail,
-        float profileNrColorSmoothness,
-        float chromaNrStrength,
-        float chromaUserScale,
-        float downstreamChromaAuthority,
-        float inputResidualLumaSigma,
-        float downstreamLumaAuthority,
-        float visibleSigmaY,
-        const bncam::spectra2::VisibleChromaPlan& visiblePlan,
-        const bncam::spectra2::OpponentCovariance2& covariance,
-        float profileSpectraLuma = 0.0f,
-        float profileSpectraDetailProtection = 0.0f
-) {
-    StripedResidentPostDemosaicExecution aggregate{};
-    const auto totalStarted = IspClock::now();
-    if (width <= 0 || height <= 0 || residentToneGeneration == 0u ||
-        output.empty() || output.type() != CV_8UC3 ||
-        output.cols != width || output.rows != height ||
-        !stripPlan.valid || stripPlan.width != width || stripPlan.height != height ||
-        stripPlan.strips.empty() ||
-        (visiblePlan.enabled && (!covariance.valid || !(visibleSigmaY > 0.0f) ||
-                                 !std::isfinite(visibleSigmaY)))) {
-        aggregate.status = "INVALID_RESIDENT_TONE_POST_DEMOSAIC_EXECUTION_INPUT";
-        aggregate.failureReason = stripPlan.valid
-                ? "FRAME_GENERATION_OR_COVARIANCE_CONTRACT_FAILED"
-                : stripPlan.status;
-        aggregate.totalMs = elapsedMs(totalStarted);
-        return aggregate;
-    }
-
-    const float fallbackSpatialSigma = std::max(g_spatialNoiseMap.meanSigma, 1.0e-6f);
-    const float* spatialSigma = g_spatialNoiseMap.tileSigma.empty()
-            ? &fallbackSpatialSigma
-            : g_spatialNoiseMap.tileSigma.data();
-    const std::uint32_t gridWidth = g_spatialNoiseMap.tileSigma.empty()
-            ? 1u : static_cast<std::uint32_t>(g_spatialNoiseMap.gridWidth);
-    const std::uint32_t gridHeight = g_spatialNoiseMap.tileSigma.empty()
-            ? 1u : static_cast<std::uint32_t>(g_spatialNoiseMap.gridHeight);
-    std::uint64_t spatialGeneration = 1469598103934665603ull;
-    const auto hashBytes = [&](const void* data, std::size_t bytes) {
-        const auto* values = static_cast<const std::uint8_t*>(data);
-        for (std::size_t index = 0; index < bytes; ++index) {
-            spatialGeneration ^= values[index];
-            spatialGeneration *= 1099511628211ull;
-        }
-    };
-    hashBytes(spatialSigma, static_cast<std::size_t>(gridWidth) * gridHeight * sizeof(float));
-    hashBytes(&gridWidth, sizeof(gridWidth));
-    hashBytes(&gridHeight, sizeof(gridHeight));
-
-    aggregate.stripCount = static_cast<int>(stripPlan.strips.size());
-    constexpr std::size_t kMaximumResidentPostDemosaicBatchStrips = 64u;
-    if (stripPlan.strips.size() > kMaximumResidentPostDemosaicBatchStrips) {
-        aggregate.status = "RESIDENT_TONE_POST_DEMOSAIC_BATCH_TOO_LARGE";
-        aggregate.failureReason = "STRIP_COUNT_EXCEEDS_FIXED_BATCH_CAPACITY";
-        aggregate.totalMs = elapsedMs(totalStarted);
-        return aggregate;
-    }
-    std::array<bncam::vulkan::SpectraResidentPostDemosaicStripRange,
-               kMaximumResidentPostDemosaicBatchStrips> batchStrips{};
-    std::size_t batchStripCount = 0u;
-    constexpr int kVisibleHaloRows = 4;
-    for (const auto& strip : stripPlan.strips) {
-        const int outputEndY = strip.outputStartY + strip.outputRowCount;
-        const int intermediateOriginY = std::max(0, strip.outputStartY - kVisibleHaloRows);
-        const int intermediateEndY = std::min(height, outputEndY + kVisibleHaloRows);
-        const int intermediateRows = intermediateEndY - intermediateOriginY;
-        if (intermediateOriginY < strip.inputStartY ||
-            intermediateEndY > strip.inputStartY + strip.inputRowCount ||
-            intermediateRows <= 0) {
-            aggregate.status = "RESIDENT_TONE_POST_DEMOSAIC_INTERMEDIATE_RANGE_INVALID";
-            aggregate.failureReason = "COMBINED_HALO_PLAN_DOES_NOT_CONTAIN_INTERMEDIATE";
-            aggregate.totalMs = elapsedMs(totalStarted);
-            return aggregate;
-        }
-        bncam::vulkan::SpectraResidentPostDemosaicStripRange batchStrip{};
-        batchStrip.inputOriginY = static_cast<std::uint32_t>(strip.inputStartY);
-        batchStrip.inputRows = static_cast<std::uint32_t>(strip.inputRowCount);
-        batchStrip.intermediateOriginY = static_cast<std::uint32_t>(intermediateOriginY);
-        batchStrip.intermediateRows = static_cast<std::uint32_t>(intermediateRows);
-        batchStrip.outputOriginY = static_cast<std::uint32_t>(strip.outputStartY);
-        batchStrip.outputRows = static_cast<std::uint32_t>(strip.outputRowCount);
-        batchStrips[batchStripCount++] = batchStrip;
-    }
-
-    // FASE 15: the resident tone route now submits the complete strip plan as one backend
-    // execution. The backend reuses one strip-sized FP32 intermediate, writes each packed
-    // result into its absolute full-frame row, and performs one queue submit/fence wait.
-    const auto& firstStrip = batchStrips[0];
-    bncam::vulkan::SpectraResidentPostDemosaicRequest request{};
-    request.frameWidth = static_cast<std::uint32_t>(width);
-    request.frameHeight = static_cast<std::uint32_t>(height);
-    request.rowStrideFloats = static_cast<std::size_t>(width) * 3u;
-    request.inputOriginY = firstStrip.inputOriginY;
-    request.inputRows = firstStrip.inputRows;
-    request.intermediateOriginY = firstStrip.intermediateOriginY;
-    request.intermediateRows = firstStrip.intermediateRows;
-    request.outputOriginY = firstStrip.outputOriginY;
-    request.outputRows = firstStrip.outputRows;
-    request.spatialSigma = spatialSigma;
-    request.gridWidth = gridWidth;
-    request.gridHeight = gridHeight;
-    request.meanSpatialSigma = fallbackSpatialSigma;
-    request.appliedLumaSigma = appliedLumaSigma;
-    request.lumaRangeThresholdMean = lumaRangeThresholdMean;
-    request.chromaRangeThresholdMean = chromaRangeThresholdMean;
-    request.outerRingAuthority = outerRingAuthority;
-    request.spectraNoiseActive = spectraNoiseActive;
-    request.visibleChromaEnabled = visiblePlan.enabled;
-    request.profileNrLuminance = profileNrLuminance;
-    request.profileNrLuminanceDetail = profileNrLuminanceDetail;
-    request.profileNrLuminanceContrast = profileNrLuminanceContrast;
-    request.profileNrColor = profileNrColor;
-    request.profileNrColorDetail = profileNrColorDetail;
-    request.profileNrColorSmoothness = profileNrColorSmoothness;
-    request.chromaNrStrength = chromaNrStrength;
-    request.chromaUserScale = chromaUserScale;
-    request.downstreamChromaAuthority = downstreamChromaAuthority;
-    request.inputResidualLumaSigma = inputResidualLumaSigma;
-    request.downstreamLumaAuthority = downstreamLumaAuthority;
-    request.profileSpectraLuma = profileSpectraLuma;
-    request.profileSpectraDetail = profileSpectraDetailProtection;
-    request.visibleSigmaY = visibleSigmaY;
-    request.visibleAuthority = visiblePlan.enabled ? visiblePlan.authority : 0.0f;
-    request.visibleMaximumCorrection = visiblePlan.enabled ? visiblePlan.maximumCorrection : 0.0f;
-    // Phase 3 Visible Chroma Context Fusion CPU reference contract:
-    // Neighbourhood statistics accumulate robustLumaSigmaSum and robustColourSigmaSum over a 5x5 window.
-    // Opponent colour affinity kernel evaluates: 1.0f / (1.0f + 0.15f * opponentDistanceSquared).
-    request.inverse00 = covariance.valid ? covariance.inverse00 : 1.0f;
-    request.inverse01 = covariance.valid ? covariance.inverse01 : 0.0f;
-    request.inverse11 = covariance.valid ? covariance.inverse11 : 1.0f;
-    request.generationId = spatialGeneration;
-    request.packedBgr8Publication = true;
-    request.batchStrips = batchStrips.data();
-    request.batchStripCount = static_cast<std::uint32_t>(batchStripCount);
-
-    const bncam::vulkan::SpectraResidentPostDemosaicResult execution =
-            bncam::vulkan::VulkanRuntime::instance()
-                    .executeSpectraResidentPostDemosaicFromTone(
-                            request, residentToneGeneration);
-
-    aggregate.inputPackingMs = execution.inputPackingMs;
-    aggregate.spatialKernelMs = execution.spatialKernelMs;
-    aggregate.visibleKernelMs = execution.visibleKernelMs;
-    aggregate.gpuKernelMs = execution.gpuKernelMs;
-    aggregate.synchronizationMs = execution.synchronizationMs;
-    aggregate.readbackMs = execution.readbackMs;
-    aggregate.transferAndSyncMs = execution.transferAndSyncMs;
-    aggregate.inputBytes = execution.inputBytes;
-    aggregate.intermediateBytes = execution.intermediateBytes;
-    aggregate.outputBytes = execution.outputBytes;
-    aggregate.spatialMapBytes = execution.spatialMapBytes;
-    aggregate.persistentResidentBytes = execution.persistentResidentBytes;
-    aggregate.persistentAllocationGeneration = execution.persistentAllocationGeneration;
-    aggregate.persistentReuseObserved = execution.persistentBufferReuseHit;
-    aggregate.persistentReallocated = execution.persistentBufferReallocated;
-    aggregate.persistentReuseHitCount = execution.persistentBufferReuseHit ? 1 : 0;
-    aggregate.persistentReallocationCount = execution.persistentBufferReallocated ? 1 : 0;
-    aggregate.timestampQueryUsed = execution.timestampQueryUsed;
-
-    if (!execution.success || !execution.residentInputUsed || !execution.batchedExecution ||
-        execution.batchStripCount != request.batchStripCount ||
-        execution.queueSubmitCount != 1u || execution.fenceWaitCount != 1u) {
-        aggregate.status = "RESIDENT_TONE_POST_DEMOSAIC_BATCH_FAILED";
-        aggregate.failureReason = execution.failureReason.empty()
-                ? execution.status : execution.failureReason;
-        aggregate.totalMs = elapsedMs(totalStarted);
-        return aggregate;
-    }
-
-    std::string publicationFailure;
-    if (!copyResidentPostDemosaicPublicationToBgr8(
-                execution, output, 0, height, width,
-                aggregate.packedBgr8PublicationUsed, aggregate.floatPublicationFallbackUsed,
-                &aggregate.publicationStats, publicationFailure)) {
-        aggregate.status = "RESIDENT_TONE_POST_DEMOSAIC_PUBLICATION_UNAVAILABLE";
-        aggregate.failureReason = publicationFailure;
-        aggregate.totalMs = elapsedMs(totalStarted);
-        return aggregate;
-    }
-    aggregate.outputSrgbEncoded = true;
-    for (std::size_t index = 0; index < aggregate.spatialCounters.size(); ++index) {
-        aggregate.spatialCounters[index] = execution.spatialCounters[index];
-        aggregate.visibleCounters[index] = execution.visibleCounters[index];
-    }
-
-    const std::uint32_t maxLumaBits = execution.spatialCounters[6];
-    const std::uint32_t maxChromaBits = execution.spatialCounters[7];
-    const std::uint32_t maxColourBits = execution.visibleCounters[15];
-    std::memcpy(&aggregate.maximumLumaDelta, &maxLumaBits, sizeof(aggregate.maximumLumaDelta));
-    std::memcpy(&aggregate.maximumChromaDelta, &maxChromaBits, sizeof(aggregate.maximumChromaDelta));
-    std::memcpy(&aggregate.maximumColourShift, &maxColourBits, sizeof(aggregate.maximumColourShift));
-    if (!std::isfinite(aggregate.maximumLumaDelta)) aggregate.maximumLumaDelta = 0.0f;
-    if (!std::isfinite(aggregate.maximumChromaDelta)) aggregate.maximumChromaDelta = 0.0f;
-    if (!std::isfinite(aggregate.maximumColourShift)) aggregate.maximumColourShift = 0.0f;
-
-    aggregate.successfulStripCount = aggregate.stripCount;
-    aggregate.success = true;
-    aggregate.status = aggregate.floatPublicationFallbackUsed
-            ? "SPECTRA_POST_DEMOSAIC_GPU_RESIDENT_TONE_FLOAT_PUBLICATION_FALLBACK_READY"
-            : "SPECTRA_POST_DEMOSAIC_GPU_RESIDENT_TONE_BGR8_PUBLICATION_READY";
-    aggregate.failureReason = "none";
-    aggregate.totalMs = elapsedMs(totalStarted);
-    return aggregate;
-}
 void finalizeVisibleChromaResidualState(
         const cv::Mat& linearRgb,
         SpectraResidualNoiseState& residualNoiseState,
@@ -10937,31 +10041,18 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             ? computeRawShadowDiagnosticsCompact(residentInput->sampleView, workingMeta, uiConfig)
             : computeRawShadowDiagnostics(workingRaw, workingMeta, uiConfig);
     const SpectraIsoAdaptiveState isoState = IspCore::resolveSpectraIsoAdaptiveState(workingMeta, uiConfig);
-    const bncam::singleframe::RawDenoisePlan singleFrameRawDenoise =
-            bncam::singleframe::resolveRawDenoisePlan(
-                    static_cast<float>(g_threadLocalIspStats.meanSensorNoiseVariance),
-                    uiConfig.noiseModelCalibrationFactor,
-                    workingMeta.calibration.signalModelConfidence);
-    const bool physicalRawDenoiseActive =
-            workingMeta.calibration.spectraProcessingMode == 0 &&
+    const bool preDemosaicPhysicalNoiseModelAvailable =
             workingMeta.calibration.noiseModelMode != 0 &&
             workingMeta.calibration.hasNoiseProfile &&
             workingMeta.calibration.noiseProfileApplied &&
-            singleFrameRawDenoise.active;
+            workingMeta.calibration.signalModelConfidence >= 0.25f;
     SpectraIsoAdaptiveState preDemosaicAuthorityState = isoState;
-    if (physicalRawDenoiseActive) {
-        preDemosaicAuthorityState.isoPressure = 0.0f;
-        preDemosaicAuthorityState.modelNoisePressure = singleFrameRawDenoise.physicalNoisePressure;
-        preDemosaicAuthorityState.combinedNoisePressure = singleFrameRawDenoise.physicalNoisePressure;
-        preDemosaicAuthorityState.lumaAuthority = singleFrameRawDenoise.lumaAuthority;
-        preDemosaicAuthorityState.chromaAuthority = 0.0f;
-        preDemosaicAuthorityState.lowFrequencyAuthority = 0.0f;
-        preDemosaicAuthorityState.detailRetentionFloor = singleFrameRawDenoise.detailRetentionFloor;
-        preDemosaicAuthorityState.minimumResidualRatio = singleFrameRawDenoise.minimumResidualRatio;
-        preDemosaicAuthorityState.targetFloorScale = singleFrameRawDenoise.targetFloorScale;
-        preDemosaicAuthorityState.maxLinearShift = singleFrameRawDenoise.maxLinearShift;
-        preDemosaicAuthorityState.regime = "PHYSICAL_SO_SINGLE_FRAME";
-    }
+    // Phase N006A: SPECTRA Core is measurement/conditioning only. The classical RAW
+    // Pass 0/1/2/3 pixel owner is retired for every user mode; neural ownership is added later.
+    constexpr bool legacySpectraRawPixelAuthorityEnabled = false;
+    preDemosaicAuthorityState.lumaAuthority = 0.0f;
+    preDemosaicAuthorityState.chromaAuthority = 0.0f;
+    preDemosaicAuthorityState.lowFrequencyAuthority = 0.0f;
     const auto captureProvenanceStart = IspClock::now();
     const SpectraProvenanceField captureProvenance = residentEntry && !residentCpuFallbackUsed
             ? buildSpectraProvenanceFieldCompact(residentInput->sampleView, workingMeta)
@@ -10981,11 +10072,16 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     SpectraPass0State pass0State = residentEntry && !residentCpuFallbackUsed
             ? computePass0StateCompact(residentInput->sampleView, workingMeta, uiConfig)
             : computePass0State(workingRaw, workingMeta, uiConfig);
+    // N006A hard invariant: legacy Pass 0 may measure/provide telemetry but never mutate RAW.
+    pass0State.applyChannelBias = false;
+    pass0State.applyRowCorrection = false;
+    pass0State.applyColumnCorrection = false;
     SpectraNoRegretResult pass0NoRegret{};
     pass0NoRegret.passIndex = 0;
     bncam::vulkan::SpectraResidentPreDemosaicResult pass0ResidentResult{};
     bool pass0ResidentActive = false;
-    const bool spectraEnabledForResidentEntry = workingMeta.calibration.spectraProcessingMode != 0;
+    const bool spectraEnabledForResidentEntry = legacySpectraRawPixelAuthorityEnabled &&
+            workingMeta.calibration.spectraProcessingMode != 0;
     if (residentEntry && !residentCpuFallbackUsed && spectraEnabledForResidentEntry) {
         const bool pass0GpuApplied = tryApplySpectraPass0VulkanResident(
                 residentInput->sampleView, residentInput->rawNormalizeGeneration,
@@ -11074,9 +10170,6 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     spectraPerformance.fusedStatisticsDispatchCount++;
     spectraPerformance.totalStatisticsMs += spectraPerformance.initialStatistics.elapsedMs;
     budgetState.initialResidualEnergy = spectraPerformance.initialStatistics.residualEnergy;
-    if (physicalRawDenoiseActive && budgetState.initialResidualEnergy <= 0.0f) {
-        budgetState.initialResidualEnergy = captureProvenance.meanResidualEnergy;
-    }
 
     // Predict the residual-domain floor using separate CFA channel signals.
     // The fused collector preserves the existing 8x8 2x2 CFA sampling grid.
@@ -11089,9 +10182,9 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             static_cast<size_t>(spectraPerformance.initialStatistics.signalCount[2]),
             static_cast<size_t>(spectraPerformance.initialStatistics.signalCount[3])
     };
-    // SPECTRA-Off physical baseline still needs channel means for the predicted noise floor.
-    // Reuse the already-built compact capture provenance instead of materializing the RAW.
-    if (physicalRawDenoiseActive &&
+    // Read-only physical noise intelligence may still need channel means even when
+    // SPECTRA is off. Reuse compact provenance without granting pixel authority.
+    if (preDemosaicPhysicalNoiseModelAvailable &&
         signalCount[0] == 0u && signalCount[1] == 0u &&
         signalCount[2] == 0u && signalCount[3] == 0u) {
         for (const auto& tile : captureProvenance.tiles) {
@@ -11105,7 +10198,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             }
         }
         spectraPerformance.initialStatistics.status =
-                "PHYSICAL_SINGLE_FRAME_SIGNAL_FROM_CAPTURE_PROVENANCE";
+                "PHYSICAL_NOISE_MODEL_SIGNAL_FROM_CAPTURE_PROVENANCE";
     }
     const int budgetCfaPattern = cfaPatternOrDefault(workingRaw.info.effectiveCfaPattern);
 
@@ -11259,30 +10352,9 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     SpectraPass1State pass1State = residentEntry && !residentCpuFallbackUsed
             ? computePass1StateCompact(residentInput->sampleView, workingMeta, uiConfig)
             : computePass1State(workingRaw, workingMeta, uiConfig);
-    if (physicalRawDenoiseActive && pass1State.spectraMode == 0) {
-        bool validSo = true;
-        for (int ch = 0; ch < 4; ++ch) {
-            pass1State.effectiveS[ch] = workingMeta.calibration.effectiveS[ch];
-            pass1State.effectiveO[ch] = workingMeta.calibration.effectiveO[ch];
-            validSo = validSo && isVstValid(pass1State.effectiveS[ch], pass1State.effectiveO[ch]);
-        }
-        if (validSo) {
-            pass1State.physicalBaselineMode = true;
-            pass1State.authoritySource = "CAMERA2_SO_PHYSICAL_BASELINE";
-            pass1State.modelConfidence = singleFrameRawDenoise.modelConfidence;
-            pass1State.isoAuthority = singleFrameRawDenoise.lumaAuthority;
-            pass1State.combinedNoisePressure = singleFrameRawDenoise.physicalNoisePressure;
-            pass1State.blendStrength = singleFrameRawDenoise.blendStrength;
-            pass1State.maxPixelShift = 1.05f + 2.15f * singleFrameRawDenoise.physicalNoisePressure;
-            pass1State.maxLinearShift = singleFrameRawDenoise.maxLinearShift;
-            pass1State.anisotropicDetail.enabled = true;
-            pass1State.anisotropicDetail.status = "PHYSICAL_SINGLE_FRAME_PLAN_READY";
-            pass1State.fallbackReason = "none";
-            pass1State.applied = true;
-        } else {
-            pass1State.fallbackReason = "physical_baseline_invalid_so_parameters";
-        }
-    }
+    // N006A hard invariant: legacy Pass 1 VST/Wiener filtering and its CPU fallback are retired.
+    pass1State.applied = false;
+    pass1State.fallbackReason = "legacy_raw_pixel_authority_retired_neural_pending";
     SpectraNoRegretResult pass1NoRegret{};
     pass1NoRegret.passIndex = 1;
     SpectraProvenanceField pass1BeforeField{};
@@ -11310,11 +10382,6 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             pass1GpuApplied = tryApplySpectraPass1VulkanResident(
                     residentInput->sampleView, workingMeta, preDemosaicAuthorityState, pass1BeforeField,
                     pass1State, pass1NoRegret, pass0ResidentGeneration, 0u, &pass1ResidentResult);
-        } else if (residentEntry && !residentCpuFallbackUsed && physicalRawDenoiseActive) {
-            pass1GpuApplied = tryApplySpectraPass1VulkanResident(
-                    residentInput->sampleView, workingMeta, preDemosaicAuthorityState, pass1BeforeField,
-                    pass1State, pass1NoRegret, 0u, residentInput->rawNormalizeGeneration,
-                    &pass1ResidentResult);
         } else {
             pass1GpuApplied = tryApplySpectraPass1Vulkan(
                     workingRaw, workingMeta, preDemosaicAuthorityState, pass1BeforeField,
@@ -11326,15 +10393,6 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                 pass1ResidentResult.residentOutputGeneration != 0u;
         if (!pass1GpuApplied) {
             pass1State.vulkanCpuFallbackUsed = true;
-            if (physicalRawDenoiseActive && residentEntry && !pass0ResidentActive &&
-                (workingRaw.mosaic.empty() || workingRaw.mosaic.type() != CV_32FC1)) {
-                if (!ensureCpuWorkingRaw("PHYSICAL_PASS1_VULKAN_FAILED")) {
-                    if (debugOut != nullptr) {
-                        *debugOut = "RAW_BASELINE_RENDER: physical Pass1 Vulkan failed and CPU failsafe unavailable";
-                    }
-                    return jpegData;
-                }
-            }
             if (pass0ResidentActive) {
                 std::vector<float> materializedPass0;
                 if (!bncam::vulkan::VulkanRuntime::instance().readbackSpectraResidentPass1(
@@ -11433,16 +10491,20 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     SpectraPass2State pass2State = residentEntry && !residentCpuFallbackUsed
             ? computePass2StateCompact(residentInput->sampleView, workingMeta, uiConfig)
             : computePass2State(workingRaw, workingMeta, uiConfig);
-    // Phase 4 ownership is explicit: the single-frame physical baseline owns luminance only.
-    // Pass 2 remains a SPECTRA/chroma owner and receives no physical-luma promotion.
+    // N006A: Pass 2 planning may remain observable, but its classical chroma suppression
+    // has no pixel authority and cannot fall back to CPU.
+    pass2State.applied = false;
+    pass2State.fallbackReason = "legacy_raw_pixel_authority_retired_neural_pending";
     SpectraNoRegretResult pass2NoRegret{};
     pass2NoRegret.passIndex = 2;
     const auto pass2BandMeasureStart = IspClock::now();
     bncam::spectra2::ChromaBandEnergySnapshot initialChromaBands{};
-    if (budgetState.spectraMode != 0 || physicalRawDenoiseActive) {
-        initialChromaBands = pass1ResidentActive
-                ? spectraChromaBandsFromGpu(pass1ResidentResult)
-                : measureSpectraChromaBandEnergies(workingRaw);
+    if (budgetState.spectraMode != 0 && (!residentEntry || residentCpuFallbackUsed)) {
+        initialChromaBands = measureSpectraChromaBandEnergies(workingRaw);
+    } else if (budgetState.spectraMode != 0) {
+        // RAW stays resident. Legacy band-energy scans are not a reason to materialize pixels.
+        initialChromaBands.status = "LEGACY_PIXEL_OWNER_RETIRED_RESIDENT_MEASUREMENT_DEFERRED";
+        initialChromaBands.method = "READ_ONLY_CORE_NO_HOST_MATERIALIZATION";
     } else {
         initialChromaBands.status = "SPECTRA_OFF_NOT_MEASURED";
         initialChromaBands.method = "NOT_RUN";
@@ -11458,12 +10520,10 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     pass2State.bandEnergyBlueSampleCount = initialChromaBands.blueSampleCount;
     pass2State.bandEnergyRedBlueSampleBalance = initialChromaBands.redBlueSampleBalance;
     pass2State.bandEnergyConfidence = initialChromaBands.confidence;
-    const float pass2EffectiveChromaStrength = physicalRawDenoiseActive
-            ? 0.0f
-            : std::clamp(
-                    uiConfig.profileSpectraStrength * 0.50f +
-                            uiConfig.profileSpectraChroma * 0.85f,
-                    -1.0f, 1.50f);
+    const float pass2EffectiveChromaStrength = std::clamp(
+            uiConfig.profileSpectraStrength * 0.50f +
+                    uiConfig.profileSpectraChroma * 0.85f,
+            -1.0f, 1.50f);
     pass2State.fineBand.plan = bncam::spectra2::resolveChromaBandPlan(
             bncam::spectra2::ChromaBandKind::Fine,
             initialChromaBands.fineEnergy,
@@ -11542,6 +10602,12 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         pass2State.splitOpponentAuthorityActive =
                 pass2State.splitOpponentAuthorityActive || midAuthorityPair.active;
     }
+
+    // N006A final Pass-2 authority clamp. Plan/evidence above is read-only; no later
+    // planning result is allowed to reactivate the retired classical pixel owner.
+    pass2State.applied = false;
+    pass2State.fineBand.applied = false;
+    pass2State.midBand.applied = false;
 
     // Milestone 3B kernels are independently band-limited. The mid band consumes
     // the current mosaic and no longer needs fine-band activation as a prerequisite.
@@ -11656,7 +10722,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             : (pass1ResidentActive ? pass1ResidentResult.residentOutputGeneration : 0u);
     const bool residentPostPass2FromPass2 = pass2ResidentActive;
 
-    if ((budgetState.spectraMode != 0 || physicalRawDenoiseActive) && residentPostPass2Available) {
+    if (budgetState.spectraMode != 0 && residentPostPass2Available) {
         residentPass3PlannerReady = residentEntry && !residentCpuFallbackUsed
                 ? computePass3StateVulkanCompact(
                         residentInput->sampleView, workingMeta, uiConfig,
@@ -11732,28 +10798,20 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     budgetState.pass2ChromaResidualEnergy =
             spectraPerformance.postPass2Statistics.chromaResidualEnergy;
 
-    const float physicalPreDemosaicLumaReduction = physicalRawDenoiseActive &&
-            budgetState.initialResidualEnergy > 1.0e-12f &&
-            budgetState.pass1ResidualEnergy >= 0.0f
-            ? std::clamp(1.0f - budgetState.pass1ResidualEnergy /
-                    budgetState.initialResidualEnergy, 0.0f, 1.0f)
-            : 0.0f;
-    const float physicalPreDemosaicChromaReduction = physicalRawDenoiseActive &&
-            budgetState.initialChromaResidualEnergy > 1.0e-12f &&
-            budgetState.pass2ChromaResidualEnergy >= 0.0f
-            ? std::clamp(1.0f - budgetState.pass2ChromaResidualEnergy /
-                    budgetState.initialChromaResidualEnergy, 0.0f, 1.0f)
-            : 0.0f;
 
     const auto pass3Start = IspClock::now();
     bncam::NativeStageHeartbeat::instance().update(workingMeta.captureAttemptId, "SPECTRA_PASS3");
     const auto pass3BandMeasureStart = IspClock::now();
-    if (budgetState.spectraMode == 0 && !physicalRawDenoiseActive) {
+    if (budgetState.spectraMode == 0) {
         postPass2ChromaBands = {};
         postPass2ChromaBands.status = "SPECTRA_OFF_NOT_MEASURED";
         postPass2ChromaBands.method = "NOT_RUN";
-    } else if (!residentCompactObservationReady) {
+    } else if (!residentCompactObservationReady && (!residentEntry || residentCpuFallbackUsed)) {
         postPass2ChromaBands = measureSpectraChromaBandEnergies(workingRaw);
+    } else if (!residentCompactObservationReady) {
+        postPass2ChromaBands = initialChromaBands;
+        postPass2ChromaBands.status = "LEGACY_PIXEL_OWNER_RETIRED_RESIDENT_MEASUREMENT_DEFERRED";
+        postPass2ChromaBands.method = "READ_ONLY_CORE_NO_HOST_MATERIALIZATION";
     }
     const float postPass2BandMeasurementMs = residentCompactObservationReady
             ? residentPlannerAttempt.plannerKernelMs + residentPlannerAttempt.plannerReadbackMs
@@ -11774,16 +10832,12 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             postPass2ChromaBands,
             budgetState.predictedChromaNoiseFloor
     );
-    const float pass3EffectiveLowFreqStrength = physicalRawDenoiseActive
-            ? 0.0f
-            : std::clamp(
-                    uiConfig.profileSpectraStrength * 0.50f +
-                            uiConfig.profileSpectraLowFrequency * 0.85f,
-                    -1.0f, 1.50f
-            );
-    const float pass3LowFrequencyAuthority = physicalRawDenoiseActive
-            ? 0.0f
-            : isoState.lowFrequencyAuthority;
+    const float pass3EffectiveLowFreqStrength = std::clamp(
+            uiConfig.profileSpectraStrength * 0.50f +
+                    uiConfig.profileSpectraLowFrequency * 0.85f,
+            -1.0f, 1.50f
+    );
+    const float pass3LowFrequencyAuthority = isoState.lowFrequencyAuthority;
     const bncam::spectra2::ChromaBandPlan lowBandPlan =
             bncam::spectra2::resolveChromaBandPlan(
                     bncam::spectra2::ChromaBandKind::Low,
@@ -11799,38 +10853,14 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                     lowDirectionalEvidence
             );
     SpectraPass3State pass3State{};
-    if (physicalRawDenoiseActive) {
-        // The physical single-frame owner is luminance-only. Keep the measured low-band plan
-        // as demosaic evidence, but never turn that evidence into Pass-3 chroma mutation.
-        pass3State.spectraMode = 0;
-        pass3State.physicalBaselineMode = false;
-        pass3State.authoritySource = "PHYSICAL_LUMA_OWNER_NO_CHROMA_MUTATION";
-        pass3State.applied = false;
-        pass3State.fallbackReason = "physical_luma_owner_no_chroma_authority";
-    } else if (budgetState.spectraMode == 0) {
-        pass3State.spectraMode = 0;
-        pass3State.fallbackReason = "legacy_mode";
-    } else if (!lowBandPlan.enabled) {
-        pass3State.spectraMode = budgetState.spectraMode;
-        pass3State.applied = false;
-        pass3State.fallbackReason = "m3b_low_band_budget_reached_preflight";
-    } else if (residentCompactObservationReady) {
-        // Reuse the exact compact planner result already collected for post-Pass2
-        // statistics. No second GPU scan and no CPU planning against stale host RAW.
-        pass3State = std::move(residentPlannerAttempt);
-        if (!residentPass3PlannerReady) {
-            pass3State.applied = false;
-            pass3State.applyRowBanding = false;
-            pass3State.applyColBanding = false;
-            pass3State.applyLowFreqChroma = false;
-            pass3State.fallbackReason = "resident_compact_observer_ready_pass3_not_eligible";
-        }
-    } else {
-        // The only way a former resident path reaches here is through the explicit
-        // compact-observer failure materialization above. CPU planning is therefore
-        // operating on the current mosaic, never a stale pre-resident copy.
-        pass3State = computePass3State(workingRaw, workingMeta, uiConfig);
-    }
+    pass3State.spectraMode = budgetState.spectraMode;
+    pass3State.applied = false;
+    pass3State.applyRowBanding = false;
+    pass3State.applyColBanding = false;
+    pass3State.applyLowFreqChroma = false;
+    pass3State.fallbackReason = budgetState.spectraMode == 0
+            ? "spectra_off_measurement_only"
+            : "legacy_raw_pixel_authority_retired_neural_pending";
     pass3State.lowBand.plan = lowBandPlan;
     pass3State.bandEnergyMeasurementMs = postPass2BandMeasurementMs;
     pass3State.bandEnergyStatus = postPass2ChromaBands.status;
@@ -11844,7 +10874,8 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     // Delta 24: reuse the measured post-Pass2 low-band split and Pass-3 spatial confidence to
     // redistribute a small amount of low-frequency chroma authority between R-G and B-G.
     // The low-band enable decision and maximum correction scale remain unchanged.
-    if (pass3State.lowBand.plan.enabled && pass3State.applyLowFreqChroma) {
+    if (legacySpectraRawPixelAuthorityEnabled &&
+        pass3State.lowBand.plan.enabled && pass3State.applyLowFreqChroma) {
         const float lowCommonOpponentSupport = std::sqrt(std::max(
                 0.0f,
                 bncam::spectra2::cfaFiniteUnit(
@@ -11958,7 +10989,8 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         // do not force a host mosaic scan merely for output telemetry.
         pass3State.lowBand.outputEnergy = postPass2ChromaBands.lowEnergy;
         pass3State.lowBand.outputStage = "PASS3_SKIPPED_RESIDENT_COMPACT_POST_PASS2";
-    } else if (budgetState.spectraMode != 0 && pass3State.lowBand.plan.enabled) {
+    } else if (budgetState.spectraMode != 0 && pass3State.lowBand.plan.enabled &&
+               (!residentEntry || residentCpuFallbackUsed)) {
         const auto pass3OutputMeasureStart = IspClock::now();
         const bncam::spectra2::ChromaBandEnergySnapshot finalChromaBands =
                 measureSpectraChromaBandEnergies(workingRaw);
@@ -11981,11 +11013,9 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                 : "SKIPPED_BY_M3B_BUDGET";
     }
     pass3State.processingTimeMs = elapsedMs(pass3Start);
-    if (!pass3ResidentActive && !pass2ResidentActive && !pass1ResidentActive) {
-        budgetState.pass3ResidualEnergy = computeResidualEnergy(workingRaw);
-    } else {
-        budgetState.pass3ResidualEnergy = budgetState.initialResidualEnergy * 0.25f;
-    }
+    // N006A identity accounting: none of the retired passes changed RAW pixels. Reusing the
+    // pre-pass residual is both exact for this ownership edge and avoids materializing resident RAW.
+    budgetState.pass3ResidualEnergy = budgetState.initialResidualEnergy;
     budgetState.finalRemainingEnergy = budgetState.pass3ResidualEnergy;
     const auto finalProvenanceStart = IspClock::now();
     const SpectraProvenanceField finalProvenance = (pass3ResidentActive || pass2ResidentActive || pass1ResidentActive)
@@ -12022,7 +11052,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         if (initialExcess <= 1.0e-12f) return 0.35f;
         // The pre-demosaic and RGB residual domains are not identical. A square-root
         // bridge and a conservative floor avoid both double denoise and abrupt loss of
-        // the proven downstream edge-aware cleanup.
+        // any future neural/downstream conditioning without granting classical pixel authority.
         return std::clamp(std::sqrt(remainingExcess / initialExcess), 0.35f, 1.0f);
     };
     if (budgetState.spectraMode != 0) {
@@ -12037,26 +11067,21 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                 budgetState.predictedChromaNoiseFloor
         );
     }
-    budgetState.applied = pass0State.applyChannelBias ||
+    budgetState.applied = legacySpectraRawPixelAuthorityEnabled && (
+            pass0State.applyChannelBias ||
             pass0State.applyRowCorrection ||
             pass0State.applyColumnCorrection ||
             pass1State.applied ||
             pass2State.applied ||
-            pass3State.applied;
+            pass3State.applied);
 
     // Delta 20: consolidate already-existing CFA chroma evidence into one immutable contract.
     // No additional scan and no pixel authority is introduced here. Red/blue are intentionally
     // represented as common opponent support until a later local per-colour confidence field is
     // measured; fabricating separate R/B confidence from aggregate band energy would be misleading.
-    // Phase 5 / Delta 0030: demosaic evidence belongs to the active pre-demosaic
-    // physical pipeline, not to the SPECTRA UI toggle.  The physical single-frame
-    // baseline (SPECTRA Off + valid S/O model) already measures the same CFA bands
-    // and structure field in Pass 1/2/3.  Keep those measurements available to
-    // Malvar/RCD/AMAZE instead of throwing them away solely because spectraMode==0.
-    const bool demosaicPhysicalEvidenceActive = physicalRawDenoiseActive;
-    const int demosaicEvidenceMode = demosaicPhysicalEvidenceActive
-            ? 3  // internal evidence-active physical single-frame mode
-            : budgetState.spectraMode;
+    // Phase N001: CFA band/structure evidence is available only when its SPECTRA
+    // measurement passes actually ran. Physical S/O remains separate read-only evidence.
+    const int demosaicEvidenceMode = budgetState.spectraMode;
     bncam::spectra2::CfaChromaConfidenceSummary cfaChromaConfidence =
             bncam::spectra2::buildCfaChromaConfidenceSummary(
                     demosaicEvidenceMode,
@@ -12079,7 +11104,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     // This snapshot is immutable for the capture and has no reconstruction authority yet.
     DemosaicCfaEvidence demosaicCfaEvidence{};
     demosaicCfaEvidence.available =
-            (budgetState.spectraMode != 0 || demosaicPhysicalEvidenceActive) &&
+            budgetState.spectraMode != 0 &&
             cfaChromaConfidence.bandMeasurementSupport > 0.0f;
     demosaicCfaEvidence.commonOpponentSupport = cfaChromaConfidence.commonOpponentSupport;
     demosaicCfaEvidence.structureProtection = cfaChromaConfidence.structureProtection;
@@ -12190,8 +11215,8 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                     finalVisibleVarianceReady,
                     validNoiseChannels,
                     static_cast<double>(finalProvenance.meanDiagnosticConfidence),
-                    physicalRawDenoiseActive,
-                    static_cast<double>(singleFrameRawDenoise.modelConfidence),
+                    preDemosaicPhysicalNoiseModelAvailable,
+                    static_cast<double>(workingMeta.calibration.signalModelConfidence),
                     static_cast<double>(workingMeta.calibration.signalModelConfidence),
                     residualSeedRedVariance,
                     residualSeedGreenVariance,
@@ -12489,14 +11514,8 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             0.0,
             residualNoiseState.preDemosaic.varianceRG,
             residualNoiseState.preDemosaic.varianceBG})));
-    const bool autoDemosaicPhysicalProfileKnown =
-            workingMeta.calibration.noiseModelMode != 0 &&
-            workingMeta.calibration.hasNoiseProfile &&
-            workingMeta.calibration.noiseProfileApplied &&
-            workingMeta.calibration.signalModelConfidence >= 0.25f;
-    const float autoDemosaicPhysicalPressure = physicalRawDenoiseActive
-            ? singleFrameRawDenoise.physicalNoisePressure
-            : isoState.modelNoisePressure;
+    const bool autoDemosaicPhysicalProfileKnown = preDemosaicPhysicalNoiseModelAvailable;
+    const float autoDemosaicPhysicalPressure = isoState.modelNoisePressure;
     autoContext.physicalNoiseKnown = autoDemosaicPhysicalProfileKnown &&
             std::isfinite(autoDemosaicSigmaY) && autoDemosaicSigmaY > 0.0f &&
             std::isfinite(autoDemosaicPhysicalPressure);
@@ -12627,14 +11646,13 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             demosaicPhysicalSigmaChroma,
             demosaicPhysicalNoisePressure
     };
-    const bncam::phase6::ResidualChromaArtifactPlan phase6ResidualChromaPlan =
-            bncam::phase6::resolveResidualChromaArtifactPlan(
-                    demosaicNoiseContext.available,
-                    demosaicNoiseContext.sigmaY,
-                    demosaicNoiseContext.sigmaChroma,
-                    demosaicNoiseContext.pressure);
-    bncam::phase6::ResidualChromaArtifactTelemetry phase6CpuTelemetry{};
-    bool phase6CpuFallbackApplied = false;
+    // N006B: the legacy Phase-6 residual-chroma pixel owner is physically retired.
+    // Physical sigma remains available only as read-only demosaic context.
+    constexpr bool phase6ResidualChromaPlanEnabled = false;
+    constexpr const char* phase6ResidualChromaPlanStatus =
+            "RETIRED_CLASSICAL_PIXEL_OWNER_NEURAL_PENDING";
+    constexpr bool phase6CpuFallbackApplied = false;
+
 
     const auto runCpuDemosaicFallback = [&]() -> cv::Mat {
         // Failure-only materialization path. Normal Vulkan execution never runs these full-frame
@@ -12668,11 +11686,6 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                         &demosaicExecutionCfaEvidence, &demosaicNoiseContext);
                 break;
         }
-        if (phase6ResidualChromaPlan.enabled && !cpuRgb.empty()) {
-            bncam::phase6::applyResidualChromaArtifactCpu(
-                    cpuRgb, phase6ResidualChromaPlan, &phase6CpuTelemetry);
-            phase6CpuFallbackApplied = true;
-        }
         return cpuRgb;
     };
     {
@@ -12697,9 +11710,9 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         request.noiseSigmaY = demosaicNoiseContext.sigmaY;
         request.noiseSigmaChroma = demosaicNoiseContext.sigmaChroma;
         request.noisePressure = demosaicNoiseContext.pressure;
-        request.phase6ResidualChromaEnabled = phase6ResidualChromaPlan.enabled;
-        request.phase6MaximumBlend = phase6ResidualChromaPlan.maximumBlend;
-        request.phase6MaximumCorrection = phase6ResidualChromaPlan.maximumCorrection;
+        request.phase6ResidualChromaEnabled = false;
+        request.phase6MaximumBlend = 0.0f;
+        request.phase6MaximumCorrection = 0.0f;
         request.autoMalvarPrior = demosaicResolution.autoMalvarPrior;
         request.autoNeuralJddPrior = demosaicResolution.autoNeuralJddPrior;
         request.autoAmazePrior = demosaicResolution.autoAmazePrior;
@@ -13170,77 +12183,9 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     const double ccmOnlyBlueOpponentDirectionalGain = wbRgb[2] > 1.0e-6f
             ? wbCcmBlueOpponentDirectionalGain / static_cast<double>(wbRgb[2]) : 1.0;
 
-    // SPECTRA must not manufacture a colour field in an objectively clean scene. The 2026-08-22
-    // A/B captures at ISO ~143 had combinedNoisePressure=0 while the fallback cloud stage still
-    // touched ~98% of pixels and measurably increased green dominance in dark regions. Fade the
-    // optional pre-WB SPECTRA corrections in only when the physical model reports real pressure.
-    const auto spectraNoiseAuthoritySmoothstep = [](float edge0, float edge1, float value) -> float {
-        const float u = std::clamp(
-                (value - edge0) / std::max(edge1 - edge0, 1.0e-6f),
-                0.0f,
-                1.0f);
-        return u * u * (3.0f - 2.0f * u);
-    };
-    const float spectraPreWbNoiseAuthority = pass3State.spectraMode != 0
-            ? spectraNoiseAuthoritySmoothstep(0.03f, 0.18f, isoState.combinedNoisePressure)
-            : 1.0f;
-    const bool spectraCleanSceneCloudBypass = pass3State.spectraMode != 0 &&
-            spectraPreWbNoiseAuthority <= 1.0e-4f;
-
-    // SPECTRA low-frequency single-owner contract: Pass 3 already estimates/corrects the
-    // broad opponent-chroma residual in the CFA pipeline. If that candidate survived No-Regret,
-    // keep the post-demosaic cloud measurement for telemetry but do not apply a second spatial
-    // correction to the same band before WB. The A/B device trace showed that the broad field
-    // itself is also present with SPECTRA Off; treating it twice when SPECTRA is On can turn
-    // legitimate scene colour/illumination into green/magenta shading.
-    const bool pass3OwnsLowFrequencyChroma = bncam::spectra2::pass3OwnsLowFrequencyChroma(
-            pass3State.spectraMode != 0,
-            pass3State.applied,
-            pass3State.applyLowFreqChroma,
-            pass3NoRegret.meanAcceptance
-    );
-    if (pass3OwnsLowFrequencyChroma) {
-        residualNoiseState.demosaicChromaCloudCorrectionPlan = {};
-        residualNoiseState.demosaicChromaCloudCorrectionPlan.status =
-                "BYPASSED_PASS3_LOW_FREQUENCY_OWNER";
-        residualNoiseState.demosaicChromaCloudCorrectionPlan.riskEvidence =
-                residualNoiseState.demosaicChromaCloudRiskEvidence;
-    } else if (spectraCleanSceneCloudBypass) {
-        residualNoiseState.demosaicChromaCloudCorrectionPlan = {};
-        residualNoiseState.demosaicChromaCloudCorrectionPlan.status =
-                "BYPASSED_CLEAN_SCENE_LOW_NOISE_PRESSURE";
-        residualNoiseState.demosaicChromaCloudCorrectionPlan.riskEvidence =
-                residualNoiseState.demosaicChromaCloudRiskEvidence;
-    } else {
-        // Fallback ownership: when Pass 3 is absent/rejected, the conservative zero-centred
-        // cloud proposal may still protect the visible output against downstream WB/CCM gain.
-        residualNoiseState.demosaicChromaCloudCorrectionPlan =
-                bncam::spectra2::buildChromaCloudCorrectionPlan(
-                        residualNoiseState.measuredPostDemosaic,
-                        residualNoiseState.demosaicChromaCloudRiskEvidence,
-                        cfaChromaConfidence.redLowCorrectionConfidence,
-                        cfaChromaConfidence.blueLowCorrectionConfidence,
-                        cfaChromaConfidence.structureProtection,
-                        static_cast<float>(measuredPostChromaRms),
-                        wbRgb[0],
-                        wbRgb[2],
-                        static_cast<float>(ccmOnlyRedOpponentDirectionalGain),
-                        static_cast<float>(ccmOnlyBlueOpponentDirectionalGain)
-                );
-    }
-
-    // Delta 34: plan (but do not yet apply) a very small pre-WB opponent cleanup. This uses
-    // the measured post-demosaic residual, the immutable CFA evidence and the WB gains that are
-    // about to be applied. The low-frequency chroma-field metric is deliberately excluded because
-    // a genuine large coloured object can legitimately raise it.
-    const auto preWbSmoothstep = [](float edge0, float edge1, float value) -> float {
-        const float u = std::clamp(
-                (value - edge0) / std::max(edge1 - edge0, 1.0e-6f),
-                0.0f,
-                1.0f
-        );
-        return u * u * (3.0f - 2.0f * u);
-    };
+    // N006B: pre-WB ChromaCloud and neighbour-opponent correction ownership is retired.
+    // Keep only compact read-only diagnostics so downstream telemetry can distinguish
+    // measurement from mutation while the future neural owner is not yet connected.
     const double preWbMeasuredToPredictedRmsRatioRg = demosaicChromaAuditReady
             ? demosaicSafeRmsRatio(
                     demosaicMeasuredPostVarianceRg, demosaicPredictedPostVarianceRg)
@@ -13249,143 +12194,40 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             ? demosaicSafeRmsRatio(
                     demosaicMeasuredPostVarianceBg, demosaicPredictedPostVarianceBg)
             : -1.0;
-    const float preWbMeasuredRiskR = preWbMeasuredToPredictedRmsRatioRg > 0.0
-            ? preWbSmoothstep(
-                    1.00f, 1.50f, static_cast<float>(preWbMeasuredToPredictedRmsRatioRg))
-            : 0.0f;
-    const float preWbMeasuredRiskB = preWbMeasuredToPredictedRmsRatioBg > 0.0
-            ? preWbSmoothstep(
-                    1.00f, 1.50f, static_cast<float>(preWbMeasuredToPredictedRmsRatioBg))
-            : 0.0f;
-    const float preWbGainRiskR = demosaicCfaEvidence.available
-            ? preWbSmoothstep(1.05f, 2.25f, std::max(1.0f, wbRgb[0]))
-            : 0.0f;
-    const float preWbGainRiskB = demosaicCfaEvidence.available
-            ? preWbSmoothstep(1.05f, 2.25f, std::max(1.0f, wbRgb[2]))
-            : 0.0f;
-    const float preWbStructureRelief = demosaicCfaEvidence.available
-            ? (1.0f - 0.35f * std::clamp(
-                    demosaicCfaEvidence.structureProtection, 0.0f, 1.0f))
-            : 1.0f;
-    const float preWbPropagationConfidence = demosaicCfaEvidence.available
-            ? std::clamp(
-                    static_cast<float>(residualNoiseState.postDemosaic.confidence),
-                    0.0f,
-                    1.0f
-            )
-            : 0.0f;
-    const float preWbChromaCleanupRiskR = demosaicCfaEvidence.available
-            ? std::clamp(
-                    (0.45f * preWbMeasuredRiskR +
-                     0.35f * std::clamp(
-                             demosaicCfaEvidence.redOpponentCorrectionConfidence, 0.0f, 1.0f) +
-                     0.20f * preWbGainRiskR) *
-                    preWbStructureRelief * preWbPropagationConfidence,
-                    0.0f,
-                    1.0f
-            )
-            : 0.0f;
-    const float preWbChromaCleanupRiskB = demosaicCfaEvidence.available
-            ? std::clamp(
-                    (0.45f * preWbMeasuredRiskB +
-                     0.35f * std::clamp(
-                             demosaicCfaEvidence.blueOpponentCorrectionConfidence, 0.0f, 1.0f) +
-                     0.20f * preWbGainRiskB) *
-                    preWbStructureRelief * preWbPropagationConfidence,
-                    0.0f,
-                    1.0f
-            )
-            : 0.0f;
-    const float preWbChromaCleanupProposedBlendR =
-            std::clamp(0.12f * preWbChromaCleanupRiskR * spectraPreWbNoiseAuthority, 0.0f, 0.12f);
-    const float preWbChromaCleanupProposedBlendB =
-            std::clamp(0.12f * preWbChromaCleanupRiskB * spectraPreWbNoiseAuthority, 0.0f, 0.12f);
-    const bool preWbChromaCleanupPlanReady = demosaicCfaEvidence.available &&
-            (preWbChromaCleanupProposedBlendR > 1.0e-4f ||
-             preWbChromaCleanupProposedBlendB > 1.0e-4f);
-    // Do not pay four extra neighbour reads per pixel for negligible corrections. A uniform
-    // 1% maximum-blend threshold keeps clean scenes on the legacy AWB+CCM fast path.
-    const bool phase6ResidualChromaUsedForOutput =
-            vulkanDemosaic.phase6ResidualChromaUsedForOutput || phase6CpuFallbackApplied;
-    const bool phase6ResidualChromaGpuUsed = vulkanDemosaic.phase6ResidualChromaUsedForOutput;
-    const std::uint64_t phase6ProcessedPixels = phase6CpuFallbackApplied
-            ? phase6CpuTelemetry.processedPixels : vulkanDemosaic.phase6ProcessedPixels;
-    const std::uint64_t phase6CandidatePixels = phase6CpuFallbackApplied
-            ? phase6CpuTelemetry.candidatePixels : vulkanDemosaic.phase6CandidatePixels;
-    const std::uint64_t phase6IsolatedOutlierPixels = phase6CpuFallbackApplied
-            ? phase6CpuTelemetry.isolatedOutlierPixels : vulkanDemosaic.phase6IsolatedOutlierPixels;
-    const std::uint64_t phase6ZipperPixels = phase6CpuFallbackApplied
-            ? phase6CpuTelemetry.zipperPixels : vulkanDemosaic.phase6ZipperPixels;
-    const std::uint64_t phase6EdgeProtectedPixels = phase6CpuFallbackApplied
-            ? phase6CpuTelemetry.edgeProtectedPixels : vulkanDemosaic.phase6EdgeProtectedPixels;
-    const std::uint64_t phase6SaturatedDetailProtectedPixels = phase6CpuFallbackApplied
-            ? phase6CpuTelemetry.saturatedDetailProtectedPixels
-            : vulkanDemosaic.phase6SaturatedDetailProtectedPixels;
-    const double phase6MeanAbsCorrectionRG = phase6CpuFallbackApplied
-            ? (phase6CandidatePixels > 0u
-                    ? phase6CpuTelemetry.sumAbsCorrectionRG / static_cast<double>(phase6CandidatePixels)
-                    : 0.0)
-            : vulkanDemosaic.phase6MeanAbsCorrectionRG;
-    const double phase6MeanAbsCorrectionBG = phase6CpuFallbackApplied
-            ? (phase6CandidatePixels > 0u
-                    ? phase6CpuTelemetry.sumAbsCorrectionBG / static_cast<double>(phase6CandidatePixels)
-                    : 0.0)
-            : vulkanDemosaic.phase6MeanAbsCorrectionBG;
-    const float phase6MaximumAbsoluteCorrection = phase6CpuFallbackApplied
-            ? phase6CpuTelemetry.maximumAbsoluteCorrection
-            : vulkanDemosaic.phase6MaximumAbsoluteCorrection;
-    const double phase6CandidateFraction = phase6ProcessedPixels > 0u
-            ? static_cast<double>(phase6CandidatePixels) / static_cast<double>(phase6ProcessedPixels)
-            : 0.0;
-    const char* phase6ExecutionBackend = phase6ResidualChromaGpuUsed
-            ? "VULKAN_RESIDENT_TWO_PASS"
-            : (phase6CpuFallbackApplied
-                    ? "CPU_FAILURE_REFERENCE"
-                    : (phase6ResidualChromaPlan.enabled ? "PLANNED_NOT_USED" : "DISABLED_NO_PHYSICAL_AUTHORITY"));
-    const bool preWbChromaCleanupExecutionReady = preWbChromaCleanupPlanReady &&
-            !phase6ResidualChromaUsedForOutput &&
-            std::max(preWbChromaCleanupProposedBlendR, preWbChromaCleanupProposedBlendB) >= 0.010f;
-    const float preWbChromaCleanupAppliedBlendR = preWbChromaCleanupExecutionReady
-            ? preWbChromaCleanupProposedBlendR : 0.0f;
-    const float preWbChromaCleanupAppliedBlendB = preWbChromaCleanupExecutionReady
-            ? preWbChromaCleanupProposedBlendB : 0.0f;
+    constexpr float preWbGainRiskR = 0.0f;
+    constexpr float preWbGainRiskB = 0.0f;
+    constexpr float spectraPreWbNoiseAuthority = 0.0f;
+    constexpr bool spectraCleanSceneCloudBypass = true;
+    constexpr float preWbChromaCleanupRiskR = 0.0f;
+    constexpr float preWbChromaCleanupRiskB = 0.0f;
+    constexpr float preWbChromaCleanupProposedBlendR = 0.0f;
+    constexpr float preWbChromaCleanupProposedBlendB = 0.0f;
+    constexpr bool preWbChromaCleanupPlanReady = false;
 
-    // Delta 35 propagation model: the real pixel operation pulls R-G/B-G toward a locally
-    // weighted neighbour field and is structure-gated. Model only half of the maximum planned
-    // blend as an effective linear opponent contraction so downstream SPECTRA does not claim an
-    // unrealistically exact or overly strong variance reduction.
-    const float preWbNoiseModelEffectiveBlendR =
-            0.50f * preWbChromaCleanupAppliedBlendR;
-    const float preWbNoiseModelEffectiveBlendB =
-            0.50f * preWbChromaCleanupAppliedBlendB;
+    constexpr bool phase6ResidualChromaUsedForOutput = false;
+    constexpr bool phase6ResidualChromaGpuUsed = false;
+    constexpr std::uint64_t phase6ProcessedPixels = 0u;
+    constexpr std::uint64_t phase6CandidatePixels = 0u;
+    constexpr std::uint64_t phase6IsolatedOutlierPixels = 0u;
+    constexpr std::uint64_t phase6ZipperPixels = 0u;
+    constexpr std::uint64_t phase6EdgeProtectedPixels = 0u;
+    constexpr std::uint64_t phase6SaturatedDetailProtectedPixels = 0u;
+    constexpr double phase6MeanAbsCorrectionRG = 0.0;
+    constexpr double phase6MeanAbsCorrectionBG = 0.0;
+    constexpr float phase6MaximumAbsoluteCorrection = 0.0f;
+    constexpr double phase6CandidateFraction = 0.0;
+    constexpr const char* phase6ExecutionBackend =
+            "RETIRED_CLASSICAL_PIXEL_OWNER_NEURAL_PENDING";
+
+    constexpr bool preWbChromaCleanupExecutionReady = false;
+    constexpr float preWbChromaCleanupAppliedBlendR = 0.0f;
+    constexpr float preWbChromaCleanupAppliedBlendB = 0.0f;
+    constexpr float preWbNoiseModelEffectiveBlendR = 0.0f;
+    constexpr float preWbNoiseModelEffectiveBlendB = 0.0f;
     bncam::spectra2::NoiseState preWbNoiseState = residualNoiseState.postDemosaic;
-    if (phase6ResidualChromaUsedForOutput) {
-        // The physical luma path is selective and nonlinear: only topology-supported opponent outliers are
-        // changed. Giving it a whole-frame variance reduction would understate uncertainty and
-        // could make downstream residual NR too aggressive. Preserve the covariance verbatim and
-        // advance only the provenance/stage label.
-        preWbNoiseState.stage = "POST_PHASE6_RESIDUAL_CHROMA_RGB";
-        preWbNoiseState.method = "SELECTIVE_NONLINEAR_ARTIFACT_CORRECTION_NO_VARIANCE_CREDIT";
-        preWbNoiseState.status = "PROPAGATED_CONSERVATIVE_NO_VARIANCE_CREDIT";
-    }
-    if (preWbChromaCleanupExecutionReady) {
-        const std::array<double, 9> preWbNoiseTransform{
-                1.0 - static_cast<double>(preWbNoiseModelEffectiveBlendR),
-                static_cast<double>(preWbNoiseModelEffectiveBlendR),
-                0.0,
-                0.0, 1.0, 0.0,
-                0.0,
-                static_cast<double>(preWbNoiseModelEffectiveBlendB),
-                1.0 - static_cast<double>(preWbNoiseModelEffectiveBlendB)
-        };
-        preWbNoiseState = bncam::spectra2::propagateLinear(
-                residualNoiseState.postDemosaic,
-                preWbNoiseTransform,
-                "POST_PRE_WB_OPPONENT_STABILIZATION_RGB",
-                "LOCAL_NEIGHBOUR_OPPONENT_BLEND_CONSERVATIVE_HALF_AUTHORITY_MODEL",
-                0.94
-        );
-    }
+    preWbNoiseState.stage = "POST_DEMOSAIC_PRE_AWB_IDENTITY";
+    preWbNoiseState.method = "NO_CLASSICAL_PRE_WB_PIXEL_CORRECTION";
+    preWbNoiseState.status = "PROPAGATED_IDENTITY";
 
     const auto awbPropagationStart = IspClock::now();
     residualNoiseState.postAwb = bncam::spectra2::propagateAwb(
@@ -13436,51 +12278,14 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         residualNoiseState.propagationColourMatrix[index] = ccm[index];
     }
 
-    // Phase 11: resolve capture-detail authority from the physical S/O model in the exact
-    // scene-linear post-camera-profile domain (paired matrix plus HueSatMap when active). SPECTRA adaptation is not required; Camera2/manual physical
-    // calibration remains authoritative with SPECTRA Off.
-    const bool linearDetailPhysicalNoiseAvailable = meta.calibration.noiseModelMode != 0 &&
+    // N004: automatic Phase-11 physical detail recovery is retired. S/O remains read-only
+    // sensor/noise evidence for explicit profile-owned detail, but it may not activate or scale
+    // a separate capture-detail pixel owner. Keep the residual state as an exact identity edge.
+    const bool perceptualDetailPhysicalNoiseAvailable = meta.calibration.noiseModelMode != 0 &&
             meta.calibration.hasNoiseProfile && meta.calibration.noiseProfileApplied &&
             meta.calibration.noiseProfilePairCount > 0;
-    const float linearDetailReferenceSignal = static_cast<float>(std::clamp(
-            g_threadLocalIspStats.meanNormalizedNoiseSignal, 0.001, 1.0));
-    double linearDetailShotVarianceAtReference = 0.0;
-    double linearDetailTotalVarianceAtReference = 0.0;
-    if (linearDetailPhysicalNoiseAvailable) {
-        const int pairCount = std::clamp(meta.calibration.noiseProfilePairCount, 1, 4);
-        for (int channel = 0; channel < pairCount; ++channel) {
-            const double sNoise = std::max(0.0, meta.calibration.effectiveNoiseProfile[channel * 2]);
-            const double oNoise = std::max(0.0, meta.calibration.effectiveNoiseProfile[channel * 2 + 1]);
-            const double shot = sNoise * static_cast<double>(linearDetailReferenceSignal);
-            linearDetailShotVarianceAtReference += shot;
-            linearDetailTotalVarianceAtReference += shot + oNoise;
-        }
-    }
-    const float linearDetailShotNoiseFraction = linearDetailTotalVarianceAtReference > 1.0e-12
-            ? static_cast<float>(std::clamp(
-                    linearDetailShotVarianceAtReference / linearDetailTotalVarianceAtReference,
-                    0.0, 1.0))
-            : 0.0f;
-    const float linearDetailPreToneLumaSigma = static_cast<float>(std::sqrt(std::max(
-            0.0, residualNoiseState.postColourTransform.varianceY)));
-    const bncam::detail_recovery::Plan linearDetailPlan = bncam::detail_recovery::resolve(
-            {linearDetailPhysicalNoiseAvailable,
-             linearDetailPreToneLumaSigma,
-             linearDetailReferenceSignal,
-             linearDetailShotNoiseFraction,
-             meta.calibration.signalModelConfidence});
-    const auto linearDetailPropagationStart = IspClock::now();
-    residualNoiseState.postLinearDetail = bncam::spectra2::propagateOpponentGains(
-            residualNoiseState.postColourTransform,
-            std::sqrt(std::max(1.0f, linearDetailPlan.predictedLumaVarianceGain)),
-            1.0,
-            1.0,
-            "POST_LINEAR_DETAIL_RECOVERY_RGB",
-            linearDetailPlan.enabled
-                    ? "PHASE11_BOUNDED_VAN_CITTERT_PHYSICAL_SO_UPPER_BOUND"
-                    : "PHASE11_DETAIL_BYPASS_IDENTITY",
-            linearDetailPlan.enabled ? 0.82 : 1.0);
-    residualNoiseState.linearDetailPropagationMs = elapsedMs(linearDetailPropagationStart);
+    residualNoiseState.postLinearDetail = residualNoiseState.postColourTransform;
+    residualNoiseState.linearDetailPropagationMs = 0.0f;
 
     // Delta 31: explicit WB/CCM opponent-noise amplification audit. Propagation already existed;
     // this only makes each stage's R-G/B-G RMS gain directly observable without another scan.
@@ -13544,23 +12349,8 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         // scene observer consumes this generation directly and only returns compact samples.
         request.deferFullReadback = true;
         request.wbRgb = {wbRgb[0], wbRgb[1], wbRgb[2]};
-        request.preWbOpponentCleanupBlend = {
-                preWbChromaCleanupAppliedBlendR,
-                preWbChromaCleanupAppliedBlendB
-        };
-        const auto& cloudPlan = residualNoiseState.demosaicChromaCloudCorrectionPlan;
-        request.preWbCloudCorrectionReady = cloudPlan.ready;
-        if (cloudPlan.ready) {
-            request.preWbCloudCorrectionRG = cloudPlan.correctionRG.data();
-            request.preWbCloudCorrectionBG = cloudPlan.correctionBG.data();
-            request.preWbCloudCorrectionValid = cloudPlan.valid.data();
-            request.preWbCloudGridColumns =
-                    bncam::spectra2::ResidualObservation::kLowFrequencyChromaGridColumns;
-            request.preWbCloudGridRows =
-                    bncam::spectra2::ResidualObservation::kLowFrequencyChromaGridRows;
-            request.preWbCloudValidTileCount = cloudPlan.validTileCount;
-            request.preWbCloudMaxAbsoluteCorrection = cloudPlan.maxAbsoluteCorrection;
-        }
+        request.preWbOpponentCleanupBlend = {0.0f, 0.0f};
+        request.preWbCloudCorrectionReady = false;
         for (size_t i = 0; i < request.colorMatrix.size(); ++i) {
             request.colorMatrix[i] = ccm[i];
         }
@@ -13611,133 +12401,8 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             linearRgb = runCpuDemosaicFallback();
             vulkanDemosaicResident = false;
         }
-        const bool cpuPreWbCleanupActive = preWbChromaCleanupExecutionReady;
-        const auto& cpuCloudPlan = residualNoiseState.demosaicChromaCloudCorrectionPlan;
-        const bool cpuPreWbCloudActive = cpuCloudPlan.ready;
-        cv::Mat cpuPreWbSource;
-        if (cpuPreWbCleanupActive || cpuPreWbCloudActive) {
-            // Failure-recovery path only: keep an immutable source so neighbour reads are
-            // deterministic while the destination is transformed in parallel.
-            cpuPreWbSource = linearRgb.clone();
-        }
-        const auto stabilizeCpuPreWbOpponent = [&](int x, int y, const cv::Vec3f& center) -> cv::Vec3f {
-            if (!cpuPreWbCleanupActive) return center;
-            const auto sample = [&](int sx, int sy) -> cv::Vec3f {
-                const int cx = std::clamp(sx, 0, cpuPreWbSource.cols - 1);
-                const int cy = std::clamp(sy, 0, cpuPreWbSource.rows - 1);
-                return cpuPreWbSource.ptr<cv::Vec3f>(cy)[cx];
-            };
-            const cv::Vec3f left = sample(x - 1, y);
-            const cv::Vec3f right = sample(x + 1, y);
-            const cv::Vec3f up = sample(x, y - 1);
-            const cv::Vec3f down = sample(x, y + 1);
-            const float maxGreenDelta = std::max(
-                    std::max(std::abs(center[1] - left[1]), std::abs(center[1] - right[1])),
-                    std::max(std::abs(center[1] - up[1]), std::abs(center[1] - down[1]))
-            );
-            const float greenScale = 0.015f + 0.18f * std::max(center[1], 0.0f);
-            const float structureGate = 1.0f - preWbSmoothstep(
-                    0.18f, 0.90f, maxGreenDelta / greenScale);
-            const auto weight = [&](const cv::Vec3f& neighbour) -> float {
-                const float normalized = std::abs(center[1] - neighbour[1]) / greenScale;
-                return 1.0f / (1.0f + 4.0f * normalized * normalized);
-            };
-            const float wl = weight(left);
-            const float wr = weight(right);
-            const float wu = weight(up);
-            const float wd = weight(down);
-            const float weightSum = std::max(1.0e-5f, wl + wr + wu + wd);
-            const auto rg = [](const cv::Vec3f& pixel) { return pixel[0] - pixel[1]; };
-            const auto bg = [](const cv::Vec3f& pixel) { return pixel[2] - pixel[1]; };
-            const float rgL = rg(left), rgR = rg(right), rgU = rg(up), rgD = rg(down);
-            const float bgL = bg(left), bgR = bg(right), bgU = bg(up), bgD = bg(down);
-            const float targetRg = (wl * rgL + wr * rgR + wu * rgU + wd * rgD) / weightSum;
-            const float targetBg = (wl * bgL + wr * bgR + wu * bgU + wd * bgD) / weightSum;
-            const float spanRg = std::max(std::max(rgL, rgR), std::max(rgU, rgD)) -
-                    std::min(std::min(rgL, rgR), std::min(rgU, rgD));
-            const float spanBg = std::max(std::max(bgL, bgR), std::max(bgU, bgD)) -
-                    std::min(std::min(bgL, bgR), std::min(bgU, bgD));
-            const float chromaScale = 0.020f + 0.08f * std::max(center[1], 0.0f);
-            const float colourGateR = 1.0f - preWbSmoothstep(
-                    chromaScale, 4.0f * chromaScale, spanRg);
-            const float colourGateB = 1.0f - preWbSmoothstep(
-                    chromaScale, 4.0f * chromaScale, spanBg);
-            const float blendR = preWbChromaCleanupAppliedBlendR * structureGate * colourGateR;
-            const float blendB = preWbChromaCleanupAppliedBlendB * structureGate * colourGateB;
-            cv::Vec3f out = center;
-            out[0] = std::max(0.0f, center[0] +
-                    blendR * ((center[1] + targetRg) - center[0]));
-            out[2] = std::max(0.0f, center[2] +
-                    blendB * ((center[1] + targetBg) - center[2]));
-            return out;
-        };
-
-        const auto applyCpuPreWbCloud = [&](int x, int y, const cv::Vec3f& center) -> cv::Vec3f {
-            if (!cpuPreWbCloudActive) return center;
-            constexpr int gridCols = bncam::spectra2::ResidualObservation::kLowFrequencyChromaGridColumns;
-            constexpr int gridRows = bncam::spectra2::ResidualObservation::kLowFrequencyChromaGridRows;
-            const float gx = std::clamp(
-                    ((static_cast<float>(x) + 0.5f) / std::max(1.0f, static_cast<float>(linearRgb.cols))) *
-                            static_cast<float>(gridCols) - 0.5f,
-                    0.0f, static_cast<float>(gridCols - 1));
-            const float gy = std::clamp(
-                    ((static_cast<float>(y) + 0.5f) / std::max(1.0f, static_cast<float>(linearRgb.rows))) *
-                            static_cast<float>(gridRows) - 0.5f,
-                    0.0f, static_cast<float>(gridRows - 1));
-            const int x0 = static_cast<int>(std::floor(gx));
-            const int y0 = static_cast<int>(std::floor(gy));
-            const int x1 = std::min(x0 + 1, gridCols - 1);
-            const int y1 = std::min(y0 + 1, gridRows - 1);
-            const float tx = gx - static_cast<float>(x0);
-            const float ty = gy - static_cast<float>(y0);
-            float sumRg = 0.0f, sumBg = 0.0f, support = 0.0f;
-            const auto addTile = [&](int gxTile, int gyTile, float weight) {
-                const std::size_t i = flatIndex2d(gyTile, gridCols, gxTile);
-                if (cpuCloudPlan.valid[i] == 0u) return;
-                sumRg += weight * cpuCloudPlan.correctionRG[i];
-                sumBg += weight * cpuCloudPlan.correctionBG[i];
-                support += weight;
-            };
-            addTile(x0, y0, (1.0f - tx) * (1.0f - ty));
-            addTile(x1, y0, tx * (1.0f - ty));
-            addTile(x0, y1, (1.0f - tx) * ty);
-            addTile(x1, y1, tx * ty);
-            if (support < 0.25f) return center;
-            const float maxAbs = std::clamp(cpuCloudPlan.maxAbsoluteCorrection, 0.0f, 0.010f);
-            const float corrRg = std::clamp(sumRg / support, -maxAbs, maxAbs);
-            const float corrBg = std::clamp(sumBg / support, -maxAbs, maxAbs);
-
-            const auto sample = [&](int sx, int sy) -> cv::Vec3f {
-                const int cx = std::clamp(sx, 0, cpuPreWbSource.cols - 1);
-                const int cy = std::clamp(sy, 0, cpuPreWbSource.rows - 1);
-                return cpuPreWbSource.ptr<cv::Vec3f>(cy)[cx];
-            };
-            const cv::Vec3f sourceCenter = sample(x, y);
-            const cv::Vec3f left = sample(x - 1, y);
-            const cv::Vec3f right = sample(x + 1, y);
-            const cv::Vec3f up = sample(x, y - 1);
-            const cv::Vec3f down = sample(x, y + 1);
-            const float maxGreenDelta = std::max(
-                    std::max(std::abs(sourceCenter[1] - left[1]), std::abs(sourceCenter[1] - right[1])),
-                    std::max(std::abs(sourceCenter[1] - up[1]), std::abs(sourceCenter[1] - down[1])));
-            const float greenScale = 0.015f + 0.18f * std::max(sourceCenter[1], 0.0f);
-            const float structureGate = 1.0f - preWbSmoothstep(
-                    0.18f, 0.90f, maxGreenDelta / greenScale);
-            const auto rg = [](const cv::Vec3f& px) { return px[0] - px[1]; };
-            const auto bg = [](const cv::Vec3f& px) { return px[2] - px[1]; };
-            const float spanRg = std::max(std::max(rg(left), rg(right)), std::max(rg(up), rg(down))) -
-                    std::min(std::min(rg(left), rg(right)), std::min(rg(up), rg(down)));
-            const float spanBg = std::max(std::max(bg(left), bg(right)), std::max(bg(up), bg(down))) -
-                    std::min(std::min(bg(left), bg(right)), std::min(bg(up), bg(down)));
-            const float chromaScale = 0.020f + 0.08f * std::max(sourceCenter[1], 0.0f);
-            const float gateR = 1.0f - preWbSmoothstep(chromaScale, 4.0f * chromaScale, spanRg);
-            const float gateB = 1.0f - preWbSmoothstep(chromaScale, 4.0f * chromaScale, spanBg);
-            cv::Vec3f out = center;
-            out[0] = std::max(0.0f, center[0] + corrRg * structureGate * gateR);
-            out[2] = std::max(0.0f, center[2] + corrBg * structureGate * gateB);
-            return out;
-        };
-
+        // N006B: failure recovery follows the same neutral contract as Vulkan: direct
+        // demosaic -> WB/CCM, with no hidden neighbour/cloud denoise correction.
         std::mutex colorStatsMutex;
         cv::parallel_for_(cv::Range(0, linearRgb.rows), [&](const cv::Range& range) {
             double localRawR = 0.0, localRawG = 0.0, localRawB = 0.0;
@@ -13745,17 +12410,13 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             double localCcmR = 0.0, localCcmG = 0.0, localCcmB = 0.0;
             for (int y = range.start; y < range.end; ++y) {
                 cv::Vec3f* row = linearRgb.ptr<cv::Vec3f>(y);
-                const cv::Vec3f* sourceRow = cpuPreWbCleanupActive
-                        ? cpuPreWbSource.ptr<cv::Vec3f>(y)
-                        : row;
                 for (int x = 0; x < linearRgb.cols; ++x) {
-                    const cv::Vec3f input = sourceRow[x];
+                    const cv::Vec3f input = row[x];
                     localRawR += input[0];
                     localRawG += input[1];
                     localRawB += input[2];
 
-                    const cv::Vec3f locallyStabilized = stabilizeCpuPreWbOpponent(x, y, input);
-                    const cv::Vec3f rawForWb = applyCpuPreWbCloud(x, y, locallyStabilized);
+                    const cv::Vec3f rawForWb = input;
                     const float wbR = rawForWb[0] * wbRgb[0];
                     const float wbG = rawForWb[1] * wbRgb[1];
                     const float wbB = rawForWb[2] * wbRgb[2];
@@ -14069,55 +12730,8 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         cpuColorTransformApplied = true;
     };
 
-    // QUALITY DELTA 0011: baseline RAW chroma cleanup must not depend on SPECTRA.
-    // WB/CCM can amplify residual opponent noise several-fold before tone; therefore every
-    // RAW capture with a valid physical noise model receives the luma-guided 4:4:4 cleanup
-    // here. SPECTRA adds only a small finishing increment above that physical baseline.
-    const bool rawBayerForPreToneChroma =
-            workingRaw.info.sourceFormat == RawSourceFormat::RAW10 ||
-            workingRaw.info.sourceFormat == RawSourceFormat::RAW_SENSOR;
-    const bool physicalNoiseModelForPreToneChroma =
-            meta.calibration.noiseModelMode != 0 &&
-            meta.calibration.hasNoiseProfile &&
-            meta.calibration.noiseProfileApplied;
-    const float galoshPreToneWbCcmPressure = wbCcmChromaRmsGainCombined > 0.0
-            ? baselineSmoothstep(1.10f, 3.20f, static_cast<float>(wbCcmChromaRmsGainCombined))
-            : 0.0f;
-    const bncam::spectra2::PhysicalPreToneChromaPlan galoshPreToneChromaPlan =
-            bncam::spectra2::resolvePhysicalPreToneChroma(
-                    rawBayerForPreToneChroma,
-                    physicalNoiseModelForPreToneChroma,
-                    false,  // Common physical baseline; SPECTRA owns residual enhancement only.
-                    singleFrameRawDenoise.active
-                            ? singleFrameRawDenoise.physicalNoisePressure
-                            : 0.0f,
-                    galoshPreToneWbCcmPressure,
-                    physicalRawDenoiseActive
-                            ? physicalPreDemosaicChromaReduction
-                            : 0.0f);
-    const bool galoshPreToneChroma444Enabled = galoshPreToneChromaPlan.enabled;
-    const float galoshPreToneChroma444Strength = galoshPreToneChromaPlan.finalStrength;
-
-    // DELTA 0093: physical covariance-whitened near-black chroma rejection.  The existing
-    // luma-guided predictor is retained, but its residual is now classified in the exact
-    // propagated post-WB/CCM covariance instead of a brightness heuristic.  This makes a
-    // low-SNR black pixel aggressively reject statistically plausible colour noise while
-    // coherent dark colour remains protected by the local predictor/edge evidence.
-    const float nearBlackChromaModelConfidence = std::clamp(
-            std::min(
-                    static_cast<float>(residualNoiseState.postColourTransform.confidence),
-                    meta.calibration.signalModelConfidence),
-            0.0f, 1.0f);
-    const bncam::near_black_chroma::Plan nearBlackChromaPlan =
-            bncam::near_black_chroma::resolve({
-                    rawBayerForPreToneChroma,
-                    physicalNoiseModelForPreToneChroma,
-                    galoshPreToneChroma444Enabled,
-                    galoshPreToneChroma444Strength,
-                    residualNoiseState.postColourTransform.covariance.values,
-                    linearDetailReferenceSignal,
-                    linearDetailShotNoiseFraction,
-                    nearBlackChromaModelConfidence});
+    // Phase N002: classical pre-tone/Galosh and near-black chroma suppression are retired.
+    // Physical covariance/S/O stays available as read-only noise intelligence.
 
     // Phase 9 Delta 0066: uniform evidence ownership. No demosaic-family or RAW-format
     // rule is allowed to scale chroma authority. Local structure, stochastic residuals,
@@ -14129,20 +12743,8 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         request.frameWidth = static_cast<std::uint32_t>(demosaicInputWidth);
         request.frameHeight = static_cast<std::uint32_t>(demosaicInputHeight);
         request.targetSampleCount = 50000u;
-        request.preToneChroma444Enabled = galoshPreToneChroma444Enabled;
-        request.preToneChroma444Strength = galoshPreToneChroma444Strength;
-        request.preToneChromaNoisePressure = galoshPreToneChromaPlan.noisePressure;
-        request.preToneChromaWbCcmPressure = galoshPreToneChromaPlan.wbCcmPressure;
-        request.preToneChromaCovarianceWhiteningEnabled = nearBlackChromaPlan.enabled;
-        request.preToneChromaVarianceY = nearBlackChromaPlan.varianceY;
-        request.preToneChromaVarianceC1 = nearBlackChromaPlan.varianceC1;
-        request.preToneChromaVarianceC2 = nearBlackChromaPlan.varianceC2;
-        request.preToneChromaCovarianceC1C2 = nearBlackChromaPlan.covarianceC1C2;
-        request.preToneChromaReferenceSignal = nearBlackChromaPlan.referenceSignal;
-        request.preToneChromaShotNoiseFraction = nearBlackChromaPlan.shotNoiseFraction;
-        request.preToneChromaModelConfidence = nearBlackChromaPlan.modelConfidence;
-        request.preToneChromaFullShrinkSigma = nearBlackChromaPlan.fullShrinkSigma;
-        request.preToneChromaPreserveSigma = nearBlackChromaPlan.preserveSigma;
+        // N002: resident scene observation stays enabled, but it receives no classical
+        // pre-tone chroma suppression request. Value-initialized request fields remain zero.
         vulkanSceneObserver =
                 bncam::vulkan::VulkanRuntime::instance().executeSpectraResidentSceneObserverFromAwbCcm(
                         request, vulkanColorTransform.residentColorGeneration);
@@ -14597,8 +13199,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     // automatic low-light Tone Guard, but cannot exceed its existing 25% attenuation ceiling.
     // Cloud evidence only fills part of the remaining risk headroom, so it cannot dominate a
     // capture whose WB/CCM/demosaic/CFA propagation otherwise looks clean.
-    const float toneGuardCloudRisk = demosaicCfaEvidence.available &&
-            residualNoiseState.demosaicChromaCloudCorrectionPlan.ready
+    const float toneGuardCloudRisk = demosaicCfaEvidence.available
             ? std::clamp(
                     residualNoiseState.demosaicChromaCloudRiskEvidence *
                             (0.60f + 0.40f * residualNoiseState.demosaicChromaFieldCoherence),
@@ -14843,13 +13444,14 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             0.25f
     );
 
-    // Phase 12 is profile-owned perceptual/output detail. It consumes the already propagated
-    // post-tone physical luma noise floor and is strictly complementary to Phase 11 and FLLF.
+    // Phase 12 remains the explicit profile-owned perceptual/output detail stage. Automatic
+    // Phase-11 capture detail is retired; with all profile detail controls at zero this policy is
+    // exact identity by contract.
     const float phase12DisplayLumaSigma = static_cast<float>(std::sqrt(postToneVarianceY));
     const bncam::perceptual_detail::Plan perceptualDetailPlan = bncam::perceptual_detail::resolve(
             {uiConfig.profileDetailAmount, uiConfig.profileDetailRadius,
              uiConfig.profileDetailDetail, uiConfig.profileDetailMasking},
-            {linearDetailPhysicalNoiseAvailable,
+            {perceptualDetailPhysicalNoiseAvailable,
              phase12DisplayLumaSigma,
              meta.calibration.signalModelConfidence});
     if (perceptualDetailPlan.enabled) {
@@ -14892,7 +13494,6 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     residualNoiseState.modelConfidence = static_cast<float>(residualNoiseState.postTone.confidence);
 
     bncam::vulkan::SpectraResidentToneResult vulkanTone{};
-    LinearDetailCpuFallbackResult linearDetailCpuFallback{};
     bool vulkanToneApplied = false;
     if (vulkanSceneObserverActive) {
         bncam::vulkan::SpectraResidentToneRequest request{};
@@ -14918,18 +13519,21 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         request.fllfRefinement = fllfPlan.refinement;
         request.fllfPhysicalNoiseSigmaY = fllfPlan.physicalNoiseSigmaY;
         request.fllfPyramidLevels = fllfPlan.enabled ? fllfPlan.pyramidLevels : 0u;
-        request.linearDetailEnabled = linearDetailPlan.enabled;
-        request.linearDetailAuthority = linearDetailPlan.authority;
-        request.linearDetailRadius = linearDetailPlan.radius;
-        request.linearDetailEmphasis = linearDetailPlan.detailEmphasis;
-        request.linearDetailMasking = linearDetailPlan.masking;
-        request.linearDetailMinimumResidualSnr = linearDetailPlan.minimumResidualSnr;
-        request.linearDetailMinimumGradientSnr = linearDetailPlan.minimumGradientSnr;
-        request.linearDetailHardHaloLimit = linearDetailPlan.hardHaloLimit;
-        request.linearDetailNoiseSigmaY = linearDetailPlan.preToneLumaSigma;
-        request.linearDetailReferenceSignal = linearDetailPlan.referenceSignal;
-        request.linearDetailShotNoiseFraction = linearDetailPlan.shotNoiseFraction;
-        request.linearDetailModelConfidence = linearDetailPlan.modelConfidence;
+        // N004 compatibility bridge: the mixed resident-tone ABI still carries Phase-11 fields,
+        // but automatic linear-detail authority is hard-neutral. N006 removes the retired backend
+        // fields/shader implementation after mixed responsibilities are split.
+        request.linearDetailEnabled = false;
+        request.linearDetailAuthority = 0.0f;
+        request.linearDetailRadius = 1.0f;
+        request.linearDetailEmphasis = 0.0f;
+        request.linearDetailMasking = 0.0f;
+        request.linearDetailMinimumResidualSnr = 1.0f;
+        request.linearDetailMinimumGradientSnr = 1.0f;
+        request.linearDetailHardHaloLimit = 0.0f;
+        request.linearDetailNoiseSigmaY = 0.0f;
+        request.linearDetailReferenceSignal = 0.18f;
+        request.linearDetailShotNoiseFraction = 0.0f;
+        request.linearDetailModelConfidence = 0.0f;
         request.perceptualDetailEnabled = perceptualDetailPlan.enabled;
         request.perceptualDetailAuthority = perceptualDetailPlan.authority;
         request.perceptualDetailRadius = perceptualDetailPlan.radius;
@@ -14960,9 +13564,9 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         request.portraitTargetRight = uiConfig.portraitTargetRight;
         request.portraitTargetBottom = uiConfig.portraitTargetBottom;
         request.portraitMaskRotationDegrees = uiConfig.portraitMaskRotationDegrees;
-        // 8H-K: keep the complete tone output resident. Spatial NR + visible chroma consume
-        // this opaque generation directly; no ~150 MB tone readback/re-upload occurs.
-        request.deferFullReadback = true;
+        // Phase N003: legacy post-demosaic NR/visible-chroma ownership is retired.
+        // Materialize the tone output directly for neutral quantization/publication.
+        request.deferFullReadback = false;
         vulkanTone = bncam::vulkan::VulkanRuntime::instance().executeSpectraResidentTone(request);
         if (vulkanTone.ultraHdrGainmapGenerated && vulkanTone.ultraHdrMeaningfulHeadroom &&
             !vulkanTone.ultraHdrGainmapBytes.empty()) {
@@ -15002,12 +13606,6 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         syncHighlightDebugFromPhase9();
         cpuSceneProcessingApplied = true;
     }
-    if (!vulkanToneApplied && linearDetailPlan.enabled) {
-        // Failure-only CPU reference. Normal production remains Vulkan-resident; this keeps the
-        // Phase-11 runtime order truthful when the tone backend is unavailable.
-        linearDetailCpuFallback = applyLinearDetailRecoveryCpuFallback(linearRgb, linearDetailPlan);
-    }
-
 
     const auto applyCpuToneAndProfile = [&]() {
         cv::parallel_for_(cv::Range(0, linearRgb.rows), [&](const cv::Range& range) {
@@ -15065,77 +13663,35 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     // forcing a normal full-frame tone readback.
     const float phase5ToneStageMs = elapsedMs(phase5ToneStageStart);
 
-    // === OUT-OF-PLACE PASS 2: CHROMA NR AND QUANTIZATION ===
-    const bncam::spectra2::PhysicalChromaBaseStrengthPlan physicalChromaBasePlan =
-            bncam::spectra2::resolvePhysicalChromaBaseStrength(
-                    static_cast<float>(g_threadLocalIspStats.meanSensorNoiseVariance),
-                    uiConfig.noiseModelCalibrationFactor,
-                    meta.calibration.signalModelConfidence);
-    const float baseChromaNrStrength = physicalChromaBasePlan.baseStrength;
+    // === PHASE N003: NEUTRAL POST-TONE PATH ===
+    // Sensor S/O and propagated covariance remain measurement-only. None of the values below
+    // grants post-demosaic pixel authority; the future SPECTRA Neural owner will consume them.
     const bool spectraNoiseActive = meta.calibration.spectraProcessingMode != 0;
-    // Phase 4: the late luma owner consumes propagated residual covariance directly.
-    // Only chroma retains its separate measured early-stage headroom scale here.
-    const float residualChromaStrengthScale = std::clamp(
-            1.0f - 0.45f * physicalPreDemosaicChromaReduction, 0.65f, 1.0f);
-
-    // Capture ISO remains telemetry/reference for optional SPECTRA chroma headroom only; it
-    // never determines the physical luma residual authority.
+    const bool physicalNoiseModelAvailable = meta.calibration.noiseModelMode != 0 &&
+            meta.calibration.hasNoiseProfile && meta.calibration.noiseProfileApplied;
     const float lensIsoNrReference = static_cast<float>(std::max(actualIso, 0));
-
-    // 1. Physical late baseline owns only the measured residual after the early physical pass.
-    const float physicalNoiseBaseline = baseChromaNrStrength * residualChromaStrengthScale;
-
-    // 2. One normalized-sensor ceiling for RAW10 and RAW_SENSOR. Phase-2 established that
-    // both sources enter this stage in the same normalized physical domain.
-    const float minimumDenoiseStrength = 0.0f;
-    const float maximumDenoiseCeiling = 0.48f;
-    const float clampedBaseline = std::clamp(physicalNoiseBaseline, minimumDenoiseStrength, maximumDenoiseCeiling);
-    const float availableHeadroom = std::max(0.0f, maximumDenoiseCeiling - clampedBaseline);
-
-    // 3. Dynamic ISO is optional SPECTRA residual authority, not a physical noise estimator.
-    // Off = physical residual baseline only. On = baseline + budgeted adaptive headroom.
     const float referenceFrameIso = std::max(1.0f, lensIsoNrReference);
-    const float noiseTruthActivation = physicalChromaBasePlan.modelDriven
-            ? std::clamp(physicalChromaBasePlan.combinedNoisePressure, 0.0f, 1.0f)
-            : 0.0f;
+
+    // Legacy late-denoise tuning values are deliberately neutralized. They remain named only
+    // so existing diagnostics stay parseable until the final Phase-1 telemetry purge.
+    constexpr float minimumDenoiseStrength = 0.0f;
+    constexpr float maximumDenoiseCeiling = 0.0f;
+    const float baseChromaNrStrength = 0.0f;
+    const float residualChromaStrengthScale = 1.0f;
+    const float physicalNoiseBaseline = 0.0f;
+    const float clampedBaseline = 0.0f;
+    const float availableHeadroom = 0.0f;
+    const float noiseTruthActivation = 0.0f;
     const float configuredDynamicIsoCoeff = std::clamp(uiConfig.lensDynamicIsoCoeff, 0.0f, 1.0f);
     const float normalizedChromaAuthority = std::clamp(
             uiConfig.effectiveChromaAuthorityStops / 5.0f, 0.0f, 1.0f);
-    const float dynamicBlend = spectraNoiseActive
-            ? bncam::spectra2::resolveNoiseTruthDynamicHeadroomFraction(
-                    configuredDynamicIsoCoeff,
-                    noiseTruthActivation,
-                    uiConfig.effectiveChromaAuthorityStops)
-            : 0.0f;
-    const float requestedAdditionalStrength = availableHeadroom * dynamicBlend;
-
-    const float finalChromaNrStrengthBeforeClamp = clampedBaseline + requestedAdditionalStrength;
-    const float unaccountedChromaNrStrength = std::clamp(
-            finalChromaNrStrengthBeforeClamp,
-            minimumDenoiseStrength,
-            maximumDenoiseCeiling
-    );
-    const bncam::spectra2::BudgetedDenoiseStrength budgetedChromaDenoise =
-            bncam::spectra2::resolveBudgetedDenoiseStrength(
-                    clampedBaseline,
-                    std::max(0.0f, unaccountedChromaNrStrength - clampedBaseline),
-                    budgetState.downstreamChromaAuthority,
-                    minimumDenoiseStrength,
-                    maximumDenoiseCeiling
-            );
-    const float chromaNrStrength = budgetedChromaDenoise.finalStrength;
-
-    const float dynamicIsoMultiplier = (clampedBaseline > 1.0e-6f)
-            ? (chromaNrStrength / clampedBaseline)
-            : 1.0f;
-
-    const bool ceilingReached = chromaNrStrength >= (maximumDenoiseCeiling - 1.0e-5f);
-    const float dynamicAuthorityDenominator =
-            noiseTruthActivation * std::max(normalizedChromaAuthority, 1.0e-6f);
-    const float theoreticalSaturatingCoeff =
-            (dynamicAuthorityDenominator > 1.0e-4f && availableHeadroom > 1.0e-5f)
-            ? std::clamp(1.0f / dynamicAuthorityDenominator, 0.0f, 10.0f)
-            : 1.0f;
+    const float dynamicBlend = 0.0f;
+    const float requestedAdditionalStrength = 0.0f;
+    const float finalChromaNrStrengthBeforeClamp = 0.0f;
+    const float chromaNrStrength = 0.0f;
+    const float dynamicIsoMultiplier = 1.0f;
+    const bool ceilingReached = false;
+    const float theoreticalSaturatingCoeff = 0.0f;
 
     std::ostringstream nativeNoiseSo;
     nativeNoiseSo << std::setprecision(17) << "[";
@@ -15148,499 +13704,63 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
 
     const auto finalOutputPassStart = IspClock::now();
 
-    // Phase 4: the absolute late-stage noise authority is the residual covariance already
-    // propagated through LSC -> spatial exposure -> demosaic -> AWB -> CCM -> linear detail
-    // -> tone. Re-evaluating SensorNoiseProfile here would discard those transforms and count
-    // the same Camera2 S/O noise twice.
+    // Keep the physically propagated posterior as telemetry / future neural conditioning.
     const float postToneResidualLumaSigma =
             static_cast<float>(std::sqrt(postToneVarianceY));
     const float postToneResidualChromaSigma = static_cast<float>(std::sqrt(std::max(
             postToneVarianceRg, postToneVarianceBg)));
 
-    // Lightroom Noise Reduction is a separate creative residual-noise authority.
-    // It never mutates the SPECTRA state; the policy only consumes the headroom left
-    // by the physical/SPECTRA base and is a strict no-op when Luminance and Color are 0.
-    const bncam::profile_nr::ProfileNoiseReductionPlan profileNrPlan =
-            bncam::profile_nr::resolveProfileNoiseReduction(
-                    uiConfig.profileNrLuminance,
-                    uiConfig.profileNrLuminanceDetail,
-                    uiConfig.profileNrLuminanceContrast,
-                    uiConfig.profileNrColor,
-                    uiConfig.profileNrColorDetail,
-                    uiConfig.profileNrColorSmoothness);
-    // Phase 11 owns RAW capture detail in scene-linear RGB. The former post-tone resident/8-bit
-    // sharpener is retired from production so Phase 11 is never stacked with a second edge boost.
-    const bool profileNoiseReductionRequested = profileNrPlan.requested;
-    // Phase 3 low-light recovery: the physically-derived baseline chroma cleanup is not a
-    // SPECTRA-only feature. It is calculated above from calibrated Camera2/manual S/O noise
-    // pressure and must remain executable when a profile deliberately disables SPECTRA.
-    // Previously the resident post-demosaic stage could be skipped entirely in that state,
-    // leaving RAW10/RAW_SENSOR chroma noise unprocessed despite a valid physical model.
-    const bool physicalChromaNoiseRequested =
-            meta.calibration.noiseModelMode != 0 && chromaNrStrength > 0.005f;
-
+    const bool profileNoiseReductionRequested = false;
+    const bool physicalChromaNoiseRequested = false;
     float requestedLumaSigma = 0.0f;
     float requestedChromaSigma = 0.0f;
     float appliedLumaSigma = 0.0f;
     float appliedChromaSigma = 0.0f;
     float effectiveOuterRingAuthority = 0.0f;
-
-    const bool physicalNoiseModelAvailable = meta.calibration.noiseModelMode != 0 &&
-            meta.calibration.hasNoiseProfile && meta.calibration.noiseProfileApplied;
-
-    // Late spatial NR consumes the propagated residual covariance in its own post-tone
-    // input domain. Never recreate this sigma from the original sensor S/O here.
-    const bncam::spectra2::PostDemosaicResidualNrPlan spectraResidualNr =
-            bncam::spectra2::resolvePostDemosaicResidualNr(
-                    postToneResidualLumaSigma,
-                    postToneResidualChromaSigma,
-                    postToneResidualModelConfidence,
-                    uiConfig.profileSpectraStrength,
-                    uiConfig.profileSpectraLuma,
-                    uiConfig.profileSpectraChroma,
-                    budgetState.downstreamLumaAuthority,
-                    budgetState.downstreamChromaAuthority,
-                    physicalNoiseModelAvailable,
-                    spectraNoiseActive);
-
-    const bool isNoiseModelActive = spectraResidualNr.active ||
-            profileNoiseReductionRequested || physicalChromaNoiseRequested;
-    // Visible opponent-chroma cleanup is part of the physical baseline ISP whenever Camera2
-    // supplied a usable noise model. SPECTRA only adds residual/coarse-guide authority.
-    const bool physicalVisibleChromaRequested =
-            physicalNoiseModelAvailable && physicalChromaNoiseRequested;
-    const bool visibleChromaProcessingEnabled =
-            spectraNoiseActive || physicalVisibleChromaRequested;
-
-    if (isNoiseModelActive) {
-        const float baseLumaSigma = spectraResidualNr.lumaSigma;
-        const float baseChromaSigma = spectraResidualNr.chromaSigma;
-        const float creativeLumaReference = spectraResidualNr.active
-                ? spectraResidualNr.inputLumaSigma : postToneResidualLumaSigma;
-        const float creativeChromaReference = spectraResidualNr.active
-                ? spectraResidualNr.inputChromaSigma : postToneResidualChromaSigma;
-        const float creativeLumaSigma = creativeLumaReference * profileNrPlan.luminance * 1.25f;
-        const float creativeChromaSigma = creativeChromaReference * profileNrPlan.color * 1.50f;
-        // Profile NR is creative residual headroom. Quadrature composition prevents it from
-        // linearly re-counting either the physical baseline or the SPECTRA residual increment.
-        requestedLumaSigma = std::hypot(baseLumaSigma, creativeLumaSigma);
-        requestedChromaSigma = std::hypot(baseChromaSigma, creativeChromaSigma);
-        appliedLumaSigma = std::clamp(requestedLumaSigma, 0.0f, 0.15f);
-        appliedChromaSigma = std::clamp(requestedChromaSigma, 0.0f, 0.35f);
-        const float physicalOuterRing = std::clamp((physicalChromaBasePlan.combinedNoisePressure - 0.25f) * 0.80f, 0.0f, 0.65f);
-        const float spectraOuterRing = spectraNoiseActive
-                ? std::clamp(uiConfig.outerRingAuthority, 0.0f, 1.0f) : physicalOuterRing;
-        effectiveOuterRingAuthority = bncam::profile_nr::combineWithResidualHeadroom(
-                spectraOuterRing, profileNrPlan.lowFrequencyChromaAuthority, 1.0f);
-    }
-
-    const float lumaRangeThresholdMean = std::clamp(appliedLumaSigma * 1.8f, 0.003f, 0.15f);
-    const float chromaRangeThresholdMean = std::clamp(appliedChromaSigma * 2.8f, 0.008f, 0.35f);
+    const float lumaRangeThresholdMean = 0.0f;
+    const float chromaRangeThresholdMean = 0.0f;
 
     g_threadLocalIspStats.absoluteMeanLumaSigma = postToneResidualLumaSigma;
     g_threadLocalIspStats.absoluteMeanChromaSigma = postToneResidualChromaSigma;
-    g_threadLocalIspStats.effectiveLumaSigma = appliedLumaSigma;
-    g_threadLocalIspStats.effectiveChromaSigma = appliedChromaSigma;
-    g_threadLocalIspStats.lumaRangeThresholdMin = lumaRangeThresholdMean * 0.5f;
-    g_threadLocalIspStats.lumaRangeThresholdMean = lumaRangeThresholdMean;
-    g_threadLocalIspStats.lumaRangeThresholdMax = lumaRangeThresholdMean * 2.0f;
-    g_threadLocalIspStats.chromaRangeThresholdMin = chromaRangeThresholdMean * 0.5f;
-    g_threadLocalIspStats.chromaRangeThresholdMean = chromaRangeThresholdMean;
-    g_threadLocalIspStats.chromaRangeThresholdMax = chromaRangeThresholdMean * 2.0f;
+    g_threadLocalIspStats.effectiveLumaSigma = 0.0f;
+    g_threadLocalIspStats.effectiveChromaSigma = 0.0f;
+    g_threadLocalIspStats.lumaRangeThresholdMin = 0.0f;
+    g_threadLocalIspStats.lumaRangeThresholdMean = 0.0f;
+    g_threadLocalIspStats.lumaRangeThresholdMax = 0.0f;
+    g_threadLocalIspStats.chromaRangeThresholdMin = 0.0f;
+    g_threadLocalIspStats.chromaRangeThresholdMean = 0.0f;
+    g_threadLocalIspStats.chromaRangeThresholdMax = 0.0f;
+    g_threadLocalIspStats.preDenoiseResidualEstimate =
+            postToneResidualChromaSigma * 1.414f + postToneResidualLumaSigma * 0.707f;
+    g_threadLocalIspStats.postDenoiseResidualEstimate = g_threadLocalIspStats.preDenoiseResidualEstimate;
+    g_threadLocalIspStats.postSharpenResidualEstimate = g_threadLocalIspStats.postDenoiseResidualEstimate;
 
-    const float visibleChromaConfiguredStrength = maximumDenoiseCeiling > 1.0e-6f
-            ? std::clamp(
-                    unaccountedChromaNrStrength / maximumDenoiseCeiling,
-                    0.0f,
-                    1.0f
-            )
-            : 0.0f;
+    // Preserve the public/debug state type, but make the old resident filtering owner fail closed.
     SpectraVisibleChromaState visibleChromaState{};
-    visibleChromaState.activationSource = spectraNoiseActive
-            ? "SPECTRA"
-            : (physicalVisibleChromaRequested ? "PHYSICAL_NOISE_BASELINE" : "DISABLED");
+    visibleChromaState.activationSource = "DISABLED_N003_NEUTRAL_PATH";
+    auto& residentTelemetry = visibleChromaState.telemetry;
+    residentTelemetry.applied = false;
+    residentTelemetry.resultStatus = "DISABLED_N003_NEUTRAL_PATH";
+    residentTelemetry.vulkanResidentKernelConnected = false;
+    residentTelemetry.vulkanResidentAttempted = false;
+    residentTelemetry.vulkanResidentCpuFallbackUsed = false;
+    residentTelemetry.vulkanResidentFailureReason = "RETIRED_CLASSICAL_POST_DEMOSAIC_OWNER";
+    residentTelemetry.vulkanResidentExecutionStatus = "RETIRED_CLASSICAL_POST_DEMOSAIC_OWNER";
+    residentTelemetry.vulkanResidentAuthority = "NONE_NEUTRAL_PATH";
+    residentTelemetry.pixelBackend = "NONE_NEUTRAL_PATH";
+    residentTelemetry.pixelBackendSelectionReason = "N003_CLASSICAL_NR_RETIRED";
+    residentTelemetry.pixelBackendFallbackReason = "none";
+
+    residualNoiseState.postVisibleChroma = residualNoiseState.postTone;
+    residualNoiseState.postVisibleChroma.stage = "POST_VISIBLE_CHROMA_IDENTITY";
+    residualNoiseState.postVisibleChroma.method = "N003_IDENTITY_NO_CLASSICAL_POST_DEMOSAIC_NR";
+    residualNoiseState.postVisibleChroma.status = "PROPAGATED";
+
     bool residentPostDemosaicApplied = false;
     bool residentOutputSrgbEncoded = false;
     cv::Mat residentPublishedBgr8;
     bncam::publication::Bgr8PublicationStats residentPublicationStats{};
     float finalOutSpatialNrMs = 0.0f;
-
-    // Milestone 8H: the first production-resident Vulkan chain owns the two
-    // dominant post-demosaic neighbourhood passes. Spatial NR writes a device-local
-    // intermediate, a compute barrier hands it directly to visible chroma, and only
-    // the final strip is published directly as packed BGR8. The CPU implementation below is a typed
-    // fallback and is not executed in parallel with a successful GPU capture.
-    auto& residentTelemetry = visibleChromaState.telemetry;
-    residentTelemetry.plan = bncam::spectra2::buildVisibleChromaPlan(
-            visibleChromaProcessingEnabled,
-            residualNoiseState.predictedVisibleVarianceRG,
-            residualNoiseState.predictedVisibleVarianceBG,
-            residualNoiseState.predictedVisibleCovarianceRgBg,
-            residualNoiseState.modelConfidence,
-            budgetState.downstreamChromaAuthority,
-            visibleChromaConfiguredStrength,
-            residualNoiseState.visibleChromaPlanningPressure
-    );
-    const bncam::spectra2::OpponentCovariance2 residentCovariance =
-            bncam::spectra2::makeOpponentCovariance(
-                    residentTelemetry.plan.predictedVarianceRG,
-                    residentTelemetry.plan.predictedVarianceBG,
-                    residentTelemetry.plan.predictedCovarianceRgBg
-            );
-    constexpr int kResidentPostDemosaicOutputRows = 512;
-    constexpr int kResidentPostDemosaicHaloRows = 5;
-    constexpr std::uint64_t kResidentPostDemosaicTransientBytes =
-            192ull * 1024ull * 1024ull;
-    const bncam::spectra2::VulkanOpponentStripPlan residentPostDemosaicPlan =
-            buildResidentPostDemosaicStripPlan(
-                    demosaicInputWidth,
-                    demosaicInputHeight,
-                    kResidentPostDemosaicOutputRows,
-                    kResidentPostDemosaicHaloRows,
-                    kResidentPostDemosaicTransientBytes
-            );
-    const auto residentRuntimeSnapshot =
-            bncam::vulkan::VulkanRuntime::instance().snapshot();
-    residentTelemetry.vulkanResidentKernelConnected = std::any_of(
-            residentRuntimeSnapshot.activeProductionStages.begin(),
-            residentRuntimeSnapshot.activeProductionStages.end(),
-            [](const std::string& stage) {
-                return stage == "SPECTRA_FP32_POST_DEMOSAIC_CHAIN_RESIDENT" ||
-                        stage == "SPECTRA_FP32_SPATIAL_NR_VISIBLE_CHROMA_RESIDENT_STRIPED";
-            }
-    );
-    residentTelemetry.vulkanResidentStripCount = static_cast<int>(
-            residentPostDemosaicPlan.strips.size()
-    );
-    residentTelemetry.vulkanResidentExecutionStatus = residentPostDemosaicPlan.status;
-    residentTelemetry.vulkanResidentAuthority =
-            "GPU_SPATIAL_NR_AND_VISIBLE_CHROMA_PRIMARY_CPU_TYPED_FALLBACK_ONLY";
-
-    // The resident tone -> spatial-NR -> visible-chroma chain is the active production path.
-    const bool shouldRunResidentPostDemosaic =
-            isNoiseModelActive &&
-            residentTelemetry.vulkanResidentKernelConnected &&
-            residentRuntimeSnapshot.state == bncam::vulkan::RuntimeState::READY &&
-            residentPostDemosaicPlan.valid;
-    if (shouldRunResidentPostDemosaic) {
-        residentTelemetry.vulkanResidentAttempted = true;
-        const bool toneResidentHandoff = vulkanToneApplied &&
-                vulkanTone.residentToneGeneration != 0u;
-        cv::Mat residentGpuOutput(
-                demosaicInputHeight, demosaicInputWidth, CV_8UC3);
-        StripedResidentPostDemosaicExecution residentExecution{};
-        if (toneResidentHandoff) {
-            // 8H-K primary path: the tone buffer is resolved inside VulkanRuntime and
-            // consumed directly by spatial NR. There is no CPU tone readback, no
-            // host-side strip packing, and no RGB re-upload between these stages.
-            residentExecution = executeResidentTonePostDemosaic(
-                    demosaicInputWidth,
-                    demosaicInputHeight,
-                    vulkanTone.residentToneGeneration,
-                    residentGpuOutput,
-                    residentPostDemosaicPlan,
-                    appliedLumaSigma,
-                    lumaRangeThresholdMean,
-                    chromaRangeThresholdMean,
-                    effectiveOuterRingAuthority,
-                    spectraNoiseActive,
-                    profileNrPlan.luminance,
-                    profileNrPlan.luminanceDetail,
-                    profileNrPlan.luminanceContrast,
-                    profileNrPlan.color,
-                    profileNrPlan.colorDetail,
-                    profileNrPlan.colorSmoothness,
-                    chromaNrStrength,
-                    uiConfig.chromaUserScale,
-                    budgetState.downstreamChromaAuthority,
-                    spectraResidualNr.inputLumaSigma,
-                    budgetState.downstreamLumaAuthority,
-                    bncam::spectra2::resolveVisibleChromaLumaGuardSigma(
-                            residualNoiseState.predictedVisibleVarianceY,
-                            residentTelemetry.plan.sigmaRG,
-                            residentTelemetry.plan.sigmaBG
-                    ),
-                    residentTelemetry.plan,
-                    residentCovariance,
-                    uiConfig.profileSpectraLuma,
-                    uiConfig.profileSpectraDetailProtection
-            );
-            residentTelemetry.vulkanResidentAuthority =
-                    "GPU_TONE_TO_SPATIAL_VISIBLE_CHROMA_RESIDENT_CPU_TYPED_FALLBACK_ONLY";
-        } else {
-            // Compatibility path for captures whose upstream tone stage already materialized
-            // a CPU RGB surface. This remains the old striped Vulkan route, not a shadow run.
-            const cv::Mat& immutableResidentInput = linearRgb;
-            residentGpuOutput = cv::Mat(linearRgb.size(), CV_8UC3);
-            residentExecution = executeStripedResidentPostDemosaic(
-                    immutableResidentInput,
-                    residentGpuOutput,
-                    residentPostDemosaicPlan,
-                    appliedLumaSigma,
-                    lumaRangeThresholdMean,
-                    chromaRangeThresholdMean,
-                    effectiveOuterRingAuthority,
-                    spectraNoiseActive,
-                    profileNrPlan.luminance,
-                    profileNrPlan.luminanceDetail,
-                    profileNrPlan.luminanceContrast,
-                    profileNrPlan.color,
-                    profileNrPlan.colorDetail,
-                    profileNrPlan.colorSmoothness,
-                    chromaNrStrength,
-                    uiConfig.chromaUserScale,
-                    budgetState.downstreamChromaAuthority,
-                    spectraResidualNr.inputLumaSigma,
-                    budgetState.downstreamLumaAuthority,
-                    bncam::spectra2::resolveVisibleChromaLumaGuardSigma(
-                            residualNoiseState.predictedVisibleVarianceY,
-                            residentTelemetry.plan.sigmaRG,
-                            residentTelemetry.plan.sigmaBG
-                    ),
-                    residentTelemetry.plan,
-                    residentCovariance,
-                    uiConfig.profileSpectraLuma,
-                    uiConfig.profileSpectraDetailProtection
-            );
-        }
-        residentTelemetry.vulkanResidentStripCount = residentExecution.stripCount;
-        residentTelemetry.vulkanResidentExecutionSucceeded = residentExecution.success;
-        residentTelemetry.vulkanResidentUsedForOutput = residentExecution.success;
-        residentTelemetry.vulkanResidentTimestampQueryUsed =
-                residentExecution.timestampQueryUsed;
-        residentTelemetry.vulkanResidentPersistentReuseObserved =
-                residentExecution.persistentReuseObserved;
-        residentTelemetry.vulkanResidentPersistentReallocated =
-                residentExecution.persistentReallocated;
-        residentTelemetry.vulkanResidentSuccessfulStripCount =
-                residentExecution.successfulStripCount;
-        residentTelemetry.vulkanResidentPersistentReuseHitCount =
-                residentExecution.persistentReuseHitCount;
-        residentTelemetry.vulkanResidentPersistentReallocationCount =
-                residentExecution.persistentReallocationCount;
-        residentTelemetry.vulkanResidentInputPackingMs = residentExecution.inputPackingMs;
-        residentTelemetry.vulkanResidentSpatialKernelMs = residentExecution.spatialKernelMs;
-        residentTelemetry.vulkanResidentVisibleKernelMs = residentExecution.visibleKernelMs;
-        residentTelemetry.vulkanResidentGpuKernelMs = residentExecution.gpuKernelMs;
-        residentTelemetry.vulkanResidentSynchronizationMs =
-                residentExecution.synchronizationMs;
-        residentTelemetry.vulkanResidentReadbackMs = residentExecution.readbackMs;
-        residentTelemetry.vulkanResidentTransferAndSyncMs =
-                residentExecution.transferAndSyncMs;
-        residentTelemetry.vulkanResidentTotalMs = residentExecution.totalMs;
-        residentTelemetry.vulkanResidentInputBytes = residentExecution.inputBytes;
-        residentTelemetry.vulkanResidentIntermediateBytes =
-                residentExecution.intermediateBytes;
-        residentTelemetry.vulkanResidentOutputBytes = residentExecution.outputBytes;
-        residentTelemetry.vulkanResidentSpatialMapBytes = residentExecution.spatialMapBytes;
-        residentTelemetry.vulkanResidentPersistentResidentBytes =
-                residentExecution.persistentResidentBytes;
-        residentTelemetry.vulkanResidentAllocationGeneration =
-                residentExecution.persistentAllocationGeneration;
-        residentTelemetry.vulkanResidentExecutionStatus = residentExecution.status;
-        residentTelemetry.vulkanResidentFailureReason = residentExecution.failureReason;
-
-        if (residentExecution.success) {
-            residentPublishedBgr8 = std::move(residentGpuOutput);
-            residentPublicationStats = residentExecution.publicationStats;
-            linearRgb.release();
-            residentPostDemosaicApplied = true;
-            residentOutputSrgbEncoded = true;
-            finalOutSpatialNrMs = residentExecution.spatialKernelMs > 0.0f
-                    ? residentExecution.spatialKernelMs
-                    : residentExecution.totalMs;
-
-            const auto& spatial = residentExecution.spatialCounters;
-            const std::uint64_t spatialProcessed = std::max<std::uint64_t>(1u, spatial[0]);
-            const std::uint64_t spatialSamples = std::max<std::uint64_t>(1u, spatial[3]);
-            constexpr double kSpatialDeltaQ16 = 65535.0;
-            constexpr double kSpatialMetricQ12 = 4095.0;
-            g_threadLocalIspStats.processedPixelCount = spatial[0];
-            g_threadLocalIspStats.changedPixelCount = spatial[1];
-            g_threadLocalIspStats.changedPixelFraction = static_cast<float>(
-                    static_cast<double>(spatial[1]) / spatialProcessed
-            );
-            g_threadLocalIspStats.meanAbsLumaDelta = static_cast<float>(
-                    static_cast<double>(spatial[4]) /
-                            (kSpatialDeltaQ16 * spatialSamples)
-            );
-            g_threadLocalIspStats.meanAbsChromaDelta = static_cast<float>(
-                    static_cast<double>(spatial[5]) /
-                            (kSpatialDeltaQ16 * spatialSamples)
-            );
-            g_threadLocalIspStats.maxLumaDelta = residentExecution.maximumLumaDelta;
-            g_threadLocalIspStats.maxChromaDelta = residentExecution.maximumChromaDelta;
-            g_threadLocalIspStats.avgNeighbourAcceptanceRate = static_cast<float>(
-                    static_cast<double>(spatial[8]) /
-                            (kSpatialMetricQ12 * spatialSamples)
-            );
-            g_threadLocalIspStats.avgNonCentreSampleWeight = static_cast<float>(
-                    64.0 * static_cast<double>(spatial[9]) /
-                            (kSpatialMetricQ12 * spatialSamples)
-            );
-            g_threadLocalIspStats.avgTotalFilterWeight = static_cast<float>(
-                    256.0 * static_cast<double>(spatial[10]) /
-                            (kSpatialMetricQ12 * spatialSamples)
-            );
-            g_threadLocalIspStats.avgAppliedBlend = static_cast<float>(
-                    static_cast<double>(spatial[11]) /
-                            (kSpatialMetricQ12 * spatialSamples)
-            );
-            g_threadLocalIspStats.edgeProtectedPixelFraction = static_cast<float>(
-                    static_cast<double>(spatial[2]) /
-                            (static_cast<double>(spatialProcessed) * 25.0)
-            );
-
-            residentTelemetry.textureClassifierExecuted = (spatialSamples > 0);
-            residentTelemetry.adaptiveLumaExecuted = (spatialSamples > 0);
-            residentTelemetry.avgStructureConfidence = static_cast<float>(
-                    static_cast<double>(spatial[12]) / (kSpatialMetricQ12 * spatialSamples)
-            );
-            residentTelemetry.avgAppliedLumaAuthority = static_cast<float>(
-                    static_cast<double>(spatial[13]) / (kSpatialMetricQ12 * spatialSamples)
-            );
-            residentTelemetry.avgAppliedChromaAuthority = static_cast<float>(
-                    static_cast<double>(spatial[11]) / (kSpatialMetricQ12 * spatialSamples)
-            );
-            residentTelemetry.smoothRegionPercentage = static_cast<float>(
-                    100.0 * static_cast<double>(spatial[14]) / spatialSamples
-            );
-            residentTelemetry.protectedTexturePercentage = static_cast<float>(
-                    100.0 * static_cast<double>(spatial[15]) / spatialSamples
-            );
-            residentTelemetry.minStructureConfidence = std::clamp(
-                    residentTelemetry.avgStructureConfidence * 0.15f, 0.0f, 1.0f);
-            residentTelemetry.maxStructureConfidence = std::clamp(
-                    residentTelemetry.avgStructureConfidence * 1.85f + 0.10f, 0.0f, 1.0f);
-            const float combinedAuthority = std::clamp(
-                    0.55f * residentTelemetry.avgAppliedLumaAuthority +
-                    0.45f * residentTelemetry.avgAppliedChromaAuthority,
-                    0.0f,
-                    0.85f
-            );
-            g_threadLocalIspStats.preDenoiseResidualEstimate =
-                    appliedChromaSigma * 1.414f + appliedLumaSigma * 0.707f;
-            g_threadLocalIspStats.postDenoiseResidualEstimate =
-                    g_threadLocalIspStats.preDenoiseResidualEstimate *
-                    (1.0f - combinedAuthority);
-            g_threadLocalIspStats.postSharpenResidualEstimate =
-                    g_threadLocalIspStats.postDenoiseResidualEstimate * 1.05f;
-
-            const auto& visible = residentExecution.visibleCounters;
-            residentTelemetry.processedPixelCount = visible[0];
-            residentTelemetry.candidatePixelCount = visible[1];
-            residentTelemetry.changedPixelCount = visible[2];
-            residentTelemetry.lumaEdgeProtectedPixelCount = visible[3];
-            residentTelemetry.colourEdgeProtectedPixelCount = visible[4];
-            residentTelemetry.saturationProtectedPixelCount = visible[5];
-            residentTelemetry.fullyAcceptedPixelCount = visible[6];
-            residentTelemetry.partiallyAcceptedPixelCount = visible[7];
-            residentTelemetry.rejectedPixelCount = visible[8];
-            const double safeVisibleProcessed = static_cast<double>(
-                    std::max<std::uint64_t>(1u, residentTelemetry.processedPixelCount)
-            );
-            const double visibleSamples = static_cast<double>(
-                    std::max<std::uint64_t>(1u, visible[9])
-            );
-            residentTelemetry.changedPixelFraction = static_cast<float>(
-                    static_cast<double>(residentTelemetry.changedPixelCount) /
-                            safeVisibleProcessed
-            );
-            residentTelemetry.meanAcceptance = static_cast<float>(
-                    static_cast<double>(visible[10]) /
-                            (kSpatialMetricQ12 * visibleSamples)
-            );
-            residentTelemetry.meanColourShift = static_cast<float>(
-                    static_cast<double>(visible[11]) /
-                            (kSpatialMetricQ12 * visibleSamples)
-            );
-            residentTelemetry.maximumColourShift =
-                    residentExecution.maximumColourShift;
-            residentTelemetry.meanNoiseImprovement = static_cast<float>(
-                    static_cast<double>(visible[12]) /
-                            (kSpatialMetricQ12 * visibleSamples)
-            );
-            residentTelemetry.edgePreservationScore = static_cast<float>(
-                    1.0 - std::clamp(
-                            static_cast<double>(visible[13]) /
-                                    (kSpatialMetricQ12 * visibleSamples),
-                            0.0,
-                            1.0
-                    )
-            );
-            residentTelemetry.oversmoothingScore = static_cast<float>(std::clamp(
-                    static_cast<double>(visible[14]) /
-                            (kSpatialMetricQ12 * visibleSamples),
-                    0.0,
-                    1.0
-            ));
-            residentTelemetry.inputMeasurementMs = 0.0f;
-            residentTelemetry.inputVarianceRG = residentTelemetry.plan.predictedVarianceRG;
-            residentTelemetry.inputVarianceBG = residentTelemetry.plan.predictedVarianceBG;
-            residentTelemetry.inputCovarianceRgBg =
-                    residentTelemetry.plan.predictedCovarianceRgBg;
-            residentTelemetry.inputResidualSampleCount = 0;
-            residentTelemetry.processingTimeMs = residentExecution.totalMs;
-            residentTelemetry.pixelBackend =
-                    "VULKAN_FP32_RESIDENT_SPATIAL_NR_VISIBLE_CHROMA";
-            residentTelemetry.pixelBackendSelectionReason =
-                    "M8H_DEVICE_LOCAL_INTERMEDIATE_NO_CPU_SHADOW_EXECUTION";
-            residentTelemetry.pixelBackendFallbackReason = "none";
-            residentTelemetry.opponentVectorizedPixelCount =
-                    residentTelemetry.processedPixelCount;
-            residentTelemetry.opponentScalarPixelCount = 0u;
-            residentTelemetry.opponentEstimatedBytesRead =
-                    residentExecution.inputBytes + residentExecution.spatialMapBytes;
-            residentTelemetry.opponentEstimatedBytesWritten =
-                    residentExecution.outputBytes;
-            residentTelemetry.opponentPeakScratchBytes =
-                    residentExecution.persistentResidentBytes;
-            residentTelemetry.opponentTileCount = residentExecution.stripCount;
-            residentTelemetry.opponentTileSize = residentPostDemosaicPlan.targetOutputRows;
-            residentTelemetry.opponentTileBuildMs = residentExecution.totalMs;
-            residentTelemetry.mutexFreeTileReduction = true;
-            residentTelemetry.vulkanResidentStatisticsMethod =
-                    "GPU_16X16_STRATIFIED_COUNTS_AND_Q12_SAMPLES_NO_CPU_FULL_FRAME_MEASUREMENT";
-            if (residentTelemetry.plan.enabled) {
-                finalizeVisibleChromaResidualState(
-                        linearRgb,
-                        residualNoiseState,
-                        residentTelemetry,
-                        false
-                );
-            } else {
-                residentTelemetry.applied = false;
-                residentTelemetry.resultStatus =
-                        "GPU_SPATIAL_NR_APPLIED_VISIBLE_CHROMA_BYPASSED_" +
-                        residentTelemetry.plan.status;
-                residualNoiseState.postVisibleChroma = residualNoiseState.postTone;
-                residualNoiseState.postVisibleChroma.stage =
-                        "POST_VISIBLE_CHROMA_BYPASS_AFTER_GPU_SPATIAL_NR";
-                residualNoiseState.postVisibleChroma.method =
-                        "M8H_GPU_SPATIAL_NR_VISIBLE_CHROMA_BYPASS";
-                residualNoiseState.postVisibleChroma.status = "BYPASSED";
-            }
-            visibleChromaState.telemetry = residentTelemetry;
-        } else {
-            residentTelemetry.vulkanResidentCpuFallbackUsed = true;
-            residentTelemetry.pixelBackendFallbackReason =
-                    "M8H_TYPED_RESIDENT_CHAIN_FAILURE_CPU_REFERENCE_FALLBACK";
-        }
-    } else {
-        residentTelemetry.vulkanResidentCpuFallbackUsed = true;
-        if (!isNoiseModelActive) {
-            residentTelemetry.vulkanResidentFailureReason = "NO_NOISE_PROCESSING_REQUESTED";
-        } else if (!residentTelemetry.vulkanResidentKernelConnected) {
-            residentTelemetry.vulkanResidentFailureReason =
-                    "RESIDENT_POST_DEMOSAIC_SHADER_NOT_CONNECTED";
-        } else if (residentRuntimeSnapshot.state != bncam::vulkan::RuntimeState::READY) {
-            residentTelemetry.vulkanResidentFailureReason = "VULKAN_RUNTIME_NOT_READY";
-        } else {
-            residentTelemetry.vulkanResidentFailureReason = residentPostDemosaicPlan.status;
-        }
-        residentTelemetry.vulkanResidentExecutionStatus =
-                residentTelemetry.vulkanResidentFailureReason;
-    }
 
     // 8H-K typed recovery: if the resident tone->post-demosaic handoff failed (or the
     // post-demosaic stage is intentionally bypassed), materialize the already-computed tone
@@ -15947,14 +14067,11 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     phase16ValidationInput.chromaCloudRiskEvidence =
             residualNoiseState.demosaicChromaCloudRiskEvidence;
     phase16ValidationInput.chromaCloudRiskStatus = residualNoiseState.demosaicChromaCloudRiskStatus;
-    phase16ValidationInput.linearDetailEvaluatedPixels = vulkanToneApplied
-            ? vulkanTone.linearDetailEvaluatedPixels : linearDetailCpuFallback.evaluatedPixels;
-    phase16ValidationInput.linearDetailEdgeSupportedPixels = vulkanToneApplied
-            ? vulkanTone.linearDetailEdgeSupportedPixels : linearDetailCpuFallback.edgeSupportedPixels;
-    phase16ValidationInput.linearDetailNoiseRejectedPixels = vulkanToneApplied
-            ? vulkanTone.linearDetailNoiseRejectedPixels : linearDetailCpuFallback.noiseRejectedPixels;
-    phase16ValidationInput.linearDetailHaloClampedPixels = vulkanToneApplied
-            ? vulkanTone.linearDetailHaloClampedPixels : linearDetailCpuFallback.haloClampedPixels;
+    // Phase-11 automatic detail owner is retired; keep compatibility validation fields neutral.
+    phase16ValidationInput.linearDetailEvaluatedPixels = 0u;
+    phase16ValidationInput.linearDetailEdgeSupportedPixels = 0u;
+    phase16ValidationInput.linearDetailNoiseRejectedPixels = 0u;
+    phase16ValidationInput.linearDetailHaloClampedPixels = 0u;
     phase16ValidationInput.perceptualDetailEvaluatedPixels = vulkanTone.perceptualDetailEvaluatedPixels;
     phase16ValidationInput.perceptualDetailEdgeSupportedPixels = vulkanTone.perceptualDetailEdgeSupportedPixels;
     phase16ValidationInput.perceptualDetailNoiseRejectedPixels = vulkanTone.perceptualDetailNoiseRejectedPixels;
@@ -15984,7 +14101,6 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             (greenSplitDebug.applied ? 1 : 0) +
             (lensDebug.applied ? 1 : 0) +
             (highlightDebug.applied ? 1 : 0) +
-            (linearDetailPlan.enabled ? 1 : 0) +
             (visibleChromaState.telemetry.plan.enabled ? 1 : 0);
     const int bufferReuseHitCount = demosaicRunStats.allocationReuse ? 1 : 0;
     const auto reductionPct = [](float before, float after) -> float {
@@ -16256,42 +14372,32 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; localToneEnabled=" << "false"
             << "; localToneBackend=" << "RETIRED_PHASE5_FLLF_SINGLE_TONE_OWNER"
             << "; localToneAdjustedPixels=" << vulkanTone.localToneAdjustedPixels
-            << "; phase11LinearDetailEnabled=" << (linearDetailPlan.enabled ? "true" : "false")
-            << "; phase11LinearDetailAuthoritySource=" << linearDetailPlan.authoritySource
-            << "; phase11LinearDetailRuntimeOrder=POST_CCM_LINEAR_BEFORE_LOG2_FLLF_PBR_NEUTRAL"
-            << "; phase11LinearDetailAuthority=" << linearDetailPlan.authority
-            << "; phase11LinearDetailRadius=" << linearDetailPlan.radius
-            << "; phase11LinearDetailEmphasis=" << linearDetailPlan.detailEmphasis
-            << "; phase11LinearDetailMasking=" << linearDetailPlan.masking
-            << "; phase11LinearDetailMinimumResidualSnr=" << linearDetailPlan.minimumResidualSnr
-            << "; phase11LinearDetailMinimumGradientSnr=" << linearDetailPlan.minimumGradientSnr
-            << "; phase11LinearDetailHardHaloLimit=" << linearDetailPlan.hardHaloLimit
-            << "; phase11LinearDetailPreToneLumaSigma=" << linearDetailPlan.preToneLumaSigma
-            << "; phase11LinearDetailReferenceSignal=" << linearDetailPlan.referenceSignal
-            << "; phase11LinearDetailShotNoiseFraction=" << linearDetailPlan.shotNoiseFraction
-            << "; phase11LinearDetailModelConfidence=" << linearDetailPlan.modelConfidence
-            << "; phase11LinearDetailPredictedVarianceGain=" << linearDetailPlan.predictedLumaVarianceGain
-            << "; phase11LinearDetailBackend="
-            << (vulkanToneApplied && vulkanTone.linearDetailRequested ? "VULKAN_RESIDENT" :
-                (linearDetailCpuFallback.attempted ? "CPU_FAILURE_REFERENCE" : "BYPASSED"))
-            << "; phase11LinearDetailApplied="
-            << ((vulkanToneApplied ? vulkanTone.linearDetailApplied : linearDetailCpuFallback.applied) ? "true" : "false")
-            << "; phase11LinearDetailEvaluatedPixels="
-            << (vulkanToneApplied ? vulkanTone.linearDetailEvaluatedPixels : linearDetailCpuFallback.evaluatedPixels)
-            << "; phase11LinearDetailChangedPixels="
-            << (vulkanToneApplied ? vulkanTone.linearDetailChangedPixels : linearDetailCpuFallback.changedPixels)
-            << "; phase11LinearDetailEdgeSupportedPixels="
-            << (vulkanToneApplied ? vulkanTone.linearDetailEdgeSupportedPixels : linearDetailCpuFallback.edgeSupportedPixels)
-            << "; phase11LinearDetailNoiseRejectedPixels="
-            << (vulkanToneApplied ? vulkanTone.linearDetailNoiseRejectedPixels : linearDetailCpuFallback.noiseRejectedPixels)
-            << "; phase11LinearDetailHaloClampedPixels="
-            << (vulkanToneApplied ? vulkanTone.linearDetailHaloClampedPixels : linearDetailCpuFallback.haloClampedPixels)
-            << "; phase11LinearDetailMeanAbsCorrection=" << vulkanTone.linearDetailMeanAbsCorrection
-            << "; phase11LinearDetailMaxAbsCorrection="
-            << (vulkanToneApplied ? vulkanTone.linearDetailMaxAbsCorrection : linearDetailCpuFallback.maxAbsCorrection)
-            << "; phase11LinearDetailKernelMs="
-            << (vulkanToneApplied ? vulkanTone.linearDetailKernelMs : linearDetailCpuFallback.processingMs)
-            << "; phase11LinearDetailScratchBytes=" << vulkanTone.linearDetailScratchBytes
+            << "; phase11LinearDetailEnabled=false"
+            << "; phase11LinearDetailAuthoritySource=RETIRED_N004_AUTOMATIC_OWNER_REMOVED"
+            << "; phase11LinearDetailRuntimeOrder=RETIRED"
+            << "; phase11LinearDetailAuthority=0"
+            << "; phase11LinearDetailRadius=0"
+            << "; phase11LinearDetailEmphasis=0"
+            << "; phase11LinearDetailMasking=0"
+            << "; phase11LinearDetailMinimumResidualSnr=0"
+            << "; phase11LinearDetailMinimumGradientSnr=0"
+            << "; phase11LinearDetailHardHaloLimit=0"
+            << "; phase11LinearDetailPreToneLumaSigma=0"
+            << "; phase11LinearDetailReferenceSignal=0"
+            << "; phase11LinearDetailShotNoiseFraction=0"
+            << "; phase11LinearDetailModelConfidence=0"
+            << "; phase11LinearDetailPredictedVarianceGain=1"
+            << "; phase11LinearDetailBackend=RETIRED"
+            << "; phase11LinearDetailApplied=false"
+            << "; phase11LinearDetailEvaluatedPixels=0"
+            << "; phase11LinearDetailChangedPixels=0"
+            << "; phase11LinearDetailEdgeSupportedPixels=0"
+            << "; phase11LinearDetailNoiseRejectedPixels=0"
+            << "; phase11LinearDetailHaloClampedPixels=0"
+            << "; phase11LinearDetailMeanAbsCorrection=0"
+            << "; phase11LinearDetailMaxAbsCorrection=0"
+            << "; phase11LinearDetailKernelMs=0"
+            << "; phase11LinearDetailScratchBytes=0"
             << "; phase12PerceptualDetailEnabled=" << (perceptualDetailPlan.enabled ? "true" : "false")
             << "; phase12PerceptualDetailAuthoritySource=" << perceptualDetailPlan.authoritySource
             << "; phase12PerceptualDetailRuntimeOrder=POST_LOG2_FLLF_PBR_NEUTRAL_PROFILE_COLOR_BEFORE_OUTPUT_ARTIFACTS"
@@ -16433,9 +14539,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                                                     ? "PURE_MALVAR_HE_CUTLER_2004"
                                                     : "WIRED_NO_RECONSTRUCTION_AUTHORITY_FOR_SELECTED_ALGORITHM")
             << "; demosaicCfaEvidenceSource="
-            << (demosaicPhysicalEvidenceActive
-                    ? "PHYSICAL_SINGLE_FRAME_SO"
-                    : (budgetState.spectraMode != 0 ? "SPECTRA" : "NONE"))
+            << (budgetState.spectraMode != 0 ? "SPECTRA" : "NONE")
             << "; demosaicCfaEvidenceAvailable=" << (demosaicCfaEvidence.available ? "true" : "false")
             << "; demosaicCfaCommonOpponentSupport=" << demosaicCfaEvidence.commonOpponentSupport
             << "; demosaicNoiseContextAvailable=" << (demosaicNoiseContext.available ? "true" : "false")
@@ -16443,14 +14547,14 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; demosaicNoiseSigmaY=" << demosaicNoiseContext.sigmaY
             << "; demosaicNoiseSigmaChroma=" << demosaicNoiseContext.sigmaChroma
             << "; demosaicNoisePressure=" << demosaicNoiseContext.pressure
-            << "; phase6ResidualChromaPlanEnabled=" << (phase6ResidualChromaPlan.enabled ? "true" : "false")
-            << "; phase6ResidualChromaPlanStatus=" << phase6ResidualChromaPlan.status
-            << "; phase6ResidualChromaAuthority=PHYSICAL_SIGMA_TOPOLOGY_ONLY"
+            << "; phase6ResidualChromaPlanEnabled=" << (phase6ResidualChromaPlanEnabled ? "true" : "false")
+            << "; phase6ResidualChromaPlanStatus=" << phase6ResidualChromaPlanStatus
+            << "; phase6ResidualChromaAuthority=RETIRED_NO_PIXEL_AUTHORITY"
             << "; phase6ResidualChromaLumaMutation=false"
-            << "; phase6ResidualChromaBandOwner=LOCAL_DEMOSAIC_ARTIFACT_TOPOLOGY"
-            << "; phase6ResidualChromaLowFrequencyCloudOwner=UNCHANGED_SEPARATE_OWNER"
-            << "; phase6ResidualChromaNoisePropagation=CONSERVATIVE_NO_VARIANCE_CREDIT"
-            << "; phase6ResidualChromaRequested=" << (phase6ResidualChromaPlan.enabled ? "true" : "false")
+            << "; phase6ResidualChromaBandOwner=NONE"
+            << "; phase6ResidualChromaLowFrequencyCloudOwner=NONE"
+            << "; phase6ResidualChromaNoisePropagation=IDENTITY"
+            << "; phase6ResidualChromaRequested=" << (phase6ResidualChromaPlanEnabled ? "true" : "false")
             << "; phase6ResidualChromaUsedForOutput=" << (phase6ResidualChromaUsedForOutput ? "true" : "false")
             << "; phase6ResidualChromaExecutionBackend=" << phase6ExecutionBackend
             << "; phase6ResidualChromaGpuUsed=" << (phase6ResidualChromaGpuUsed ? "true" : "false")
@@ -16529,12 +14633,12 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; autoAmazePrior=" << demosaicResolution.autoAmazePrior
             << "; autoSignals=" << demosaicResolution.autoSignals
             << "; baseChromaDenoiseStrength=" << baseChromaNrStrength
-            << "; physicalChromaModelDriven=" << (physicalChromaBasePlan.modelDriven ? "true" : "false")
-            << "; physicalChromaRawNoiseSigma=" << physicalChromaBasePlan.rawNoiseSigma
-            << "; physicalChromaCalibratedNoiseSigma=" << physicalChromaBasePlan.calibratedNoiseSigma
-            << "; physicalChromaModelConfidence=" << physicalChromaBasePlan.modelConfidence
-            << "; physicalChromaCombinedNoisePressure=" << physicalChromaBasePlan.combinedNoisePressure
-            << "; physicalChromaAuthoritySource=MAX_RENDER_GAIN_OR_CAPTURE_ISO"
+            << "; physicalChromaModelDriven=false"
+            << "; physicalChromaRawNoiseSigma=0.0000"
+            << "; physicalChromaCalibratedNoiseSigma=0.0000"
+            << "; physicalChromaModelConfidence=0.0000"
+            << "; physicalChromaCombinedNoisePressure=0.0000"
+            << "; physicalChromaAuthoritySource=RETIRED_N003"
             << "; chromaDenoiseStrength=" << chromaNrStrength
             << "; sensorNoiseVarianceFormula=S*x+O"
             << "; sensorNoiseVarianceSamples=" << g_threadLocalIspStats.sensorNoiseVarianceSamples
@@ -17192,49 +15296,11 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << residualNoiseState.demosaicChromaCloudRiskEvidence
             << "; spectraDemosaicChromaCloudRiskStatus="
             << residualNoiseState.demosaicChromaCloudRiskStatus
-            << "; spectraDemosaicChromaCloudPlanReady="
-            << (residualNoiseState.demosaicChromaCloudCorrectionPlan.ready ? "true" : "false")
-            << "; spectraDemosaicChromaCloudPlanStatus="
-            << residualNoiseState.demosaicChromaCloudCorrectionPlan.status
-            << "; spectraDemosaicChromaCloudPlanRedAuthority="
-            << residualNoiseState.demosaicChromaCloudCorrectionPlan.redAuthority
-            << "; spectraDemosaicChromaCloudPlanBlueAuthority="
-            << residualNoiseState.demosaicChromaCloudCorrectionPlan.blueAuthority
-            << "; spectraDemosaicChromaCloudPlanRedWbGainPressure="
-            << residualNoiseState.demosaicChromaCloudCorrectionPlan.redWbGainPressure
-            << "; spectraDemosaicChromaCloudPlanBlueWbGainPressure="
-            << residualNoiseState.demosaicChromaCloudCorrectionPlan.blueWbGainPressure
-            << "; spectraDemosaicChromaCloudPlanRedCcmGainPressure="
-            << residualNoiseState.demosaicChromaCloudCorrectionPlan.redCcmGainPressure
-            << "; spectraDemosaicChromaCloudPlanBlueCcmGainPressure="
-            << residualNoiseState.demosaicChromaCloudCorrectionPlan.blueCcmGainPressure
-            << "; spectraDemosaicChromaCloudPlanMaxAbs="
-            << residualNoiseState.demosaicChromaCloudCorrectionPlan.maxAbsoluteCorrection
-            << "; spectraDemosaicChromaCloudPlanRms="
-            << residualNoiseState.demosaicChromaCloudCorrectionPlan.correctionRms
-            << "; spectraDemosaicChromaCloudPlanP90="
-            << residualNoiseState.demosaicChromaCloudCorrectionPlan.correctionP90
-            << "; spectraDemosaicChromaCloudPlanShadowBoostedTileCount="
-            << residualNoiseState.demosaicChromaCloudCorrectionPlan.shadowBoostedTileCount
-            << "; spectraDemosaicChromaCloudPlanMeanShadowAuthorityBoost="
-            << residualNoiseState.demosaicChromaCloudCorrectionPlan.meanShadowAuthorityBoost
-            << "; spectraDemosaicChromaCloudPlanMaxShadowAuthorityBoost="
-            << residualNoiseState.demosaicChromaCloudCorrectionPlan.maxShadowAuthorityBoost
-            << "; spectraPreWbCloudTransportContractReady="
-            << (residualNoiseState.demosaicChromaCloudCorrectionPlan.ready ? "true" : "false")
-            << "; spectraPreWbCloudGpuMapUploaded="
-            << (vulkanColorTransform.cloudCorrectionMapUploaded ? "true" : "false")
-            << "; spectraPreWbCloudSpatialCorrectionApplied="
-            << ((vulkanColorTransform.success && vulkanColorTransform.cloudCorrectionApplied) ||
-                (!vulkanColorTransform.success &&
-                 residualNoiseState.demosaicChromaCloudCorrectionPlan.ready) ? "true" : "false")
-            << "; spectraPreWbCloudGpuMapBytes=" << vulkanColorTransform.cloudCorrectionMapBytes
-            << "; spectraPreWbCloudMeanAbsCorrectionRG="
-            << vulkanColorTransform.cloudMeanAbsCorrectionRG
-            << "; spectraPreWbCloudMeanAbsCorrectionBG="
-            << vulkanColorTransform.cloudMeanAbsCorrectionBG
-            << "; spectraPreWbCloudAffectedPixelFraction="
-            << vulkanColorTransform.cloudAffectedPixelFraction
+            << "; spectraDemosaicChromaCloudPlanReady=false"
+            << "; spectraDemosaicChromaCloudPlanStatus=RETIRED_CLASSICAL_PIXEL_OWNER_NEURAL_PENDING"
+            << "; spectraPreWbCloudTransportContractReady=false"
+            << "; spectraPreWbCloudGpuMapUploaded=false"
+            << "; spectraPreWbCloudSpatialCorrectionApplied=false"
             << "; spectraVisibleChromaPlanningPressure="
             << residualNoiseState.visibleChromaPlanningPressure
             << "; spectraPredictedVisibleVarianceY=" << residualNoiseState.predictedVisibleVarianceY
@@ -17311,9 +15377,8 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; dynamicIsoMultiplier=" << dynamicIsoMultiplier
             << "; finalChromaDenoiseStrengthBeforeClamp=" << finalChromaNrStrengthBeforeClamp
             << "; finalChromaDenoiseStrengthAfterClamp=" << chromaNrStrength
-            << "; budgetedChromaAdditionalStrength=" << budgetedChromaDenoise.budgetedAdditional
-            << "; physicalChromaBaselinePreserved="
-            << (budgetedChromaDenoise.physicalBaselinePreserved ? "true" : "false")
+            << "; budgetedChromaAdditionalStrength=0.0000"
+            << "; physicalChromaBaselinePreserved=false"
             << "; ceilingReached=" << (ceilingReached ? "true" : "false")
             << "; theoreticalSaturatingCoeff=" << theoreticalSaturatingCoeff
             << "; processedPixelCount=" << g_threadLocalIspStats.processedPixelCount
@@ -17330,28 +15395,10 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; edgeProtectedPixelFraction=" << g_threadLocalIspStats.edgeProtectedPixelFraction
             << "; absoluteMeanLumaSigma=" << g_threadLocalIspStats.absoluteMeanLumaSigma
             << "; absoluteMeanChromaSigma=" << g_threadLocalIspStats.absoluteMeanChromaSigma
-            << "; singleFrameRawDenoiseActive=" << (physicalRawDenoiseActive ? "true" : "false")
-            << "; singleFrameRawDenoiseAuthoritySource="
-            << (physicalRawDenoiseActive ? "CAMERA2_SO_PHYSICAL_BASELINE" : "INACTIVE")
-            << "; singleFrameRawNoisePressure=" << singleFrameRawDenoise.physicalNoisePressure
-            << "; singleFrameRawModelConfidence=" << singleFrameRawDenoise.modelConfidence
-            << "; singleFrameRawLumaAuthority=" << singleFrameRawDenoise.lumaAuthority
-            << "; singleFrameRawChromaAuthority=0.0000"
-            << "; singleFrameRawLowFrequencyAuthority=0.0000"
-            << "; singleFrameRawTargetFloorScale=" << singleFrameRawDenoise.targetFloorScale
-            << "; singleFrameRawMinimumResidualRatio=" << singleFrameRawDenoise.minimumResidualRatio
-            << "; singleFrameRawDetailRetentionFloor=" << singleFrameRawDenoise.detailRetentionFloor
-            << "; singleFrameRawMaxLinearShift=" << singleFrameRawDenoise.maxLinearShift
+            << "; physicalNoiseModelAvailable=" << (physicalNoiseModelAvailable ? "true" : "false")
+            << "; physicalNoiseModelPixelAuthority=false"
+            << "; spectraOffPhysicalLumaBaselineActive=false"
             << "; pass1EffectiveMaxLinearShift=" << pass1State.maxLinearShift
-            << "; singleFrameRawPass1Physical=" << (pass1State.physicalBaselineMode ? "true" : "false")
-            << "; singleFrameRawPass2Physical=" << (pass2State.physicalBaselineMode ? "true" : "false")
-            << "; singleFrameRawPass3Physical=" << (pass3State.physicalBaselineMode ? "true" : "false")
-            << "; singleFrameRawPass3LowFreqApplied=" << (pass3State.applyLowFreqChroma ? "true" : "false")
-            << "; singleFrameRawPass3LowFreqConfidence=" << pass3State.lowFreqChromaConfidence
-            << "; singleFrameRawPass3RowBandingApplied=" << (pass3State.applyRowBanding ? "true" : "false")
-            << "; singleFrameRawPass3ColBandingApplied=" << (pass3State.applyColBanding ? "true" : "false")
-            << "; singleFrameRawPreDemosaicLumaReduction=" << physicalPreDemosaicLumaReduction
-            << "; singleFrameRawPreDemosaicChromaReduction=" << physicalPreDemosaicChromaReduction
             << "; residualSeedConfidence=" << residualSeedConfidence.confidence
             << "; residualSeedConfidenceStatus=" << residualSeedConfidence.status
             << "; residualSeedConfidenceMethod=" << residualSeedConfidence.method
@@ -17366,23 +15413,20 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; phase4PhysicalNoiseModelAvailable="
             << (physicalNoiseModelAvailable ? "true" : "false")
             << "; phase4SpectraContextFusionActive=" << (spectraNoiseActive ? "true" : "false")
-            << "; phase4ResidualBudgetActive=" << (spectraResidualNr.active ? "true" : "false")
-            << "; phase4ResidualAuthoritySource=" << spectraResidualNr.authoritySource
-            << "; phase4ResidualCovarianceAuthoritative="
-            << (spectraResidualNr.residualCovarianceAuthoritative ? "true" : "false")
-            << "; phase4DuplicatePhysicalSigmaPrevented="
-            << (spectraResidualNr.duplicatePhysicalSigmaPrevented ? "true" : "false")
-            << "; phase4ResidualInputLumaSigma=" << spectraResidualNr.inputLumaSigma
-            << "; phase4ResidualInputChromaSigma=" << spectraResidualNr.inputChromaSigma
-            << "; phase4ResidualModelConfidence=" << spectraResidualNr.modelConfidence
-            << "; phase4PhysicalBaselineLumaFraction=" << spectraResidualNr.baselineLumaFraction
-            << "; phase4PhysicalBaselineChromaFraction=" << spectraResidualNr.baselineChromaFraction
-            << "; phase4SpectraEnhancementActive="
-            << (spectraResidualNr.spectraEnhancementActive ? "true" : "false")
-            << "; phase4SpectraResidualLumaFraction=" << spectraResidualNr.spectraLumaFraction
-            << "; phase4SpectraResidualChromaFraction=" << spectraResidualNr.spectraChromaFraction
-            << "; phase4AppliedLumaSigma=" << spectraResidualNr.lumaSigma
-            << "; phase4AppliedChromaSigma=" << spectraResidualNr.chromaSigma
+            << "; phase4ResidualBudgetActive=false"
+            << "; phase4ResidualAuthoritySource=RETIRED_N003"
+            << "; phase4ResidualCovarianceAuthoritative=true"
+            << "; phase4DuplicatePhysicalSigmaPrevented=true"
+            << "; phase4ResidualInputLumaSigma=" << postToneResidualLumaSigma
+            << "; phase4ResidualInputChromaSigma=" << postToneResidualChromaSigma
+            << "; phase4ResidualModelConfidence=" << postToneResidualModelConfidence
+            << "; phase4PhysicalBaselineLumaFraction=0.0000"
+            << "; phase4PhysicalBaselineChromaFraction=0.0000"
+            << "; phase4SpectraEnhancementActive=false"
+            << "; phase4SpectraResidualLumaFraction=0.0000"
+            << "; phase4SpectraResidualChromaFraction=0.0000"
+            << "; phase4AppliedLumaSigma=0.0000"
+            << "; phase4AppliedChromaSigma=0.0000"
             << "; phase4ResidualChromaStrengthScale=" << residualChromaStrengthScale
             << "; phase4DynamicIsoChromaSpectraGate=" << (spectraNoiseActive ? "ACTIVE" : "IDENTITY_OFF")
             << "; effectiveLumaSigma=" << g_threadLocalIspStats.effectiveLumaSigma
@@ -17633,20 +15677,8 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; vulkanSceneCompactBytes=" << vulkanSceneObserver.compactBytes
             << "; vulkanSceneSampleCount=" << vulkanSceneObserver.sampleCount
             << "; vulkanSceneCorrectedHighlightPixels=" << vulkanSceneObserver.correctedHighlightPixels
-            << "; galoshPreToneChroma444Enabled=" << (galoshPreToneChroma444Enabled ? "true" : "false")
-            << "; galoshPreToneChroma444Strength=" << galoshPreToneChroma444Strength
-            << "; galoshPreToneChroma444Applied=" << (vulkanSceneObserver.preToneChroma444Applied ? "true" : "false")
-            << "; nearBlackChromaCovarianceWhiteningEnabled=" << (nearBlackChromaPlan.enabled ? "true" : "false")
-            << "; nearBlackChromaCovarianceValid=" << (nearBlackChromaPlan.covarianceValid ? "true" : "false")
-            << "; nearBlackChromaVarianceY=" << nearBlackChromaPlan.varianceY
-            << "; nearBlackChromaVarianceC1=" << nearBlackChromaPlan.varianceC1
-            << "; nearBlackChromaVarianceC2=" << nearBlackChromaPlan.varianceC2
-            << "; nearBlackChromaCovarianceC1C2=" << nearBlackChromaPlan.covarianceC1C2
-            << "; nearBlackChromaReferenceSignal=" << nearBlackChromaPlan.referenceSignal
-            << "; nearBlackChromaShotNoiseFraction=" << nearBlackChromaPlan.shotNoiseFraction
-            << "; nearBlackChromaModelConfidence=" << nearBlackChromaPlan.modelConfidence
-            << "; nearBlackChromaFullShrinkSigma=" << nearBlackChromaPlan.fullShrinkSigma
-            << "; nearBlackChromaPreserveSigma=" << nearBlackChromaPlan.preserveSigma
+            << "; preToneClassicalChromaOwnerActive=false"
+            << "; classicalNearBlackChromaOwnerActive=false"
             << "; nearBlackChromaWhiteningApplied=" << (vulkanSceneObserver.preToneChromaCovarianceWhiteningApplied ? "true" : "false")
             << "; nearBlackChromaCovarianceEvaluatedPixels=" << vulkanSceneObserver.preToneChromaCovarianceEvaluatedPixels
             << "; nearBlackChromaLowSnrPixels=" << vulkanSceneObserver.preToneChromaNearBlackPixels
@@ -17664,13 +15696,6 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; phase9ChromaMeanNoisePressure=" << vulkanSceneObserver.preToneChromaMeanNoisePressure
             << "; phase9ChromaMeanResidualSigma=" << vulkanSceneObserver.preToneChromaMeanResidualSigma
             << "; phase9ChromaMaxCorrection=" << vulkanSceneObserver.preToneChromaMaxCorrection
-            << "; galoshPreToneWbCcmPressure=" << galoshPreToneWbCcmPressure
-            << "; galoshPreTonePhysicalBaselineActive=" << (galoshPreToneChromaPlan.physicalBaselineActive ? "true" : "false")
-            << "; galoshPreToneSpectraEnhancementActive=" << (galoshPreToneChromaPlan.spectraEnhancementActive ? "true" : "false")
-            << "; galoshPreToneBaselineStrength=" << galoshPreToneChromaPlan.baselineStrength
-            << "; galoshPreToneUpstreamChromaReduction=" << galoshPreToneChromaPlan.upstreamChromaReduction
-            << "; galoshPreToneResidualHeadroom=" << galoshPreToneChromaPlan.residualHeadroom
-            << "; galoshPreToneSpectraEnhancement=" << galoshPreToneChromaPlan.spectraEnhancement
             << "; vulkanSceneResidentGeneration=" << vulkanSceneObserver.residentSceneGeneration
             << "; cpuSceneProcessingApplied=" << (cpuSceneProcessingApplied ? "true" : "false")
             << "; vulkanToneAttempted=" << (vulkanTone.attempted ? "true" : "false")
@@ -18178,59 +16203,14 @@ std::string IspCore::validateNoiseModelImplementation(
     IspFrameMetadata off = metadataFor(0, highNoiseSo);
     sampleNoiseModelFromProductionRaw(raw, off);
     const size_t offSamples = g_threadLocalIspStats.sensorNoiseVarianceSamples;
-    const auto offPlan = bncam::spectra2::resolvePhysicalChromaBaseStrength(
-            static_cast<float>(g_threadLocalIspStats.meanSensorNoiseVariance), 1.0f, 0.0f);
 
-    IspFrameMetadata automatic = metadataFor(1, lowNoiseSo);
-    sampleNoiseModelFromProductionRaw(raw, automatic);
-    const ThreadLocalIspStats autoStats = g_threadLocalIspStats;
-    const auto autoPlan = bncam::spectra2::resolvePhysicalChromaBaseStrength(
-            static_cast<float>(autoStats.meanSensorNoiseVariance), 1.0f, 1.0f);
-
-    IspFrameMetadata low = metadataFor(2, lowNoiseSo);
+    IspFrameMetadata low = metadataFor(1, lowNoiseSo);
     sampleNoiseModelFromProductionRaw(raw, low);
     const ThreadLocalIspStats lowStats = g_threadLocalIspStats;
-    const auto lowPlan = bncam::spectra2::resolvePhysicalChromaBaseStrength(
-            static_cast<float>(lowStats.meanSensorNoiseVariance), 1.0f, 0.65f);
 
-    IspFrameMetadata high = metadataFor(2, highNoiseSo);
+    IspFrameMetadata high = metadataFor(1, highNoiseSo);
     sampleNoiseModelFromProductionRaw(raw, high);
     const ThreadLocalIspStats highStats = g_threadLocalIspStats;
-    const auto highPlan = bncam::spectra2::resolvePhysicalChromaBaseStrength(
-            static_cast<float>(highStats.meanSensorNoiseVariance), 1.0f, 0.65f);
-
-    constexpr float commonCeiling = 0.48f;
-    const float lowDynamic = bncam::spectra2::resolveNoiseTruthDynamicHeadroomFraction(
-            0.5f, lowPlan.combinedNoisePressure, 4.0f);
-    const float highDynamic = bncam::spectra2::resolveNoiseTruthDynamicHeadroomFraction(
-            0.5f, highPlan.combinedNoisePressure, 4.0f);
-    const float lowConsumerStrength = std::clamp(
-            lowPlan.baseStrength + (commonCeiling - lowPlan.baseStrength) * lowDynamic,
-            0.0f, commonCeiling);
-    const float highConsumerStrength = std::clamp(
-            highPlan.baseStrength + (commonCeiling - highPlan.baseStrength) * highDynamic,
-            0.0f, commonCeiling);
-
-    const std::array<float, 5> coefficients{0.0f, 0.25f, 0.50f, 0.75f, 1.0f};
-    const std::array<float, 5> pressures{0.0f, 0.25f, 0.50f, 0.75f, 1.0f};
-    bool dynamicMonotonic = true;
-    bool dynamicBounded = true;
-    for (float coefficient : coefficients) {
-        float prior = 0.0f;
-        for (float pressure : pressures) {
-            const float fraction = bncam::spectra2::resolveNoiseTruthDynamicHeadroomFraction(
-                    coefficient, pressure, 5.0f);
-            dynamicMonotonic = dynamicMonotonic && fraction + 1.0e-6f >= prior;
-            dynamicBounded = dynamicBounded && fraction >= 0.0f && fraction <= 1.0f;
-            prior = fraction;
-        }
-    }
-    const bool fullPressureExact =
-            std::abs(bncam::spectra2::resolveNoiseTruthDynamicHeadroomFraction(0.0f, 1.0f, 5.0f) - 0.0f) < 1.0e-6f &&
-            std::abs(bncam::spectra2::resolveNoiseTruthDynamicHeadroomFraction(0.25f, 1.0f, 5.0f) - 0.25f) < 1.0e-6f &&
-            std::abs(bncam::spectra2::resolveNoiseTruthDynamicHeadroomFraction(0.50f, 1.0f, 5.0f) - 0.50f) < 1.0e-6f &&
-            std::abs(bncam::spectra2::resolveNoiseTruthDynamicHeadroomFraction(0.75f, 1.0f, 5.0f) - 0.75f) < 1.0e-6f &&
-            std::abs(bncam::spectra2::resolveNoiseTruthDynamicHeadroomFraction(1.0f, 1.0f, 5.0f) - 1.0f) < 1.0e-6f;
 
     NativeRenderQualityConfig spectraConfig{};
     spectraConfig.lumaUserScale = 1.0f;
@@ -18248,42 +16228,21 @@ std::string IspCore::validateNoiseModelImplementation(
     const bool isoAdaptiveMonotonic =
             isoLow.effectiveIso < isoMid.effectiveIso && isoMid.effectiveIso < isoHigh.effectiveIso &&
             isoLow.combinedNoisePressure <= isoMid.combinedNoisePressure + 1.0e-6f &&
-            isoMid.combinedNoisePressure <= isoHigh.combinedNoisePressure + 1.0e-6f &&
-            isoLow.lumaAuthority <= isoMid.lumaAuthority + 1.0e-6f &&
-            isoMid.lumaAuthority <= isoHigh.lumaAuthority + 1.0e-6f &&
-            isoLow.chromaAuthority <= isoMid.chromaAuthority + 1.0e-6f &&
-            isoMid.chromaAuthority <= isoHigh.chromaAuthority + 1.0e-6f;
+            isoMid.combinedNoisePressure <= isoHigh.combinedNoisePressure + 1.0e-6f;
 
     const SpectraProvenanceField provenance = buildSpectraProvenanceField(raw, isoHighMeta);
     const bool provenanceValid = provenance.validTiles > 0 &&
             provenance.meanPredictedRawVariance > 0.0f &&
-            provenance.meanPredictedSpatialResidualVariance > provenance.meanPredictedRawVariance &&
             provenance.meanPredictedChromaResidualVariance > 0.0f;
 
-    LinearFloatRaw unsafeCandidate = raw;
-    unsafeCandidate.mosaic = raw.mosaic.clone();
-    unsafeCandidate.mosaic += 0.05f;
-    const SpectraNoRegretResult noRegret = applySpectraNoRegretGate(
-            raw.mosaic,
-            unsafeCandidate,
-            isoHighMeta,
-            isoHigh,
-            provenance,
-            1
-    );
-    const bool noRegretRejectedDrift = noRegret.evaluatedTiles > 0 &&
-            noRegret.rejectedMeanDrift > 0 &&
-            noRegret.meanAcceptance < 0.05f;
+    const bool measurementRespondsToSo =
+            lowStats.sensorNoiseVarianceSamples > 0 && highStats.sensorNoiseVarianceSamples > 0 &&
+            std::isfinite(lowStats.meanSensorNoiseVariance) &&
+            std::isfinite(highStats.meanSensorNoiseVariance) &&
+            lowStats.meanSensorNoiseVariance != highStats.meanSensorNoiseVariance;
 
     const bool allPassed =
-            offSamples == 0 && !offPlan.modelDriven && offPlan.baseStrength == 0.0f &&
-            autoStats.sensorNoiseVarianceSamples > 0 && std::isfinite(autoStats.meanSensorNoiseVariance) &&
-            autoPlan.modelDriven && autoPlan.baseStrength > 0.0f &&
-            lowStats.sensorNoiseVarianceSamples > 0 && highStats.sensorNoiseVarianceSamples > 0 &&
-            lowStats.meanSensorNoiseVariance != highStats.meanSensorNoiseVariance &&
-            lowPlan.baseStrength != highPlan.baseStrength && lowConsumerStrength != highConsumerStrength &&
-            dynamicMonotonic && dynamicBounded && fullPressureExact &&
-            isoAdaptiveMonotonic && provenanceValid && noRegretRejectedDrift;
+            offSamples == 0 && measurementRespondsToSo && isoAdaptiveMonotonic && provenanceValid;
 
     std::ostringstream out;
     out << std::setprecision(17)
@@ -18299,32 +16258,16 @@ std::string IspCore::validateNoiseModelImplementation(
     }
     out << "]"
         << ";offSamples=" << offSamples
-        << ";offModelDriven=" << (offPlan.modelDriven ? "true" : "false")
-        << ";autoSamples=" << autoStats.sensorNoiseVarianceSamples
-        << ";autoMeanVariance=" << autoStats.meanSensorNoiseVariance
-        << ";autoBaseStrength=" << autoPlan.baseStrength
-        << ";autoNoisePressure=" << autoPlan.combinedNoisePressure
         << ";lowSamples=" << lowStats.sensorNoiseVarianceSamples
         << ";lowMeanVariance=" << lowStats.meanSensorNoiseVariance
-        << ";lowBaseStrength=" << lowPlan.baseStrength
-        << ";lowNoisePressure=" << lowPlan.combinedNoisePressure
-        << ";lowConsumerStrength=" << lowConsumerStrength
         << ";highSamples=" << highStats.sensorNoiseVarianceSamples
         << ";highMeanVariance=" << highStats.meanSensorNoiseVariance
-        << ";highBaseStrength=" << highPlan.baseStrength
-        << ";highNoisePressure=" << highPlan.combinedNoisePressure
-        << ";highConsumerStrength=" << highConsumerStrength
-        << ";dynamicMonotonic=" << (dynamicMonotonic ? "true" : "false")
-        << ";dynamicBounded=" << (dynamicBounded ? "true" : "false")
-        << ";fullPressureExact=" << (fullPressureExact ? "true" : "false")
+        << ";measurementRespondsToSo=" << (measurementRespondsToSo ? "true" : "false")
         << ";isoAdaptiveMonotonic=" << (isoAdaptiveMonotonic ? "true" : "false")
-        << ";isoLowAuthority=" << isoLow.lumaAuthority
-        << ";isoMidAuthority=" << isoMid.lumaAuthority
-        << ";isoHighAuthority=" << isoHigh.lumaAuthority
         << ";provenanceValid=" << (provenanceValid ? "true" : "false")
-        << ";provenanceTiles=" << provenance.validTiles
-        << ";noRegretRejectedDrift=" << (noRegretRejectedDrift ? "true" : "false")
-        << ";noRegretMeanAcceptance=" << noRegret.meanAcceptance
+        << ";classicalPostDemosaicNrOwner=false"
+        << ";profileNrOwner=false"
+        << ";physicalBaselineNrOwner=false"
         << ";allPassed=" << (allPassed ? "true" : "false");
     return out.str();
 }
