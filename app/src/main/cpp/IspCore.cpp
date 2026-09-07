@@ -1714,54 +1714,6 @@ std::string formatPropagationStateFields(
 }
 
 
-std::string formatChromaBandFields(
-        const char* prefix,
-        const bncam::spectra2::ChromaBandTelemetry& telemetry
-) {
-    const auto& plan = telemetry.plan;
-    std::ostringstream out;
-    out << std::fixed << std::setprecision(9)
-        << "; " << prefix << "Name=" << bncam::spectra2::chromaBandName(plan.kind)
-        << "; " << prefix << "Enabled=" << (plan.enabled ? "true" : "false")
-        << "; " << prefix << "Applied=" << (telemetry.applied ? "true" : "false")
-        << "; " << prefix << "PlanStatus=" << plan.status
-        << "; " << prefix << "ResultStatus=" << telemetry.resultStatus
-        << "; " << prefix << "Kernel=" << plan.kernel
-        << "; " << prefix << "TargetStatus=" << plan.targetStatus
-        << "; " << prefix << "NoRegretScope=" << plan.noRegretScope
-        << "; " << prefix << "InputEnergy=" << plan.inputEnergy
-        << "; " << prefix << "TargetFloor=" << plan.targetFloor
-        << "; " << prefix << "ExcessEnergy=" << plan.excessEnergy
-        << "; " << prefix << "RequiredReductionFraction=" << plan.requiredReductionFraction
-        << "; " << prefix << "AuthorityScale=" << plan.authorityScale
-        << "; " << prefix << "MaximumCorrectionScale=" << plan.maximumCorrectionScale
-        << "; " << prefix << "ModelConfidence=" << plan.modelConfidence
-        << "; " << prefix << "VisibleChromaAmplification=" << plan.visibleChromaAmplification
-        << "; " << prefix << "Evidence=" << plan.evidence
-        << "; " << prefix << "OutputEnergy=" << telemetry.outputEnergy
-        << "; " << prefix << "OutputStage=" << telemetry.outputStage
-        << "; " << prefix << "RuntimeMethod=" << telemetry.runtimeMethod
-        << "; " << prefix << "ReductionPercentage=" << telemetry.reductionPercentage
-        << "; " << prefix << "CoefficientEnergyBefore=" << telemetry.coefficientEnergyBefore
-        << "; " << prefix << "CoefficientEnergyAfter=" << telemetry.coefficientEnergyAfter
-        << "; " << prefix << "MaximumCorrection=" << telemetry.maximumCorrection
-        << "; " << prefix << "ChangedPixelFraction=" << telemetry.changedPixelFraction
-        << "; " << prefix << "CandidatePixelCount=" << telemetry.candidatePixelCount
-        << "; " << prefix << "ChangedPixelCount=" << telemetry.changedPixelCount
-        << "; " << prefix << "StructureRejectedPixelCount="
-        << telemetry.structureRejectedPixelCount
-        << "; " << prefix << "MeanNoiseSigma=" << telemetry.meanNoiseSigma
-        << "; " << prefix << "MeanStructureWeight=" << telemetry.meanStructureWeight
-        << "; " << prefix << "MeanShrinkage=" << telemetry.meanShrinkage
-        << "; " << prefix << "ShrinkageP90=" << telemetry.shrinkageP90
-        << "; " << prefix << "MaximumShrinkage=" << telemetry.maximumShrinkage
-        << "; " << prefix << "ProcessingTimeMs=" << telemetry.processingTimeMs
-        << "; " << prefix << "MeasurementTimeMs=" << telemetry.measurementTimeMs
-        << "; " << prefix << "NoRegretMeanAcceptance=" << telemetry.noRegretMeanAcceptance
-        << "; " << prefix << "NoRegretAttenuatedPixelFraction="
-        << telemetry.noRegretAttenuatedPixelFraction;
-    return out.str();
-}
 
 std::string formatDerivativeStatsFields(
         const char* prefix,
@@ -5481,53 +5433,20 @@ std::uint64_t spectraLensMapGenerationId(const IspFrameMetadata& meta) {
 std::string SpectraPass2State::formatDebugString() const {
     std::ostringstream out;
     out << std::fixed << std::setprecision(4);
-    out << "spectraPass2={"
-        << "mode=" << (physicalBaselineMode ? "physical_single_frame" : (spectraMode == 1 ? "auto" : (spectraMode == 2 ? "manual" : "legacy")))
-        << ";authoritySource=" << authoritySource
-        << ";applied=" << (applied ? "true" : "false")
-        << ";chromaReductionPct=" << averageChromaReductionPct
-        << ";maxChromaShift=" << maxChromaShift
+    out << "spectraCfaBandObserver={"
+        << "mode=" << (spectraMode == 1 ? "auto" : (spectraMode == 2 ? "manual" : "off"))
+        << ";status=" << observerStatus
         << ";modelConfidence=" << modelConfidence
-        << ";blendStrength=" << blendStrength
-        << ";isoAuthority=" << isoAuthority
-        << ";meanShadingAuthority=" << localShadingAuthorityMean
-        << ";noRegretAcceptedTiles=" << noRegretAcceptedTileFraction
-        << ";noRegretRollback=" << noRegretRollbackFraction
-        << ";fallbackReason=" << fallbackReason
+        << ";bandEnergyStatus=" << bandEnergyStatus
+        << ";bandEnergyMethod=" << bandEnergyMethod
+        << ";sampleCount=" << bandEnergySampleCount
+        << ";redSampleCount=" << bandEnergyRedSampleCount
+        << ";blueSampleCount=" << bandEnergyBlueSampleCount
+        << ";redBlueSampleBalance=" << bandEnergyRedBlueSampleBalance
+        << ";bandEnergyConfidence=" << bandEnergyConfidence
+        << ";measurementTimeMs=" << bandEnergyMeasurementMs
         << ";processingTimeMs=" << processingTimeMs
-        << ";multiscaleArchitecture=" << multiscaleArchitecture
-        << ";pixelWorkingCloneCount=" << pixelWorkingCloneCount
-        << ";avoidedFullFrameCloneCount=" << avoidedFullFrameCloneCount
-        << ";pixelBufferStrategy=" << pixelBufferStrategy
-        << ";finePlan=" << fineBand.plan.status
-        << ";midPlan=" << midBand.plan.status
-        << ";splitOpponentAuthorityActive=" << (splitOpponentAuthorityActive ? "true" : "false")
-        << ";splitOpponentMaxModulation=" << splitOpponentMaximumModulation
-        << ";fineRedAuthorityMultiplier=" << fineRedAuthorityMultiplier
-        << ";fineBlueAuthorityMultiplier=" << fineBlueAuthorityMultiplier
-        << ";midRedAuthorityMultiplier=" << midRedAuthorityMultiplier
-        << ";midBlueAuthorityMultiplier=" << midBlueAuthorityMultiplier
-        << ";profiledStrongFineBlendQuads=" << profiledStrongFineBlendQuadCount
-        << ";profiledColorEdgeProtectedQuads=" << profiledColorEdgeProtectedQuadCount
-        << ";profiledHeavyFineCleanQuads=" << profiledHeavyFineCleanQuadCount
-        << ";profiledStrongFineBlendFraction=" << profiledStrongFineBlendFraction
-        << ";profiledColorEdgeProtectedFraction=" << profiledColorEdgeProtectedFraction
-        << ";profiledHeavyFineCleanFraction=" << profiledHeavyFineCleanFraction
-        << ";vulkanKernelConnected=" << (vulkanKernelConnected ? "true" : "false")
-        << ";vulkanAttempted=" << (vulkanAttempted ? "true" : "false")
-        << ";vulkanExecutionSucceeded=" << (vulkanExecutionSucceeded ? "true" : "false")
-        << ";vulkanUsedForOutput=" << (vulkanUsedForOutput ? "true" : "false")
-        << ";vulkanCpuFallbackUsed=" << (vulkanCpuFallbackUsed ? "true" : "false")
-        << ";vulkanGpuNoRegretBlendUsed=" << (vulkanGpuNoRegretBlendUsed ? "true" : "false")
-        << ";vulkanCandidateReadbackAvoided=" << (vulkanCandidateReadbackAvoided ? "true" : "false")
-        << ";vulkanStatus=" << vulkanStatus
-        << ";vulkanFailureReason=" << vulkanFailureReason
-        << ";vulkanFineKernelMs=" << vulkanFineKernelMs
-        << ";vulkanMidKernelMs=" << vulkanMidKernelMs
-        << ";vulkanGpuKernelMs=" << vulkanGpuKernelMs
-        << ";vulkanTransferAndSyncMs=" << vulkanTransferAndSyncMs
-        << ";vulkanTotalMs=" << vulkanTotalMs
-        << ";vulkanResidentBytes=" << vulkanResidentBytes
+        << ";pixelAuthority=false"
         << "}";
     return out.str();
 }
@@ -5701,67 +5620,130 @@ float spectraDirectionalEvidence(
     return std::clamp((directional - reference) / (4.0f * reference), 0.0f, 1.0f);
 }
 
+struct CfaBandResidualEvidence {
+    bncam::spectra2::ChromaBandKind kind = bncam::spectra2::ChromaBandKind::Fine;
+    std::string status = "UNAVAILABLE";
+    float inputEnergy = 0.0f;
+    float expectedNoiseFloor = 0.0f;
+    float excessEnergy = 0.0f;
+    float residualPressure = 0.0f;
+    float modelConfidence = 0.0f;
+    float directionalEvidence = 0.0f;
+};
+
+CfaBandResidualEvidence resolveCfaBandResidualEvidence(
+        bncam::spectra2::ChromaBandKind kind,
+        float inputEnergy,
+        float predictedChromaFloor,
+        float modelConfidence,
+        float directionalEvidence = 0.0f
+) {
+    CfaBandResidualEvidence out{};
+    out.kind = kind;
+    out.inputEnergy = std::isfinite(inputEnergy) ? std::max(0.0f, inputEnergy) : 0.0f;
+    out.modelConfidence = std::isfinite(modelConfidence)
+            ? std::clamp(modelConfidence, 0.0f, 1.0f)
+            : 0.0f;
+    out.directionalEvidence = std::isfinite(directionalEvidence)
+            ? std::clamp(directionalEvidence, 0.0f, 1.0f)
+            : 0.0f;
+
+    const float baseFloor = std::isfinite(predictedChromaFloor)
+            ? std::max(0.0f, predictedChromaFloor)
+            : 0.0f;
+    const float floorScale = kind == bncam::spectra2::ChromaBandKind::Fine
+            ? 1.00f
+            : (kind == bncam::spectra2::ChromaBandKind::Mid ? 0.38f : 0.16f);
+    out.expectedNoiseFloor = baseFloor * floorScale;
+    out.excessEnergy = std::max(0.0f, out.inputEnergy - out.expectedNoiseFloor);
+    out.residualPressure = out.inputEnergy > 1.0e-12f
+            ? std::clamp(out.excessEnergy / out.inputEnergy, 0.0f, 1.0f)
+            : 0.0f;
+
+    if (out.inputEnergy <= 0.0f) {
+        out.status = "NO_VALID_BAND_ENERGY";
+    } else if (baseFloor <= 0.0f) {
+        out.status = "NO_CALIBRATED_NOISE_FLOOR";
+    } else if (out.modelConfidence < 0.15f) {
+        out.status = "LOW_MODEL_CONFIDENCE";
+    } else {
+        out.status = "READY_EVIDENCE_ONLY_NO_PIXEL_AUTHORITY";
+    }
+    return out;
+}
+
+// Transitional compatibility transport for the existing CFA-confidence builder. Only
+// observation fields are populated; all kernel/enable/authority/correction fields remain neutral.
+bncam::spectra2::ChromaBandPlan makeCfaEvidenceTransport(
+        const CfaBandResidualEvidence& evidence
+) {
+    bncam::spectra2::ChromaBandPlan out{};
+    out.kind = evidence.kind;
+    out.status = evidence.status;
+    out.targetStatus = "RAW_DOMAIN_EXPECTED_NOISE_FLOOR_EVIDENCE";
+    out.inputEnergy = evidence.inputEnergy;
+    out.targetFloor = evidence.expectedNoiseFloor;
+    out.excessEnergy = evidence.excessEnergy;
+    out.requiredReductionFraction = evidence.residualPressure;
+    out.modelConfidence = evidence.modelConfidence;
+    out.evidence = evidence.directionalEvidence;
+    return out;
+}
+
+std::string formatCfaBandResidualEvidenceFields(
+        const char* prefix,
+        const CfaBandResidualEvidence& evidence
+) {
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(9)
+        << "; " << prefix << "Name=" << bncam::spectra2::chromaBandName(evidence.kind)
+        << "; " << prefix << "Status=" << evidence.status
+        << "; " << prefix << "InputEnergy=" << evidence.inputEnergy
+        << "; " << prefix << "ExpectedNoiseFloor=" << evidence.expectedNoiseFloor
+        << "; " << prefix << "ExcessEnergy=" << evidence.excessEnergy
+        << "; " << prefix << "ResidualPressure=" << evidence.residualPressure
+        << "; " << prefix << "ModelConfidence=" << evidence.modelConfidence
+        << "; " << prefix << "DirectionalEvidence=" << evidence.directionalEvidence
+        << "; " << prefix << "PixelAuthority=false";
+    return out.str();
+}
+
 SpectraPass2State computePass2StateForInputAvailability(
         bool inputAvailable,
         const IspFrameMetadata& meta,
         const NativeRenderQualityConfig& uiConfig
 ) {
+    static_cast<void>(uiConfig);
     SpectraPass2State state{};
     state.spectraMode = meta.calibration.spectraProcessingMode;
 
     if (state.spectraMode == 0) {
-        state.fallbackReason = "legacy_mode";
+        state.observerStatus = "SPECTRA_OFF_NOT_OBSERVED";
         return state;
     }
-
     if (!inputAvailable) {
-        state.fallbackReason = "mosaic_empty";
+        state.observerStatus = "RAW_INPUT_UNAVAILABLE";
         return state;
     }
-
     if (!meta.calibration.spectraSnapshotPresent) {
-        state.fallbackReason = "snapshot_not_present_or_invalid";
+        state.observerStatus = "NO_VALID_SPECTRA_SNAPSHOT";
         return state;
     }
 
     for (int ch = 0; ch < 4; ++ch) {
-        state.effectiveS[ch] = meta.calibration.effectiveS[ch];
-        state.effectiveO[ch] = meta.calibration.effectiveO[ch];
-    }
-
-    // Pass 2 currently mutates only red and blue sites. Both must have a valid
-    // model, while green is used only as a structural/noise reference.
-    if (!isVstValid(state.effectiveS[0], state.effectiveO[0]) ||
-        !isVstValid(state.effectiveS[3], state.effectiveO[3]) ||
-        !isVstValid(state.effectiveS[1], state.effectiveO[1]) ||
-        !isVstValid(state.effectiveS[2], state.effectiveO[2])) {
-        state.fallbackReason = "invalid_or_zero_so_parameters";
-        return state;
+        if (!isVstValid(meta.calibration.effectiveS[ch], meta.calibration.effectiveO[ch])) {
+            state.observerStatus = "INVALID_OR_ZERO_SO_PARAMETERS";
+            return state;
+        }
     }
 
     state.modelConfidence = std::clamp(meta.calibration.signalModelConfidence, 0.0f, 1.0f);
     if (state.modelConfidence < 0.25f) {
-        state.fallbackReason = "low_signal_model_confidence";
+        state.observerStatus = "LOW_SIGNAL_MODEL_CONFIDENCE";
         return state;
     }
 
-    // Chroma authority follows the continuous ISO/S/O pressure model. The pass
-    // never drives R/B residuals toward zero and leaves both green planes untouched.
-    const SpectraIsoAdaptiveState isoState = IspCore::resolveSpectraIsoAdaptiveState(meta, uiConfig);
-    state.isoAuthority = isoState.chromaAuthority;
-    // Context Fusion Chroma Rescue: the old path multiplied two conservative
-    // authorities and left the supplied low-light capture at ~0.28 effective
-    // pre-gate blend. The structure classifier is now sigma-normalized and the
-    // continuous No-Regret solver enforces residual/detail floors, so candidate
-    // authority can follow physical noise pressure directly without becoming an
-    // unconditional colour blur. Profile chroma/strength remain embedded in
-    // isoState.chromaAuthority and therefore remain the user authority.
-    state.blendStrength = bncam::spectra2::resolveContextFusionChromaCandidateAuthority(
-            isoState.combinedNoisePressure,
-            state.modelConfidence,
-            isoState.chromaAuthority
-    );
-    state.applied = true;
+    state.observerStatus = "READY_READ_ONLY_CFA_BAND_OBSERVER";
     return state;
 }
 
@@ -5783,10 +5765,8 @@ SpectraPass2State IspCore::computePass2StateCompact(
             raw.valid && raw.info.width > 0 && raw.info.height > 0, meta, uiConfig);
 }
 
-// N006M: retired classical Pass-2 / Pass-3 CPU pixel mutators and the old
-// Pass-3 correction-state builder were physically removed. Pass 2/3 may still
-// contribute read-only noise/structure observations, but no classical RAW
-// correction implementation remains here.
+// N006O: retired Pass-2 / Pass-3 correction implementations remain physically absent.
+// This layer now contributes read-only CFA noise/structure evidence only.
 
 float IspCore::computeResidualEnergy(const LinearFloatRaw& raw) {
     if (raw.mosaic.empty() || raw.mosaic.type() != CV_32FC1) return 0.0f;
@@ -6277,10 +6257,9 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             ? captureProvenance.meanPredictedSpatialResidualVariance * preDemosaicAuthorityState.targetFloorScale
             : static_cast<float>(1.25 * meanPredictedPixelVariance * preDemosaicAuthorityState.targetFloorScale);
 
-    // Pass 2 operates in an R-G / B-G residual domain, so it cannot be gated by
-    // the all-channel spatial residual used for Pass 1. Predict a dedicated chroma
-    // floor: Var(C - mean(G4)) = Var(C) + Var(G)/4, followed by the same-colour
-    // high-pass kernel whose white-noise energy is 1.25.
+    // The CFA chroma observer works in an R-G / B-G residual domain. Predict a dedicated
+    // raw-domain noise floor from the physical S/O model; this is evidence only and grants no
+    // correction or reconstruction authority by itself.
     double predictedChromaVariance = 0.0;
     int validChromaChannels = 0;
     const double meanGreenS = 0.5 * (
@@ -6319,9 +6298,9 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                             static_cast<double>(validChromaChannels) * preDemosaicAuthorityState.targetFloorScale)
                     : 0.0f);
 
-    // Milestone 2 prepares a visible-domain target before Pass 2 is allowed to claim that the
-    // chroma budget is already met. The estimate uses the requested demosaic model, actual AWB/CCM
-    // metadata and the configured curve stack. Auto demosaic remains a lower-confidence fallback.
+    // Read-only downstream-risk observation: propagate the physical CFA noise estimate through
+    // the requested demosaic model, AWB/CCM and configured curve stack. This is telemetry/conditioning
+    // evidence only; it is deliberately not used to set the raw-domain band residual pressure.
     const double predictedGreenVariance = 0.5 * (
             predictedChannelVariance[1] + predictedChannelVariance[2]
     );
@@ -6330,17 +6309,17 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     const bool captureVisibleVarianceReady = hasThreeColourVariances(
             captureVisibleVarianceByChannel
     );
-    const double pass2TargetRedVariance = captureVisibleVarianceReady
+    const double cfaRiskRedVariance = captureVisibleVarianceReady
             ? captureVisibleVarianceByChannel[0]
             : predictedChannelVariance[0];
-    const double pass2TargetGreenVariance = captureVisibleVarianceReady
+    const double cfaRiskGreenVariance = captureVisibleVarianceReady
             ? 0.5 * (captureVisibleVarianceByChannel[1] + captureVisibleVarianceByChannel[2])
             : predictedGreenVariance;
-    const double pass2TargetBlueVariance = captureVisibleVarianceReady
+    const double cfaRiskBlueVariance = captureVisibleVarianceReady
             ? captureVisibleVarianceByChannel[3]
             : predictedChannelVariance[3];
-    const bncam::spectra2::NoiseState pass2TargetPreDemosaic = bncam::spectra2::makeState(
-            "PASS2_TARGET_POST_LENS_SHADING_PRE_DEMOSAIC",
+    const bncam::spectra2::NoiseState cfaRiskPreDemosaic = bncam::spectra2::makeState(
+            "CFA_VISIBLE_RISK_POST_LENS_SHADING_PRE_DEMOSAIC",
             captureVisibleVarianceReady
                     ? "CAMERA2_SO_WITH_LENS_SHADING_GAIN_SQUARED"
                     : "CAMERA2_SO_SIGNAL_MODEL_LENS_SHADING_FALLBACK",
@@ -6355,52 +6334,51 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                     1.0
             ),
             bncam::spectra2::diagonalCovariance(
-                    pass2TargetRedVariance,
-                    pass2TargetGreenVariance,
-                    pass2TargetBlueVariance
+                    cfaRiskRedVariance,
+                    cfaRiskGreenVariance,
+                    cfaRiskBlueVariance
             )
     );
-    const bncam::spectra2::NoiseState pass2TargetDemosaic =
+    const bncam::spectra2::NoiseState cfaRiskDemosaic =
             bncam::spectra2::propagateDemosaic(
-                    pass2TargetPreDemosaic,
+                    cfaRiskPreDemosaic,
                     requestedDemosaicNoiseModel(workingMeta.requestedDemosaicMode),
-                    "PASS2_TARGET_POST_DEMOSAIC"
+                    "CFA_VISIBLE_RISK_POST_DEMOSAIC"
             );
-    const bncam::spectra2::NoiseState pass2TargetAwb = bncam::spectra2::propagateAwb(
-            pass2TargetDemosaic,
+    const bncam::spectra2::NoiseState cfaRiskAwb = bncam::spectra2::propagateAwb(
+            cfaRiskDemosaic,
             normalizedWbRgb(workingMeta.calibration),
-            "PASS2_TARGET_POST_AWB"
+            "CFA_VISIBLE_RISK_POST_AWB"
     );
-    const bncam::spectra2::NoiseState pass2TargetCcm = bncam::spectra2::propagateColourMatrix(
-            pass2TargetAwb,
+    const bncam::spectra2::NoiseState cfaRiskCcm = bncam::spectra2::propagateColourMatrix(
+            cfaRiskAwb,
             colourMatrixArray(workingMeta.calibration.effectiveColorMatrix),
-            "PASS2_TARGET_POST_CCM"
+            "CFA_VISIBLE_RISK_POST_CCM"
     );
     const GenericCurvePropagationEstimate genericCurveEstimate =
             estimateGenericCurvePropagation(uiConfig);
-    const bncam::spectra2::NoiseState pass2TargetVisible =
+    const bncam::spectra2::NoiseState cfaRiskVisible =
             bncam::spectra2::propagateOpponentGains(
-                    pass2TargetCcm,
+                    cfaRiskCcm,
                     genericCurveEstimate.total.rms,
                     genericCurveEstimate.chromaScale.rms,
                     genericCurveEstimate.chromaScale.rms,
-                    "PASS2_TARGET_POST_PROFILE_CURVES",
+                    "CFA_VISIBLE_RISK_POST_PROFILE_CURVES",
                     "GENERIC_PROFILE_CURVE_DERIVATIVE_ESTIMATE",
                     0.80
             );
-    const float pass2VisibleChromaAmplification = static_cast<float>(
+    const float cfaVisibleChromaAmplification = static_cast<float>(
             bncam::spectra2::chromaAmplification(
-                    pass2TargetPreDemosaic,
-                    pass2TargetVisible
+                    cfaRiskPreDemosaic,
+                    cfaRiskVisible
             )
     );
-    const float pass2VisibleTargetConfidence = static_cast<float>(pass2TargetVisible.confidence);
-    const bool pass2VisibleTargetReady = validNoiseChannels >= 3 &&
-            std::isfinite(pass2VisibleChromaAmplification);
-    const char* pass2VisibleTargetStatus = pass2VisibleTargetReady
-            ? "OBSERVATION_ONLY_NO_SKIP_AUTHORITY_MILESTONE_2"
-            : "INSUFFICIENT_INPUT_FOR_VISIBLE_TARGET";
-    bool pass2VisibleTargetPreventedSkip = false;
+    const float cfaVisibleRiskConfidence = static_cast<float>(cfaRiskVisible.confidence);
+    const bool cfaVisibleRiskReady = validNoiseChannels >= 3 &&
+            std::isfinite(cfaVisibleChromaAmplification);
+    const char* cfaVisibleRiskStatus = cfaVisibleRiskReady
+            ? "OBSERVATION_ONLY_NO_PIXEL_AUTHORITY"
+            : "INSUFFICIENT_INPUT_FOR_VISIBLE_RISK_OBSERVATION";
 
     const auto pass1Start = IspClock::now();
     bncam::NativeStageHeartbeat::instance().update(workingMeta.captureAttemptId, "SPECTRA_PASS1");
@@ -6441,23 +6419,18 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             spectraPerformance.postPass1Statistics.chromaResidualEnergy;
 
     const auto pass2Start = IspClock::now();
-    bncam::NativeStageHeartbeat::instance().update(workingMeta.captureAttemptId, "SPECTRA_PASS2");
+    bncam::NativeStageHeartbeat::instance().update(
+            workingMeta.captureAttemptId, "SPECTRA_CFA_BAND_OBSERVER");
     SpectraPass2State pass2State = residentEntry && !residentCpuFallbackUsed
             ? computePass2StateCompact(residentInput->sampleView, workingMeta, uiConfig)
             : computePass2State(workingRaw, workingMeta, uiConfig);
-    // N006A: Pass 2 planning may remain observable, but its classical chroma suppression
-    // has no pixel authority and cannot fall back to CPU.
-    pass2State.applied = false;
-    pass2State.fallbackReason = "legacy_raw_pixel_authority_retired_neural_pending";
-    SpectraNoRegretResult pass2NoRegret{};
-    pass2NoRegret.passIndex = 2;
+
     const auto pass2BandMeasureStart = IspClock::now();
     bncam::spectra2::ChromaBandEnergySnapshot initialChromaBands{};
     if (budgetState.spectraMode != 0 && (!residentEntry || residentCpuFallbackUsed)) {
         initialChromaBands = measureSpectraChromaBandEnergies(workingRaw);
     } else if (budgetState.spectraMode != 0) {
-        // RAW stays resident. Legacy band-energy scans are not a reason to materialize pixels.
-        initialChromaBands.status = "LEGACY_PIXEL_OWNER_RETIRED_RESIDENT_MEASUREMENT_DEFERRED";
+        initialChromaBands.status = "RESIDENT_MEASUREMENT_DEFERRED_NO_HOST_MATERIALIZATION";
         initialChromaBands.method = "READ_ONLY_CORE_NO_HOST_MATERIALIZATION";
     } else {
         initialChromaBands.status = "SPECTRA_OFF_NOT_MEASURED";
@@ -6471,168 +6444,62 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     pass2State.bandEnergyBlueSampleCount = initialChromaBands.blueSampleCount;
     pass2State.bandEnergyRedBlueSampleBalance = initialChromaBands.redBlueSampleBalance;
     pass2State.bandEnergyConfidence = initialChromaBands.confidence;
-    const float pass2EffectiveChromaStrength = std::clamp(
-            uiConfig.profileSpectraStrength * 0.50f +
-                    uiConfig.profileSpectraChroma * 0.85f,
-            -1.0f, 1.50f);
-    pass2State.fineBand.plan = bncam::spectra2::resolveChromaBandPlan(
+
+    const float bandEvidenceModelConfidence = std::min(
+            pass2State.modelConfidence,
+            initialChromaBands.confidence
+    );
+    const CfaBandResidualEvidence fineBandEvidence = resolveCfaBandResidualEvidence(
             bncam::spectra2::ChromaBandKind::Fine,
             initialChromaBands.fineEnergy,
             budgetState.predictedChromaNoiseFloor,
-            pass2VisibleChromaAmplification,
-            std::min(pass2State.modelConfidence, initialChromaBands.confidence),
-            pass2State.isoAuthority,
-            pass2EffectiveChromaStrength
+            bandEvidenceModelConfidence
     );
-    pass2State.midBand.plan = bncam::spectra2::resolveChromaBandPlan(
+    const CfaBandResidualEvidence midBandEvidence = resolveCfaBandResidualEvidence(
             bncam::spectra2::ChromaBandKind::Mid,
             initialChromaBands.midEnergy,
             budgetState.predictedChromaNoiseFloor,
-            pass2VisibleChromaAmplification,
-            std::min(pass2State.modelConfidence, initialChromaBands.confidence),
-            pass2State.isoAuthority,
-            pass2EffectiveChromaStrength
+            bandEvidenceModelConfidence
     );
 
-    // Delta 23: keep the established aggregate band plans authoritative, but allow a small
-    // red-vs-blue redistribution when the split CFA evidence from Delta 21/22 supports it.
-    // Both pairs are centred on 1.0 and bounded to +/-12%; weak evidence remains exactly neutral.
-    const float pass2CommonOpponentSupport = std::sqrt(std::max(
-            0.0f,
-            bncam::spectra2::cfaFiniteUnit(pass2State.modelConfidence) *
-                    bncam::spectra2::cfaFiniteUnit(initialChromaBands.confidence) *
-                    bncam::spectra2::cfaFiniteUnit(initialChromaBands.redBlueSampleBalance)
-    ));
-    if (pass2State.fineBand.plan.enabled) {
-        const float redFinePressure = bncam::spectra2::splitResidualPressure(
-                pass2State.fineBand.plan.requiredReductionFraction,
-                initialChromaBands.redFineEnergy,
-                initialChromaBands.blueFineEnergy
-        );
-        const float blueFinePressure = bncam::spectra2::splitResidualPressure(
-                pass2State.fineBand.plan.requiredReductionFraction,
-                initialChromaBands.blueFineEnergy,
-                initialChromaBands.redFineEnergy
-        );
-        const auto fineAuthorityPair = bncam::spectra2::resolveOpponentAuthorityPair(
-                bncam::spectra2::applyChannelShadingRiskToEvidence(
-                        pass2CommonOpponentSupport * redFinePressure,
-                        channelShadingRisk.redMultiplier),
-                bncam::spectra2::applyChannelShadingRiskToEvidence(
-                        pass2CommonOpponentSupport * blueFinePressure,
-                        channelShadingRisk.blueMultiplier),
-                pass2State.splitOpponentMaximumModulation
-        );
-        pass2State.fineRedAuthorityMultiplier = fineAuthorityPair.redMultiplier;
-        pass2State.fineBlueAuthorityMultiplier = fineAuthorityPair.blueMultiplier;
-        pass2State.splitOpponentAuthorityActive =
-                pass2State.splitOpponentAuthorityActive || fineAuthorityPair.active;
-    }
-    if (pass2State.midBand.plan.enabled) {
-        const float redMidPressure = bncam::spectra2::splitResidualPressure(
-                pass2State.midBand.plan.requiredReductionFraction,
-                initialChromaBands.redMidEnergy,
-                initialChromaBands.blueMidEnergy
-        );
-        const float blueMidPressure = bncam::spectra2::splitResidualPressure(
-                pass2State.midBand.plan.requiredReductionFraction,
-                initialChromaBands.blueMidEnergy,
-                initialChromaBands.redMidEnergy
-        );
-        const auto midAuthorityPair = bncam::spectra2::resolveOpponentAuthorityPair(
-                bncam::spectra2::applyChannelShadingRiskToEvidence(
-                        pass2CommonOpponentSupport * redMidPressure,
-                        channelShadingRisk.redMultiplier),
-                bncam::spectra2::applyChannelShadingRiskToEvidence(
-                        pass2CommonOpponentSupport * blueMidPressure,
-                        channelShadingRisk.blueMultiplier),
-                pass2State.splitOpponentMaximumModulation
-        );
-        pass2State.midRedAuthorityMultiplier = midAuthorityPair.redMultiplier;
-        pass2State.midBlueAuthorityMultiplier = midAuthorityPair.blueMultiplier;
-        pass2State.splitOpponentAuthorityActive =
-                pass2State.splitOpponentAuthorityActive || midAuthorityPair.active;
-    }
-
-    // N006A final Pass-2 authority clamp. Plan/evidence above is read-only; no later
-    // planning result is allowed to reactivate the retired classical pixel owner.
-    pass2State.applied = false;
-    pass2State.fineBand.applied = false;
-    pass2State.midBand.applied = false;
-
-    // Milestone 3B kernels are independently band-limited. The mid band consumes
-    // the current mosaic and no longer needs fine-band activation as a prerequisite.
-    if (pass2State.applied &&
-        !pass2State.fineBand.plan.enabled &&
-        !pass2State.midBand.plan.enabled) {
-        pass2State.applied = false;
-        pass2State.fallbackReason = "m3b_all_chroma_bands_below_budget";
-    }
-
-    const bool preDemosaicChromaBudgetReached = budgetState.spectraMode != 0 &&
-            budgetState.predictedChromaNoiseFloor > 0.0f &&
-            budgetState.initialChromaResidualEnergy <=
-                    budgetState.predictedChromaNoiseFloor * 1.10f;
-    // The propagated visible-domain target remains telemetry-only in the current production
-    // architecture. It deliberately has no authority to skip Pass 2.
-    if (preDemosaicChromaBudgetReached) {
-        pass2VisibleTargetPreventedSkip = true;
-    }
-    // N006D: Pass-2 is observation/planning only; classical pixel execution is physically absent.
-    pass2State.processingTimeMs = elapsedMs(pass2Start);
-
-    // N006D: retired Pass1/2 cannot create a resident post-Pass2 generation. Reuse the
-    // read-only observations from the identical pre-demosaic image instead of invoking the old
-    // low-band observer or rescanning an unchanged full frame.
-    bncam::spectra2::ChromaBandEnergySnapshot postPass2ChromaBands = initialChromaBands;
+    // Classical Pass-2 execution is gone. The image is unchanged; reuse the same observation
+    // instead of fabricating a post-filter measurement or reduction percentage.
+    const bncam::spectra2::ChromaBandEnergySnapshot postPass2ChromaBands = initialChromaBands;
     spectraPerformance.postPass2Statistics = spectraPerformance.postPass1Statistics;
     budgetState.pass2ResidualEnergy = spectraPerformance.postPass2Statistics.residualEnergy;
     budgetState.pass2ChromaResidualEnergy =
             spectraPerformance.postPass2Statistics.chromaResidualEnergy;
 
-
     const auto lowBandObserverStart = IspClock::now();
     bncam::NativeStageHeartbeat::instance().update(
             workingMeta.captureAttemptId, "SPECTRA_CFA_LOW_BAND_OBSERVER");
-    // N006N: Pass-3 correction ownership is gone. Reuse the unchanged pre-demosaic CFA
-    // measurement and retain only compact low-band evidence for demosaic/neural conditioning.
-    // This path has no RAW pixel authority and performs no correction.
-    const float postPass2BandMeasurementMs = 0.0f;
-    pass2State.fineBand.outputEnergy = postPass2ChromaBands.fineEnergy;
-    pass2State.fineBand.outputStage = "PASS2_RETIRED_IDENTITY_OBSERVATION";
-    pass2State.fineBand.reductionPercentage = bncam::spectra2::reductionPercentage(
-            pass2State.fineBand.plan.inputEnergy, pass2State.fineBand.outputEnergy);
-    pass2State.midBand.outputEnergy = postPass2ChromaBands.midEnergy;
-    pass2State.midBand.outputStage = "PASS2_RETIRED_IDENTITY_OBSERVATION";
-    pass2State.midBand.reductionPercentage = bncam::spectra2::reductionPercentage(
-            pass2State.midBand.plan.inputEnergy,
-            pass2State.midBand.outputEnergy
-    );
     const float lowDirectionalEvidence = spectraDirectionalEvidence(
             postPass2ChromaBands,
             budgetState.predictedChromaNoiseFloor
     );
-    const float lowBandConfiguredStrength = std::clamp(
-            uiConfig.profileSpectraStrength * 0.50f +
-                    uiConfig.profileSpectraLowFrequency * 0.85f,
-            -1.0f, 1.50f
+    const CfaBandResidualEvidence lowBandEvidence = resolveCfaBandResidualEvidence(
+            bncam::spectra2::ChromaBandKind::Low,
+            postPass2ChromaBands.lowEnergy,
+            budgetState.predictedChromaNoiseFloor,
+            std::min(
+                    std::clamp(workingMeta.calibration.signalModelConfidence, 0.0f, 1.0f),
+                    postPass2ChromaBands.confidence
+            ),
+            lowDirectionalEvidence
     );
-    const float lowBandIsoAuthority = isoState.lowFrequencyAuthority;
-    const bncam::spectra2::ChromaBandPlan lowBandPlan =
-            bncam::spectra2::resolveChromaBandPlan(
-                    bncam::spectra2::ChromaBandKind::Low,
-                    postPass2ChromaBands.lowEnergy,
-                    budgetState.predictedChromaNoiseFloor,
-                    pass2VisibleChromaAmplification,
-                    std::min(
-                            std::clamp(workingMeta.calibration.signalModelConfidence, 0.0f, 1.0f),
-                            postPass2ChromaBands.confidence
-                    ),
-                    lowBandIsoAuthority,
-                    lowBandConfiguredStrength,
-                    lowDirectionalEvidence
-            );
     const float lowBandObserverMs = elapsedMs(lowBandObserverStart);
+    const float postPass2BandMeasurementMs = 0.0f;
+
+    // The CFA-confidence contract is still shared with demosaic. Feed it a neutral compatibility
+    // transport containing only raw-domain evidence; correction/authority fields remain zero.
+    const bncam::spectra2::ChromaBandPlan fineBandEvidenceTransport =
+            makeCfaEvidenceTransport(fineBandEvidence);
+    const bncam::spectra2::ChromaBandPlan midBandEvidenceTransport =
+            makeCfaEvidenceTransport(midBandEvidence);
+    const bncam::spectra2::ChromaBandPlan lowBandEvidenceTransport =
+            makeCfaEvidenceTransport(lowBandEvidence);
+
+    pass2State.processingTimeMs = elapsedMs(pass2Start);
 
     budgetState.finalRemainingEnergy = budgetState.initialResidualEnergy;
     const auto finalProvenanceStart = IspClock::now();
@@ -6648,8 +6515,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     int noRegretEvaluatedPasses = 0;
     for (const SpectraNoRegretResult* passResult : {
             &pass0NoRegret,
-            &pass1NoRegret,
-            &pass2NoRegret
+            &pass1NoRegret
     }) {
         if (passResult->evaluatedTiles <= 0) continue;
         noRegretAcceptanceSum += passResult->meanAcceptance;
@@ -6697,9 +6563,9 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                     demosaicEvidenceMode,
                     workingMeta.calibration.signalModelConfidence,
                     initialChromaBands,
-                    pass2State.fineBand.plan,
-                    pass2State.midBand.plan,
-                    lowBandPlan,
+                    fineBandEvidenceTransport,
+                    midBandEvidenceTransport,
+                    lowBandEvidenceTransport,
                     0.0f, // retired Pass-3 spatial correction confidence: no pixel authority
                     pass1State.anisotropicDetail.confidenceP50,
                     pass1State.edgeProtectedFraction,
@@ -6870,11 +6736,10 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     residualNoiseState.columnPatternEnergy = 0.0f;
     residualNoiseState.modelConfidence = static_cast<float>(
             residualNoiseState.preDemosaic.confidence);
-    residualNoiseState.pass2VisibleTargetReady = pass2VisibleTargetReady;
-    residualNoiseState.pass2VisibleTargetStatus = pass2VisibleTargetStatus;
-    residualNoiseState.pass2VisibleTargetPreventedSkip = pass2VisibleTargetPreventedSkip;
-    residualNoiseState.pass2VisibleTargetConfidence = pass2VisibleTargetConfidence;
-    residualNoiseState.pass2VisibleChromaAmplification = pass2VisibleChromaAmplification;
+    residualNoiseState.cfaVisibleRiskReady = cfaVisibleRiskReady;
+    residualNoiseState.cfaVisibleRiskStatus = cfaVisibleRiskStatus;
+    residualNoiseState.cfaVisibleRiskConfidence = cfaVisibleRiskConfidence;
+    residualNoiseState.cfaVisibleChromaAmplification = cfaVisibleChromaAmplification;
     const float spectraProcessingMs = elapsedMs(spectraProcessingStart);
 
     // workingRaw is already the private JPEG-only normalization result. Taking it by value and
@@ -9657,8 +9522,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     spectraPerformance.knownFullFrameCloneCount =
             ((residentEntry && !residentCpuFallbackUsed) ? 0 : 1) +
             (pass0NoRegret.evaluatedTiles > 0 ? 1 : 0) +
-            (pass1NoRegret.evaluatedTiles > 0 ? 1 : 0) +
-            (pass2NoRegret.evaluatedTiles > 0 ? 1 : 0);
+            (pass1NoRegret.evaluatedTiles > 0 ? 1 : 0);
     const std::uint64_t spectraStatisticsBytesRead =
             spectraPerformance.initialStatistics.estimatedBytesRead +
             spectraPerformance.postPass1Statistics.estimatedBytesRead +
@@ -10134,7 +9998,6 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << formatCfaChromaConfidenceFields(cfaChromaConfidence)
             << "; " << pass0NoRegret.formatDebugString()
             << "; " << pass1NoRegret.formatDebugString()
-            << "; " << pass2NoRegret.formatDebugString()
             << "; " << budgetState.formatDebugString()
             << "; " << residualNoiseState.formatDebugString()
             << "; " << downstreamIspState.formatDebugString()
@@ -10370,55 +10233,24 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << pass1State.anisotropicDetail.tensorFieldBuildMs
             << "; spectraAnisotropicDetailDirectionalFilterMs="
             << pass1State.anisotropicDetail.directionalFilterMs
-            << "; spectraPass2Applied=" << (pass2State.applied ? "true" : "false")
-            << "; spectraPass2SkipReason=" << pass2State.fallbackReason
-            << "; spectraPass2InputEnergy=" << budgetState.initialChromaResidualEnergy
-            << "; spectraPass2TargetFloor=" << budgetState.predictedChromaNoiseFloor
-            << "; spectraPass2OutputEnergy=" << budgetState.pass2ChromaResidualEnergy
-            << "; spectraPass2ReductionPercentage=" << reductionPct(budgetState.initialChromaResidualEnergy, budgetState.pass2ChromaResidualEnergy)
-            << "; spectraPass2MaximumCorrection=" << pass2State.maxChromaShift
-            << "; spectraPass2ProcessingTimeMs=" << pass2State.processingTimeMs
-            << "; spectraPass2PixelWorkingCloneCount="
-            << pass2State.pixelWorkingCloneCount
-            << "; spectraPass2AvoidedFullFrameCloneCount="
-            << pass2State.avoidedFullFrameCloneCount
-            << "; spectraPass2PixelBufferStrategy="
-            << pass2State.pixelBufferStrategy
-            << "; spectraPass2VulkanKernelConnected=" << (pass2State.vulkanKernelConnected ? "true" : "false")
-            << "; spectraPass2VulkanAttempted=" << (pass2State.vulkanAttempted ? "true" : "false")
-            << "; spectraPass2VulkanExecutionSucceeded=" << (pass2State.vulkanExecutionSucceeded ? "true" : "false")
-            << "; spectraPass2VulkanUsedForOutput=" << (pass2State.vulkanUsedForOutput ? "true" : "false")
-            << "; spectraPass2VulkanCpuFallbackUsed=" << (pass2State.vulkanCpuFallbackUsed ? "true" : "false")
-            << "; spectraPass2VulkanGpuNoRegretBlendUsed=" << (pass2State.vulkanGpuNoRegretBlendUsed ? "true" : "false")
-            << "; spectraPass2VulkanCandidateReadbackAvoided=" << (pass2State.vulkanCandidateReadbackAvoided ? "true" : "false")
-            << "; spectraPass2VulkanPersistentReuseHit=" << (pass2State.vulkanPersistentReuseHit ? "true" : "false")
-            << "; spectraPass2VulkanPersistentReallocated=" << (pass2State.vulkanPersistentReallocated ? "true" : "false")
-            << "; spectraPass2VulkanStatus=" << pass2State.vulkanStatus
-            << "; spectraPass2VulkanFailureReason=" << pass2State.vulkanFailureReason
-            << "; spectraPass2VulkanInputPackingMs=" << pass2State.vulkanInputPackingMs
-            << "; spectraPass2VulkanAuxiliaryUploadMs=" << pass2State.vulkanAuxiliaryUploadMs
-            << "; spectraPass2VulkanFineKernelMs=" << pass2State.vulkanFineKernelMs
-            << "; spectraPass2VulkanMidKernelMs=" << pass2State.vulkanMidKernelMs
-            << "; spectraPass2VulkanTileStatisticsKernelMs=" << pass2State.vulkanTileStatisticsKernelMs
-            << "; spectraPass2VulkanNoRegretDecisionMs=" << pass2State.vulkanNoRegretDecisionMs
-            << "; spectraPass2VulkanNoRegretBlendMs=" << pass2State.vulkanNoRegretBlendMs
-            << "; spectraPass2VulkanGpuKernelMs=" << pass2State.vulkanGpuKernelMs
-            << "; spectraPass2VulkanSynchronizationMs=" << pass2State.vulkanSynchronizationMs
-            << "; spectraPass2VulkanReadbackMs=" << pass2State.vulkanReadbackMs
-            << "; spectraPass2VulkanTransferAndSyncMs=" << pass2State.vulkanTransferAndSyncMs
-            << "; spectraPass2VulkanTotalMs=" << pass2State.vulkanTotalMs
-            << "; spectraPass2VulkanResidentBytes=" << pass2State.vulkanResidentBytes
-            << "; spectraPass2VulkanAllocationGeneration=" << pass2State.vulkanAllocationGeneration
-            << "; spectraCfaLowBandObserverStatus=" << lowBandPlan.status
-            << "; spectraCfaLowBandObserverInputEnergy=" << lowBandPlan.inputEnergy
-            << "; spectraCfaLowBandObserverTargetFloor=" << lowBandPlan.targetFloor
-            << "; spectraCfaLowBandObserverExcessEnergy=" << lowBandPlan.excessEnergy
-            << "; spectraCfaLowBandObserverResidualPressure=" << lowBandPlan.requiredReductionFraction
-            << "; spectraCfaLowBandObserverModelConfidence=" << lowBandPlan.modelConfidence
-            << "; spectraCfaLowBandObserverDirectionalEvidence=" << lowBandPlan.evidence
+            << "; spectraCfaBandObserverStatus=" << pass2State.observerStatus
+            << "; spectraCfaBandObserverModelConfidence=" << pass2State.modelConfidence
+            << "; spectraCfaBandObserverPixelAuthority=false"
+            << "; spectraCfaBandObserverInputEnergy=" << budgetState.initialChromaResidualEnergy
+            << "; spectraCfaBandObserverExpectedNoiseFloor=" << budgetState.predictedChromaNoiseFloor
+            << "; spectraCfaBandObserverObservedOutputEnergy=" << budgetState.pass2ChromaResidualEnergy
+            << "; spectraCfaBandObserverImageUnchanged=true"
+            << "; spectraCfaBandObserverProcessingTimeMs=" << pass2State.processingTimeMs
+            << "; spectraCfaLowBandObserverStatus=" << lowBandEvidence.status
+            << "; spectraCfaLowBandObserverInputEnergy=" << lowBandEvidence.inputEnergy
+            << "; spectraCfaLowBandObserverTargetFloor=" << lowBandEvidence.expectedNoiseFloor
+            << "; spectraCfaLowBandObserverExcessEnergy=" << lowBandEvidence.excessEnergy
+            << "; spectraCfaLowBandObserverResidualPressure=" << lowBandEvidence.residualPressure
+            << "; spectraCfaLowBandObserverModelConfidence=" << lowBandEvidence.modelConfidence
+            << "; spectraCfaLowBandObserverDirectionalEvidence=" << lowBandEvidence.directionalEvidence
             << "; spectraCfaLowBandObserverMeasurementReused=true"
             << "; spectraCfaLowBandObserverProcessingTimeMs=" << lowBandObserverMs
-            << "; spectraChromaBandsArchitecture=" << pass2State.multiscaleArchitecture
+            << "; spectraChromaBandsArchitecture=READ_ONLY_CFA_BAND_ENERGY_OBSERVER"
             << "; spectraChromaBandEnergyMethod=" << pass2State.bandEnergyMethod
             << "; spectraChromaBandEnergyInputStatus=" << pass2State.bandEnergyStatus
             << "; spectraChromaBandEnergyInputSampleCount=" << pass2State.bandEnergySampleCount
@@ -10446,8 +10278,8 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; spectraChromaBandEnergyPostPass2BlueMid=" << postPass2ChromaBands.blueMidEnergy
             << "; spectraChromaBandEnergyPostPass2BlueLow=" << postPass2ChromaBands.blueLowEnergy
             << "; spectraChromaBandEnergyPostPass2MeasurementMs=" << postPass2BandMeasurementMs
-            << formatChromaBandFields("spectraChromaFine", pass2State.fineBand)
-            << formatChromaBandFields("spectraChromaMid", pass2State.midBand)
+            << formatCfaBandResidualEvidenceFields("spectraCfaFineBand", fineBandEvidence)
+            << formatCfaBandResidualEvidenceFields("spectraCfaMidBand", midBandEvidence)
             << "; spectraNoRegretP0TotalTiles=" << pass0NoRegret.totalTiles
             << "; spectraNoRegretP0EvaluatedTiles=" << pass0NoRegret.evaluatedTiles
             << "; spectraNoRegretP0InvalidTiles=" << pass0NoRegret.invalidTiles
@@ -10486,25 +10318,6 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; spectraNoRegretP1MaxColourShift=" << pass1NoRegret.maxColourShift
             << "; spectraNoRegretP1EdgePreservationScore=" << pass1NoRegret.edgePreservationScore
             << "; spectraNoRegretP1OversmoothingScore=" << pass1NoRegret.oversmoothingScore
-            << "; spectraNoRegretP2TotalTiles=" << pass2NoRegret.totalTiles
-            << "; spectraNoRegretP2EvaluatedTiles=" << pass2NoRegret.evaluatedTiles
-            << "; spectraNoRegretP2InvalidTiles=" << pass2NoRegret.invalidTiles
-            << "; spectraNoRegretP2FullyAcceptedTiles=" << pass2NoRegret.acceptedTiles
-            << "; spectraNoRegretP2PartiallyAcceptedTiles=" << pass2NoRegret.partiallyAcceptedTiles
-            << "; spectraNoRegretP2RejectedTiles=" << pass2NoRegret.rejectedTiles
-            << "; spectraNoRegretP2RejectedOversmooth=" << pass2NoRegret.rejectedOversmooth
-            << "; spectraNoRegretP2RejectedDetailLoss=" << pass2NoRegret.rejectedDetailLoss
-            << "; spectraNoRegretP2RejectedMeanDrift=" << pass2NoRegret.rejectedMeanDrift
-            << "; spectraNoRegretP2RejectedNoImprovement=" << pass2NoRegret.rejectedNoImprovement
-            << "; spectraNoRegretP2MeanAcceptance=" << pass2NoRegret.meanAcceptance
-            << "; spectraNoRegretP2AcceptanceP10=" << pass2NoRegret.acceptanceP10
-            << "; spectraNoRegretP2AcceptanceP50=" << pass2NoRegret.acceptanceP50
-            << "; spectraNoRegretP2AcceptanceP90=" << pass2NoRegret.acceptanceP90
-            << "; spectraNoRegretP2AttenuatedPixelFraction=" << pass2NoRegret.attenuatedPixelFraction
-            << "; spectraNoRegretP2MeanColourShift=" << pass2NoRegret.meanColourShift
-            << "; spectraNoRegretP2MaxColourShift=" << pass2NoRegret.maxColourShift
-            << "; spectraNoRegretP2EdgePreservationScore=" << pass2NoRegret.edgePreservationScore
-            << "; spectraNoRegretP2OversmoothingScore=" << pass2NoRegret.oversmoothingScore
             << "; spectraResidualDomain=" << residualNoiseState.domain
             << "; spectraResidualValueStage=" << residualNoiseState.valueStage
             << "; spectraResidualLastObservedStage=" << residualNoiseState.lastObservedStage
@@ -10593,8 +10406,8 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << demosaicMeasuredToPredictedPostRmsRatio
             << "; spectraDemosaicMeasuredPostAcceptedSamples="
             << residualNoiseState.measuredPostDemosaic.acceptedSampleCount
-            << "; spectraDemosaicPreFineChromaEnergy=" << pass2State.fineBand.outputEnergy
-            << "; spectraDemosaicPreMidChromaEnergy=" << pass2State.midBand.outputEnergy
+            << "; spectraDemosaicPreFineChromaEnergy=" << postPass2ChromaBands.fineEnergy
+            << "; spectraDemosaicPreMidChromaEnergy=" << postPass2ChromaBands.midEnergy
             << "; spectraDemosaicPreLowChromaEnergy=" << postPass2ChromaBands.lowEnergy
             << "; spectraPreWbChromaCleanupPlanReady="
             << (preWbChromaCleanupPlanReady ? "true" : "false")
@@ -10740,11 +10553,10 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; spectraMeasuredPostIspVarianceBG=" << residualNoiseState.measuredPostIspVarianceBG
             << "; spectraMeasuredPostIspCovarianceRgBg=" << residualNoiseState.measuredPostIspCovarianceRgBg
             << "; spectraMeasuredPostIspSampleCount=" << residualNoiseState.measuredPostIspSampleCount
-            << "; spectraPass2VisibleTargetReady=" << (residualNoiseState.pass2VisibleTargetReady ? "true" : "false")
-            << "; spectraPass2VisibleTargetStatus=" << residualNoiseState.pass2VisibleTargetStatus
-            << "; spectraPass2VisibleTargetPreventedSkip=" << (residualNoiseState.pass2VisibleTargetPreventedSkip ? "true" : "false")
-            << "; spectraPass2VisibleTargetConfidence=" << residualNoiseState.pass2VisibleTargetConfidence
-            << "; spectraPass2VisibleChromaAmplification=" << residualNoiseState.pass2VisibleChromaAmplification
+            << "; spectraCfaVisibleRiskReady=" << (residualNoiseState.cfaVisibleRiskReady ? "true" : "false")
+            << "; spectraCfaVisibleRiskStatus=" << residualNoiseState.cfaVisibleRiskStatus
+            << "; spectraCfaVisibleRiskConfidence=" << residualNoiseState.cfaVisibleRiskConfidence
+            << "; spectraCfaVisibleChromaAmplification=" << residualNoiseState.cfaVisibleChromaAmplification
             << "; spectraCaptureProvenanceMs=" << captureProvenanceMs
             << "; spectraFinalProvenanceMs=" << finalProvenanceMs
             << "; spectraTotalProcessingMs=" << spectraProcessingMs
@@ -11151,17 +10963,15 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << (isRawSensor ? meta.rawSensorToMasterRaw16Ms : 0.0f)
             << "; raw10SharedRawBayerIspMs=" << (isRaw10 ? totalRawIspCoreMs : 0.0f)
             << "; rawSensorSharedRawBayerIspMs=" << (isRawSensor ? totalRawIspCoreMs : 0.0f)
-            << "; spectraPerformanceMilestone=N006N_READ_ONLY_CFA_LOW_BAND_OBSERVER"
+            << "; spectraPerformanceMilestone=N006O_READ_ONLY_CFA_BAND_EVIDENCE"
             << "; spectraPerformancePrevious=M8H_J_GPU_RESIDENT_POST_CCM_SCENE_HIGHLIGHT_TONE_VIBRANCE_PROFILE_COLOR"
-            << "; spectraPerformanceBase=N006N_SPECTRA_CORE_OBSERVATION_RAW_FINALIZE_DEMOSAIC_AWB_CCM_TONE"
+            << "; spectraPerformanceBase=N006O_SPECTRA_CORE_OBSERVATION_RAW_FINALIZE_DEMOSAIC_AWB_CCM_TONE"
             << "; spectraPerformanceEfContract=M8H_EF_GPU_PRIMARY_RAW_FINALIZE_DEMOSAIC_AWB_CCM_POST_DEMOSAIC"
             << "; spectraPerformanceHContract=N006D_READ_ONLY_NOISE_MAP_RAW_FINALIZE_DEMOSAIC_AWB_CCM"
             << "; spectraPerformanceIContract=N006D_TEMPORAL_OBSERVER_RAW_FINALIZE_DEMOSAIC_AWB_CCM"
             << "; spectraProductionBackend=VULKAN_GPU_PRIMARY_HYBRID_TRANSITION"
             << "; spectraPass1GpuPrimary="
             << (pass1State.vulkanUsedForOutput ? "true" : "false")
-            << "; spectraPass2GpuPrimary="
-            << (pass2State.vulkanUsedForOutput ? "true" : "false")
             << "; spectraCfaLowBandObserverPixelAuthority=false"
             << "; spectraDemosaicGpuPrimary="
             << (vulkanDemosaicResident ? "true" : "false")

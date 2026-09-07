@@ -335,25 +335,10 @@ struct SpectraPass1State {
 };
 
 struct SpectraPass2State {
-    bool physicalBaselineMode = false;
-    std::string authoritySource = "SPECTRA";
-    int spectraMode = 0; // 0=Legacy/Off, 1=Auto, 2=Manual
-    bool applied = false;
-    std::string fallbackReason = "none";
-    float averageChromaReductionPct = 0.0f;
-    float maxChromaShift = 0.0f;
+    int spectraMode = 0; // 0=Off, 1=Auto, 2=Manual
+    std::string observerStatus = "UNINITIALIZED";
     float modelConfidence = 0.0f;
-    float blendStrength = 0.0f;
-    float isoAuthority = 0.0f;
-    float localShadingAuthorityMean = 1.0f;
-    float noRegretAcceptedTileFraction = 0.0f;
-    float noRegretRollbackFraction = 0.0f;
-    std::array<double, 4> effectiveS{0.0, 0.0, 0.0, 0.0};
-    std::array<double, 4> effectiveO{0.0, 0.0, 0.0, 0.0};
     float processingTimeMs = 0.0f;
-    std::string multiscaleArchitecture = "SPECTRA_CONTEXT_FUSION_MULTISCALE_CFA_CHROMA";
-    bncam::spectra2::ChromaBandTelemetry fineBand{};
-    bncam::spectra2::ChromaBandTelemetry midBand{};
     std::string bandEnergyStatus = "UNAVAILABLE";
     std::string bandEnergyMethod = "UNINITIALIZED";
     std::uint64_t bandEnergySampleCount = 0;
@@ -362,53 +347,6 @@ struct SpectraPass2State {
     float bandEnergyRedBlueSampleBalance = 0.0f;
     float bandEnergyConfidence = 0.0f;
     float bandEnergyMeasurementMs = 0.0f;
-    std::uint64_t profiledStrongFineBlendQuadCount = 0;
-    std::uint64_t profiledColorEdgeProtectedQuadCount = 0;
-    std::uint64_t profiledHeavyFineCleanQuadCount = 0;
-    float profiledStrongFineBlendFraction = 0.0f;
-    float profiledColorEdgeProtectedFraction = 0.0f;
-    float profiledHeavyFineCleanFraction = 0.0f;
-
-    // Delta 23: conservative per-opponent redistribution of the existing Pass-2 authority.
-    // These multipliers remain centred on 1.0 and are bounded to +/-12%; they do not alter
-    // whether a band is enabled or its maximum correction scale.
-    bool splitOpponentAuthorityActive = false;
-    float splitOpponentMaximumModulation = 0.12f;
-    float fineRedAuthorityMultiplier = 1.0f;
-    float fineBlueAuthorityMultiplier = 1.0f;
-    float midRedAuthorityMultiplier = 1.0f;
-    float midBlueAuthorityMultiplier = 1.0f;
-
-    int pixelWorkingCloneCount = 0;
-    int avoidedFullFrameCloneCount = 0;
-    std::string pixelBufferStrategy = "UNINITIALIZED";
-
-    // Milestone 8H-C: Pass 2 full-frame fine/mid candidate and No-Regret blend are GPU-primary.
-    bool vulkanKernelConnected = false;
-    bool vulkanAttempted = false;
-    bool vulkanExecutionSucceeded = false;
-    bool vulkanUsedForOutput = false;
-    bool vulkanCpuFallbackUsed = false;
-    bool vulkanGpuNoRegretBlendUsed = false;
-    bool vulkanCandidateReadbackAvoided = false;
-    bool vulkanPersistentReuseHit = false;
-    bool vulkanPersistentReallocated = false;
-    std::string vulkanStatus = "NOT_RUN";
-    std::string vulkanFailureReason = "none";
-    float vulkanInputPackingMs = 0.0f;
-    float vulkanAuxiliaryUploadMs = 0.0f;
-    float vulkanFineKernelMs = 0.0f;
-    float vulkanMidKernelMs = 0.0f;
-    float vulkanTileStatisticsKernelMs = 0.0f;
-    float vulkanNoRegretDecisionMs = 0.0f;
-    float vulkanNoRegretBlendMs = 0.0f;
-    float vulkanGpuKernelMs = 0.0f;
-    float vulkanSynchronizationMs = 0.0f;
-    float vulkanReadbackMs = 0.0f;
-    float vulkanTransferAndSyncMs = 0.0f;
-    float vulkanTotalMs = 0.0f;
-    std::uint64_t vulkanResidentBytes = 0;
-    std::uint64_t vulkanAllocationGeneration = 0;
 
     std::string formatDebugString() const;
 };
@@ -500,11 +438,10 @@ struct SpectraResidualNoiseState {
     std::string measuredPostIspStatus =
             "CONTROLLED_SCENE_PROXY_SPATIAL_CORRELATION_AND_TEXTURE_NOT_DECONVOLVED";
     float measuredPostIspFilterEnergyGain = 1.25f;
-    bool pass2VisibleTargetReady = false;
-    std::string pass2VisibleTargetStatus = "UNAVAILABLE";
-    bool pass2VisibleTargetPreventedSkip = false;
-    float pass2VisibleTargetConfidence = 0.0f;
-    float pass2VisibleChromaAmplification = 1.0f;
+    bool cfaVisibleRiskReady = false;
+    std::string cfaVisibleRiskStatus = "UNAVAILABLE";
+    float cfaVisibleRiskConfidence = 0.0f;
+    float cfaVisibleChromaAmplification = 1.0f;
 
     float demosaicPropagationMs = 0.0f;
     float awbPropagationMs = 0.0f;
