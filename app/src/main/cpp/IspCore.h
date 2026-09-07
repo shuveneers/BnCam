@@ -824,24 +824,6 @@ public:
             const NativeRenderQualityConfig& uiConfig
     );
 
-    static void applySpectraPass2(
-            LinearFloatRaw& raw,
-            const IspFrameMetadata& meta,
-            SpectraPass2State& pass2State
-    );
-
-    static SpectraPass3State computePass3State(
-            const LinearFloatRaw& raw,
-            const IspFrameMetadata& meta,
-            const NativeRenderQualityConfig& uiConfig
-    );
-
-    static void applySpectraPass3(
-            LinearFloatRaw& raw,
-            const IspFrameMetadata& meta,
-            SpectraPass3State& pass3State
-    );
-
     static float computeResidualEnergy(
             const LinearFloatRaw& raw
     );
