@@ -7353,477 +7353,6 @@ float IspCore::computeChromaResidualEnergy(const LinearFloatRaw& raw) {
 // N005: retired RAW post-demosaic/Profile-NR resident bridge removed.
 // The remaining legacy backend ABI is purged structurally in N006.
 
-void finalizeVisibleChromaResidualState(
-        const cv::Mat& linearRgb,
-        SpectraResidualNoiseState& residualNoiseState,
-        bncam::spectra2::VisibleChromaTelemetry& telemetry,
-        bool measureOutputResidual = true
-) {
-    if (measureOutputResidual) {
-        const auto outputMeasurementStart = IspClock::now();
-        const bncam::spectra2::ResidualObservation outputObservation =
-                measureLinearResidualFlatRegions(
-                        linearRgb,
-                        "POST_VISIBLE_CHROMA_PRE_QUANTIZATION_RGB"
-                );
-        telemetry.outputMeasurementMs = elapsedMs(outputMeasurementStart);
-        telemetry.outputVarianceRG = static_cast<float>(outputObservation.varianceRG);
-        telemetry.outputVarianceBG = static_cast<float>(outputObservation.varianceBG);
-        telemetry.outputCovarianceRgBg = static_cast<float>(outputObservation.covarianceRgBg);
-        telemetry.outputResidualSampleCount = static_cast<int>(std::min<std::size_t>(
-                outputObservation.acceptedSampleCount,
-                static_cast<std::size_t>(std::numeric_limits<int>::max())
-        ));
-    } else {
-        telemetry.outputMeasurementMs = 0.0f;
-        telemetry.outputVarianceRG = 0.0f;
-        telemetry.outputVarianceBG = 0.0f;
-        telemetry.outputCovarianceRgBg = 0.0f;
-        telemetry.outputResidualSampleCount = 0;
-    }
-    telemetry.applied = telemetry.changedPixelCount > 0u;
-    telemetry.resultStatus = telemetry.applied
-            ? (telemetry.vulkanResidentUsedForOutput
-                    ? "SPECTRA_CONTEXT_FUSION_GPU_RESIDENT_VISIBLE_CHROMA_APPLIED"
-                    : "SPECTRA_CONTEXT_FUSION_VISIBLE_CHROMA_APPLIED")
-            : "NO_SUPPORTED_VISIBLE_CHROMA_CORRECTION";
-
-    const auto safeVarianceGain = [](float before, float after) -> double {
-        if (!(before > 1.0e-12f) || !std::isfinite(after)) return 1.0;
-        return std::sqrt(std::clamp(
-                static_cast<double>(after) / static_cast<double>(before),
-                0.12,
-                1.25
-        ));
-    };
-    const bool measuredReductionReady = telemetry.inputResidualSampleCount >= 2048 &&
-            telemetry.outputResidualSampleCount >= 2048 &&
-            telemetry.inputVarianceRG > 0.0f && telemetry.inputVarianceBG > 0.0f;
-    const double rgGain = measuredReductionReady
-            ? safeVarianceGain(telemetry.inputVarianceRG, telemetry.outputVarianceRG)
-            : std::sqrt(std::clamp(
-                    1.0 - 0.55 * static_cast<double>(telemetry.meanAcceptance) *
-                            static_cast<double>(telemetry.changedPixelFraction),
-                    0.35,
-                    1.0
-            ));
-    const double bgGain = measuredReductionReady
-            ? safeVarianceGain(telemetry.inputVarianceBG, telemetry.outputVarianceBG)
-            : rgGain;
-    residualNoiseState.postVisibleChroma = bncam::spectra2::propagateOpponentGains(
-            residualNoiseState.postTone,
-            1.0,
-            rgGain,
-            bgGain,
-            "POST_VISIBLE_CHROMA_PRE_QUANTIZATION",
-            measuredReductionReady
-                    ? "MEASURED_FLAT_REGION_OPPONENT_REDUCTION"
-                    : "NO_REGRET_ACCEPTANCE_DERIVED_CONSERVATIVE_REDUCTION",
-            measuredReductionReady ? 0.92 : 0.78
-    );
-    residualNoiseState.varianceY = static_cast<float>(
-            residualNoiseState.postVisibleChroma.varianceY
-    );
-    residualNoiseState.varianceRG = static_cast<float>(
-            residualNoiseState.postVisibleChroma.varianceRG
-    );
-    residualNoiseState.varianceBG = static_cast<float>(
-            residualNoiseState.postVisibleChroma.varianceBG
-    );
-    residualNoiseState.covarianceRgBg = static_cast<float>(
-            residualNoiseState.postVisibleChroma.covarianceRgBg
-    );
-    for (std::size_t index = 0; index < residualNoiseState.covarianceRgb.size(); ++index) {
-        residualNoiseState.covarianceRgb[index] = static_cast<float>(
-                residualNoiseState.postVisibleChroma.covariance.values[index]
-        );
-    }
-    residualNoiseState.valueStage = "POST_VISIBLE_CHROMA_PRE_QUANTIZATION";
-    residualNoiseState.propagationStatus =
-            "SPECTRA_CONTEXT_FUSION_PROPAGATED_VISIBLE_CHROMA";
-    residualNoiseState.comparabilityStatus =
-            "VISIBLE_CHROMA_PROPAGATED_SHARPENING_AND_QUANTIZATION_NOT_PROPAGATED";
-}
-
-std::string SpectraVisibleChromaState::formatDebugString() const {
-    const auto& t = telemetry;
-    const auto& p = t.plan;
-    std::ostringstream out;
-    out << std::fixed << std::setprecision(9)
-        << "spectraVisibleChromaActivationSource=" << activationSource
-        << "; spectraVisibleChromaArchitecture=" << architecture
-        << "; spectraVisibleChromaInputStage=" << inputStage
-        << "; spectraVisibleChromaOutputStage=" << outputStage
-        << "; spectraVisibleChromaCovarianceSource=" << covarianceSource
-        << "; spectraVisibleChromaTimingAccounting=" << timingAccounting
-        << "; spectraVisibleChromaEnabled=" << (p.enabled ? "true" : "false")
-        << "; spectraVisibleChromaApplied=" << (t.applied ? "true" : "false")
-        << "; spectraVisibleChromaPlanStatus=" << p.status
-        << "; spectraVisibleChromaResultStatus=" << t.resultStatus
-        << "; spectraVisibleChromaMethod=" << p.method
-        << "; spectraVisibleChromaNoRegretMethod=" << p.noRegretMethod
-        << "; spectraVisibleChromaModelConfidence=" << p.modelConfidence
-        << "; spectraVisibleChromaAuthorityConfidenceFactor=" << p.authorityConfidenceFactor
-        << "; spectraVisibleChromaAuthority=" << p.authority
-        << "; spectraVisibleChromaMaximumCorrection=" << p.maximumCorrection
-        << "; spectraVisibleChromaSigmaRG=" << p.sigmaRG
-        << "; spectraVisibleChromaSigmaBG=" << p.sigmaBG
-        << "; spectraVisibleChromaCovarianceCorrelation=" << p.covarianceCorrelation
-        << "; spectraVisibleChromaPredictedVarianceRG=" << p.predictedVarianceRG
-        << "; spectraVisibleChromaPredictedVarianceBG=" << p.predictedVarianceBG
-        << "; spectraVisibleChromaPredictedCovarianceRgBg=" << p.predictedCovarianceRgBg
-        << "; spectraVisibleChromaProcessedPixelCount=" << t.processedPixelCount
-        << "; spectraVisibleChromaCandidatePixelCount=" << t.candidatePixelCount
-        << "; spectraVisibleChromaChangedPixelCount=" << t.changedPixelCount
-        << "; spectraVisibleChromaChangedPixelFraction=" << t.changedPixelFraction
-        << "; spectraVisibleChromaLumaEdgeProtectedPixelCount="
-        << t.lumaEdgeProtectedPixelCount
-        << "; spectraVisibleChromaColourEdgeProtectedPixelCount="
-        << t.colourEdgeProtectedPixelCount
-        << "; spectraVisibleChromaSaturationProtectedPixelCount="
-        << t.saturationProtectedPixelCount
-        << "; spectraVisibleChromaFullyAcceptedPixelCount=" << t.fullyAcceptedPixelCount
-        << "; spectraVisibleChromaPartiallyAcceptedPixelCount="
-        << t.partiallyAcceptedPixelCount
-        << "; spectraVisibleChromaRejectedPixelCount=" << t.rejectedPixelCount
-        << "; spectraVisibleChromaFullyAcceptedTileCount=" << t.fullyAcceptedTileCount
-        << "; spectraVisibleChromaPartiallyAcceptedTileCount="
-        << t.partiallyAcceptedTileCount
-        << "; spectraVisibleChromaRejectedTileCount=" << t.rejectedTileCount
-        << "; spectraVisibleChromaEvaluatedTileCount=" << t.evaluatedTileCount
-        << "; spectraVisibleChromaMeanAcceptance=" << t.meanAcceptance
-        << "; spectraVisibleChromaAcceptanceP10=" << t.acceptanceP10
-        << "; spectraVisibleChromaAcceptanceP50=" << t.acceptanceP50
-        << "; spectraVisibleChromaAcceptanceP90=" << t.acceptanceP90
-        << "; spectraVisibleChromaMeanColourShift=" << t.meanColourShift
-        << "; spectraVisibleChromaMaximumColourShift=" << t.maximumColourShift
-        << "; spectraVisibleChromaMeanNoiseImprovement=" << t.meanNoiseImprovement
-        << "; spectraVisibleChromaEdgePreservationScore=" << t.edgePreservationScore
-        << "; spectraVisibleChromaOversmoothingScore=" << t.oversmoothingScore
-        << "; spectraVisibleChromaInputVarianceRG=" << t.inputVarianceRG
-        << "; spectraVisibleChromaInputVarianceBG=" << t.inputVarianceBG
-        << "; spectraVisibleChromaInputCovarianceRgBg=" << t.inputCovarianceRgBg
-        << "; spectraVisibleChromaOutputVarianceRG=" << t.outputVarianceRG
-        << "; spectraVisibleChromaOutputVarianceBG=" << t.outputVarianceBG
-        << "; spectraVisibleChromaOutputCovarianceRgBg=" << t.outputCovarianceRgBg
-        << "; spectraVisibleChromaInputResidualSampleCount=" << t.inputResidualSampleCount
-        << "; spectraVisibleChromaOutputResidualSampleCount=" << t.outputResidualSampleCount
-        << "; spectraVisibleChromaProcessingTimeMs=" << t.processingTimeMs
-        << "; spectraVisibleChromaInputMeasurementMs=" << t.inputMeasurementMs
-        << "; spectraVisibleChromaOutputMeasurementMs=" << t.outputMeasurementMs
-        << "; spectraVisibleChromaPixelBackend=" << t.pixelBackend
-        << "; spectraVisibleChromaPixelBackendSelectionReason="
-        << t.pixelBackendSelectionReason
-        << "; spectraVisibleChromaPixelBackendFallbackReason="
-        << t.pixelBackendFallbackReason
-        << "; spectraVisibleChromaPixelNeonCompiled="
-        << (t.pixelNeonCompiled ? "true" : "false")
-        << "; spectraVisibleChromaPixelSimdSelfTestPerformed="
-        << (t.pixelSimdSelfTestPerformed ? "true" : "false")
-        << "; spectraVisibleChromaPixelSimdSelfTestPassed="
-        << (t.pixelSimdSelfTestPassed ? "true" : "false")
-        << "; spectraVisibleChromaPixelSimdSelfTestMaximumAbsoluteDelta="
-        << t.pixelSimdSelfTestMaximumAbsoluteDelta
-        << "; spectraVisibleChromaPixelSimdSelfTestElapsedMs="
-        << t.pixelSimdSelfTestElapsedMs
-        << "; spectraVisibleChromaPixelLatencyBenchmarkPerformed="
-        << (t.pixelLatencyBenchmarkPerformed ? "true" : "false")
-        << "; spectraVisibleChromaPixelLatencyBenchmarkPassed="
-        << (t.pixelLatencyBenchmarkPassed ? "true" : "false")
-        << "; spectraVisibleChromaPixelScalarBenchmarkMs="
-        << t.pixelScalarBenchmarkMs
-        << "; spectraVisibleChromaPixelNeonBenchmarkMs="
-        << t.pixelNeonBenchmarkMs
-        << "; spectraVisibleChromaPixelBenchmarkSpeedup="
-        << t.pixelBenchmarkSpeedup
-        << "; spectraVisibleChromaOpponentVectorizedPixelCount="
-        << t.opponentVectorizedPixelCount
-        << "; spectraVisibleChromaOpponentScalarPixelCount="
-        << t.opponentScalarPixelCount
-        << "; spectraVisibleChromaOpponentRejectedNonFinitePixelCount="
-        << t.opponentRejectedNonFinitePixelCount
-        << "; spectraVisibleChromaOpponentEstimatedBytesRead="
-        << t.opponentEstimatedBytesRead
-        << "; spectraVisibleChromaOpponentEstimatedBytesWritten="
-        << t.opponentEstimatedBytesWritten
-        << "; spectraVisibleChromaOpponentPeakScratchBytes="
-        << t.opponentPeakScratchBytes
-        << "; spectraVisibleChromaOpponentTileCount=" << t.opponentTileCount
-        << "; spectraVisibleChromaOpponentTileSize=" << t.opponentTileSize
-        << "; spectraVisibleChromaOpponentTileBuildMs=" << t.opponentTileBuildMs
-        << "; spectraVisibleChromaMutexFreeTileReduction="
-        << (t.mutexFreeTileReduction ? "true" : "false")
-        << "; spectraVisibleChromaVulkanOpponentKernelConnected="
-        << (t.vulkanOpponentKernelConnected ? "true" : "false")
-        << "; spectraVisibleChromaVulkanOpponentAttempted="
-        << (t.vulkanOpponentAttempted ? "true" : "false")
-        << "; spectraVisibleChromaVulkanOpponentExecutionSucceeded="
-        << (t.vulkanOpponentExecutionSucceeded ? "true" : "false")
-        << "; spectraVisibleChromaVulkanOpponentUsedForOutput="
-        << (t.vulkanOpponentUsedForOutput ? "true" : "false")
-        << "; spectraVisibleChromaVulkanOpponentTimestampQueryUsed="
-        << (t.vulkanOpponentTimestampQueryUsed ? "true" : "false")
-        << "; spectraVisibleChromaVulkanOpponentBenchmarkPerformed="
-        << (t.vulkanOpponentBenchmarkPerformed ? "true" : "false")
-        << "; spectraVisibleChromaVulkanOpponentNumericalEquivalencePassed="
-        << (t.vulkanOpponentNumericalEquivalencePassed ? "true" : "false")
-        << "; spectraVisibleChromaVulkanOpponentDeviceQualificationSelected="
-        << (t.vulkanOpponentDeviceQualificationSelected ? "true" : "false")
-        << "; spectraVisibleChromaVulkanOpponentBenchmarkAborted="
-        << (t.vulkanOpponentBenchmarkAborted ? "true" : "false")
-        << "; spectraVisibleChromaVulkanOpponentMemoryGatePassed="
-        << (t.vulkanOpponentMemoryGatePassed ? "true" : "false")
-        << "; spectraVisibleChromaVulkanOpponentBenchmarkSampleCount="
-        << t.vulkanOpponentBenchmarkSampleCount
-        << "; spectraVisibleChromaVulkanOpponentFailedSampleCount="
-        << t.vulkanOpponentFailedSampleCount
-        << "; spectraVisibleChromaVulkanOpponentCurrentMaximumAbsoluteDelta="
-        << t.vulkanOpponentCurrentMaximumAbsoluteDelta
-        << "; spectraVisibleChromaVulkanOpponentMaximumAbsoluteDelta="
-        << t.vulkanOpponentMaximumAbsoluteDelta
-        << "; spectraVisibleChromaVulkanOpponentCurrentCpuReferenceMs="
-        << t.vulkanOpponentCurrentCpuReferenceMs
-        << "; spectraVisibleChromaVulkanOpponentCurrentCpuVectorizedPixelCount="
-        << t.vulkanOpponentCurrentCpuVectorizedPixelCount
-        << "; spectraVisibleChromaVulkanOpponentCurrentCpuScalarPixelCount="
-        << t.vulkanOpponentCurrentCpuScalarPixelCount
-        << "; spectraVisibleChromaVulkanOpponentCpuReferenceBackend="
-        << t.vulkanOpponentCpuReferenceBackend
-        << "; spectraVisibleChromaVulkanOpponentCpuReferenceStatus="
-        << t.vulkanOpponentCpuReferenceStatus
-        << "; spectraVisibleChromaVulkanOpponentCurrentGpuKernelMs="
-        << t.vulkanOpponentCurrentGpuKernelMs
-        << "; spectraVisibleChromaVulkanOpponentCurrentGpuTotalMs="
-        << t.vulkanOpponentCurrentGpuTotalMs
-        << "; spectraVisibleChromaVulkanOpponentCurrentTransferAndSyncMs="
-        << t.vulkanOpponentCurrentTransferAndSyncMs
-        << "; spectraVisibleChromaVulkanOpponentCpuMedianMs="
-        << t.vulkanOpponentCpuMedianMs
-        << "; spectraVisibleChromaVulkanOpponentGpuKernelMedianMs="
-        << t.vulkanOpponentGpuKernelMedianMs
-        << "; spectraVisibleChromaVulkanOpponentGpuTotalMedianMs="
-        << t.vulkanOpponentGpuTotalMedianMs
-        << "; spectraVisibleChromaVulkanOpponentTransferAndSyncMedianMs="
-        << t.vulkanOpponentTransferAndSyncMedianMs
-        << "; spectraVisibleChromaVulkanOpponentMeasuredSpeedup="
-        << t.vulkanOpponentMeasuredSpeedup
-        << "; spectraVisibleChromaVulkanOpponentTransferFraction="
-        << t.vulkanOpponentTransferFraction
-        << "; spectraVisibleChromaVulkanOpponentQualificationOverheadMs="
-        << t.vulkanOpponentQualificationOverheadMs
-        << "; spectraVisibleChromaVulkanOpponentInputBytes="
-        << t.vulkanOpponentInputBytes
-        << "; spectraVisibleChromaVulkanOpponentOutputBytes="
-        << t.vulkanOpponentOutputBytes
-        << "; spectraVisibleChromaVulkanOpponentAllocatedBytes="
-        << t.vulkanOpponentAllocatedBytes
-        << "; spectraVisibleChromaVulkanOpponentEstimatedTransientBytes="
-        << t.vulkanOpponentEstimatedTransientBytes
-        << "; spectraVisibleChromaVulkanOpponentMaximumTransientBytes="
-        << t.vulkanOpponentMaximumTransientBytes
-        << "; spectraVisibleChromaVulkanOpponentStripedMode="
-        << (t.vulkanOpponentStripedMode ? "true" : "false")
-        << "; spectraVisibleChromaVulkanOpponentStripPlanValid="
-        << (t.vulkanOpponentStripPlanValid ? "true" : "false")
-        << "; spectraVisibleChromaVulkanOpponentStripPlanStatus="
-        << t.vulkanOpponentStripPlanStatus
-        << "; spectraVisibleChromaVulkanOpponentStripCount="
-        << t.vulkanOpponentStripCount
-        << "; spectraVisibleChromaVulkanOpponentSuccessfulStripCount="
-        << t.vulkanOpponentSuccessfulStripCount
-        << "; spectraVisibleChromaVulkanOpponentTargetOutputRows="
-        << t.vulkanOpponentTargetOutputRows
-        << "; spectraVisibleChromaVulkanOpponentHaloRows="
-        << t.vulkanOpponentHaloRows
-        << "; spectraVisibleChromaVulkanOpponentMaximumInputRows="
-        << t.vulkanOpponentMaximumInputRows
-        << "; spectraVisibleChromaVulkanOpponentAssemblyMs="
-        << t.vulkanOpponentAssemblyMs
-        << "; spectraVisibleChromaVulkanOpponentFullFrameOutputBytes="
-        << t.vulkanOpponentFullFrameOutputBytes
-        << "; spectraVisibleChromaVulkanOpponentMaximumStripInputBytes="
-        << t.vulkanOpponentMaximumStripInputBytes
-        << "; spectraVisibleChromaVulkanOpponentMaximumStripOutputBytes="
-        << t.vulkanOpponentMaximumStripOutputBytes
-        << "; spectraVisibleChromaVulkanOpponentPersistentBufferReuseObserved="
-        << (t.vulkanOpponentPersistentBufferReuseObserved ? "true" : "false")
-        << "; spectraVisibleChromaVulkanOpponentPersistentBufferReallocated="
-        << (t.vulkanOpponentPersistentBufferReallocated ? "true" : "false")
-        << "; spectraVisibleChromaVulkanOpponentPersistentBufferReuseHitCount="
-        << t.vulkanOpponentPersistentBufferReuseHitCount
-        << "; spectraVisibleChromaVulkanOpponentPersistentBufferReallocationCount="
-        << t.vulkanOpponentPersistentBufferReallocationCount
-        << "; spectraVisibleChromaVulkanOpponentPersistentBufferCapacityBytes="
-        << t.vulkanOpponentPersistentBufferCapacityBytes
-        << "; spectraVisibleChromaVulkanOpponentPersistentResidentBytes="
-        << t.vulkanOpponentPersistentResidentBytes
-        << "; spectraVisibleChromaVulkanOpponentPersistentAllocationGeneration="
-        << t.vulkanOpponentPersistentAllocationGeneration
-        << "; spectraVisibleChromaVulkanOpponentRouteKey="
-        << t.vulkanOpponentRouteKey
-        << "; spectraVisibleChromaVulkanOpponentExecutionStatus="
-        << t.vulkanOpponentExecutionStatus
-        << "; spectraVisibleChromaVulkanOpponentQualificationStatus="
-        << t.vulkanOpponentQualificationStatus
-        << "; spectraVisibleChromaVulkanOpponentFailureReason="
-        << t.vulkanOpponentFailureReason
-        << "; spectraVisibleChromaVulkanCandidateKernelConnected="
-        << (t.vulkanVisibleCandidateKernelConnected ? "true" : "false")
-        << "; spectraVisibleChromaVulkanCandidateAttempted="
-        << (t.vulkanVisibleCandidateAttempted ? "true" : "false")
-        << "; spectraVisibleChromaVulkanCandidateExecutionSucceeded="
-        << (t.vulkanVisibleCandidateExecutionSucceeded ? "true" : "false")
-        << "; spectraVisibleChromaVulkanCandidateUsedForOutput="
-        << (t.vulkanVisibleCandidateUsedForOutput ? "true" : "false")
-        << "; spectraVisibleChromaVulkanCandidateTimestampQueryUsed="
-        << (t.vulkanVisibleCandidateTimestampQueryUsed ? "true" : "false")
-        << "; spectraVisibleChromaVulkanCandidateBenchmarkPerformed="
-        << (t.vulkanVisibleCandidateBenchmarkPerformed ? "true" : "false")
-        << "; spectraVisibleChromaVulkanCandidateShaderEquivalencePassed="
-        << (t.vulkanVisibleCandidateShaderEquivalencePassed ? "true" : "false")
-        << "; spectraVisibleChromaVulkanCandidateFinalDecisionCompatibilityPassed="
-        << (t.vulkanVisibleCandidateFinalDecisionCompatibilityPassed ? "true" : "false")
-        << "; spectraVisibleChromaVulkanCandidateDeviceQualificationSelected="
-        << (t.vulkanVisibleCandidateDeviceQualificationSelected ? "true" : "false")
-        << "; spectraVisibleChromaVulkanCandidateBenchmarkAborted="
-        << (t.vulkanVisibleCandidateBenchmarkAborted ? "true" : "false")
-        << "; spectraVisibleChromaVulkanCandidateMemoryGatePassed="
-        << (t.vulkanVisibleCandidateMemoryGatePassed ? "true" : "false")
-        << "; spectraVisibleChromaVulkanCandidateBenchmarkSampleCount="
-        << t.vulkanVisibleCandidateBenchmarkSampleCount
-        << "; spectraVisibleChromaVulkanCandidateFailedSampleCount="
-        << t.vulkanVisibleCandidateFailedSampleCount
-        << "; spectraVisibleChromaVulkanCandidateStripCount="
-        << t.vulkanVisibleCandidateStripCount
-        << "; spectraVisibleChromaVulkanCandidateSuccessfulStripCount="
-        << t.vulkanVisibleCandidateSuccessfulStripCount
-        << "; spectraVisibleChromaVulkanCandidateStrength="
-        << t.vulkanVisibleCandidateStrength
-        << "; spectraVisibleChromaVulkanCandidateCurrentShaderMaximumAbsoluteDelta="
-        << t.vulkanVisibleCandidateCurrentShaderMaximumAbsoluteDelta
-        << "; spectraVisibleChromaVulkanCandidateShaderMaximumAbsoluteDelta="
-        << t.vulkanVisibleCandidateShaderMaximumAbsoluteDelta
-        << "; spectraVisibleChromaVulkanCandidateCurrentFinalDecisionMaximumAbsoluteDelta="
-        << t.vulkanVisibleCandidateCurrentFinalDecisionMaximumAbsoluteDelta
-        << "; spectraVisibleChromaVulkanCandidateFinalDecisionMaximumAbsoluteDelta="
-        << t.vulkanVisibleCandidateFinalDecisionMaximumAbsoluteDelta
-        << "; spectraVisibleChromaVulkanCandidateFinalDecisionComparedPixelCount="
-        << t.vulkanVisibleCandidateFinalDecisionComparedPixelCount
-        << "; spectraVisibleChromaVulkanCandidateCurrentCpuReferenceMs="
-        << t.vulkanVisibleCandidateCurrentCpuReferenceMs
-        << "; spectraVisibleChromaVulkanCandidateCurrentGpuKernelMs="
-        << t.vulkanVisibleCandidateCurrentGpuKernelMs
-        << "; spectraVisibleChromaVulkanCandidateCurrentGpuTotalMs="
-        << t.vulkanVisibleCandidateCurrentGpuTotalMs
-        << "; spectraVisibleChromaVulkanCandidateCurrentTransferAndSyncMs="
-        << t.vulkanVisibleCandidateCurrentTransferAndSyncMs
-        << "; spectraVisibleChromaVulkanCandidateCpuMedianMs="
-        << t.vulkanVisibleCandidateCpuMedianMs
-        << "; spectraVisibleChromaVulkanCandidateGpuKernelMedianMs="
-        << t.vulkanVisibleCandidateGpuKernelMedianMs
-        << "; spectraVisibleChromaVulkanCandidateGpuTotalMedianMs="
-        << t.vulkanVisibleCandidateGpuTotalMedianMs
-        << "; spectraVisibleChromaVulkanCandidateTransferAndSyncMedianMs="
-        << t.vulkanVisibleCandidateTransferAndSyncMedianMs
-        << "; spectraVisibleChromaVulkanCandidateMeasuredSpeedup="
-        << t.vulkanVisibleCandidateMeasuredSpeedup
-        << "; spectraVisibleChromaVulkanCandidateTransferFraction="
-        << t.vulkanVisibleCandidateTransferFraction
-        << "; spectraVisibleChromaVulkanCandidateQualificationOverheadMs="
-        << t.vulkanVisibleCandidateQualificationOverheadMs
-        << "; spectraVisibleChromaVulkanCandidateInputBytes="
-        << t.vulkanVisibleCandidateInputBytes
-        << "; spectraVisibleChromaVulkanCandidateOutputBytes="
-        << t.vulkanVisibleCandidateOutputBytes
-        << "; spectraVisibleChromaVulkanCandidateAllocatedBytes="
-        << t.vulkanVisibleCandidateAllocatedBytes
-        << "; spectraVisibleChromaVulkanCandidateEstimatedTransientBytes="
-        << t.vulkanVisibleCandidateEstimatedTransientBytes
-        << "; spectraVisibleChromaVulkanCandidateMaximumTransientBytes="
-        << t.vulkanVisibleCandidateMaximumTransientBytes
-        << "; spectraVisibleChromaVulkanCandidateRouteKey="
-        << t.vulkanVisibleCandidateRouteKey
-        << "; spectraVisibleChromaVulkanCandidateExecutionStatus="
-        << t.vulkanVisibleCandidateExecutionStatus
-        << "; spectraVisibleChromaVulkanCandidateQualificationStatus="
-        << t.vulkanVisibleCandidateQualificationStatus
-        << "; spectraVisibleChromaVulkanCandidateFailureReason="
-        << t.vulkanVisibleCandidateFailureReason
-        << "; spectraVisibleChromaVulkanCandidateNoRegretExecution="
-        << t.vulkanVisibleCandidateNoRegretExecution
-        << "; spectraVisibleChromaVulkanResidentKernelConnected="
-        << (t.vulkanResidentKernelConnected ? "true" : "false")
-        << "; spectraVisibleChromaVulkanResidentAttempted="
-        << (t.vulkanResidentAttempted ? "true" : "false")
-        << "; spectraVisibleChromaVulkanResidentExecutionSucceeded="
-        << (t.vulkanResidentExecutionSucceeded ? "true" : "false")
-        << "; spectraVisibleChromaVulkanResidentUsedForOutput="
-        << (t.vulkanResidentUsedForOutput ? "true" : "false")
-        << "; spectraVisibleChromaVulkanResidentTimestampQueryUsed="
-        << (t.vulkanResidentTimestampQueryUsed ? "true" : "false")
-        << "; spectraVisibleChromaVulkanResidentCpuFallbackUsed="
-        << (t.vulkanResidentCpuFallbackUsed ? "true" : "false")
-        << "; spectraVisibleChromaVulkanResidentPersistentReuseObserved="
-        << (t.vulkanResidentPersistentReuseObserved ? "true" : "false")
-        << "; spectraVisibleChromaVulkanResidentPersistentReallocated="
-        << (t.vulkanResidentPersistentReallocated ? "true" : "false")
-        << "; spectraVisibleChromaVulkanResidentStripCount="
-        << t.vulkanResidentStripCount
-        << "; spectraVisibleChromaVulkanResidentSuccessfulStripCount="
-        << t.vulkanResidentSuccessfulStripCount
-        << "; spectraVisibleChromaVulkanResidentPersistentReuseHitCount="
-        << t.vulkanResidentPersistentReuseHitCount
-        << "; spectraVisibleChromaVulkanResidentPersistentReallocationCount="
-        << t.vulkanResidentPersistentReallocationCount
-        << "; spectraVisibleChromaVulkanResidentInputPackingMs="
-        << t.vulkanResidentInputPackingMs
-        << "; spectraVisibleChromaVulkanResidentSpatialKernelMs="
-        << t.vulkanResidentSpatialKernelMs
-        << "; spectraVisibleChromaVulkanResidentVisibleKernelMs="
-        << t.vulkanResidentVisibleKernelMs
-        << "; spectraVisibleChromaVulkanResidentGpuKernelMs="
-        << t.vulkanResidentGpuKernelMs
-        << "; spectraVisibleChromaVulkanResidentSynchronizationMs="
-        << t.vulkanResidentSynchronizationMs
-        << "; spectraVisibleChromaVulkanResidentReadbackMs="
-        << t.vulkanResidentReadbackMs
-        << "; spectraVisibleChromaVulkanResidentTransferAndSyncMs="
-        << t.vulkanResidentTransferAndSyncMs
-        << "; spectraVisibleChromaVulkanResidentTotalMs="
-        << t.vulkanResidentTotalMs
-        << "; spectraVisibleChromaVulkanResidentInputBytes="
-        << t.vulkanResidentInputBytes
-        << "; spectraVisibleChromaVulkanResidentIntermediateBytes="
-        << t.vulkanResidentIntermediateBytes
-        << "; spectraVisibleChromaVulkanResidentOutputBytes="
-        << t.vulkanResidentOutputBytes
-        << "; spectraVisibleChromaVulkanResidentSpatialMapBytes="
-        << t.vulkanResidentSpatialMapBytes
-        << "; spectraVisibleChromaVulkanResidentPersistentResidentBytes="
-        << t.vulkanResidentPersistentResidentBytes
-        << "; spectraVisibleChromaVulkanResidentAllocationGeneration="
-        << t.vulkanResidentAllocationGeneration
-        << "; spectraVisibleChromaVulkanResidentExecutionStatus="
-        << t.vulkanResidentExecutionStatus
-        << "; spectraVisibleChromaVulkanResidentFailureReason="
-        << t.vulkanResidentFailureReason
-        << "; spectraVisibleChromaVulkanResidentStatisticsMethod="
-        << t.vulkanResidentStatisticsMethod
-        << "; spectraVisibleChromaVulkanResidentAuthority="
-        << t.vulkanResidentAuthority
-        << "; textureClassifierExecuted=" << (t.textureClassifierExecuted ? "true" : "false")
-        << "; adaptiveLumaExecuted=" << (t.adaptiveLumaExecuted ? "true" : "false")
-        << "; avgStructureConfidence=" << t.avgStructureConfidence
-        << "; minStructureConfidence=" << t.minStructureConfidence
-        << "; maxStructureConfidence=" << t.maxStructureConfidence
-        << "; avgAppliedLumaAuthority=" << t.avgAppliedLumaAuthority
-        << "; avgAppliedChromaAuthority=" << t.avgAppliedChromaAuthority
-        << "; smoothRegionPercentage=" << t.smoothRegionPercentage
-        << "; protectedTexturePercentage=" << t.protectedTexturePercentage;
-    return out.str();
-}
-
-
 std::string SpectraDownstreamIspState::formatDebugString() const {
     std::ostringstream out;
     out << std::fixed << std::setprecision(9)
@@ -7916,7 +7445,6 @@ std::string SpectraResidualNoiseState::formatDebugString() const {
         << ";modelConfidence=" << modelConfidence
         << ";motionConfidence=" << motionConfidence
         << ";alignmentConfidence=" << alignmentConfidence
-        << ";predictedVisibleChromaAmplification=" << predictedVisibleChromaAmplification
         << ";demosaicChromaCloudClassificationReady="
         << (demosaicChromaCloudClassificationReady ? "true" : "false")
         << ";demosaicChromaFieldToResidualRmsRatio=" << demosaicChromaFieldToResidualRmsRatio
@@ -11072,22 +10600,6 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                 residualNoiseState.postTone.covariance.values[index]
         );
     }
-    residualNoiseState.predictedVisibleChromaAmplification = static_cast<float>(
-            bncam::spectra2::chromaAmplification(
-                    residualNoiseState.preDemosaic,
-                    residualNoiseState.postTone
-            )
-    );
-    residualNoiseState.visibleChromaPlanningPressure = std::clamp(
-            residualNoiseState.predictedVisibleChromaAmplification *
-                    residualNoiseState.demosaicMeasuredChromaAuthorityPressure,
-            0.65f,
-            4.0f
-    );
-    residualNoiseState.predictedVisibleVarianceY = residualNoiseState.varianceY;
-    residualNoiseState.predictedVisibleVarianceRG = residualNoiseState.varianceRG;
-    residualNoiseState.predictedVisibleVarianceBG = residualNoiseState.varianceBG;
-    residualNoiseState.predictedVisibleCovarianceRgBg = residualNoiseState.covarianceRgBg;
     residualNoiseState.modelConfidence = static_cast<float>(residualNoiseState.postTone.confidence);
 
     bncam::vulkan::SpectraResidentToneResult vulkanTone{};
@@ -11332,32 +10844,10 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     g_threadLocalIspStats.postDenoiseResidualEstimate = g_threadLocalIspStats.preDenoiseResidualEstimate;
     g_threadLocalIspStats.postSharpenResidualEstimate = g_threadLocalIspStats.postDenoiseResidualEstimate;
 
-    // Preserve the public/debug state type, but make the old resident filtering owner fail closed.
-    SpectraVisibleChromaState visibleChromaState{};
-    visibleChromaState.activationSource = "DISABLED_N003_NEUTRAL_PATH";
-    auto& residentTelemetry = visibleChromaState.telemetry;
-    residentTelemetry.applied = false;
-    residentTelemetry.resultStatus = "DISABLED_N003_NEUTRAL_PATH";
-    residentTelemetry.vulkanResidentKernelConnected = false;
-    residentTelemetry.vulkanResidentAttempted = false;
-    residentTelemetry.vulkanResidentCpuFallbackUsed = false;
-    residentTelemetry.vulkanResidentFailureReason = "RETIRED_CLASSICAL_POST_DEMOSAIC_OWNER";
-    residentTelemetry.vulkanResidentExecutionStatus = "RETIRED_CLASSICAL_POST_DEMOSAIC_OWNER";
-    residentTelemetry.vulkanResidentAuthority = "NONE_NEUTRAL_PATH";
-    residentTelemetry.pixelBackend = "NONE_NEUTRAL_PATH";
-    residentTelemetry.pixelBackendSelectionReason = "N003_CLASSICAL_NR_RETIRED";
-    residentTelemetry.pixelBackendFallbackReason = "none";
-
-    residualNoiseState.postVisibleChroma = residualNoiseState.postTone;
-    residualNoiseState.postVisibleChroma.stage = "POST_VISIBLE_CHROMA_IDENTITY";
-    residualNoiseState.postVisibleChroma.method = "N003_IDENTITY_NO_CLASSICAL_POST_DEMOSAIC_NR";
-    residualNoiseState.postVisibleChroma.status = "PROPAGATED";
-
     bool residentPostDemosaicApplied = false;
     bool residentOutputSrgbEncoded = false;
     cv::Mat residentPublishedBgr8;
     bncam::publication::Bgr8PublicationStats residentPublicationStats{};
-    float finalOutSpatialNrMs = 0.0f;
 
     // 8H-K typed recovery: if the resident tone->post-demosaic handoff failed (or the
     // post-demosaic stage is intentionally bypassed), materialize the already-computed tone
@@ -11382,19 +10872,11 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             linearRgb = cv::Mat(
                     demosaicInputHeight, demosaicInputWidth, CV_32FC3,
                     toneReadback.data()).clone();
-            if (residentTelemetry.vulkanResidentFailureReason.empty() ||
-                residentTelemetry.vulkanResidentFailureReason == "none") {
-                residentTelemetry.vulkanResidentFailureReason =
-                        "M8H_K_POST_DEMOSAIC_BYPASS_TONE_READBACK_ONLY";
-            }
         } else {
             materializeCpuPostCcmReference();
             syncHighlightDebugFromPhase9();
             applyCpuToneAndProfile();
             cpuSceneProcessingApplied = true;
-            residentTelemetry.vulkanResidentCpuFallbackUsed = true;
-            residentTelemetry.vulkanResidentFailureReason =
-                    "M8H_K_TONE_READBACK_FAILED_CPU_REFERENCE_REBUILT_" + toneReadbackFailure;
         }
     }
 
@@ -11500,10 +10982,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     const double toneMeanB = static_cast<double>(toneBlueSum.load(std::memory_order_relaxed)) / (finalPixelCount * 255.0);
 
     const auto quantizationPropagationStart = IspClock::now();
-    const bncam::spectra2::NoiseState preQuantizationResidual =
-            residualNoiseState.postVisibleChroma.status == "PROPAGATED"
-                    ? residualNoiseState.postVisibleChroma
-                    : residualNoiseState.postTone;
+    const bncam::spectra2::NoiseState preQuantizationResidual = residualNoiseState.postTone;
     residualNoiseState.postQuantization = bncam::spectra2::propagateQuantization8Bit(
             preQuantizationResidual
     );
@@ -11640,25 +11119,6 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     phase16ValidationInput.modeledVarianceRG = residualNoiseState.finalJpeg.varianceRG;
     phase16ValidationInput.modeledVarianceBG = residualNoiseState.finalJpeg.varianceBG;
     phase16ValidationInput.modeledConfidence = residualNoiseState.finalJpeg.confidence;
-    phase16ValidationInput.visibleInputVarianceRG = visibleChromaState.telemetry.inputVarianceRG;
-    phase16ValidationInput.visibleInputVarianceBG = visibleChromaState.telemetry.inputVarianceBG;
-    phase16ValidationInput.visibleOutputVarianceRG = visibleChromaState.telemetry.outputVarianceRG;
-    phase16ValidationInput.visibleOutputVarianceBG = visibleChromaState.telemetry.outputVarianceBG;
-    phase16ValidationInput.visibleInputResidualSampleCount = static_cast<std::uint64_t>(
-            std::max(0, visibleChromaState.telemetry.inputResidualSampleCount));
-    phase16ValidationInput.visibleOutputResidualSampleCount = static_cast<std::uint64_t>(
-            std::max(0, visibleChromaState.telemetry.outputResidualSampleCount));
-    phase16ValidationInput.visibleChangedPixelFraction = visibleChromaState.telemetry.changedPixelFraction;
-    phase16ValidationInput.visibleMeanAcceptance = visibleChromaState.telemetry.meanAcceptance;
-    phase16ValidationInput.visibleMeanColourShift = visibleChromaState.telemetry.meanColourShift;
-    phase16ValidationInput.visibleMaximumColourShift = visibleChromaState.telemetry.maximumColourShift;
-    phase16ValidationInput.visibleEdgePreservationScore = visibleChromaState.telemetry.edgePreservationScore;
-    phase16ValidationInput.visibleOversmoothingScore = visibleChromaState.telemetry.oversmoothingScore;
-    phase16ValidationInput.visibleProcessedPixelCount = visibleChromaState.telemetry.processedPixelCount;
-    phase16ValidationInput.visibleCandidatePixelCount = visibleChromaState.telemetry.candidatePixelCount;
-    phase16ValidationInput.visibleChangedPixelCount = visibleChromaState.telemetry.changedPixelCount;
-    phase16ValidationInput.visibleExecutionStatus = visibleChromaState.telemetry.resultStatus;
-    phase16ValidationInput.visibleStatisticsMethod = visibleChromaState.telemetry.vulkanResidentStatisticsMethod;
     phase16ValidationInput.chromaCloudClassificationReady =
             residualNoiseState.demosaicChromaCloudClassificationReady;
     phase16ValidationInput.chromaCloudRiskEvidence =
@@ -11689,6 +11149,14 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     phase16ValidationInput.finalOutputStatsSource = finalOutputStatsSource;
     const bncam::validation::ObjectiveValidationSummary phase16Validation =
             bncam::validation::summarizeObjectiveValidation(phase16ValidationInput);
+    const std::string phase16CoreTelemetryStatus =
+            !phase16Validation.coreTelemetryReady
+                    ? "CORE_TELEMETRY_INCOMPLETE"
+                    : (!phase16Validation.residualMeasurementReady
+                            ? "CORE_READY_RESIDUAL_MEASUREMENT_UNAVAILABLE"
+                            : (!phase16Validation.falseColorRiskTelemetryReady
+                                    ? "CORE_RESIDUAL_READY_FALSE_COLOR_RISK_TELEMETRY_UNAVAILABLE"
+                                    : "OBJECTIVE_CORE_RESIDUAL_TELEMETRY_READY_IMAGE_REVIEW_REQUIRED"));
 
     const uint64_t rawIspWorkingSetEstimateBytes =
             static_cast<uint64_t>(demosaicInputWidth) * demosaicInputHeight *
@@ -11697,8 +11165,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             (defectDebug.expensivePassSkipped ? 0 : 1) +
             (greenSplitDebug.applied ? 1 : 0) +
             (lensDebug.applied ? 1 : 0) +
-            (highlightDebug.applied ? 1 : 0) +
-            (visibleChromaState.telemetry.plan.enabled ? 1 : 0);
+            (highlightDebug.applied ? 1 : 0);
     const int bufferReuseHitCount = demosaicRunStats.allocationReuse ? 1 : 0;
     const auto reductionPct = [](float before, float after) -> float {
         if (!(before > 1.0e-12f) || !std::isfinite(after)) return 0.0f;
@@ -11795,11 +11262,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             spectraPerformance.totalStatisticsMs,
             pass0State.processingTimeMs + pass1State.processingTimeMs +
                     pass2State.processingTimeMs + pass3State.processingTimeMs,
-            visibleChromaState.telemetry.processingTimeMs +
-                    visibleChromaState.telemetry.inputMeasurementMs +
-                    visibleChromaState.telemetry.outputMeasurementMs +
-                    visibleChromaState.telemetry.vulkanOpponentQualificationOverheadMs +
-                    visibleChromaState.telemetry.vulkanVisibleCandidateQualificationOverheadMs,
+            0.0f,
             residualNoiseState.measuredPreSharpenResidualMs +
                     residualNoiseState.downstreamSharpenPropagationMs +
                     residualNoiseState.measuredVisibleResidualMs
@@ -11837,41 +11300,15 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; phase16TelemetryReady=" << (phase16Validation.coreTelemetryReady ? "true" : "false")
             << "; phase16ResidualMeasurementReady="
             << (phase16Validation.residualMeasurementReady ? "true" : "false")
-            << "; phase16VisibleChromaMeasurementReady="
-            << (phase16Validation.visibleChromaMeasurementReady ? "true" : "false")
-            << "; phase16VisibleChromaVarianceComparisonReady="
-            << (phase16Validation.visibleChromaVarianceComparisonReady ? "true" : "false")
-            << "; phase16VisibleChromaSigmaRatioAvailable="
-            << (phase16Validation.visibleChromaSigmaRatioAvailable ? "true" : "false")
             << "; phase16FalseColorRiskTelemetryReady="
             << (phase16Validation.falseColorRiskTelemetryReady ? "true" : "false")
-            << "; phase16ColourDriftProxyReady="
-            << (phase16Validation.colourDriftProxyReady ? "true" : "false")
-            << "; phase16TelemetryStatus=" << phase16Validation.telemetryStatus
+            << "; phase16TelemetryStatus=" << phase16CoreTelemetryStatus
             << "; phase16MeasuredFinalLumaSigma=" << phase16Validation.measuredFinalLumaSigma
             << "; phase16MeasuredFinalChromaSigma=" << phase16Validation.measuredFinalChromaSigma
             << "; phase16ModeledFinalLumaSigma=" << phase16Validation.modeledFinalLumaSigma
             << "; phase16ModeledFinalChromaSigma=" << phase16Validation.modeledFinalChromaSigma
             << "; phase16ModeledFinalConfidence=" << residualNoiseState.finalJpeg.confidence
             << "; phase16MeasuredFinalResidualSamples=" << measuredVisibleResidual.sampleCount
-            << "; phase16VisibleChromaSigmaRatio=" << phase16Validation.visibleChromaSigmaRatio
-            << "; phase16VisibleChromaProcessedPixelCount="
-            << visibleChromaState.telemetry.processedPixelCount
-            << "; phase16VisibleChromaCandidatePixelCount="
-            << visibleChromaState.telemetry.candidatePixelCount
-            << "; phase16VisibleChromaChangedPixelCount="
-            << visibleChromaState.telemetry.changedPixelCount
-            << "; phase16VisibleChromaExecutionStatus=" << visibleChromaState.telemetry.resultStatus
-            << "; phase16VisibleChromaStatisticsMethod="
-            << visibleChromaState.telemetry.vulkanResidentStatisticsMethod
-            << "; phase16VisibleChromaChangedPixelFraction="
-            << visibleChromaState.telemetry.changedPixelFraction
-            << "; phase16VisibleChromaMeanAcceptance=" << visibleChromaState.telemetry.meanAcceptance
-            << "; phase16VisibleChromaMeanColourShift=" << visibleChromaState.telemetry.meanColourShift
-            << "; phase16VisibleChromaMaximumColourShift=" << visibleChromaState.telemetry.maximumColourShift
-            << "; phase16VisibleChromaEdgePreservationScore="
-            << visibleChromaState.telemetry.edgePreservationScore
-            << "; phase16VisibleChromaOversmoothingScore=" << visibleChromaState.telemetry.oversmoothingScore
             << "; phase16FalseColorRiskEvidence=" << phase16Validation.falseColorRiskEvidence
             << "; phase16FalseColorRiskStatus=" << residualNoiseState.demosaicChromaCloudRiskStatus
             << "; phase16LinearDetailEdgeSupportFraction="
@@ -12266,7 +11703,6 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; " << pass3NoRegret.formatDebugString()
             << "; " << budgetState.formatDebugString()
             << "; " << residualNoiseState.formatDebugString()
-            << "; " << visibleChromaState.formatDebugString()
             << "; " << downstreamIspState.formatDebugString()
             << "; " << spectraCaptureIntegration.str()
             << "; spectraCaptureProvenanceTileCount=" << captureProvenance.totalTiles
@@ -12732,10 +12168,6 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << ccmOnlyBlueOpponentDirectionalGain
             << formatPropagationStateFields("spectraPostTone", residualNoiseState.postTone)
             << formatPropagationStateFields(
-                    "spectraPostVisibleChroma",
-                    residualNoiseState.postVisibleChroma
-            )
-            << formatPropagationStateFields(
                     "spectraPostQuantization",
                     residualNoiseState.postQuantization
             )
@@ -12872,7 +12304,6 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; spectraToneGuardCloudRisk=" << toneGuardCloudRisk
             << "; spectraToneGuardFeedForwardRisk=" << toneGuardFeedForwardRisk
             << "; spectraToneGuardMode=AUTO_LOW_LIGHT_LIFT_ONLY"
-            << "; spectraPredictedVisibleChromaAmplification=" << residualNoiseState.predictedVisibleChromaAmplification
             << "; spectraDemosaicMeasuredChromaCalibrationReady="
             << (residualNoiseState.demosaicMeasuredChromaCalibrationReady ? "true" : "false")
             << "; spectraDemosaicMeasuredToPredictedPostChromaRmsRatio="
@@ -12898,17 +12329,6 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; spectraPreWbCloudTransportContractReady=false"
             << "; spectraPreWbCloudGpuMapUploaded=false"
             << "; spectraPreWbCloudSpatialCorrectionApplied=false"
-            << "; spectraVisibleChromaPlanningPressure="
-            << residualNoiseState.visibleChromaPlanningPressure
-            << "; spectraPredictedVisibleVarianceY=" << residualNoiseState.predictedVisibleVarianceY
-            << "; spectraVisibleChromaLumaGuardSigma="
-            << bncam::spectra2::resolveVisibleChromaLumaGuardSigma(
-                    residualNoiseState.predictedVisibleVarianceY,
-                    residentTelemetry.plan.sigmaRG,
-                    residentTelemetry.plan.sigmaBG)
-            << "; spectraPredictedVisibleVarianceRG=" << residualNoiseState.predictedVisibleVarianceRG
-            << "; spectraPredictedVisibleVarianceBG=" << residualNoiseState.predictedVisibleVarianceBG
-            << "; spectraPredictedVisibleCovarianceRgBg=" << residualNoiseState.predictedVisibleCovarianceRgBg
             << "; spectraMeasuredPreSharpenStage=POST_QUANTIZATION_8BIT_PRE_SHARPEN"
             << "; spectraMeasuredPreSharpenVarianceY="
             << residualNoiseState.measuredPreSharpenVarianceY
@@ -13320,14 +12740,6 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; highlightRecoveryMs=" << highlightDebug.elapsedMs
             << "; phase5ToneStageMs=" << phase5ToneStageMs
             << "; finalOutputPassMs=" << finalOutputPassMs
-            << "; finalOutSpatialNrMs=" << finalOutSpatialNrMs
-            << "; spectraVisibleChromaProcessingMs="
-            << visibleChromaState.telemetry.processingTimeMs
-            << "; spectraVisibleChromaInputMeasurementMs="
-            << visibleChromaState.telemetry.inputMeasurementMs
-            << "; spectraVisibleChromaOutputMeasurementMs="
-            << visibleChromaState.telemetry.outputMeasurementMs
-            << "; spectraVisibleChromaTimingMode=nested_in_finalOutputPassMs"
             << "; finalOutClampQuantMs=" << finalOutClampQuantMs
             << "; sharpenMs=0"
             << "; phase11LinearDetailPropagationMs=" << residualNoiseState.linearDetailPropagationMs
@@ -13369,12 +12781,6 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << (vulkanSceneObserverActive ? "true" : "false")
             << "; spectraToneGpuPrimary="
             << (vulkanToneApplied ? "true" : "false")
-            << "; spectraToneToPostDemosaicFullRgbRoundtripAvoided="
-            << (vulkanToneApplied && vulkanTone.fullReadbackDeferred &&
-                residentPostDemosaicApplied &&
-                residentTelemetry.vulkanResidentInputBytes == 0u ? "true" : "false")
-            << "; spectraToneToPostDemosaicResidentInputUploadBytes="
-            << residentTelemetry.vulkanResidentInputBytes
             << "; spectraAwbCcmToToneFullRgbRoundtripAvoided="
             << (vulkanColorResident && vulkanSceneObserverActive && vulkanToneApplied &&
                 vulkanColorTransform.fullReadbackDeferred ? "true" : "false")
@@ -13477,27 +12883,6 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << (vulkanCapabilities.timestampQueriesSupported ? "true" : "false")
             << "; spectraPerformanceVulkanVmaReady="
             << (vulkanCapabilities.vmaReady ? "true" : "false")
-            << "; spectraPerformanceVulkanProductionKernelConnected="
-            << (visibleChromaState.telemetry.vulkanResidentKernelConnected ? "true" : "false")
-            << "; spectraPerformanceVulkanBenchmarkPerformed="
-            << (visibleChromaState.telemetry.vulkanOpponentBenchmarkPerformed ? "true" : "false")
-            << "; spectraPerformanceVulkanBenchmarkSampleCount="
-            << visibleChromaState.telemetry.vulkanOpponentBenchmarkSampleCount
-            << "; spectraPerformanceVulkanNumericalEquivalencePassed="
-            << (visibleChromaState.telemetry.vulkanOpponentNumericalEquivalencePassed
-                    ? "true" : "false")
-            << "; spectraPerformanceVulkanMaximumAbsoluteDelta="
-            << visibleChromaState.telemetry.vulkanOpponentMaximumAbsoluteDelta
-            << "; spectraPerformanceVulkanOpponentUsedForOutput="
-            << (visibleChromaState.telemetry.vulkanOpponentUsedForOutput ? "true" : "false")
-            << "; spectraPerformanceVulkanOpponentRouteKey="
-            << visibleChromaState.telemetry.vulkanOpponentRouteKey
-            << "; spectraPerformanceVulkanOpponentQualificationStatus="
-            << visibleChromaState.telemetry.vulkanOpponentQualificationStatus
-            << "; spectraPerformanceVulkanOpponentExecutionStatus="
-            << visibleChromaState.telemetry.vulkanOpponentExecutionStatus
-            << "; spectraPerformanceVulkanOpponentFailureReason="
-            << visibleChromaState.telemetry.vulkanOpponentFailureReason
             << "; spectraPerformanceVulkanRuntimeGatePassed="
             << (spectraPerformance.vulkanQualification.runtimeGatePassed ? "true" : "false")
             << "; spectraPerformanceVulkanKernelGatePassed="

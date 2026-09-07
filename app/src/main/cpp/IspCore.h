@@ -14,7 +14,6 @@
 #include "SpectraNoiseCalibration.h"
 #include "SpectraChromaBands.h"
 #include "SpectraChromaMultiscale.h"
-#include "SpectraVisibleChroma.h"
 #include "SpectraAnisotropicDetail.h"
 #include "SpectraDownstreamIsp.h"
 #include "SpectraPerformanceBackend.h"
@@ -547,7 +546,6 @@ struct SpectraResidualNoiseState {
     bncam::spectra2::NoiseState postColourTransform{};
     bncam::spectra2::NoiseState postLinearDetail{};
     bncam::spectra2::NoiseState postTone{};
-    bncam::spectra2::NoiseState postVisibleChroma{};
     bncam::spectra2::NoiseState postQuantization{};
     bncam::spectra2::NoiseState finalJpeg{};
 
@@ -565,7 +563,6 @@ struct SpectraResidualNoiseState {
     bncam::spectra2::DerivativeStats totalToneDerivative{};
     bncam::spectra2::DerivativeStats toneChromaScale{};
 
-    float predictedVisibleChromaAmplification = 1.0f;
     bool demosaicMeasuredChromaCalibrationReady = false;
     float demosaicMeasuredToPredictedPostChromaRmsRatio = 1.0f;
     float demosaicMeasuredChromaAuthorityPressure = 1.0f;
@@ -580,11 +577,6 @@ struct SpectraResidualNoiseState {
     float demosaicChromaCloudRiskEvidence = 0.0f;
     std::string demosaicChromaCloudRiskStatus = "UNAVAILABLE";
 
-    float visibleChromaPlanningPressure = 1.0f;
-    float predictedVisibleVarianceY = 0.0f;
-    float predictedVisibleVarianceRG = 0.0f;
-    float predictedVisibleVarianceBG = 0.0f;
-    float predictedVisibleCovarianceRgBg = 0.0f;
     float measuredPreSharpenVarianceY = 0.0f;
     float measuredPreSharpenVarianceRG = 0.0f;
     float measuredPreSharpenVarianceBG = 0.0f;
@@ -616,18 +608,6 @@ struct SpectraResidualNoiseState {
     float measuredVisibleResidualMs = 0.0f;
     float measuredPreSharpenResidualMs = 0.0f;
     float downstreamSharpenPropagationMs = 0.0f;
-
-    std::string formatDebugString() const;
-};
-
-struct SpectraVisibleChromaState {
-    bncam::spectra2::VisibleChromaTelemetry telemetry{};
-    std::string activationSource = "DISABLED";
-    std::string architecture = "SPECTRA_CONTEXT_FUSION_POST_TONE_VISIBLE_CHROMA";
-    std::string inputStage = "POST_TONE_VIBRANCE_COLOR_MANAGEMENT_LINEAR_RGB";
-    std::string outputStage = "PRE_QUANTIZATION_LINEAR_RGB";
-    std::string covarianceSource = "SPECTRA_POST_TONE_PROPAGATED_RG_BG_COVARIANCE";
-    std::string timingAccounting = "PROCESSING_INCLUDES_NEIGHBOUR_FILTER_EXCLUDES_RESIDUAL_MEASUREMENTS";
 
     std::string formatDebugString() const;
 };
