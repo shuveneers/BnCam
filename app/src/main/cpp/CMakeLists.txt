@@ -62,8 +62,6 @@ set(BNCAM_VULKAN_PREP_SOURCES
         vulkan/VulkanRuntimeBootstrap.cpp
         vulkan/VulkanRuntime.cpp
         vulkan/VulkanRuntimeJni.cpp
-        vulkan/VulkanSpectraOpponentBackend.cpp
-        vulkan/VulkanSpectraVisibleChromaBackend.cpp
         vulkan/VulkanSpectraTemporalObserverBackend.cpp
         vulkan/VulkanSpectraResidentDemosaicBackend.cpp
         vulkan/VulkanRawPreviewBackend.cpp
@@ -82,9 +80,7 @@ set(BNCAM_VULKAN_PREP_SOURCES
 )
 
 
-# Build the production SPECTRA resident post-demosaic shader with the NDK shader tool.
-# One persistent GPU command chain executes spatial NR and visible-chroma final decision
-# without an intermediate CPU readback.
+# Locate the NDK shader compiler used by the retained Vulkan compute stages.
 if(CMAKE_HOST_WIN32)
     set(BNCAM_SHADER_HOST_TAG "windows-x86_64")
 elseif(CMAKE_HOST_APPLE)
@@ -101,10 +97,6 @@ find_program(BNCAM_GLSLC
         "$ENV{ANDROID_NDK_HOME}/shader-tools/${BNCAM_SHADER_HOST_TAG}"
 )
 set(BNCAM_GENERATED_SHADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated/shaders")
-# N006ER: the retired classical resident post-demosaic spatial/chroma kernel has no
-# implementation or shader target. VulkanRuntime keeps a temporary fail-closed type facade
-# until the obsolete runtime API is physically removed in N006F.
-
 # Lightweight fused live RAW viewfinder kernel. This is deliberately separate from the capture
 # resident demosaic backend so preview never runs capture-only residual/statistics passes.
 set(BNCAM_RAW_PREVIEW_SPV "${BNCAM_GENERATED_SHADER_DIR}/raw_preview.spv")
