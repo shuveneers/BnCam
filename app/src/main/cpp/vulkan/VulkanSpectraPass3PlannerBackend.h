@@ -1,7 +1,6 @@
 #pragma once
 
 #include "VulkanVmaIntegration.h"
-#include "VulkanSpectraResidentPreDemosaicBackend.h"
 
 #include <vulkan/vulkan.h>
 
@@ -13,6 +12,42 @@
 #include <vector>
 
 namespace bncam::vulkan {
+
+// N006GR: compact observation contracts owned by the planner/observer backend.
+// These two structs are measurement-only data surfaces. They were previously
+// declared in the retired pre-demosaic pixel-backend facade solely for reuse by
+// this planner. Keeping them here removes that compile-time dependency without
+// restoring any Pass0/Pass1 pixel-mutation API or implementation.
+struct SpectraResidentRawStatisticsGpu {
+    double residualSquaredSum = 0.0;
+    std::uint64_t residualSampleCount = 0;
+    double chromaSquaredSum = 0.0;
+    std::uint64_t chromaSampleCount = 0;
+    float residualEnergy = 0.0f;
+    float chromaResidualEnergy = 0.0f;
+    std::string method = "NOT_RUN";
+};
+
+struct SpectraResidentChromaBandsGpu {
+    float fineEnergy = 0.0f;
+    float midEnergy = 0.0f;
+    float lowEnergy = 0.0f;
+    float redFineEnergy = 0.0f;
+    float redMidEnergy = 0.0f;
+    float redLowEnergy = 0.0f;
+    float blueFineEnergy = 0.0f;
+    float blueMidEnergy = 0.0f;
+    float blueLowEnergy = 0.0f;
+    float rowPatternProxy = 0.0f;
+    float columnPatternProxy = 0.0f;
+    std::uint64_t sampleCount = 0;
+    std::uint64_t redSampleCount = 0;
+    std::uint64_t blueSampleCount = 0;
+    float redBlueSampleBalance = 0.0f;
+    float confidence = 0.0f;
+    std::string status = "NOT_RUN";
+    std::string method = "GPU_RESIDENT_SAMPLED_PRE_DEMOSAIC_PROXY";
+};
 
 struct SpectraPass3PlannerRequest {
     std::uint64_t residentInputGeneration = 0;
@@ -50,7 +85,6 @@ struct SpectraPass3PlannerResult {
     std::string status = "NOT_RUN";
     std::string failureReason;
 };
-
 
 // Phase 13 exact compact noise-map observation from resident normalized RAW.
 // Each tile returns per-CFA signal sums/counts plus the exact tile signal range;
@@ -94,10 +128,10 @@ struct SpectraNoiseMapPlannerResult {
 /**
  * Milestone 8H-H compact Pass-3 planner.
  *
- * It consumes the opaque device-resident Pass-2 mosaic. Only row/column
- * profiles and the low-frequency 24x18 field cross to the CPU. This removes
- * the multi-second full-frame CPU Pass-3 scan while retaining the established
- * CPU low-field smoothing/activation rules and GPU No-Regret application.
+ * It consumes an opaque device-resident mosaic and only exposes compact
+ * measurement results to the CPU. N006GR keeps this legacy planner surface
+ * temporarily because the exact RAW noise-map observer shares the backend;
+ * the mutating Pass0/Pass1 facade is not a dependency anymore.
  */
 class VulkanSpectraPass3PlannerBackend final {
 public:
@@ -105,8 +139,6 @@ public:
     ~VulkanSpectraPass3PlannerBackend() = default;
     VulkanSpectraPass3PlannerBackend(const VulkanSpectraPass3PlannerBackend&) = delete;
     VulkanSpectraPass3PlannerBackend& operator=(const VulkanSpectraPass3PlannerBackend&) = delete;
-
-
 
     SpectraNoiseMapPlannerResult executeNoiseMapFromResident(
             VkPhysicalDevice physicalDevice,
@@ -118,6 +150,7 @@ public:
             std::uint64_t residentInputBytes,
             const SpectraNoiseMapPlannerRequest& request
     ) noexcept;
+
     SpectraPass3PlannerResult executeFromResident(
             VkPhysicalDevice physicalDevice,
             VkDevice device,
