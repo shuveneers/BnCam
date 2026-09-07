@@ -9,6 +9,7 @@ import android.util.Log
 import com.bncam.core.quality.NeutralYuvToneMapper
 import android.hardware.camera2.CameraCharacteristics
 import com.bncam.core.quality.ProfileCurveDefaults
+import com.bncam.core.quality.ProfileColorTuning
 import com.bncam.core.quality.RenderQualityConfig
 import com.bncam.core.quality.FocusConfidenceState
 import com.bncam.core.quality.FinalSensorCalibration
@@ -180,10 +181,26 @@ object ImageUtils {
         analysisNv21: ByteBuffer?,
         frameSlotIndex: Int,
         maxWidth: Int,
-        maxHeight: Int
+        maxHeight: Int,
+        profilePop: Float = 0f,
+        profileColorRecovery: Float = 0f
     ): IntArray? {
         if (!nativeEngineAvailable || retainedHardwareBuffer == 0L || !outputRgba.isDirect) {
             return null
+        }
+        val profileSaturationCarrier = if (
+            profileSaturation.isFinite() && profileSaturation <= -1.5f
+        ) {
+            // Already encoded by an upstream caller; never clamp/re-encode a valid carrier.
+            profileSaturation
+        } else {
+            ProfileColorTuning(
+                vibrance = profileVibrance,
+                saturation = profileSaturation,
+                contrast = profileContrast,
+                pop = profilePop,
+                colorRecovery = profileColorRecovery
+            ).nativeSaturationCarrier()
         }
         return try {
             renderRawPreviewNative(
@@ -208,7 +225,7 @@ object ImageUtils {
                 profileToneBlacks,
                 profileToneContrast,
                 profileLocalToneBias,
-                profileSaturation,
+                profileSaturationCarrier,
                 profileContrast,
                 profileVibrance,
                 profileDetailAmount,
@@ -437,7 +454,7 @@ object ImageUtils {
                 profileYuvWbRed = yuvAwbCompensation[0],
                 profileYuvWbGreen = yuvAwbCompensation[1],
                 profileYuvWbBlue = yuvAwbCompensation[2],
-                profileColorSaturation = qualityConfig?.profileColorTuning?.saturation ?: 0.0f,
+                profileColorSaturation = qualityConfig?.profileColorTuning?.nativeSaturationCarrier() ?: 0.0f,
                 profileColorContrast = qualityConfig?.profileColorTuning?.contrast ?: 0.0f,
                 profilePresenceVibrance = qualityConfig?.profileColorTuning?.vibrance ?: 0.0f,
                 profileDetailAmount = qualityConfig?.profileDetailTuning?.amount ?: com.bncam.data.settings.ProfileDetailDefaults.AMOUNT,
@@ -811,7 +828,7 @@ object ImageUtils {
                 profileToneBlacks = qualityConfig?.profileToneTuning?.blacks ?: 0.0f,
                 profileToneContrast = qualityConfig?.profileToneTuning?.contrast ?: 0.0f,
                 profileLocalToneBias = qualityConfig?.profileToneTuning?.localToneBias ?: 0.0f,
-                profileColorSaturation = qualityConfig?.profileColorTuning?.saturation ?: 0.0f,
+                profileColorSaturation = qualityConfig?.profileColorTuning?.nativeSaturationCarrier() ?: 0.0f,
                 profileColorContrast = qualityConfig?.profileColorTuning?.contrast ?: 0.0f,
                 profilePresenceVibrance = qualityConfig?.profileColorTuning?.vibrance ?: 0.0f,
                 profileDetailAmount = profileDetailTuning.amount,

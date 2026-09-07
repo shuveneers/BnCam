@@ -50,13 +50,13 @@ object ProfileIspKeys {
     const val DETAIL_NR_COLOR_DETAIL = "detail_nr_color_detail"
     const val DETAIL_NR_COLOR_SMOOTHNESS = "detail_nr_color_smoothness"
 
-    // Color Manager controls. The historical storage IDs stay stable so existing profiles and
-    // .bnc exports remain compatible; Pop and Color Recovery are the only creative authorities
-    // exposed for these slots. Tonal contrast remains owned by Tone Contrast.
-    const val PRESENCE_VIBRANCE = "presence_vibrance" // compatibility storage ID: Pop
-    const val PRESENCE_SATURATION = "presence_saturation" // compatibility storage ID: Color Recovery
-    const val PRESENCE_POP = PRESENCE_VIBRANCE
-    const val PRESENCE_COLOR_RECOVERY = PRESENCE_SATURATION
+    // Independent Color Manager owners. Historical Saturation/Vibrance keys retain their original
+    // meaning; Pop and Color Recovery deliberately use new keys so DELTA 0208 alias values cannot
+    // be misinterpreted during profile migration.
+    const val PRESENCE_VIBRANCE = "presence_vibrance"
+    const val PRESENCE_SATURATION = "presence_saturation"
+    const val PRESENCE_POP = "presence_pop"
+    const val PRESENCE_COLOR_RECOVERY = "presence_color_recovery"
     const val PRESENCE_COLOR_FRINGE_SUPPRESSION = "presence_color_fringe_suppression"
 
     // Profile-owned Normal Sharpness controls. Global, Edge, Detail and Legibility are

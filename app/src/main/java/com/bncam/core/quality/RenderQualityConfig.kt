@@ -327,21 +327,49 @@ data class ProfileNoiseReductionTuning(
 }
 
 data class ProfileColorTuning(
-    // Field names remain transport-compatible with the established native ABI. DELTA 0208 maps
-    // vibrance -> Pop and saturation -> Color Recovery; they are not duplicate legacy controls.
     val vibrance: Float = 0f,
     val saturation: Float = 0f,
+    val pop: Float = 0f,
+    val colorRecovery: Float = 0f,
     val contrast: Float = 0f
 ) {
     fun sanitized(): ProfileColorTuning = copy(
-        vibrance = vibrance.coerceIn(-1f, 1f),
-        saturation = saturation.coerceIn(-1f, 1f),
-        contrast = contrast.coerceIn(-1f, 1f)
+        vibrance = vibrance.takeIf { it.isFinite() }?.coerceIn(-1f, 1f) ?: 0f,
+        saturation = saturation.takeIf { it.isFinite() }?.coerceIn(-1f, 1f) ?: 0f,
+        pop = pop.takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: 0f,
+        colorRecovery = colorRecovery.takeIf { it.isFinite() }?.coerceIn(-1f, 1f) ?: 0f,
+        contrast = contrast.takeIf { it.isFinite() }?.coerceIn(-1f, 1f) ?: 0f
     )
 
+    /**
+     * Existing JNI/Vulkan ABIs expose one Saturation float plus dedicated Vibrance/Contrast
+     * floats. When Pop or Color Recovery is active, encode Saturation + Pop + Recovery into an
+     * otherwise-invalid (< -1.5) exact-integer float carrier. 23 payload bits stay exactly
+     * representable in Float32. Plain Saturation is retained byte-for-byte when both new controls
+     * are neutral, so old profiles preserve their established response.
+     */
+    fun nativeSaturationCarrier(): Float {
+        val safe = sanitized()
+        if (safe.pop <= 1.0e-4f && kotlin.math.abs(safe.colorRecovery) <= 1.0e-4f) {
+            return safe.saturation
+        }
+        fun encodeSigned8(value: Float): Int = if (value >= 0f) {
+            128 + (value.coerceIn(0f, 1f) * 127f + 0.5f).toInt().coerceIn(0, 127)
+        } else {
+            128 - ((-value).coerceIn(0f, 1f) * 128f + 0.5f).toInt().coerceIn(0, 128)
+        }
+        val saturationCode = encodeSigned8(safe.saturation)
+        val popCode = (safe.pop * 127f + 0.5f).toInt().coerceIn(0, 127)
+        val recoveryCode = encodeSigned8(safe.colorRecovery)
+        val packed = saturationCode or (popCode shl 8) or (recoveryCode shl 15)
+        return -(packed + 2).toFloat()
+    }
+
     fun debugPairs(): List<Pair<String, String>> = listOf(
-        "Profile Color Pop" to String.format(Locale.US, "%+.2f", vibrance),
-        "Profile Color Recovery" to String.format(Locale.US, "%+.2f", saturation),
+        "Profile Color Saturation" to String.format(Locale.US, "%+.2f", saturation),
+        "Profile Color Vibrance" to String.format(Locale.US, "%+.2f", vibrance),
+        "Profile Color Pop" to String.format(Locale.US, "%.0f%%", pop * 100f),
+        "Profile Color Recovery" to String.format(Locale.US, "%+.2f", colorRecovery),
         "Live Color Contrast Offset" to String.format(Locale.US, "%+.2f", contrast)
     )
 }
@@ -534,8 +562,12 @@ data class RenderQualityConfig(
                 localToneBias = 0f
             ).sanitized()
             val baseColorTuning = ProfileColorTuning(
-                vibrance = readProfileFloatOrFallback(repo, profileId, ProfileIspKeys.PRESENCE_POP, 0f, -1f..1f),
-                saturation = readProfileFloatOrFallback(repo, profileId, ProfileIspKeys.PRESENCE_COLOR_RECOVERY, 0f, -1f..1f),
+                // Historical owners keep their original meaning. New Pop/Recovery keys default
+                // neutral; ambiguous values written by the DELTA 0208 aliases are never copied.
+                vibrance = readProfileFloatOrFallback(repo, profileId, ProfileIspKeys.PRESENCE_VIBRANCE, 0f, -1f..1f),
+                saturation = readProfileFloatOrFallback(repo, profileId, ProfileIspKeys.PRESENCE_SATURATION, 0f, -1f..1f),
+                pop = readProfileFloatOrFallback(repo, profileId, ProfileIspKeys.PRESENCE_POP, 0f, 0f..1f),
+                colorRecovery = readProfileFloatOrFallback(repo, profileId, ProfileIspKeys.PRESENCE_COLOR_RECOVERY, 0f, -1f..1f),
                 // Profile tonal contrast is owned by ProfileToneTuning/GTM. Keep this RGB lane
                 // neutral; ViewfinderLiveTuning may still apply a temporary live override.
                 contrast = 0f

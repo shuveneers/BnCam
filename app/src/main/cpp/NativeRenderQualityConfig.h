@@ -172,6 +172,8 @@ struct NativeRenderQualityConfig {
     float profileColorSaturation = 0.0f;
     float profileColorContrast = 0.0f;
     float profilePresenceVibrance = 0.0f;
+    float profilePresencePop = 0.0f;
+    float profileColorRecovery = 0.0f;
 
     // Lightroom-style Detail > Sharpening is the only profile sharpening authority.
     float profileDetailAmount = bncam::profile_defaults::kDetailAmount;

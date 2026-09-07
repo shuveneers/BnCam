@@ -530,7 +530,7 @@ private fun LibpatcherProfileOverview(
             )
             SettingValueRow(
                 title = "Color Manager",
-                description = "Vibrance, saturation and future colour-fringe correction.",
+                description = "Saturation, vibrance, local depth and colour recovery.",
                 value = "Open",
                 onClick = onNavigateToColorManager
             )

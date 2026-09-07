@@ -1274,6 +1274,7 @@ class SettingsRepository(private val context: Context) {
             val finite = value.takeIf { it.isFinite() } ?: 0f
             when {
                 key.startsWith("curve_") && key.contains("_point_") -> finite.coerceIn(0f, 1f)
+                key == ProfileIspKeys.PRESENCE_POP -> finite.coerceIn(0f, 1f)
                 key == ProfileIspKeys.SPECTRA_DYNAMIC_ISO -> finite.coerceIn(0f, 1f)
                 key == "awb_reference_intensity" -> finite.coerceIn(0f, 1.5f)
                 key == ProfileIspKeys.DETAIL_NR_LUMINANCE ||
@@ -2356,6 +2357,8 @@ class SettingsRepository(private val context: Context) {
                 ProfileIspKeys.TONE_CONTRAST to getProfileFloat(activeProfile.id, ProfileIspKeys.TONE_CONTRAST, 0f).first(),
                 ProfileIspKeys.PRESENCE_VIBRANCE to getProfileFloat(activeProfile.id, ProfileIspKeys.PRESENCE_VIBRANCE, 0f).first(),
                 ProfileIspKeys.PRESENCE_SATURATION to getProfileFloat(activeProfile.id, ProfileIspKeys.PRESENCE_SATURATION, 0f).first(),
+                ProfileIspKeys.PRESENCE_POP to getProfileFloat(activeProfile.id, ProfileIspKeys.PRESENCE_POP, 0f).first(),
+                ProfileIspKeys.PRESENCE_COLOR_RECOVERY to getProfileFloat(activeProfile.id, ProfileIspKeys.PRESENCE_COLOR_RECOVERY, 0f).first(),
                 CaptureSettingKeys.JPEG_QUALITY to getProfileInt(activeProfile.id, CaptureSettingKeys.JPEG_QUALITY, 98).first().coerceIn(80, 100).toFloat()
             )
         )

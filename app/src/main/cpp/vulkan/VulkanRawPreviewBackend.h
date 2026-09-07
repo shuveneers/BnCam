@@ -77,6 +77,10 @@ struct RawPreviewGpuRequest {
     float profileSaturation = 0.0f;
     float profileContrast = 0.0f;
     float profileVibrance = 0.0f;
+    // DELTA 0209A: explicit CPU-side Color Management request lanes. These do not extend
+    // the fixed 128-byte Vulkan push-constant ABI; the backend may pack them at the GPU boundary.
+    float profilePop = 0.0f;
+    float profileColorRecovery = 0.0f;
     float profileToneExposure = 0.0f;
     float profileToneHighlights = 0.0f;
     float profileToneShadows = 0.0f;

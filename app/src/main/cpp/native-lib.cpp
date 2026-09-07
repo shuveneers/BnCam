@@ -357,6 +357,22 @@ std::vector<float> extractCurveVector(
     return out;
 }
 
+// Color Manager ABI bridge. Values below -1.5 are exact-integer Float32 carriers
+// produced by ProfileColorTuning.nativeSaturationCarrier(): 8-bit Saturation, 7-bit Pop,
+// 8-bit Color Recovery. Preserve those carriers until the Vulkan color stage decodes them.
+static float sanitizeProfileCreativeCarrier(float value) {
+    if (!std::isfinite(value)) return 0.0f;
+    if (value <= -1.5f) {
+        const float payload = -value - 2.0f;
+        if (payload >= 0.0f && payload <= 8388607.0f &&
+            std::abs(payload - std::round(payload)) <= 0.001f) {
+            return value;
+        }
+        return 0.0f;
+    }
+    return std::clamp(value, -1.0f, 1.0f);
+}
+
 NativeRenderQualityConfig makeQualityConfig(
         JNIEnv *env,
         jfloatArray wbGainsArray,
@@ -428,7 +444,7 @@ NativeRenderQualityConfig makeQualityConfig(
     cfg.profileToneBlacks = std::isfinite(profileToneBlacks) ? std::clamp(profileToneBlacks, -1.0f, 1.0f) : 0.0f;
     cfg.profileToneContrast = std::isfinite(profileToneContrast) ? std::clamp(profileToneContrast, -1.0f, 1.0f) : 0.0f;
     cfg.profileLocalToneBias = std::isfinite(profileLocalToneBias) ? std::clamp(profileLocalToneBias, -1.0f, 1.0f) : 0.0f;
-    cfg.profileColorSaturation = std::isfinite(profileColorSaturation) ? std::clamp(profileColorSaturation, -1.0f, 1.0f) : 0.0f;
+    cfg.profileColorSaturation = sanitizeProfileCreativeCarrier(profileColorSaturation);
     cfg.profileColorContrast = std::isfinite(profileColorContrast) ? std::clamp(profileColorContrast, -1.0f, 1.0f) : 0.0f;
     cfg.profilePresenceVibrance = std::isfinite(profilePresenceVibrance) ? std::clamp(profilePresenceVibrance, -1.0f, 1.0f) : 0.0f;
     cfg.profileDetailAmount = std::isfinite(profileDetailAmount) ? std::clamp(profileDetailAmount, -1.0f, 1.0f) : bncam::profile_defaults::kDetailAmount;
@@ -1849,8 +1865,7 @@ Java_com_bncam_core_engine_ImageUtils_renderRawPreviewNative(
     quality.profileToneBlacks = std::isfinite(profileToneBlacks) ? std::clamp(static_cast<float>(profileToneBlacks), -1.0f, 1.0f) : 0.0f;
     quality.profileToneContrast = std::isfinite(profileToneContrast) ? std::clamp(static_cast<float>(profileToneContrast), -1.0f, 1.0f) : 0.0f;
     quality.profileLocalToneBias = std::isfinite(profileLocalToneBias) ? std::clamp(static_cast<float>(profileLocalToneBias), -1.0f, 1.0f) : 0.0f;
-    quality.profileColorSaturation = std::isfinite(profileSaturation)
-            ? std::clamp(static_cast<float>(profileSaturation), -1.0f, 1.0f) : 0.0f;
+    quality.profileColorSaturation = sanitizeProfileCreativeCarrier(static_cast<float>(profileSaturation));
     quality.profileColorContrast = std::isfinite(profileContrast)
             ? std::clamp(static_cast<float>(profileContrast), -1.0f, 1.0f) : 0.0f;
     quality.profilePresenceVibrance = std::isfinite(profileVibrance)
@@ -2351,7 +2366,7 @@ Java_com_bncam_core_engine_ImageUtils_processNativeYuv(
     yuvQuality.profileYuvWbRed = std::isfinite(profileYuvWbRed) ? std::clamp(profileYuvWbRed, 0.50f, 2.00f) : 1.0f;
     yuvQuality.profileYuvWbGreen = std::isfinite(profileYuvWbGreen) ? std::clamp(profileYuvWbGreen, 0.50f, 2.00f) : 1.0f;
     yuvQuality.profileYuvWbBlue = std::isfinite(profileYuvWbBlue) ? std::clamp(profileYuvWbBlue, 0.50f, 2.00f) : 1.0f;
-    yuvQuality.profileColorSaturation = std::isfinite(profileColorSaturation) ? std::clamp(profileColorSaturation, -1.0f, 1.0f) : 0.0f;
+    yuvQuality.profileColorSaturation = sanitizeProfileCreativeCarrier(profileColorSaturation);
     yuvQuality.profileColorContrast = std::isfinite(profileColorContrast) ? std::clamp(profileColorContrast, -1.0f, 1.0f) : 0.0f;
     yuvQuality.profilePresenceVibrance = std::isfinite(profilePresenceVibrance) ? std::clamp(profilePresenceVibrance, -1.0f, 1.0f) : 0.0f;
     yuvQuality.profileDetailAmount = std::isfinite(profileDetailAmount) ? std::clamp(profileDetailAmount, -1.0f, 1.0f) : bncam::profile_defaults::kDetailAmount;

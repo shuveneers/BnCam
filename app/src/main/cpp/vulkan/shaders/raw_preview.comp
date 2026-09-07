@@ -741,11 +741,110 @@ vec3 applyExplicitLiveToneContrast(vec3 rgb) {
     return rgb * (y > 0.000001 ? mapped / y : 1.0);
 }
 
-vec3 applyProfile(vec3 rgb) {
-    float y = max(0.0, dot(rgb, vec3(0.2126, 0.7152, 0.0722)));
-    // Only explicit profile Vibrance/Saturation are handled here.
+bool profileCreativeCarrierEncoded(float value) {
+    return value <= -1.5;
+}
 
+uint profileCreativePayload(float value) {
+    return uint(clamp(round(-value - 2.0), 0.0, 8388607.0));
+}
+
+float profileDecodeSigned8(uint code) {
+    int signedCode = int(code) - 128;
+    return signedCode >= 0
+            ? clamp(float(signedCode) / 127.0, 0.0, 1.0)
+            : clamp(float(signedCode) / 128.0, -1.0, 0.0);
+}
+
+float profileDecodedSaturation(float carrier) {
+    if (!profileCreativeCarrierEncoded(carrier)) return clamp(carrier, -1.0, 1.0);
+    return profileDecodeSigned8(profileCreativePayload(carrier) & 0xffu);
+}
+
+float profileDecodedPop(float carrier) {
+    if (!profileCreativeCarrierEncoded(carrier)) return 0.0;
+    return float((profileCreativePayload(carrier) >> 8u) & 0x7fu) / 127.0;
+}
+
+float profileDecodedColorRecovery(float carrier) {
+    if (!profileCreativeCarrierEncoded(carrier)) return 0.0;
+    return profileDecodeSigned8((profileCreativePayload(carrier) >> 15u) & 0xffu);
+}
+
+float profileColorRelativeSaturation(vec3 rgb) {
+    float maximum = max(rgb.r, max(rgb.g, rgb.b));
+    float minimum = min(rgb.r, min(rgb.g, rgb.b));
+    return clamp((maximum - minimum) / max(abs(maximum), 1.0e-4), 0.0, 1.0);
+}
+
+float profileColorChromaRange(vec3 rgb) {
+    return max(0.0, max(rgb.r, max(rgb.g, rgb.b)) - min(rgb.r, min(rgb.g, rgb.b)));
+}
+
+float profileColorLumaWindow(float y) {
+    return smoothstep(0.025, 0.12, y) * (1.0 - smoothstep(0.82, 0.98, y));
+}
+
+vec3 applyProfileColorRecovery(vec3 rgb, float signedControl) {
+    float control = clamp(signedControl, -1.0, 1.0);
+    if (abs(control) < 1.0e-4) return rgb;
+
+    float y = max(0.0, dot(rgb, vec3(0.2126, 0.7152, 0.0722)));
+    float chroma = profileColorChromaRange(rgb);
+    float saturation = profileColorRelativeSaturation(rgb);
+    float evidence = smoothstep(0.012, 0.055, chroma);
+    float mutedHeadroom = 1.0 - smoothstep(0.40, 0.78, saturation);
+    float authority = control * evidence * mutedHeadroom * profileColorLumaWindow(y);
+    float stops = authority * (control >= 0.0 ? 0.48 : 0.36);
+    return vec3(y) + (rgb - vec3(y)) * exp2(stops);
+}
+
+vec3 applyProfilePopPreview(vec3 rgb, float controlValue, float sourceLuma, float localBase) {
+    float control = clamp(controlValue, 0.0, 1.0);
+    // Exact neutral path: Pop=0 performs no local-base dependent work.
+    if (control <= 1.0e-4) return rgb;
+
+    float center = max(0.0, sourceLuma);
+    float base = max(0.0, localBase);
+    float evDetail = log2((center + 0.004) / (base + 0.004));
+    float magnitude = abs(evDetail);
+
+    // The resident FLLF base is already a range-aware mid-scale neighbourhood estimate.
+    // Reuse it instead of re-demosaicing eight neighbours per preview pixel. This keeps Pop
+    // structural and inexpensive enough for the high-FPS RAW viewfinder.
+    float structure = smoothstep(0.025, 0.18, magnitude);
+    float hardEdgeGuard = 1.0 - 0.72 * smoothstep(0.58, 1.30, magnitude);
+    float noiseSigma = previewPhysicalNoiseSigma(max(base, 1.0e-4));
+    float snr = center / max(noiseSigma, 1.0e-4);
+    float noiseGuard = smoothstep(1.4, 4.5, snr);
+
+    float y = max(0.0, dot(rgb, vec3(0.2126, 0.7152, 0.0722)));
+    float shadowGuard = smoothstep(0.035, 0.13, y);
+    float highlightGuard = 1.0 - smoothstep(0.72, 0.965, y);
+    float toneWindow = shadowGuard * highlightGuard;
+    float authority = pow(control, 1.15) * structure * hardEdgeGuard * noiseGuard * toneWindow;
+
+    float popEv = clamp(evDetail * 0.46 * authority, -0.16, 0.16);
+    float targetY = clamp(y * exp2(popEv), 0.0, 1.0);
+    vec3 outRgb = rgb * clamp(y > 1.0e-6 ? targetY / y : 1.0, 0.84, 1.20);
+
+    float outY = max(0.0, dot(outRgb, vec3(0.2126, 0.7152, 0.0722)));
+    float chroma = profileColorChromaRange(outRgb);
+    float saturation = profileColorRelativeSaturation(outRgb);
+    float chromaEvidence = smoothstep(0.025, 0.12, chroma) *
+            (1.0 - smoothstep(0.62, 0.90, saturation));
+    float chromaGain = 1.0 + 0.045 * control * structure * toneWindow * chromaEvidence;
+    return vec3(outY) + (outRgb - vec3(outY)) * chromaGain;
+}
+
+vec3 applyProfile(vec3 rgb, float popSourceLuma, float popLocalBase) {
+    float y = max(0.0, dot(rgb, vec3(0.2126, 0.7152, 0.0722)));
+    float saturationControl = profileDecodedSaturation(pc.profileSaturation);
     float vibranceControl = clamp(pc.profileVibrance, -1.0, 1.0);
+    float colorRecoveryControl = profileDecodedColorRecovery(pc.profileSaturation);
+    float popControl = profileDecodedPop(pc.profileSaturation);
+
+    // Keep the established RAW-preview creative response: Vibrance then Saturation.
     if (abs(vibranceControl) >= 0.0001) {
         float maximum = max(rgb.r, max(rgb.g, rgb.b));
         float minimum = min(rgb.r, min(rgb.g, rgb.b));
@@ -756,8 +855,14 @@ vec3 applyProfile(vec3 rgb) {
                 : vibranceControl * (0.55 + 0.45 * protection);
         rgb = vec3(y) + (rgb - vec3(y)) * exp2(authority * 0.90);
     }
-    if (abs(pc.profileSaturation) >= 0.0001) {
-        rgb = vec3(y) + (rgb - vec3(y)) * exp2(clamp(pc.profileSaturation, -1.0, 1.0) * 0.85);
+    if (abs(saturationControl) >= 0.0001) {
+        rgb = vec3(y) + (rgb - vec3(y)) * exp2(saturationControl * 0.85);
+    }
+    if (abs(colorRecoveryControl) >= 0.0001) {
+        rgb = applyProfileColorRecovery(rgb, colorRecoveryControl);
+    }
+    if (popControl > 0.0001) {
+        rgb = applyProfilePopPreview(rgb, popControl, popSourceLuma, popLocalBase);
     }
     return rgb;
 }
@@ -1349,7 +1454,11 @@ void renderPass() {
     rgb = pbrNeutralToneMapping(rgb);
     rgb = applyPreviewToneLook(rgb);
     rgb = applyExplicitLiveToneContrast(rgb);
-    rgb = applyProfile(rgb);
+    // Pop reuses the resident FLLF mid-scale base. Avoid even those four buffer reads when Pop=0.
+    float popSourceLuma = denoisedLuma * previewAutomaticExposureMultiplier();
+    float popControl = profileDecodedPop(pc.profileSaturation);
+    float popLocalBase = popControl > 1.0e-4 ? samplePreviewFllfBase(gid) : popSourceLuma;
+    rgb = applyProfile(rgb, popSourceLuma, popLocalBase);
     rgb = compressPreviewToUnitGamutPreserveLuma(rgb);
     rgb = srgb(rgb);
     rgb = clamp(rgb, vec3(0.0), vec3(1.0));

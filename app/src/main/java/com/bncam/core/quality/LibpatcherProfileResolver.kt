@@ -159,6 +159,8 @@ object LibpatcherProfileResolver {
 
             add(f(ProfileIspKeys.PRESENCE_VIBRANCE))
             add(f(ProfileIspKeys.PRESENCE_SATURATION))
+            add(f(ProfileIspKeys.PRESENCE_POP))
+            add(f(ProfileIspKeys.PRESENCE_COLOR_RECOVERY))
 
             // Normal-vs-Polysharp ownership is runtime-relevant even while Polysharp itself is not
             // connected: selecting Polysharp must disable the Normal backend rather than stacking both.

@@ -289,7 +289,8 @@ void toneAndPackPreview(
     const bool profileColorActive =
             std::abs(quality.profileColorSaturation) >= 1.0e-4f ||
             std::abs(quality.profileColorContrast) >= 1.0e-4f ||
-            std::abs(quality.profilePresenceVibrance) >= 1.0e-4f;
+            std::abs(quality.profilePresenceVibrance) >= 1.0e-4f ||
+            std::abs(quality.profileColorRecovery) >= 1.0e-4f;
     std::atomic<int> rgbMinimum{255};
     std::atomic<int> rgbMaximum{0};
     std::atomic<std::uint64_t> rgbSum{0u};
@@ -561,6 +562,8 @@ RawPreviewResult renderRawPreviewRgba(
     previewRequest.profileSaturation = parameters.quality.profileColorSaturation;
     previewRequest.profileContrast = parameters.quality.profileColorContrast;
     previewRequest.profileVibrance = parameters.quality.profilePresenceVibrance;
+    previewRequest.profilePop = parameters.quality.profilePresencePop;
+    previewRequest.profileColorRecovery = parameters.quality.profileColorRecovery;
     previewRequest.profileToneExposure = parameters.quality.profileToneExposure;
     previewRequest.profileToneHighlights = parameters.quality.profileToneHighlights;
     previewRequest.profileToneShadows = parameters.quality.profileToneShadows;

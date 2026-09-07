@@ -14944,6 +14944,8 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         request.profileColorSaturation = uiConfig.profileColorSaturation;
         request.profileColorContrast = uiConfig.profileColorContrast;
         request.profilePresenceVibrance = uiConfig.profilePresenceVibrance;
+        request.profilePresencePop = uiConfig.profilePresencePop;
+        request.profileColorRecovery = uiConfig.profileColorRecovery;
         request.toneLut = vulkanToneLut.data();
         request.toneLutFloatCount = vulkanToneLut.size();
         request.ultraHdrGainmapRequested = uiConfig.ultraHdrGainmapEnabled;

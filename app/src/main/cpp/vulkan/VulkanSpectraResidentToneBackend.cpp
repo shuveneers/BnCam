@@ -24,6 +24,18 @@
 
 namespace bncam::vulkan {
 namespace {
+
+float sanitizeProfileCreativeCarrier(float value) {
+    if (!std::isfinite(value)) return 0.0f;
+    if (value <= -1.5f) {
+        const float payload = -value - 2.0f;
+        if (payload >= 0.0f && payload <= 8388607.0f &&
+            std::abs(payload - std::round(payload)) <= 0.001f) return value;
+        return 0.0f;
+    }
+    return std::clamp(value, -1.0f, 1.0f);
+}
+
 using Clock = std::chrono::steady_clock;
 float elapsedMs(Clock::time_point start) {
     return static_cast<float>(std::chrono::duration<double, std::milli>(Clock::now() - start).count());
@@ -1021,7 +1033,7 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
     push.rawJpegBaseVibrance = request.rawJpegBaseVibrance;
     push.shoulderStart = std::clamp(request.shoulderStart, 0.50f, 0.85f);
     push.shoulderStrength = std::clamp(request.shoulderStrength, 0.50f, 2.50f);
-    push.profileSaturation = std::clamp(request.profileColorSaturation, -1.0f, 1.0f);
+    push.profileSaturation = sanitizeProfileCreativeCarrier(request.profileColorSaturation);
     push.profileContrast = std::clamp(request.profileColorContrast, -1.0f, 1.0f);
     push.profileVibrance = std::clamp(request.profilePresenceVibrance, -1.0f, 1.0f);
     push.ultraHdrSourceMapWidth = sourceMapWidth;

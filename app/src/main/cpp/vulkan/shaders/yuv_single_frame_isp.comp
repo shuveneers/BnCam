@@ -130,6 +130,40 @@ float profileColorLuma(vec3 rgb) {
     return max(0.0, dot(rgb, vec3(0.2126, 0.7152, 0.0722)));
 }
 
+// Declared here because Color Manager executes before the later source-sampling helpers are
+// defined. Pop reads immutable input luma; it never samples the sharpened/output buffer.
+float inputYAtOutput(int outputX, int outputY);
+
+bool profileCreativeCarrierEncoded(float value) {
+    return value <= -1.5;
+}
+
+uint profileCreativePayload(float value) {
+    return uint(clamp(round(-value - 2.0), 0.0, 8388607.0));
+}
+
+float profileDecodeSigned8(uint code) {
+    int signedCode = int(code) - 128;
+    return signedCode >= 0
+            ? clamp(float(signedCode) / 127.0, 0.0, 1.0)
+            : clamp(float(signedCode) / 128.0, -1.0, 0.0);
+}
+
+float profileDecodedSaturation(float carrier) {
+    if (!profileCreativeCarrierEncoded(carrier)) return clamp(carrier, -1.0, 1.0);
+    return profileDecodeSigned8(profileCreativePayload(carrier) & 0xffu);
+}
+
+float profileDecodedPop(float carrier) {
+    if (!profileCreativeCarrierEncoded(carrier)) return 0.0;
+    return float((profileCreativePayload(carrier) >> 8u) & 0x7fu) / 127.0;
+}
+
+float profileDecodedColorRecovery(float carrier) {
+    if (!profileCreativeCarrierEncoded(carrier)) return 0.0;
+    return profileDecodeSigned8((profileCreativePayload(carrier) >> 15u) & 0xffu);
+}
+
 float profileColorRelativeSaturation(vec3 rgb) {
     float maximum = max(rgb.r, max(rgb.g, rgb.b));
     float minimum = min(rgb.r, min(rgb.g, rgb.b));
@@ -160,21 +194,62 @@ vec3 applyProfileColorRecovery(vec3 rgb, float signedControl) {
     return vec3(y) + (rgb - vec3(y)) * exp2(stops);
 }
 
-vec3 applyProfilePop(vec3 rgb, float signedControl) {
-    float control = clamp(signedControl, -1.0, 1.0);
-    if (abs(control) < 1.0e-4) return rgb;
+vec3 applyProfilePop(vec3 rgb, float controlValue, int outputX, int outputY) {
+    float control = clamp(controlValue, 0.0, 1.0);
+    // Exact neutral fast path: no neighbourhood reads and no additional ALU when Pop is zero.
+    if (control <= 1.0e-4) return rgb;
+
+    float shortSide = max(1.0, min(float(pc.outputWidth), float(pc.outputHeight)));
+    int nearRadius = int(clamp(floor(shortSide / 260.0 + 0.5), 3.0, 14.0));
+    int farRadius = int(clamp(floor(shortSide / 110.0 + 0.5), 8.0, 32.0));
+
+    float center = inputYAtOutput(outputX, outputY);
+    float n0 = inputYAtOutput(outputX, outputY - nearRadius);
+    float s0 = inputYAtOutput(outputX, outputY + nearRadius);
+    float w0 = inputYAtOutput(outputX - nearRadius, outputY);
+    float e0 = inputYAtOutput(outputX + nearRadius, outputY);
+    float n1 = inputYAtOutput(outputX, outputY - farRadius);
+    float s1 = inputYAtOutput(outputX, outputY + farRadius);
+    float w1 = inputYAtOutput(outputX - farRadius, outputY);
+    float e1 = inputYAtOutput(outputX + farRadius, outputY);
+
+    float nearBase = 0.25 * (n0 + s0 + w0 + e0);
+    float farBase = 0.25 * (n1 + s1 + w1 + e1);
+    float localBase = mix(farBase, nearBase, 0.62);
+    float evDetail = log2((max(center, 0.0) + 0.004) / (max(localBase, 0.0) + 0.004));
+
+    float localMin = min(center, min(min(n0, s0), min(w0, e0)));
+    localMin = min(localMin, min(min(n1, s1), min(w1, e1)));
+    float localMax = max(center, max(max(n0, s0), max(w0, e0)));
+    localMax = max(localMax, max(max(n1, s1), max(w1, e1)));
+    float localRange = max(0.0, localMax - localMin);
+    float structure = smoothstep(0.010, 0.075, localRange + 0.18 * abs(evDetail));
+    float scaleDrift = abs(nearBase - farBase);
+    float coherence = 1.0 - 0.55 * smoothstep(0.055, 0.22, scaleDrift);
+    float hardEdgeGuard = 1.0 - 0.72 * smoothstep(0.24, 0.62, localRange);
 
     float y = profileColorLuma(rgb);
-    float chroma = profileColorChromaRange(rgb);
-    float saturation = profileColorRelativeSaturation(rgb);
-    float evidence = smoothstep(0.008, 0.032, chroma);
-    float saturationHeadroom = clamp(1.0 - saturation, 0.0, 1.0);
-    float protection = control >= 0.0
-            ? 0.28 + 0.72 * saturationHeadroom
-            : 0.62 + 0.38 * saturationHeadroom;
-    float authority = control * evidence * profileColorLumaWindow(y) * protection;
-    float stops = authority * (control >= 0.0 ? 0.60 : 0.50);
-    return vec3(y) + (rgb - vec3(y)) * exp2(stops);
+    float shadowGuard = smoothstep(0.035, 0.13, y);
+    float highlightGuard = 1.0 - smoothstep(0.72, 0.965, y);
+    float toneWindow = shadowGuard * highlightGuard;
+    float noiseGuard = smoothstep(0.012, 0.050, localRange + 0.28 * max(center, 0.0));
+    float authority = pow(control, 1.15) * structure * coherence * hardEdgeGuard *
+            toneWindow * noiseGuard;
+
+    float popEv = clamp(evDetail * 0.50 * authority, -0.18, 0.18);
+    float targetY = clamp(y * exp2(popEv), 0.0, 1.0);
+    float lumaScale = y > 1.0e-6 ? targetY / y : 1.0;
+    vec3 outRgb = rgb * clamp(lumaScale, 0.82, 1.22);
+
+    // Secondary colourfulness is intentionally small and evidence-gated. Pop's identity is
+    // mid-scale luminance separation, not another saturation/vibrance control.
+    float outY = profileColorLuma(outRgb);
+    float chroma = profileColorChromaRange(outRgb);
+    float saturation = profileColorRelativeSaturation(outRgb);
+    float chromaEvidence = smoothstep(0.025, 0.12, chroma) *
+            (1.0 - smoothstep(0.62, 0.90, saturation));
+    float chromaGain = 1.0 + 0.055 * control * structure * toneWindow * chromaEvidence;
+    return vec3(outY) + (outRgb - vec3(outY)) * chromaGain;
 }
 
 vec3 compressProfileColorToUnitGamutPreserveLuma(vec3 rgb) {
@@ -196,19 +271,20 @@ vec3 compressProfileColorToUnitGamutPreserveLuma(vec3 rgb) {
     return clamp(vec3(y) + (rgb - vec3(y)) * clamp(authority, 0.0, 1.0), vec3(0.0), vec3(1.0));
 }
 
-vec3 applyProfile(vec3 rgb) {
+vec3 applyProfile(vec3 rgb, int outputX, int outputY) {
     float r = clamp(rgb.r * pc.wbRed, 0.0, 1.0);
     float g = clamp(rgb.g * pc.wbGreen, 0.0, 1.0);
     float b = clamp(rgb.b * pc.wbBlue, 0.0, 1.0);
 
-    // Native field names remain compatibility transport slots:
-    // saturationControl = Color Recovery, vibranceControl = Pop.
-    float colorRecoveryControl = clamp(pc.saturationControl, -1.0, 1.0);
+    float saturationControl = profileDecodedSaturation(pc.saturationControl);
     float contrastControl = clamp(pc.contrastControl, -1.0, 1.0);
-    float popControl = clamp(pc.vibranceControl, -1.0, 1.0);
-    if (abs(colorRecoveryControl) < 1.0e-4 &&
+    float vibranceControl = clamp(pc.vibranceControl, -1.0, 1.0);
+    float colorRecoveryControl = profileDecodedColorRecovery(pc.saturationControl);
+    float popControl = profileDecodedPop(pc.saturationControl);
+    if (abs(saturationControl) < 1.0e-4 &&
         abs(contrastControl) < 1.0e-4 &&
-        abs(popControl) < 1.0e-4) {
+        abs(vibranceControl) < 1.0e-4 &&
+        abs(colorRecoveryControl) < 1.0e-4 && popControl <= 1.0e-4) {
         return vec3(r, g, b);
     }
 
@@ -218,19 +294,32 @@ vec3 applyProfile(vec3 rgb) {
         float mappedY = contrastCurve(y, contrastControl);
         float scale = y > 1.0e-6 ? mappedY / y : 1.0;
         outRgb *= scale;
+        y = mappedY;
     }
 
-    bool colorManagerActive = abs(colorRecoveryControl) >= 1.0e-4 || abs(popControl) >= 1.0e-4;
+    // Restore the established pre-0208 creative owners unchanged: Saturation is global;
+    // Vibrance preferentially acts where existing saturation still has headroom.
+    if (abs(saturationControl) >= 1.0e-4) {
+        float saturationFactor = exp2(saturationControl * 0.85);
+        outRgb = vec3(y) + (outRgb - vec3(y)) * saturationFactor;
+    }
+    if (abs(vibranceControl) >= 1.0e-4) {
+        float maximum = max(outRgb.r, max(outRgb.g, outRgb.b));
+        float minimum = min(outRgb.r, min(outRgb.g, outRgb.b));
+        float currentSaturation = (maximum - minimum) / max(1.0e-4, maximum);
+        float protection = clamp(1.0 - currentSaturation, 0.0, 1.0);
+        float authority = vibranceControl >= 0.0
+                ? vibranceControl * (0.20 + 0.80 * protection)
+                : vibranceControl * (0.55 + 0.45 * protection);
+        outRgb = vec3(y) + (outRgb - vec3(y)) * exp2(authority * 0.90);
+    }
     if (abs(colorRecoveryControl) >= 1.0e-4) {
         outRgb = applyProfileColorRecovery(outRgb, colorRecoveryControl);
     }
-    if (abs(popControl) >= 1.0e-4) {
-        outRgb = applyProfilePop(outRgb, popControl);
+    if (popControl > 1.0e-4) {
+        outRgb = applyProfilePop(outRgb, popControl, outputX, outputY);
     }
-    if (colorManagerActive) {
-        outRgb = compressProfileColorToUnitGamutPreserveLuma(outRgb);
-    }
-    return clamp(outRgb, vec3(0.0), vec3(1.0));
+    return compressProfileColorToUnitGamutPreserveLuma(outRgb);
 }
 
 vec2 sourceUvForOutput(uint outputX, uint outputY) {
@@ -1276,7 +1365,13 @@ float profileDetailedYAtOutput(uint outputX, uint outputY) {
 }
 
 vec3 renderRgbUnblurred(uint outputX, uint outputY) {
-    uint yValue = uint(clamp(roundEven(profileDetailedYAtOutput(outputX, outputY) * 255.0), 0.0, 255.0));
+    // Color Manager/Pop owns the tone-mapped base image. Existing sharpness still computes its
+    // exact detailed luminance, but that delta is applied only after Color Manager so Pop is not
+    // accidentally a second sharpening stage and does not analyse already-sharpened structure.
+    float baseToneY = toneMappedYAtOutput(int(outputX), int(outputY));
+    float detailedY = profileDetailedYAtOutput(outputX, outputY);
+    float sharpDelta = detailedY - baseToneY;
+    uint yValue = uint(clamp(roundEven(baseToneY * 255.0), 0.0, 255.0));
     vec2 filteredUv = denoisedUvAtOutput(outputX, outputY);
     float y = float(yValue);
     float u = clamp(roundEven(filteredUv.x * 255.0), 0.0, 255.0) - 128.0;
@@ -1286,7 +1381,19 @@ vec3 renderRgbUnblurred(uint outputX, uint outputY) {
     float r8 = clamp(y + 1.402000 * v, 0.0, 255.0);
     float g8 = clamp(y - 0.344136 * u - 0.714136 * v, 0.0, 255.0);
     float b8 = clamp(y + 1.772000 * u, 0.0, 255.0);
-    return applyProfile(vec3(r8, g8, b8) / 255.0);
+    vec3 managed = applyProfile(vec3(r8, g8, b8) / 255.0, int(outputX), int(outputY));
+
+    if (abs(sharpDelta) > 1.0e-6) {
+        float managedY = profileColorLuma(managed);
+        float targetY = clamp(managedY + sharpDelta, 0.0, 1.0);
+        if (managedY > 1.0e-6) {
+            managed *= targetY / managedY;
+        } else {
+            managed = vec3(targetY);
+        }
+        managed = compressProfileColorToUnitGamutPreserveLuma(managed);
+    }
+    return clamp(managed, vec3(0.0), vec3(1.0));
 }
 
 vec3 renderRgbPortrait(uint outputX, uint outputY) {

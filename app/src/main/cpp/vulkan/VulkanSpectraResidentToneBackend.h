@@ -144,6 +144,10 @@ struct SpectraResidentToneRequest {
     float profileColorSaturation = 0.0f;
     float profileColorContrast = 0.0f;
     float profilePresenceVibrance = 0.0f;
+    // DELTA 0209A: explicit CPU-side Color Management request lanes. These are request
+    // metadata only and do not change the resident tone shader push-constant layout.
+    float profilePresencePop = 0.0f;
+    float profileColorRecovery = 0.0f;
     // Two floats per LUT entry: curvedLuma, safeMidtoneGate. Exactly 4096 entries.
     const float* toneLut = nullptr;
     std::size_t toneLutFloatCount = 0u;

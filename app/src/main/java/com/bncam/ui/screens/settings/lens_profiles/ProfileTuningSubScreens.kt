@@ -385,13 +385,30 @@ fun ProfilePresenceSettingsScreen(
     val scope = rememberCoroutineScope()
 
     SettingsTopicScaffold("Color Manager", onNavigateBack) {
-        SettingsCard("Color Manager", "Perceptual colour controls. Both preserve luminance and protect neutrals, deep shadows, highlights and already-saturated colours.") {
+        SettingsCard("Color Manager", "Independent colour and local-presence controls. Zero is neutral; Pop is structure-aware and separate from sharpening.") {
             ProfileSignedSlider(
+                repo = repo,
+                profileId = profileId,
+                key = ProfileIspKeys.PRESENCE_SATURATION,
+                title = "Saturation",
+                description = "Adjusts overall colour intensity."
+            )
+            ProfileSignedSlider(
+                repo = repo,
+                profileId = profileId,
+                key = ProfileIspKeys.PRESENCE_VIBRANCE,
+                title = "Vibrance",
+                description = "Selectively adjusts less-saturated colours while protecting colours that are already strong."
+            )
+            ProfileRangeSlider(
                 repo = repo,
                 profileId = profileId,
                 key = ProfileIspKeys.PRESENCE_POP,
                 title = "Pop",
-                description = "Adjusts overall colour vividness without acting as a global saturation multiplier. Positive values favour muted colours while protecting already-saturated colour."
+                description = "Adds structure-aware local depth and tonal separation without acting as conventional sharpening.",
+                defaultValue = 0f,
+                valueRange = 0f..1f,
+                formatter = { String.format(Locale.US, "%.0f", it * 100f) }
             )
             ProfileSignedSlider(
                 repo = repo,
@@ -416,6 +433,8 @@ fun ProfilePresenceSettingsScreen(
                 repo.clearProfileOverrideValues(
                     profileId,
                     listOf(
+                        ProfileSettingSpec(ProfileIspKeys.PRESENCE_SATURATION, ProfileSettingValueType.FLOAT),
+                        ProfileSettingSpec(ProfileIspKeys.PRESENCE_VIBRANCE, ProfileSettingValueType.FLOAT),
                         ProfileSettingSpec(ProfileIspKeys.PRESENCE_POP, ProfileSettingValueType.FLOAT),
                         ProfileSettingSpec(ProfileIspKeys.PRESENCE_COLOR_RECOVERY, ProfileSettingValueType.FLOAT),
                         ProfileSettingSpec(ProfileIspKeys.PRESENCE_COLOR_FRINGE_SUPPRESSION, ProfileSettingValueType.FLOAT)

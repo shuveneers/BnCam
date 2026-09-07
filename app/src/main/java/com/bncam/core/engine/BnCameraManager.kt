@@ -2200,6 +2200,8 @@ class BnCameraManager(private val context: Context) {
                     profileSaturation = quality.profileColorTuning.saturation,
                     profileContrast = quality.profileColorTuning.contrast,
                     profileVibrance = quality.profileColorTuning.vibrance,
+                    profilePop = quality.profileColorTuning.pop,
+                    profileColorRecovery = quality.profileColorTuning.colorRecovery,
                     // Capture sharpening/NR are not live-viewfinder stages. The RAW preview has
                     // its own conservative base-detail pass for focus readability; stacking profile
                     // detail/NR here made cadence and appearance depend on capture processing.
@@ -2368,6 +2370,8 @@ class BnCameraManager(private val context: Context) {
             profileSaturation = 0f,
             profileContrast = 0f,
             profileVibrance = 0f,
+            profilePop = 0f,
+            profileColorRecovery = 0f,
             profileDetailAmount = 0f,
             profileDetailRadius = 1f,
             profileDetailDetail = 0.25f,

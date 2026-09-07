@@ -34,6 +34,17 @@ std::uint64_t align4(std::uint64_t value) {
     return (value + 3u) & ~std::uint64_t{3u};
 }
 
+float sanitizeProfileCreativeCarrier(float value) {
+    if (!std::isfinite(value)) return 0.0f;
+    if (value <= -1.5f) {
+        const float payload = -value - 2.0f;
+        if (payload >= 0.0f && payload <= 8388607.0f &&
+            std::abs(payload - std::round(payload)) <= 0.001f) return value;
+        return 0.0f;
+    }
+    return std::clamp(value, -1.0f, 1.0f);
+}
+
 struct IspPush {
     std::uint32_t inputWidth;
     std::uint32_t inputHeight;
@@ -567,7 +578,7 @@ YuvSingleFrameIspResult VulkanYuvSingleFrameBackend::execute(
         std::clamp(request.wbRed, 0.50f, 2.00f),
         std::clamp(request.wbGreen, 0.50f, 2.00f),
         std::clamp(request.wbBlue, 0.50f, 2.00f),
-        std::clamp(request.saturation, -1.0f, 1.0f),
+        sanitizeProfileCreativeCarrier(request.saturation),
         std::clamp(request.contrast, -1.0f, 1.0f),
         std::clamp(request.vibrance, -1.0f, 1.0f),
         std::clamp(request.profileDetailAmount, -1.0f, 1.0f),
