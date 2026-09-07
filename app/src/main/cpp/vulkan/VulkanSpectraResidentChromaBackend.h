@@ -8,25 +8,19 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <mutex>
 #include <string>
 #include <vector>
 
 namespace bncam::vulkan {
 
-/**
- * Milestone 8H-C GPU-primary Pass 2 request.
- *
- * The full-resolution fine + mid chroma candidate remains on the GPU. Only the
- * compact No-Regret tile statistics are read by the CPU; the full-frame blend
- * and final output stay in Vulkan until one final readback.
- */
+// N006E temporary compile facade.
+// The classical Pass2/Pass3 resident chroma/banding pixel implementation and shader
+// are physically removed. This type surface is retained only until N006F removes
+// the obsolete VulkanRuntime API. Every execution entrypoint is fail-closed.
+
 struct SpectraResidentPass2Request {
     const float* mosaicData = nullptr;
-    // Opaque 8H-G generation resolved by VulkanRuntime; no VkBuffer leaves the runtime.
     std::uint64_t residentInputGeneration = 0;
-    // Keep the Pass-2 mosaic resident for Pass-3 planning/finalize instead of
-    // materializing the full frame on the host. Compact telemetry still returns.
     bool deferFullFrameReadback = false;
     std::uint32_t frameWidth = 0;
     std::uint32_t frameHeight = 0;
@@ -71,17 +65,9 @@ struct SpectraResidentPass2Request {
     float combinedNoisePressure = 0.0f;
 };
 
-/**
- * Milestone 8H-C GPU-primary Pass 3 request.
- *
- * The CPU still estimates the compact row/column and low-frequency fields in
- * this milestone; all full-frame application and No-Regret blending is Vulkan.
- */
 struct SpectraResidentPass3Request {
     const float* mosaicData = nullptr;
-    // Opaque Pass-2 generation resolved inside VulkanRuntime.
     std::uint64_t residentInputGeneration = 0;
-    // Keep Pass-3 final mosaic on-device for direct demosaic handoff.
     bool deferFullFrameReadback = false;
     std::uint32_t frameWidth = 0;
     std::uint32_t frameHeight = 0;
@@ -192,121 +178,70 @@ public:
     VulkanSpectraResidentChromaBackend& operator=(const VulkanSpectraResidentChromaBackend&) = delete;
 
     SpectraResidentChromaResult executePass2(
-            VkPhysicalDevice physicalDevice,
-            VkDevice device,
-            VkQueue computeQueue,
-            VkCommandPool commandPool,
-            VulkanAllocatorOwner& allocatorOwner,
-            const SpectraResidentPass2Request& request
-    ) noexcept;
+            VkPhysicalDevice, VkDevice, VkQueue, VkCommandPool,
+            VulkanAllocatorOwner&, const SpectraResidentPass2Request&
+    ) noexcept {
+        return retired();
+    }
 
-    // Runtime-internal resident handoff from Pass 1. Vulkan handles never cross IspCore/JNI.
     SpectraResidentChromaResult executePass2FromResident(
-            VkPhysicalDevice physicalDevice,
-            VkDevice device,
-            VkQueue computeQueue,
-            VkCommandPool commandPool,
-            VulkanAllocatorOwner& allocatorOwner,
-            VkBuffer residentInputBuffer,
-            std::uint64_t residentInputBytes,
-            const SpectraResidentPass2Request& request
-    ) noexcept;
+            VkPhysicalDevice, VkDevice, VkQueue, VkCommandPool,
+            VulkanAllocatorOwner&, VkBuffer, std::uint64_t,
+            const SpectraResidentPass2Request&
+    ) noexcept {
+        return retired();
+    }
 
     SpectraResidentChromaResult executePass3(
-            VkPhysicalDevice physicalDevice,
-            VkDevice device,
-            VkQueue computeQueue,
-            VkCommandPool commandPool,
-            VulkanAllocatorOwner& allocatorOwner,
-            const SpectraResidentPass3Request& request
-    ) noexcept;
+            VkPhysicalDevice, VkDevice, VkQueue, VkCommandPool,
+            VulkanAllocatorOwner&, const SpectraResidentPass3Request&
+    ) noexcept {
+        return retired();
+    }
 
     SpectraResidentChromaResult executePass3FromResident(
-            VkPhysicalDevice physicalDevice,
-            VkDevice device,
-            VkQueue computeQueue,
-            VkCommandPool commandPool,
-            VulkanAllocatorOwner& allocatorOwner,
-            VkBuffer residentInputBuffer,
-            std::uint64_t residentInputBytes,
-            const SpectraResidentPass3Request& request
-    ) noexcept;
+            VkPhysicalDevice, VkDevice, VkQueue, VkCommandPool,
+            VulkanAllocatorOwner&, VkBuffer, std::uint64_t,
+            const SpectraResidentPass3Request&
+    ) noexcept {
+        return retired();
+    }
 
     bool resolveResidentOutput(
-            std::uint64_t generation,
+            std::uint64_t,
             VkBuffer& buffer,
             std::uint64_t& bytes,
             std::uint32_t& width,
             std::uint32_t& height
-    ) const noexcept;
+    ) const noexcept {
+        buffer = VK_NULL_HANDLE;
+        bytes = 0u;
+        width = 0u;
+        height = 0u;
+        return false;
+    }
 
-    /** Explicit fail-safe materialization only; normal resident success must not call this. */
     bool readbackResidentOutput(
-            std::uint64_t generation,
+            std::uint64_t,
             std::vector<float>& output
-    ) noexcept;
+    ) noexcept {
+        output.clear();
+        return false;
+    }
 
-    void destroy(VkDevice device) noexcept;
-    bool productionKernelConnected() const noexcept;
-    bool pipelineInitialized() const noexcept;
+    void destroy(VkDevice) noexcept {}
+    bool productionKernelConnected() const noexcept { return false; }
+    bool pipelineInitialized() const noexcept { return false; }
 
 private:
-    struct PersistentBuffer {
-        VkBuffer buffer = VK_NULL_HANDLE;
-        VmaAllocation allocation = nullptr;
-        void* mapped = nullptr;
-        std::uint64_t capacityBytes = 0;
-    };
-
-    bool initializeLocked(VkDevice device, VkCommandPool commandPool,
-                          std::string& failureReason) noexcept;
-    bool ensureBufferLocked(VmaAllocator allocator, std::uint64_t bytes,
-                            std::uint32_t hostAccess, PersistentBuffer& buffer,
-                            bool& reallocated, std::string& failureReason) noexcept;
-    void updateDescriptorSetLocked(VkDevice device, VkBuffer inputOverride = VK_NULL_HANDLE) noexcept;
-    SpectraResidentChromaResult executePass2Internal(
-            VkPhysicalDevice physicalDevice, VkDevice device, VkQueue computeQueue, VkCommandPool commandPool,
-            VulkanAllocatorOwner& allocatorOwner, VkBuffer residentInputBuffer,
-            std::uint64_t residentInputBytes, const SpectraResidentPass2Request& request
-    ) noexcept;
-    SpectraResidentChromaResult executePass3Internal(
-            VkPhysicalDevice physicalDevice, VkDevice device, VkQueue computeQueue, VkCommandPool commandPool,
-            VulkanAllocatorOwner& allocatorOwner, VkBuffer residentInputBuffer,
-            std::uint64_t residentInputBytes, const SpectraResidentPass3Request& request
-    ) noexcept;
-    void destroyBuffersLocked() noexcept;
-    void destroyLocked(VkDevice device) noexcept;
-
-    mutable std::mutex mutex_;
-    bool initialized_ = false;
-    VkDevice initializedDevice_ = VK_NULL_HANDLE;
-    VkCommandPool initializedCommandPool_ = VK_NULL_HANDLE;
-    VkDescriptorSetLayout descriptorSetLayout_ = VK_NULL_HANDLE;
-    VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
-    VkShaderModule shaderModule_ = VK_NULL_HANDLE;
-    VkPipeline pipeline_ = VK_NULL_HANDLE;
-    VkDescriptorPool descriptorPool_ = VK_NULL_HANDLE;
-    VkDescriptorSet descriptorSet_ = VK_NULL_HANDLE;
-    VkCommandBuffer commandBuffer_ = VK_NULL_HANDLE;
-    VkFence fence_ = VK_NULL_HANDLE;
-    VkQueryPool queryPool_ = VK_NULL_HANDLE;
-    VmaAllocator allocator_ = nullptr;
-    PersistentBuffer input_;
-    PersistentBuffer candidate_;
-    PersistentBuffer scratch_;
-    PersistentBuffer lensShading_;
-    PersistentBuffer auxiliary_;
-    PersistentBuffer tileStatistics_;
-    PersistentBuffer acceptance_;
-    PersistentBuffer telemetry_;
-    [[maybe_unused]] std::uint64_t allocationGeneration_ = 0;
-    std::uint64_t lensShadingGenerationId_ = 0;
-    std::uint64_t lensShadingGenerationBytes_ = 0;
-    std::uint64_t residentOutputGeneration_ = 0;
-    std::uint64_t residentOutputBytes_ = 0;
-    std::uint32_t residentOutputWidth_ = 0;
-    std::uint32_t residentOutputHeight_ = 0;
-    bool descriptorBindingsInitialized_ = false;
+    static SpectraResidentChromaResult retired() noexcept {
+        SpectraResidentChromaResult result{};
+        result.attempted = true;
+        result.pipelineAvailable = false;
+        result.status = "RETIRED_N006E_CLASSICAL_CHROMA_KERNEL";
+        result.failureReason = "CLASSICAL_CHROMA_PASS2_PASS3_PIXEL_KERNEL_REMOVED";
+        return result;
+    }
 };
 
 } // namespace bncam::vulkan

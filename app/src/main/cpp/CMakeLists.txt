@@ -64,9 +64,6 @@ set(BNCAM_VULKAN_PREP_SOURCES
         vulkan/VulkanRuntimeJni.cpp
         vulkan/VulkanSpectraOpponentBackend.cpp
         vulkan/VulkanSpectraVisibleChromaBackend.cpp
-        vulkan/VulkanSpectraResidentPostDemosaicBackend.cpp
-        vulkan/VulkanSpectraResidentPreDemosaicBackend.cpp
-        vulkan/VulkanSpectraResidentChromaBackend.cpp
         vulkan/VulkanSpectraTemporalObserverBackend.cpp
         vulkan/VulkanSpectraResidentDemosaicBackend.cpp
         vulkan/VulkanRawPreviewBackend.cpp
@@ -104,34 +101,9 @@ find_program(BNCAM_GLSLC
         "$ENV{ANDROID_NDK_HOME}/shader-tools/${BNCAM_SHADER_HOST_TAG}"
 )
 set(BNCAM_GENERATED_SHADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated/shaders")
-set(BNCAM_RESIDENT_POST_DEMOSAIC_SPV "${BNCAM_GENERATED_SHADER_DIR}/spectra_post_demosaic_resident.spv")
-set(BNCAM_RESIDENT_POST_DEMOSAIC_HEADER "${BNCAM_GENERATED_SHADER_DIR}/SpectraResidentPostDemosaicSpirv.h")
-if(BNCAM_GLSLC)
-    add_custom_command(
-            OUTPUT "${BNCAM_RESIDENT_POST_DEMOSAIC_HEADER}"
-            COMMAND "${CMAKE_COMMAND}" -E make_directory "${BNCAM_GENERATED_SHADER_DIR}"
-            COMMAND "${BNCAM_GLSLC}" --target-env=vulkan1.1 -O
-                    "${CMAKE_CURRENT_SOURCE_DIR}/vulkan/shaders/spectra_post_demosaic_resident.comp"
-                    -o "${BNCAM_RESIDENT_POST_DEMOSAIC_SPV}"
-            COMMAND "${CMAKE_COMMAND}"
-                    -DINPUT=${BNCAM_RESIDENT_POST_DEMOSAIC_SPV}
-                    -DOUTPUT=${BNCAM_RESIDENT_POST_DEMOSAIC_HEADER}
-                    -DSYMBOL=getSpectraResidentPostDemosaicSpirv
-                    -P "${CMAKE_CURRENT_SOURCE_DIR}/vulkan/cmake/EmbedSpirv.cmake"
-            DEPENDS
-                    "${CMAKE_CURRENT_SOURCE_DIR}/vulkan/shaders/spectra_post_demosaic_resident.comp"
-                    "${CMAKE_CURRENT_SOURCE_DIR}/vulkan/cmake/EmbedSpirv.cmake"
-            VERBATIM
-    )
-    add_custom_target(bncam_spectra_post_demosaic_shader
-            DEPENDS "${BNCAM_RESIDENT_POST_DEMOSAIC_HEADER}")
-    set(BNCAM_SPECTRA_POST_DEMOSAIC_SHADER_AVAILABLE 1)
-else()
-    message(FATAL_ERROR
-            "glslc was not found in the configured Android NDK. "
-            "The SPECTRA resident Vulkan production shader is mandatory; "
-            "verify CMAKE_ANDROID_NDK/ANDROID_NDK points to the installed NDK.")
-endif()
+# N006ER: the retired classical resident post-demosaic spatial/chroma kernel has no
+# implementation or shader target. VulkanRuntime keeps a temporary fail-closed type facade
+# until the obsolete runtime API is physically removed in N006F.
 
 # Lightweight fused live RAW viewfinder kernel. This is deliberately separate from the capture
 # resident demosaic backend so preview never runs capture-only residual/statistics passes.
@@ -430,62 +402,6 @@ else()
     set(BNCAM_YUV_EXPOSURE_STATISTICS_SHADER_AVAILABLE 0)
 endif()
 
-# Milestone 8H-B: GPU-primary pre-demosaic Pass 1. The candidate, tile
-# statistics and No-Regret blend stay on-device; only the compact acceptance
-# decision is made on CPU before the final mosaic readback needed by Pass 2.
-set(BNCAM_RESIDENT_PRE_DEMOSAIC_SPV "${BNCAM_GENERATED_SHADER_DIR}/spectra_pass1_resident.spv")
-set(BNCAM_RESIDENT_PRE_DEMOSAIC_HEADER "${BNCAM_GENERATED_SHADER_DIR}/SpectraResidentPreDemosaicSpirv.h")
-if(BNCAM_GLSLC)
-    add_custom_command(
-            OUTPUT "${BNCAM_RESIDENT_PRE_DEMOSAIC_HEADER}"
-            COMMAND "${CMAKE_COMMAND}" -E make_directory "${BNCAM_GENERATED_SHADER_DIR}"
-            COMMAND "${BNCAM_GLSLC}" --target-env=vulkan1.1 -O
-                    "${CMAKE_CURRENT_SOURCE_DIR}/vulkan/shaders/spectra_pass1_resident.comp"
-                    -o "${BNCAM_RESIDENT_PRE_DEMOSAIC_SPV}"
-            COMMAND "${CMAKE_COMMAND}"
-                    -DINPUT=${BNCAM_RESIDENT_PRE_DEMOSAIC_SPV}
-                    -DOUTPUT=${BNCAM_RESIDENT_PRE_DEMOSAIC_HEADER}
-                    -DSYMBOL=getSpectraResidentPreDemosaicSpirv
-                    -P "${CMAKE_CURRENT_SOURCE_DIR}/vulkan/cmake/EmbedSpirv.cmake"
-            DEPENDS
-                    "${CMAKE_CURRENT_SOURCE_DIR}/vulkan/shaders/spectra_pass1_resident.comp"
-                    "${CMAKE_CURRENT_SOURCE_DIR}/vulkan/cmake/EmbedSpirv.cmake"
-            VERBATIM
-    )
-    add_custom_target(bncam_spectra_pre_demosaic_shader
-            DEPENDS "${BNCAM_RESIDENT_PRE_DEMOSAIC_HEADER}")
-    set(BNCAM_SPECTRA_PRE_DEMOSAIC_SHADER_AVAILABLE 1)
-else()
-    set(BNCAM_SPECTRA_PRE_DEMOSAIC_SHADER_AVAILABLE 0)
-endif()
-
-# Milestone 8H-C: GPU-primary Pass 2 + Pass 3 chroma/banding application.
-set(BNCAM_RESIDENT_CHROMA_SPV "${BNCAM_GENERATED_SHADER_DIR}/spectra_chroma_resident.spv")
-set(BNCAM_RESIDENT_CHROMA_HEADER "${BNCAM_GENERATED_SHADER_DIR}/SpectraResidentChromaSpirv.h")
-if(BNCAM_GLSLC)
-    add_custom_command(
-            OUTPUT "${BNCAM_RESIDENT_CHROMA_HEADER}"
-            COMMAND "${CMAKE_COMMAND}" -E make_directory "${BNCAM_GENERATED_SHADER_DIR}"
-            COMMAND "${BNCAM_GLSLC}" --target-env=vulkan1.1 -O
-                    "${CMAKE_CURRENT_SOURCE_DIR}/vulkan/shaders/spectra_chroma_resident.comp"
-                    -o "${BNCAM_RESIDENT_CHROMA_SPV}"
-            COMMAND "${CMAKE_COMMAND}"
-                    -DINPUT=${BNCAM_RESIDENT_CHROMA_SPV}
-                    -DOUTPUT=${BNCAM_RESIDENT_CHROMA_HEADER}
-                    -DSYMBOL=getSpectraResidentChromaSpirv
-                    -P "${CMAKE_CURRENT_SOURCE_DIR}/vulkan/cmake/EmbedSpirv.cmake"
-            DEPENDS
-                    "${CMAKE_CURRENT_SOURCE_DIR}/vulkan/shaders/spectra_chroma_resident.comp"
-                    "${CMAKE_CURRENT_SOURCE_DIR}/vulkan/cmake/EmbedSpirv.cmake"
-            VERBATIM
-    )
-    add_custom_target(bncam_spectra_chroma_resident_shader
-            DEPENDS "${BNCAM_RESIDENT_CHROMA_HEADER}")
-    set(BNCAM_SPECTRA_CHROMA_RESIDENT_SHADER_AVAILABLE 1)
-else()
-    set(BNCAM_SPECTRA_CHROMA_RESIDENT_SHADER_AVAILABLE 0)
-endif()
-
 # Milestone 8H-H: compact GPU Pass-3 planner. Row/column residual profiles and
 # the low-frequency R-G/B-G field are sampled directly from the resident Pass-2
 # mosaic; no full-frame CPU scan/readback is required for planning.
@@ -643,15 +559,6 @@ add_library(bncam SHARED
 )
 
 
-if(TARGET bncam_spectra_post_demosaic_shader)
-    add_dependencies(bncam bncam_spectra_post_demosaic_shader)
-endif()
-if(TARGET bncam_spectra_pre_demosaic_shader)
-    add_dependencies(bncam bncam_spectra_pre_demosaic_shader)
-endif()
-if(TARGET bncam_spectra_chroma_resident_shader)
-    add_dependencies(bncam bncam_spectra_chroma_resident_shader)
-endif()
 if(TARGET bncam_spectra_temporal_observer_shader)
     add_dependencies(bncam bncam_spectra_temporal_observer_shader)
 endif()
@@ -701,7 +608,6 @@ if(TARGET bncam_spectra_tone_shader)
     add_dependencies(bncam bncam_spectra_tone_shader)
 endif()
 target_compile_definitions(bncam PRIVATE
-        BNCAM_SPECTRA_POST_DEMOSAIC_SHADER_AVAILABLE=${BNCAM_SPECTRA_POST_DEMOSAIC_SHADER_AVAILABLE}
         BNCAM_RAW_CAPTURE_CANONICALIZE_SHADER_AVAILABLE=${BNCAM_RAW_CAPTURE_CANONICALIZE_SHADER_AVAILABLE}
         BNCAM_RAW_JPEG_NORMALIZE_SHADER_AVAILABLE=${BNCAM_RAW_JPEG_NORMALIZE_SHADER_AVAILABLE}
         BNCAM_RAW_MULTIFRAME_ALIGNMENT_SHADER_AVAILABLE=${BNCAM_RAW_MULTIFRAME_ALIGNMENT_SHADER_AVAILABLE}
@@ -710,8 +616,6 @@ target_compile_definitions(bncam PRIVATE
         BNCAM_YUV_MULTIFRAME_FUSION_SHADER_AVAILABLE=${BNCAM_YUV_MULTIFRAME_FUSION_SHADER_AVAILABLE}
         BNCAM_YUV_SINGLE_FRAME_ISP_SHADER_AVAILABLE=${BNCAM_YUV_SINGLE_FRAME_ISP_SHADER_AVAILABLE}
         BNCAM_YUV_EXPOSURE_STATISTICS_SHADER_AVAILABLE=${BNCAM_YUV_EXPOSURE_STATISTICS_SHADER_AVAILABLE}
-        BNCAM_SPECTRA_PRE_DEMOSAIC_SHADER_AVAILABLE=${BNCAM_SPECTRA_PRE_DEMOSAIC_SHADER_AVAILABLE}
-        BNCAM_SPECTRA_CHROMA_RESIDENT_SHADER_AVAILABLE=${BNCAM_SPECTRA_CHROMA_RESIDENT_SHADER_AVAILABLE}
         BNCAM_SPECTRA_TEMPORAL_OBSERVER_SHADER_AVAILABLE=${BNCAM_SPECTRA_TEMPORAL_OBSERVER_SHADER_AVAILABLE}
         BNCAM_SPECTRA_PASS3_PLANNER_SHADER_AVAILABLE=${BNCAM_SPECTRA_PASS3_PLANNER_SHADER_AVAILABLE}
         BNCAM_SPECTRA_DEMOSAIC_SHADER_AVAILABLE=${BNCAM_SPECTRA_DEMOSAIC_SHADER_AVAILABLE}

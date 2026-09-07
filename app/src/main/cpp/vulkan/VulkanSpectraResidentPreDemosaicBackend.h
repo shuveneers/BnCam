@@ -7,11 +7,15 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <mutex>
 #include <string>
 #include <vector>
 
 namespace bncam::vulkan {
+
+// N006E temporary compile facade.
+// The classical Pass0/Pass1 resident pixel implementation and shader are physically removed.
+// This type surface is retained for exactly one compile gate so VulkanRuntime can be purged
+// independently in N006F. Every execution entrypoint is fail-closed and cannot mutate pixels.
 
 struct SpectraPass1BeforeTile {
     std::array<float, 4> meanSignal{0.0f, 0.0f, 0.0f, 0.0f};
@@ -32,19 +36,10 @@ struct SpectraResidentPreDemosaicRequest {
     std::size_t rowStrideFloats = 0;
     std::uint32_t cfaPattern = 0;
 
-    // Phase 10: Pass 0 and Pass 1 share this resident ping-pong backend.
-    // pass0Only applies the already-planned channel-bias correction on GPU and
-    // leaves the No-Regret blended mosaic resident for a later Pass 1 call.
     bool pass0Only = false;
     std::array<float, 4> pass0ChannelBias{0.0f, 0.0f, 0.0f, 0.0f};
-    // Opaque generation previously produced by this backend (normally Pass 0).
-    // When non-zero, mosaicData is ignored and Pass 1 consumes the resident mosaic directly.
     std::uint64_t residentInputGeneration = 0u;
 
-    // Phase 13 runtime-internal bridge for a resident float mosaic produced by another
-    // Vulkan backend. VulkanRuntime must resolve/validate the opaque producer generation
-    // under the global submission lock before populating these fields. The backend never
-    // owns, maps, uploads, or reads back this external buffer.
     VkBuffer externalResidentInputBuffer = VK_NULL_HANDLE;
     std::uint64_t externalResidentInputBytes = 0u;
 
@@ -58,17 +53,13 @@ struct SpectraResidentPreDemosaicRequest {
     float greenS = 0.0f;
     float greenO = 0.0f;
 
-    // CPU-built tensor field is intentionally retained in 8H-B: device traces show
-    // tensor construction is ~70 ms while the directional pixel kernel is ~6.5 s.
-    // Uploading the compact field preserves the proven tensor estimator while moving
-    // the dominant full-frame work to Vulkan.
-    const float* tensorCells = nullptr; // packed jxx,jxy,jyy,gradientNoiseVariance
+    const float* tensorCells = nullptr;
     std::uint32_t tensorColumns = 0;
     std::uint32_t tensorRows = 0;
     std::uint32_t tensorStep = 16;
     std::uint64_t tensorGenerationId = 0;
 
-    const float* lensShadingMap = nullptr; // packed RGGB canonical channel order
+    const float* lensShadingMap = nullptr;
     std::uint32_t lensShadingColumns = 0;
     std::uint32_t lensShadingRows = 0;
     std::uint64_t lensShadingGenerationId = 0;
@@ -83,10 +74,8 @@ struct SpectraResidentPreDemosaicRequest {
     float detailRetentionFloor = 0.95f;
     float combinedNoisePressure = 0.0f;
     float modelConfidence = 0.0f;
-    // 8H-G: when true, keep the final Pass-1 mosaic device-resident and return only compact observations.
     bool deferFullFrameReadback = false;
 };
-
 
 struct SpectraResidentRawStatisticsGpu {
     double residualSquaredSum = 0.0;
@@ -228,89 +217,50 @@ public:
             const VulkanSpectraResidentPreDemosaicBackend&) = delete;
 
     SpectraResidentPreDemosaicResult executePass1(
-            VkPhysicalDevice physicalDevice,
-            VkDevice device,
-            VkQueue computeQueue,
-            VkCommandPool commandPool,
-            VulkanAllocatorOwner& allocatorOwner,
+            VkPhysicalDevice,
+            VkDevice,
+            VkQueue,
+            VkCommandPool,
+            VulkanAllocatorOwner&,
             const SpectraResidentPreDemosaicRequest& request
-    ) noexcept;
+    ) noexcept {
+        SpectraResidentPreDemosaicResult result{};
+        result.attempted = true;
+        result.pass0Only = request.pass0Only;
+        result.pipelineAvailable = false;
+        result.status = "RETIRED_N006E_CLASSICAL_PRE_DEMOSAIC_KERNEL";
+        result.failureReason = "CLASSICAL_PRE_DEMOSAIC_PIXEL_KERNEL_REMOVED";
+        return result;
+    }
 
-    void destroy(VkDevice device) noexcept;
-    bool productionKernelConnected() const noexcept;
-    bool pipelineInitialized() const noexcept;
+    void destroy(VkDevice) noexcept {}
 
-    // Runtime-internal opaque hand-off. Vulkan handles never cross JNI/IspCore.
+    bool productionKernelConnected() const noexcept { return false; }
+    bool pipelineInitialized() const noexcept { return false; }
+
     bool resolveResidentOutput(
-            std::uint64_t generation,
+            std::uint64_t,
             VkBuffer& buffer,
             std::uint64_t& bytes,
             std::uint32_t& width,
             std::uint32_t& height
-    ) const noexcept;
+    ) const noexcept {
+        buffer = VK_NULL_HANDLE;
+        bytes = 0u;
+        width = 0u;
+        height = 0u;
+        return false;
+    }
 
-    // Failure/branch materialization only. Production Pass-1 -> Pass-2 uses the
-    // opaque device-resident handoff and never calls this.
     bool readbackResidentOutput(
-            VkDevice device,
-            VkQueue computeQueue,
-            std::uint64_t generation,
+            VkDevice,
+            VkQueue,
+            std::uint64_t,
             std::vector<float>& output
-    ) noexcept;
-
-
-private:
-    struct PersistentBuffer {
-        VkBuffer buffer = VK_NULL_HANDLE;
-        VmaAllocation allocation = nullptr;
-        void* mapped = nullptr;
-        std::uint64_t capacityBytes = 0;
-    };
-
-    bool initializeLocked(VkDevice device, VkCommandPool commandPool,
-                          std::string& failureReason) noexcept;
-    bool ensureBufferLocked(VmaAllocator allocator, std::uint64_t bytes,
-                            std::uint32_t hostAccess, PersistentBuffer& buffer,
-                            bool& reallocated, std::string& failureReason) noexcept;
-    void updateDescriptorSetLocked(
-            VkDevice device,
-            VkBuffer sourceBuffer,
-            VkBuffer candidateBuffer
-    ) noexcept;
-    void destroyBuffersLocked() noexcept;
-    void destroyLocked(VkDevice device) noexcept;
-
-    mutable std::mutex mutex_;
-    bool initialized_ = false;
-    VkDevice initializedDevice_ = VK_NULL_HANDLE;
-    VkCommandPool initializedCommandPool_ = VK_NULL_HANDLE;
-    VkDescriptorSetLayout descriptorSetLayout_ = VK_NULL_HANDLE;
-    VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
-    VkShaderModule shaderModule_ = VK_NULL_HANDLE;
-    VkPipeline pipeline_ = VK_NULL_HANDLE;
-    VkDescriptorPool descriptorPool_ = VK_NULL_HANDLE;
-    VkDescriptorSet descriptorSet_ = VK_NULL_HANDLE;
-    VkCommandBuffer commandBuffer_ = VK_NULL_HANDLE;
-    VkFence fence_ = VK_NULL_HANDLE;
-    VkQueryPool queryPool_ = VK_NULL_HANDLE;
-    VmaAllocator allocator_ = nullptr;
-    PersistentBuffer input_;
-    PersistentBuffer candidate_;
-    PersistentBuffer tensor_;
-    PersistentBuffer lensShading_;
-    PersistentBuffer tileStatistics_;
-    PersistentBuffer acceptance_;
-    PersistentBuffer telemetry_;
-    PersistentBuffer observation_;
-    std::uint64_t allocationGeneration_ = 0;
-    std::uint64_t lensShadingGenerationId_ = 0;
-    std::uint64_t lensShadingGenerationBytes_ = 0;
-    std::uint64_t residentOutputGeneration_ = 0;
-    std::uint64_t residentOutputBytes_ = 0;
-    std::uint32_t residentOutputWidth_ = 0;
-    std::uint32_t residentOutputHeight_ = 0;
-    bool descriptorBindingsInitialized_ = false;
-    bool residentOutputIsInput_ = false;
+    ) noexcept {
+        output.clear();
+        return false;
+    }
 };
 
 } // namespace bncam::vulkan
