@@ -616,7 +616,6 @@ struct SpectraResidualNoiseState {
     float demosaicPreLowFrequencyChromaSupport = 0.0f;
     float demosaicChromaCloudRiskEvidence = 0.0f;
     std::string demosaicChromaCloudRiskStatus = "UNAVAILABLE";
-    bncam::spectra2::ChromaCloudCorrectionPlan demosaicChromaCloudCorrectionPlan{};
 
     float visibleChromaPlanningPressure = 1.0f;
     float predictedVisibleVarianceY = 0.0f;
@@ -793,7 +792,7 @@ public:
             bool isYuv
     );
 
-    /** Native deterministic proof for S/O sampling, Dynamic ISO, and the production strength consumer. */
+    /** Native deterministic proof for S/O sampling, Dynamic ISO, and measurement-only noise-model truth. */
     static std::string validateNoiseModelImplementation(
             const std::array<double, 8>& lowNoiseSo,
             const std::array<double, 8>& highNoiseSo
