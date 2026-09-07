@@ -413,98 +413,6 @@ struct SpectraPass2State {
     std::string formatDebugString() const;
 };
 
-struct SpectraPass3State {
-    bool physicalBaselineMode = false;
-    std::string authoritySource = "SPECTRA";
-    int spectraMode = 0; // 0=Legacy/Off, 1=Auto, 2=Manual
-    bool applied = false;
-    bool applyRowBanding = false;
-    bool applyColBanding = false;
-    bool applyLowFreqChroma = false;
-    std::string fallbackReason = "none";
-    float rowPatternEnergyBefore = 0.0f;
-    float rowPatternEnergyAfter = 0.0f;
-    float colPatternEnergyBefore = 0.0f;
-    float colPatternEnergyAfter = 0.0f;
-    float maxLowFreqChromaShift = 0.0f;
-    float lowFreqChromaConfidence = 0.0f;
-    float rowPatternConfidence = 0.0f;
-    float columnPatternConfidence = 0.0f;
-    float bandingAuthority = 0.0f;
-    float chromaAuthority = 0.0f;
-    float isoAuthority = 0.0f;
-    float noRegretAcceptedTileFraction = 0.0f;
-    float noRegretRollbackFraction = 0.0f;
-    int chromaGridCols = 0;
-    int chromaGridRows = 0;
-    std::array<std::vector<float>, 4> rowProfileByChannel;
-    std::array<std::vector<float>, 4> columnProfileByChannel;
-    std::vector<float> lowFreqRGrid;
-    std::vector<float> lowFreqBGrid;
-    std::vector<float> lowFreqRConfidenceGrid;
-    std::vector<float> lowFreqBConfidenceGrid;
-    float processingTimeMs = 0.0f;
-    std::string multiscaleArchitecture = "SPECTRA_CONTEXT_FUSION_MULTISCALE_CFA_CHROMA";
-    bncam::spectra2::ChromaBandTelemetry lowBand{};
-    std::string bandEnergyStatus = "UNAVAILABLE";
-    std::string bandEnergyMethod = "UNINITIALIZED";
-    std::uint64_t bandEnergySampleCount = 0;
-    std::uint64_t bandEnergyRedSampleCount = 0;
-    std::uint64_t bandEnergyBlueSampleCount = 0;
-    float bandEnergyRedBlueSampleBalance = 0.0f;
-    float bandEnergyConfidence = 0.0f;
-    float bandEnergyMeasurementMs = 0.0f;
-
-    // Delta 24: conservative R-G / B-G redistribution of low-frequency Pass-3 authority.
-    // This affects the low-frequency chroma field only; row/column banding authority is unchanged.
-    bool splitLowOpponentAuthorityActive = false;
-    float splitLowOpponentMaximumModulation = 0.12f;
-    float lowRedAuthorityMultiplier = 1.0f;
-    float lowBlueAuthorityMultiplier = 1.0f;
-
-    // Milestone 8H-H: compact Pass-3 planning is GPU-primary when Pass 2 is resident.
-    bool plannerGpuAttempted = false;
-    bool plannerGpuUsed = false;
-    bool plannerResidentInputUsed = false;
-    bool plannerCpuFallbackUsed = false;
-    std::string plannerStatus = "NOT_RUN";
-    std::string plannerFailureReason = "none";
-    std::string plannerSamplingMethod = "NOT_RUN";
-    float plannerKernelMs = 0.0f;
-    float plannerSynchronizationMs = 0.0f;
-    float plannerReadbackMs = 0.0f;
-    float plannerTotalMs = 0.0f;
-    std::uint64_t plannerCompactBytes = 0;
-
-    // Milestone 8H-C: Pass 3 full-frame banding/low-frequency application and No-Regret blend are GPU-primary.
-    bool vulkanKernelConnected = false;
-    bool vulkanAttempted = false;
-    bool vulkanExecutionSucceeded = false;
-    bool vulkanUsedForOutput = false;
-    bool vulkanCpuFallbackUsed = false;
-    bool vulkanGpuNoRegretBlendUsed = false;
-    bool vulkanCandidateReadbackAvoided = false;
-    bool vulkanPersistentReuseHit = false;
-    bool vulkanPersistentReallocated = false;
-    std::string vulkanStatus = "NOT_RUN";
-    std::string vulkanFailureReason = "none";
-    float vulkanInputPackingMs = 0.0f;
-    float vulkanAuxiliaryUploadMs = 0.0f;
-    float vulkanPass3KernelMs = 0.0f;
-    float vulkanTileStatisticsKernelMs = 0.0f;
-    float vulkanNoRegretDecisionMs = 0.0f;
-    float vulkanNoRegretBlendMs = 0.0f;
-    float vulkanGpuKernelMs = 0.0f;
-    float vulkanSynchronizationMs = 0.0f;
-    float vulkanReadbackMs = 0.0f;
-    float vulkanTransferAndSyncMs = 0.0f;
-    float vulkanTotalMs = 0.0f;
-    std::uint64_t vulkanResidentBytes = 0;
-    std::uint64_t vulkanAllocationGeneration = 0;
-
-    std::string formatDebugString() const;
-};
-
 // Phase 13 final production RAW-JPEG entry. Pixel ownership stays in Vulkan;
 // masterRaw16 is used only for bounded compact planning and explicit CPU failsafe after GPU failure.
 struct ResidentRawRenderInput {
@@ -655,7 +563,6 @@ struct SpectraBudgetState {
     float initialResidualEnergy = 0.0f;
     float pass1ResidualEnergy = 0.0f;
     float pass2ResidualEnergy = 0.0f;
-    float pass3ResidualEnergy = 0.0f;
     float finalRemainingEnergy = 0.0f;
     float predictedChromaNoiseFloor = 0.0f;
     float initialChromaResidualEnergy = 0.0f;
@@ -664,7 +571,6 @@ struct SpectraBudgetState {
     float downstreamChromaAuthority = 1.0f;
     bool pass1SkippedBudgetReached = false;
     bool pass2SkippedBudgetReached = false;
-    bool pass3SkippedBudgetReached = false;
     float effectiveIso = 100.0f;
     float isoNoisePressure = 0.0f;
     float provenanceMeanConfidence = 0.0f;

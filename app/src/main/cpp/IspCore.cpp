@@ -4192,8 +4192,8 @@ SpectraPass0State IspCore::computePass0State(
                 : "metadata_black_authoritative_scene_scan_validator_only";
     }
 
-    // Row/column and low-frequency residual correction are handled by Pass 3,
-    // where scene structure is explicitly removed before estimating a pattern.
+    // Row/column and low-frequency classical correction ownership is retired.
+    // These flags remain false; observer-only pattern evidence must not mutate RAW pixels.
     state.applyRowCorrection = false;
     state.applyColumnCorrection = false;
     return state;
@@ -5532,67 +5532,6 @@ std::string SpectraPass2State::formatDebugString() const {
     return out.str();
 }
 
-std::string SpectraPass3State::formatDebugString() const {
-    std::ostringstream out;
-    out << std::fixed << std::setprecision(4);
-    out << "spectraPass3={"
-        << "mode=" << (physicalBaselineMode ? "physical_single_frame" : (spectraMode == 1 ? "auto" : (spectraMode == 2 ? "manual" : "legacy")))
-        << ";authoritySource=" << authoritySource
-        << ";applied=" << (applied ? "true" : "false")
-        << ";rowBanding=" << (applyRowBanding ? "true" : "false")
-        << ";colBanding=" << (applyColBanding ? "true" : "false")
-        << ";lowFreqChroma=" << (applyLowFreqChroma ? "true" : "false")
-        << ";rowEnergyBefore=" << rowPatternEnergyBefore
-        << ";rowEnergyAfter=" << rowPatternEnergyAfter
-        << ";colEnergyBefore=" << colPatternEnergyBefore
-        << ";colEnergyAfter=" << colPatternEnergyAfter
-        << ";maxLowFreqChromaShift=" << maxLowFreqChromaShift
-        << ";rowConfidence=" << rowPatternConfidence
-        << ";colConfidence=" << columnPatternConfidence
-        << ";bandingAuthority=" << bandingAuthority
-        << ";chromaAuthority=" << chromaAuthority
-        << ";isoAuthority=" << isoAuthority
-        << ";noRegretAcceptedTiles=" << noRegretAcceptedTileFraction
-        << ";noRegretRollback=" << noRegretRollbackFraction
-        << ";lowFreqConfidence=" << lowFreqChromaConfidence
-        << ";fallbackReason=" << fallbackReason
-        << ";processingTimeMs=" << processingTimeMs
-        << ";multiscaleArchitecture=" << multiscaleArchitecture
-        << ";lowPlan=" << lowBand.plan.status
-        << ";splitLowOpponentAuthorityActive=" << (splitLowOpponentAuthorityActive ? "true" : "false")
-        << ";splitLowOpponentMaxModulation=" << splitLowOpponentMaximumModulation
-        << ";lowRedAuthorityMultiplier=" << lowRedAuthorityMultiplier
-        << ";lowBlueAuthorityMultiplier=" << lowBlueAuthorityMultiplier
-        << ";plannerGpuAttempted=" << (plannerGpuAttempted ? "true" : "false")
-        << ";plannerGpuUsed=" << (plannerGpuUsed ? "true" : "false")
-        << ";plannerResidentInputUsed=" << (plannerResidentInputUsed ? "true" : "false")
-        << ";plannerCpuFallbackUsed=" << (plannerCpuFallbackUsed ? "true" : "false")
-        << ";plannerStatus=" << plannerStatus
-        << ";plannerFailureReason=" << plannerFailureReason
-        << ";plannerSamplingMethod=" << plannerSamplingMethod
-        << ";plannerKernelMs=" << plannerKernelMs
-        << ";plannerSynchronizationMs=" << plannerSynchronizationMs
-        << ";plannerReadbackMs=" << plannerReadbackMs
-        << ";plannerTotalMs=" << plannerTotalMs
-        << ";plannerCompactBytes=" << plannerCompactBytes
-        << ";vulkanKernelConnected=" << (vulkanKernelConnected ? "true" : "false")
-        << ";vulkanAttempted=" << (vulkanAttempted ? "true" : "false")
-        << ";vulkanExecutionSucceeded=" << (vulkanExecutionSucceeded ? "true" : "false")
-        << ";vulkanUsedForOutput=" << (vulkanUsedForOutput ? "true" : "false")
-        << ";vulkanCpuFallbackUsed=" << (vulkanCpuFallbackUsed ? "true" : "false")
-        << ";vulkanGpuNoRegretBlendUsed=" << (vulkanGpuNoRegretBlendUsed ? "true" : "false")
-        << ";vulkanCandidateReadbackAvoided=" << (vulkanCandidateReadbackAvoided ? "true" : "false")
-        << ";vulkanStatus=" << vulkanStatus
-        << ";vulkanFailureReason=" << vulkanFailureReason
-        << ";vulkanPass3KernelMs=" << vulkanPass3KernelMs
-        << ";vulkanGpuKernelMs=" << vulkanGpuKernelMs
-        << ";vulkanTransferAndSyncMs=" << vulkanTransferAndSyncMs
-        << ";vulkanTotalMs=" << vulkanTotalMs
-        << ";vulkanResidentBytes=" << vulkanResidentBytes
-        << "}";
-    return out.str();
-}
-
 
 
 bncam::spectra2::ChromaBandEnergySnapshot measureSpectraChromaBandEnergies(
@@ -6067,7 +6006,6 @@ std::string SpectraBudgetState::formatDebugString() const {
         << ";initialEnergy=" << initialResidualEnergy
         << ";pass1Energy=" << pass1ResidualEnergy
         << ";pass2Energy=" << pass2ResidualEnergy
-        << ";pass3Energy=" << pass3ResidualEnergy
         << ";finalRemaining=" << finalRemainingEnergy
         << ";chromaTargetFloor=" << predictedChromaNoiseFloor
         << ";initialChromaEnergy=" << initialChromaResidualEnergy
@@ -6076,7 +6014,6 @@ std::string SpectraBudgetState::formatDebugString() const {
         << ";downstreamChromaAuthority=" << downstreamChromaAuthority
         << ";p1Skip=" << (pass1SkippedBudgetReached ? "true" : "false")
         << ";p2Skip=" << (pass2SkippedBudgetReached ? "true" : "false")
-        << ";p3Skip=" << (pass3SkippedBudgetReached ? "true" : "false")
         << ";effectiveIso=" << effectiveIso
         << ";isoRegime=" << isoRegime
         << ";isoNoisePressure=" << isoNoisePressure
@@ -6220,7 +6157,6 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     SpectraIsoAdaptiveState preDemosaicAuthorityState = isoState;
     // Phase N006A: SPECTRA Core is measurement/conditioning only. The classical RAW
     // Pass 0/1/2/3 pixel owner is retired for every user mode; neural ownership is added later.
-    constexpr bool legacySpectraRawPixelAuthorityEnabled = false;
     preDemosaicAuthorityState.lumaAuthority = 0.0f;
     preDemosaicAuthorityState.chromaAuthority = 0.0f;
     preDemosaicAuthorityState.lowFrequencyAuthority = 0.0f;
@@ -6478,7 +6414,6 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     pass1NoRegret.passIndex = 1;
     SpectraProvenanceField pass1BeforeField{};
     SpectraProvenanceField pass2BeforeField{};
-    SpectraProvenanceField pass3BeforeField{};
     // N006D: no legacy Pass-1 resident generation and no classical CPU fallback remain.
     pass1State.processingTimeMs = elapsedMs(pass1Start);
 
@@ -6648,7 +6583,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
 
     // N006D: retired Pass1/2 cannot create a resident post-Pass2 generation. Reuse the
     // read-only observations from the identical pre-demosaic image instead of invoking the old
-    // Pass3 planner or rescanning an unchanged full frame.
+    // low-band observer or rescanning an unchanged full frame.
     bncam::spectra2::ChromaBandEnergySnapshot postPass2ChromaBands = initialChromaBands;
     spectraPerformance.postPass2Statistics = spectraPerformance.postPass1Statistics;
     budgetState.pass2ResidualEnergy = spectraPerformance.postPass2Statistics.residualEnergy;
@@ -6656,17 +6591,19 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             spectraPerformance.postPass2Statistics.chromaResidualEnergy;
 
 
-    const auto pass3Start = IspClock::now();
-    bncam::NativeStageHeartbeat::instance().update(workingMeta.captureAttemptId, "SPECTRA_PASS3");
-    const float postPass2BandMeasurementMs = 0.0f; // identity observation reused from Pass 2
-    // Resident success uses only compact GPU observation; the full RAW mosaic remains
-    // opaque until RAW-finalize/demosaic or an explicit failure-recovery boundary.
+    const auto lowBandObserverStart = IspClock::now();
+    bncam::NativeStageHeartbeat::instance().update(
+            workingMeta.captureAttemptId, "SPECTRA_CFA_LOW_BAND_OBSERVER");
+    // N006N: Pass-3 correction ownership is gone. Reuse the unchanged pre-demosaic CFA
+    // measurement and retain only compact low-band evidence for demosaic/neural conditioning.
+    // This path has no RAW pixel authority and performs no correction.
+    const float postPass2BandMeasurementMs = 0.0f;
     pass2State.fineBand.outputEnergy = postPass2ChromaBands.fineEnergy;
-    pass2State.fineBand.outputStage = "POST_PASS2_COMBINED_NO_REGRET";
+    pass2State.fineBand.outputStage = "PASS2_RETIRED_IDENTITY_OBSERVATION";
     pass2State.fineBand.reductionPercentage = bncam::spectra2::reductionPercentage(
             pass2State.fineBand.plan.inputEnergy, pass2State.fineBand.outputEnergy);
     pass2State.midBand.outputEnergy = postPass2ChromaBands.midEnergy;
-    pass2State.midBand.outputStage = "POST_PASS2_COMBINED_NO_REGRET";
+    pass2State.midBand.outputStage = "PASS2_RETIRED_IDENTITY_OBSERVATION";
     pass2State.midBand.reductionPercentage = bncam::spectra2::reductionPercentage(
             pass2State.midBand.plan.inputEnergy,
             pass2State.midBand.outputEnergy
@@ -6675,12 +6612,12 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             postPass2ChromaBands,
             budgetState.predictedChromaNoiseFloor
     );
-    const float pass3EffectiveLowFreqStrength = std::clamp(
+    const float lowBandConfiguredStrength = std::clamp(
             uiConfig.profileSpectraStrength * 0.50f +
                     uiConfig.profileSpectraLowFrequency * 0.85f,
             -1.0f, 1.50f
     );
-    const float pass3LowFrequencyAuthority = isoState.lowFrequencyAuthority;
+    const float lowBandIsoAuthority = isoState.lowFrequencyAuthority;
     const bncam::spectra2::ChromaBandPlan lowBandPlan =
             bncam::spectra2::resolveChromaBandPlan(
                     bncam::spectra2::ChromaBandKind::Low,
@@ -6691,92 +6628,13 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                             std::clamp(workingMeta.calibration.signalModelConfidence, 0.0f, 1.0f),
                             postPass2ChromaBands.confidence
                     ),
-                    pass3LowFrequencyAuthority,
-                    pass3EffectiveLowFreqStrength,
+                    lowBandIsoAuthority,
+                    lowBandConfiguredStrength,
                     lowDirectionalEvidence
             );
-    SpectraPass3State pass3State{};
-    pass3State.spectraMode = budgetState.spectraMode;
-    pass3State.applied = false;
-    pass3State.applyRowBanding = false;
-    pass3State.applyColBanding = false;
-    pass3State.applyLowFreqChroma = false;
-    pass3State.fallbackReason = budgetState.spectraMode == 0
-            ? "spectra_off_measurement_only"
-            : "legacy_raw_pixel_authority_retired_neural_pending";
-    pass3State.lowBand.plan = lowBandPlan;
-    pass3State.bandEnergyMeasurementMs = postPass2BandMeasurementMs;
-    pass3State.bandEnergyStatus = postPass2ChromaBands.status;
-    pass3State.bandEnergyMethod = postPass2ChromaBands.method;
-    pass3State.bandEnergySampleCount = postPass2ChromaBands.sampleCount;
-    pass3State.bandEnergyRedSampleCount = postPass2ChromaBands.redSampleCount;
-    pass3State.bandEnergyBlueSampleCount = postPass2ChromaBands.blueSampleCount;
-    pass3State.bandEnergyRedBlueSampleBalance = postPass2ChromaBands.redBlueSampleBalance;
-    pass3State.bandEnergyConfidence = postPass2ChromaBands.confidence;
+    const float lowBandObserverMs = elapsedMs(lowBandObserverStart);
 
-    // Delta 24: reuse the measured post-Pass2 low-band split and Pass-3 spatial confidence to
-    // redistribute a small amount of low-frequency chroma authority between R-G and B-G.
-    // The low-band enable decision and maximum correction scale remain unchanged.
-    if (legacySpectraRawPixelAuthorityEnabled &&
-        pass3State.lowBand.plan.enabled && pass3State.applyLowFreqChroma) {
-        const float lowCommonOpponentSupport = std::sqrt(std::max(
-                0.0f,
-                bncam::spectra2::cfaFiniteUnit(
-                        static_cast<float>(workingMeta.calibration.signalModelConfidence)) *
-                        bncam::spectra2::cfaFiniteUnit(postPass2ChromaBands.confidence) *
-                        bncam::spectra2::cfaFiniteUnit(postPass2ChromaBands.redBlueSampleBalance)
-        ));
-        const float redLowPressure = bncam::spectra2::splitResidualPressure(
-                pass3State.lowBand.plan.requiredReductionFraction,
-                postPass2ChromaBands.redLowEnergy,
-                postPass2ChromaBands.blueLowEnergy
-        );
-        const float blueLowPressure = bncam::spectra2::splitResidualPressure(
-                pass3State.lowBand.plan.requiredReductionFraction,
-                postPass2ChromaBands.blueLowEnergy,
-                postPass2ChromaBands.redLowEnergy
-        );
-        const float spatialSupport = bncam::spectra2::cfaFiniteUnit(
-                pass3State.lowFreqChromaConfidence);
-        const auto lowAuthorityPair = bncam::spectra2::resolveOpponentAuthorityPair(
-                bncam::spectra2::applyChannelShadingRiskToEvidence(
-                        lowCommonOpponentSupport * redLowPressure * spatialSupport,
-                        channelShadingRisk.redMultiplier),
-                bncam::spectra2::applyChannelShadingRiskToEvidence(
-                        lowCommonOpponentSupport * blueLowPressure * spatialSupport,
-                        channelShadingRisk.blueMultiplier),
-                pass3State.splitLowOpponentMaximumModulation
-        );
-        pass3State.lowRedAuthorityMultiplier = lowAuthorityPair.redMultiplier;
-        pass3State.lowBlueAuthorityMultiplier = lowAuthorityPair.blueMultiplier;
-        pass3State.splitLowOpponentAuthorityActive = lowAuthorityPair.active;
-    }
-
-    SpectraNoRegretResult pass3NoRegret{};
-    pass3NoRegret.passIndex = 3;
-    // Pass 3 owns coherent low-frequency and row/column confidence gates. Its
-    // candidate still has to pass the same tile-local no-regret contract.
-    // N006D: Pass-3 classical low-frequency/banding owner is physically absent.
-    if (budgetState.spectraMode != 0) {
-        pass3State.lowBand.outputEnergy = pass3State.lowBand.plan.inputEnergy;
-        pass3State.lowBand.outputStage = "LEGACY_PASS3_RETIRED_IDENTITY";
-    } else {
-        pass3State.lowBand.outputStage = "SPECTRA_OFF_NOT_MEASURED";
-    }
-    pass3State.lowBand.reductionPercentage = bncam::spectra2::reductionPercentage(
-            pass3State.lowBand.plan.inputEnergy,
-            pass3State.lowBand.outputEnergy
-    );
-    if (!pass3State.lowBand.applied && pass3State.lowBand.resultStatus == "NOT_RUN") {
-        pass3State.lowBand.resultStatus = pass3State.lowBand.plan.enabled
-                ? "CANDIDATE_NOT_APPLIED"
-                : "SKIPPED_BY_M3B_BUDGET";
-    }
-    pass3State.processingTimeMs = elapsedMs(pass3Start);
-    // N006A identity accounting: none of the retired passes changed RAW pixels. Reusing the
-    // pre-pass residual is both exact for this ownership edge and avoids materializing resident RAW.
-    budgetState.pass3ResidualEnergy = budgetState.initialResidualEnergy;
-    budgetState.finalRemainingEnergy = budgetState.pass3ResidualEnergy;
+    budgetState.finalRemainingEnergy = budgetState.initialResidualEnergy;
     const auto finalProvenanceStart = IspClock::now();
     const SpectraProvenanceField finalProvenance = captureProvenance;
     const bool physicalSpatialNoiseShapeInstalled = installPhysicalSpatialNoiseShape(
@@ -6791,8 +6649,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     for (const SpectraNoRegretResult* passResult : {
             &pass0NoRegret,
             &pass1NoRegret,
-            &pass2NoRegret,
-            &pass3NoRegret
+            &pass2NoRegret
     }) {
         if (passResult->evaluatedTiles <= 0) continue;
         noRegretAcceptanceSum += passResult->meanAcceptance;
@@ -6825,13 +6682,8 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                 budgetState.predictedChromaNoiseFloor
         );
     }
-    budgetState.applied = legacySpectraRawPixelAuthorityEnabled && (
-            pass0State.applyChannelBias ||
-            pass0State.applyRowCorrection ||
-            pass0State.applyColumnCorrection ||
-            pass1State.applied ||
-            pass2State.applied ||
-            pass3State.applied);
+    // N006N: all retired classical RAW SPECTRA pixel owners are physically absent.
+    budgetState.applied = false;
 
     // Delta 20: consolidate already-existing CFA chroma evidence into one immutable contract.
     // No additional scan and no pixel authority is introduced here. Red/blue are intentionally
@@ -6847,8 +6699,8 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                     initialChromaBands,
                     pass2State.fineBand.plan,
                     pass2State.midBand.plan,
-                    pass3State.lowBand.plan,
-                    pass3State.lowFreqChromaConfidence,
+                    lowBandPlan,
+                    0.0f, // retired Pass-3 spatial correction confidence: no pixel authority
                     pass1State.anisotropicDetail.confidenceP50,
                     pass1State.edgeProtectedFraction,
                     pass0State.greenSplitTileConsensus,
@@ -7010,14 +6862,12 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     );
     residualNoiseState.lowFrequencyBudget = std::max(
             0.0f,
-            budgetState.pass3ResidualEnergy - budgetState.predictedNoiseFloor
+            budgetState.finalRemainingEnergy - budgetState.predictedNoiseFloor
     );
-    residualNoiseState.directionalPatternEnergy = 0.5f * (
-            std::max(0.0f, pass3State.rowPatternEnergyAfter) +
-            std::max(0.0f, pass3State.colPatternEnergyAfter)
-    );
-    residualNoiseState.rowPatternEnergy = std::max(0.0f, pass3State.rowPatternEnergyAfter);
-    residualNoiseState.columnPatternEnergy = std::max(0.0f, pass3State.colPatternEnergyAfter);
+    // Retired Pass-3 correction state no longer fabricates post-correction row/column energy.
+    residualNoiseState.directionalPatternEnergy = 0.0f;
+    residualNoiseState.rowPatternEnergy = 0.0f;
+    residualNoiseState.columnPatternEnergy = 0.0f;
     residualNoiseState.modelConfidence = static_cast<float>(
             residualNoiseState.preDemosaic.confidence);
     residualNoiseState.pass2VisibleTargetReady = pass2VisibleTargetReady;
@@ -9766,7 +9616,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     });
     const float spectraAccountedMs = captureProvenanceMs + finalProvenanceMs +
             pass0State.processingTimeMs + pass1State.processingTimeMs +
-            pass2State.processingTimeMs + pass3State.processingTimeMs;
+            pass2State.processingTimeMs + lowBandObserverMs;
     const float spectraUnattributedMs = std::max(0.0f, spectraProcessingMs - spectraAccountedMs);
     const float spectraPropagationMathMs = residualNoiseState.demosaicPropagationMs +
             residualNoiseState.awbPropagationMs +
@@ -9808,8 +9658,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             ((residentEntry && !residentCpuFallbackUsed) ? 0 : 1) +
             (pass0NoRegret.evaluatedTiles > 0 ? 1 : 0) +
             (pass1NoRegret.evaluatedTiles > 0 ? 1 : 0) +
-            (pass2NoRegret.evaluatedTiles > 0 ? 1 : 0) +
-            (pass3NoRegret.evaluatedTiles > 0 ? 1 : 0);
+            (pass2NoRegret.evaluatedTiles > 0 ? 1 : 0);
     const std::uint64_t spectraStatisticsBytesRead =
             spectraPerformance.initialStatistics.estimatedBytesRead +
             spectraPerformance.postPass1Statistics.estimatedBytesRead +
@@ -9848,7 +9697,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             totalRawIspCoreMs,
             spectraPerformance.totalStatisticsMs,
             pass0State.processingTimeMs + pass1State.processingTimeMs +
-                    pass2State.processingTimeMs + pass3State.processingTimeMs,
+                    pass2State.processingTimeMs + lowBandObserverMs,
             0.0f,
             residualNoiseState.measuredPreSharpenResidualMs +
                     residualNoiseState.downstreamSharpenPropagationMs +
@@ -10282,12 +10131,10 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; " << pass0State.formatDebugString()
             << "; " << pass1State.formatDebugString()
             << "; " << pass2State.formatDebugString()
-            << "; " << pass3State.formatDebugString()
             << formatCfaChromaConfidenceFields(cfaChromaConfidence)
             << "; " << pass0NoRegret.formatDebugString()
             << "; " << pass1NoRegret.formatDebugString()
             << "; " << pass2NoRegret.formatDebugString()
-            << "; " << pass3NoRegret.formatDebugString()
             << "; " << budgetState.formatDebugString()
             << "; " << residualNoiseState.formatDebugString()
             << "; " << downstreamIspState.formatDebugString()
@@ -10562,38 +10409,15 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; spectraPass2VulkanTotalMs=" << pass2State.vulkanTotalMs
             << "; spectraPass2VulkanResidentBytes=" << pass2State.vulkanResidentBytes
             << "; spectraPass2VulkanAllocationGeneration=" << pass2State.vulkanAllocationGeneration
-            << "; spectraPass3Applied=" << (pass3State.applied ? "true" : "false")
-            << "; spectraPass3SkipReason=" << pass3State.fallbackReason
-            << "; spectraPass3InputEnergy=" << budgetState.pass2ResidualEnergy
-            << "; spectraPass3TargetFloor=" << budgetState.predictedNoiseFloor
-            << "; spectraPass3OutputEnergy=" << budgetState.pass3ResidualEnergy
-            << "; spectraPass3ReductionPercentage=" << reductionPct(budgetState.pass2ResidualEnergy, budgetState.pass3ResidualEnergy)
-            << "; spectraPass3MaximumCorrection=" << pass3State.maxLowFreqChromaShift
-            << "; spectraPass3ProcessingTimeMs=" << pass3State.processingTimeMs
-            << "; spectraPass3VulkanKernelConnected=" << (pass3State.vulkanKernelConnected ? "true" : "false")
-            << "; spectraPass3VulkanAttempted=" << (pass3State.vulkanAttempted ? "true" : "false")
-            << "; spectraPass3VulkanExecutionSucceeded=" << (pass3State.vulkanExecutionSucceeded ? "true" : "false")
-            << "; spectraPass3VulkanUsedForOutput=" << (pass3State.vulkanUsedForOutput ? "true" : "false")
-            << "; spectraPass3VulkanCpuFallbackUsed=" << (pass3State.vulkanCpuFallbackUsed ? "true" : "false")
-            << "; spectraPass3VulkanGpuNoRegretBlendUsed=" << (pass3State.vulkanGpuNoRegretBlendUsed ? "true" : "false")
-            << "; spectraPass3VulkanCandidateReadbackAvoided=" << (pass3State.vulkanCandidateReadbackAvoided ? "true" : "false")
-            << "; spectraPass3VulkanPersistentReuseHit=" << (pass3State.vulkanPersistentReuseHit ? "true" : "false")
-            << "; spectraPass3VulkanPersistentReallocated=" << (pass3State.vulkanPersistentReallocated ? "true" : "false")
-            << "; spectraPass3VulkanStatus=" << pass3State.vulkanStatus
-            << "; spectraPass3VulkanFailureReason=" << pass3State.vulkanFailureReason
-            << "; spectraPass3VulkanInputPackingMs=" << pass3State.vulkanInputPackingMs
-            << "; spectraPass3VulkanAuxiliaryUploadMs=" << pass3State.vulkanAuxiliaryUploadMs
-            << "; spectraPass3VulkanPass3KernelMs=" << pass3State.vulkanPass3KernelMs
-            << "; spectraPass3VulkanTileStatisticsKernelMs=" << pass3State.vulkanTileStatisticsKernelMs
-            << "; spectraPass3VulkanNoRegretDecisionMs=" << pass3State.vulkanNoRegretDecisionMs
-            << "; spectraPass3VulkanNoRegretBlendMs=" << pass3State.vulkanNoRegretBlendMs
-            << "; spectraPass3VulkanGpuKernelMs=" << pass3State.vulkanGpuKernelMs
-            << "; spectraPass3VulkanSynchronizationMs=" << pass3State.vulkanSynchronizationMs
-            << "; spectraPass3VulkanReadbackMs=" << pass3State.vulkanReadbackMs
-            << "; spectraPass3VulkanTransferAndSyncMs=" << pass3State.vulkanTransferAndSyncMs
-            << "; spectraPass3VulkanTotalMs=" << pass3State.vulkanTotalMs
-            << "; spectraPass3VulkanResidentBytes=" << pass3State.vulkanResidentBytes
-            << "; spectraPass3VulkanAllocationGeneration=" << pass3State.vulkanAllocationGeneration
+            << "; spectraCfaLowBandObserverStatus=" << lowBandPlan.status
+            << "; spectraCfaLowBandObserverInputEnergy=" << lowBandPlan.inputEnergy
+            << "; spectraCfaLowBandObserverTargetFloor=" << lowBandPlan.targetFloor
+            << "; spectraCfaLowBandObserverExcessEnergy=" << lowBandPlan.excessEnergy
+            << "; spectraCfaLowBandObserverResidualPressure=" << lowBandPlan.requiredReductionFraction
+            << "; spectraCfaLowBandObserverModelConfidence=" << lowBandPlan.modelConfidence
+            << "; spectraCfaLowBandObserverDirectionalEvidence=" << lowBandPlan.evidence
+            << "; spectraCfaLowBandObserverMeasurementReused=true"
+            << "; spectraCfaLowBandObserverProcessingTimeMs=" << lowBandObserverMs
             << "; spectraChromaBandsArchitecture=" << pass2State.multiscaleArchitecture
             << "; spectraChromaBandEnergyMethod=" << pass2State.bandEnergyMethod
             << "; spectraChromaBandEnergyInputStatus=" << pass2State.bandEnergyStatus
@@ -10609,22 +10433,21 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; spectraChromaBandEnergyInputBlueMid=" << initialChromaBands.blueMidEnergy
             << "; spectraChromaBandEnergyInputBlueLow=" << initialChromaBands.blueLowEnergy
             << "; spectraChromaBandEnergyInputMeasurementMs=" << pass2State.bandEnergyMeasurementMs
-            << "; spectraChromaBandEnergyPostPass2Status=" << pass3State.bandEnergyStatus
-            << "; spectraChromaBandEnergyPostPass2SampleCount=" << pass3State.bandEnergySampleCount
-            << "; spectraChromaBandEnergyPostPass2RedSampleCount=" << pass3State.bandEnergyRedSampleCount
-            << "; spectraChromaBandEnergyPostPass2BlueSampleCount=" << pass3State.bandEnergyBlueSampleCount
-            << "; spectraChromaBandEnergyPostPass2RedBlueSampleBalance=" << pass3State.bandEnergyRedBlueSampleBalance
-            << "; spectraChromaBandEnergyPostPass2Confidence=" << pass3State.bandEnergyConfidence
+            << "; spectraChromaBandEnergyPostPass2Status=" << postPass2ChromaBands.status
+            << "; spectraChromaBandEnergyPostPass2SampleCount=" << postPass2ChromaBands.sampleCount
+            << "; spectraChromaBandEnergyPostPass2RedSampleCount=" << postPass2ChromaBands.redSampleCount
+            << "; spectraChromaBandEnergyPostPass2BlueSampleCount=" << postPass2ChromaBands.blueSampleCount
+            << "; spectraChromaBandEnergyPostPass2RedBlueSampleBalance=" << postPass2ChromaBands.redBlueSampleBalance
+            << "; spectraChromaBandEnergyPostPass2Confidence=" << postPass2ChromaBands.confidence
             << "; spectraChromaBandEnergyPostPass2RedFine=" << postPass2ChromaBands.redFineEnergy
             << "; spectraChromaBandEnergyPostPass2RedMid=" << postPass2ChromaBands.redMidEnergy
             << "; spectraChromaBandEnergyPostPass2RedLow=" << postPass2ChromaBands.redLowEnergy
             << "; spectraChromaBandEnergyPostPass2BlueFine=" << postPass2ChromaBands.blueFineEnergy
             << "; spectraChromaBandEnergyPostPass2BlueMid=" << postPass2ChromaBands.blueMidEnergy
             << "; spectraChromaBandEnergyPostPass2BlueLow=" << postPass2ChromaBands.blueLowEnergy
-            << "; spectraChromaBandEnergyPostPass2MeasurementMs=" << pass3State.bandEnergyMeasurementMs
+            << "; spectraChromaBandEnergyPostPass2MeasurementMs=" << postPass2BandMeasurementMs
             << formatChromaBandFields("spectraChromaFine", pass2State.fineBand)
             << formatChromaBandFields("spectraChromaMid", pass2State.midBand)
-            << formatChromaBandFields("spectraChromaLow", pass3State.lowBand)
             << "; spectraNoRegretP0TotalTiles=" << pass0NoRegret.totalTiles
             << "; spectraNoRegretP0EvaluatedTiles=" << pass0NoRegret.evaluatedTiles
             << "; spectraNoRegretP0InvalidTiles=" << pass0NoRegret.invalidTiles
@@ -10682,25 +10505,6 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; spectraNoRegretP2MaxColourShift=" << pass2NoRegret.maxColourShift
             << "; spectraNoRegretP2EdgePreservationScore=" << pass2NoRegret.edgePreservationScore
             << "; spectraNoRegretP2OversmoothingScore=" << pass2NoRegret.oversmoothingScore
-            << "; spectraNoRegretP3TotalTiles=" << pass3NoRegret.totalTiles
-            << "; spectraNoRegretP3EvaluatedTiles=" << pass3NoRegret.evaluatedTiles
-            << "; spectraNoRegretP3InvalidTiles=" << pass3NoRegret.invalidTiles
-            << "; spectraNoRegretP3FullyAcceptedTiles=" << pass3NoRegret.acceptedTiles
-            << "; spectraNoRegretP3PartiallyAcceptedTiles=" << pass3NoRegret.partiallyAcceptedTiles
-            << "; spectraNoRegretP3RejectedTiles=" << pass3NoRegret.rejectedTiles
-            << "; spectraNoRegretP3RejectedOversmooth=" << pass3NoRegret.rejectedOversmooth
-            << "; spectraNoRegretP3RejectedDetailLoss=" << pass3NoRegret.rejectedDetailLoss
-            << "; spectraNoRegretP3RejectedMeanDrift=" << pass3NoRegret.rejectedMeanDrift
-            << "; spectraNoRegretP3RejectedNoImprovement=" << pass3NoRegret.rejectedNoImprovement
-            << "; spectraNoRegretP3MeanAcceptance=" << pass3NoRegret.meanAcceptance
-            << "; spectraNoRegretP3AcceptanceP10=" << pass3NoRegret.acceptanceP10
-            << "; spectraNoRegretP3AcceptanceP50=" << pass3NoRegret.acceptanceP50
-            << "; spectraNoRegretP3AcceptanceP90=" << pass3NoRegret.acceptanceP90
-            << "; spectraNoRegretP3AttenuatedPixelFraction=" << pass3NoRegret.attenuatedPixelFraction
-            << "; spectraNoRegretP3MeanColourShift=" << pass3NoRegret.meanColourShift
-            << "; spectraNoRegretP3MaxColourShift=" << pass3NoRegret.maxColourShift
-            << "; spectraNoRegretP3EdgePreservationScore=" << pass3NoRegret.edgePreservationScore
-            << "; spectraNoRegretP3OversmoothingScore=" << pass3NoRegret.oversmoothingScore
             << "; spectraResidualDomain=" << residualNoiseState.domain
             << "; spectraResidualValueStage=" << residualNoiseState.valueStage
             << "; spectraResidualLastObservedStage=" << residualNoiseState.lastObservedStage
@@ -10791,7 +10595,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << residualNoiseState.measuredPostDemosaic.acceptedSampleCount
             << "; spectraDemosaicPreFineChromaEnergy=" << pass2State.fineBand.outputEnergy
             << "; spectraDemosaicPreMidChromaEnergy=" << pass2State.midBand.outputEnergy
-            << "; spectraDemosaicPreLowChromaEnergy=" << pass3State.lowBand.outputEnergy
+            << "; spectraDemosaicPreLowChromaEnergy=" << postPass2ChromaBands.lowEnergy
             << "; spectraPreWbChromaCleanupPlanReady="
             << (preWbChromaCleanupPlanReady ? "true" : "false")
             << "; spectraPreWbMeasuredToPredictedRmsRatioRG="
@@ -11347,9 +11151,9 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << (isRawSensor ? meta.rawSensorToMasterRaw16Ms : 0.0f)
             << "; raw10SharedRawBayerIspMs=" << (isRaw10 ? totalRawIspCoreMs : 0.0f)
             << "; rawSensorSharedRawBayerIspMs=" << (isRawSensor ? totalRawIspCoreMs : 0.0f)
-            << "; spectraPerformanceMilestone=M8H_K_GPU_RESIDENT_TONE_TO_SPATIAL_VISIBLE_CHROMA_HANDOFF"
+            << "; spectraPerformanceMilestone=N006N_READ_ONLY_CFA_LOW_BAND_OBSERVER"
             << "; spectraPerformancePrevious=M8H_J_GPU_RESIDENT_POST_CCM_SCENE_HIGHLIGHT_TONE_VIBRANCE_PROFILE_COLOR"
-            << "; spectraPerformanceBase=M8H_EF_GPU_PRIMARY_TEMPORAL_PASS1_PASS2_PASS3_DEMOSAIC_AWB_CCM_POST_DEMOSAIC"
+            << "; spectraPerformanceBase=N006N_SPECTRA_CORE_OBSERVATION_RAW_FINALIZE_DEMOSAIC_AWB_CCM_TONE"
             << "; spectraPerformanceEfContract=M8H_EF_GPU_PRIMARY_RAW_FINALIZE_DEMOSAIC_AWB_CCM_POST_DEMOSAIC"
             << "; spectraPerformanceHContract=N006D_READ_ONLY_NOISE_MAP_RAW_FINALIZE_DEMOSAIC_AWB_CCM"
             << "; spectraPerformanceIContract=N006D_TEMPORAL_OBSERVER_RAW_FINALIZE_DEMOSAIC_AWB_CCM"
@@ -11358,8 +11162,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << (pass1State.vulkanUsedForOutput ? "true" : "false")
             << "; spectraPass2GpuPrimary="
             << (pass2State.vulkanUsedForOutput ? "true" : "false")
-            << "; spectraPass3GpuPrimary="
-            << (pass3State.vulkanUsedForOutput ? "true" : "false")
+            << "; spectraCfaLowBandObserverPixelAuthority=false"
             << "; spectraDemosaicGpuPrimary="
             << (vulkanDemosaicResident ? "true" : "false")
             << "; spectraAwbCcmGpuPrimary="
