@@ -1,0 +1,25 @@
+#version 450
+
+// C4 activations use two uint words per logical vec4. Values are FP16 in memory
+// but arithmetic is FP32 for deterministic, portable accumulation.
+vec4 loadC4(const uint words[], uint vecIndex) {
+    uint i = vecIndex * 2u;
+    return vec4(unpackHalf2x16(words[i]), unpackHalf2x16(words[i+1u]));
+}
+void storeC4(inout uint words[], uint vecIndex, vec4 v) {
+    uint i = vecIndex * 2u;
+    words[i] = packHalf2x16(v.xy);
+    words[i+1u] = packHalf2x16(v.zw);
+}
+float loadHalf(const uint words[], uint halfIndex) {
+    vec2 p = unpackHalf2x16(words[halfIndex >> 1u]);
+    return ((halfIndex & 1u) == 0u) ? p.x : p.y;
+}
+
+layout(local_size_x=64,local_size_y=1,local_size_z=1) in;
+layout(set=0,binding=0,std430) readonly buffer Global { float c[]; } globalC;
+layout(set=0,binding=1,std430) readonly buffer Weights { uint data[]; } wt;
+layout(set=0,binding=2,std430) readonly buffer Bias { uint data[]; } bs;
+layout(set=0,binding=3,std430) writeonly buffer Params { uint data[]; } outP;
+layout(push_constant) uniform PC { uint outC;uint inC;uint weightHalfBase;uint biasC4Base;uint globalFloatBase; } pc;
+void main(){uint og=gl_GlobalInvocationID.x;if(og>=(pc.outC+3u)/4u)return;uint inGroups=(pc.inC+3u)/4u;vec4 a=loadC4(bs.data,pc.biasC4Base+og);for(uint ig=0u;ig<inGroups;++ig){vec4 v=vec4(0);for(uint j=0u;j<4u;++j){uint c=ig*4u+j;if(c<pc.inC)v[j]=globalC.c[pc.globalFloatBase+c];}uint block=(og*inGroups+ig)*16u;for(uint o=0u;o<4u;++o){vec4 w=vec4(loadHalf(wt.data,pc.weightHalfBase+block+o*4u),loadHalf(wt.data,pc.weightHalfBase+block+o*4u+1u),loadHalf(wt.data,pc.weightHalfBase+block+o*4u+2u),loadHalf(wt.data,pc.weightHalfBase+block+o*4u+3u));a[o]+=dot(v,w);}}storeC4(outP.data,og,a);}

@@ -1,0 +1,24 @@
+#version 450
+
+// C4 activations use two uint words per logical vec4. Values are FP16 in memory
+// but arithmetic is FP32 for deterministic, portable accumulation.
+vec4 loadC4(const uint words[], uint vecIndex) {
+    uint i = vecIndex * 2u;
+    return vec4(unpackHalf2x16(words[i]), unpackHalf2x16(words[i+1u]));
+}
+void storeC4(inout uint words[], uint vecIndex, vec4 v) {
+    uint i = vecIndex * 2u;
+    words[i] = packHalf2x16(v.xy);
+    words[i+1u] = packHalf2x16(v.zw);
+}
+float loadHalf(const uint words[], uint halfIndex) {
+    vec2 p = unpackHalf2x16(words[halfIndex >> 1u]);
+    return ((halfIndex & 1u) == 0u) ? p.x : p.y;
+}
+
+layout(local_size_x=8,local_size_y=8,local_size_z=1) in;
+layout(set=0,binding=0,std430) readonly buffer Input { uint data[]; } src;
+layout(set=0,binding=1,std430) readonly buffer Params { uint data[]; } prm;
+layout(set=0,binding=2,std430) writeonly buffer Output { uint data[]; } dst;
+layout(push_constant) uniform PC { uint width;uint height;uint channels; } pc;
+void main(){uint x=gl_GlobalInvocationID.x,y=gl_GlobalInvocationID.y,g=gl_GlobalInvocationID.z,groups=(pc.channels+3u)/4u;if(x>=pc.width||y>=pc.height||g>=groups)return;vec4 v=loadC4(src.data,(y*pc.width+x)*groups+g);vec4 gamma=loadC4(prm.data,g);vec4 beta=loadC4(prm.data,groups+g);storeC4(dst.data,(y*pc.width+x)*groups+g,v*(vec4(1)+gamma)+beta);}

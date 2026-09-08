@@ -7,8 +7,8 @@
 
 namespace bncam::spectra::neural {
 
-constexpr std::uint32_t kNeuralRawDenoiseRequestSchemaVersion = 1;
-constexpr std::uint32_t kNeuralRawDenoiseResultSchemaVersion = 1;
+constexpr std::uint32_t kNeuralRawDenoiseRequestSchemaVersion = 3;
+constexpr std::uint32_t kNeuralRawDenoiseResultSchemaVersion = 3;
 
 enum class NeuralResourceKind : std::uint8_t {
     Unbound = 0,
@@ -21,13 +21,36 @@ enum class NeuralResourceKind : std::uint8_t {
 enum class NeuralElementType : std::uint8_t {
     Unknown = 0,
     Fp16 = 1,
-    Fp32 = 2
+    Fp32 = 2,
+    U32 = 3
 };
 
 enum class NeuralResourceAccess : std::uint8_t {
     ReadOnly = 0,
     WriteOnly = 1,
     ReadWrite = 2
+};
+
+// External producer synchronization is explicit. Resident Vulkan buffers owned
+// by BnCam can use None when queue-order + a backend acquire barrier establish
+// visibility. An imported AndroidHardwareBuffer must either be known producer-
+// complete or provide a borrowed Vulkan semaphore that the backend waits on.
+enum class NeuralExternalSyncKind : std::uint8_t {
+    None = 0,
+    ProducerComplete = 1,
+    VulkanSemaphore = 2
+};
+
+struct NeuralExternalSync {
+    NeuralExternalSyncKind kind = NeuralExternalSyncKind::None;
+    std::uint64_t token = 0;
+
+    bool valid() const noexcept {
+        if (kind == NeuralExternalSyncKind::VulkanSemaphore) {
+            return token != 0u;
+        }
+        return token == 0u;
+    }
 };
 
 // Backend-neutral GPU/external-resource descriptor. The token is interpreted
@@ -43,6 +66,7 @@ struct NeuralResourceView {
     std::uint32_t height = 0;
     std::uint32_t channels = 0;
     std::uint32_t rowStrideBytes = 0;
+    NeuralExternalSync externalSync{};
 
     bool bound() const noexcept {
         return kind != NeuralResourceKind::Unbound && token != 0u;
@@ -50,7 +74,7 @@ struct NeuralResourceView {
 
     bool valid() const noexcept {
         if (!bound() || elementType == NeuralElementType::Unknown || width == 0u || height == 0u ||
-            channels == 0u || rowStrideBytes == 0u) {
+            channels == 0u || rowStrideBytes == 0u || !externalSync.valid()) {
             return false;
         }
         return true;
@@ -65,9 +89,23 @@ struct NeuralRawDenoiseRequest {
     NeuralDenoiseControls controls{};
 
     NeuralResourceView packedNormalizedRawInput{};
+    // Optional backend-selected GPU staging view. When the primary input is an
+    // AndroidHardwareBuffer that cannot be imported with the required Vulkan
+    // storage features, the Vulkan backend may consume this BnCam-owned GPU
+    // buffer instead. There is deliberately no host/full-frame CPU pointer.
+    NeuralResourceView packedNormalizedRawGpuFallback{};
     NeuralResourceView remainingLscMap{};
     NeuralResourceView cleanPackedRawOutput{};
     NeuralResourceView posteriorVarianceOutput{};
+
+    // Future Neural Highlight Reconstruction boundary. The denoiser does not
+    // reconstruct clipped signal. When requested it must preserve evidence
+    // derived from the ORIGINAL neural input: a packed u32 bit mask (bits 0..3
+    // hard-clipped R/G1/G2/B, bits 4..7 near-clipped) and scalar minimum
+    // headroom. Partial/full clipping remains inferable without altering RAW.
+    bool originalSaturationEvidenceRequested = false;
+    NeuralResourceView originalSaturationMaskOutput{};
+    NeuralResourceView originalHeadroomEvidenceOutput{};
 
     bool residualDebugRequested = false;
     NeuralResourceView boundedResidualDebugOutput{};
@@ -88,9 +126,21 @@ struct NeuralRawDenoiseRequest {
             !isPackedCfa4(posteriorVarianceOutput)) {
             return false;
         }
+        if (packedNormalizedRawGpuFallback.bound()) {
+            if (!packedNormalizedRawGpuFallback.valid() || !isPackedCfa4(packedNormalizedRawGpuFallback) ||
+                packedNormalizedRawGpuFallback.access == NeuralResourceAccess::WriteOnly ||
+                packedNormalizedRawGpuFallback.kind != NeuralResourceKind::VulkanBuffer) {
+                return false;
+            }
+        }
         if (packedNormalizedRawInput.access == NeuralResourceAccess::WriteOnly ||
             cleanPackedRawOutput.access == NeuralResourceAccess::ReadOnly ||
             posteriorVarianceOutput.access == NeuralResourceAccess::ReadOnly) {
+            return false;
+        }
+        if (packedNormalizedRawInput.kind == NeuralResourceKind::AndroidHardwareBuffer &&
+            packedNormalizedRawInput.externalSync.kind == NeuralExternalSyncKind::None) {
+            // Direct AHB import must never assume producer completion.
             return false;
         }
 
@@ -103,6 +153,26 @@ struct NeuralRawDenoiseRequest {
             }
         } else if (remainingLscMap.bound()) {
             // Do not accept an undeclared second LSC source.
+            return false;
+        }
+
+        if (originalSaturationEvidenceRequested) {
+            if (!originalSaturationMaskOutput.valid() ||
+                originalSaturationMaskOutput.width != packedWidth ||
+                originalSaturationMaskOutput.height != packedHeight ||
+                originalSaturationMaskOutput.channels != 1u ||
+                originalSaturationMaskOutput.elementType != NeuralElementType::U32 ||
+                originalSaturationMaskOutput.access == NeuralResourceAccess::ReadOnly ||
+                !originalHeadroomEvidenceOutput.valid() ||
+                originalHeadroomEvidenceOutput.width != packedWidth ||
+                originalHeadroomEvidenceOutput.height != packedHeight ||
+                originalHeadroomEvidenceOutput.channels != 1u ||
+                (originalHeadroomEvidenceOutput.elementType != NeuralElementType::Fp16 &&
+                 originalHeadroomEvidenceOutput.elementType != NeuralElementType::Fp32) ||
+                originalHeadroomEvidenceOutput.access == NeuralResourceAccess::ReadOnly) {
+                return false;
+            }
+        } else if (originalSaturationMaskOutput.bound() || originalHeadroomEvidenceOutput.bound()) {
             return false;
         }
 
@@ -142,6 +212,9 @@ struct NeuralRawDenoiseResult {
     bool cleanRawWritten = false;
     bool posteriorVarianceWritten = false;
     bool boundedResidualDebugWritten = false;
+    bool originalSaturationMaskWritten = false;
+    bool originalHeadroomEvidenceWritten = false;
+    std::uint32_t dispatchedKernelCount = 0u;
 };
 
 enum class NeuralPublicationSource : std::uint8_t {

@@ -1,0 +1,34 @@
+#version 450
+
+// C4 activations use two uint words per logical vec4. Values are FP16 in memory
+// but arithmetic is FP32 for deterministic, portable accumulation.
+vec4 loadC4(const uint words[], uint vecIndex) {
+    uint i = vecIndex * 2u;
+    return vec4(unpackHalf2x16(words[i]), unpackHalf2x16(words[i+1u]));
+}
+void storeC4(inout uint words[], uint vecIndex, vec4 v) {
+    uint i = vecIndex * 2u;
+    words[i] = packHalf2x16(v.xy);
+    words[i+1u] = packHalf2x16(v.zw);
+}
+float loadHalf(const uint words[], uint halfIndex) {
+    vec2 p = unpackHalf2x16(words[halfIndex >> 1u]);
+    return ((halfIndex & 1u) == 0u) ? p.x : p.y;
+}
+
+layout(local_size_x=8, local_size_y=8, local_size_z=1) in;
+layout(set=0,binding=0,std430) readonly buffer RawInput { float raw[]; } src;
+layout(set=0,binding=1,std430) readonly buffer LscInput { float lsc[]; } lscSrc;
+layout(set=0,binding=2,std430) readonly buffer Physics { float c[]; } phys;
+layout(set=0,binding=3,std430) writeonly buffer Conditioning { uint data[]; } dst;
+layout(push_constant) uniform PC { int tileX; int tileY; uint tileW; uint tileH; uint fullW; uint fullH; uint paddedW; uint paddedH; uint lscW; uint lscH; uint lscChannels; uint hasLsc; } pc;
+vec4 rawAt(uint x,uint y){uint p=(y*pc.fullW+x)*4u;return vec4(src.raw[p],src.raw[p+1u],src.raw[p+2u],src.raw[p+3u]);}
+vec4 lscAt(uint x,uint y){
+ if(pc.hasLsc==0u||pc.lscW==0u||pc.lscH==0u)return vec4(1.0);
+ vec2 uv=(vec2(x,y)+vec2(0.5))/vec2(pc.fullW,pc.fullH);vec2 q=uv*vec2(pc.lscW,pc.lscH)-vec2(0.5);ivec2 b=ivec2(floor(q));vec2 f=fract(q);ivec2 a=clamp(b,ivec2(0),ivec2(pc.lscW-1u,pc.lscH-1u));ivec2 d=clamp(b+ivec2(1),ivec2(0),ivec2(pc.lscW-1u,pc.lscH-1u));
+ uint ch=max(pc.lscChannels,1u);uint p00=(uint(a.y)*pc.lscW+uint(a.x))*ch,p10=(uint(a.y)*pc.lscW+uint(d.x))*ch,p01=(uint(d.y)*pc.lscW+uint(a.x))*ch,p11=(uint(d.y)*pc.lscW+uint(d.x))*ch;
+ vec4 v00=(ch==1u)?vec4(lscSrc.lsc[p00]):vec4(lscSrc.lsc[p00],lscSrc.lsc[p00+1],lscSrc.lsc[p00+2],lscSrc.lsc[p00+3]);vec4 v10=(ch==1u)?vec4(lscSrc.lsc[p10]):vec4(lscSrc.lsc[p10],lscSrc.lsc[p10+1],lscSrc.lsc[p10+2],lscSrc.lsc[p10+3]);vec4 v01=(ch==1u)?vec4(lscSrc.lsc[p01]):vec4(lscSrc.lsc[p01],lscSrc.lsc[p01+1],lscSrc.lsc[p01+2],lscSrc.lsc[p01+3]);vec4 v11=(ch==1u)?vec4(lscSrc.lsc[p11]):vec4(lscSrc.lsc[p11],lscSrc.lsc[p11+1],lscSrc.lsc[p11+2],lscSrc.lsc[p11+3]);return mix(mix(v00,v10,f.x),mix(v01,v11,f.x),f.y);
+}
+void main(){uint lx=gl_GlobalInvocationID.x,ly=gl_GlobalInvocationID.y;if(lx>=pc.tileW||ly>=pc.tileH)return;int gx=pc.tileX+int(lx),gy=pc.tileY+int(ly);uint base=(ly*pc.tileW+lx)*4u;
+ if(gx<0||gy<0||gx>=int(pc.paddedW)||gy>=int(pc.paddedH)){storeC4(dst.data,base+0u,vec4(0));storeC4(dst.data,base+1u,vec4(0));storeC4(dst.data,base+2u,vec4(0));storeC4(dst.data,base+3u,vec4(0));return;}
+ uint sx=min(uint(gx),pc.fullW-1u),sy=min(uint(gy),pc.fullH-1u);vec4 x=clamp(rawAt(sx,sy),vec4(0),vec4(1));vec4 S=max(vec4(phys.c[0],phys.c[1],phys.c[2],phys.c[3]),vec4(0));vec4 O=max(vec4(phys.c[4],phys.c[5],phys.c[6],phys.c[7]),vec4(0));vec4 sigma=sqrt(max(S*x+O,vec4(0)));vec4 logs=log(max(sigma,vec4(max(phys.c[8],1e-12))));vec4 lg=lscAt(sx,sy);float hspan=max(phys.c[9],1e-6);float head=min(min((1.0-x.r)/hspan,(1.0-x.g)/hspan),min((1.0-x.b)/hspan,(1.0-x.a)/hspan));head=clamp(head,0.0,1.0);storeC4(dst.data,base+0u,x);storeC4(dst.data,base+1u,logs);storeC4(dst.data,base+2u,lg);storeC4(dst.data,base+3u,vec4(clamp(phys.c[10],0.0,1.0),head,0,0));}

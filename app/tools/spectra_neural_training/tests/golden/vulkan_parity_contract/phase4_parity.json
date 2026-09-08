@@ -1,0 +1,91 @@
+{
+  "clipped_reference_cell_identity": true,
+  "contract_name": "spectra_neural_phase4_vulkan_golden_parity_v1",
+  "gpu_validation_gate": {
+    "do_not_claim_device_parity_from_this_file": true,
+    "reason": "offline environment has no Android NDK Vulkan headers/glslc/device",
+    "required_comparison": "run the same golden vector through VulkanNeuralRawDenoiseBackend and compare dumped FP32 clean/posterior outputs against these reference hashes/arrays",
+    "status": "REQUIRED_ON_ANDROID_VULKAN_DEVICE"
+  },
+  "manifest_minimum_halo_packed": 38,
+  "package_sha256": "49ba12394fe4c82ed1442f8cba26b5ef84ba5f830daef23a626e7e7346b0276f",
+  "package_vs_phase3": {
+    "clean_raw": {
+      "max_abs": 0.0,
+      "mean_abs": 0.0,
+      "rms": 0.0
+    },
+    "confidence": {
+      "max_abs": 0.0,
+      "mean_abs": 0.0,
+      "rms": 0.0
+    },
+    "posterior_log_variance_ratio": {
+      "max_abs": 0.0,
+      "mean_abs": 0.0,
+      "rms": 0.0
+    },
+    "posterior_variance": {
+      "max_abs": 0.0,
+      "mean_abs": 0.0,
+      "rms": 0.0
+    },
+    "residual": {
+      "max_abs": 0.0,
+      "mean_abs": 0.0,
+      "rms": 0.0
+    },
+    "sigma_normalized_residual": {
+      "max_abs": 0.0,
+      "mean_abs": 0.0,
+      "rms": 0.0
+    }
+  },
+  "phase3_golden_model_content_sha256": "69cab904702f03e776a0786387b09fd9fa722052d027574b2ae6447cc5bc8cce",
+  "phase3_package_reference_exact": true,
+  "recommended_inner_tile_packed": 64,
+  "reference_output_sha256": {
+    "clean_raw": "48faa86f7eb193f9766e35d2dcb66a299996ba84e3286b4489b2f93443a5cf6a",
+    "confidence": "ae5d3d37e1c035ff1511e9b6f794a117053a7b9730d5c8acff4df601346436b6",
+    "posterior_log_variance_ratio": "e6b84a0455fc70b58ceded9568567eee1f36b96fba11b1c5c9111427d9b5d956",
+    "posterior_variance": "5194421ba3aa3fd8b6c95f26f13a78228cdefcd54bc37a34808d26627c0058d4",
+    "residual": "c457cef417e41123b1ffea0f5f9d55c9eb5f57dfb8695a1d2a78407744c7bbc9",
+    "sigma_normalized_residual": "8b61e23ac9e6dd7e5d3c5043a21c85b713bb1d6ca69f43a42d7e2e02b08c8bc6"
+  },
+  "runtime_aligned_halo_packed": 40,
+  "schema_version": 1,
+  "source_model_content_sha256": "69cab904702f03e776a0786387b09fd9fa722052d027574b2ae6447cc5bc8cce",
+  "tiled_vs_full": {
+    "clean_raw": {
+      "max_abs": 0.0,
+      "mean_abs": 0.0,
+      "rms": 0.0
+    },
+    "confidence": {
+      "max_abs": 0.0,
+      "mean_abs": 0.0,
+      "rms": 0.0
+    },
+    "posterior_log_variance_ratio": {
+      "max_abs": 0.0,
+      "mean_abs": 0.0,
+      "rms": 0.0
+    },
+    "posterior_variance": {
+      "max_abs": 0.0,
+      "mean_abs": 0.0,
+      "rms": 0.0
+    },
+    "residual": {
+      "max_abs": 0.0,
+      "mean_abs": 0.0,
+      "rms": 0.0
+    },
+    "sigma_normalized_residual": {
+      "max_abs": 0.0,
+      "mean_abs": 0.0,
+      "rms": 0.0
+    }
+  },
+  "valid_center_tiled_reference_exact": true
+}
