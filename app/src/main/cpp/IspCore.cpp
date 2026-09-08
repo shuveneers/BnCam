@@ -5672,24 +5672,6 @@ CfaBandResidualEvidence resolveCfaBandResidualEvidence(
     return out;
 }
 
-// Transitional compatibility transport for the existing CFA-confidence builder. Only
-// observation fields are populated; all kernel/enable/authority/correction fields remain neutral.
-bncam::spectra2::ChromaBandPlan makeCfaEvidenceTransport(
-        const CfaBandResidualEvidence& evidence
-) {
-    bncam::spectra2::ChromaBandPlan out{};
-    out.kind = evidence.kind;
-    out.status = evidence.status;
-    out.targetStatus = "RAW_DOMAIN_EXPECTED_NOISE_FLOOR_EVIDENCE";
-    out.inputEnergy = evidence.inputEnergy;
-    out.targetFloor = evidence.expectedNoiseFloor;
-    out.excessEnergy = evidence.excessEnergy;
-    out.requiredReductionFraction = evidence.residualPressure;
-    out.modelConfidence = evidence.modelConfidence;
-    out.evidence = evidence.directionalEvidence;
-    return out;
-}
-
 std::string formatCfaBandResidualEvidenceFields(
         const char* prefix,
         const CfaBandResidualEvidence& evidence
@@ -6490,15 +6472,6 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     const float lowBandObserverMs = elapsedMs(lowBandObserverStart);
     const float postPass2BandMeasurementMs = 0.0f;
 
-    // The CFA-confidence contract is still shared with demosaic. Feed it a neutral compatibility
-    // transport containing only raw-domain evidence; correction/authority fields remain zero.
-    const bncam::spectra2::ChromaBandPlan fineBandEvidenceTransport =
-            makeCfaEvidenceTransport(fineBandEvidence);
-    const bncam::spectra2::ChromaBandPlan midBandEvidenceTransport =
-            makeCfaEvidenceTransport(midBandEvidence);
-    const bncam::spectra2::ChromaBandPlan lowBandEvidenceTransport =
-            makeCfaEvidenceTransport(lowBandEvidence);
-
     pass2State.processingTimeMs = elapsedMs(pass2Start);
 
     budgetState.finalRemainingEnergy = budgetState.initialResidualEnergy;
@@ -6563,9 +6536,9 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                     demosaicEvidenceMode,
                     workingMeta.calibration.signalModelConfidence,
                     initialChromaBands,
-                    fineBandEvidenceTransport,
-                    midBandEvidenceTransport,
-                    lowBandEvidenceTransport,
+                    fineBandEvidence.residualPressure,
+                    midBandEvidence.residualPressure,
+                    lowBandEvidence.residualPressure,
                     0.0f, // retired Pass-3 spatial correction confidence: no pixel authority
                     pass1State.anisotropicDetail.confidenceP50,
                     pass1State.edgeProtectedFraction,

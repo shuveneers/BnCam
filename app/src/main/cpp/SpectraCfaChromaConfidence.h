@@ -240,13 +240,15 @@ inline OpponentAuthorityPair resolveOpponentAuthorityPair(
     return pair;
 }
 
+// N006P: accept normalized residual-pressure evidence directly. Do not transport classical
+// ChromaBandPlan kernel/enable/authority/correction semantics into the demosaic evidence ABI.
 inline CfaChromaConfidenceSummary buildCfaChromaConfidenceSummary(
         int spectraMode,
         float signalModelConfidence,
         const ChromaBandEnergySnapshot& measuredBands,
-        const ChromaBandPlan& finePlan,
-        const ChromaBandPlan& midPlan,
-        const ChromaBandPlan& lowPlan,
+        float fineResidualPressure,
+        float midResidualPressure,
+        float lowResidualPressure,
         float lowFrequencyFieldConfidence,
         float tensorConfidenceP50,
         float edgeProtectedFraction,
@@ -270,9 +272,9 @@ inline CfaChromaConfidenceSummary buildCfaChromaConfidenceSummary(
                     summary.redBlueSampleBalance
     ));
 
-    summary.fineResidualPressure = cfaFiniteUnit(finePlan.requiredReductionFraction);
-    summary.midResidualPressure = cfaFiniteUnit(midPlan.requiredReductionFraction);
-    summary.lowResidualPressure = cfaFiniteUnit(lowPlan.requiredReductionFraction);
+    summary.fineResidualPressure = cfaFiniteUnit(fineResidualPressure);
+    summary.midResidualPressure = cfaFiniteUnit(midResidualPressure);
+    summary.lowResidualPressure = cfaFiniteUnit(lowResidualPressure);
     summary.fineCorrectionConfidence =
             summary.commonOpponentSupport * summary.fineResidualPressure;
     summary.midCorrectionConfidence =
