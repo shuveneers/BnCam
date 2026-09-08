@@ -14,7 +14,6 @@
 #include "SpectraNoiseCalibration.h"
 #include "SpectraChromaBands.h"
 #include "SpectraChromaMultiscale.h"
-#include "SpectraAnisotropicDetail.h"
 #include "SpectraDownstreamIsp.h"
 #include "SpectraPerformanceBackend.h"
 
@@ -175,162 +174,52 @@ struct SpectraProvenanceField {
     std::string formatDebugString() const;
 };
 
-struct SpectraNoRegretResult {
-    int passIndex = 0;
-    int totalTiles = 0;
-    int evaluatedTiles = 0;
-    int invalidTiles = 0;
-    int acceptedTiles = 0;
-    int partiallyAcceptedTiles = 0;
-    int rejectedTiles = 0;
-    int rejectedOversmooth = 0;
-    int rejectedDetailLoss = 0;
-    int rejectedMeanDrift = 0;
-    int rejectedNoImprovement = 0;
-    float meanAcceptance = 0.0f;
-    float acceptanceP10 = 0.0f;
-    float acceptanceP50 = 0.0f;
-    float acceptanceP90 = 0.0f;
-    float attenuatedPixelFraction = 0.0f;
-    float rolledBackPixelFraction = 0.0f; // compatibility alias for attenuatedPixelFraction
-    float meanRiskImprovement = 0.0f;
-    float meanColourShift = 0.0f;
-    float maxColourShift = 0.0f;
-    float edgePreservationScore = 1.0f;
-    float oversmoothingScore = 0.0f;
-
-    std::string formatDebugString() const;
-};
-
 struct SpectraPass0State {
-    int spectraMode = 0; // 0=Legacy/Off, 1=Auto, 2=Manual
+    int spectraMode = 0; // 0=Off, 1=Auto, 2=Manual
     std::string sourceFormat = "UNKNOWN";
     std::string lensKey = "unknown";
-
     int totalTileCount = 0;
     int acceptedTileCount = 0;
     float darkTileConfidence = 0.0f;
-
     std::array<float, 4> channelBiasBefore{0.0f, 0.0f, 0.0f, 0.0f};
-    std::array<float, 4> appliedChannelBias{0.0f, 0.0f, 0.0f, 0.0f};
-    std::array<float, 4> channelBiasAfter{0.0f, 0.0f, 0.0f, 0.0f};
-
     float g1g2Before = 0.0f;
-    float g1g2After = 0.0f;
-
     float rowVarianceBefore = 0.0f;
-    float rowVarianceAfter = 0.0f;
     float colVarianceBefore = 0.0f;
-    float colVarianceAfter = 0.0f;
-
     std::array<float, 4> zeroClipBefore{0.0f, 0.0f, 0.0f, 0.0f};
-    std::array<float, 4> zeroClipAfter{0.0f, 0.0f, 0.0f, 0.0f};
-
     float channelBiasConfidence = 0.0f;
     float rowPatternConfidence = 0.0f;
     float columnPatternConfidence = 0.0f;
-
-    bool applyChannelBias = false;
-    bool applyRowCorrection = false;
-    bool applyColumnCorrection = false;
     float greenSplitMad = 0.0f;
     float greenSplitTileConsensus = 0.0f;
     int greenSplitTileCount = 0;
-
-    // Residual post-metadata CFA black calibration. Values are sensor code units.
     float commonGreenResidualBefore = 0.0f;
-    float commonGreenResidualAfter = 0.0f;
     float commonGreenResidualConfidence = 0.0f;
     float commonGreenTileMedian = 0.0f;
     float commonGreenTileMad = 0.0f;
     float commonGreenTileConsensus = 0.0f;
     float commonGreenLowerTailRbMismatch = 0.0f;
     int commonGreenStrictTileCount = 0;
-    bool residualPedestalApplied = false;
-    std::string residualPedestalReason = "not_evaluated";
-
     std::string classification = "K. Insufficient evidence";
-    std::string fallbackReason = "none";
-    std::string planningMethod = "LEGACY_FULL_FRAME_REFERENCE";
+    std::string fallbackReason = "not_evaluated";
+    std::string planningMethod = "READ_ONLY_CFA_BLACK_PATTERN_OBSERVER";
     std::uint64_t planningSampleCount = 0u;
     bool sceneBlackMetadataAuthoritative = false;
-    bool sceneBlackImageMutationAllowed = true;
-    std::string sceneBlackAuthorityMode = "IMAGE_DERIVED_FALLBACK_ELIGIBLE";
+    bool sceneBlackImageMutationAllowed = false; // compatibility telemetry; always false here
+    std::string sceneBlackAuthorityMode = "OBSERVER_ONLY";
     float isoAuthority = 0.0f;
-    float noRegretAcceptedTileFraction = 0.0f;
-    float noRegretRollbackFraction = 0.0f;
-    bool vulkanAttempted = false;
-    bool vulkanExecutionSucceeded = false;
-    bool vulkanUsedForOutput = false;
-    bool vulkanCpuFallbackUsed = false;
-    bool vulkanGpuNoRegretBlendUsed = false;
-    bool vulkanCandidateReadbackAvoided = false;
-    std::string vulkanStatus = "NOT_ATTEMPTED";
-    std::string vulkanFailureReason = "none";
-    float vulkanPass0KernelMs = 0.0f;
-    float vulkanTileStatisticsKernelMs = 0.0f;
-    float vulkanNoRegretDecisionMs = 0.0f;
-    float vulkanNoRegretBlendMs = 0.0f;
-    float vulkanSynchronizationMs = 0.0f;
-    float vulkanCompactReadbackMs = 0.0f;
-    std::uint64_t vulkanResidentGeneration = 0u;
     float processingTimeMs = 0.0f;
-
     std::string formatDebugString() const;
 };
 
 struct SpectraPass1State {
-    bool physicalBaselineMode = false;
-    std::string authoritySource = "SPECTRA";
-    int spectraMode = 0; // 0=Legacy/Off, 1=Auto, 2=Manual
-    bool applied = false;
-    std::string fallbackReason = "none";
-    float averageVstResidualVar = 1.0f;
-    float maxPixelShift = 0.0f;
-    // Linear-domain per-pixel safety cap. 0.028 preserves the existing non-physical GPU path.
-    float maxLinearShift = 0.028f;
+    int spectraMode = 0; // 0=Off, 1=Auto, 2=Manual
+    std::string fallbackReason = "not_evaluated";
     float modelConfidence = 0.0f;
-    float blendStrength = 0.0f;
-    float averageWienerGain = 0.0f;
-    float edgeProtectedFraction = 0.0f;
-    float changedPixelFraction = 0.0f;
     float isoAuthority = 0.0f;
     float combinedNoisePressure = 0.0f;
-    float localShadingAuthorityMean = 1.0f;
-    float noRegretAcceptedTileFraction = 0.0f;
-    float noRegretRollbackFraction = 0.0f;
     std::array<double, 4> effectiveS{0.0, 0.0, 0.0, 0.0};
     std::array<double, 4> effectiveO{0.0, 0.0, 0.0, 0.0};
     float processingTimeMs = 0.0f;
-    bncam::spectra2::AnisotropicDetailTelemetry anisotropicDetail{};
-
-    // Milestone 8H-B: Pass 1 is GPU-primary when the authoritative Vulkan
-    // runtime is READY. CPU remains a typed fallback/reference only.
-    bool vulkanKernelConnected = false;
-    bool vulkanAttempted = false;
-    bool vulkanExecutionSucceeded = false;
-    bool vulkanUsedForOutput = false;
-    bool vulkanCpuFallbackUsed = false;
-    bool vulkanGpuNoRegretBlendUsed = false;
-    bool vulkanCandidateReadbackAvoided = false;
-    bool vulkanPersistentReuseHit = false;
-    bool vulkanPersistentReallocated = false;
-    std::string vulkanStatus = "NOT_RUN";
-    std::string vulkanFailureReason = "none";
-    float vulkanInputPackingMs = 0.0f;
-    float vulkanTensorUploadMs = 0.0f;
-    float vulkanPass1KernelMs = 0.0f;
-    float vulkanTileStatisticsKernelMs = 0.0f;
-    float vulkanNoRegretDecisionMs = 0.0f;
-    float vulkanNoRegretBlendMs = 0.0f;
-    float vulkanGpuKernelMs = 0.0f;
-    float vulkanSynchronizationMs = 0.0f;
-    float vulkanReadbackMs = 0.0f;
-    float vulkanTransferAndSyncMs = 0.0f;
-    float vulkanTotalMs = 0.0f;
-    std::uint64_t vulkanResidentBytes = 0;
-    std::uint64_t vulkanAllocationGeneration = 0;
-
     std::string formatDebugString() const;
 };
 
@@ -512,38 +401,15 @@ struct SpectraBudgetState {
     float isoNoisePressure = 0.0f;
     float provenanceMeanConfidence = 0.0f;
     float provenanceMeanShadingGain = 1.0f;
-    float noRegretMeanAcceptance = 0.0f;
     std::string isoRegime = "LOW";
 
     std::string formatDebugString() const;
 };
 
-// SPECTRA Variance Stabilisation Transform (VST) helper functions
-inline bool isVstValidDomain(float x, double S, double O) {
-    if (S <= 1.0e-12 || O < 0.0 || !std::isfinite(S) || !std::isfinite(O)) return false;
-    const double xd = static_cast<double>(x);
-    return (S * xd + O + 0.375 * S * S) > 1.0e-6;
-}
-
+// Physical S/O validity helper retained for read-only noise-model observation.
 inline bool isVstValid(double S, double O) {
     return S > 1.0e-12 && O >= 0.0 && std::isfinite(S) && std::isfinite(O);
 }
-
-inline float spectraForwardVst(float x, double S, double O) {
-    if (!isVstValidDomain(x, S, O)) return x;
-    const double xd = static_cast<double>(x);
-    const double arg = S * xd + O + 0.375 * S * S;
-    return static_cast<float>((2.0 / S) * std::sqrt(arg));
-}
-
-inline float spectraInverseVst(float y, double S, double O) {
-    if (S <= 1.0e-12 || O < 0.0 || !std::isfinite(S) || !std::isfinite(O)) return y;
-    const double yd = static_cast<double>(y);
-    const double sy2 = 0.5 * S * yd;
-    const double xd = (1.0 / S) * (sy2 * sy2 - O - 0.375 * S * S);
-    return static_cast<float>(xd);
-}
-
 
 struct UltraHdrGainmapArtifact {
     bool valid = false;
@@ -607,15 +473,6 @@ public:
             const IspFrameMetadata& meta
     );
 
-    static SpectraNoRegretResult applySpectraNoRegretGate(
-            const cv::Mat& before,
-            LinearFloatRaw& candidate,
-            const IspFrameMetadata& meta,
-            const SpectraIsoAdaptiveState& isoState,
-            const SpectraProvenanceField& beforeField,
-            int passIndex
-    );
-
     static SpectraPass0State computePass0State(
             const LinearFloatRaw& raw,
             const IspFrameMetadata& meta,
@@ -629,12 +486,6 @@ public:
             const NativeRenderQualityConfig& uiConfig
     );
 
-    static void applySpectraPass0(
-            LinearFloatRaw& raw,
-            const IspFrameMetadata& meta,
-            const SpectraPass0State& pass0State
-    );
-
     static SpectraPass1State computePass1State(
             const LinearFloatRaw& raw,
             const IspFrameMetadata& meta,
@@ -646,12 +497,6 @@ public:
             const RawNormalizedSampleView& raw,
             const IspFrameMetadata& meta,
             const NativeRenderQualityConfig& uiConfig
-    );
-
-    static void applySpectraPass1(
-            LinearFloatRaw& raw,
-            const IspFrameMetadata& meta,
-            SpectraPass1State& pass1State
     );
 
     static SpectraPass2State computePass2State(

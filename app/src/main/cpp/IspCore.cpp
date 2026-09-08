@@ -10,9 +10,6 @@
 #include "RawSpatialNoiseCalibrationPolicy.h"
 #include "RawGreenSplitPolicy.h"
 #include "RawAdaptiveExposurePolicy.h"
-#include "SpectraContextFusionNoRegret.h"
-#include "SpectraChromaNoRegretPolicy.h"
-#include "SpectraContextFusionChromaAuthority.h"
 #include "SpectraResidualSeedConfidence.h"
 #include "PhysicalAwbEstimator.h"
 #include "SensorColorScienceV2.h"
@@ -24,11 +21,6 @@
 #include "RawCameraHueSatMapTelemetry.h"
 #include "RawCameraHueSatMapNoisePropagation.h"
 #include "HighlightGamutProtectionV2.h"
-#include "SpectraMultiscaleContext.h"
-#include "SpectraMultiscaleResidualConsensus.h"
-#include "SpectraMultiscaleChromaContext.h"
-#include "SpectraCfaOrthonormalSupport.h"
-#include "SpectraCfaSurfaceClassifier.h"
 #include "Demosaic.h"
 #include "FastLocalLaplacianPolicy.h"
 #include "ProfileToneRenderPolicy.h"
@@ -67,10 +59,9 @@ constexpr int CFA_GRBG = 1;
 constexpr int CFA_GBRG = 2;
 constexpr int CFA_BGGR = 3;
 
-// SPECTRA production runtime gates.
-// Temporal observation, S/O adaptation and fusion weighting live in DngMerger,
-// where genuinely aligned warm-buffer RAW frames are available. IspCore consumes
-// the resulting immutable capture snapshot and owns the four pre-demosaic passes.
+// SPECTRA pre-neural boundary. Temporal observation, S/O adaptation and fusion evidence
+// live upstream. IspCore observes physical RAW/residual/CFA evidence only; no classical
+// SPECTRA denoiser owns or modifies RAW pixels here. The next denoise pixel owner is neural.
 
 
 
@@ -86,33 +77,12 @@ struct ThreadLocalIspStats {
     bool noiseModelApplied = false;
     std::string noiseModelReason = "not_evaluated";
 
-    // Filter effectiveness instrumentation
-    uint64_t processedPixelCount = 0;
-    uint64_t changedPixelCount = 0;
-    float changedPixelFraction = 0.0f;
-    float meanAbsLumaDelta = 0.0f;
-    float meanAbsChromaDelta = 0.0f;
-    float maxLumaDelta = 0.0f;
-    float maxChromaDelta = 0.0f;
-    float avgNeighbourAcceptanceRate = 0.0f;
-    float avgNonCentreSampleWeight = 0.0f;
-    float avgTotalFilterWeight = 0.0f;
-    float avgAppliedBlend = 0.0f;
-    float edgeProtectedPixelFraction = 0.0f;
+    // Read-only physical sigma telemetry for neural conditioning
 
     float absoluteMeanLumaSigma = 0.0f;
     float absoluteMeanChromaSigma = 0.0f;
     float effectiveLumaSigma = 0.0f;
     float effectiveChromaSigma = 0.0f;
-    float lumaRangeThresholdMin = 0.0f;
-    float lumaRangeThresholdMean = 0.0f;
-    float lumaRangeThresholdMax = 0.0f;
-    float chromaRangeThresholdMin = 0.0f;
-    float chromaRangeThresholdMean = 0.0f;
-    float chromaRangeThresholdMax = 0.0f;
-    float preDenoiseResidualEstimate = 0.0f;
-    float postDenoiseResidualEstimate = 0.0f;
-    float postSharpenResidualEstimate = 0.0f;
 
     // Advanced sensor noise calibration & channel propagation telemetry
 };
@@ -2469,52 +2439,35 @@ std::string IspCore::describeResolvedConfig(const NativeRenderQualityConfig& uiC
 std::string SpectraPass0State::formatDebugString() const {
     std::ostringstream out;
     out << std::fixed << std::setprecision(4);
-    out << "spectraPass0={"
-        << "mode=" << (spectraMode == 1 ? "auto" : (spectraMode == 2 ? "manual" : "legacy"))
+    out << "spectraPass0Observer={"
+        << "mode=" << (spectraMode == 1 ? "auto" : (spectraMode == 2 ? "manual" : "off"))
         << ";sourceFormat=" << sourceFormat
         << ";lensKey=" << lensKey
         << ";acceptedTiles=" << acceptedTileCount << "/" << totalTileCount
         << ";confidence=" << darkTileConfidence
         << ";classification=" << classification
-        << ";applyChannelBias=" << (applyChannelBias ? "true" : "false")
-        << ";appliedChannelBias=[" << appliedChannelBias[0] << "," << appliedChannelBias[1] << "," << appliedChannelBias[2] << "," << appliedChannelBias[3] << "]"
-        << ";g1g2Before=" << g1g2Before
-        << ";g1g2After=" << g1g2After
+        << ";g1g2=" << g1g2Before
         << ";greenSplitMad=" << greenSplitMad
         << ";greenSplitTileConsensus=" << greenSplitTileConsensus
         << ";greenSplitTileCount=" << greenSplitTileCount
-        << ";applyRowCorrection=" << (applyRowCorrection ? "true" : "false")
-        << ";rowVarianceBefore=" << rowVarianceBefore
-        << ";rowVarianceAfter=" << rowVarianceAfter
-        << ";applyColumnCorrection=" << (applyColumnCorrection ? "true" : "false")
-        << ";colVarianceBefore=" << colVarianceBefore
-        << ";colVarianceAfter=" << colVarianceAfter
-        << ";isoAuthority=" << isoAuthority
-        << ";noRegretAcceptedTiles=" << noRegretAcceptedTileFraction
-        << ";noRegretRollback=" << noRegretRollbackFraction
-        << ";vulkanAttempted=" << (vulkanAttempted ? "true" : "false")
-        << ";vulkanExecutionSucceeded=" << (vulkanExecutionSucceeded ? "true" : "false")
-        << ";vulkanUsedForOutput=" << (vulkanUsedForOutput ? "true" : "false")
-        << ";vulkanCpuFallbackUsed=" << (vulkanCpuFallbackUsed ? "true" : "false")
-        << ";vulkanGpuNoRegretBlendUsed=" << (vulkanGpuNoRegretBlendUsed ? "true" : "false")
-        << ";vulkanCandidateReadbackAvoided=" << (vulkanCandidateReadbackAvoided ? "true" : "false")
-        << ";vulkanStatus=" << vulkanStatus
-        << ";vulkanFailureReason=" << vulkanFailureReason
-        << ";vulkanPass0KernelMs=" << vulkanPass0KernelMs
-        << ";vulkanTileStatisticsKernelMs=" << vulkanTileStatisticsKernelMs
-        << ";vulkanNoRegretDecisionMs=" << vulkanNoRegretDecisionMs
-        << ";vulkanNoRegretBlendMs=" << vulkanNoRegretBlendMs
-        << ";vulkanSynchronizationMs=" << vulkanSynchronizationMs
-        << ";vulkanCompactReadbackMs=" << vulkanCompactReadbackMs
-        << ";vulkanResidentGeneration=" << vulkanResidentGeneration
-        << ";fallbackReason=" << fallbackReason
+        << ";rowVariance=" << rowVarianceBefore
+        << ";columnVariance=" << colVarianceBefore
+        << ";channelBiasConfidence=" << channelBiasConfidence
+        << ";rowPatternConfidence=" << rowPatternConfidence
+        << ";columnPatternConfidence=" << columnPatternConfidence
+        << ";commonGreenResidual=" << commonGreenResidualBefore
+        << ";commonGreenResidualConfidence=" << commonGreenResidualConfidence
+        << ";sceneBlackAuthorityMode=" << sceneBlackAuthorityMode
+        << ";metadataBlackAuthoritative=" << (sceneBlackMetadataAuthoritative ? "true" : "false")
+        << ";isoEvidenceAuthority=" << isoAuthority
         << ";planningMethod=" << planningMethod
         << ";planningSampleCount=" << planningSampleCount
+        << ";status=" << fallbackReason
+        << ";pixelAuthority=false"
         << ";processingTimeMs=" << processingTimeMs
         << "}";
     return out.str();
 }
-
 
 std::string SpectraIsoAdaptiveState::formatDebugString() const {
     std::ostringstream out;
@@ -2582,35 +2535,6 @@ std::string SpectraProvenanceField::formatDebugString() const {
         << ";modelMismatchP10=" << modelMismatchP10
         << ";modelMismatchP50=" << modelMismatchP50
         << ";modelMismatchP90=" << modelMismatchP90
-        << "}";
-    return out.str();
-}
-
-std::string SpectraNoRegretResult::formatDebugString() const {
-    std::ostringstream out;
-    out << std::fixed << std::setprecision(4);
-    out << "spectraNoRegretP" << passIndex << "={"
-        << "tiles=" << totalTiles
-        << ";evaluated=" << evaluatedTiles
-        << ";invalid=" << invalidTiles
-        << ";accepted=" << acceptedTiles
-        << ";partial=" << partiallyAcceptedTiles
-        << ";rejected=" << rejectedTiles
-        << ";rejectOversmooth=" << rejectedOversmooth
-        << ";rejectDetail=" << rejectedDetailLoss
-        << ";rejectMeanDrift=" << rejectedMeanDrift
-        << ";rejectNoImprovement=" << rejectedNoImprovement
-        << ";meanAcceptance=" << meanAcceptance
-        << ";acceptanceP10=" << acceptanceP10
-        << ";acceptanceP50=" << acceptanceP50
-        << ";acceptanceP90=" << acceptanceP90
-        << ";attenuatedPixelFraction=" << attenuatedPixelFraction
-        << ";rollbackPixelFraction=" << rolledBackPixelFraction
-        << ";meanRiskImprovement=" << meanRiskImprovement
-        << ";meanColourShift=" << meanColourShift
-        << ";maxColourShift=" << maxColourShift
-        << ";edgePreservationScore=" << edgePreservationScore
-        << ";oversmoothingScore=" << oversmoothingScore
         << "}";
     return out.str();
 }
@@ -3678,227 +3602,6 @@ SpectraProvenanceField IspCore::buildSpectraProvenanceFieldCompact(
     }
     return field;
 }
-SpectraNoRegretResult IspCore::applySpectraNoRegretGate(
-        const cv::Mat& before,
-        LinearFloatRaw& candidate,
-        const IspFrameMetadata& meta,
-        const SpectraIsoAdaptiveState& isoState,
-        const SpectraProvenanceField& beforeField,
-        int passIndex
-) {
-    SpectraNoRegretResult result{};
-    result.passIndex = passIndex;
-    if (before.empty() || candidate.mosaic.empty() ||
-        before.type() != CV_32FC1 || candidate.mosaic.type() != CV_32FC1 ||
-        before.size() != candidate.mosaic.size() || beforeField.tiles.empty()) {
-        candidate.mosaic = before.clone();
-        return result;
-    }
-
-    const SpectraProvenanceField afterField = buildSpectraProvenanceField(candidate, meta);
-    if (afterField.tiles.size() != beforeField.tiles.size()) {
-        candidate.mosaic = before.clone();
-        return result;
-    }
-
-    result.totalTiles = static_cast<int>(beforeField.tiles.size());
-    std::vector<float> acceptance(beforeField.tiles.size(), 0.0f);
-    std::vector<float> evaluatedAcceptance;
-    double acceptanceSum = 0.0;
-    double improvementSum = 0.0;
-    double colourShiftSum = 0.0;
-    double edgePreservationSum = 0.0;
-    double oversmoothingSum = 0.0;
-    float maximumColourShift = 0.0f;
-
-    for (size_t i = 0; i < beforeField.tiles.size(); ++i) {
-        const auto& b = beforeField.tiles[i];
-        const auto& a = afterField.tiles[i];
-        if (!b.valid || !a.valid || b.confidence < 0.05f || a.confidence < 0.05f) {
-            continue;
-        }
-        result.evaluatedTiles++;
-
-        float beforeEnergy = b.residualEnergy;
-        float afterEnergy = a.residualEnergy;
-        float targetBase = b.predictedSpatialResidualVariance;
-        if (passIndex == 0) {
-            beforeEnergy = b.greenSplitResidualEnergy;
-            afterEnergy = a.greenSplitResidualEnergy;
-            targetBase = b.predictedRawVarianceByChannel[1] +
-                    b.predictedRawVarianceByChannel[2];
-        } else if (passIndex == 2) {
-            beforeEnergy = b.chromaResidualEnergy;
-            afterEnergy = a.chromaResidualEnergy;
-            targetBase = b.predictedChromaResidualVariance;
-        } else if (passIndex == 3) {
-            beforeEnergy = 0.55f * b.residualEnergy + 0.45f * b.chromaResidualEnergy;
-            afterEnergy = 0.55f * a.residualEnergy + 0.45f * a.chromaResidualEnergy;
-            targetBase = 0.55f * b.predictedSpatialResidualVariance +
-                    0.45f * b.predictedChromaResidualVariance;
-        }
-        const float target = std::max(1.0e-12f, targetBase) * isoState.targetFloorScale;
-
-        auto risk = [&](float energy) -> float {
-            const float ratio = std::max(0.04f, energy / target);
-            if (passIndex >= 2) {
-                // Retired Pass 2 & 3: legacy chroma/low-frequency suppression is measurement-only pending neural ownership.
-                // CFA opponent false-colour reduction at or below predicted target is desirable,
-                // while true texture/edge preservation is guarded by structureRetention.
-                return ratio > 1.0f ? std::log(ratio) : 0.0f;
-            }
-            if (ratio < 1.0f) {
-                // Retired Pass 0 & 1: legacy luma suppression is measurement-only; keep objective scoring read-only;
-                // texture preservation is enforced by detailRetentionFloor.
-                return 0.35f * std::abs(std::log(std::max(0.40f, ratio)));
-            }
-            return std::log(ratio);
-        };
-        const float beforeRisk = risk(beforeEnergy);
-        const float afterRisk = risk(afterEnergy);
-        const float riskImprovement = beforeRisk - afterRisk;
-        improvementSum += riskImprovement;
-
-        const float minimumEnergy = target * isoState.minimumResidualRatio;
-        const auto contextDecision = bncam::spectra::resolveContextFusionNoRegret({
-                beforeEnergy,
-                afterEnergy,
-                target,
-                b.structureEnergy,
-                a.structureEnergy,
-                isoState.minimumResidualRatio,
-                isoState.detailRetentionFloor,
-                b.confidence,
-                riskImprovement,
-                passIndex != 0
-        });
-        const float structureRetention = contextDecision.structureRetention;
-        const float beforeGreen = 0.5f * (b.meanSignal[1] + b.meanSignal[2]);
-        const float afterGreen = 0.5f * (a.meanSignal[1] + a.meanSignal[2]);
-        const float deltaRg = (a.meanSignal[0] - afterGreen) - (b.meanSignal[0] - beforeGreen);
-        const float deltaBg = (a.meanSignal[3] - afterGreen) - (b.meanSignal[3] - beforeGreen);
-        const float colourShift = std::sqrt(deltaRg * deltaRg + deltaBg * deltaBg);
-        colourShiftSum += colourShift;
-        maximumColourShift = std::max(maximumColourShift, colourShift);
-        edgePreservationSum += std::clamp(structureRetention, 0.0f, 1.0f);
-        const float oversmoothingRisk = minimumEnergy > 1.0e-12f
-                ? std::clamp((minimumEnergy - afterEnergy) / minimumEnergy, 0.0f, 1.0f)
-                : 0.0f;
-        oversmoothingSum += oversmoothingRisk;
-
-        bool meanDrift = false;
-        for (int ch = 0; ch < 4; ++ch) {
-            const float channelDrift = std::abs(a.meanSignal[ch] - b.meanSignal[ch]);
-            const float channelVariance = std::max(
-                    1.0e-12f,
-                    b.predictedRawVarianceByChannel[ch]
-            );
-            const float driftLimit = std::max(
-                    0.00025f,
-                    (1.20f + 0.35f * isoState.combinedNoisePressure) *
-                            std::sqrt(channelVariance)
-            );
-            if (channelDrift > driftLimit) {
-                meanDrift = true;
-                break;
-            }
-        }
-
-        float tileAcceptance = 0.0f;
-        if (meanDrift) {
-            result.rejectedMeanDrift++;
-        } else if (contextDecision.worsened || contextDecision.noImprovement) {
-            result.rejectedNoImprovement++;
-        } else {
-            tileAcceptance = contextDecision.acceptance;
-            if (tileAcceptance <= 0.0f) {
-                if (contextDecision.residualFloorLimited) result.rejectedOversmooth++;
-                else if (contextDecision.detailFloorLimited) result.rejectedDetailLoss++;
-                else result.rejectedNoImprovement++;
-            } else if (tileAcceptance >= 0.90f) {
-                result.acceptedTiles++;
-            } else {
-                result.partiallyAcceptedTiles++;
-            }
-        }
-        acceptance[i] = tileAcceptance;
-        evaluatedAcceptance.push_back(tileAcceptance);
-        acceptanceSum += tileAcceptance;
-    }
-
-    result.invalidTiles = std::max(0, result.totalTiles - result.evaluatedTiles);
-    result.rejectedTiles = std::max(
-            0,
-            result.evaluatedTiles - result.acceptedTiles - result.partiallyAcceptedTiles
-    );
-
-    result.meanAcceptance = result.evaluatedTiles > 0
-            ? static_cast<float>(acceptanceSum / static_cast<double>(result.evaluatedTiles))
-            : 0.0f;
-    result.meanRiskImprovement = result.evaluatedTiles > 0
-            ? static_cast<float>(improvementSum / static_cast<double>(result.evaluatedTiles))
-            : 0.0f;
-    result.acceptanceP10 = spectraPercentile(evaluatedAcceptance, 0.10f);
-    result.acceptanceP50 = spectraPercentile(evaluatedAcceptance, 0.50f);
-    result.acceptanceP90 = spectraPercentile(evaluatedAcceptance, 0.90f);
-    result.meanColourShift = result.evaluatedTiles > 0
-            ? static_cast<float>(colourShiftSum / static_cast<double>(result.evaluatedTiles))
-            : 0.0f;
-    result.maxColourShift = maximumColourShift;
-    result.edgePreservationScore = result.evaluatedTiles > 0
-            ? static_cast<float>(edgePreservationSum / static_cast<double>(result.evaluatedTiles))
-            : 1.0f;
-    result.oversmoothingScore = result.evaluatedTiles > 0
-            ? static_cast<float>(oversmoothingSum / static_cast<double>(result.evaluatedTiles))
-            : 0.0f;
-    if (result.evaluatedTiles == 0) {
-        candidate.mosaic = before.clone();
-        result.attenuatedPixelFraction = 1.0f;
-        result.rolledBackPixelFraction = result.attenuatedPixelFraction;
-        return result;
-    }
-
-    const int width = candidate.mosaic.cols;
-    const int height = candidate.mosaic.rows;
-    std::atomic<uint64_t> rolledBack{0};
-    cv::parallel_for_(cv::Range(0, height), [&](const cv::Range& range) {
-        uint64_t localRollback = 0;
-        for (int y = range.start; y < range.end; ++y) {
-            const float* beforeRow = before.ptr<float>(y);
-            float* candidateRow = candidate.mosaic.ptr<float>(y);
-            const float gy = (static_cast<float>(y) + 0.5f) /
-                    static_cast<float>(std::max(1, beforeField.tileHeight)) - 0.5f;
-            const int gy0 = std::clamp(static_cast<int>(std::floor(gy)), 0, beforeField.gridRows - 1);
-            const int gy1 = std::min(gy0 + 1, beforeField.gridRows - 1);
-            const float ty = std::clamp(gy - static_cast<float>(gy0), 0.0f, 1.0f);
-            for (int x = 0; x < width; ++x) {
-                const float gx = (static_cast<float>(x) + 0.5f) /
-                        static_cast<float>(std::max(1, beforeField.tileWidth)) - 0.5f;
-                const int gx0 = std::clamp(static_cast<int>(std::floor(gx)), 0, beforeField.gridCols - 1);
-                const int gx1 = std::min(gx0 + 1, beforeField.gridCols - 1);
-                const float tx = std::clamp(gx - static_cast<float>(gx0), 0.0f, 1.0f);
-                const auto weightAt = [&](int gxIndex, int gyIndex) -> float {
-                    return acceptance[flatIndex2d(gyIndex, beforeField.gridCols, gxIndex)];
-                };
-                const float top = weightAt(gx0, gy0) +
-                        (weightAt(gx1, gy0) - weightAt(gx0, gy0)) * tx;
-                const float bottom = weightAt(gx0, gy1) +
-                        (weightAt(gx1, gy1) - weightAt(gx0, gy1)) * tx;
-                const float weight = std::clamp(top + (bottom - top) * ty, 0.0f, 1.0f);
-                const float proposed = candidateRow[x];
-                candidateRow[x] = beforeRow[x] + weight * (proposed - beforeRow[x]);
-                if (weight < 0.999f) localRollback++;
-            }
-        }
-        rolledBack.fetch_add(localRollback, std::memory_order_relaxed);
-    });
-    result.attenuatedPixelFraction = candidate.mosaic.total() > 0
-            ? static_cast<float>(rolledBack.load(std::memory_order_relaxed)) /
-                    static_cast<float>(candidate.mosaic.total())
-            : 0.0f;
-    result.rolledBackPixelFraction = result.attenuatedPixelFraction;
-    return result;
-}
 SpectraPass0State IspCore::computePass0State(
         const LinearFloatRaw& raw,
         const IspFrameMetadata& meta,
@@ -4114,40 +3817,11 @@ SpectraPass0State IspCore::computePass0State(
             state.greenSplitTileConsensus *
             std::clamp(1.0f - state.greenSplitMad / std::max(consistencyLimit, 1.0e-6f), 0.0f, 1.0f);
 
-    if (state.sceneBlackImageMutationAllowed &&
-        state.acceptedTileCount >= 16 &&
-        state.greenSplitTileCount >= 12 &&
-        state.greenSplitTileConsensus >= 0.80f &&
-        state.channelBiasConfidence >= 0.04f &&
-        std::abs(state.g1g2Before) > activationThresholdCode &&
-        state.greenSplitMad <= consistencyLimit) {
-        const float halfCorrectionCode = std::clamp(
-                0.5f * state.g1g2Before,
-                -1.0f,
-                1.0f
-        );
-        const float normalizedHalf = halfCorrectionCode / std::max(1.0f, whiteLevel);
-        const float boundedIsoAuthority = std::clamp(0.45f + 0.55f * state.isoAuthority, 0.45f, 1.0f);
-        state.appliedChannelBias[1] = -normalizedHalf * boundedIsoAuthority;
-        state.appliedChannelBias[2] = normalizedHalf * boundedIsoAuthority;
-        state.channelBiasAfter = channelMedians;
-        state.channelBiasAfter[1] += state.appliedChannelBias[1] * whiteLevel;
-        state.channelBiasAfter[2] += state.appliedChannelBias[2] * whiteLevel;
-        state.g1g2After = state.g1g2Before +
-                (state.appliedChannelBias[1] - state.appliedChannelBias[2]) * whiteLevel;
-        state.applyChannelBias = true;
-        state.fallbackReason = "none";
-    } else {
-        state.g1g2After = state.g1g2Before;
-        state.fallbackReason = state.sceneBlackImageMutationAllowed
-                ? "no_confident_green_split_bias"
-                : "metadata_black_authoritative_scene_scan_validator_only";
-    }
-
-    // Row/column and low-frequency classical correction ownership is retired.
-    // These flags remain false; observer-only pattern evidence must not mutate RAW pixels.
-    state.applyRowCorrection = false;
-    state.applyColumnCorrection = false;
+    // Pre-neural boundary: retain the measured CFA/black-pattern evidence only.
+    // Classical black/green-split correction planning has no pixel authority.
+    state.sceneBlackImageMutationAllowed = false;
+    state.sceneBlackAuthorityMode = "OBSERVER_ONLY_NEURAL_PENDING";
+    state.fallbackReason = "observer_only_neural_pending";
     return state;
 }
 
@@ -4346,404 +4020,27 @@ SpectraPass0State IspCore::computePass0StateCompact(
             state.greenSplitTileConsensus *
             std::clamp(1.0f - state.greenSplitMad / std::max(consistencyLimit, 1.0e-6f), 0.0f, 1.0f);
 
-    if (state.sceneBlackImageMutationAllowed &&
-        state.acceptedTileCount >= 16 && state.greenSplitTileCount >= 12 &&
-        state.greenSplitTileConsensus >= 0.80f && state.channelBiasConfidence >= 0.04f &&
-        std::abs(state.g1g2Before) > activationThresholdCode &&
-        state.greenSplitMad <= consistencyLimit) {
-        const float halfCorrectionCode = std::clamp(0.5f * state.g1g2Before, -1.0f, 1.0f);
-        const float normalizedHalf = halfCorrectionCode / std::max(1.0f, whiteLevel);
-        const float boundedIsoAuthority = std::clamp(0.45f + 0.55f * state.isoAuthority, 0.45f, 1.0f);
-        state.appliedChannelBias[1] = -normalizedHalf * boundedIsoAuthority;
-        state.appliedChannelBias[2] = normalizedHalf * boundedIsoAuthority;
-        state.channelBiasAfter = channelMedians;
-        state.channelBiasAfter[1] += state.appliedChannelBias[1] * whiteLevel;
-        state.channelBiasAfter[2] += state.appliedChannelBias[2] * whiteLevel;
-        state.g1g2After = state.g1g2Before +
-                (state.appliedChannelBias[1] - state.appliedChannelBias[2]) * whiteLevel;
-        state.applyChannelBias = true;
-        state.fallbackReason = "none";
-    } else {
-        state.g1g2After = state.g1g2Before;
-        state.fallbackReason = state.sceneBlackImageMutationAllowed
-                ? "no_confident_green_split_bias"
-                : "metadata_black_authoritative_scene_scan_validator_only";
-    }
-    state.applyRowCorrection = false;
-    state.applyColumnCorrection = false;
+    // Pre-neural boundary: retain the measured CFA/black-pattern evidence only.
+    // Classical black/green-split correction planning has no pixel authority.
+    state.sceneBlackImageMutationAllowed = false;
+    state.sceneBlackAuthorityMode = "OBSERVER_ONLY_NEURAL_PENDING";
+    state.fallbackReason = "observer_only_neural_pending";
     return state;
-}
-
-void IspCore::applySpectraPass0(
-        LinearFloatRaw& raw,
-        const IspFrameMetadata& meta,
-        const SpectraPass0State& pass0State
-) {
-    if (!pass0State.applyChannelBias && !pass0State.applyRowCorrection && !pass0State.applyColumnCorrection) {
-        return;
-    }
-
-    if (raw.mosaic.empty() || raw.mosaic.type() != CV_32FC1) return;
-
-    const int width = raw.mosaic.cols;
-    const int height = raw.mosaic.rows;
-    const int cfaPattern = cfaPatternOrDefault(raw.info.effectiveCfaPattern);
-
-    if (pass0State.applyChannelBias) {
-        cv::parallel_for_(cv::Range(0, height), [&](const cv::Range& range) {
-            for (int y = range.start; y < range.end; ++y) {
-                float* row = raw.mosaic.ptr<float>(y);
-                for (int x = 0; x < width; ++x) {
-                    const int ch = cfaColorChannel(cfaPattern, x, y);
-                    if (ch >= 0 && ch < 4) {
-                        row[x] += pass0State.appliedChannelBias[ch];
-                    }
-                }
-            }
-        });
-    }
-}
-
-
-
-float spectraGreenGuideAt(
-        const cv::Mat& mosaic,
-        int cfaPattern,
-        int x,
-        int y
-) {
-    if (mosaic.empty()) return 0.0f;
-    x = std::clamp(x, 0, mosaic.cols - 1);
-    y = std::clamp(y, 0, mosaic.rows - 1);
-    const int channel = cfaColorChannel(cfaPattern, x, y);
-    if (channel == 1 || channel == 2) return mosaic.ptr<float>(y)[x];
-    double sum = 0.0;
-    int count = 0;
-    constexpr int dx[4] = {-1, 1, 0, 0};
-    constexpr int dy[4] = {0, 0, -1, 1};
-    for (int i = 0; i < 4; ++i) {
-        const int sx = std::clamp(x + dx[i], 0, mosaic.cols - 1);
-        const int sy = std::clamp(y + dy[i], 0, mosaic.rows - 1);
-        const int neighbourChannel = cfaColorChannel(cfaPattern, sx, sy);
-        if (neighbourChannel == 1 || neighbourChannel == 2) {
-            sum += mosaic.ptr<float>(sy)[sx];
-            ++count;
-        }
-    }
-    return count > 0 ? static_cast<float>(sum / static_cast<double>(count))
-                     : mosaic.ptr<float>(y)[x];
-}
-
-struct SpectraStructureTensorCell {
-    float jxx = 0.0f;
-    float jxy = 0.0f;
-    float jyy = 0.0f;
-    float gradientNoiseVariance = 1.0e-8f;
-};
-
-struct SpectraStructureTensorField {
-    int step = 16;
-    int columns = 0;
-    int rows = 0;
-    int imageWidth = 0;
-    int imageHeight = 0;
-    bool valid = false;
-    std::vector<SpectraStructureTensorCell> cells;
-
-    [[nodiscard]] const SpectraStructureTensorCell& at(int x, int y) const {
-        return cells[flatIndex2d(y, columns, x)];
-    }
-};
-
-SpectraStructureTensorField buildSpectraStructureTensorField(
-        const cv::Mat& mosaic,
-        int cfaPattern,
-        double greenS,
-        double greenO
-) {
-    SpectraStructureTensorField field{};
-    field.imageWidth = mosaic.cols;
-    field.imageHeight = mosaic.rows;
-    if (mosaic.empty() || mosaic.type() != CV_32FC1 || mosaic.cols < 16 || mosaic.rows < 16) {
-        return field;
-    }
-    field.columns = std::max(2, (mosaic.cols + field.step - 1) / field.step + 1);
-    field.rows = std::max(2, (mosaic.rows + field.step - 1) / field.step + 1);
-    field.cells.resize(static_cast<size_t>(field.columns) * static_cast<size_t>(field.rows));
-
-    cv::parallel_for_(cv::Range(0, field.rows), [&](const cv::Range& range) {
-        constexpr float spatialWeights[9] = {
-            0.50f, 0.72f, 0.50f,
-            0.72f, 1.00f, 0.72f,
-            0.50f, 0.72f, 0.50f
-        };
-        for (int gy = range.start; gy < range.end; ++gy) {
-            const int cy = std::clamp(gy * field.step, 4, mosaic.rows - 5);
-            for (int gx = 0; gx < field.columns; ++gx) {
-                const int cx = std::clamp(gx * field.step, 4, mosaic.cols - 5);
-                double jxx = 0.0;
-                double jxy = 0.0;
-                double jyy = 0.0;
-                double weightSum = 0.0;
-                int sampleIndex = 0;
-                for (int oy = -2; oy <= 2; oy += 2) {
-                    for (int ox = -2; ox <= 2; ox += 2) {
-                        const int px = cx + ox;
-                        const int py = cy + oy;
-                        const float gradX = 0.25f * (
-                                spectraGreenGuideAt(mosaic, cfaPattern, px + 2, py) -
-                                spectraGreenGuideAt(mosaic, cfaPattern, px - 2, py)
-                        );
-                        const float gradY = 0.25f * (
-                                spectraGreenGuideAt(mosaic, cfaPattern, px, py + 2) -
-                                spectraGreenGuideAt(mosaic, cfaPattern, px, py - 2)
-                        );
-                        const float weight = spatialWeights[sampleIndex++];
-                        if (!std::isfinite(gradX) || !std::isfinite(gradY)) continue;
-                        jxx += static_cast<double>(weight * gradX * gradX);
-                        jxy += static_cast<double>(weight * gradX * gradY);
-                        jyy += static_cast<double>(weight * gradY * gradY);
-                        weightSum += weight;
-                    }
-                }
-                const float centerGreen = spectraGreenGuideAt(mosaic, cfaPattern, cx, cy);
-                const double greenVariance = std::max(
-                        1.0e-12,
-                        greenS * std::max(0.0f, centerGreen) + greenO
-                );
-                // Central differences and local green interpolation reduce the raw
-                // per-sample variance. Keep a conservative floor so noise alone
-                // does not acquire directional authority.
-                const float gradientNoiseVariance = static_cast<float>(
-                        std::max(1.0e-10, 0.42 * greenVariance)
-                );
-                SpectraStructureTensorCell cell{};
-                if (weightSum > 1.0e-8) {
-                    cell.jxx = static_cast<float>(jxx / weightSum);
-                    cell.jxy = static_cast<float>(jxy / weightSum);
-                    cell.jyy = static_cast<float>(jyy / weightSum);
-                }
-                cell.gradientNoiseVariance = gradientNoiseVariance;
-                field.cells[flatIndex2d(gy, field.columns, gx)] = cell;
-            }
-        }
-    });
-    field.valid = !field.cells.empty();
-    return field;
-}
-
-float spectraGreenGuideAt(
-        const RawNormalizedSampleView& raw,
-        int cfaPattern,
-        int x,
-        int y
-) {
-    if (!raw.valid || raw.info.width <= 0 || raw.info.height <= 0) return 0.0f;
-    x = std::clamp(x, 0, raw.info.width - 1);
-    y = std::clamp(y, 0, raw.info.height - 1);
-    const int channel = cfaColorChannel(cfaPattern, x, y);
-    if (channel == 1 || channel == 2) return raw.sample(x, y);
-    double sum = 0.0;
-    int count = 0;
-    constexpr int dx[4] = {-1, 1, 0, 0};
-    constexpr int dy[4] = {0, 0, -1, 1};
-    for (int i = 0; i < 4; ++i) {
-        const int sx = std::clamp(x + dx[i], 0, raw.info.width - 1);
-        const int sy = std::clamp(y + dy[i], 0, raw.info.height - 1);
-        const int neighbourChannel = cfaColorChannel(cfaPattern, sx, sy);
-        if (neighbourChannel == 1 || neighbourChannel == 2) {
-            const float value = raw.sample(sx, sy);
-            if (std::isfinite(value)) {
-                sum += value;
-                ++count;
-            }
-        }
-    }
-    const float center = raw.sample(x, y);
-    return count > 0 ? static_cast<float>(sum / static_cast<double>(count))
-                     : (std::isfinite(center) ? center : 0.0f);
-}
-
-SpectraStructureTensorField buildSpectraStructureTensorFieldCompact(
-        const RawNormalizedSampleView& raw,
-        int cfaPattern,
-        double greenS,
-        double greenO
-) {
-    SpectraStructureTensorField field{};
-    field.imageWidth = raw.info.width;
-    field.imageHeight = raw.info.height;
-    if (!raw.valid || raw.info.width < 16 || raw.info.height < 16) return field;
-    field.columns = std::max(2, (raw.info.width + field.step - 1) / field.step + 1);
-    field.rows = std::max(2, (raw.info.height + field.step - 1) / field.step + 1);
-    field.cells.resize(static_cast<size_t>(field.columns) * static_cast<size_t>(field.rows));
-
-    // CONTROL_OK: CPU work is bounded to the step-16 tensor grid; no full-frame pixel pass.
-    cv::parallel_for_(cv::Range(0, field.rows), [&](const cv::Range& range) {
-        constexpr float spatialWeights[9] = {
-            0.50f, 0.72f, 0.50f,
-            0.72f, 1.00f, 0.72f,
-            0.50f, 0.72f, 0.50f
-        };
-        for (int gy = range.start; gy < range.end; ++gy) {
-            const int cy = std::clamp(gy * field.step, 4, raw.info.height - 5);
-            for (int gx = 0; gx < field.columns; ++gx) {
-                const int cx = std::clamp(gx * field.step, 4, raw.info.width - 5);
-                double jxx = 0.0;
-                double jxy = 0.0;
-                double jyy = 0.0;
-                double weightSum = 0.0;
-                int sampleIndex = 0;
-                for (int oy = -2; oy <= 2; oy += 2) {
-                    for (int ox = -2; ox <= 2; ox += 2) {
-                        const int px = cx + ox;
-                        const int py = cy + oy;
-                        const float gradX = 0.25f * (
-                                spectraGreenGuideAt(raw, cfaPattern, px + 2, py) -
-                                spectraGreenGuideAt(raw, cfaPattern, px - 2, py));
-                        const float gradY = 0.25f * (
-                                spectraGreenGuideAt(raw, cfaPattern, px, py + 2) -
-                                spectraGreenGuideAt(raw, cfaPattern, px, py - 2));
-                        const float weight = spatialWeights[sampleIndex++];
-                        if (!std::isfinite(gradX) || !std::isfinite(gradY)) continue;
-                        jxx += static_cast<double>(weight * gradX * gradX);
-                        jxy += static_cast<double>(weight * gradX * gradY);
-                        jyy += static_cast<double>(weight * gradY * gradY);
-                        weightSum += weight;
-                    }
-                }
-                const float centerGreen = spectraGreenGuideAt(raw, cfaPattern, cx, cy);
-                const double greenVariance = std::max(
-                        1.0e-12, greenS * std::max(0.0f, centerGreen) + greenO);
-                const float gradientNoiseVariance = static_cast<float>(
-                        std::max(1.0e-10, 0.42 * greenVariance));
-                SpectraStructureTensorCell cell{};
-                if (weightSum > 1.0e-8) {
-                    cell.jxx = static_cast<float>(jxx / weightSum);
-                    cell.jxy = static_cast<float>(jxy / weightSum);
-                    cell.jyy = static_cast<float>(jyy / weightSum);
-                }
-                cell.gradientNoiseVariance = gradientNoiseVariance;
-                field.cells[flatIndex2d(gy, field.columns, gx)] = cell;
-            }
-        }
-    });
-    field.valid = !field.cells.empty();
-    return field;
-}
-
-bncam::spectra2::StructureTensorEstimate interpolateSpectraStructureTensor(
-        const SpectraStructureTensorField& field,
-        int x,
-        int y
-) {
-    if (!field.valid || field.columns < 2 || field.rows < 2) return {};
-    const float fx = std::clamp(
-            static_cast<float>(x) / static_cast<float>(field.step),
-            0.0f,
-            static_cast<float>(field.columns - 1)
-    );
-    const float fy = std::clamp(
-            static_cast<float>(y) / static_cast<float>(field.step),
-            0.0f,
-            static_cast<float>(field.rows - 1)
-    );
-    const int x0 = std::min(field.columns - 2, static_cast<int>(std::floor(fx)));
-    const int y0 = std::min(field.rows - 2, static_cast<int>(std::floor(fy)));
-    const int x1 = x0 + 1;
-    const int y1 = y0 + 1;
-    const float tx = std::clamp(fx - static_cast<float>(x0), 0.0f, 1.0f);
-    const float ty = std::clamp(fy - static_cast<float>(y0), 0.0f, 1.0f);
-    auto interpolate = [&](float SpectraStructureTensorCell::*member) -> float {
-        const float top = (field.at(x0, y0)).*member * (1.0f - tx) +
-                (field.at(x1, y0)).*member * tx;
-        const float bottom = (field.at(x0, y1)).*member * (1.0f - tx) +
-                (field.at(x1, y1)).*member * tx;
-        return top * (1.0f - ty) + bottom * ty;
-    };
-    return bncam::spectra2::structureTensorFromMoments(
-            interpolate(&SpectraStructureTensorCell::jxx),
-            interpolate(&SpectraStructureTensorCell::jxy),
-            interpolate(&SpectraStructureTensorCell::jyy),
-            interpolate(&SpectraStructureTensorCell::gradientNoiseVariance)
-    );
-}
-
-float histogramPercentile(
-        const std::array<std::uint64_t, 32>& histogram,
-        std::uint64_t count,
-        float quantile
-) {
-    if (count == 0) return 0.0f;
-    const std::uint64_t target = static_cast<std::uint64_t>(
-            std::ceil(std::clamp(quantile, 0.0f, 1.0f) * static_cast<float>(count))
-    );
-    std::uint64_t cumulative = 0;
-    for (size_t i = 0; i < histogram.size(); ++i) {
-        cumulative += histogram[i];
-        if (cumulative >= std::max<std::uint64_t>(1, target)) {
-            return (static_cast<float>(i) + 0.5f) /
-                    static_cast<float>(histogram.size());
-        }
-    }
-    return 1.0f;
 }
 
 std::string SpectraPass1State::formatDebugString() const {
     std::ostringstream out;
     out << std::fixed << std::setprecision(4);
-    out << "spectraPass1={"
-        << "mode=" << (physicalBaselineMode ? "physical_single_frame" : (spectraMode == 1 ? "auto" : (spectraMode == 2 ? "manual" : "legacy")))
-        << ";authoritySource=" << authoritySource
-        << ";applied=" << (applied ? "true" : "false")
-        << ";vstResidualVar=" << averageVstResidualVar
-        << ";maxPixelShift=" << maxPixelShift
+    out << "spectraNoiseObserver={"
+        << "mode=" << (spectraMode == 1 ? "auto" : (spectraMode == 2 ? "manual" : "off"))
         << ";modelConfidence=" << modelConfidence
-        << ";blendStrength=" << blendStrength
-        << ";averageWienerGain=" << averageWienerGain
-        << ";edgeProtectedFraction=" << edgeProtectedFraction
-        << ";changedPixelFraction=" << changedPixelFraction
-        << ";isoAuthority=" << isoAuthority
+        << ";isoEvidenceAuthority=" << isoAuthority
         << ";combinedNoisePressure=" << combinedNoisePressure
-        << ";meanShadingAuthority=" << localShadingAuthorityMean
-        << ";noRegretAcceptedTiles=" << noRegretAcceptedTileFraction
-        << ";noRegretRollback=" << noRegretRollbackFraction
         << ";effectiveS=[" << effectiveS[0] << "," << effectiveS[1] << "," << effectiveS[2] << "," << effectiveS[3] << "]"
         << ";effectiveO=[" << effectiveO[0] << "," << effectiveO[1] << "," << effectiveO[2] << "," << effectiveO[3] << "]"
-        << ";fallbackReason=" << fallbackReason
+        << ";status=" << fallbackReason
+        << ";pixelAuthority=false"
         << ";processingTimeMs=" << processingTimeMs
-        << ";anisotropicStatus=" << anisotropicDetail.status
-        << ";anisotropicApplied=" << (anisotropicDetail.applied ? "true" : "false")
-        << ";tensorConfidenceP50=" << anisotropicDetail.confidenceP50
-        << ";tensorCoherenceP50=" << anisotropicDetail.coherenceP50
-        << ";tensorFallbackFraction=" << anisotropicDetail.fallbackFraction
-        << ";contextFlatFraction=" << anisotropicDetail.contextFlatFraction
-        << ";contextStructureProtectedFraction=" << anisotropicDetail.contextStructureProtectedFraction
-        << ";contextBoostedFraction=" << anisotropicDetail.contextBoostedFraction
-        << ";vulkanKernelConnected=" << (vulkanKernelConnected ? "true" : "false")
-        << ";vulkanAttempted=" << (vulkanAttempted ? "true" : "false")
-        << ";vulkanExecutionSucceeded=" << (vulkanExecutionSucceeded ? "true" : "false")
-        << ";vulkanUsedForOutput=" << (vulkanUsedForOutput ? "true" : "false")
-        << ";vulkanCpuFallbackUsed=" << (vulkanCpuFallbackUsed ? "true" : "false")
-        << ";vulkanGpuNoRegretBlendUsed=" << (vulkanGpuNoRegretBlendUsed ? "true" : "false")
-        << ";vulkanCandidateReadbackAvoided=" << (vulkanCandidateReadbackAvoided ? "true" : "false")
-        << ";vulkanPersistentReuseHit=" << (vulkanPersistentReuseHit ? "true" : "false")
-        << ";vulkanPersistentReallocated=" << (vulkanPersistentReallocated ? "true" : "false")
-        << ";vulkanStatus=" << vulkanStatus
-        << ";vulkanFailureReason=" << vulkanFailureReason
-        << ";vulkanInputPackingMs=" << vulkanInputPackingMs
-        << ";vulkanTensorUploadMs=" << vulkanTensorUploadMs
-        << ";vulkanPass1KernelMs=" << vulkanPass1KernelMs
-        << ";vulkanTileStatisticsKernelMs=" << vulkanTileStatisticsKernelMs
-        << ";vulkanNoRegretDecisionMs=" << vulkanNoRegretDecisionMs
-        << ";vulkanNoRegretBlendMs=" << vulkanNoRegretBlendMs
-        << ";vulkanGpuKernelMs=" << vulkanGpuKernelMs
-        << ";vulkanSynchronizationMs=" << vulkanSynchronizationMs
-        << ";vulkanReadbackMs=" << vulkanReadbackMs
-        << ";vulkanTransferAndSyncMs=" << vulkanTransferAndSyncMs
-        << ";vulkanTotalMs=" << vulkanTotalMs
-        << ";vulkanResidentBytes=" << vulkanResidentBytes
-        << ";vulkanAllocationGeneration=" << vulkanAllocationGeneration
         << "}";
     return out.str();
 }
@@ -4755,76 +4052,31 @@ SpectraPass1State computePass1StateForInputAvailability(
 ) {
     SpectraPass1State state{};
     state.spectraMode = meta.calibration.spectraProcessingMode;
-    state.anisotropicDetail.enabled = state.spectraMode != 0;
-    state.anisotropicDetail.status = state.spectraMode == 0
-            ? "SPECTRA_OFF"
-            : "WAITING_FOR_PASS1_ELIGIBILITY";
-
     if (state.spectraMode == 0) {
-        state.fallbackReason = "legacy_mode";
-        state.anisotropicDetail.status = "SPECTRA_OFF";
+        state.fallbackReason = "spectra_off";
         return state;
     }
-
     if (!inputAvailable) {
-        state.fallbackReason = "mosaic_empty";
-        state.anisotropicDetail.status = "PASS1_NOT_ELIGIBLE_MOSAIC_EMPTY";
+        state.fallbackReason = "mosaic_unavailable";
         return state;
     }
-
     if (!meta.calibration.spectraSnapshotPresent) {
         state.fallbackReason = "snapshot_not_present_or_invalid";
-        state.anisotropicDetail.status = "PASS1_NO_CAPTURE_NOISE_SNAPSHOT";
         return state;
     }
-
     for (int ch = 0; ch < 4; ++ch) {
         state.effectiveS[ch] = meta.calibration.effectiveS[ch];
         state.effectiveO[ch] = meta.calibration.effectiveO[ch];
-    }
-
-    bool allChannelsValid = true;
-    for (int ch = 0; ch < 4; ++ch) {
         if (!isVstValid(state.effectiveS[ch], state.effectiveO[ch])) {
-            allChannelsValid = false;
-            break;
+            state.fallbackReason = "invalid_or_zero_so_parameters";
+            return state;
         }
     }
-
-    if (!allChannelsValid) {
-        state.fallbackReason = "invalid_or_zero_so_parameters";
-        state.anisotropicDetail.status = "PASS1_INVALID_SO_MODEL";
-        return state;
-    }
-
     state.modelConfidence = std::clamp(meta.calibration.signalModelConfidence, 0.0f, 1.0f);
-    if (state.modelConfidence < 0.25f) {
-        state.fallbackReason = "low_signal_model_confidence";
-        state.anisotropicDetail.status = "PASS1_MODEL_CONFIDENCE_TOO_LOW";
-        return state;
-    }
-
     const SpectraIsoAdaptiveState isoState = IspCore::resolveSpectraIsoAdaptiveState(meta, uiConfig);
     state.isoAuthority = isoState.lumaAuthority;
     state.combinedNoisePressure = isoState.combinedNoisePressure;
-    // ISO changes authority continuously, while the real S/O model still defines
-    // the per-pixel sigma. Low ISO therefore preserves micro-detail; high ISO
-    // unlocks stronger high-frequency shrinkage without a hard threshold jump.
-    // Context Fusion separates stochastic CFA variation from coherent structure
-    // in noise-sigma units. Authority can therefore follow the physical noise
-    // pressure more directly than the old globally conservative blend. Profile
-    // luma/strength still modulate isoState.lumaAuthority and remain authoritative.
-    const float pressureAuthority = 0.22f + 1.35f * isoState.combinedNoisePressure;
-    const float confidenceAuthority = 0.72f + 0.28f * state.modelConfidence;
-    const float profileAuthority = std::sqrt(std::clamp(isoState.lumaAuthority, 0.08f, 1.65f));
-    state.blendStrength = std::clamp(
-            pressureAuthority * confidenceAuthority * profileAuthority,
-            0.08f,
-            1.18f
-    );
-    state.maxPixelShift = 0.85f + 1.85f * isoState.combinedNoisePressure;
-    state.anisotropicDetail.status = "MILESTONE_5_PLAN_READY";
-    state.applied = true;
+    state.fallbackReason = "observer_only_neural_pending";
     return state;
 }
 
@@ -4844,579 +4096,6 @@ SpectraPass1State IspCore::computePass1StateCompact(
 ) {
     return computePass1StateForInputAvailability(
             raw.valid && raw.info.width > 0 && raw.info.height > 0, meta, uiConfig);
-}
-
-void IspCore::applySpectraPass1(
-        LinearFloatRaw& raw,
-        const IspFrameMetadata& meta,
-        SpectraPass1State& pass1State
-) {
-    if (!pass1State.applied || (pass1State.spectraMode == 0 && !pass1State.physicalBaselineMode)) return;
-    if (raw.mosaic.empty() || raw.mosaic.type() != CV_32FC1) return;
-
-    const int width = raw.mosaic.cols;
-    const int height = raw.mosaic.rows;
-    if (width < 17 || height < 17) return;
-    const int cfaPattern = cfaPatternOrDefault(raw.info.effectiveCfaPattern);
-
-    // Milestone 5 retains the proven VST Wiener estimator, but replaces its
-    // direction-blind support at credible edges with a continuously interpolated
-    // green/luma structure tensor. Low-confidence tensor locations execute the
-    // established isotropic path exactly, providing a safe per-pixel fallback.
-    const cv::Mat source = raw.mosaic.clone();
-    cv::Mat destination = source.clone();
-
-    const double greenS = 0.5 * (
-            pass1State.effectiveS[1] + pass1State.effectiveS[2]
-    );
-    const double greenO = 0.5 * (
-            pass1State.effectiveO[1] + pass1State.effectiveO[2]
-    );
-    const auto tensorBuildStart = IspClock::now();
-    const SpectraStructureTensorField tensorField = buildSpectraStructureTensorField(
-            source,
-            cfaPattern,
-            greenS,
-            greenO
-    );
-    pass1State.anisotropicDetail.tensorFieldBuildMs = elapsedMs(tensorBuildStart);
-    pass1State.anisotropicDetail.enabled = true;
-
-    struct RuntimeStats {
-        double localVarianceSum = 0.0;
-        double wienerGainSum = 0.0;
-        double shadingAuthoritySum = 0.0;
-        double tensorConfidenceSum = 0.0;
-        double tensorCoherenceSum = 0.0;
-        double directionalWeightSum = 0.0;
-        double isotropicAuthorityScaleSum = 0.0;
-        double finalAuthorityScaleSum = 0.0;
-        std::uint64_t evaluated = 0;
-        std::uint64_t changed = 0;
-        std::uint64_t edgeProtected = 0;
-        std::uint64_t validTensor = 0;
-        std::uint64_t confidentTensor = 0;
-        std::uint64_t fallback = 0;
-        std::uint64_t directionalChanged = 0;
-        std::uint64_t directionalWeightSamples = 0;
-        std::uint64_t crossEdgeProtectedSamples = 0;
-        std::uint64_t alongStructureSupportedSamples = 0;
-        std::uint64_t contextFlatPixels = 0;
-        std::uint64_t contextStructureProtectedPixels = 0;
-        std::uint64_t contextBoostedPixels = 0;
-        std::array<std::uint64_t, 4> orientationHistogram{0, 0, 0, 0};
-        std::array<std::uint64_t, 32> confidenceHistogram{};
-        std::array<std::uint64_t, 32> coherenceHistogram{};
-        float maximumLinearCorrection = 0.0f;
-
-        void addHistogram(
-                std::array<std::uint64_t, 32>& histogram,
-                float value
-        ) {
-            const int bin = std::clamp(
-                    static_cast<int>(std::floor(
-                            bncam::spectra2::anisotropicFiniteUnit(value) * 32.0f
-                    )),
-                    0,
-                    31
-            );
-            histogram[static_cast<size_t>(bin)]++;
-        }
-
-        void merge(const RuntimeStats& other) {
-            localVarianceSum += other.localVarianceSum;
-            wienerGainSum += other.wienerGainSum;
-            shadingAuthoritySum += other.shadingAuthoritySum;
-            tensorConfidenceSum += other.tensorConfidenceSum;
-            tensorCoherenceSum += other.tensorCoherenceSum;
-            directionalWeightSum += other.directionalWeightSum;
-            isotropicAuthorityScaleSum += other.isotropicAuthorityScaleSum;
-            finalAuthorityScaleSum += other.finalAuthorityScaleSum;
-            evaluated += other.evaluated;
-            changed += other.changed;
-            edgeProtected += other.edgeProtected;
-            validTensor += other.validTensor;
-            confidentTensor += other.confidentTensor;
-            fallback += other.fallback;
-            directionalChanged += other.directionalChanged;
-            directionalWeightSamples += other.directionalWeightSamples;
-            crossEdgeProtectedSamples += other.crossEdgeProtectedSamples;
-            alongStructureSupportedSamples += other.alongStructureSupportedSamples;
-            contextFlatPixels += other.contextFlatPixels;
-            contextStructureProtectedPixels += other.contextStructureProtectedPixels;
-            contextBoostedPixels += other.contextBoostedPixels;
-            maximumLinearCorrection = std::max(
-                    maximumLinearCorrection,
-                    other.maximumLinearCorrection
-            );
-            for (size_t i = 0; i < orientationHistogram.size(); ++i) {
-                orientationHistogram[i] += other.orientationHistogram[i];
-            }
-            for (size_t i = 0; i < confidenceHistogram.size(); ++i) {
-                confidenceHistogram[i] += other.confidenceHistogram[i];
-                coherenceHistogram[i] += other.coherenceHistogram[i];
-            }
-        }
-    };
-
-    RuntimeStats total{};
-    std::mutex statsMutex;
-    const auto directionalFilterStart = IspClock::now();
-    cv::parallel_for_(cv::Range(8, height - 8), [&](const cv::Range& range) {
-        RuntimeStats local{};
-        constexpr int sampleDx[9] = {0, -2, 0, 2, -2, 2, -2, 0, 2};
-        constexpr int sampleDy[9] = {0, -2, -2, -2, 0, 0, 2, 2, 2};
-
-        for (int y = range.start; y < range.end; ++y) {
-            float* outRow = destination.ptr<float>(y);
-            const float* rowCurr = source.ptr<float>(y);
-            const float* rowM2 = source.ptr<float>(y - 2);
-            const float* rowP2 = source.ptr<float>(y + 2);
-            const float* rowM4 = source.ptr<float>(y - 4);
-            const float* rowP4 = source.ptr<float>(y + 4);
-
-            for (int x = 8; x < width - 8; ++x) {
-                const int ch = cfaColorChannel(cfaPattern, x, y);
-                if (ch < 0 || ch >= 4) continue;
-                const double S = pass1State.effectiveS[ch];
-                const double O = pass1State.effectiveO[ch];
-                if (!isVstValid(S, O)) continue;
-
-                const float samples[9] = {
-                    rowCurr[x],
-                    rowM2[x - 2], rowM2[x], rowM2[x + 2],
-                    rowCurr[x - 2], rowCurr[x + 2],
-                    rowP2[x - 2], rowP2[x], rowP2[x + 2]
-                };
-                bool validDomain = true;
-                for (float sample : samples) {
-                    if (!std::isfinite(sample) || !isVstValidDomain(sample, S, O)) {
-                        validDomain = false;
-                        break;
-                    }
-                }
-                if (!validDomain) continue;
-
-                std::array<float, 9> vst{};
-                for (int i = 0; i < 9; ++i) {
-                    vst[static_cast<size_t>(i)] = spectraForwardVst(samples[i], S, O);
-                }
-                const float center = vst[0];
-                std::array<float, 9> sorted = vst;
-                std::sort(sorted.begin(), sorted.end());
-                const float median = sorted[4];
-                std::array<float, 9> madSamples{};
-                for (size_t i = 0; i < vst.size(); ++i) {
-                    madSamples[i] = std::abs(vst[i] - median);
-                }
-                std::sort(madSamples.begin(), madSamples.end());
-                constexpr float kExpectedNineSampleGaussianMad = 0.58601043f;
-                const float normalizedMad = madSamples[4] / kExpectedNineSampleGaussianMad;
-
-                const auto tensor = interpolateSpectraStructureTensor(tensorField, x, y);
-                if (tensor.valid) {
-                    local.validTensor++;
-                    local.tensorConfidenceSum += tensor.confidence;
-                    local.tensorCoherenceSum += tensor.coherence;
-                    local.addHistogram(local.confidenceHistogram, tensor.confidence);
-                    local.addHistogram(local.coherenceHistogram, tensor.coherence);
-                }
-                if (tensor.confident) {
-                    local.confidentTensor++;
-                    local.orientationHistogram[static_cast<size_t>(
-                            bncam::spectra2::orientationBin(tensor.tangentDegrees)
-                    )]++;
-                } else {
-                    local.fallback++;
-                }
-
-                const float centerGreen = spectraGreenGuideAt(source, cfaPattern, x, y);
-                const float greenSigma = static_cast<float>(std::sqrt(std::max(
-                        1.0e-12,
-                        greenS * std::max(0.0f, centerGreen) + greenO
-                )));
-
-                constexpr float kSqrt2 = 1.4142135623730951f;
-                const float sameCfaHorizontalZ = std::abs(vst[4] - vst[5]) / kSqrt2;
-                const float sameCfaVerticalZ = std::abs(vst[2] - vst[7]) / kSqrt2;
-                const float sameCfaStructureZ = std::max(sameCfaHorizontalZ, sameCfaVerticalZ);
-                const float greenLeft = spectraGreenGuideAt(source, cfaPattern, x - 2, y);
-                const float greenRight = spectraGreenGuideAt(source, cfaPattern, x + 2, y);
-                const float greenUp = spectraGreenGuideAt(source, cfaPattern, x, y - 2);
-                const float greenDown = spectraGreenGuideAt(source, cfaPattern, x, y + 2);
-                const float greenHorizontalSigma = static_cast<float>(std::sqrt(std::max(
-                        1.0e-12,
-                        greenS * std::max(0.0f, greenLeft) + greenO +
-                        greenS * std::max(0.0f, greenRight) + greenO)));
-                const float greenVerticalSigma = static_cast<float>(std::sqrt(std::max(
-                        1.0e-12,
-                        greenS * std::max(0.0f, greenUp) + greenO +
-                        greenS * std::max(0.0f, greenDown) + greenO)));
-                const float greenStructureZ = std::max(
-                        std::abs(greenLeft - greenRight) / std::max(1.0e-6f, greenHorizontalSigma),
-                        std::abs(greenUp - greenDown) / std::max(1.0e-6f, greenVerticalSigma));
-                const float contextStructureZ = std::max(sameCfaStructureZ, 0.85f * greenStructureZ);
-
-                // Context Pyramid: a real scene edge normally persists at both the
-                // native CFA spacing and a broader same-CFA/green scaffold. Fine-only
-                // energy is much more likely to be stochastic sensor noise. This is
-                // the analytic SPECTRA equivalent of coarse-to-fine CFA conditioning.
-                float coarseSameCfaStructureZ = 0.0f;
-                const float coarseRawLeft = rowCurr[x - 4];
-                const float coarseRawRight = rowCurr[x + 4];
-                const float coarseRawUp = rowM4[x];
-                const float coarseRawDown = rowP4[x];
-                if (isVstValidDomain(coarseRawLeft, S, O) &&
-                    isVstValidDomain(coarseRawRight, S, O) &&
-                    isVstValidDomain(coarseRawUp, S, O) &&
-                    isVstValidDomain(coarseRawDown, S, O)) {
-                    coarseSameCfaStructureZ = std::max(
-                            std::abs(spectraForwardVst(coarseRawLeft, S, O) -
-                                     spectraForwardVst(coarseRawRight, S, O)) / kSqrt2,
-                            std::abs(spectraForwardVst(coarseRawUp, S, O) -
-                                     spectraForwardVst(coarseRawDown, S, O)) / kSqrt2);
-                }
-                const float coarseGreenLeft = spectraGreenGuideAt(source, cfaPattern, x - 4, y);
-                const float coarseGreenRight = spectraGreenGuideAt(source, cfaPattern, x + 4, y);
-                const float coarseGreenUp = spectraGreenGuideAt(source, cfaPattern, x, y - 4);
-                const float coarseGreenDown = spectraGreenGuideAt(source, cfaPattern, x, y + 4);
-                const float coarseGreenHorizontalSigma = static_cast<float>(std::sqrt(std::max(
-                        1.0e-12,
-                        greenS * std::max(0.0f, coarseGreenLeft) + greenO +
-                        greenS * std::max(0.0f, coarseGreenRight) + greenO)));
-                const float coarseGreenVerticalSigma = static_cast<float>(std::sqrt(std::max(
-                        1.0e-12,
-                        greenS * std::max(0.0f, coarseGreenUp) + greenO +
-                        greenS * std::max(0.0f, coarseGreenDown) + greenO)));
-                const float coarseGreenStructureZ = std::max(
-                        std::abs(coarseGreenLeft - coarseGreenRight) /
-                                std::max(1.0e-6f, coarseGreenHorizontalSigma),
-                        std::abs(coarseGreenUp - coarseGreenDown) /
-                                std::max(1.0e-6f, coarseGreenVerticalSigma));
-                const float coarseStructureZ = std::max(
-                        coarseSameCfaStructureZ, 0.85f * coarseGreenStructureZ);
-                const auto multiscaleContext = bncam::spectra2::resolveMultiscaleContext(
-                        contextStructureZ,
-                        coarseStructureZ,
-                        pass1State.combinedNoisePressure,
-                        pass1State.modelConfidence);
-                const auto surfaceClass = bncam::spectra2::resolveCfaSurfaceClassification(
-                        normalizedMad,
-                        multiscaleContext.coherentStructureZ,
-                        tensor.confidence,
-                        pass1State.combinedNoisePressure,
-                        pass1State.modelConfidence);
-                const float flatContext = std::clamp(
-                        0.62f * multiscaleContext.flatContext +
-                        0.38f * surfaceClass.flatConfidence -
-                        0.45f * surfaceClass.textureConfidence,
-                        0.0f, 1.0f);
-
-                // Robust directional neighbourhood mean. With low tensor
-                // confidence every directional weight is exactly one, preserving
-                // the previous isotropic estimator.
-                double weightedSum = 0.0;
-                double weightSum = 0.0;
-                for (int i = 1; i < 9; ++i) {
-                    const float distance = vst[static_cast<size_t>(i)] - median;
-                    const float robustWeight = 1.0f /
-                            (1.0f + 0.25f * distance * distance);
-                    const float neighbourGreen = spectraGreenGuideAt(
-                            source,
-                            cfaPattern,
-                            x + sampleDx[i],
-                            y + sampleDy[i]
-                    );
-                    const float guideDeltaSigma = (neighbourGreen - centerGreen) /
-                            std::max(1.0e-6f, greenSigma);
-                    const auto directional =
-                            bncam::spectra2::resolveDirectionalSampleWeight(
-                                    tensor,
-                                    static_cast<float>(sampleDx[i]),
-                                    static_cast<float>(sampleDy[i]),
-                                    guideDeltaSigma
-                            );
-                    const float weight = robustWeight * directional.weight;
-                    weightedSum += static_cast<double>(
-                            weight * vst[static_cast<size_t>(i)]
-                    );
-                    weightSum += weight;
-                    if (tensor.confident) {
-                        local.directionalWeightSum += directional.weight;
-                        local.directionalWeightSamples++;
-                        if (directional.crossEdgeProtected) {
-                            local.crossEdgeProtectedSamples++;
-                        }
-                        if (directional.alongStructureSupported) {
-                            local.alongStructureSupportedSamples++;
-                        }
-                    }
-                }
-                if (weightSum <= 1.0e-6) continue;
-                const float localMean = static_cast<float>(weightedSum / weightSum);
-
-                double varianceSum = 0.0;
-                for (int i = 1; i < 9; ++i) {
-                    const double delta = static_cast<double>(
-                            vst[static_cast<size_t>(i)] - localMean
-                    );
-                    varianceSum += delta * delta;
-                }
-                const float localVariance = static_cast<float>(varianceSum / 7.0);
-                const float signalVariance = std::max(0.0f, localVariance - 1.0f);
-                const float wienerGain = signalVariance / (signalVariance + 1.0f);
-                float target = localMean + wienerGain * (center - localMean);
-
-                const float impulseScore = std::abs(center - median);
-                if (impulseScore > 3.0f) {
-                    const float impulseAuthority = smoothstepIsp(3.0f, 6.0f, impulseScore);
-                    target += impulseAuthority * (median - target);
-                }
-
-                // SPECTRA Multiscale Residual Consensus. The primary Vulkan
-                // path runs the same rule: two wider same-CFA contexts must agree
-                // before they may steer the fine Wiener estimate. This CPU code is
-                // only the explicit fail-safe/reference path.
-                auto ringEstimate = [&](int radius, float& ringTarget, float& structureZ) {
-                    constexpr int ringDx[8] = {-1, 1, 0, 0, -1, 1, 1, -1};
-                    constexpr int ringDy[8] = {0, 0, -1, 1, -1, 1, -1, 1};
-                    std::array<float, 8> ring{};
-                    for (int i = 0; i < 8; ++i) {
-                        const int sx = x + ringDx[i] * radius;
-                        const int sy = y + ringDy[i] * radius;
-                        const float rawValue = source.ptr<float>(sy)[sx];
-                        if (!std::isfinite(rawValue) || !isVstValidDomain(rawValue, S, O)) {
-                            return false;
-                        }
-                        ring[static_cast<size_t>(i)] = spectraForwardVst(rawValue, S, O);
-                    }
-                    std::array<float, 8> sortedRing = ring;
-                    std::sort(sortedRing.begin(), sortedRing.end());
-                    const float ringMedian = 0.5f * (sortedRing[3] + sortedRing[4]);
-                    double ringSum = 0.0;
-                    double ringWeightSum = 0.0;
-                    for (float value : ring) {
-                        const float delta = value - ringMedian;
-                        const float weight = 1.0f / (1.0f + 0.20f * delta * delta);
-                        ringSum += static_cast<double>(weight * value);
-                        ringWeightSum += weight;
-                    }
-                    if (ringWeightSum <= 1.0e-6) return false;
-                    ringTarget = static_cast<float>(ringSum / ringWeightSum);
-                    structureZ = std::max(
-                            std::max(std::abs(ring[0] - ring[1]),
-                                     std::abs(ring[2] - ring[3])),
-                            std::max(std::abs(ring[4] - ring[5]),
-                                     std::abs(ring[6] - ring[7]))) / kSqrt2;
-                    return std::isfinite(ringTarget) && std::isfinite(structureZ);
-                };
-
-                float midTarget = 0.0f;
-                float midStructureZ = 8.0f;
-                float coarseTarget = 0.0f;
-                float coarseRingStructureZ = 8.0f;
-                if (ringEstimate(4, midTarget, midStructureZ) &&
-                    ringEstimate(8, coarseTarget, coarseRingStructureZ)) {
-                    const float persistentStructureZ = std::max(
-                            multiscaleContext.coherentStructureZ,
-                            0.75f * std::min(midStructureZ, coarseRingStructureZ));
-                    const auto residualConsensus =
-                            bncam::spectra2::resolveMultiscaleResidualConsensus(
-                                    std::abs(center - target),
-                                    std::abs(midTarget - coarseTarget),
-                                    persistentStructureZ,
-                                    flatContext,
-                                    pass1State.combinedNoisePressure,
-                                    pass1State.modelConfidence);
-                    const float contextualTarget =
-                            residualConsensus.midWeight * midTarget +
-                            residualConsensus.coarseWeight * coarseTarget;
-                    const float surfaceContextMix = std::clamp(
-                            residualConsensus.contextMix * surfaceClass.contextMixScale,
-                            0.0f, 0.62f);
-                    target += surfaceContextMix * (contextualTarget - target);
-                }
-
-                const float edgeProtection = multiscaleContext.edgeProtection;
-                const auto authorityDecision =
-                        bncam::spectra2::resolveAnisotropicAuthority(
-                                tensor,
-                                edgeProtection
-                        );
-                const float lensGain = lensShadingGainAt(
-                        meta,
-                        ch,
-                        x,
-                        y,
-                        width,
-                        height
-                );
-                const float shadingAuthority = std::clamp(
-                        0.90f + 0.20f * (lensGain - 1.0f),
-                        0.90f,
-                        1.38f
-                );
-                const float isolatedNoiseEvidence = smoothstepIsp(
-                        0.55f, 2.75f, impulseScore) * flatContext;
-                const float contextBoost = 0.90f + (1.34f - 0.90f) *
-                        flatContext * (0.70f + 0.30f * isolatedNoiseEvidence);
-                const float authority = std::min(
-                        1.35f,
-                        pass1State.blendStrength * shadingAuthority *
-                                authorityDecision.finalScale * contextBoost *
-                                multiscaleContext.denoiseAuthorityScale *
-                                surfaceClass.authorityScale);
-                if (edgeProtection > 0.70f ||
-                    (tensor.confident && authorityDecision.finalScale < 0.45f)) {
-                    local.edgeProtected++;
-                }
-                if (flatContext > 0.70f) local.contextFlatPixels++;
-                if (edgeProtection > 0.70f) local.contextStructureProtectedPixels++;
-                if (contextBoost > 1.15f) local.contextBoostedPixels++;
-
-                const float boundedVstDelta = std::clamp(
-                        (target - center) * authority,
-                        -pass1State.maxPixelShift,
-                        pass1State.maxPixelShift
-                );
-                const float candidate = spectraInverseVst(
-                        center + boundedVstDelta,
-                        S,
-                        O
-                );
-                if (!std::isfinite(candidate)) continue;
-
-                const float localSigma = static_cast<float>(std::sqrt(std::max(
-                        1.0e-12,
-                        S * std::max(0.0f, samples[0]) + O
-                )));
-                const float edgeShiftGuard = tensor.confident
-                        ? std::clamp(0.82f + 0.18f * tensor.confidence, 0.82f, 1.0f)
-                        : 1.0f;
-                const float contextShiftGuard = 1.12f + (0.78f - 1.12f) * edgeProtection;
-                const float maxLinearShift = std::clamp(
-                        (1.25f + 1.55f * pass1State.isoAuthority) *
-                                localSigma * shadingAuthority * edgeShiftGuard * contextShiftGuard,
-                        1.0e-5f,
-                        0.018f
-                );
-                const float appliedDelta = std::clamp(
-                        candidate - samples[0],
-                        -maxLinearShift,
-                        maxLinearShift
-                );
-                outRow[x] = samples[0] + appliedDelta;
-
-                local.localVarianceSum += localVariance;
-                local.wienerGainSum += wienerGain;
-                local.shadingAuthoritySum += shadingAuthority;
-                local.isotropicAuthorityScaleSum += authorityDecision.isotropicScale;
-                local.finalAuthorityScaleSum += authorityDecision.finalScale;
-                local.evaluated++;
-                if (std::abs(appliedDelta) > 1.0e-7f) {
-                    local.changed++;
-                    if (tensor.confident) local.directionalChanged++;
-                }
-                local.maximumLinearCorrection = std::max(
-                        local.maximumLinearCorrection,
-                        std::abs(appliedDelta)
-                );
-            }
-        }
-
-        std::lock_guard<std::mutex> lock(statsMutex);
-        total.merge(local);
-    });
-    pass1State.anisotropicDetail.directionalFilterMs = elapsedMs(
-            directionalFilterStart
-    );
-
-    raw.mosaic = std::move(destination);
-    if (total.evaluated > 0) {
-        const double inv = 1.0 / static_cast<double>(total.evaluated);
-        pass1State.averageVstResidualVar = static_cast<float>(
-                total.localVarianceSum * inv
-        );
-        pass1State.averageWienerGain = static_cast<float>(
-                total.wienerGainSum * inv
-        );
-        pass1State.localShadingAuthorityMean = static_cast<float>(
-                total.shadingAuthoritySum * inv
-        );
-        pass1State.changedPixelFraction = static_cast<float>(total.changed) /
-                static_cast<float>(total.evaluated);
-        pass1State.edgeProtectedFraction = static_cast<float>(total.edgeProtected) /
-                static_cast<float>(total.evaluated);
-    }
-
-    auto& telemetry = pass1State.anisotropicDetail;
-    telemetry.evaluatedPixelCount = total.evaluated;
-    telemetry.validTensorPixelCount = total.validTensor;
-    telemetry.confidentTensorPixelCount = total.confidentTensor;
-    telemetry.fallbackPixelCount = total.fallback;
-    telemetry.directionalChangedPixelCount = total.directionalChanged;
-    telemetry.crossEdgeProtectedSampleCount = total.crossEdgeProtectedSamples;
-    telemetry.alongStructureSupportedSampleCount = total.alongStructureSupportedSamples;
-    telemetry.contextFlatPixelCount = total.contextFlatPixels;
-    telemetry.contextStructureProtectedPixelCount = total.contextStructureProtectedPixels;
-    telemetry.contextBoostedPixelCount = total.contextBoostedPixels;
-    telemetry.orientationHistogram = total.orientationHistogram;
-    telemetry.maximumLinearCorrection = total.maximumLinearCorrection;
-    if (total.evaluated > 0) {
-        const float invEvaluated = 1.0f / static_cast<float>(total.evaluated);
-        telemetry.validTensorFraction = static_cast<float>(total.validTensor) * invEvaluated;
-        telemetry.confidentTensorFraction = static_cast<float>(total.confidentTensor) * invEvaluated;
-        telemetry.fallbackFraction = static_cast<float>(total.fallback) * invEvaluated;
-        telemetry.directionalChangedFraction = static_cast<float>(total.directionalChanged) *
-                invEvaluated;
-        telemetry.contextFlatFraction = static_cast<float>(total.contextFlatPixels) * invEvaluated;
-        telemetry.contextStructureProtectedFraction = static_cast<float>(total.contextStructureProtectedPixels) * invEvaluated;
-        telemetry.contextBoostedFraction = static_cast<float>(total.contextBoostedPixels) * invEvaluated;
-        telemetry.meanIsotropicAuthorityScale = static_cast<float>(
-                total.isotropicAuthorityScaleSum / static_cast<double>(total.evaluated)
-        );
-        telemetry.meanDirectionalAuthorityScale = static_cast<float>(
-                total.finalAuthorityScaleSum / static_cast<double>(total.evaluated)
-        );
-    }
-    if (total.validTensor > 0) {
-        telemetry.meanConfidence = static_cast<float>(
-                total.tensorConfidenceSum / static_cast<double>(total.validTensor)
-        );
-        telemetry.meanCoherence = static_cast<float>(
-                total.tensorCoherenceSum / static_cast<double>(total.validTensor)
-        );
-        telemetry.confidenceP10 = histogramPercentile(
-                total.confidenceHistogram, total.validTensor, 0.10f
-        );
-        telemetry.confidenceP50 = histogramPercentile(
-                total.confidenceHistogram, total.validTensor, 0.50f
-        );
-        telemetry.confidenceP90 = histogramPercentile(
-                total.confidenceHistogram, total.validTensor, 0.90f
-        );
-        telemetry.coherenceP10 = histogramPercentile(
-                total.coherenceHistogram, total.validTensor, 0.10f
-        );
-        telemetry.coherenceP50 = histogramPercentile(
-                total.coherenceHistogram, total.validTensor, 0.50f
-        );
-        telemetry.coherenceP90 = histogramPercentile(
-                total.coherenceHistogram, total.validTensor, 0.90f
-        );
-    }
-    if (total.directionalWeightSamples > 0) {
-        telemetry.meanDirectionalWeight = static_cast<float>(
-                total.directionalWeightSum /
-                        static_cast<double>(total.directionalWeightSamples)
-        );
-    }
-    telemetry.applied = total.changed > 0;
-    telemetry.status = !tensorField.valid
-            ? "CONTEXT_FUSION_APPLIED_WITHOUT_TENSOR_FIELD"
-            : (telemetry.applied
-                    ? "SPECTRA_CONTEXT_FUSION_APPLIED"
-                    : "SPECTRA_CONTEXT_FUSION_NO_PIXEL_CHANGE");
 }
 
 std::uint64_t spectraLensMapGenerationId(const IspFrameMetadata& meta) {
@@ -5981,7 +4660,6 @@ std::string SpectraBudgetState::formatDebugString() const {
         << ";isoNoisePressure=" << isoNoisePressure
         << ";provenanceConfidence=" << provenanceMeanConfidence
         << ";provenanceShadingGain=" << provenanceMeanShadingGain
-        << ";noRegretMeanAcceptance=" << noRegretMeanAcceptance
         << "}";
     return out.str();
 }
@@ -6141,14 +4819,6 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     SpectraPass0State pass0State = residentEntry && !residentCpuFallbackUsed
             ? computePass0StateCompact(residentInput->sampleView, workingMeta, uiConfig)
             : computePass0State(workingRaw, workingMeta, uiConfig);
-    // N006A hard invariant: legacy Pass 0 may measure/provide telemetry but never mutate RAW.
-    pass0State.applyChannelBias = false;
-    pass0State.applyRowCorrection = false;
-    pass0State.applyColumnCorrection = false;
-    SpectraNoRegretResult pass0NoRegret{};
-    pass0NoRegret.passIndex = 0;
-    // N006D: legacy Pass-0 pixel orchestration is physically retired.
-    // Measurement state remains available, but no resident generation or CPU mutation exists.
     pass0State.processingTimeMs = elapsedMs(pass0Start);
 
     SpectraBudgetState budgetState{};
@@ -6367,14 +5037,9 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     SpectraPass1State pass1State = residentEntry && !residentCpuFallbackUsed
             ? computePass1StateCompact(residentInput->sampleView, workingMeta, uiConfig)
             : computePass1State(workingRaw, workingMeta, uiConfig);
-    // N006A hard invariant: legacy Pass 1 VST/Wiener filtering and its CPU fallback are retired.
-    pass1State.applied = false;
-    pass1State.fallbackReason = "legacy_raw_pixel_authority_retired_neural_pending";
-    SpectraNoRegretResult pass1NoRegret{};
-    pass1NoRegret.passIndex = 1;
-    SpectraProvenanceField pass1BeforeField{};
-    SpectraProvenanceField pass2BeforeField{};
-    // N006D: no legacy Pass-1 resident generation and no classical CPU fallback remain.
+    pass1State.fallbackReason = pass1State.spectraMode == 0
+            ? "spectra_off"
+            : "observer_only_neural_pending";
     pass1State.processingTimeMs = elapsedMs(pass1Start);
 
     if (residentEntry && !residentCpuFallbackUsed) {
@@ -6484,21 +5149,6 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                 "sensor_so_plus_lens_shading_g2_relative_shape_absolute_covariance_propagated_by_domain";
     }
     const float finalProvenanceMs = elapsedMs(finalProvenanceStart);
-    double noRegretAcceptanceSum = 0.0;
-    int noRegretEvaluatedPasses = 0;
-    for (const SpectraNoRegretResult* passResult : {
-            &pass0NoRegret,
-            &pass1NoRegret
-    }) {
-        if (passResult->evaluatedTiles <= 0) continue;
-        noRegretAcceptanceSum += passResult->meanAcceptance;
-        noRegretEvaluatedPasses++;
-    }
-    budgetState.noRegretMeanAcceptance = noRegretEvaluatedPasses > 0
-            ? static_cast<float>(noRegretAcceptanceSum /
-                    static_cast<double>(noRegretEvaluatedPasses))
-            : 0.0f;
-
     auto remainingDownstreamAuthority = [](float before, float after, float target) -> float {
         if (!(before > 0.0f) || !(target > 0.0f) || !std::isfinite(after)) return 1.0f;
         const float initialExcess = std::max(0.0f, before - target);
@@ -6540,11 +5190,11 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                     midBandEvidence.residualPressure,
                     lowBandEvidence.residualPressure,
                     0.0f, // retired Pass-3 spatial correction confidence: no pixel authority
-                    pass1State.anisotropicDetail.confidenceP50,
-                    pass1State.edgeProtectedFraction,
+                    0.0f, // retired Pass-1 filter confidence: no pixel authority
+                    0.0f, // retired Pass-1 edge-protection authority
                     pass0State.greenSplitTileConsensus,
                     pass0State.greenSplitMad,
-                    pass0State.g1g2After,
+                    pass0State.g1g2Before,
                     static_cast<std::uint64_t>(std::max(0, pass0State.greenSplitTileCount))
             );
     bncam::spectra2::applyChannelShadingRisk(cfaChromaConfidence, channelShadingRisk);
@@ -9053,29 +7703,6 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     const bool spectraNoiseActive = meta.calibration.spectraProcessingMode != 0;
     const bool physicalNoiseModelAvailable = meta.calibration.noiseModelMode != 0 &&
             meta.calibration.hasNoiseProfile && meta.calibration.noiseProfileApplied;
-    const float lensIsoNrReference = static_cast<float>(std::max(actualIso, 0));
-    const float referenceFrameIso = std::max(1.0f, lensIsoNrReference);
-
-    // Legacy late-denoise tuning values are deliberately neutralized. They remain named only
-    // so existing diagnostics stay parseable until the final Phase-1 telemetry purge.
-    constexpr float minimumDenoiseStrength = 0.0f;
-    constexpr float maximumDenoiseCeiling = 0.0f;
-    const float baseChromaNrStrength = 0.0f;
-    const float residualChromaStrengthScale = 1.0f;
-    const float physicalNoiseBaseline = 0.0f;
-    const float clampedBaseline = 0.0f;
-    const float availableHeadroom = 0.0f;
-    const float noiseTruthActivation = 0.0f;
-    const float configuredDynamicIsoCoeff = std::clamp(uiConfig.lensDynamicIsoCoeff, 0.0f, 1.0f);
-    const float normalizedChromaAuthority = std::clamp(
-            uiConfig.effectiveChromaAuthorityStops / 5.0f, 0.0f, 1.0f);
-    const float dynamicBlend = 0.0f;
-    const float requestedAdditionalStrength = 0.0f;
-    const float finalChromaNrStrengthBeforeClamp = 0.0f;
-    const float chromaNrStrength = 0.0f;
-    const float dynamicIsoMultiplier = 1.0f;
-    const bool ceilingReached = false;
-    const float theoreticalSaturatingCoeff = 0.0f;
 
     std::ostringstream nativeNoiseSo;
     nativeNoiseSo << std::setprecision(17) << "[";
@@ -9108,16 +7735,6 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     g_threadLocalIspStats.absoluteMeanChromaSigma = postToneResidualChromaSigma;
     g_threadLocalIspStats.effectiveLumaSigma = 0.0f;
     g_threadLocalIspStats.effectiveChromaSigma = 0.0f;
-    g_threadLocalIspStats.lumaRangeThresholdMin = 0.0f;
-    g_threadLocalIspStats.lumaRangeThresholdMean = 0.0f;
-    g_threadLocalIspStats.lumaRangeThresholdMax = 0.0f;
-    g_threadLocalIspStats.chromaRangeThresholdMin = 0.0f;
-    g_threadLocalIspStats.chromaRangeThresholdMean = 0.0f;
-    g_threadLocalIspStats.chromaRangeThresholdMax = 0.0f;
-    g_threadLocalIspStats.preDenoiseResidualEstimate =
-            postToneResidualChromaSigma * 1.414f + postToneResidualLumaSigma * 0.707f;
-    g_threadLocalIspStats.postDenoiseResidualEstimate = g_threadLocalIspStats.preDenoiseResidualEstimate;
-    g_threadLocalIspStats.postSharpenResidualEstimate = g_threadLocalIspStats.postDenoiseResidualEstimate;
 
     bool residentPostDemosaicApplied = false;
     bool residentOutputSrgbEncoded = false;
@@ -9346,8 +7963,6 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             "PHASE11_LINEAR_DETAIL_THEN_TONE_QUANTIZATION_IDENTITY_TO_JPEG";
     residualNoiseState.comparabilityStatus =
             "FINAL_JPEG_RESIDUAL_STATE_MEASURED_PRE_ENCODE_JPEG_COMPRESSION_NOT_PROPAGATED";
-    g_threadLocalIspStats.postSharpenResidualEstimate =
-            g_threadLocalIspStats.postDenoiseResidualEstimate;
 
     const auto rotateStart = IspClock::now();
     rotateMatForOutput(bgr8, rotationDegrees);
@@ -9446,12 +8061,6 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         if (!(before > 1.0e-12f) || !std::isfinite(after)) return 0.0f;
         return 100.0f * std::clamp((before - after) / before, -10.0f, 1.0f);
     };
-    const float pass0MaxCorrection = std::max({
-            std::abs(pass0State.appliedChannelBias[0]),
-            std::abs(pass0State.appliedChannelBias[1]),
-            std::abs(pass0State.appliedChannelBias[2]),
-            std::abs(pass0State.appliedChannelBias[3])
-    });
     const float spectraAccountedMs = captureProvenanceMs + finalProvenanceMs +
             pass0State.processingTimeMs + pass1State.processingTimeMs +
             pass2State.processingTimeMs + lowBandObserverMs;
@@ -9493,9 +8102,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     const float rawIspUnattributedMs = std::max(0.0f, totalRawIspCoreMs - rawIspAccountedMs);
 
     spectraPerformance.knownFullFrameCloneCount =
-            ((residentEntry && !residentCpuFallbackUsed) ? 0 : 1) +
-            (pass0NoRegret.evaluatedTiles > 0 ? 1 : 0) +
-            (pass1NoRegret.evaluatedTiles > 0 ? 1 : 0);
+            (residentEntry && !residentCpuFallbackUsed) ? 0 : 1;
     const std::uint64_t spectraStatisticsBytesRead =
             spectraPerformance.initialStatistics.estimatedBytesRead +
             spectraPerformance.postPass1Statistics.estimatedBytesRead +
@@ -9939,14 +8546,11 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; autoNeuralJddPrior=" << demosaicResolution.autoNeuralJddPrior
             << "; autoAmazePrior=" << demosaicResolution.autoAmazePrior
             << "; autoSignals=" << demosaicResolution.autoSignals
-            << "; baseChromaDenoiseStrength=" << baseChromaNrStrength
             << "; physicalChromaModelDriven=false"
             << "; physicalChromaRawNoiseSigma=0.0000"
             << "; physicalChromaCalibratedNoiseSigma=0.0000"
             << "; physicalChromaModelConfidence=0.0000"
             << "; physicalChromaCombinedNoisePressure=0.0000"
-            << "; physicalChromaAuthoritySource=RETIRED_N003"
-            << "; chromaDenoiseStrength=" << chromaNrStrength
             << "; sensorNoiseVarianceFormula=S*x+O"
             << "; sensorNoiseVarianceSamples=" << g_threadLocalIspStats.sensorNoiseVarianceSamples
             << "; meanSensorNoiseVariance=" << g_threadLocalIspStats.meanSensorNoiseVariance
@@ -9969,8 +8573,6 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; " << pass1State.formatDebugString()
             << "; " << pass2State.formatDebugString()
             << formatCfaChromaConfidenceFields(cfaChromaConfidence)
-            << "; " << pass0NoRegret.formatDebugString()
-            << "; " << pass1NoRegret.formatDebugString()
             << "; " << budgetState.formatDebugString()
             << "; " << residualNoiseState.formatDebugString()
             << "; " << downstreamIspState.formatDebugString()
@@ -10032,180 +8634,6 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << (rawFinalizeFailureResidentInputMaterialized ? "true" : "false")
             << "; spectraDemosaicFailureRawFinalizeMaterialized="
             << (demosaicFailureRawFinalizeMaterialized ? "true" : "false")
-            << "; spectraPass0Applied=" << ((pass0State.applyChannelBias || pass0State.applyRowCorrection || pass0State.applyColumnCorrection) ? "true" : "false")
-            << "; spectraPass0SkipReason=" << pass0State.fallbackReason
-            << "; sceneBlackAuthorityMode=" << pass0State.sceneBlackAuthorityMode
-            << "; sceneBlackMetadataAuthoritative="
-            << (pass0State.sceneBlackMetadataAuthoritative ? "true" : "false")
-            << "; sceneBlackImageMutationAllowed="
-            << (pass0State.sceneBlackImageMutationAllowed ? "true" : "false")
-            << "; spectraPass0InputEnergy=" << pass0State.g1g2Before
-            << "; spectraPass0TargetFloor=" << captureProvenance.meanPredictedRawVariance
-            << "; spectraPass0OutputEnergy=" << pass0State.g1g2After
-            << "; spectraPass0ReductionPercentage=" << reductionPct(pass0State.g1g2Before, pass0State.g1g2After)
-            << "; spectraPass0MaximumCorrection=" << pass0MaxCorrection
-            << "; spectraPass0ProcessingTimeMs=" << pass0State.processingTimeMs
-            << "; spectraPass0VulkanAttempted=" << (pass0State.vulkanAttempted ? "true" : "false")
-            << "; spectraPass0VulkanExecutionSucceeded=" << (pass0State.vulkanExecutionSucceeded ? "true" : "false")
-            << "; spectraPass0VulkanUsedForOutput=" << (pass0State.vulkanUsedForOutput ? "true" : "false")
-            << "; spectraPass0VulkanCpuFallbackUsed=" << (pass0State.vulkanCpuFallbackUsed ? "true" : "false")
-            << "; spectraPass0VulkanGpuNoRegretBlendUsed=" << (pass0State.vulkanGpuNoRegretBlendUsed ? "true" : "false")
-            << "; spectraPass0VulkanCandidateReadbackAvoided=" << (pass0State.vulkanCandidateReadbackAvoided ? "true" : "false")
-            << "; spectraPass0VulkanStatus=" << pass0State.vulkanStatus
-            << "; spectraPass0VulkanFailureReason=" << pass0State.vulkanFailureReason
-            << "; spectraPass0VulkanPass0KernelMs=" << pass0State.vulkanPass0KernelMs
-            << "; spectraPass0VulkanTileStatisticsKernelMs=" << pass0State.vulkanTileStatisticsKernelMs
-            << "; spectraPass0VulkanNoRegretDecisionMs=" << pass0State.vulkanNoRegretDecisionMs
-            << "; spectraPass0VulkanNoRegretBlendMs=" << pass0State.vulkanNoRegretBlendMs
-            << "; spectraPass0VulkanSynchronizationMs=" << pass0State.vulkanSynchronizationMs
-            << "; spectraPass0VulkanCompactReadbackMs=" << pass0State.vulkanCompactReadbackMs
-            << "; spectraPass0VulkanResidentGeneration=" << pass0State.vulkanResidentGeneration
-            << "; spectraPass1Applied=" << (pass1State.applied ? "true" : "false")
-            << "; spectraPass1SkipReason=" << pass1State.fallbackReason
-            << "; spectraPass1InputEnergy=" << budgetState.initialResidualEnergy
-            << "; spectraPass1TargetFloor=" << budgetState.predictedNoiseFloor
-            << "; spectraPass1OutputEnergy=" << budgetState.pass1ResidualEnergy
-            << "; spectraPass1ReductionPercentage=" << reductionPct(budgetState.initialResidualEnergy, budgetState.pass1ResidualEnergy)
-            << "; spectraPass1MaximumCorrection=" << pass1State.maxPixelShift
-            << "; spectraPass1ProcessingTimeMs=" << pass1State.processingTimeMs
-            << "; spectraPass1VulkanKernelConnected=" << (pass1State.vulkanKernelConnected ? "true" : "false")
-            << "; spectraPass1VulkanAttempted=" << (pass1State.vulkanAttempted ? "true" : "false")
-            << "; spectraPass1VulkanExecutionSucceeded=" << (pass1State.vulkanExecutionSucceeded ? "true" : "false")
-            << "; spectraPass1VulkanUsedForOutput=" << (pass1State.vulkanUsedForOutput ? "true" : "false")
-            << "; spectraPass1VulkanCpuFallbackUsed=" << (pass1State.vulkanCpuFallbackUsed ? "true" : "false")
-            << "; spectraPass1VulkanGpuNoRegretBlendUsed=" << (pass1State.vulkanGpuNoRegretBlendUsed ? "true" : "false")
-            << "; spectraPass1VulkanCandidateReadbackAvoided=" << (pass1State.vulkanCandidateReadbackAvoided ? "true" : "false")
-            << "; spectraPass1VulkanPersistentReuseHit=" << (pass1State.vulkanPersistentReuseHit ? "true" : "false")
-            << "; spectraPass1VulkanPersistentReallocated=" << (pass1State.vulkanPersistentReallocated ? "true" : "false")
-            << "; spectraPass1VulkanStatus=" << pass1State.vulkanStatus
-            << "; spectraPass1VulkanFailureReason=" << pass1State.vulkanFailureReason
-            << "; spectraPass1VulkanInputPackingMs=" << pass1State.vulkanInputPackingMs
-            << "; spectraPass1VulkanTensorUploadMs=" << pass1State.vulkanTensorUploadMs
-            << "; spectraPass1VulkanPass1KernelMs=" << pass1State.vulkanPass1KernelMs
-            << "; spectraPass1VulkanTileStatisticsKernelMs=" << pass1State.vulkanTileStatisticsKernelMs
-            << "; spectraPass1VulkanNoRegretDecisionMs=" << pass1State.vulkanNoRegretDecisionMs
-            << "; spectraPass1VulkanNoRegretBlendMs=" << pass1State.vulkanNoRegretBlendMs
-            << "; spectraPass1VulkanGpuKernelMs=" << pass1State.vulkanGpuKernelMs
-            << "; spectraPass1VulkanSynchronizationMs=" << pass1State.vulkanSynchronizationMs
-            << "; spectraPass1VulkanReadbackMs=" << pass1State.vulkanReadbackMs
-            << "; spectraPass1VulkanTransferAndSyncMs=" << pass1State.vulkanTransferAndSyncMs
-            << "; spectraPass1VulkanTotalMs=" << pass1State.vulkanTotalMs
-            << "; spectraPass1VulkanResidentBytes=" << pass1State.vulkanResidentBytes
-            << "; spectraPass1VulkanAllocationGeneration=" << pass1State.vulkanAllocationGeneration
-            << "; spectraAnisotropicDetailArchitecture="
-            << pass1State.anisotropicDetail.architecture
-            << "; spectraAnisotropicDetailTensorMethod="
-            << pass1State.anisotropicDetail.tensorMethod
-            << "; spectraAnisotropicDetailFilterMethod="
-            << pass1State.anisotropicDetail.filterMethod
-            << "; spectraAnisotropicDetailFallbackMethod="
-            << pass1State.anisotropicDetail.fallbackMethod
-            << "; spectraAnisotropicDetailTimingAccounting="
-            << pass1State.anisotropicDetail.timingAccounting
-            << "; spectraAnisotropicDetailEnabled="
-            << (pass1State.anisotropicDetail.enabled ? "true" : "false")
-            << "; spectraAnisotropicDetailApplied="
-            << (pass1State.anisotropicDetail.applied ? "true" : "false")
-            << "; spectraAnisotropicDetailStatus="
-            << pass1State.anisotropicDetail.status
-            << "; spectraAnisotropicDetailEvaluatedPixelCount="
-            << pass1State.anisotropicDetail.evaluatedPixelCount
-            << "; spectraAnisotropicDetailValidTensorPixelCount="
-            << pass1State.anisotropicDetail.validTensorPixelCount
-            << "; spectraAnisotropicDetailConfidentTensorPixelCount="
-            << pass1State.anisotropicDetail.confidentTensorPixelCount
-            << "; spectraAnisotropicDetailFallbackPixelCount="
-            << pass1State.anisotropicDetail.fallbackPixelCount
-            << "; spectraAnisotropicDetailDirectionalChangedPixelCount="
-            << pass1State.anisotropicDetail.directionalChangedPixelCount
-            << "; spectraAnisotropicDetailCrossEdgeProtectedSampleCount="
-            << pass1State.anisotropicDetail.crossEdgeProtectedSampleCount
-            << "; spectraAnisotropicDetailAlongStructureSupportedSampleCount="
-            << pass1State.anisotropicDetail.alongStructureSupportedSampleCount
-            << "; spectraContextFusionFlatPixelCount="
-            << pass1State.anisotropicDetail.contextFlatPixelCount
-            << "; spectraContextFusionStructureProtectedPixelCount="
-            << pass1State.anisotropicDetail.contextStructureProtectedPixelCount
-            << "; spectraContextFusionBoostedPixelCount="
-            << pass1State.anisotropicDetail.contextBoostedPixelCount
-            << "; spectraContextFusionFlatFraction="
-            << pass1State.anisotropicDetail.contextFlatFraction
-            << "; spectraContextFusionStructureProtectedFraction="
-            << pass1State.anisotropicDetail.contextStructureProtectedFraction
-            << "; spectraContextFusionBoostedFraction="
-            << pass1State.anisotropicDetail.contextBoostedFraction
-            << "; spectraProfiledMultibandPixelCount="
-            << pass1State.anisotropicDetail.profiledMultibandPixelCount
-            << "; spectraProfiledHeavyFineShrinkPixelCount="
-            << pass1State.anisotropicDetail.profiledHeavyFineShrinkPixelCount
-            << "; spectraCoherentDetailRestitutionPixelCount="
-            << pass1State.anisotropicDetail.coherentDetailRestitutionPixelCount
-            << "; spectraProfiledMultibandFraction="
-            << pass1State.anisotropicDetail.profiledMultibandFraction
-            << "; spectraProfiledHeavyFineShrinkFraction="
-            << pass1State.anisotropicDetail.profiledHeavyFineShrinkFraction
-            << "; spectraCoherentDetailRestitutionFraction="
-            << pass1State.anisotropicDetail.coherentDetailRestitutionFraction
-            << "; spectraProfiledPatchConsensusPixelCount="
-            << pass1State.anisotropicDetail.profiledPatchConsensusPixelCount
-            << "; spectraProfiledStrongPatchConsensusPixelCount="
-            << pass1State.anisotropicDetail.profiledStrongPatchConsensusPixelCount
-            << "; spectraProfiledPatchConsensusFraction="
-            << pass1State.anisotropicDetail.profiledPatchConsensusFraction
-            << "; spectraProfiledStrongPatchConsensusFraction="
-            << pass1State.anisotropicDetail.profiledStrongPatchConsensusFraction
-            << "; spectraProfiledPatchPosteriorCleanPixelCount="
-            << pass1State.anisotropicDetail.profiledPatchPosteriorCleanPixelCount
-            << "; spectraProfiledPatchPosteriorCleanFraction="
-            << pass1State.anisotropicDetail.profiledPatchPosteriorCleanFraction
-            << "; spectraProfiledPatchGradientProtectedPixelCount="
-            << pass1State.anisotropicDetail.profiledPatchGradientProtectedPixelCount
-            << "; spectraProfiledPatchGradientProtectedFraction="
-            << pass1State.anisotropicDetail.profiledPatchGradientProtectedFraction
-            << "; spectraAnisotropicDetailOrientation0Count="
-            << pass1State.anisotropicDetail.orientationHistogram[0]
-            << "; spectraAnisotropicDetailOrientation45Count="
-            << pass1State.anisotropicDetail.orientationHistogram[1]
-            << "; spectraAnisotropicDetailOrientation90Count="
-            << pass1State.anisotropicDetail.orientationHistogram[2]
-            << "; spectraAnisotropicDetailOrientation135Count="
-            << pass1State.anisotropicDetail.orientationHistogram[3]
-            << "; spectraAnisotropicDetailValidTensorFraction="
-            << pass1State.anisotropicDetail.validTensorFraction
-            << "; spectraAnisotropicDetailConfidentTensorFraction="
-            << pass1State.anisotropicDetail.confidentTensorFraction
-            << "; spectraAnisotropicDetailFallbackFraction="
-            << pass1State.anisotropicDetail.fallbackFraction
-            << "; spectraAnisotropicDetailDirectionalChangedFraction="
-            << pass1State.anisotropicDetail.directionalChangedFraction
-            << "; spectraAnisotropicDetailMeanConfidence="
-            << pass1State.anisotropicDetail.meanConfidence
-            << "; spectraAnisotropicDetailConfidenceP10="
-            << pass1State.anisotropicDetail.confidenceP10
-            << "; spectraAnisotropicDetailConfidenceP50="
-            << pass1State.anisotropicDetail.confidenceP50
-            << "; spectraAnisotropicDetailConfidenceP90="
-            << pass1State.anisotropicDetail.confidenceP90
-            << "; spectraAnisotropicDetailMeanCoherence="
-            << pass1State.anisotropicDetail.meanCoherence
-            << "; spectraAnisotropicDetailCoherenceP10="
-            << pass1State.anisotropicDetail.coherenceP10
-            << "; spectraAnisotropicDetailCoherenceP50="
-            << pass1State.anisotropicDetail.coherenceP50
-            << "; spectraAnisotropicDetailCoherenceP90="
-            << pass1State.anisotropicDetail.coherenceP90
-            << "; spectraAnisotropicDetailMeanDirectionalWeight="
-            << pass1State.anisotropicDetail.meanDirectionalWeight
-            << "; spectraAnisotropicDetailMeanIsotropicAuthorityScale="
-            << pass1State.anisotropicDetail.meanIsotropicAuthorityScale
-            << "; spectraAnisotropicDetailMeanDirectionalAuthorityScale="
-            << pass1State.anisotropicDetail.meanDirectionalAuthorityScale
-            << "; spectraAnisotropicDetailMaximumLinearCorrection="
-            << pass1State.anisotropicDetail.maximumLinearCorrection
-            << "; spectraAnisotropicDetailTensorFieldBuildMs="
-            << pass1State.anisotropicDetail.tensorFieldBuildMs
-            << "; spectraAnisotropicDetailDirectionalFilterMs="
-            << pass1State.anisotropicDetail.directionalFilterMs
             << "; spectraCfaBandObserverStatus=" << pass2State.observerStatus
             << "; spectraCfaBandObserverModelConfidence=" << pass2State.modelConfidence
             << "; spectraCfaBandObserverPixelAuthority=false"
@@ -10253,44 +8681,6 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; spectraChromaBandEnergyPostPass2MeasurementMs=" << postPass2BandMeasurementMs
             << formatCfaBandResidualEvidenceFields("spectraCfaFineBand", fineBandEvidence)
             << formatCfaBandResidualEvidenceFields("spectraCfaMidBand", midBandEvidence)
-            << "; spectraNoRegretP0TotalTiles=" << pass0NoRegret.totalTiles
-            << "; spectraNoRegretP0EvaluatedTiles=" << pass0NoRegret.evaluatedTiles
-            << "; spectraNoRegretP0InvalidTiles=" << pass0NoRegret.invalidTiles
-            << "; spectraNoRegretP0FullyAcceptedTiles=" << pass0NoRegret.acceptedTiles
-            << "; spectraNoRegretP0PartiallyAcceptedTiles=" << pass0NoRegret.partiallyAcceptedTiles
-            << "; spectraNoRegretP0RejectedTiles=" << pass0NoRegret.rejectedTiles
-            << "; spectraNoRegretP0RejectedOversmooth=" << pass0NoRegret.rejectedOversmooth
-            << "; spectraNoRegretP0RejectedDetailLoss=" << pass0NoRegret.rejectedDetailLoss
-            << "; spectraNoRegretP0RejectedMeanDrift=" << pass0NoRegret.rejectedMeanDrift
-            << "; spectraNoRegretP0RejectedNoImprovement=" << pass0NoRegret.rejectedNoImprovement
-            << "; spectraNoRegretP0MeanAcceptance=" << pass0NoRegret.meanAcceptance
-            << "; spectraNoRegretP0AcceptanceP10=" << pass0NoRegret.acceptanceP10
-            << "; spectraNoRegretP0AcceptanceP50=" << pass0NoRegret.acceptanceP50
-            << "; spectraNoRegretP0AcceptanceP90=" << pass0NoRegret.acceptanceP90
-            << "; spectraNoRegretP0AttenuatedPixelFraction=" << pass0NoRegret.attenuatedPixelFraction
-            << "; spectraNoRegretP0MeanColourShift=" << pass0NoRegret.meanColourShift
-            << "; spectraNoRegretP0MaxColourShift=" << pass0NoRegret.maxColourShift
-            << "; spectraNoRegretP0EdgePreservationScore=" << pass0NoRegret.edgePreservationScore
-            << "; spectraNoRegretP0OversmoothingScore=" << pass0NoRegret.oversmoothingScore
-            << "; spectraNoRegretP1TotalTiles=" << pass1NoRegret.totalTiles
-            << "; spectraNoRegretP1EvaluatedTiles=" << pass1NoRegret.evaluatedTiles
-            << "; spectraNoRegretP1InvalidTiles=" << pass1NoRegret.invalidTiles
-            << "; spectraNoRegretP1FullyAcceptedTiles=" << pass1NoRegret.acceptedTiles
-            << "; spectraNoRegretP1PartiallyAcceptedTiles=" << pass1NoRegret.partiallyAcceptedTiles
-            << "; spectraNoRegretP1RejectedTiles=" << pass1NoRegret.rejectedTiles
-            << "; spectraNoRegretP1RejectedOversmooth=" << pass1NoRegret.rejectedOversmooth
-            << "; spectraNoRegretP1RejectedDetailLoss=" << pass1NoRegret.rejectedDetailLoss
-            << "; spectraNoRegretP1RejectedMeanDrift=" << pass1NoRegret.rejectedMeanDrift
-            << "; spectraNoRegretP1RejectedNoImprovement=" << pass1NoRegret.rejectedNoImprovement
-            << "; spectraNoRegretP1MeanAcceptance=" << pass1NoRegret.meanAcceptance
-            << "; spectraNoRegretP1AcceptanceP10=" << pass1NoRegret.acceptanceP10
-            << "; spectraNoRegretP1AcceptanceP50=" << pass1NoRegret.acceptanceP50
-            << "; spectraNoRegretP1AcceptanceP90=" << pass1NoRegret.acceptanceP90
-            << "; spectraNoRegretP1AttenuatedPixelFraction=" << pass1NoRegret.attenuatedPixelFraction
-            << "; spectraNoRegretP1MeanColourShift=" << pass1NoRegret.meanColourShift
-            << "; spectraNoRegretP1MaxColourShift=" << pass1NoRegret.maxColourShift
-            << "; spectraNoRegretP1EdgePreservationScore=" << pass1NoRegret.edgePreservationScore
-            << "; spectraNoRegretP1OversmoothingScore=" << pass1NoRegret.oversmoothingScore
             << "; spectraResidualDomain=" << residualNoiseState.domain
             << "; spectraResidualValueStage=" << residualNoiseState.valueStage
             << "; spectraResidualLastObservedStage=" << residualNoiseState.lastObservedStage
@@ -10551,47 +8941,12 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; spatialExposureNoiseScaleRms=" << spatialExposureNoiseScale
             << "; spatialExposureMeanGainSquared=" << spatialExposureMeanGainSquared
             << "; noiseMapCoordinateSpace=" << g_spatialNoiseMap.rawWidth << "x" << g_spatialNoiseMap.rawHeight
-            << "; denoiseConsumerCoordinateSpace=" << linearRgb.cols << "x" << linearRgb.rows
             << "; lensIsoNrMode=" << uiConfig.lensIsoNrMode
-            << "; lensIsoNrReference=" << lensIsoNrReference
-            << "; lensIsoNrMultiplier=" << dynamicIsoMultiplier
-            << "; dynamicIsoCoefficient=" << uiConfig.lensDynamicIsoCoeff
-            << "; frameIso=" << referenceFrameIso
-            << "; dynamicIsoActivationSource=calibrated_so_noise_pressure"
-            << "; dynamicNoiseTruthActivation=" << noiseTruthActivation
-            << "; normalizedDynamicChromaAuthority=" << normalizedChromaAuthority
-            << "; sensorIsoActivation=" << noiseTruthActivation
-            << "; physicalNoiseModelBaseline=" << clampedBaseline
-            << "; commonNormalizedDenoiseCeiling=" << maximumDenoiseCeiling
-            << "; formatSpecificDenoiseCeiling=" << maximumDenoiseCeiling
-            << "; availableDenoiseHeadroom=" << availableHeadroom
-            << "; requestedHeadroomFraction=" << dynamicBlend
-            << "; requestedAdditionalStrength=" << requestedAdditionalStrength
-            << "; dynamicIsoMultiplier=" << dynamicIsoMultiplier
-            << "; finalChromaDenoiseStrengthBeforeClamp=" << finalChromaNrStrengthBeforeClamp
-            << "; finalChromaDenoiseStrengthAfterClamp=" << chromaNrStrength
-            << "; budgetedChromaAdditionalStrength=0.0000"
-            << "; physicalChromaBaselinePreserved=false"
-            << "; ceilingReached=" << (ceilingReached ? "true" : "false")
-            << "; theoreticalSaturatingCoeff=" << theoreticalSaturatingCoeff
-            << "; processedPixelCount=" << g_threadLocalIspStats.processedPixelCount
-            << "; changedPixelCount=" << g_threadLocalIspStats.changedPixelCount
-            << "; changedPixelFraction=" << g_threadLocalIspStats.changedPixelFraction
-            << "; meanAbsLumaDelta=" << g_threadLocalIspStats.meanAbsLumaDelta
-            << "; meanAbsChromaDelta=" << g_threadLocalIspStats.meanAbsChromaDelta
-            << "; maxLumaDelta=" << g_threadLocalIspStats.maxLumaDelta
-            << "; maxChromaDelta=" << g_threadLocalIspStats.maxChromaDelta
-            << "; avgNeighbourAcceptanceRate=" << g_threadLocalIspStats.avgNeighbourAcceptanceRate
-            << "; avgNonCentreSampleWeight=" << g_threadLocalIspStats.avgNonCentreSampleWeight
-            << "; avgTotalFilterWeight=" << g_threadLocalIspStats.avgTotalFilterWeight
-            << "; avgAppliedBlend=" << g_threadLocalIspStats.avgAppliedBlend
-            << "; edgeProtectedPixelFraction=" << g_threadLocalIspStats.edgeProtectedPixelFraction
             << "; absoluteMeanLumaSigma=" << g_threadLocalIspStats.absoluteMeanLumaSigma
             << "; absoluteMeanChromaSigma=" << g_threadLocalIspStats.absoluteMeanChromaSigma
             << "; physicalNoiseModelAvailable=" << (physicalNoiseModelAvailable ? "true" : "false")
             << "; physicalNoiseModelPixelAuthority=false"
             << "; spectraOffPhysicalLumaBaselineActive=false"
-            << "; pass1EffectiveMaxLinearShift=" << pass1State.maxLinearShift
             << "; residualSeedConfidence=" << residualSeedConfidence.confidence
             << "; residualSeedConfidenceStatus=" << residualSeedConfidence.status
             << "; residualSeedConfidenceMethod=" << residualSeedConfidence.method
@@ -10620,19 +8975,9 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; phase4SpectraResidualChromaFraction=0.0000"
             << "; phase4AppliedLumaSigma=0.0000"
             << "; phase4AppliedChromaSigma=0.0000"
-            << "; phase4ResidualChromaStrengthScale=" << residualChromaStrengthScale
             << "; phase4DynamicIsoChromaSpectraGate=" << (spectraNoiseActive ? "ACTIVE" : "IDENTITY_OFF")
             << "; effectiveLumaSigma=" << g_threadLocalIspStats.effectiveLumaSigma
             << "; effectiveChromaSigma=" << g_threadLocalIspStats.effectiveChromaSigma
-            << "; lumaRangeThresholdMin=" << g_threadLocalIspStats.lumaRangeThresholdMin
-            << "; lumaRangeThresholdMean=" << g_threadLocalIspStats.lumaRangeThresholdMean
-            << "; lumaRangeThresholdMax=" << g_threadLocalIspStats.lumaRangeThresholdMax
-            << "; chromaRangeThresholdMin=" << g_threadLocalIspStats.chromaRangeThresholdMin
-            << "; chromaRangeThresholdMean=" << g_threadLocalIspStats.chromaRangeThresholdMean
-            << "; chromaRangeThresholdMax=" << g_threadLocalIspStats.chromaRangeThresholdMax
-            << "; preDenoiseResidualEstimate=" << g_threadLocalIspStats.preDenoiseResidualEstimate
-            << "; postDenoiseResidualEstimate=" << g_threadLocalIspStats.postDenoiseResidualEstimate
-            << "; postSharpenResidualEstimate=" << g_threadLocalIspStats.postSharpenResidualEstimate
             << "; rawBlackAnchorOwner=PREDEMOSAIC_CALIBRATED_SENSOR_BLACK_LEVEL"
             << "; rawLowEndToneAnchorOwner=FLLF_PHYSICAL_NOISE_GATED_LOG2_LUMA"
             << "; fllfDeepBlackGuard=PROPAGATED_PHYSICAL_NOISE_RELATIVE"
@@ -10943,8 +9288,6 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; spectraPerformanceHContract=N006D_READ_ONLY_NOISE_MAP_RAW_FINALIZE_DEMOSAIC_AWB_CCM"
             << "; spectraPerformanceIContract=N006D_TEMPORAL_OBSERVER_RAW_FINALIZE_DEMOSAIC_AWB_CCM"
             << "; spectraProductionBackend=VULKAN_GPU_PRIMARY_HYBRID_TRANSITION"
-            << "; spectraPass1GpuPrimary="
-            << (pass1State.vulkanUsedForOutput ? "true" : "false")
             << "; spectraCfaLowBandObserverPixelAuthority=false"
             << "; spectraDemosaicGpuPrimary="
             << (vulkanDemosaicResident ? "true" : "false")
