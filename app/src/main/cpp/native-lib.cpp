@@ -426,14 +426,19 @@ NativeRenderQualityConfig makeQualityConfig(
     cfg.lensIsoNrMode = std::clamp(static_cast<int>(lensIsoNrMode), 0, 2);
     cfg.lensDynamicIsoCoeff = std::isfinite(lensDynamicIsoCoeff) ? std::clamp(lensDynamicIsoCoeff, 0.0f, 1.0f) : 0.0f;
     cfg.lensManualIsoValue = std::isfinite(lensManualIsoValue) ? std::max(0.0f, lensManualIsoValue) : 0.0f;
-    cfg.profileSpectraStrength = std::isfinite(profileSpectraStrength) ? std::clamp(profileSpectraStrength, -1.0f, 1.0f) : 0.0f;
+    // Phase 6 neural RAW controls. Master is direct unit authority; existing component
+    // values retain their signed profile storage and are projected in the production policy.
+    cfg.profileSpectraStrength = std::isfinite(profileSpectraStrength)
+            ? std::clamp(profileSpectraStrength, 0.0f, 1.0f) : 0.70f;
     cfg.profileSpectraLuma = std::isfinite(profileSpectraLuma) ? std::clamp(profileSpectraLuma, -1.0f, 1.0f) : 0.0f;
     cfg.profileSpectraChroma = std::isfinite(profileSpectraChroma) ? std::clamp(profileSpectraChroma, -1.0f, 1.0f) : 0.0f;
     cfg.profileSpectraDetailProtection = std::isfinite(profileSpectraDetailProtection) ? std::clamp(profileSpectraDetailProtection, -1.0f, 1.0f) : 0.0f;
     cfg.profileSpectraLowFrequency = std::isfinite(profileSpectraLowFrequency) ? std::clamp(profileSpectraLowFrequency, -1.0f, 1.0f) : 0.0f;
-    // N005: these six JNI slots are retained temporarily for Kotlin/native ABI compatibility only.
-    // Classical Profile NR no longer enters any RAW quality state; YUV owns the preserved policy.
-    (void)profileNrLuminance;
+
+    // RAW-only ABI migration: the retired first Profile-NR slot now carries only Adaptive
+    // Response. It is profile-owned 0..1 state and is never derived from capture ISO.
+    cfg.profileNeuralAdaptiveResponse = std::isfinite(profileNrLuminance)
+            ? std::clamp(profileNrLuminance, 0.0f, 1.0f) : 0.45f;
     (void)profileNrLuminanceDetail;
     (void)profileNrLuminanceContrast;
     (void)profileNrColor;

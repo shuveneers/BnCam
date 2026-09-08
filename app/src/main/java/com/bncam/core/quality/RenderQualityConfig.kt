@@ -270,16 +270,25 @@ data class CurveRuntimeConfig(
 
 data class ProfileNoiseTuning(
     val spectraEnabled: Boolean = false,
-    val spectraDynamicIso: Float = SpectraProfileDefaults.DYNAMIC_ISO,
-    val spectraStrength: Float = SpectraProfileDefaults.STRENGTH,
+    val neuralDenoiseStrength: Float = SpectraProfileDefaults.MASTER_STRENGTH,
+    val neuralAdaptiveResponse: Float = SpectraProfileDefaults.ADAPTIVE_RESPONSE,
     val spectraLuma: Float = SpectraProfileDefaults.LUMA,
     val spectraChroma: Float = SpectraProfileDefaults.CHROMA,
     val spectraDetailProtection: Float = SpectraProfileDefaults.DETAIL_PROTECTION,
     val spectraLowFrequency: Float = SpectraProfileDefaults.LOW_FREQUENCY
 ) {
+    /**
+     * Phase-6 source compatibility only. Older immutable recipe/trace callsites still read
+     * `spectraStrength`; it is now a read-only alias of the single neural master authority.
+     * It owns no persistence key and cannot create a second denoise control.
+     */
+    @Deprecated("Use neuralDenoiseStrength", ReplaceWith("neuralDenoiseStrength"))
+    val spectraStrength: Float
+        get() = neuralDenoiseStrength
+
     fun sanitized(): ProfileNoiseTuning = copy(
-        spectraDynamicIso = spectraDynamicIso.coerceIn(0f, 1f),
-        spectraStrength = spectraStrength.coerceIn(-1f, 1f),
+        neuralDenoiseStrength = neuralDenoiseStrength.coerceIn(0f, 1f),
+        neuralAdaptiveResponse = neuralAdaptiveResponse.coerceIn(0f, 1f),
         spectraLuma = spectraLuma.coerceIn(-1f, 1f),
         spectraChroma = spectraChroma.coerceIn(-1f, 1f),
         spectraDetailProtection = spectraDetailProtection.coerceIn(-1f, 1f),
@@ -287,13 +296,13 @@ data class ProfileNoiseTuning(
     )
 
     fun debugPairs(): List<Pair<String, String>> = listOf(
-        "Profile SPECTRA Enabled" to spectraEnabled.toString(),
-        "Profile SPECTRA Dynamic ISO" to String.format(Locale.US, "%.2f", spectraDynamicIso),
-        "Profile SPECTRA Strength" to String.format(Locale.US, "%+.2f", spectraStrength),
-        "Profile SPECTRA Luma" to String.format(Locale.US, "%+.2f", spectraLuma),
-        "Profile SPECTRA Chroma" to String.format(Locale.US, "%+.2f", spectraChroma),
-        "Profile SPECTRA Detail Protection" to String.format(Locale.US, "%+.2f", spectraDetailProtection),
-        "Profile SPECTRA Low Frequency" to String.format(Locale.US, "%+.2f", spectraLowFrequency)
+        "Profile Neural Enabled" to spectraEnabled.toString(),
+        "Neural Denoise Strength" to String.format(Locale.US, "%.2f", neuralDenoiseStrength),
+        "Neural Adaptive Response" to String.format(Locale.US, "%.2f", neuralAdaptiveResponse),
+        "Neural Luma" to String.format(Locale.US, "%+.2f", spectraLuma),
+        "Neural Chroma" to String.format(Locale.US, "%+.2f", spectraChroma),
+        "Neural Detail Protection" to String.format(Locale.US, "%+.2f", spectraDetailProtection),
+        "Neural Low Frequency" to String.format(Locale.US, "%+.2f", spectraLowFrequency)
     )
 }
 
@@ -532,23 +541,31 @@ data class RenderQualityConfig(
             val gammaPreset = loadCurvePreset(repo, profileId, ProfileCurveDefaults.TYPE_GAMMA)
             val sectionPreset = loadCurvePreset(repo, profileId, ProfileCurveDefaults.TYPE_SECT)
             val profileAwb = repo.getProfileAwbSettingsFlow(profileId).first()
+            // Phase 6 migration: old Dynamic ISO storage can seed Adaptive Response once, but
+            // the runtime control itself is profile-owned and never reads capture ISO.
+            val legacyAdaptiveResponse = readProfileFloatOrFallback(
+                repo, profileId, ProfileIspKeys.SPECTRA_DYNAMIC_ISO,
+                SpectraProfileDefaults.ADAPTIVE_RESPONSE, 0f..1f
+            )
             val noiseTuning = ProfileNoiseTuning(
                 spectraEnabled = readProfileIntOrFallback(repo, profileId, ProfileIspKeys.SPECTRA_ENABLED, 0) == 1,
-                spectraDynamicIso = readProfileFloatOrFallback(repo, profileId, ProfileIspKeys.SPECTRA_DYNAMIC_ISO, SpectraProfileDefaults.DYNAMIC_ISO, 0f..1f),
-                spectraStrength = SpectraProfileDefaults.STRENGTH, // calibrated master authority; legacy stored strength is intentionally ignored
+                neuralDenoiseStrength = readProfileFloatOrFallback(
+                    repo, profileId, ProfileIspKeys.NEURAL_DENOISE_STRENGTH,
+                    SpectraProfileDefaults.MASTER_STRENGTH, 0f..1f
+                ),
+                neuralAdaptiveResponse = readProfileFloatOrFallback(
+                    repo, profileId, ProfileIspKeys.NEURAL_ADAPTIVE_RESPONSE,
+                    legacyAdaptiveResponse, 0f..1f
+                ),
                 spectraLuma = readProfileFloatOrFallback(repo, profileId, ProfileIspKeys.SPECTRA_LUMA, SpectraProfileDefaults.LUMA, -1f..1f),
                 spectraChroma = readProfileFloatOrFallback(repo, profileId, ProfileIspKeys.SPECTRA_CHROMA, SpectraProfileDefaults.CHROMA, -1f..1f),
                 spectraDetailProtection = readProfileFloatOrFallback(repo, profileId, ProfileIspKeys.SPECTRA_DETAIL, SpectraProfileDefaults.DETAIL_PROTECTION, -1f..1f),
                 spectraLowFrequency = readProfileFloatOrFallback(repo, profileId, ProfileIspKeys.SPECTRA_LOW_FREQUENCY, SpectraProfileDefaults.LOW_FREQUENCY, -1f..1f)
             ).sanitized()
-            val noiseReductionTuning = ProfileNoiseReductionTuning(
-                luminance = readProfileFloatOrFallback(repo, profileId, ProfileIspKeys.DETAIL_NR_LUMINANCE, ProfileNoiseReductionDefaults.LUMINANCE, 0f..1f),
-                luminanceDetail = readProfileFloatOrFallback(repo, profileId, ProfileIspKeys.DETAIL_NR_LUMINANCE_DETAIL, ProfileNoiseReductionDefaults.LUMINANCE_DETAIL, 0f..1f),
-                luminanceContrast = readProfileFloatOrFallback(repo, profileId, ProfileIspKeys.DETAIL_NR_LUMINANCE_CONTRAST, ProfileNoiseReductionDefaults.LUMINANCE_CONTRAST, 0f..1f),
-                color = readProfileFloatOrFallback(repo, profileId, ProfileIspKeys.DETAIL_NR_COLOR, ProfileNoiseReductionDefaults.COLOR, 0f..1f),
-                colorDetail = readProfileFloatOrFallback(repo, profileId, ProfileIspKeys.DETAIL_NR_COLOR_DETAIL, ProfileNoiseReductionDefaults.COLOR_DETAIL, 0f..1f),
-                colorSmoothness = readProfileFloatOrFallback(repo, profileId, ProfileIspKeys.DETAIL_NR_COLOR_SMOOTHNESS, ProfileNoiseReductionDefaults.COLOR_SMOOTHNESS, 0f..1f)
-            ).sanitized()
+
+            // Retained only as an ABI/data-shape shell. Legacy Detail-NR profile values no longer
+            // enter RenderQualityConfig, so there is no second profile denoise pixel-owner.
+            val noiseReductionTuning = ProfileNoiseReductionTuning().sanitized()
 
             val toneTuning = ProfileToneTuning(
                 exposure = readProfileFloatOrFallback(repo, profileId, ProfileIspKeys.TONE_EXPOSURE, 0f, -1f..1f),

@@ -8,9 +8,12 @@
 
 namespace bncam::spectra::neural {
 
-constexpr std::uint32_t kNeuralDenoiseControlsSchemaVersion = 1;
+constexpr std::uint32_t kNeuralDenoiseControlsSchemaVersion = 2;
 constexpr float kNeuralAuthorityBypassEpsilon = 1.0e-6f;
 
+// Single production noise-reduction control truth. Every field shapes the one
+// Student residual; none of these fields authorizes a second post-demosaic NR engine.
+// User-facing values are unit-range and are projected directly into Vulkan writeback.
 struct NeuralDenoiseControls {
     std::uint32_t schemaVersion = kNeuralDenoiseControlsSchemaVersion;
     bool enabled = false;

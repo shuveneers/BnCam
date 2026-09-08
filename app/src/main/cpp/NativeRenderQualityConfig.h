@@ -141,16 +141,19 @@ struct NativeRenderQualityConfig {
     float lumaUserScale = 1.0f;
     float outerRingAuthority = 0.0f;
 
-    // Profile-scoped controls layered on top of the lens-specific physical model.
-    // 0.00 is neutral; negative values weaken, positive values strengthen.
-    float profileSpectraStrength = 0.0f;
+    // Phase 6 neural RAW denoise control transport. Master and Adaptive Response are direct
+    // unit authorities. Existing Luma/Chroma/Detail/LF profile storage remains signed and is
+    // projected to unit controls by SpectraNeuralProductionPolicy before Student inference.
+    float profileSpectraStrength = 0.70f;
+    float profileNeuralAdaptiveResponse = 0.45f;
     float profileSpectraLuma = 0.0f;
     float profileSpectraChroma = 0.0f;
     float profileSpectraDetailProtection = 0.0f;
     float profileSpectraLowFrequency = 0.0f;
 
-    // Lightroom-style Detail > Noise Reduction. SPECTRA remains a separate
-    // physical/adaptive RAW authority; these controls shape residual post-demosaic cleanup.
+    // Legacy Profile-NR ABI slots. They no longer own RAW or YUV pixels. The first RAW JNI
+    // carrier is repurposed narrowly as profileNeuralAdaptiveResponse in makeQualityConfig;
+    // every YUV caller sends the complete legacy tuple at neutral values.
     float profileNrLuminance = 0.0f;
     float profileNrLuminanceDetail = 0.5f;
     float profileNrLuminanceContrast = 0.0f;

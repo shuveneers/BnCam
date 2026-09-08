@@ -143,19 +143,15 @@ object LibpatcherProfileResolver {
             // Profile V3 removed the old Local Tone Bias control. Keep the persisted key
             // readable for backwards compatibility, but do not export or execute it.
 
-            // SPECTRA profile module. Physical per-lens sensor calibration remains outside profiles.
+            // Phase 6: one Neural RAW denoise owner. Physical per-lens sensor calibration
+            // remains outside profiles; these controls only shape the one Student residual.
             add(i(ProfileIspKeys.SPECTRA_ENABLED, 0))
-            add(f(ProfileIspKeys.SPECTRA_DYNAMIC_ISO, SpectraProfileDefaults.DYNAMIC_ISO))
+            add(f(ProfileIspKeys.NEURAL_DENOISE_STRENGTH, SpectraProfileDefaults.MASTER_STRENGTH))
+            add(f(ProfileIspKeys.NEURAL_ADAPTIVE_RESPONSE, SpectraProfileDefaults.ADAPTIVE_RESPONSE))
             add(f(ProfileIspKeys.SPECTRA_LUMA, SpectraProfileDefaults.LUMA))
             add(f(ProfileIspKeys.SPECTRA_CHROMA, SpectraProfileDefaults.CHROMA))
             add(f(ProfileIspKeys.SPECTRA_DETAIL, SpectraProfileDefaults.DETAIL_PROTECTION))
             add(f(ProfileIspKeys.SPECTRA_LOW_FREQUENCY, SpectraProfileDefaults.LOW_FREQUENCY))
-            add(f(ProfileIspKeys.DETAIL_NR_LUMINANCE, ProfileNoiseReductionDefaults.LUMINANCE))
-            add(f(ProfileIspKeys.DETAIL_NR_LUMINANCE_DETAIL, ProfileNoiseReductionDefaults.LUMINANCE_DETAIL))
-            add(f(ProfileIspKeys.DETAIL_NR_LUMINANCE_CONTRAST, ProfileNoiseReductionDefaults.LUMINANCE_CONTRAST))
-            add(f(ProfileIspKeys.DETAIL_NR_COLOR, ProfileNoiseReductionDefaults.COLOR))
-            add(f(ProfileIspKeys.DETAIL_NR_COLOR_DETAIL, ProfileNoiseReductionDefaults.COLOR_DETAIL))
-            add(f(ProfileIspKeys.DETAIL_NR_COLOR_SMOOTHNESS, ProfileNoiseReductionDefaults.COLOR_SMOOTHNESS))
 
             add(f(ProfileIspKeys.PRESENCE_VIBRANCE))
             add(f(ProfileIspKeys.PRESENCE_SATURATION))
@@ -203,6 +199,21 @@ object LibpatcherProfileResolver {
         }
     }
 
+
+
+    private fun legacyNoiseCompatibilitySpecs(): List<ProfileSettingSpec> = listOf(
+        // Import/export compatibility only. These keys are deliberately excluded from the runtime
+        // setting contract and cannot create a second denoise pixel-owner.
+        ProfileSettingSpec(ProfileIspKeys.SPECTRA_DYNAMIC_ISO, ProfileSettingValueType.FLOAT, SpectraProfileDefaults.DYNAMIC_ISO.toString()),
+        ProfileSettingSpec(ProfileIspKeys.SPECTRA_STRENGTH, ProfileSettingValueType.FLOAT, SpectraProfileDefaults.STRENGTH.toString()),
+        ProfileSettingSpec(ProfileIspKeys.DETAIL_NR_LUMINANCE, ProfileSettingValueType.FLOAT, ProfileNoiseReductionDefaults.LUMINANCE.toString()),
+        ProfileSettingSpec(ProfileIspKeys.DETAIL_NR_LUMINANCE_DETAIL, ProfileSettingValueType.FLOAT, ProfileNoiseReductionDefaults.LUMINANCE_DETAIL.toString()),
+        ProfileSettingSpec(ProfileIspKeys.DETAIL_NR_LUMINANCE_CONTRAST, ProfileSettingValueType.FLOAT, ProfileNoiseReductionDefaults.LUMINANCE_CONTRAST.toString()),
+        ProfileSettingSpec(ProfileIspKeys.DETAIL_NR_COLOR, ProfileSettingValueType.FLOAT, ProfileNoiseReductionDefaults.COLOR.toString()),
+        ProfileSettingSpec(ProfileIspKeys.DETAIL_NR_COLOR_DETAIL, ProfileSettingValueType.FLOAT, ProfileNoiseReductionDefaults.COLOR_DETAIL.toString()),
+        ProfileSettingSpec(ProfileIspKeys.DETAIL_NR_COLOR_SMOOTHNESS, ProfileSettingValueType.FLOAT, ProfileNoiseReductionDefaults.COLOR_SMOOTHNESS.toString())
+    )
+
     private fun plannedProfileSettingSpecs(): List<ProfileSettingSpec> = listOf(
         // Visible V3 placeholders. These values round-trip through .bnc but are intentionally
         // excluded from runtimeProfileSettingSpecs until their dedicated processing backend exists.
@@ -242,8 +253,12 @@ object LibpatcherProfileResolver {
             f(CaptureSettingKeys.CAPTURE_EV_BIAS, 0.0f)
         )
 
-        return (runtimeProfileSettingSpecs() + captureProfileSpecs + plannedProfileSettingSpecs())
-            .distinctBy { "${it.type}:${it.key}" }
+        return (
+            runtimeProfileSettingSpecs() +
+                captureProfileSpecs +
+                plannedProfileSettingSpecs() +
+                legacyNoiseCompatibilitySpecs()
+            ).distinctBy { "${it.type}:${it.key}" }
     }
 
     suspend fun resolve(

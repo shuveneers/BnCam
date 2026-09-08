@@ -1,0 +1,76 @@
+#version 450
+
+layout(local_size_x=8, local_size_y=8, local_size_z=1) in;
+layout(set=0,binding=0,std430) readonly buffer InputBuffer { float data[]; } src;
+layout(set=0,binding=1,std430) writeonly buffer OutputBuffer { float data[]; } dst;
+
+layout(push_constant) uniform PC {
+    uint rawWidth;
+    uint rawHeight;
+    uint packedWidth;
+    uint packedHeight;
+    uint mode; // 0=mosaic->C4, 1=C4->mosaic, 2=posterior C4 -> one vec4 sum/workgroup
+    uint off0x; uint off0y;
+    uint off1x; uint off1y;
+    uint off2x; uint off2y;
+    uint off3x; uint off3y;
+} pc;
+
+uvec2 channelOffset(uint c) {
+    if (c == 0u) return uvec2(pc.off0x, pc.off0y);
+    if (c == 1u) return uvec2(pc.off1x, pc.off1y);
+    if (c == 2u) return uvec2(pc.off2x, pc.off2y);
+    return uvec2(pc.off3x, pc.off3y);
+}
+
+shared vec4 posteriorPartial[64];
+
+vec4 finiteNonNegativePosterior(uint packedBase) {
+    vec4 v = vec4(src.data[packedBase + 0u], src.data[packedBase + 1u],
+                  src.data[packedBase + 2u], src.data[packedBase + 3u]);
+    for (uint c = 0u; c < 4u; ++c) {
+        if (isnan(v[c]) || isinf(v[c]) || v[c] < 0.0) v[c] = 0.0;
+    }
+    return v;
+}
+
+void main() {
+    const uint px = gl_GlobalInvocationID.x;
+    const uint py = gl_GlobalInvocationID.y;
+    const bool insidePacked = px < pc.packedWidth && py < pc.packedHeight;
+    const uint packedBase = insidePacked ? (py * pc.packedWidth + px) * 4u : 0u;
+
+    if (pc.mode == 2u) {
+        const uint lid = gl_LocalInvocationID.y * 8u + gl_LocalInvocationID.x;
+        posteriorPartial[lid] = insidePacked ? finiteNonNegativePosterior(packedBase) : vec4(0.0);
+        barrier();
+        for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+            if (lid < stride) posteriorPartial[lid] += posteriorPartial[lid + stride];
+            barrier();
+        }
+        if (lid == 0u) {
+            const uint groupsX = (pc.packedWidth + 7u) / 8u;
+            const uint groupIndex = gl_WorkGroupID.y * groupsX + gl_WorkGroupID.x;
+            const uint outBase = groupIndex * 4u;
+            const vec4 sum = posteriorPartial[0];
+            dst.data[outBase + 0u] = sum.x;
+            dst.data[outBase + 1u] = sum.y;
+            dst.data[outBase + 2u] = sum.z;
+            dst.data[outBase + 3u] = sum.w;
+        }
+        return;
+    }
+
+    if (!insidePacked) return;
+    const uint rawBaseX = px * 2u;
+    const uint rawBaseY = py * 2u;
+    for (uint c = 0u; c < 4u; ++c) {
+        const uvec2 o = channelOffset(c);
+        const uint x = rawBaseX + o.x;
+        const uint y = rawBaseY + o.y;
+        if (x >= pc.rawWidth || y >= pc.rawHeight) continue;
+        const uint rawIndex = y * pc.rawWidth + x;
+        if (pc.mode == 0u) dst.data[packedBase + c] = src.data[rawIndex];
+        else dst.data[rawIndex] = src.data[packedBase + c];
+    }
+}

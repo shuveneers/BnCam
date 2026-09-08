@@ -31,18 +31,25 @@ object ProfileIspKeys {
     const val TONE_DEHAZE = "tone_dehaze"
     const val TONE_CLARITY = "tone_clarity"
 
-    // Profile-scoped SPECTRA steering. A value of 0.00 is neutral and inherits
-    // the physical lens model unchanged; negative values weaken, positive values strengthen.
+    // Phase 6: one profile-owned Neural RAW denoise control surface.
+    // Master and Adaptive Response use direct 0..1 authority. The four existing component keys
+    // retain their signed storage so older .bnc profiles migrate without changing their meaning.
     const val SPECTRA_ENABLED = "spectra_profile_enabled"
-    const val SPECTRA_DYNAMIC_ISO = "spectra_profile_dynamic_iso"
-    const val SPECTRA_STRENGTH = "spectra_profile_strength"
+    const val NEURAL_DENOISE_STRENGTH = "neural_denoise_strength"
+    const val NEURAL_ADAPTIVE_RESPONSE = "neural_adaptive_response"
     const val SPECTRA_LUMA = "spectra_profile_luma"
     const val SPECTRA_CHROMA = "spectra_profile_chroma"
     const val SPECTRA_DETAIL = "spectra_profile_detail"
     const val SPECTRA_LOW_FREQUENCY = "spectra_profile_low_frequency"
 
-    // Lightroom-style Detail > Noise Reduction. These are creative post-demosaic controls and
-    // remain independent from SPECTRA's physical/adaptive RAW noise-model authority.
+    // Legacy SPECTRA persistence keys. They remain import-readable only; neither key owns
+    // runtime neural pixels after Phase 6. Dynamic ISO may be used once as an Adaptive Response
+    // migration default, but capture ISO is never used to drive the neural control.
+    const val SPECTRA_DYNAMIC_ISO = "spectra_profile_dynamic_iso"
+    const val SPECTRA_STRENGTH = "spectra_profile_strength"
+
+    // Legacy Detail > Noise Reduction persistence/ABI. These keys no longer own pixels.
+    // The Denoise UI is rewired to the same NeuralDenoiseControls state as SPECTRA.
     const val DETAIL_NR_LUMINANCE = "detail_nr_luminance"
     const val DETAIL_NR_LUMINANCE_DETAIL = "detail_nr_luminance_detail"
     const val DETAIL_NR_LUMINANCE_CONTRAST = "detail_nr_luminance_contrast"
@@ -120,6 +127,7 @@ object ProfileDetailDefaults {
 }
 
 
+// Legacy import/ABI defaults only. Phase 6 does not execute a separate Profile-NR engine.
 object ProfileNoiseReductionDefaults {
     const val LUMINANCE = 0.00f
     const val LUMINANCE_DETAIL = 0.50f

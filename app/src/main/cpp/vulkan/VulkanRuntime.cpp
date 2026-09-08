@@ -2,10 +2,18 @@
 #include "VulkanJson.h"
 #include "VulkanVmaIntegration.h"
 
+#ifndef BNCAM_VMA_HEADER_AVAILABLE
+#define BNCAM_VMA_HEADER_AVAILABLE 0
+#endif
+#if BNCAM_VMA_HEADER_AVAILABLE
+#include "vk_mem_alloc.h"
+#endif
+
 #include <vulkan/vulkan_android.h>
 
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <sstream>
 #include <thread>
 #include <vector>
@@ -25,6 +33,165 @@ std::uint64_t epochMilliseconds() {
             std::chrono::system_clock::now().time_since_epoch()
         ).count()
     );
+}
+
+bool readbackNeuralStageFp32(
+        VkDevice device,
+        VkQueue queue,
+        VkCommandPool commandPool,
+        VulkanAllocatorOwner& allocatorOwner,
+        std::mutex& queueMutex,
+        VkBuffer source,
+        std::uint64_t bytes,
+        std::vector<float>& output,
+        float& elapsedOutMs,
+        std::string& failureReason) noexcept {
+    const auto started = std::chrono::steady_clock::now();
+    elapsedOutMs = 0.0f;
+    output.clear();
+    if (device == VK_NULL_HANDLE || queue == VK_NULL_HANDLE || commandPool == VK_NULL_HANDLE ||
+        source == VK_NULL_HANDLE || bytes == 0u || (bytes % sizeof(float)) != 0u) {
+        failureReason = "NEURAL_STAGE_DUMP_INVALID_INPUT";
+        return false;
+    }
+#if !BNCAM_VMA_HEADER_AVAILABLE
+    (void)allocatorOwner;
+    (void)queueMutex;
+    failureReason = "NEURAL_STAGE_DUMP_VMA_UNAVAILABLE";
+    return false;
+#else
+    VmaAllocator allocator = allocatorOwner.handle();
+    if (allocator == nullptr) {
+        failureReason = "NEURAL_STAGE_DUMP_ALLOCATOR_UNAVAILABLE";
+        return false;
+    }
+
+    VkBuffer staging = VK_NULL_HANDLE;
+    VmaAllocation allocation = nullptr;
+    VmaAllocationInfo allocationInfo{};
+    VkBufferCreateInfo bufferInfo{};
+    bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bufferInfo.size = static_cast<VkDeviceSize>(bytes);
+    bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VmaAllocationCreateInfo createInfo{};
+    createInfo.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+    createInfo.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT |
+            VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
+    const VkResult allocationResult = vmaCreateBuffer(
+            allocator, &bufferInfo, &createInfo, &staging, &allocation, &allocationInfo);
+    if (allocationResult != VK_SUCCESS || staging == VK_NULL_HANDLE ||
+        allocation == nullptr || allocationInfo.pMappedData == nullptr) {
+        if (staging != VK_NULL_HANDLE && allocation != nullptr) {
+            vmaDestroyBuffer(allocator, staging, allocation);
+        }
+        failureReason = "NEURAL_STAGE_DUMP_STAGING_ALLOCATION_FAILED_" +
+                std::to_string(allocationResult);
+        return false;
+    }
+
+    VkCommandBuffer command = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+    bool ok = false;
+    do {
+        VkCommandBufferAllocateInfo allocCommand{};
+        allocCommand.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        allocCommand.commandPool = commandPool;
+        allocCommand.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        allocCommand.commandBufferCount = 1u;
+        if (vkAllocateCommandBuffers(device, &allocCommand, &command) != VK_SUCCESS) {
+            failureReason = "NEURAL_STAGE_DUMP_COMMAND_ALLOC_FAILED";
+            break;
+        }
+
+        VkCommandBufferBeginInfo begin{};
+        begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        if (vkBeginCommandBuffer(command, &begin) != VK_SUCCESS) {
+            failureReason = "NEURAL_STAGE_DUMP_COMMAND_BEGIN_FAILED";
+            break;
+        }
+
+        VkBufferMemoryBarrier sourceReady{};
+        sourceReady.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        sourceReady.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        sourceReady.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        sourceReady.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        sourceReady.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        sourceReady.buffer = source;
+        sourceReady.offset = 0u;
+        sourceReady.size = static_cast<VkDeviceSize>(bytes);
+        vkCmdPipelineBarrier(
+                command,
+                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0u, 0u, nullptr, 1u, &sourceReady, 0u, nullptr);
+
+        VkBufferCopy copy{};
+        copy.size = static_cast<VkDeviceSize>(bytes);
+        vkCmdCopyBuffer(command, source, staging, 1u, &copy);
+
+        VkBufferMemoryBarrier hostReady{};
+        hostReady.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        hostReady.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        hostReady.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        hostReady.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        hostReady.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        hostReady.buffer = staging;
+        hostReady.offset = 0u;
+        hostReady.size = static_cast<VkDeviceSize>(bytes);
+        vkCmdPipelineBarrier(
+                command,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_HOST_BIT,
+                0u, 0u, nullptr, 1u, &hostReady, 0u, nullptr);
+
+        if (vkEndCommandBuffer(command) != VK_SUCCESS) {
+            failureReason = "NEURAL_STAGE_DUMP_COMMAND_END_FAILED";
+            break;
+        }
+
+        VkFenceCreateInfo fenceInfo{};
+        fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        if (vkCreateFence(device, &fenceInfo, nullptr, &fence) != VK_SUCCESS) {
+            failureReason = "NEURAL_STAGE_DUMP_FENCE_CREATE_FAILED";
+            break;
+        }
+        VkSubmitInfo submit{};
+        submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submit.commandBufferCount = 1u;
+        submit.pCommandBuffers = &command;
+        {
+            std::lock_guard<std::mutex> lock(queueMutex);
+            if (vkQueueSubmit(queue, 1u, &submit, fence) != VK_SUCCESS) {
+                failureReason = "NEURAL_STAGE_DUMP_SUBMIT_FAILED";
+                break;
+            }
+        }
+        const VkResult wait = vkWaitForFences(device, 1u, &fence, VK_TRUE, UINT64_MAX);
+        if (wait != VK_SUCCESS) {
+            failureReason = "NEURAL_STAGE_DUMP_WAIT_FAILED_" + std::to_string(wait);
+            break;
+        }
+        vmaInvalidateAllocation(allocator, allocation, 0u, static_cast<VkDeviceSize>(bytes));
+        output.resize(static_cast<std::size_t>(bytes / sizeof(float)));
+        std::memcpy(output.data(), allocationInfo.pMappedData, static_cast<std::size_t>(bytes));
+        failureReason = "none";
+        ok = true;
+    } while (false);
+
+    if (fence != VK_NULL_HANDLE) {
+        vkDestroyFence(device, fence, nullptr);
+    }
+    if (command != VK_NULL_HANDLE) {
+        vkFreeCommandBuffers(device, commandPool, 1u, &command);
+    }
+    vmaDestroyBuffer(allocator, staging, allocation);
+    elapsedOutMs = std::chrono::duration<float, std::milli>(
+            std::chrono::steady_clock::now() - started).count();
+    if (!ok) output.clear();
+    return ok;
+#endif
 }
 }  // namespace
 
@@ -185,6 +352,8 @@ RuntimeSnapshot VulkanRuntime::initialize(const RuntimeConfig& config) noexcept 
 }
 
 RuntimeSnapshot VulkanRuntime::shutdown() noexcept {
+    // Match neural configure/clear lock ordering: orchestration before runtime state.
+    std::unique_lock<std::mutex> neuralLock(neuralOrchestrationMutex_);
     std::unique_lock<std::mutex> lock(mutex_);
     ++shutdownRequestCount_;
     while (state_ == RuntimeState::INITIALIZING) {
@@ -230,6 +399,11 @@ RuntimeSnapshot VulkanRuntime::shutdown() noexcept {
     spectraPass3PlannerBackend_.destroy(handles_.device);
     spectraRawFinalizeBackend_.destroy(handles_.device);
     spectraResidentToneBackend_.destroy(handles_.device);
+    // Phase 5: neural device objects must die before VMA/device ownership.
+    spectraNeuralRemainingLscBackend_.destroy(handles_.device);
+    spectraNeuralProductionBridge_.destroy(handles_.device);
+    spectraNeuralRawDenoiseBackend_.destroy();
+    spectraNeuralModelAvailable_.store(false, std::memory_order_release);
     OwnedRuntimeHandles handlesToDestroy = std::move(handles_);
     lock.unlock();
     RuntimeFailure destroyFailure = VulkanRuntimeBootstrap::destroy(handlesToDestroy);
@@ -431,6 +605,7 @@ SpectraTemporalObserverResult VulkanRuntime::executeSpectraTemporalObserver(
 SpectraRawFinalizeResult VulkanRuntime::executeSpectraRawFinalize(
         const SpectraRawFinalizeRequest& request
 ) noexcept {
+    std::lock_guard<std::mutex> orchestrationLock(neuralOrchestrationMutex_);
     SpectraRawFinalizeResult rejected{};
     rejected.attempted = true;
     VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
@@ -470,6 +645,7 @@ bool VulkanRuntime::readbackSpectraRawFinalizeResident(
         std::uint64_t generation,
         std::vector<float>& output
 ) noexcept {
+    std::lock_guard<std::mutex> orchestrationLock(neuralOrchestrationMutex_);
     output.clear();
     if (generation == 0u) return false;
 
@@ -532,13 +708,19 @@ SpectraResidentDemosaicResult VulkanRuntime::executeSpectraResidentDemosaicFromR
         std::uint64_t residentBytes = 0u;
         std::uint32_t residentWidth = 0u;
         std::uint32_t residentHeight = 0u;
-        if (!spectraRawFinalizeBackend_.resolveResidentOutput(
+        bool resolved = spectraRawFinalizeBackend_.resolveResidentOutput(
+                rawFinalizeGeneration, residentInput, residentBytes,
+                residentWidth, residentHeight);
+        if (!resolved) {
+            resolved = spectraNeuralRemainingLscBackend_.resolveResidentOutput(
                     rawFinalizeGeneration, residentInput, residentBytes,
-                    residentWidth, residentHeight)) {
+                    residentWidth, residentHeight);
+        }
+        if (!resolved) {
             result.attempted = true;
             result.cpuFallbackRequired = true;
-            result.status = "RAW_FINALIZE_RESIDENT_GENERATION_UNAVAILABLE";
-            result.failureReason = "Opaque RAW-finalize generation could not be resolved.";
+            result.status = "PRE_DEMOSAIC_RESIDENT_GENERATION_UNAVAILABLE";
+            result.failureReason = "Opaque RawFinalize/remaining-LSC generation could not be resolved.";
         } else if (residentWidth != request.frameWidth || residentHeight != request.frameHeight) {
             result.attempted = true;
             result.cpuFallbackRequired = true;
@@ -893,10 +1075,466 @@ RawJpegNormalizeResult VulkanRuntime::executeRawJpegNormalizeFromResidentRaw(
     return result;
 }
 
+bool VulkanRuntime::configureSpectraNeuralModel(
+        const void* packageBytes,
+        std::size_t packageSize,
+        bool releaseApproved,
+        std::uint32_t inFlightSlots
+) noexcept {
+    // A package cannot self-promote from a test fixture to production. Release
+    // approval is an explicit caller contract supplied by the model deployment layer.
+    if (!releaseApproved || packageBytes == nullptr || packageSize == 0u ||
+        inFlightSlots < 2u || inFlightSlots > 4u) {
+        clearSpectraNeuralModel();
+        return false;
+    }
+
+    std::lock_guard<std::mutex> orchestrationLock(neuralOrchestrationMutex_);
+    VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
+    VkDevice device = VK_NULL_HANDLE;
+    VkQueue queue = VK_NULL_HANDLE;
+    VkCommandPool commandPool = VK_NULL_HANDLE;
+    VulkanAllocatorOwner* allocator = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_ != RuntimeState::READY || !handles_.complete()) {
+            spectraNeuralModelAvailable_.store(false, std::memory_order_release);
+            return false;
+        }
+        physicalDevice = handles_.physicalDevice;
+        device = handles_.device;
+        queue = handles_.computeQueue;
+        commandPool = handles_.commandPool;
+        allocator = &handles_.allocator;
+    }
+
+    // Reconfiguration is fail-closed and owns no second runtime/device.
+    spectraNeuralProductionBridge_.destroy(device);
+    spectraNeuralRawDenoiseBackend_.destroy();
+    const bool ready = spectraNeuralRawDenoiseBackend_.initialize(
+            physicalDevice, device, queue, commandPool, *allocator,
+            submissionMutex_, packageBytes, packageSize, inFlightSlots);
+    spectraNeuralModelAvailable_.store(ready, std::memory_order_release);
+    return ready;
+}
+
+void VulkanRuntime::clearSpectraNeuralModel() noexcept {
+    std::lock_guard<std::mutex> orchestrationLock(neuralOrchestrationMutex_);
+    VkDevice device = VK_NULL_HANDLE;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        device = handles_.device;
+    }
+    spectraNeuralModelAvailable_.store(false, std::memory_order_release);
+    spectraNeuralProductionBridge_.destroy(device);
+    spectraNeuralRawDenoiseBackend_.destroy();
+}
+
+bool VulkanRuntime::spectraNeuralModelAvailable() const noexcept {
+    return spectraNeuralModelAvailable_.load(std::memory_order_acquire);
+}
+
+SpectraRawFinalizeResult VulkanRuntime::executeSpectraNeuralThenRawFinalizeFromRawNormalize(
+        const SpectraRawFinalizeRequest& request,
+        const neural::SpectraNeuralProductionRequest& neuralRequest,
+        std::uint64_t rawNormalizeGeneration,
+        neural::SpectraNeuralProductionTrace* traceOut,
+        neural::SpectraNeuralStageDumps* stageDumpsOut
+) noexcept {
+    using bncam::spectra::neural::NeuralBackendFailureCode;
+    using bncam::spectra::neural::NeuralBypassReason;
+    using bncam::spectra::neural::decideNeuralInvocation;
+    using bncam::spectra::neural::mergeProductionReadiness;
+    using bncam::spectra::neural::neuralBypassReasonName;
+
+    const auto orchestrationStarted = std::chrono::steady_clock::now();
+    const auto orchestrationElapsedMs = [&]() noexcept -> float {
+        return std::chrono::duration<float, std::milli>(
+                std::chrono::steady_clock::now() - orchestrationStarted).count();
+    };
+
+    neural::SpectraNeuralProductionTrace trace{};
+    trace.modelAvailable = spectraNeuralModelAvailable();
+    trace.stageDumpsRequested = neuralRequest.collectStageDumps;
+    neural::SpectraNeuralStageDumps stageDumps{};
+    stageDumps.requested = neuralRequest.collectStageDumps;
+    stageDumps.width = request.frameWidth;
+    stageDumps.height = request.frameHeight;
+    stageDumps.status = neuralRequest.collectStageDumps ? "REQUESTED" : "NOT_REQUESTED";
+    if (traceOut != nullptr) *traceOut = trace;
+    if (stageDumpsOut != nullptr) *stageDumpsOut = stageDumps;
+
+    SpectraRawFinalizeResult rejected{};
+    rejected.attempted = true;
+    if (rawNormalizeGeneration == 0u) {
+        rejected.status = "NEURAL_RAW_FINALIZE_NORMALIZE_GENERATION_MISSING";
+        rejected.failureReason = "Resident RAW-normalize generation is required.";
+        return rejected;
+    }
+
+    VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
+    VkDevice device = VK_NULL_HANDLE;
+    VkQueue queue = VK_NULL_HANDLE;
+    VkCommandPool commandPool = VK_NULL_HANDLE;
+    VulkanAllocatorOwner* allocator = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_ != RuntimeState::READY || !handles_.complete()) {
+            rejected.status = "VULKAN_RUNTIME_NOT_READY";
+            rejected.failureReason = "Authoritative Vulkan runtime is not READY.";
+            return rejected;
+        }
+        inFlightSubmissionCount_.fetch_add(1, std::memory_order_acq_rel);
+        physicalDevice = handles_.physicalDevice;
+        device = handles_.device;
+        queue = handles_.computeQueue;
+        commandPool = handles_.commandPool;
+        allocator = &handles_.allocator;
+    }
+
+    SpectraRawFinalizeResult result{};
+    {
+        // One capture may orchestrate several internally serialized queue submissions,
+        // but we never recursively lock submissionMutex_. The orchestration mutex also
+        // prevents model reconfiguration from invalidating neural resources mid-shot.
+        std::lock_guard<std::mutex> orchestrationLock(neuralOrchestrationMutex_);
+
+        VkBuffer normalizedInput = VK_NULL_HANDLE;
+        std::uint64_t normalizedBytes = 0u;
+        std::uint32_t normalizedWidth = 0u;
+        std::uint32_t normalizedHeight = 0u;
+        if (!rawJpegNormalizeBackend_.resolveResidentOutput(
+                    rawNormalizeGeneration, normalizedInput, normalizedBytes,
+                    normalizedWidth, normalizedHeight)) {
+            result.attempted = true;
+            result.status = "NEURAL_RAW_FINALIZE_NORMALIZE_GENERATION_UNAVAILABLE";
+            result.failureReason = "Opaque RAW-normalize generation could not be resolved.";
+        } else if (normalizedWidth != request.frameWidth || normalizedHeight != request.frameHeight) {
+            result.attempted = true;
+            result.status = "NEURAL_RAW_FINALIZE_NORMALIZE_DIMENSION_MISMATCH";
+            result.failureReason = "Resolved normalized RAW dimensions do not match finalizer request.";
+        } else {
+            const std::uint64_t imageBytes = static_cast<std::uint64_t>(request.frameWidth) *
+                    request.frameHeight * sizeof(float);
+
+            const auto captureDebugStage = [&](VkBuffer source, std::vector<float>& destination,
+                                               bool& ready, const char* stageName) noexcept {
+                if (!neuralRequest.collectStageDumps || stageDumpsOut == nullptr) return;
+                float readbackMs = 0.0f;
+                std::string failure;
+                if (readbackNeuralStageFp32(
+                            device, queue, commandPool, *allocator, submissionMutex_,
+                            source, imageBytes, destination, readbackMs, failure)) {
+                    ready = true;
+                    ++stageDumps.stageCount;
+                    stageDumps.debugReadbackBytes += imageBytes;
+                    stageDumps.debugReadbackMs += readbackMs;
+                } else {
+                    ready = false;
+                    if (stageDumps.status == "REQUESTED" || stageDumps.status == "COMPLETE") {
+                        stageDumps.status = std::string("PARTIAL_") + stageName + "_" + failure;
+                    }
+                }
+            };
+
+            const auto runExactBaselineFinalize = [&]() noexcept -> SpectraRawFinalizeResult {
+                std::lock_guard<std::mutex> submitLock(submissionMutex_);
+                return spectraRawFinalizeBackend_.executeFromResident(
+                        physicalDevice, device, queue, commandPool, *allocator,
+                        normalizedInput, normalizedBytes, request);
+            };
+
+            // Preflight is deliberately before the split physical/neural path. Off, model-missing,
+            // OOD, schema mismatch and every other structural bypass execute the exact historical
+            // normalized-RAW -> full RawFinalize route, with no extra full-frame GPU stage.
+            const bool conditioningValid = neuralRequest.conditioningConfig.valid();
+            const bool modelReady = spectraNeuralModelAvailable();
+            auto readiness = neuralRequest.runtimeReadiness;
+            // configureSpectraNeuralModel() publishes modelReady only after a release-approved
+            // package has passed the frozen package/schema/hash loader and backend initialization.
+            // These are therefore runtime facts, not caller-provided optimistic hints.
+            readiness.conditioningSchemaCompatible = conditioningValid;
+            readiness.modelPresent = modelReady;
+            readiness.modelIntegrityVerified = modelReady;
+            readiness.modelSchemaCompatible = modelReady;
+            readiness.backendAvailable = spectraNeuralRawDenoiseBackend_.available();
+            readiness = mergeProductionReadiness(neuralRequest.prepared, readiness);
+            const auto decision = decideNeuralInvocation(
+                    neuralRequest.prepared.core, neuralRequest.prepared.controls, readiness);
+            if (!decision.runInference || !conditioningValid) {
+                trace.exactPreflightBypass = true;
+                trace.originalPublished = true;
+                trace.neuralPublished = false;
+                trace.bypassReason = conditioningValid
+                        ? decision.bypassReason : NeuralBypassReason::InvalidConditioningSchema;
+                trace.status = "EXACT_PREFLIGHT_BYPASS_" +
+                        std::string(neuralBypassReasonName(trace.bypassReason));
+                result = runExactBaselineFinalize();
+            } else if (normalizedBytes < imageBytes) {
+                trace.exactPreflightBypass = true;
+                trace.bypassReason = NeuralBypassReason::BackendFailure;
+                trace.failureCode = NeuralBackendFailureCode::InvalidRequest;
+                trace.status = "FAIL_BYPASS_NORMALIZED_RAW_SIZE_MISMATCH";
+                result = runExactBaselineFinalize();
+            } else {
+                // Stage A: hard physical Bayer correction only. LSC and spatial exposure are
+                // intentionally absent so the Student sees defect/green-corrected pre-LSC RAW.
+                SpectraRawFinalizeRequest hardRequest = request;
+                hardRequest.lensShadingMap = nullptr;
+                hardRequest.lensShadingColumns = 0u;
+                hardRequest.lensShadingRows = 0u;
+                hardRequest.lensShadingGenerationId = 0u;
+                hardRequest.adaptiveExposureEnabled = false;
+
+                SpectraRawFinalizeResult hardPhysical{};
+                {
+                    std::lock_guard<std::mutex> submitLock(submissionMutex_);
+                    hardPhysical = spectraRawFinalizeBackend_.executeFromResident(
+                            physicalDevice, device, queue, commandPool, *allocator,
+                            normalizedInput, normalizedBytes, hardRequest);
+                }
+                trace.prePhysicalMs = hardPhysical.totalMs;
+                trace.hardPhysicalCorrectionApplied = hardPhysical.success;
+
+                if (hardPhysical.submissionMayRemainInFlight) {
+                    result = hardPhysical;
+                    trace.failureCode = NeuralBackendFailureCode::DispatchFailed;
+                    trace.bypassReason = NeuralBypassReason::BackendFailure;
+                    trace.status = "GPU_STALLED_PRE_NEURAL_HARD_PHYSICAL";
+                } else if (!hardPhysical.success || hardPhysical.residentOutputGeneration == 0u ||
+                           !hardPhysical.sourceClipConfidenceMapReady) {
+                    trace.failureCode = NeuralBackendFailureCode::DispatchFailed;
+                    trace.bypassReason = NeuralBypassReason::BackendFailure;
+                    trace.status = "FAIL_BYPASS_PRE_NEURAL_HARD_PHYSICAL";
+                    result = runExactBaselineFinalize();
+                } else {
+                    VkBuffer hardPhysicalBuffer = VK_NULL_HANDLE;
+                    std::uint64_t hardPhysicalBytes = 0u;
+                    std::uint32_t hardPhysicalWidth = 0u;
+                    std::uint32_t hardPhysicalHeight = 0u;
+                    if (!spectraRawFinalizeBackend_.resolveResidentOutput(
+                                hardPhysical.residentOutputGeneration,
+                                hardPhysicalBuffer, hardPhysicalBytes,
+                                hardPhysicalWidth, hardPhysicalHeight) ||
+                        hardPhysicalWidth != request.frameWidth ||
+                        hardPhysicalHeight != request.frameHeight ||
+                        hardPhysicalBytes < imageBytes + hardPhysical.sourceClipConfidenceMapBytes) {
+                        trace.failureCode = NeuralBackendFailureCode::InternalError;
+                        trace.bypassReason = NeuralBypassReason::BackendFailure;
+                        trace.status = "FAIL_BYPASS_PRE_NEURAL_RESIDENT_TRANSPORT_INVALID";
+                        result = runExactBaselineFinalize();
+                    } else {
+                        captureDebugStage(
+                                hardPhysicalBuffer,
+                                stageDumps.preNeuralHardPhysicalMosaic,
+                                stageDumps.preNeuralHardPhysicalReady,
+                                "PRE_NEURAL_HARD_PHYSICAL");
+                        neural::NeuralProductionGpuRequest gpuRequest{};
+                        gpuRequest.normalizedBayerInput = hardPhysicalBuffer;
+                        // The bridge consumes only the Bayer image prefix. The source-clip tail
+                        // remains owned by RawFinalize and is transported separately after neural.
+                        gpuRequest.normalizedBayerBytes = imageBytes;
+                        gpuRequest.prepared = neuralRequest.prepared;
+                        gpuRequest.conditioningConfig = neuralRequest.conditioningConfig;
+                        gpuRequest.runtimeReadiness = readiness;
+                        gpuRequest.remainingLscMap = neuralRequest.remainingLscMap;
+                        gpuRequest.remainingLscWidth = neuralRequest.remainingLscWidth;
+                        gpuRequest.remainingLscHeight = neuralRequest.remainingLscHeight;
+                        gpuRequest.remainingLscChannels = neuralRequest.remainingLscChannels;
+                        gpuRequest.remainingLscGeneration = neuralRequest.remainingLscGeneration;
+                        gpuRequest.generationId = neuralRequest.generationId;
+
+                        const auto neuralResult = spectraNeuralProductionBridge_.execute(
+                                device, queue, commandPool, *allocator, submissionMutex_,
+                                spectraNeuralRawDenoiseBackend_, gpuRequest);
+                        trace.attempted = neuralResult.attempted;
+                        trace.neuralPublished = neuralResult.neuralPublished;
+                        trace.originalPublished = neuralResult.originalPublished;
+                        trace.modelAvailable = spectraNeuralModelAvailable();
+                        trace.neuralKernelDispatches = neuralResult.neuralKernelDispatches;
+                        trace.bridgeKernelDispatches = neuralResult.bridgeKernelDispatches;
+                        trace.compactMetadataUploadBytes = neuralResult.compactMetadataUploadBytes;
+                        trace.posteriorSummaryReady = neuralResult.posteriorSummaryReady;
+                        trace.posteriorMeanVarianceCfa = neuralResult.posteriorMeanVarianceCfa;
+                        trace.compactPosteriorReadbackBytes = neuralResult.compactPosteriorReadbackBytes;
+                        trace.persistentGpuBytes = neuralResult.persistentGpuBytes;
+                        trace.fullFrameCpuReadbackBytes = neuralResult.fullFrameCpuReadbackBytes;
+                        trace.cpuFallbackUsed = neuralResult.cpuFallbackUsed;
+                        trace.neuralWallMs = neuralResult.totalWallMs;
+                        trace.bypassReason = neuralResult.bypassReason;
+                        trace.failureCode = neuralResult.failureCode;
+                        trace.status = neuralResult.status;
+
+                        if (!neuralResult.success || !neuralResult.neuralPublished ||
+                            neuralResult.downstreamBayerBuffer == VK_NULL_HANDLE ||
+                            neuralResult.downstreamBayerBytes != imageBytes) {
+                            // Fail=bypass means discard every split-stage intermediate and rerun
+                            // the exact baseline full finalizer from immutable normalized RAW.
+                            if (trace.bypassReason == NeuralBypassReason::None) {
+                                trace.bypassReason = NeuralBypassReason::BackendFailure;
+                            }
+                            if (trace.failureCode == NeuralBackendFailureCode::None) {
+                                trace.failureCode = NeuralBackendFailureCode::DispatchFailed;
+                            }
+                            trace.status = "FAIL_BYPASS_NEURAL_PUBLICATION";
+                            trace.neuralPublished = false;
+                            trace.originalPublished = true;
+                            result = runExactBaselineFinalize();
+                        } else {
+                            captureDebugStage(
+                                    neuralResult.downstreamBayerBuffer,
+                                    stageDumps.postNeuralMosaic,
+                                    stageDumps.postNeuralReady,
+                                    "POST_NEURAL");
+                            neural::NeuralRemainingLscRequest lscRequest{};
+                            lscRequest.bayerInput = neuralResult.downstreamBayerBuffer;
+                            lscRequest.bayerInputBytes = neuralResult.downstreamBayerBytes;
+                            lscRequest.sourceClipTransport = hardPhysicalBuffer;
+                            lscRequest.sourceClipTransportBytes = hardPhysicalBytes;
+                            lscRequest.frameWidth = request.frameWidth;
+                            lscRequest.frameHeight = request.frameHeight;
+                            lscRequest.sensorCfaPattern = request.sensorCfaPattern;
+                            lscRequest.cfaOffsetX = request.cfaOffsetX;
+                            lscRequest.cfaOffsetY = request.cfaOffsetY;
+                            lscRequest.lensShadingMap = request.lensShadingMap;
+                            lscRequest.lensShadingColumns = request.lensShadingColumns;
+                            lscRequest.lensShadingRows = request.lensShadingRows;
+                            lscRequest.lensShadingGenerationId = request.lensShadingGenerationId;
+                            lscRequest.collectAutoSceneMetrics = neuralRequest.collectAutoSceneMetrics;
+
+                            neural::NeuralRemainingLscResult lscResult{};
+                            {
+                                std::lock_guard<std::mutex> submitLock(submissionMutex_);
+                                lscResult = spectraNeuralRemainingLscBackend_.execute(
+                                        physicalDevice, device, queue, commandPool,
+                                        *allocator, lscRequest);
+                            }
+                            trace.remainingLscMs = lscResult.totalMs;
+                            trace.remainingLscApplied = lscResult.lensShadingApplied;
+                            trace.sourceClipProvenancePreserved =
+                                    lscResult.sourceClipConfidenceMapPreserved;
+
+                            if (lscResult.submissionMayRemainInFlight) {
+                                result = hardPhysical;
+                                result.success = false;
+                                result.submissionMayRemainInFlight = true;
+                                result.status = "GPU_STALLED_NEURAL_REMAINING_LSC";
+                                result.failureReason = lscResult.failureReason;
+                                trace.failureCode = NeuralBackendFailureCode::DispatchFailed;
+                                trace.bypassReason = NeuralBypassReason::BackendFailure;
+                                trace.status = "GPU_STALLED_NEURAL_REMAINING_LSC";
+                            } else if (!lscResult.success ||
+                                       lscResult.residentOutputGeneration == 0u ||
+                                       !lscResult.sourceClipConfidenceMapPreserved ||
+                                       (neuralRequest.collectAutoSceneMetrics &&
+                                        !lscResult.autoSceneMetricsReady)) {
+                                trace.failureCode = NeuralBackendFailureCode::DispatchFailed;
+                                trace.bypassReason = NeuralBypassReason::BackendFailure;
+                                trace.status = "FAIL_BYPASS_NEURAL_REMAINING_LSC";
+                                trace.neuralPublished = false;
+                                trace.originalPublished = true;
+                                result = runExactBaselineFinalize();
+                            } else {
+                                VkBuffer postLscBuffer = VK_NULL_HANDLE;
+                                std::uint64_t postLscBytes = 0u;
+                                std::uint32_t postLscWidth = 0u;
+                                std::uint32_t postLscHeight = 0u;
+                                if (neuralRequest.collectStageDumps && stageDumpsOut != nullptr &&
+                                    spectraNeuralRemainingLscBackend_.resolveResidentOutput(
+                                            lscResult.residentOutputGeneration,
+                                            postLscBuffer, postLscBytes,
+                                            postLscWidth, postLscHeight) &&
+                                    postLscWidth == request.frameWidth &&
+                                    postLscHeight == request.frameHeight &&
+                                    postLscBytes >= imageBytes) {
+                                    captureDebugStage(
+                                            postLscBuffer,
+                                            stageDumps.postRemainingLscMosaic,
+                                            stageDumps.postRemainingLscReady,
+                                            "POST_REMAINING_LSC");
+                                }
+                                // Preserve hard-physical/source telemetry, then replace only the
+                                // fields owned by the post-neural remaining-LSC stage.
+                                result = hardPhysical;
+                                result.success = true;
+                                result.submissionMayRemainInFlight = false;
+                                result.lensShadingApplied = lscResult.lensShadingApplied;
+                                result.lensCorrectedPixelCount = lscResult.lensCorrectedPixelCount;
+                                result.overRangePixelCount = lscResult.overRangePixelCount;
+                                result.lensMaximumGain = lscResult.lensMaximumGain;
+                                result.lensMapUploadMs += lscResult.lensMapUploadMs;
+                                result.finalizeKernelMs += lscResult.lscKernelMs;
+                                result.synchronizationMs += lscResult.synchronizationMs;
+                                result.autoSceneMetricsReady = lscResult.autoSceneMetricsReady;
+                                result.autoSceneSampleCount = lscResult.autoSceneSampleCount;
+                                result.autoSceneMedianSignal = lscResult.autoSceneMedianSignal;
+                                result.autoSceneMeanGradient = lscResult.autoSceneMeanGradient;
+                                result.autoSceneP90Gradient = lscResult.autoSceneP90Gradient;
+                                result.autoSceneEdgeFraction = lscResult.autoSceneEdgeFraction;
+                                result.autoSceneCoherentEdgeFraction =
+                                        lscResult.autoSceneCoherentEdgeFraction;
+                                result.autoSceneLowSignalFraction = lscResult.autoSceneLowSignalFraction;
+                                result.sourceClipConfidenceMapReady =
+                                        lscResult.sourceClipConfidenceMapPreserved;
+                                result.sourceClipConfidenceMapBytes =
+                                        lscResult.sourceClipConfidenceMapBytes;
+                                result.persistentBufferReuseHit =
+                                        hardPhysical.persistentBufferReuseHit &&
+                                        lscResult.persistentBufferReuseHit;
+                                result.persistentBufferReallocated =
+                                        hardPhysical.persistentBufferReallocated ||
+                                        lscResult.persistentBufferReallocated;
+                                result.persistentResidentBytes = hardPhysical.persistentResidentBytes +
+                                        neuralResult.persistentGpuBytes +
+                                        lscResult.persistentResidentBytes;
+                                result.residentOutputGeneration = lscResult.residentOutputGeneration;
+                                result.status =
+                                        "GPU_RAW_FINALIZE_NEURAL_REMAINING_LSC_PRIMARY_DEMOSAIC_HANDOFF_READY";
+                                result.failureReason = "none";
+                                result.totalMs = hardPhysical.totalMs + neuralResult.totalWallMs +
+                                        lscResult.totalMs;
+                                trace.neuralPublished = true;
+                                trace.originalPublished = false;
+                                trace.bypassReason = NeuralBypassReason::None;
+                                trace.failureCode = NeuralBackendFailureCode::None;
+                                trace.status = "NEURAL_PRE_DEMOSAIC_RESIDENT_PUBLISHED";
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (neuralRequest.collectStageDumps) {
+        if (stageDumps.stageCount == 3u) {
+            stageDumps.status = "COMPLETE";
+        } else if (stageDumps.stageCount == 0u && stageDumps.status == "REQUESTED") {
+            stageDumps.status = "NO_NEURAL_STAGE_PUBLISHED";
+        } else if (stageDumps.status == "REQUESTED") {
+            stageDumps.status = "PARTIAL";
+        }
+        trace.stageDumpCount = stageDumps.stageCount;
+        trace.stageDumpsCollected = stageDumps.stageCount > 0u;
+        trace.debugStageDumpReadbackBytes = stageDumps.debugReadbackBytes;
+        trace.debugStageDumpReadbackMs = stageDumps.debugReadbackMs;
+    }
+    trace.totalWallMs = orchestrationElapsedMs();
+    if (traceOut != nullptr) *traceOut = trace;
+    if (stageDumpsOut != nullptr) *stageDumpsOut = stageDumps;
+    if (result.submissionMayRemainInFlight) {
+        markGpuStalled("NEURAL_RAW_FINALIZE_FROM_RAW_NORMALIZE");
+        return result;
+    }
+    completeSubmission();
+    return result;
+}
+
 SpectraRawFinalizeResult VulkanRuntime::executeSpectraRawFinalizeFromRawNormalize(
         const SpectraRawFinalizeRequest& request,
         std::uint64_t rawNormalizeGeneration
 ) noexcept {
+    std::lock_guard<std::mutex> orchestrationLock(neuralOrchestrationMutex_);
     SpectraRawFinalizeResult rejected{};
     rejected.attempted = true;
     if (rawNormalizeGeneration == 0u) {

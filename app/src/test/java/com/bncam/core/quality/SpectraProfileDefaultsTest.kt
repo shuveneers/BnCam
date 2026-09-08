@@ -18,10 +18,10 @@ class SpectraProfileDefaultsTest {
         val natural = SpectraProfileCharacters.natural.values
         val clean = SpectraProfileCharacters.clean.values
         val night = SpectraProfileCharacters.night.values
-        assertTrue(clean.dynamicIso >= natural.dynamicIso)
+        assertTrue(clean.adaptiveResponse >= natural.adaptiveResponse)
         assertTrue(clean.chroma > natural.chroma)
         assertTrue(clean.lowFrequency > natural.lowFrequency)
-        assertTrue(night.dynamicIso >= clean.dynamicIso)
+        assertTrue(night.adaptiveResponse >= clean.adaptiveResponse)
         assertTrue(night.chroma > clean.chroma)
         assertTrue(night.lowFrequency > clean.lowFrequency)
         assertTrue(natural.detailProtection > 0f)

@@ -71,13 +71,19 @@ def run_reference_inference(
         raise ValueError("reference inputs must be finite")
 
     previous_threads = torch.get_num_threads()
+    previous_mkldnn = torch.backends.mkldnn.enabled
     try:
+        # oneDNN FP16 convolution kernels can differ by one half-precision ULP
+        # across host/PyTorch revisions. The frozen golden contract is the plain
+        # deterministic CPU graph, so disable oneDNN for reference generation.
+        torch.backends.mkldnn.enabled = False
         torch.set_num_threads(1)
         torch.use_deterministic_algorithms(True, warn_only=False)
         with torch.inference_mode():
             output = model(cond, glob)
     finally:
         torch.set_num_threads(previous_threads)
+        torch.backends.mkldnn.enabled = previous_mkldnn
 
     def array(x: Optional[torch.Tensor]) -> Optional[np.ndarray]:
         if x is None:

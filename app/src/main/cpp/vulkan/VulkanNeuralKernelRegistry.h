@@ -12,6 +12,6 @@ constexpr std::array<NeuralKernelContract,static_cast<std::size_t>(NeuralKernel:
  {"neural_gate.comp","NeuralGateSpirv.h","getNeuralGateSpirv",2},
  {"neural_add.comp","NeuralAddSpirv.h","getNeuralAddSpirv",3},
  {"neural_scaled_add.comp","NeuralScaledAddSpirv.h","getNeuralScaledAddSpirv",4},
- {"neural_writeback.comp","NeuralWritebackSpirv.h","getNeuralWritebackSpirv",9}
+ {"neural_writeback.comp","NeuralWritebackSpirv.h","getNeuralWritebackSpirv",10}
 }};
 } // namespace bncam::vulkan::neural

@@ -152,13 +152,16 @@ def run_vulkan_package_reference(
     x = torch.as_tensor(conditioning, dtype=torch.float16).unsqueeze(0) if conditioning.ndim == 3 else torch.as_tensor(conditioning, dtype=torch.float16)
     g = torch.as_tensor(global_condition, dtype=torch.float16).unsqueeze(0) if global_condition.ndim == 1 else torch.as_tensor(global_condition, dtype=torch.float16)
     previous_threads = torch.get_num_threads()
+    previous_mkldnn = torch.backends.mkldnn.enabled
     try:
+        torch.backends.mkldnn.enabled = False
         torch.set_num_threads(1)
         torch.use_deterministic_algorithms(True, warn_only=False)
         with torch.inference_mode():
             return _output_arrays(model(x, g))
     finally:
         torch.set_num_threads(previous_threads)
+        torch.backends.mkldnn.enabled = previous_mkldnn
 
 
 def _tile_conditioning(conditioning: np.ndarray, input_x: int, input_y: int, tile_w: int, tile_h: int) -> np.ndarray:
@@ -255,7 +258,9 @@ def run_tiled_vulkan_package_reference(
     g = torch.as_tensor(global_condition, dtype=torch.float16).reshape(1, -1)
 
     previous_threads = torch.get_num_threads()
+    previous_mkldnn = torch.backends.mkldnn.enabled
     try:
+        torch.backends.mkldnn.enabled = False
         torch.set_num_threads(1)
         torch.use_deterministic_algorithms(True, warn_only=False)
         with torch.inference_mode():
@@ -297,6 +302,7 @@ def run_tiled_vulkan_package_reference(
                             value[..., valid_y:valid_y+valid_h, valid_x:valid_x+valid_w]
     finally:
         torch.set_num_threads(previous_threads)
+        torch.backends.mkldnn.enabled = previous_mkldnn
     return assembled
 
 

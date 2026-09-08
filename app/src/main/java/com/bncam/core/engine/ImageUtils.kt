@@ -15,8 +15,8 @@ import com.bncam.core.quality.FocusConfidenceState
 import com.bncam.core.quality.FinalSensorCalibration
 import com.bncam.core.quality.ProfileYuvAwbMapper
 import com.bncam.core.quality.TemporalNoiseModelAuthorityPolicy
+import com.bncam.core.quality.SpectraProfileDefaults
 import com.bncam.data.settings.ResolvedLensHardwareSettings
-import com.bncam.data.settings.ProfileNoiseReductionDefaults
 import com.bncam.core.isp.raw.MasterRawFrame
 import com.bncam.core.isp.raw.Raw16RenderInput
 import com.bncam.core.isp.raw.RawInputSource
@@ -466,12 +466,14 @@ object ImageUtils {
                 // Phase 2 transport compatibility: native profileDetailMasking is an ABI slot only.
                 // It carries standalone Edge authority; the Sharp Mask setting remains disconnected.
                 profileDetailMasking = qualityConfig?.profileDetailTuning?.let { packEdgeAntiZipper(it.edge, it.antiZipper) } ?: 0f,
-                profileNrLuminance = qualityConfig?.profileNoiseReductionTuning?.luminance ?: ProfileNoiseReductionDefaults.LUMINANCE,
-                profileNrLuminanceDetail = qualityConfig?.profileNoiseReductionTuning?.luminanceDetail ?: ProfileNoiseReductionDefaults.LUMINANCE_DETAIL,
-                profileNrLuminanceContrast = qualityConfig?.profileNoiseReductionTuning?.luminanceContrast ?: ProfileNoiseReductionDefaults.LUMINANCE_CONTRAST,
-                profileNrColor = qualityConfig?.profileNoiseReductionTuning?.color ?: ProfileNoiseReductionDefaults.COLOR,
-                profileNrColorDetail = qualityConfig?.profileNoiseReductionTuning?.colorDetail ?: ProfileNoiseReductionDefaults.COLOR_DETAIL,
-                profileNrColorSmoothness = qualityConfig?.profileNoiseReductionTuning?.colorSmoothness ?: ProfileNoiseReductionDefaults.COLOR_SMOOTHNESS,
+                // Phase 6: retired Profile-NR controls no longer own YUV pixels. Keep the
+                // legacy JNI tuple at its exact neutral values so it cannot become a second owner.
+                profileNrLuminance = 0.0f,
+                profileNrLuminanceDetail = 0.5f,
+                profileNrLuminanceContrast = 0.0f,
+                profileNrColor = 0.0f,
+                profileNrColorDetail = 0.5f,
+                profileNrColorSmoothness = 0.5f,
                 toneCurve = qualityConfig?.curves?.toneNodes?.toFloatArray()
                     ?: ProfileCurveDefaults.linearNodes(ProfileCurveDefaults.TYPE_TONE).toFloatArray(),
                 gammaCurve = qualityConfig?.curves?.gammaNodes?.toFloatArray()
@@ -668,19 +670,9 @@ object ImageUtils {
         val spectraEffectiveS = spectraSnapshot?.effectiveS ?: DoubleArray(0)
         val spectraEffectiveO = spectraSnapshot?.effectiveO ?: DoubleArray(0)
         val lensIsoNrMode = qualityConfig?.lensHardwareSettings?.isoNrNativeMode ?: 0
-        val physicalDynamicIsoCoeff = qualityConfig?.lensHardwareSettings?.dynamicIsoCoeff ?: 0.0f
-        // A disabled SPECTRA profile must be inert. Previously its latent Dynamic ISO value was
-        // still blended into the native lens coefficient, so a control shown as disabled in the
-        // profile could silently change the conventional physical-noise baseline.
-        val profileDynamicIsoBoost = if (qualityConfig?.profileNoiseTuning?.spectraEnabled == true) {
-            qualityConfig.profileNoiseTuning.spectraDynamicIso
-        } else {
-            0.0f
-        }
-        // Profile Dynamic ISO is a boost on top of physical lens calibration, never a replacement.
-        val lensDynamicIsoCoeff = (physicalDynamicIsoCoeff +
-            profileDynamicIsoBoost.coerceIn(0.0f, 1.0f) * (1.0f - physicalDynamicIsoCoeff.coerceIn(0.0f, 1.0f)))
-            .coerceIn(0.0f, 1.0f)
+        // Lens Dynamic ISO remains a hardware/observer policy. Phase-6 neural Adaptive Response
+        // is an independent profile control and must never be folded into this coefficient.
+        val lensDynamicIsoCoeff = qualityConfig?.lensHardwareSettings?.dynamicIsoCoeff ?: 0.0f
         val lensManualIsoValue = qualityConfig?.lensHardwareSettings?.manualIsoValue ?: 0.0f
         val lensShadingMap = captureResult.toNativeLensShadingMap()
         val curves = qualityConfig?.curves
@@ -812,14 +804,16 @@ object ImageUtils {
                 noiseModelCalibrationFactor = qualityConfig?.lensHardwareSettings?.noiseModelCalibrationFactor ?: 1.0f,
                 effectiveChromaAuthorityStops = qualityConfig?.lensHardwareSettings?.effectiveChromaAuthorityStops ?: 4.0f,
                 effectiveLumaAuthorityStops = qualityConfig?.lensHardwareSettings?.effectiveLumaAuthorityStops ?: 2.25f,
-                profileSpectraStrength = qualityConfig?.profileNoiseTuning?.spectraStrength ?: 0.0f,
+                profileSpectraStrength = qualityConfig?.profileNoiseTuning?.neuralDenoiseStrength
+                    ?: SpectraProfileDefaults.MASTER_STRENGTH,
                 profileSpectraLuma = qualityConfig?.profileNoiseTuning?.spectraLuma ?: 0.0f,
                 profileSpectraChroma = qualityConfig?.profileNoiseTuning?.spectraChroma ?: 0.0f,
                 profileSpectraDetailProtection = qualityConfig?.profileNoiseTuning?.spectraDetailProtection ?: 0.0f,
                 profileSpectraLowFrequency = qualityConfig?.profileNoiseTuning?.spectraLowFrequency ?: 0.0f,
-                // N005: old Profile NR does not own RAW pixels. Preserve the six native ABI slots
-                // as neutral values until the neural-control transport lands.
-                profileNrLuminance = 0.0f,
+                // Phase 6 RAW transport: this retired first Profile-NR ABI slot carries only
+                // profile-owned Adaptive Response. It no longer means luminance denoise.
+                profileNrLuminance = qualityConfig?.profileNoiseTuning?.neuralAdaptiveResponse
+                    ?: SpectraProfileDefaults.ADAPTIVE_RESPONSE,
                 profileNrLuminanceDetail = 0.5f,
                 profileNrLuminanceContrast = 0.0f,
                 profileNrColor = 0.0f,

@@ -1,18 +1,45 @@
 package com.bncam.core.quality
 
 /**
- * Named SPECTRA characters are convenience projections onto the user-facing
- * profile controls. The adaptive SPECTRA engine itself always runs at its
- * calibrated master authority when enabled; there is intentionally no second
- * user-facing master-strength control on top of the component controls.
+ * Named neural-denoise characters are transparent projections onto the same six
+ * user-visible controls. There is no hidden preset state: editing any control
+ * after selecting a character naturally resolves back to Custom.
  */
 data class SpectraProfileCharacterValues(
-    val dynamicIso: Float,
+    val masterStrength: Float,
+    val adaptiveResponse: Float,
     val luma: Float,
     val chroma: Float,
     val detailProtection: Float,
     val lowFrequency: Float
-)
+) {
+    /**
+     * Compatibility constructor for the legacy profile-overview inference callsite.
+     * `dynamicIso` is migration input only and maps to Adaptive Response; the active neural
+     * master uses the Phase-6 default until that overview is migrated to the new profile key.
+     * Production capture and the SPECTRA/Denoise controls use the primary six-control API.
+     */
+    @Deprecated(
+        message = "Use masterStrength + adaptiveResponse",
+        replaceWith = ReplaceWith(
+            "SpectraProfileCharacterValues(SpectraProfileDefaults.MASTER_STRENGTH, dynamicIso, luma, chroma, detailProtection, lowFrequency)"
+        )
+    )
+    constructor(
+        dynamicIso: Float,
+        luma: Float,
+        chroma: Float,
+        detailProtection: Float,
+        lowFrequency: Float
+    ) : this(
+        masterStrength = SpectraProfileDefaults.MASTER_STRENGTH,
+        adaptiveResponse = dynamicIso,
+        luma = luma,
+        chroma = chroma,
+        detailProtection = detailProtection,
+        lowFrequency = lowFrequency
+    )
+}
 
 data class SpectraProfileCharacter(
     val name: String,
@@ -22,21 +49,24 @@ data class SpectraProfileCharacter(
 
 object SpectraProfileDefaults {
     const val ENABLED = false
-    const val DYNAMIC_ISO = 0.45f
-    /**
-     * Internal neutral master-authority bias. 0 means: use 100% of the calibrated
-     * adaptive authority resolved by the physical-noise model. It is not a UI control.
-     * Kept as a compatibility constant because older .bnc profiles may still contain
-     * spectra_profile_strength.
-     */
-    const val STRENGTH = 0.00f
+
+    // Phase 6 neural controls. Master and Adaptive Response are direct unit authorities.
+    const val MASTER_STRENGTH = 0.70f
+    const val ADAPTIVE_RESPONSE = 0.45f
+
+    // Existing signed component storage is retained so old .bnc profiles remain compatible.
     const val LUMA = 0.20f
     const val CHROMA = 0.60f
     const val DETAIL_PROTECTION = 0.35f
     const val LOW_FREQUENCY = 0.60f
 
+    // Legacy persistence defaults only. These names are not active runtime neural controls.
+    const val DYNAMIC_ISO = 0.45f
+    const val STRENGTH = 0.00f
+
     fun values(): SpectraProfileCharacterValues = SpectraProfileCharacterValues(
-        dynamicIso = DYNAMIC_ISO,
+        masterStrength = MASTER_STRENGTH,
+        adaptiveResponse = ADAPTIVE_RESPONSE,
         luma = LUMA,
         chroma = CHROMA,
         detailProtection = DETAIL_PROTECTION,
@@ -49,9 +79,10 @@ object SpectraProfileCharacters {
 
     val natural = SpectraProfileCharacter(
         name = "Natural",
-        description = "Balanced sensor cleanup with restrained chroma recovery and strong texture retention.",
+        description = "Balanced neural cleanup with restrained residual authority and strong texture retention.",
         values = SpectraProfileCharacterValues(
-            dynamicIso = SpectraProfileDefaults.DYNAMIC_ISO,
+            masterStrength = 0.70f,
+            adaptiveResponse = 0.45f,
             luma = SpectraProfileDefaults.LUMA,
             chroma = SpectraProfileDefaults.CHROMA,
             detailProtection = SpectraProfileDefaults.DETAIL_PROTECTION,
@@ -60,9 +91,10 @@ object SpectraProfileCharacters {
     )
     val clean = SpectraProfileCharacter(
         name = "Clean",
-        description = "Cleaner surfaces and colour while retaining edge and texture context.",
+        description = "Cleaner surfaces and colour with stronger neural residual authority.",
         values = SpectraProfileCharacterValues(
-            dynamicIso = 0.65f,
+            masterStrength = 0.85f,
+            adaptiveResponse = 0.65f,
             luma = 0.55f,
             chroma = 0.85f,
             detailProtection = 0.25f,
@@ -73,7 +105,8 @@ object SpectraProfileCharacters {
         name = "Texture",
         description = "Prioritises microtexture and natural grain while still suppressing false colour.",
         values = SpectraProfileCharacterValues(
-            dynamicIso = 0.30f,
+            masterStrength = 0.60f,
+            adaptiveResponse = 0.30f,
             luma = -0.10f,
             chroma = 0.40f,
             detailProtection = 0.65f,
@@ -82,9 +115,10 @@ object SpectraProfileCharacters {
     )
     val night = SpectraProfileCharacter(
         name = "Night",
-        description = "Strong low-light chroma and blotch cleanup with bounded luminance smoothing.",
+        description = "Strong low-light chroma and low-frequency cleanup with bounded luminance smoothing.",
         values = SpectraProfileCharacterValues(
-            dynamicIso = 0.75f,
+            masterStrength = 0.95f,
+            adaptiveResponse = 0.75f,
             luma = 0.35f,
             chroma = 0.90f,
             detailProtection = 0.15f,
@@ -103,7 +137,8 @@ object SpectraProfileCharacters {
     }
 
     private fun SpectraProfileCharacterValues.near(other: SpectraProfileCharacterValues, tolerance: Float): Boolean =
-        kotlin.math.abs(dynamicIso - other.dynamicIso) <= tolerance &&
+        kotlin.math.abs(masterStrength - other.masterStrength) <= tolerance &&
+            kotlin.math.abs(adaptiveResponse - other.adaptiveResponse) <= tolerance &&
             kotlin.math.abs(luma - other.luma) <= tolerance &&
             kotlin.math.abs(chroma - other.chroma) <= tolerance &&
             kotlin.math.abs(detailProtection - other.detailProtection) <= tolerance &&

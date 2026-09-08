@@ -17,6 +17,8 @@ set(_BNCAM_NEURAL_SHADER_SPECS
     "neural_add|NeuralAddSpirv.h|getNeuralAddSpirv"
     "neural_scaled_add|NeuralScaledAddSpirv.h|getNeuralScaledAddSpirv"
     "neural_writeback|NeuralWritebackSpirv.h|getNeuralWritebackSpirv"
+    "neural_mosaic_bridge|NeuralMosaicBridgeSpirv.h|getNeuralMosaicBridgeSpirv"
+    "neural_remaining_lsc|NeuralRemainingLscSpirv.h|getNeuralRemainingLscSpirv"
 )
 
 set(BNCAM_NEURAL_GENERATED_HEADERS "")
@@ -62,9 +64,13 @@ function(bncam_attach_spectra_neural_backend TARGET_NAME)
         "${_BNCAM_NEURAL_VULKAN_DIR}/VulkanNeuralExecutionPlan.cpp"
         "${_BNCAM_NEURAL_VULKAN_DIR}/VulkanNeuralResourceBridge.cpp"
         "${_BNCAM_NEURAL_VULKAN_DIR}/VulkanNeuralRawDenoiseBackend.cpp"
+        "${_BNCAM_NEURAL_VULKAN_DIR}/VulkanNeuralRawProductionBridge.cpp"
+        "${_BNCAM_NEURAL_VULKAN_DIR}/VulkanNeuralRemainingLscBackend.cpp"
     )
     target_compile_definitions("${TARGET_NAME}" PRIVATE
         BNCAM_NEURAL_SHADERS_AVAILABLE=${BNCAM_NEURAL_SHADERS_AVAILABLE}
+        BNCAM_NEURAL_MOSAIC_BRIDGE_SHADER_AVAILABLE=${BNCAM_NEURAL_SHADERS_AVAILABLE}
+        BNCAM_NEURAL_REMAINING_LSC_SHADER_AVAILABLE=${BNCAM_NEURAL_SHADERS_AVAILABLE}
     )
     target_include_directories("${TARGET_NAME}" PRIVATE
         "${_BNCAM_NEURAL_VULKAN_DIR}"

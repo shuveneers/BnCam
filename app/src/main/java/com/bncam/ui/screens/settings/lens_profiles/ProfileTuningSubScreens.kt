@@ -30,7 +30,6 @@ import com.bncam.data.settings.ProfileIspKeys
 import com.bncam.data.settings.ProfilePlannedDefaults
 import com.bncam.data.settings.ProfileSharpnessMethods
 import com.bncam.data.settings.ProfileDetailDefaults
-import com.bncam.data.settings.ProfileNoiseReductionDefaults
 import com.bncam.data.settings.ProfileSettingSpec
 import com.bncam.data.settings.ProfileSettingValueType
 import com.bncam.data.settings.SettingsRepository
@@ -60,8 +59,16 @@ fun ProfileSpectraSettingsScreen(
     val spectraEnabledInt by repo.getProfileInt(profileId, ProfileIspKeys.SPECTRA_ENABLED, 0)
         .collectAsStateWithLifecycle(initialValue = 0)
     val spectraEnabled = spectraEnabledInt == 1
-    val spectraDynamicIso by repo.getProfileFloat(profileId, ProfileIspKeys.SPECTRA_DYNAMIC_ISO, SpectraProfileDefaults.DYNAMIC_ISO)
-        .collectAsStateWithLifecycle(initialValue = SpectraProfileDefaults.DYNAMIC_ISO)
+
+    val neuralMaster by repo.getProfileFloat(
+        profileId, ProfileIspKeys.NEURAL_DENOISE_STRENGTH, SpectraProfileDefaults.MASTER_STRENGTH
+    ).collectAsStateWithLifecycle(initialValue = SpectraProfileDefaults.MASTER_STRENGTH)
+    val legacyAdaptive by repo.getProfileFloat(
+        profileId, ProfileIspKeys.SPECTRA_DYNAMIC_ISO, SpectraProfileDefaults.ADAPTIVE_RESPONSE
+    ).collectAsStateWithLifecycle(initialValue = SpectraProfileDefaults.ADAPTIVE_RESPONSE)
+    val adaptiveResponse by repo.getProfileFloat(
+        profileId, ProfileIspKeys.NEURAL_ADAPTIVE_RESPONSE, legacyAdaptive
+    ).collectAsStateWithLifecycle(initialValue = legacyAdaptive)
     val spectraLuma by repo.getProfileFloat(profileId, ProfileIspKeys.SPECTRA_LUMA, SpectraProfileDefaults.LUMA)
         .collectAsStateWithLifecycle(initialValue = SpectraProfileDefaults.LUMA)
     val spectraChroma by repo.getProfileFloat(profileId, ProfileIspKeys.SPECTRA_CHROMA, SpectraProfileDefaults.CHROMA)
@@ -72,7 +79,8 @@ fun ProfileSpectraSettingsScreen(
         .collectAsStateWithLifecycle(initialValue = SpectraProfileDefaults.LOW_FREQUENCY)
     val spectraCharacter = SpectraProfileCharacters.infer(
         SpectraProfileCharacterValues(
-            dynamicIso = spectraDynamicIso,
+            masterStrength = neuralMaster,
+            adaptiveResponse = adaptiveResponse,
             luma = spectraLuma,
             chroma = spectraChroma,
             detailProtection = spectraDetail,
@@ -82,17 +90,17 @@ fun ProfileSpectraSettingsScreen(
 
     SettingsTopicScaffold("SPECTRA", onNavigateBack) {
         if (!isRawFrameSource) {
-            SettingsCard("Unavailable", "SPECTRA profile steering applies only to RAW10 and RAW_SENSOR profiles.") {
+            SettingsCard("Unavailable", "Neural RAW denoise applies only to RAW10 and RAW_SENSOR profiles.") {
                 SettingValueRow("Buffer Type / Pipeline", "Change this from the profile overview.", frameSource) {}
             }
         } else {
             SettingsCard(
-                title = "SPECTRA · Context Fusion",
-                description = "BnCam sensor intelligence: CFA-domain physical-noise cleanup, multiscale chroma recovery and texture-aware residual control. When On, the adaptive engine runs at full calibrated master authority; the controls below shape the result."
+                title = "SPECTRA · Neural RAW Denoise",
+                description = "SPECTRA Core supplies read-only physical sensor evidence; one neural Student residual owns RAW noise suppression before demosaic. Every control below acts on that same residual."
             ) {
                 ChoiceSettingRow(
-                    title = "SPECTRA",
-                    description = "Enable or disable SPECTRA engine processing for this profile.",
+                    title = "SPECTRA Neural",
+                    description = "Enable or disable neural RAW denoise for this profile. Off is an exact pre-inference bypass.",
                     value = if (spectraEnabled) "On" else "Off",
                     options = listOf("Off", "On"),
                     onSelected = { selected ->
@@ -102,8 +110,8 @@ fun ProfileSpectraSettingsScreen(
                     }
                 )
                 ChoiceSettingRow(
-                    title = "SPECTRA Character",
-                    description = "Natural, Clean, Texture and Night are coherent starting points. Changing any SPECTRA slider afterwards becomes Custom; there is no hidden preset state.",
+                    title = "Character",
+                    description = "Natural, Clean, Texture and Night are transparent presets over the six visible controls below. Editing any value afterwards becomes Custom; there is no hidden preset state.",
                     value = spectraCharacter,
                     options = SpectraProfileCharacters.names,
                     onSelected = { selected ->
@@ -114,7 +122,8 @@ fun ProfileSpectraSettingsScreen(
                                     profileId = profileId,
                                     intValues = mapOf(ProfileIspKeys.SPECTRA_ENABLED to 1),
                                     floatValues = mapOf(
-                                        ProfileIspKeys.SPECTRA_DYNAMIC_ISO to values.dynamicIso,
+                                        ProfileIspKeys.NEURAL_DENOISE_STRENGTH to values.masterStrength,
+                                        ProfileIspKeys.NEURAL_ADAPTIVE_RESPONSE to values.adaptiveResponse,
                                         ProfileIspKeys.SPECTRA_LUMA to values.luma,
                                         ProfileIspKeys.SPECTRA_CHROMA to values.chroma,
                                         ProfileIspKeys.SPECTRA_DETAIL to values.detailProtection,
@@ -128,18 +137,18 @@ fun ProfileSpectraSettingsScreen(
                 ProfileBoostSlider(
                     repo = repo,
                     profileId = profileId,
-                    key = ProfileIspKeys.SPECTRA_DYNAMIC_ISO,
-                    title = "Dynamic ISO",
-                    description = "Natural starts at 0.45. Higher values add progressively more authority as ISO/noise rises.",
+                    key = ProfileIspKeys.NEURAL_DENOISE_STRENGTH,
+                    title = "Neural Denoise Strength",
+                    description = "Master residual authority. 0.00 is exact neural bypass; higher values apply more of the bounded Student residual.",
                     enabled = spectraEnabled,
-                    defaultValue = SpectraProfileDefaults.DYNAMIC_ISO
+                    defaultValue = SpectraProfileDefaults.MASTER_STRENGTH
                 )
                 ProfileSignedSlider(
                     repo = repo,
                     profileId = profileId,
                     key = ProfileIspKeys.SPECTRA_LUMA,
                     title = "Luma noise",
-                    description = "Changes SPECTRA authority over luminance grain.",
+                    description = "Steers the luminance component of the same neural residual basis; it never launches a second luma denoiser.",
                     enabled = spectraEnabled,
                     defaultValue = SpectraProfileDefaults.LUMA
                 )
@@ -148,7 +157,7 @@ fun ProfileSpectraSettingsScreen(
                     profileId = profileId,
                     key = ProfileIspKeys.SPECTRA_CHROMA,
                     title = "Chroma noise",
-                    description = "Controls CFA and post-demosaic false-colour cleanup. Context Fusion still protects confirmed colour edges.",
+                    description = "Steers the chroma components of the same neural residual basis while preserving confirmed colour structure.",
                     enabled = spectraEnabled,
                     defaultValue = SpectraProfileDefaults.CHROMA
                 )
@@ -157,7 +166,7 @@ fun ProfileSpectraSettingsScreen(
                     profileId = profileId,
                     key = ProfileIspKeys.SPECTRA_DETAIL,
                     title = "Detail protection",
-                    description = "Positive values retain more fine structure; negative values allow stronger cleanup.",
+                    description = "Raises or lowers the posterior-aware protection gate. It can reduce cleanup around credible detail, never create a separate sharpening or denoise pass.",
                     enabled = spectraEnabled,
                     defaultValue = SpectraProfileDefaults.DETAIL_PROTECTION
                 )
@@ -166,9 +175,18 @@ fun ProfileSpectraSettingsScreen(
                     profileId = profileId,
                     key = ProfileIspKeys.SPECTRA_LOW_FREQUENCY,
                     title = "Low-frequency cleanup",
-                    description = "Controls multiscale chroma clouds, blotches and coherent low-frequency sensor noise.",
+                    description = "Controls the coarse neural residual component used for clouds, blotches and coherent low-frequency noise.",
                     enabled = spectraEnabled,
                     defaultValue = SpectraProfileDefaults.LOW_FREQUENCY
+                )
+                ProfileBoostSlider(
+                    repo = repo,
+                    profileId = profileId,
+                    key = ProfileIspKeys.NEURAL_ADAPTIVE_RESPONSE,
+                    title = "Adaptive Response",
+                    description = "Controls sigma/SNR-driven residual adaptation. This is not an ISO threshold and does not read lens Dynamic ISO authority.",
+                    enabled = spectraEnabled,
+                    defaultValue = SpectraProfileDefaults.ADAPTIVE_RESPONSE
                 )
             }
         }
@@ -181,11 +199,15 @@ fun ProfileSpectraSettingsScreen(
                         profileId,
                         listOf(
                             ProfileSettingSpec(ProfileIspKeys.SPECTRA_ENABLED, ProfileSettingValueType.INT),
-                            ProfileSettingSpec(ProfileIspKeys.SPECTRA_DYNAMIC_ISO, ProfileSettingValueType.FLOAT),
+                            ProfileSettingSpec(ProfileIspKeys.NEURAL_DENOISE_STRENGTH, ProfileSettingValueType.FLOAT),
+                            ProfileSettingSpec(ProfileIspKeys.NEURAL_ADAPTIVE_RESPONSE, ProfileSettingValueType.FLOAT),
                             ProfileSettingSpec(ProfileIspKeys.SPECTRA_LUMA, ProfileSettingValueType.FLOAT),
                             ProfileSettingSpec(ProfileIspKeys.SPECTRA_CHROMA, ProfileSettingValueType.FLOAT),
                             ProfileSettingSpec(ProfileIspKeys.SPECTRA_DETAIL, ProfileSettingValueType.FLOAT),
-                            ProfileSettingSpec(ProfileIspKeys.SPECTRA_LOW_FREQUENCY, ProfileSettingValueType.FLOAT)
+                            ProfileSettingSpec(ProfileIspKeys.SPECTRA_LOW_FREQUENCY, ProfileSettingValueType.FLOAT),
+                            // Clear obsolete hidden values as well so reset cannot resurrect migration state.
+                            ProfileSettingSpec(ProfileIspKeys.SPECTRA_DYNAMIC_ISO, ProfileSettingValueType.FLOAT),
+                            ProfileSettingSpec(ProfileIspKeys.SPECTRA_STRENGTH, ProfileSettingValueType.FLOAT)
                         )
                     )
                 }
@@ -455,34 +477,88 @@ fun ProfileDenoiseSettingsScreen(
     val context = LocalContext.current
     val repo = remember(context) { SettingsRepository(context) }
     val scope = rememberCoroutineScope()
+    val frameSource by repo.getProfileFrameSourceFlow(profileId)
+        .collectAsStateWithLifecycle(initialValue = "YUV")
+    val isRawFrameSource = frameSource == "RAW10" || frameSource == "RAW_SENSOR"
+    val spectraEnabledInt by repo.getProfileInt(profileId, ProfileIspKeys.SPECTRA_ENABLED, 0)
+        .collectAsStateWithLifecycle(initialValue = 0)
+    val spectraEnabled = spectraEnabledInt == 1
 
     SettingsTopicScaffold("Denoise", onNavigateBack) {
-        SettingsCard(
-            "Denoise",
-            "Post-reconstruction luminance and colour noise reduction. SPECTRA remains the independent RAW/CFA physical-noise engine."
-        ) {
-            ProfileRangeSlider(repo, profileId, ProfileIspKeys.DETAIL_NR_LUMINANCE, "Luminance", "Reduces luminance grain after RAW reconstruction or in the YUV ISP.", ProfileNoiseReductionDefaults.LUMINANCE, 0f..1f, formatter = { String.format(Locale.US, "%.0f", it * 100f) })
-            ProfileRangeSlider(repo, profileId, ProfileIspKeys.DETAIL_NR_LUMINANCE_DETAIL, "Luminance Detail", "Balances retained fine texture against luminance smoothing.", ProfileNoiseReductionDefaults.LUMINANCE_DETAIL, 0f..1f, formatter = { String.format(Locale.US, "%.0f", it * 100f) })
-            ProfileRangeSlider(repo, profileId, ProfileIspKeys.DETAIL_NR_LUMINANCE_CONTRAST, "Luminance Contrast", "Restores local luminance separation after denoising without acting as global tone contrast.", ProfileNoiseReductionDefaults.LUMINANCE_CONTRAST, 0f..1f, formatter = { String.format(Locale.US, "%.0f", it * 100f) })
-            ProfileRangeSlider(repo, profileId, ProfileIspKeys.DETAIL_NR_COLOR, "Color / Chroma", "Reduces chroma speckle independently of SPECTRA's physical chroma model.", ProfileNoiseReductionDefaults.COLOR, 0f..1f, formatter = { String.format(Locale.US, "%.0f", it * 100f) })
-            ProfileRangeSlider(repo, profileId, ProfileIspKeys.DETAIL_NR_COLOR_DETAIL, "Color / Chroma Detail", "Controls how strongly fine colour structure is protected from chroma smoothing.", ProfileNoiseReductionDefaults.COLOR_DETAIL, 0f..1f, formatter = { String.format(Locale.US, "%.0f", it * 100f) })
-            ProfileRangeSlider(repo, profileId, ProfileIspKeys.DETAIL_NR_COLOR_SMOOTHNESS, "Color / Chroma Smoothness", "Controls spatial smoothness of chroma-noise cleanup in low-detail regions.", ProfileNoiseReductionDefaults.COLOR_SMOOTHNESS, 0f..1f, formatter = { String.format(Locale.US, "%.0f", it * 100f) })
-        }
-        ResetPageToDefaultValuesButton {
-            scope.launch {
-                repo.clearProfileOverrideValues(
-                    profileId,
-                    listOf(
-                        ProfileSettingSpec(ProfileIspKeys.DETAIL_NR_LUMINANCE, ProfileSettingValueType.FLOAT),
-                        ProfileSettingSpec(ProfileIspKeys.DETAIL_NR_LUMINANCE_DETAIL, ProfileSettingValueType.FLOAT),
-                        ProfileSettingSpec(ProfileIspKeys.DETAIL_NR_LUMINANCE_CONTRAST, ProfileSettingValueType.FLOAT),
-                        ProfileSettingSpec(ProfileIspKeys.DETAIL_NR_COLOR, ProfileSettingValueType.FLOAT),
-                        ProfileSettingSpec(ProfileIspKeys.DETAIL_NR_COLOR_DETAIL, ProfileSettingValueType.FLOAT),
-                        ProfileSettingSpec(ProfileIspKeys.DETAIL_NR_COLOR_SMOOTHNESS, ProfileSettingValueType.FLOAT)
-                    )
+        if (!isRawFrameSource) {
+            SettingsCard(
+                "Unavailable",
+                "The profile Denoise page now controls the single Neural RAW denoise owner and is available for RAW10/RAW_SENSOR profiles only."
+            ) {
+                SettingValueRow("Buffer Type / Pipeline", "Change this from the profile overview.", frameSource) {}
+            }
+        } else {
+            SettingsCard(
+                "Neural Denoise",
+                "Simple controls for the same SPECTRA Neural state. Advanced Detail Protection, Low-frequency Cleanup, Adaptive Response and Character presets remain on the SPECTRA page."
+            ) {
+                ChoiceSettingRow(
+                    title = "Neural Denoise",
+                    description = "One Student model and one RAW residual. Off is an exact pre-inference bypass.",
+                    value = if (spectraEnabled) "On" else "Off",
+                    options = listOf("Off", "On"),
+                    onSelected = { selected ->
+                        scope.launch {
+                            repo.setProfileIntOverride(profileId, ProfileIspKeys.SPECTRA_ENABLED, if (selected == "On") 1 else 0)
+                        }
+                    }
+                )
+                ProfileBoostSlider(
+                    repo = repo,
+                    profileId = profileId,
+                    key = ProfileIspKeys.NEURAL_DENOISE_STRENGTH,
+                    title = "Neural Denoise Strength",
+                    description = "Master neural residual authority. 0.00 bypasses inference exactly.",
+                    enabled = spectraEnabled,
+                    defaultValue = SpectraProfileDefaults.MASTER_STRENGTH
+                )
+                ProfileSignedSlider(
+                    repo = repo,
+                    profileId = profileId,
+                    key = ProfileIspKeys.SPECTRA_LUMA,
+                    title = "Luma noise",
+                    description = "Luminance authority inside the same neural residual basis.",
+                    enabled = spectraEnabled,
+                    defaultValue = SpectraProfileDefaults.LUMA
+                )
+                ProfileSignedSlider(
+                    repo = repo,
+                    profileId = profileId,
+                    key = ProfileIspKeys.SPECTRA_CHROMA,
+                    title = "Chroma noise",
+                    description = "Chroma authority inside the same neural residual basis.",
+                    enabled = spectraEnabled,
+                    defaultValue = SpectraProfileDefaults.CHROMA
                 )
             }
         }
+        ResetPageToDefaultValuesButton(
+            enabled = isRawFrameSource,
+            onReset = {
+                scope.launch {
+                    repo.clearProfileOverrideValues(
+                        profileId,
+                        listOf(
+                            ProfileSettingSpec(ProfileIspKeys.SPECTRA_ENABLED, ProfileSettingValueType.INT),
+                            ProfileSettingSpec(ProfileIspKeys.NEURAL_DENOISE_STRENGTH, ProfileSettingValueType.FLOAT),
+                            ProfileSettingSpec(ProfileIspKeys.SPECTRA_LUMA, ProfileSettingValueType.FLOAT),
+                            ProfileSettingSpec(ProfileIspKeys.SPECTRA_CHROMA, ProfileSettingValueType.FLOAT),
+                            ProfileSettingSpec(ProfileIspKeys.DETAIL_NR_LUMINANCE, ProfileSettingValueType.FLOAT),
+                            ProfileSettingSpec(ProfileIspKeys.DETAIL_NR_LUMINANCE_DETAIL, ProfileSettingValueType.FLOAT),
+                            ProfileSettingSpec(ProfileIspKeys.DETAIL_NR_LUMINANCE_CONTRAST, ProfileSettingValueType.FLOAT),
+                            ProfileSettingSpec(ProfileIspKeys.DETAIL_NR_COLOR, ProfileSettingValueType.FLOAT),
+                            ProfileSettingSpec(ProfileIspKeys.DETAIL_NR_COLOR_DETAIL, ProfileSettingValueType.FLOAT),
+                            ProfileSettingSpec(ProfileIspKeys.DETAIL_NR_COLOR_SMOOTHNESS, ProfileSettingValueType.FLOAT)
+                        )
+                    )
+                }
+            }
+        )
     }
 }
 

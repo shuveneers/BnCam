@@ -40,7 +40,7 @@ std::vector<std::uint32_t> spirv(NeuralKernel k){
 struct CondPC{std::int32_t tileX,tileY;std::uint32_t tileW,tileH,fullW,fullH,paddedW,paddedH,lscW,lscH,lscChannels,hasLsc;};
 struct ConvPC{std::uint32_t inW,inH,inC,outW,outH,outC,kernel,stride,upsample2x,weightHalfBase,biasC4Base;std::int32_t inputGlobalX,inputGlobalY;std::uint32_t domainW,domainH,enforceDomain;};
 struct FilmParamPC{std::uint32_t outC,inC,weightHalfBase,biasC4Base,globalFloatBase;};struct BasicPC{std::uint32_t width,height,channels,extra;};
-struct WritePC{std::uint32_t tileW,tileH,validX,validY,validW,validH,fullW,fullH;std::int32_t globalX,globalY;float kSigma,qMin,qMax,authority,clipThreshold,nearThreshold;std::uint32_t writeResidual,writeEvidence;};
+struct WritePC{std::uint32_t tileW,tileH,validX,validY,validW,validH,fullW,fullH;std::int32_t globalX,globalY;float kSigma,qMin,qMax,authority,lumaAuthority,chromaAuthority,detailProtection,lowFrequencyCleanup,adaptiveResponse,clipThreshold,nearThreshold;std::uint32_t writeResidual,writeEvidence,hasConfidence;};
 static_assert(sizeof(WritePC)<=128);
 }
 bool VulkanNeuralRawDenoiseBackend::ensureBuffer(Buffer&b,std::uint64_t bytes,bool host) noexcept{
@@ -59,7 +59,7 @@ bool VulkanNeuralRawDenoiseBackend::createPipelines() noexcept{
 #if !BNCAM_NEURAL_SHADERS_AVAILABLE
  return false;
 #else
- std::array<VkDescriptorSetLayoutBinding,9> binds{};for(std::uint32_t i=0;i<binds.size();++i){binds[i].binding=i;binds[i].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;binds[i].descriptorCount=1;binds[i].stageFlags=VK_SHADER_STAGE_COMPUTE_BIT;}VkDescriptorSetLayoutCreateInfo si{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};si.bindingCount=binds.size();si.pBindings=binds.data();if(vkCreateDescriptorSetLayout(device_,&si,nullptr,&pipes_.setLayout)!=VK_SUCCESS)return false;VkPushConstantRange pr{};pr.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT;pr.offset=0;pr.size=128;VkPipelineLayoutCreateInfo li{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};li.setLayoutCount=1;li.pSetLayouts=&pipes_.setLayout;li.pushConstantRangeCount=1;li.pPushConstantRanges=&pr;if(vkCreatePipelineLayout(device_,&li,nullptr,&pipes_.pipelineLayout)!=VK_SUCCESS)return false;for(std::size_t i=0;i<static_cast<std::size_t>(NeuralKernel::Count);++i){auto code=spirv(static_cast<NeuralKernel>(i));if(code.empty())return false;VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};mi.codeSize=code.size()*4u;mi.pCode=code.data();if(vkCreateShaderModule(device_,&mi,nullptr,&pipes_.modules[i])!=VK_SUCCESS)return false;VkPipelineShaderStageCreateInfo st{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};st.stage=VK_SHADER_STAGE_COMPUTE_BIT;st.module=pipes_.modules[i];st.pName="main";VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};ci.stage=st;ci.layout=pipes_.pipelineLayout;if(vkCreateComputePipelines(device_,VK_NULL_HANDLE,1,&ci,nullptr,&pipes_.pipelines[i])!=VK_SUCCESS)return false;}VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,9u*2048u};VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};pi.flags=VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;pi.maxSets=2048;pi.poolSizeCount=1;pi.pPoolSizes=&ps;return vkCreateDescriptorPool(device_,&pi,nullptr,&pipes_.pool)==VK_SUCCESS;
+ std::array<VkDescriptorSetLayoutBinding,10> binds{};for(std::uint32_t i=0;i<binds.size();++i){binds[i].binding=i;binds[i].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;binds[i].descriptorCount=1;binds[i].stageFlags=VK_SHADER_STAGE_COMPUTE_BIT;}VkDescriptorSetLayoutCreateInfo si{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};si.bindingCount=binds.size();si.pBindings=binds.data();if(vkCreateDescriptorSetLayout(device_,&si,nullptr,&pipes_.setLayout)!=VK_SUCCESS)return false;VkPushConstantRange pr{};pr.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT;pr.offset=0;pr.size=128;VkPipelineLayoutCreateInfo li{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};li.setLayoutCount=1;li.pSetLayouts=&pipes_.setLayout;li.pushConstantRangeCount=1;li.pPushConstantRanges=&pr;if(vkCreatePipelineLayout(device_,&li,nullptr,&pipes_.pipelineLayout)!=VK_SUCCESS)return false;for(std::size_t i=0;i<static_cast<std::size_t>(NeuralKernel::Count);++i){auto code=spirv(static_cast<NeuralKernel>(i));if(code.empty())return false;VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};mi.codeSize=code.size()*4u;mi.pCode=code.data();if(vkCreateShaderModule(device_,&mi,nullptr,&pipes_.modules[i])!=VK_SUCCESS)return false;VkPipelineShaderStageCreateInfo st{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};st.stage=VK_SHADER_STAGE_COMPUTE_BIT;st.module=pipes_.modules[i];st.pName="main";VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};ci.stage=st;ci.layout=pipes_.pipelineLayout;if(vkCreateComputePipelines(device_,VK_NULL_HANDLE,1,&ci,nullptr,&pipes_.pipelines[i])!=VK_SUCCESS)return false;}VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,10u*2048u};VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};pi.flags=VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;pi.maxSets=2048;pi.poolSizeCount=1;pi.pPoolSizes=&ps;return vkCreateDescriptorPool(device_,&pi,nullptr,&pipes_.pool)==VK_SUCCESS;
 #endif
 }
 bool VulkanNeuralRawDenoiseBackend::uploadWeights() noexcept {
@@ -541,8 +541,8 @@ bool VulkanNeuralRawDenoiseBackend::recordAndSubmit(
 
         bool updateDescriptorSets = true;
         auto dispatch = [&](NeuralKernel kernel,
-                            const std::array<VkBuffer, 9>& buffers,
-                            const std::array<VkDeviceSize, 9>& offsets,
+                            const std::array<VkBuffer, 10>& buffers,
+                            const std::array<VkDeviceSize, 10>& offsets,
                             const void* pushConstants,
                             std::uint32_t pushConstantBytes,
                             std::uint32_t groupsX,
@@ -553,9 +553,9 @@ bool VulkanNeuralRawDenoiseBackend::recordAndSubmit(
                 return false;
             }
             if (updateDescriptorSets) {
-                std::array<VkDescriptorBufferInfo, 9> infos{};
-                std::array<VkWriteDescriptorSet, 9> writes{};
-                for (std::uint32_t i = 0u; i < 9u; ++i) {
+                std::array<VkDescriptorBufferInfo, 10> infos{};
+                std::array<VkWriteDescriptorSet, 10> writes{};
+                for (std::uint32_t i = 0u; i < 10u; ++i) {
                     infos[i].buffer = buffers[i] != VK_NULL_HANDLE ? buffers[i] : dummy_.buffer;
                     infos[i].offset = offsets[i];
                     infos[i].range = VK_WHOLE_SIZE;
@@ -566,7 +566,7 @@ bool VulkanNeuralRawDenoiseBackend::recordAndSubmit(
                     writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
                     writes[i].pBufferInfo = &infos[i];
                 }
-                vkUpdateDescriptorSets(device_, 9u, writes.data(), 0u, nullptr);
+                vkUpdateDescriptorSets(device_, 10u, writes.data(), 0u, nullptr);
             }
             vkCmdBindPipeline(
                     slot.command,
@@ -612,8 +612,8 @@ bool VulkanNeuralRawDenoiseBackend::recordAndSubmit(
 
                 if (op.primitive == NeuralPrimitive::Conditioning) {
                     CondPC pc{
-                            tile.inputX,
-                            tile.inputY,
+                            static_cast<std::int32_t>(tile.inputX),
+                            static_cast<std::int32_t>(tile.inputY),
                             tileWidth,
                             tileHeight,
                             plan.tiles.fullWidth,
@@ -624,9 +624,9 @@ bool VulkanNeuralRawDenoiseBackend::recordAndSubmit(
                             request.core.remainingLsc.mapHeight,
                             request.core.remainingLsc.mapChannels,
                             request.core.remainingLsc.hasSpatialGainMap ? 1u : 0u};
-                    std::array<VkBuffer, 9> buffers{
+                    std::array<VkBuffer, 10> buffers{
                             input.buffer, lsc, slot.physicsGlobal.buffer, slot.conditioning.buffer};
-                    std::array<VkDeviceSize, 9> offsets{
+                    std::array<VkDeviceSize, 10> offsets{
                             input.byteOffset, request.remainingLscMap.byteOffset, 0u, 0u};
                     if (!dispatch(
                                 NeuralKernel::Conditioning,
@@ -691,12 +691,12 @@ bool VulkanNeuralRawDenoiseBackend::recordAndSubmit(
                             (op.weight == "residual_head.weight" ||
                              op.weight == "posterior_head.weight" ||
                              op.weight == "confidence_head.weight") ? 1u : 0u};
-                    std::array<VkBuffer, 9> buffers{
+                    std::array<VkBuffer, 10> buffers{
                             slotBuffer(slot, op.src0),
                             weights_.buffer,
                             weights_.buffer,
                             slotBuffer(slot, op.dst)};
-                    std::array<VkDeviceSize, 9> offsets{};
+                    std::array<VkDeviceSize, 10> offsets{};
                     if (!dispatch(
                                 NeuralKernel::Conv,
                                 buffers,
@@ -725,12 +725,12 @@ bool VulkanNeuralRawDenoiseBackend::recordAndSubmit(
                             static_cast<std::uint32_t>(weight->weightOffset / 2u),
                             static_cast<std::uint32_t>(bias->weightOffset / 8u),
                             16u};
-                    std::array<VkBuffer, 9> paramBuffers{
+                    std::array<VkBuffer, 10> paramBuffers{
                             slot.physicsGlobal.buffer,
                             weights_.buffer,
                             weights_.buffer,
                             slot.filmParams.buffer};
-                    std::array<VkDeviceSize, 9> paramOffsets{};
+                    std::array<VkDeviceSize, 10> paramOffsets{};
                     if (!dispatch(
                                 NeuralKernel::FilmParams,
                                 paramBuffers,
@@ -745,11 +745,11 @@ bool VulkanNeuralRawDenoiseBackend::recordAndSubmit(
                     }
 
                     BasicPC applyPc{shapeWidth, shapeHeight, op.channelsOut, 0u};
-                    std::array<VkBuffer, 9> applyBuffers{
+                    std::array<VkBuffer, 10> applyBuffers{
                             slotBuffer(slot, op.src0),
                             slot.filmParams.buffer,
                             slotBuffer(slot, op.dst)};
-                    std::array<VkDeviceSize, 9> applyOffsets{};
+                    std::array<VkDeviceSize, 10> applyOffsets{};
                     if (!dispatch(
                                 NeuralKernel::FilmApply,
                                 applyBuffers,
@@ -771,7 +771,7 @@ bool VulkanNeuralRawDenoiseBackend::recordAndSubmit(
                     const NeuralKernel kernel = op.primitive == NeuralPrimitive::SimpleGate
                             ? NeuralKernel::Gate
                             : NeuralKernel::Add;
-                    std::array<VkBuffer, 9> buffers{};
+                    std::array<VkBuffer, 10> buffers{};
                     buffers[0] = slotBuffer(slot, op.src0);
                     if (op.primitive == NeuralPrimitive::SimpleGate) {
                         buffers[1] = slotBuffer(slot, op.dst);
@@ -779,7 +779,7 @@ bool VulkanNeuralRawDenoiseBackend::recordAndSubmit(
                         buffers[1] = slotBuffer(slot, op.src1);
                         buffers[2] = slotBuffer(slot, op.dst);
                     }
-                    std::array<VkDeviceSize, 9> offsets{};
+                    std::array<VkDeviceSize, 10> offsets{};
                     if (!dispatch(
                                 kernel,
                                 buffers,
@@ -808,12 +808,12 @@ bool VulkanNeuralRawDenoiseBackend::recordAndSubmit(
                             shapeHeight,
                             op.channelsOut,
                             static_cast<std::uint32_t>(scale->weightOffset / 8u)};
-                    std::array<VkBuffer, 9> buffers{
+                    std::array<VkBuffer, 10> buffers{
                             slotBuffer(slot, op.src0),
                             slotBuffer(slot, op.src1),
                             weights_.buffer,
                             slotBuffer(slot, op.dst)};
-                    std::array<VkDeviceSize, 9> offsets{};
+                    std::array<VkDeviceSize, 10> offsets{};
                     if (!dispatch(
                                 NeuralKernel::ScaledAdd,
                                 buffers,
@@ -845,11 +845,17 @@ bool VulkanNeuralRawDenoiseBackend::recordAndSubmit(
                             model_.posteriorMin,
                             model_.posteriorMax,
                             std::clamp(request.controls.noiseReduction, 0.0f, 1.0f),
+                            std::clamp(request.controls.lumaNoise, 0.0f, 1.0f),
+                            std::clamp(request.controls.chromaNoise, 0.0f, 1.0f),
+                            std::clamp(request.controls.detailProtection, 0.0f, 1.0f),
+                            std::clamp(request.controls.lowFrequencyCleanup, 0.0f, 1.0f),
+                            std::clamp(request.controls.adaptiveResponse, 0.0f, 1.0f),
                             1.0f - request.conditioningConfig.clippingEpsilon,
                             1.0f - request.conditioningConfig.headroomSpan,
                             request.residualDebugRequested ? 1u : 0u,
-                            request.originalSaturationEvidenceRequested ? 1u : 0u};
-                    std::array<VkBuffer, 9> buffers{
+                            request.originalSaturationEvidenceRequested ? 1u : 0u,
+                            (model_.flags & 1u) != 0u ? 1u : 0u};
+                    std::array<VkBuffer, 10> buffers{
                             input.buffer,
                             slot.conditioning.buffer,
                             slot.residualLogits.buffer,
@@ -858,8 +864,9 @@ bool VulkanNeuralRawDenoiseBackend::recordAndSubmit(
                             posterior,
                             residual,
                             saturationMask,
-                            headroomEvidence};
-                    std::array<VkDeviceSize, 9> offsets{
+                            headroomEvidence,
+                            slot.confidenceLogits.buffer};
+                    std::array<VkDeviceSize, 10> offsets{
                             input.byteOffset,
                             0u,
                             0u,
@@ -868,7 +875,8 @@ bool VulkanNeuralRawDenoiseBackend::recordAndSubmit(
                             request.posteriorVarianceOutput.byteOffset,
                             request.boundedResidualDebugOutput.byteOffset,
                             request.originalSaturationMaskOutput.byteOffset,
-                            request.originalHeadroomEvidenceOutput.byteOffset};
+                            request.originalHeadroomEvidenceOutput.byteOffset,
+                            0u};
                     if (!dispatch(
                                 NeuralKernel::Writeback,
                                 buffers,

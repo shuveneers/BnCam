@@ -15,15 +15,96 @@
 #include "VulkanSpectraPass3PlannerBackend.h"
 #include "VulkanSpectraRawFinalizeBackend.h"
 #include "VulkanSpectraResidentToneBackend.h"
+#include "VulkanNeuralRawDenoiseBackend.h"
+#include "VulkanNeuralRawProductionBridge.h"
+#include "VulkanNeuralRemainingLscBackend.h"
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <mutex>
 #include <string>
 #include <vector>
 
 namespace bncam::vulkan {
+namespace neural {
+
+/**
+ * Capture-local Phase-5 request. The normalized RAW VkBuffer is deliberately
+ * absent: VulkanRuntime resolves that opaque resident generation internally.
+ */
+struct SpectraNeuralProductionRequest {
+    bncam::spectra::neural::NeuralProductionPreparedContext prepared{};
+    bncam::spectra::neural::SpectraNeuralConditioningConfig conditioningConfig{};
+    bncam::spectra::neural::NeuralRuntimeReadiness runtimeReadiness{};
+    const float* remainingLscMap = nullptr;
+    std::uint32_t remainingLscWidth = 0u;
+    std::uint32_t remainingLscHeight = 0u;
+    std::uint32_t remainingLscChannels = 0u;
+    std::uint64_t remainingLscGeneration = 0u;
+    // Avoids a compact post-LSC observer dispatch for fixed demosaic modes.
+    bool collectAutoSceneMetrics = true;
+    // Developer-only exact scene-stage dumps. Normal production capture keeps this false,
+    // therefore the resident neural path performs zero full-frame host readback.
+    bool collectStageDumps = false;
+    std::uint64_t generationId = 0u;
+};
+
+struct SpectraNeuralStageDumps {
+    bool requested = false;
+    bool preNeuralHardPhysicalReady = false;
+    bool postNeuralReady = false;
+    bool postRemainingLscReady = false;
+    std::uint32_t width = 0u;
+    std::uint32_t height = 0u;
+    std::uint32_t stageCount = 0u;
+    std::uint64_t debugReadbackBytes = 0u;
+    float debugReadbackMs = 0.0f;
+    std::vector<float> preNeuralHardPhysicalMosaic;
+    std::vector<float> postNeuralMosaic;
+    std::vector<float> postRemainingLscMosaic;
+    std::string status = "NOT_REQUESTED";
+};
+
+/** Compact telemetry only. No Vulkan resource handle escapes the runtime. */
+struct SpectraNeuralProductionTrace {
+    bool attempted = false;
+    bool neuralPublished = false;
+    bool originalPublished = true;
+    bool modelAvailable = false;
+    bool exactPreflightBypass = false;
+    bool hardPhysicalCorrectionApplied = false;
+    bool remainingLscApplied = false;
+    bool sourceClipProvenancePreserved = false;
+    std::uint32_t neuralKernelDispatches = 0u;
+    std::uint32_t bridgeKernelDispatches = 0u;
+    std::uint64_t compactMetadataUploadBytes = 0u;
+    bool posteriorSummaryReady = false;
+    std::array<float, 4> posteriorMeanVarianceCfa{{0.0f, 0.0f, 0.0f, 0.0f}};
+    std::uint64_t compactPosteriorReadbackBytes = 0u;
+    std::uint64_t persistentGpuBytes = 0u;
+    std::uint64_t fullFrameCpuReadbackBytes = 0u;
+    bool cpuFallbackUsed = false;
+    bool stageDumpsRequested = false;
+    bool stageDumpsCollected = false;
+    std::uint32_t stageDumpCount = 0u;
+    std::uint64_t debugStageDumpReadbackBytes = 0u;
+    float debugStageDumpReadbackMs = 0.0f;
+    float prePhysicalMs = 0.0f;
+    float neuralWallMs = 0.0f;
+    float remainingLscMs = 0.0f;
+    float totalWallMs = 0.0f;
+    bncam::spectra::neural::NeuralBypassReason bypassReason =
+            bncam::spectra::neural::NeuralBypassReason::None;
+    bncam::spectra::neural::NeuralBackendFailureCode failureCode =
+            bncam::spectra::neural::NeuralBackendFailureCode::None;
+    std::string status = "NOT_RUN";
+};
+
+} // namespace neural
+
 
 /**
  * The only authoritative Vulkan runtime owner in BnCam.
@@ -124,6 +205,41 @@ public:
             std::uint64_t rawNormalizeGeneration
     ) noexcept;
 
+
+    /**
+     * Phase 5: configure one release-approved Student package on the existing
+     * process-scoped Vulkan runtime. Test/unapproved packages fail closed.
+     */
+    bool configureSpectraNeuralModel(
+            const void* packageBytes,
+            std::size_t packageSize,
+            bool releaseApproved,
+            std::uint32_t inFlightSlots = 3u
+    ) noexcept;
+
+    /** Clear neural model/resources without changing the authoritative Vulkan runtime. */
+    void clearSpectraNeuralModel() noexcept;
+
+    /** True only after a release-approved package has initialized successfully. */
+    bool spectraNeuralModelAvailable() const noexcept;
+
+    /**
+     * Phase 5 production handoff:
+     * normalized resident RAW -> exact preflight bypass OR hard physical correction ->
+     * neural -> remaining software LSC -> demosaic-resident generation.
+     * Normal production capture performs no full-frame host readback. When developer-only
+     * collectStageDumps is explicitly requested, exact pre-neural/post-neural/post-LSC Bayer
+     * buffers may be copied to host through the separate stageDumpsOut observability channel.
+     * No Vulkan handle leaves this method.
+     */
+    SpectraRawFinalizeResult executeSpectraNeuralThenRawFinalizeFromRawNormalize(
+            const SpectraRawFinalizeRequest& request,
+            const neural::SpectraNeuralProductionRequest& neuralRequest,
+            std::uint64_t rawNormalizeGeneration,
+            neural::SpectraNeuralProductionTrace* traceOut = nullptr,
+            neural::SpectraNeuralStageDumps* stageDumpsOut = nullptr
+    ) noexcept;
+
     /** Phase 11: GPU-primary YUV luma alignment with compact score readback only. */
     YuvMultiFrameAlignmentResult executeYuvMultiFrameAlignment(
             const YuvMultiFrameAlignmentRequest& request
@@ -200,6 +316,11 @@ private:
     VulkanSpectraPass3PlannerBackend spectraPass3PlannerBackend_;
     VulkanSpectraRawFinalizeBackend spectraRawFinalizeBackend_;
     VulkanSpectraResidentToneBackend spectraResidentToneBackend_;
+    neural::VulkanNeuralRawDenoiseBackend spectraNeuralRawDenoiseBackend_;
+    neural::VulkanNeuralRawProductionBridge spectraNeuralProductionBridge_;
+    neural::VulkanNeuralRemainingLscBackend spectraNeuralRemainingLscBackend_;
+    std::atomic<bool> spectraNeuralModelAvailable_{false};
+    std::mutex neuralOrchestrationMutex_;
     std::mutex submissionMutex_;
     // RAW preview uses this independent external-synchronization domain only when bootstrap
     // provides a dedicated second queue and command pool. Single-queue devices keep using

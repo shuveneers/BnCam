@@ -37,7 +37,14 @@ def test_phase4_masterprompt_task_surface_is_complete():
         "neural_scaled_add.comp",
         "neural_writeback.comp",
     }
-    assert {p.name for p in SHADERS.glob("neural_*.comp")} == shader_names
+    # Phase 4 owns this exact primitive set; later production phases may add bridge shaders
+    # without changing the frozen Phase-4 model graph.
+    discovered = {p.name for p in SHADERS.glob("neural_*.comp")}
+    assert shader_names <= discovered
+    assert discovered - shader_names <= {
+        "neural_mosaic_bridge.comp",
+        "neural_remaining_lsc.comp",  # Phase-5 production bridge stage, not a Phase-4 model primitive.
+    }
 
 
 def test_backend_keeps_single_runtime_and_phase5_callsite_boundary():
