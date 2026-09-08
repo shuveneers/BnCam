@@ -1,0 +1,55 @@
+schema_version: 1
+# Fill this with a real manifest before training release weights.
+dataset:
+  manifest: dataset_manifest.json
+  sensor_split:
+    train_sensors: []
+    validation_sensors: []
+    test_sensors: []
+model:
+  name: spectra_teacher_v1
+  input_channels: 14
+  global_condition_dim: 18
+  widths: [80, 120, 176, 240]
+  encoder_blocks: [4, 6, 8]
+  bottleneck_blocks: 10
+  decoder_blocks: [8, 6, 4]
+  residual_k_sigma: 4.0
+  posterior_log_ratio_min: -6.0
+  posterior_log_ratio_max: 3.0
+  confidence_head: true
+training:
+  seed: 1337
+  deterministic: true
+  device: cuda
+  run_dir: runs/teacher_v1
+  repo_root: ../..
+  batch_size: 4
+  steps_per_epoch: 1000
+  crop_size: 256
+  evaluation_crop_size: 512
+  grad_clip_norm: 1.0
+optimizer:
+  lr: 0.0002
+  weight_decay: 0.0001
+loss_weights:
+  raw: 1.0
+  gradient: 0.20
+  multiscale: 0.10
+  frequency: 0.00
+  identity: 0.50
+  physics: 0.05
+  channel_bias: 0.10
+  uncertainty: 0.10
+  isp_proxy: 0.01
+synthesis:
+  distribution_randomization: [0.50, 2.00]
+  lsc_max_gain_range: [1.0, 3.0]
+  headroom_span: 0.08
+curriculum:
+  - {name: A_ideal_physics, epochs: 4, crop_size: 256}
+  - {name: B_real_electronics, epochs: 4, crop_size: 256}
+  - {name: C_spatial_optics, epochs: 4, crop_size: 512}
+  - {name: D_real_paired, epochs: 4, crop_size: 512}
+  - {name: E_extreme_low_light, epochs: 2, crop_size: 512}
+  - {name: F_held_out_validation, validation_only: true}

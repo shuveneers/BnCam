@@ -1,0 +1,17 @@
+schema_version: 1
+model:
+  name: spectra_teacher_v1
+  input_channels: 14
+  global_condition_dim: 18
+  widths: [80, 120, 176, 240]
+  encoder_blocks: [4, 6, 8]
+  bottleneck_blocks: 10
+  decoder_blocks: [8, 6, 4]
+  residual_k_sigma: 4.0
+  posterior_log_ratio_min: -6.0
+  posterior_log_ratio_max: 3.0
+  confidence_head: true
+notes:
+  - offline Teacher only; never shipped in Android production
+  - K=4 is a starting research value and must be ablated on real/held-out RAW
+  - Student architecture and distillation belong to Phase 3

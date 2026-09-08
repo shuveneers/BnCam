@@ -1,0 +1,21 @@
+schema_version: 1
+model:
+  name: spectra_student_lite_v1
+  variant: lite
+  input_channels: 14
+  global_condition_dim: 18
+  widths: [36, 52, 76, 104]
+  encoder_blocks: [2, 3, 4]
+  bottleneck_blocks: 4
+  decoder_blocks: [4, 3, 2]
+  residual_k_sigma: 4.0
+  posterior_log_ratio_min: -6.0
+  posterior_log_ratio_max: 3.0
+  confidence_head: true
+  global_lowres_context: false
+  fine_coarse_residual_head: false
+export:
+  precision: fp16
+  recommended_inner_tile_packed: 320
+notes:
+  - lower-compute Student candidate; held-out quality must decide if it is acceptable

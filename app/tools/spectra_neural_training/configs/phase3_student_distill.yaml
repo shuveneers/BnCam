@@ -1,0 +1,66 @@
+schema_version: 1
+# Requires a frozen, governed Teacher checkpoint from Phase 2.
+dataset:
+  manifest: dataset_manifest.json
+  sensor_split:
+    train_sensors: []
+    validation_sensors: []
+    test_sensors: []
+teacher:
+  checkpoint: runs/teacher_v1/teacher_last.pt
+  expected_sha256: REPLACE_WITH_FROZEN_TEACHER_SHA256
+student:
+  name: spectra_student_hq_v1
+  variant: hq
+  input_channels: 14
+  global_condition_dim: 18
+  widths: [48, 72, 104, 144]
+  encoder_blocks: [3, 4, 5]
+  bottleneck_blocks: 6
+  decoder_blocks: [5, 4, 3]
+  residual_k_sigma: 4.0
+  posterior_log_ratio_min: -6.0
+  posterior_log_ratio_max: 3.0
+  confidence_head: true
+  global_lowres_context: false
+  fine_coarse_residual_head: false
+training:
+  seed: 7331
+  deterministic: true
+  device: cuda
+  run_dir: runs/student_hq_v1
+  repo_root: ../..
+  batch_size: 4
+  steps_per_epoch: 1000
+  evaluation_crop_size: 512
+  grad_clip_norm: 1.0
+optimizer:
+  lr: 0.0002
+  weight_decay: 0.0001
+loss_weights:
+  raw: 1.0
+  gradient: 0.20
+  multiscale: 0.10
+  frequency: 0.00
+  identity: 0.50
+  physics: 0.05
+  channel_bias: 0.10
+  uncertainty: 0.10
+  isp_proxy: 0.01
+distillation_weights:
+  teacher_clean: 0.50
+  teacher_residual: 0.50
+  teacher_posterior: 0.20
+  teacher_confidence: 0.02
+  feature_energy: 0.05
+synthesis:
+  distribution_randomization: [0.50, 2.00]
+  lsc_max_gain_range: [1.0, 3.0]
+  headroom_span: 0.08
+curriculum:
+  - {name: student_context_256, epochs: 6, crop_size: 256}
+  - {name: student_context_512, epochs: 8, crop_size: 512}
+notes:
+  - Teacher is frozen and SHA-256 verified before distillation starts.
+  - Held-out test sensors never enter optimization.
+  - No QAT/INT8 in Phase 3 baseline; FP16 export follows after training.

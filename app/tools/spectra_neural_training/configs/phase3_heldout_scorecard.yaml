@@ -1,0 +1,25 @@
+schema_version: 1
+dataset:
+  manifest: dataset_manifest.json
+  sensor_split:
+    train_sensors: []
+    validation_sensors: []
+    test_sensors: []
+student:
+  manifest: runs/student_hq_v1/export/model_manifest.json
+teacher:
+  checkpoint: runs/teacher_v1/teacher_last.pt
+  # If omitted, the exported Student's bound Teacher SHA-256 is authoritative.
+  expected_sha256: ""
+evaluation:
+  seed: 9901
+  crop_size: 512
+synthesis:
+  distribution_randomization: [0.50, 2.00]
+  lsc_max_gain_range: [1.0, 3.0]
+  headroom_span: 0.08
+output:
+  dir: runs/student_hq_v1/heldout_scorecard
+notes:
+  - Only test_sensors are scored here.
+  - The tool enforces invariant safety gates but does not invent image-quality thresholds.

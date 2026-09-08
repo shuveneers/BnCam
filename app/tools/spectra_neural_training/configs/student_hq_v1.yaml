@@ -1,0 +1,23 @@
+schema_version: 1
+model:
+  name: spectra_student_hq_v1
+  variant: hq
+  input_channels: 14
+  global_condition_dim: 18
+  widths: [48, 72, 104, 144]
+  encoder_blocks: [3, 4, 5]
+  bottleneck_blocks: 6
+  decoder_blocks: [5, 4, 3]
+  residual_k_sigma: 4.0
+  posterior_log_ratio_min: -6.0
+  posterior_log_ratio_max: 3.0
+  confidence_head: true
+  global_lowres_context: false
+  fine_coarse_residual_head: false
+export:
+  precision: fp16
+  recommended_inner_tile_packed: 320
+notes:
+  - production Student research baseline; no LayerNorm or transposed convolution
+  - quality weights are not supplied by this config; training/distillation is separate
+  - global low-resolution context and fine/coarse heads are ablations, not enabled by default
