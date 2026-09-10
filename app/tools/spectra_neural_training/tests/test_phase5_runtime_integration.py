@@ -3,7 +3,7 @@ import json
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[3]
-CPP = ROOT / "app/src/main/cpp"
+CPP = ROOT / "src/main/cpp"
 
 
 def text(path: str) -> str:

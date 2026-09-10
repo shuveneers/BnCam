@@ -5,6 +5,7 @@ import android.os.Build
 import com.bncam.core.nativebridge.NativeEngineLoader
 import com.bncam.core.vulkan.VulkanRuntimeConfig
 import com.bncam.core.vulkan.VulkanRuntimeOwner
+import com.bncam.core.vulkan.SpectraNeuralModelInstaller
 import org.lsposed.hiddenapibypass.HiddenApiBypass
 
 class BnCamApplication : Application() {
@@ -28,6 +29,7 @@ class BnCamApplication : Application() {
                 requireAndroidHardwareBuffer = true
             )
         )
+        SpectraNeuralModelInstaller.loadBundled(applicationContext)
         VulkanRuntimeOwner.prepareRawPreviewBackend()
         VulkanRuntimeOwner.exportApplicationDiagnostics()
         com.bncam.core.debug.RawRecoveryTrace.init(applicationContext)

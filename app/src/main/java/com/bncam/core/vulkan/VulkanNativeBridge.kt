@@ -13,6 +13,8 @@ internal object VulkanNativeBridge {
         pipelineCachePath: String
     ): Int
 
+    external fun nativeConfigureSpectraNeuralModel(packageBytes: ByteArray): Boolean
+
     external fun nativeShutdown(): Int
     external fun nativeGetRuntimeStateCode(): Int
     external fun nativeGetSchemaVersion(): Int

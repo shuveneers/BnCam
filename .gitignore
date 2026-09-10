@@ -31,3 +31,8 @@ google-services.json
 
 # Android Profiling
 *.hprof
+
+# Python runtime caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
