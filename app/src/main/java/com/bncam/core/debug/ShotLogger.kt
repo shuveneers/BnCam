@@ -89,6 +89,7 @@ data class FrameAnalysisDebugEntry(
     val sensorAuthorityFallbackUsed: Boolean = false,
     val rawProcessingSafe: Boolean = false,
     val sensorAuthorityStatus: String = "UNAVAILABLE",
+    val sensorMetadataAuditLines: List<String> = emptyList(),
     val imageArrivalElapsedNs: Long = 0L,
     val metadataArrivalElapsedNs: Long = 0L,
     val pairCompleteElapsedNs: Long = 0L,
@@ -1729,6 +1730,31 @@ class ShotLogger(
                 kv("Sync", formatScore(entry.syncScore))
                 kv("Decision", entry.decisionReason)
                 if (!entry.accepted) kv("Rejection reason", entry.rejectionReason)
+                if (entry.selectedAnchor) {
+                    line("")
+                    line("  Sensor Authority / Provenance")
+                    kv("Sensor Authority ID", entry.sensorAuthorityId)
+                    kv("Camera Device ID", entry.cameraDeviceId)
+                    kv("Physical Camera ID", entry.physicalCameraId)
+                    kv("RAW Source ID", entry.rawSourceId)
+                    kv("CaptureResult Source ID", entry.captureResultSourceId)
+                    kv("Characteristics Source ID", entry.characteristicsSourceId)
+                    kv("Calibration Source ID", entry.calibrationSourceId)
+                    kv("Sensor Authority Frame Number", entry.sensorAuthorityFrameNumber)
+                    kv("Capture Sequence ID", entry.captureSequenceId)
+                    kv("Sensor Metadata Timestamp Ns", entry.sensorMetadataTimestampNs)
+                    kv("RAW/Metadata Timestamp Match", entry.rawMetadataTimestampMatch)
+                    kv("Fallback Used", entry.sensorAuthorityFallbackUsed)
+                    kv("Raw Processing Safe", entry.rawProcessingSafe)
+                    kv("Sensor Authority Status", entry.sensorAuthorityStatus)
+                    line("")
+                    line("  Uniform Sensor Metadata")
+                    if (entry.sensorMetadataAuditLines.isEmpty()) {
+                        line("  UNAVAILABLE | value=UNAVAILABLE; source=UNAVAILABLE; validity=UNAVAILABLE; reason=SENSOR_METADATA_AUDIT_NOT_RECORDED")
+                    } else {
+                        entry.sensorMetadataAuditLines.forEach { auditLine -> line("  $auditLine") }
+                    }
+                }
                 if (includeFullDetail) {
                     kv("Timestamp ns", entry.timestampNs)
                     kv("Shutter relation", entry.shutterRelation)
@@ -1752,20 +1778,22 @@ class ShotLogger(
                         "requestProvenanceStatus",
                         entry.requestProvenanceStatus
                     )
-                    kv("Sensor Authority ID", entry.sensorAuthorityId)
-                    kv("Camera Device ID", entry.cameraDeviceId)
-                    kv("Physical Camera ID", entry.physicalCameraId)
-                    kv("RAW Source ID", entry.rawSourceId)
-                    kv("CaptureResult Source ID", entry.captureResultSourceId)
-                    kv("Characteristics Source ID", entry.characteristicsSourceId)
-                    kv("Calibration Source ID", entry.calibrationSourceId)
-                    kv("Sensor Authority Frame Number", entry.sensorAuthorityFrameNumber)
-                    kv("Capture Sequence ID", entry.captureSequenceId)
-                    kv("Sensor Metadata Timestamp Ns", entry.sensorMetadataTimestampNs)
-                    kv("RAW/Metadata Timestamp Match", entry.rawMetadataTimestampMatch)
-                    kv("Fallback Used", entry.sensorAuthorityFallbackUsed)
-                    kv("Raw Processing Safe", entry.rawProcessingSafe)
-                    kv("Sensor Authority Status", entry.sensorAuthorityStatus)
+                    if (!entry.selectedAnchor) {
+                        kv("Sensor Authority ID", entry.sensorAuthorityId)
+                        kv("Camera Device ID", entry.cameraDeviceId)
+                        kv("Physical Camera ID", entry.physicalCameraId)
+                        kv("RAW Source ID", entry.rawSourceId)
+                        kv("CaptureResult Source ID", entry.captureResultSourceId)
+                        kv("Characteristics Source ID", entry.characteristicsSourceId)
+                        kv("Calibration Source ID", entry.calibrationSourceId)
+                        kv("Sensor Authority Frame Number", entry.sensorAuthorityFrameNumber)
+                        kv("Capture Sequence ID", entry.captureSequenceId)
+                        kv("Sensor Metadata Timestamp Ns", entry.sensorMetadataTimestampNs)
+                        kv("RAW/Metadata Timestamp Match", entry.rawMetadataTimestampMatch)
+                        kv("Fallback Used", entry.sensorAuthorityFallbackUsed)
+                        kv("Raw Processing Safe", entry.rawProcessingSafe)
+                        kv("Sensor Authority Status", entry.sensorAuthorityStatus)
+                    }
                     kv("imageArrivalElapsedNs", entry.imageArrivalElapsedNs)
                     kv("metadataArrivalElapsedNs", entry.metadataArrivalElapsedNs)
                     kv("pairCompleteElapsedNs", entry.pairCompleteElapsedNs)

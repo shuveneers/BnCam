@@ -3,8 +3,6 @@ package com.bncam.core.quality
 import android.graphics.ImageFormat
 import android.util.Log
 import android.hardware.camera2.CameraCharacteristics
-import android.hardware.camera2.CaptureResult
-import android.hardware.camera2.params.ColorSpaceTransform
 import com.bncam.data.settings.ProfileAwbModes
 import com.bncam.data.settings.ProfileAwbSettings
 import com.bncam.data.settings.ResolvedLensHardwareSettings
@@ -187,7 +185,7 @@ data class FinalSensorCalibration(
     fun debugPairs(): List<Pair<String, String>> {
         val pairs = mutableListOf<Pair<String, String>>()
         pairs.add("Sensor Calibration Summary" to "V2 central metadata baseline")
-        pairs.add("Base Layer" to "CameraCharacteristics + CaptureResult")
+        pairs.add("Base Layer" to "Uniform SensorMetadata + exact authority CameraCharacteristics")
         pairs.add("Adjustment Layer" to adjustmentLayerSummary())
         pairs.add("Final Layer" to "Base merged with validated per-lens adjustment values")
         pairs.add("Capture Mode / Frame Source" to base.frameSource)
@@ -457,14 +455,19 @@ object SensorCalibrationResolver {
         physicalCameraId: String?,
         frameSourceFormat: Int,
         characteristics: CameraCharacteristics,
-        captureResult: CaptureResult?,
+        sensorMetadata: SensorMetadata,
         lensSettings: ResolvedLensHardwareSettings?,
         profileAwbSettings: ProfileAwbSettings? = null,
         profileNoiseTuning: ProfileNoiseTuning? = null,
         stableAutoWhiteBalance: StableWhiteBalanceSnapshot? = null
     ): FinalSensorCalibration {
         val resolvedPhysicalCameraId = physicalCameraId
-        val base = buildBaseCalibration(lensId, resolvedPhysicalCameraId, frameSourceFormat, characteristics, captureResult)
+        val base = buildBaseCalibration(
+            lensId = lensId,
+            physicalCameraId = resolvedPhysicalCameraId,
+            frameSourceFormat = frameSourceFormat,
+            sensorMetadata = sensorMetadata
+        )
         val override = lensSettings?.toOverrideLayer() ?: defaultOverrideLayer()
         return buildFinalCalibration(
             base,
@@ -567,8 +570,7 @@ object SensorCalibrationResolver {
         lensId: String,
         physicalCameraId: String?,
         frameSourceFormat: Int,
-        characteristics: CameraCharacteristics,
-        captureResult: CaptureResult?
+        sensorMetadata: SensorMetadata
     ): BaseSensorCalibration {
         val warnings = mutableListOf<String>()
         val (domain, label, bitDepth) = when (frameSourceFormat) {
@@ -577,6 +579,7 @@ object SensorCalibrationResolver {
             ImageFormat.YUV_420_888 -> Triple(RawDomain.UNKNOWN, "YUV", 8)
             else -> Triple(RawDomain.UNKNOWN, "UNKNOWN($frameSourceFormat)", 8)
         }
+        val isRaw = domain == RawDomain.RAW10_PACKED_10BIT || domain == RawDomain.RAW_SENSOR_16BIT
         val appliedDomain = when (domain) {
             RawDomain.RAW10_PACKED_10BIT -> "RAW10"
             RawDomain.RAW_SENSOR_16BIT -> "RAW16_OR_RAW_SENSOR"
@@ -584,56 +587,75 @@ object SensorCalibrationResolver {
             RawDomain.UNKNOWN -> "UNKNOWN_OR_YUV"
         }
 
-        val cfa = characteristics.get(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT)
-            ?: CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT_RGGB
-        val sensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: -1
-        val sensorTimestamp = captureResult?.get(CaptureResult.SENSOR_TIMESTAMP)
-        val sensorSensitivityIso = captureResult?.get(CaptureResult.SENSOR_SENSITIVITY) ?: 0
-        val sensorExposureTimeNs = captureResult?.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 0L
-        val postRawSensitivityBoost = try {
-            captureResult?.get(CaptureResult.CONTROL_POST_RAW_SENSITIVITY_BOOST) ?: 100
-        } catch (_: Throwable) {
-            100
-        }
-
-        val staticWhite = characteristics.get(CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL)
-        val dynamicWhite = captureResult?.get(CaptureResult.SENSOR_DYNAMIC_WHITE_LEVEL)
-        val metadataWhite = dynamicWhite ?: staticWhite
-        val fallbackWhite = if (domain == RawDomain.RAW10_PACKED_10BIT) 1023 else if (domain == RawDomain.RAW_SENSOR_16BIT) 65535 else 255
-        val rawWhite = metadataWhite ?: fallbackWhite.also {
-            warnings.add("Missing SENSOR_INFO_WHITE_LEVEL/SENSOR_DYNAMIC_WHITE_LEVEL; using format fallback white=$it")
-        }
-        val whiteScale = if (domain == RawDomain.RAW10_PACKED_10BIT && rawWhite > 1023) 1023f / rawWhite.toFloat() else 1f
-        val appliedWhite = if (domain == RawDomain.RAW10_PACKED_10BIT && rawWhite > 1023) 1023 else rawWhite.coerceAtLeast(1)
-
-        val staticBlackPattern = characteristics.get(CameraCharacteristics.SENSOR_BLACK_LEVEL_PATTERN)
-        val dynamicBlackPattern = captureResult?.get(CaptureResult.SENSOR_DYNAMIC_BLACK_LEVEL)
-        // Camera2 dynamic black levels (SENSOR_DYNAMIC_BLACK_LEVEL) are in 2x2 mosaic tile order
-        // [row0_col0, row0_col1, row1_col0, row1_col1], matching SENSOR_BLACK_LEVEL_PATTERN.
-        val rawBlackValues = when {
-            dynamicBlackPattern != null && dynamicBlackPattern.size >= 4 -> FloatArray(4) {
-                dynamicBlackPattern[it].finiteOrNull() ?: 0f
-            }
-            staticBlackPattern != null -> floatArrayOf(
-                staticBlackPattern.getOffsetForIndex(0, 0).toFloat(),
-                staticBlackPattern.getOffsetForIndex(1, 0).toFloat(),
-                staticBlackPattern.getOffsetForIndex(0, 1).toFloat(),
-                staticBlackPattern.getOffsetForIndex(1, 1).toFloat()
+        if (isRaw && !sensorMetadata.coreRawMetadataValid) {
+            throw SensorAuthorityUnavailableException(
+                "UNSAFE_TO_PROCESS:${sensorMetadata.coreRawMetadataStatus}"
             )
-            else -> {
-                warnings.add("Missing SENSOR_DYNAMIC_BLACK_LEVEL and SENSOR_BLACK_LEVEL_PATTERN; black subtraction uses no-op 0 fallback")
-                floatArrayOf(0f, 0f, 0f, 0f)
+        }
+        if (sensorMetadata.logicalMetadataFallbackUsed || sensorMetadata.foreignSensorMetadataUsed) {
+            throw SensorAuthorityUnavailableException("UNSAFE_TO_PROCESS:SENSOR_AUTHORITY_FALLBACK_FORBIDDEN")
+        }
+        if (sensorMetadata.sensorIdentity.sourceId != sensorMetadata.calibrationSourceId ||
+            sensorMetadata.sensorIdentity.sourceId != sensorMetadata.characteristicsSourceId ||
+            sensorMetadata.sensorIdentity.sourceId != sensorMetadata.captureResultSourceId
+        ) {
+            throw SensorAuthorityUnavailableException("UNSAFE_TO_PROCESS:SENSOR_METADATA_SOURCE_MISMATCH")
+        }
+
+        val cfa = sensorMetadata.cfa.value ?: -1
+        val sensorOrientation = sensorMetadata.orientationField.value ?: -1
+        val sensorTimestamp = sensorMetadata.timestampField.value
+        val sensorSensitivityIso = sensorMetadata.sensitivityIsoField.value ?: 0
+        val sensorExposureTimeNs = sensorMetadata.exposureTimeNsField.value ?: 0L
+        val postRawSensitivityBoost = sensorMetadata.postRawSensitivityBoostField.value
+            ?.takeIf { it > 0 }
+            ?: 100.also {
+                warnings.add(
+                    "CONTROL_POST_RAW_SENSITIVITY_BOOST unavailable; explicit neutral 100% boost used"
+                )
+            }
+
+        val metadataWhite = sensorMetadata.effectiveWhiteLevelField.value
+        val rawWhite = when {
+            metadataWhite != null && metadataWhite > 0 -> metadataWhite
+            isRaw -> throw SensorAuthorityUnavailableException("UNSAFE_TO_PROCESS:WHITE_LEVEL_UNAVAILABLE")
+            else -> 255.also {
+                warnings.add("White level unavailable for non-RAW input; explicit 8-bit domain value 255 used")
             }
         }
-        // Native ISP indexes black levels by canonical R/Gr/Gb/B color plane.
+        val whiteScale = if (domain == RawDomain.RAW10_PACKED_10BIT && rawWhite > 1023) {
+            1023f / rawWhite.toFloat()
+        } else {
+            1f
+        }
+        val appliedWhite = if (domain == RawDomain.RAW10_PACKED_10BIT && rawWhite > 1023) {
+            1023
+        } else {
+            rawWhite.coerceAtLeast(1)
+        }
+
+        val effectiveBlackList = sensorMetadata.effectiveBlackLevel.value
+        val rawBlackValues = when {
+            effectiveBlackList != null && effectiveBlackList.size >= 4 ->
+                FloatArray(4) { effectiveBlackList[it] }
+            isRaw -> throw SensorAuthorityUnavailableException("UNSAFE_TO_PROCESS:BLACK_LEVEL_UNAVAILABLE")
+            else -> FloatArray(4).also {
+                warnings.add("Black level unavailable for non-RAW input; explicit no-op zero level used")
+            }
+        }
         val appliedBlack = mosaicToCanonical(rawBlackValues, cfa).map { value ->
             (value * whiteScale).coerceIn(0f, appliedWhite.coerceAtLeast(2) - 1f)
         }.toFloatArray()
         if (domain == RawDomain.RAW10_PACKED_10BIT && rawWhite > 1023) {
-            warnings.add("White/black metadata scaled from metadata domain white=$rawWhite to RAW10 domain white=1023 with scale=${whiteScale.format6()}")
+            warnings.add(
+                "White/black metadata scaled from metadata domain white=$rawWhite to RAW10 domain " +
+                    "white=1023 with scale=${whiteScale.format6()}"
+            )
         }
-        if (dynamicBlackPattern == null && staticBlackPattern != null) {
-            warnings.add("Dynamic black unavailable; static SENSOR_BLACK_LEVEL_PATTERN used")
+        if (!sensorMetadata.dynamicBlackLevel.isValid && sensorMetadata.staticBlackLevel.isValid) {
+            warnings.add(
+                "Dynamic black unavailable/invalid; exact-authority static SENSOR_BLACK_LEVEL_PATTERN used"
+            )
         }
 
         val cfaSupportedForBayer = cfa in listOf(
@@ -642,15 +664,17 @@ object SensorCalibrationResolver {
             CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT_GBRG,
             CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT_BGGR
         )
-        val normalizationCalibrationValid = metadataWhite != null && (dynamicBlackPattern != null || staticBlackPattern != null)
+        val normalizationCalibrationValid =
+            sensorMetadata.effectiveWhiteLevelField.isValid && sensorMetadata.effectiveBlackLevel.isValid
 
-        val noise = resolveSensorNoiseProfile(captureResult, warnings)
-        val wb = resolveWhiteBalanceGains(captureResult, warnings)
-        val colorMatrix = resolveColorCorrectionMatrix(characteristics, captureResult, warnings)
+        val noise = resolveSensorNoiseProfile(sensorMetadata, warnings)
+        val wb = resolveWhiteBalanceGains(sensorMetadata, warnings)
+        val colorMatrix = resolveColorCorrectionMatrix(sensorMetadata, warnings)
 
         val hasNoiseProfile = noise.values != null
         val noiseProfileValid = noise.values != null && noise.values.all { it.isFinite() && it >= 0.0 }
-        val baseNoiseApplied = hasNoiseProfile && noiseProfileValid && normalizationCalibrationValid && cfaSupportedForBayer
+        val baseNoiseApplied = hasNoiseProfile && noiseProfileValid &&
+            normalizationCalibrationValid && cfaSupportedForBayer
 
         return BaseSensorCalibration(
             lensId = lensId,
@@ -672,25 +696,17 @@ object SensorCalibrationResolver {
             inputBitDepth = bitDepth,
             inputDomain = domain,
             baseWhiteLevel = appliedWhite,
-            baseWhiteLevelSource = when {
-                dynamicWhite != null -> "CaptureResult.SENSOR_DYNAMIC_WHITE_LEVEL"
-                staticWhite != null -> "CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL"
-                else -> "missing/fallback"
-            },
+            baseWhiteLevelSource = sensorMetadata.effectiveWhiteLevelField.source,
             baseWhiteLevelRawMetadata = metadataWhite,
             baseWhiteLevelAppliedDomain = appliedDomain,
             baseWhiteLevelScaleFactor = whiteScale,
-            dynamicWhiteLevelAvailable = dynamicWhite != null,
+            dynamicWhiteLevelAvailable = sensorMetadata.dynamicWhiteLevelField.isValid,
             baseBlackLevels = appliedBlack,
-            baseBlackLevelSource = when {
-                dynamicBlackPattern != null -> "CaptureResult.SENSOR_DYNAMIC_BLACK_LEVEL"
-                staticBlackPattern != null -> "CameraCharacteristics.SENSOR_BLACK_LEVEL_PATTERN"
-                else -> "missing/fallback_noop_0"
-            },
+            baseBlackLevelSource = sensorMetadata.effectiveBlackLevel.source,
             baseBlackLevelRawMetadataValues = rawBlackValues,
             baseBlackLevelAppliedDomain = appliedDomain,
             baseBlackLevelScaleFactor = whiteScale,
-            dynamicBlackLevelAvailable = dynamicBlackPattern != null,
+            dynamicBlackLevelAvailable = sensorMetadata.dynamicBlackLevel.isValid,
             blackSubtractionApplied = rawBlackValues.any { abs(it) > 0.0001f },
             baseNoiseProfile = noise.values,
             baseNoiseProfileSource = noise.source,
@@ -1090,59 +1106,42 @@ object SensorCalibrationResolver {
         val channelMap: String
     )
 
-    private fun resolveSensorNoiseProfile(captureResult: CaptureResult?, warnings: MutableList<String>): NoiseResolution {
-        val channelMap = "Android SENSOR_NOISE_PROFILE coefficient pairs flattened as S0,O0,S1,O1...; channel order follows Android CFA planes for the capture result"
-        val profile = try {
-            captureResult?.get(CaptureResult.SENSOR_NOISE_PROFILE)
-        } catch (t: Throwable) {
-            warnings.add("Reading SENSOR_NOISE_PROFILE failed: ${t.javaClass.simpleName}: ${t.message}")
-            null
-        }
-        if (profile == null || profile.isEmpty()) {
-            warnings.add("Missing SENSOR_NOISE_PROFILE; sensor noise baseline will use conservative no-op fallback")
-            return NoiseResolution(null, "missing/null", "CaptureResult.SENSOR_NOISE_PROFILE unavailable", 0, 0, channelMap)
+    private fun resolveSensorNoiseProfile(sensorMetadata: SensorMetadata, warnings: MutableList<String>): NoiseResolution {
+        val channelMap = "Android SENSOR_NOISE_PROFILE coefficient pairs flattened as S0,O0,S1,O1...; channel order follows Android CFA planes for the exact sensor-authority result"
+        val field = sensorMetadata.noiseProfileSoField
+        val profile = field.value
+        if (!field.isValid || profile.isNullOrEmpty()) {
+            val reason = if (field.reason.isBlank()) "SENSOR_NOISE_PROFILE_UNAVAILABLE" else field.reason
+            warnings.add("SENSOR_NOISE_PROFILE unavailable/invalid from uniform SensorMetadata: $reason")
+            return NoiseResolution(null, field.source, reason, (profile?.size ?: 0) / 2, (profile?.size ?: 0) / 2, channelMap)
         }
 
-        val pairCount = profile.size
-        val out = DoubleArray(pairCount * 2)
-        var valid = true
-        for (i in profile.indices) {
-            val pair = profile[i]
-            val signal = pair.first
-            val offset = pair.second
-            if (signal == null || offset == null || !signal.isFinite() || !offset.isFinite()) {
-                valid = false
-                break
-            }
-            out[i * 2] = signal
-            out[i * 2 + 1] = offset
+        val out = profile.toDoubleArray()
+        val pairCount = out.size / 2
+        if (out.size % 2 != 0 || out.any { !it.isFinite() || it < 0.0 } || out.all { abs(it) < 1.0e-12 }) {
+            warnings.add("Invalid SENSOR_NOISE_PROFILE reached calibration despite uniform metadata validation")
+            return NoiseResolution(null, field.source, "UNSAFE_SENSOR_NOISE_PROFILE", pairCount, pairCount, channelMap)
         }
-        if (!valid || out.any { !it.isFinite() || it < 0.0 } || out.all { abs(it) < 1.0e-12 }) {
-            warnings.add("Invalid SENSOR_NOISE_PROFILE; received $pairCount pairs but values were non-finite or all zero")
-            return NoiseResolution(null, "invalid/non-finite-or-all-zero", "Camera2 S/O was negative, non-finite, or all zero", pairCount, pairCount, channelMap)
-        }
-        return NoiseResolution(out, "CaptureResult.SENSOR_NOISE_PROFILE", "None", pairCount, pairCount, channelMap)
+        return NoiseResolution(out, field.source, "None", pairCount, pairCount, channelMap)
     }
 
     private data class WbResolution(val values: FloatArray, val source: String, val applied: Boolean)
 
-    private fun resolveWhiteBalanceGains(captureResult: CaptureResult?, warnings: MutableList<String>): WbResolution {
-        val gains = try {
-            captureResult?.get(CaptureResult.COLOR_CORRECTION_GAINS)
-        } catch (t: Throwable) {
-            warnings.add("Reading COLOR_CORRECTION_GAINS failed: ${t.javaClass.simpleName}: ${t.message}")
-            null
-        }
-        if (gains != null) {
-            val out = floatArrayOf(gains.red, gains.greenEven, gains.greenOdd, gains.blue)
+    private fun resolveWhiteBalanceGains(sensorMetadata: SensorMetadata, warnings: MutableList<String>): WbResolution {
+        val field = sensorMetadata.colorCorrectionGainsField
+        val gains = field.value
+        if (field.isValid && gains != null && gains.size == 4) {
+            val out = gains.toFloatArray()
             if (out.all { it.isFinite() && it > 0f }) {
-                return WbResolution(out, "CaptureResult.COLOR_CORRECTION_GAINS", true)
+                return WbResolution(out, field.source, true)
             }
-            warnings.add("Invalid COLOR_CORRECTION_GAINS; neutral fallback used")
-        } else {
-            warnings.add("AWB gains unavailable; neutral fallback used")
         }
-        return WbResolution(floatArrayOf(1f, 1f, 1f, 1f), "fallback/neutral_1_1_1_1", false)
+        warnings.add("WB gains unavailable/invalid in uniform SensorMetadata; controlled neutral fallback used (${field.reason})")
+        return WbResolution(
+            floatArrayOf(1f, 1f, 1f, 1f),
+            "CONTROLLED_NEUTRAL_WB_FALLBACK[${field.source}; ${field.validity}; ${field.reason}]",
+            false
+        )
     }
 
     private fun applyAwbOverride(base: FloatArray, override: LensOverrideLayer): FloatArray {
@@ -1232,12 +1231,11 @@ object SensorCalibrationResolver {
     )
 
     private fun resolveForwardMatrixCandidate(
-        characteristics: CameraCharacteristics,
-        forwardKey: CameraCharacteristics.Key<ColorSpaceTransform>,
-        calibrationKey: CameraCharacteristics.Key<ColorSpaceTransform>
+        forwardField: SensorMetadataValue<List<Float>>,
+        calibrationField: SensorMetadataValue<List<Float>>
     ): ForwardMatrixCandidateResolution {
-        val forward = characteristics.get(forwardKey)?.let(RawColorTransformEngine::colorSpaceTransformToArray)
-        val calibration = characteristics.get(calibrationKey)?.let(RawColorTransformEngine::colorSpaceTransformToArray)
+        val forward = forwardField.value?.takeIf { forwardField.isValid }?.toFloatArray()
+        val calibration = calibrationField.value?.takeIf { calibrationField.isValid }?.toFloatArray()
         val resolved = RawColorTransformEngine.resolveActualSensorForwardMatrixToLinearSrgb(
             forwardMatrix = forward,
             calibrationTransform = calibration
@@ -1250,8 +1248,7 @@ object SensorCalibrationResolver {
     }
 
     private fun resolveColorCorrectionMatrix(
-        characteristics: CameraCharacteristics,
-        captureResult: CaptureResult?,
+        sensorMetadata: SensorMetadata,
         warnings: MutableList<String>
     ): MatrixResolution {
         val rejected = mutableListOf<String>()
@@ -1261,9 +1258,10 @@ object SensorCalibrationResolver {
         // Phase 8 therefore validates and preserves it exactly; no BnCam row normalization,
         // XYZ conversion or chromatic adaptation is applied on top of it.
         candidates.add(MatrixCandidate(
-            source = "CaptureResult.COLOR_CORRECTION_TRANSFORM -> linear_sRGB",
-            values = captureResult?.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)
-                ?.let { RawColorTransformEngine.colorSpaceTransformToArray(it) },
+            source = "${sensorMetadata.colorCorrectionTransformField.source} -> linear_sRGB",
+            values = sensorMetadata.colorCorrectionTransformField.value
+                ?.takeIf { sensorMetadata.colorCorrectionTransformField.isValid }
+                ?.toFloatArray(),
             note = "capture_result_sensor_rgb_to_linear_srgb_direct_phase8_preserved",
             declaredInputSpace = "actual_sensor_RGB_after_WB",
             declaredOutputSpace = "linear_sRGB_D65",
@@ -1277,9 +1275,8 @@ object SensorCalibrationResolver {
         // back to the reference sensor with inverse(SENSOR_CALIBRATION_TRANSFORM), then apply
         // ForwardMatrix -> XYZ D50 -> Bradford D65 -> linear sRGB.
         val forward2 = resolveForwardMatrixCandidate(
-            characteristics,
-            CameraCharacteristics.SENSOR_FORWARD_MATRIX2,
-            CameraCharacteristics.SENSOR_CALIBRATION_TRANSFORM2
+            sensorMetadata.forwardMatrix2,
+            sensorMetadata.cameraCalibration2
         )
         candidates.add(MatrixCandidate(
             source = "inverse(SENSOR_CALIBRATION_TRANSFORM2) -> SENSOR_FORWARD_MATRIX2 -> XYZ_D50 -> Bradford_D65 -> linear_sRGB",
@@ -1294,9 +1291,8 @@ object SensorCalibrationResolver {
         ))
 
         val forward1 = resolveForwardMatrixCandidate(
-            characteristics,
-            CameraCharacteristics.SENSOR_FORWARD_MATRIX1,
-            CameraCharacteristics.SENSOR_CALIBRATION_TRANSFORM1
+            sensorMetadata.forwardMatrix1,
+            sensorMetadata.cameraCalibration1
         )
         candidates.add(MatrixCandidate(
             source = "inverse(SENSOR_CALIBRATION_TRANSFORM1) -> SENSOR_FORWARD_MATRIX1 -> XYZ_D50 -> Bradford_D65 -> linear_sRGB",

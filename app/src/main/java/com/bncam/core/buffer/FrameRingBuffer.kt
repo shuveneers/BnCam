@@ -1053,7 +1053,8 @@ class FrameRingBuffer(private var capacity: Int = 35) {
 
     private fun hasExactSensorAuthority(pair: ZslFramePair): Boolean {
         if (!requiresExactSensorAuthority(pair.format)) return true
-        return frameIdentity(pair)?.safeForRawProcessing == true
+        val snapshot = pair.sensorMetadataSnapshot ?: return false
+        return frameIdentity(pair)?.safeForRawProcessing == true && snapshot.coreRawMetadataValid
     }
 
     private fun hasCompleteProvenance(pair: ZslFramePair): Boolean =
@@ -1078,7 +1079,14 @@ class FrameRingBuffer(private var capacity: Int = 35) {
         }
         if (!hasExactSensorAuthority(pair)) {
             val identity = frameIdentity(pair)
-            val reason = identity?.rejectionReason() ?: "SENSOR_AUTHORITY_SNAPSHOT_UNAVAILABLE"
+            val snapshot = pair.sensorMetadataSnapshot
+            val reason = when {
+                identity == null -> "SENSOR_AUTHORITY_SNAPSHOT_UNAVAILABLE"
+                !identity.safeForRawProcessing -> identity.rejectionReason()
+                snapshot == null -> "SENSOR_METADATA_UNAVAILABLE"
+                !snapshot.coreRawMetadataValid -> "UNSAFE_TO_PROCESS:${snapshot.coreRawMetadataStatus}"
+                else -> "SENSOR_AUTHORITY_REJECTED"
+            }
             if (!pair.sensorAuthorityRejectionCounted) {
                 pair.sensorAuthorityRejectionCounted = true
                 pairingFailuresCount++

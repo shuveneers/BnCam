@@ -1,5 +1,6 @@
 package com.bncam.core.quality
 
+import android.graphics.ImageFormat
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureResult
@@ -14,16 +15,8 @@ import android.util.Rational
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 
-data class SensorRouteKey(val logicalCameraId: String, val physicalCameraId: String?) {
-    val effectiveCameraId: String get() = physicalCameraId?.takeIf { it.isNotBlank() } ?: logicalCameraId
-    override fun toString(): String = physicalCameraId?.takeIf { it.isNotBlank() }
-        ?.let { "$logicalCameraId/$it" } ?: logicalCameraId
-}
-
 data class IntRangeSnapshot(val lower: Int, val upper: Int)
 data class LongRangeSnapshot(val lower: Long, val upper: Long)
-data class RectSnapshot(val left: Int, val top: Int, val right: Int, val bottom: Int)
-data class SizeSnapshot(val width: Int, val height: Int)
 
 /** CameraCharacteristics-only truth. Safe to build before the first capture. */
 data class PhysicalSensorProfile(
@@ -35,6 +28,8 @@ data class PhysicalSensorProfile(
     val cfaArrangement: Int?,
     val sensorOrientationDegrees: Int?,
     val pixelArraySize: SizeSnapshot?,
+    val rawSensorOutputSizes: List<SizeSnapshot>,
+    val raw10OutputSizes: List<SizeSnapshot>,
     val activeArray: RectSnapshot?,
     val preCorrectionActiveArray: RectSnapshot?,
     val opticalBlackRegions: List<RectSnapshot>,
@@ -63,73 +58,6 @@ data class PhysicalSensorProfile(
     val availableAntibandingModes: List<Int>,
     val staticFingerprint: String
 )
-
-/** Exact per-frame state, copied away from mutable/latest-result ownership. */
-data class FrameSensorMetadataSnapshot(
-    val route: SensorRouteKey,
-    val staticFingerprint: String?,
-    val metadataSource: String,
-    val sensorTimestampNs: Long?,
-    val frameNumber: Long,
-    val sensitivityIso: Int?,
-    val exposureTimeNs: Long?,
-    val frameDurationNs: Long?,
-    val postRawSensitivityBoost: Int?,
-    val rollingShutterSkewNs: Long?,
-    val dynamicBlackLevels: List<Float>?,
-    val dynamicWhiteLevel: Int?,
-    /** Flattened [S0,O0,S1,O1,...] from SENSOR_NOISE_PROFILE. */
-    val noiseProfileSo: List<Double>?,
-    /** R, Geven, Godd, B. */
-    val colorCorrectionGains: List<Float>?,
-    val colorCorrectionTransform: List<Float>?,
-    val neutralColorPoint: List<Float>?,
-    val lensShadingMapMode: Int?,
-    val lensShadingRows: Int,
-    val lensShadingColumns: Int,
-    val lensShadingGainFactors: List<Float>?,
-    val aeState: Int?,
-    val awbState: Int?,
-    val afState: Int?,
-    val sceneFlicker: Int?,
-    val lensState: Int?,
-    val oisMode: Int?,
-    val focusDistanceDiopters: Float?,
-    val focalLengthMm: Float?,
-    val aperture: Float?,
-    val sensorIdentity: SensorIdentity? = null,
-    val captureIdentity: CaptureIdentity? = null,
-    val rawSourceId: String? = null,
-    val captureResultSourceId: String? = null,
-    val characteristicsSourceId: String? = null,
-    val calibrationSourceId: String? = null,
-    val logicalMetadataFallbackUsed: Boolean = false,
-    val foreignSensorMetadataUsed: Boolean = false
-) {
-    val hasPhysicalNoiseModel: Boolean
-        get() = !noiseProfileSo.isNullOrEmpty() && noiseProfileSo.size % 2 == 0
-    val hasDynamicLensShadingMap: Boolean
-        get() = lensShadingRows > 0 && lensShadingColumns > 0 &&
-            lensShadingGainFactors?.size == lensShadingRows * lensShadingColumns * 4
-
-    fun frameIdentityForRaw(rawSensorTimestampNs: Long): FrameIdentity? {
-        val capture = captureIdentity ?: return null
-        val rawSource = rawSourceId ?: return null
-        val resultSource = captureResultSourceId ?: return null
-        val characteristicsSource = characteristicsSourceId ?: return null
-        val calibrationSource = calibrationSourceId ?: return null
-        return FrameIdentity(
-            captureIdentity = capture,
-            rawSourceId = rawSource,
-            captureResultSourceId = resultSource,
-            characteristicsSourceId = characteristicsSource,
-            calibrationSourceId = calibrationSource,
-            rawSensorTimestampNs = rawSensorTimestampNs,
-            logicalMetadataFallbackUsed = logicalMetadataFallbackUsed,
-            foreignSensorMetadataUsed = foreignSensorMetadataUsed
-        )
-    }
-}
 
 data class SensorProfileRegistrySnapshot(
     val prewarmAttempted: Boolean,
@@ -172,10 +100,11 @@ data class SensorCalibrationInput(
     val physicalCameraId: String?,
     val characteristics: CameraCharacteristics,
     val captureResult: CaptureResult?,
+    val sensorMetadata: SensorMetadata,
     val authority: String,
     val deterministic: Boolean,
     val staticFingerprint: String?,
-    val sensorIdentity: SensorIdentity? = null
+    val sensorIdentity: SensorIdentity
 )
 
 /**
@@ -189,6 +118,7 @@ class PhysicalSensorProfileRegistry(private val cameraManager: CameraManager) {
     private val recentFrameRoutesByTimestamp = LinkedHashMap<Long, SensorRouteKey>(RECENT_FRAME_ROUTE_CAPACITY)
     private val recentFrameResultsByTimestamp = LinkedHashMap<Long, CaptureResult>(RECENT_FRAME_ROUTE_CAPACITY)
     private val recentFrameIdentitiesByTimestamp = LinkedHashMap<Long, CaptureIdentity>(RECENT_FRAME_ROUTE_CAPACITY)
+    private val recentFrameMetadataByTimestamp = LinkedHashMap<Long, SensorMetadata>(RECENT_FRAME_ROUTE_CAPACITY)
 
     init {
         activeRegistry = this
@@ -239,7 +169,8 @@ class PhysicalSensorProfileRegistry(private val cameraManager: CameraManager) {
     fun snapshotForFrame(
         logicalCameraId: String,
         physicalCameraId: String?,
-        result: TotalCaptureResult
+        result: TotalCaptureResult,
+        rawFrameSize: SizeSnapshot? = null
     ): FrameSensorMetadataSnapshot {
         val route = SensorRouteKey(logicalCameraId, physicalCameraId?.takeIf { it.isNotBlank() })
         if (route.physicalCameraId == null && isLogicalMultiCameraCameraId(route.logicalCameraId)) {
@@ -302,15 +233,138 @@ class PhysicalSensorProfileRegistry(private val cameraManager: CameraManager) {
         )
 
         val shading = metadata.get(CaptureResult.STATISTICS_LENS_SHADING_CORRECTION_MAP)?.copySnapshot()
-        val noise = metadata.get(CaptureResult.SENSOR_NOISE_PROFILE)
+        val rawNoise = metadata.get(CaptureResult.SENSOR_NOISE_PROFILE)
             ?.flatMap { pair -> listOf(pair.first, pair.second) }
-            ?.takeIf { it.isNotEmpty() }
-        val dynamicBlack = metadata.get(CaptureResult.SENSOR_DYNAMIC_BLACK_LEVEL)
-            ?.map { it }?.takeIf { it.size == 4 }
-        val neutral = metadata.get(CaptureResult.SENSOR_NEUTRAL_COLOR_POINT)
-            ?.mapNotNull { it.safeFloatOrNull() }?.takeIf { it.isNotEmpty() }
+        val rawDynamicBlack = metadata.get(CaptureResult.SENSOR_DYNAMIC_BLACK_LEVEL)?.map { it }
+        val rawNeutral = metadata.get(CaptureResult.SENSOR_NEUTRAL_COLOR_POINT)
+            ?.mapNotNull { it.safeFloatOrNull() }
+        val rawWb = metadata.get(CaptureResult.COLOR_CORRECTION_GAINS)?.asList()
+        val rawColorCorrection = metadata.get(CaptureResult.COLOR_CORRECTION_TRANSFORM).asFloatList()
 
-        val snapshot = FrameSensorMetadataSnapshot(
+        val cfa = staticProfile.cfaArrangement.toField(
+            source = "CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT",
+            valid = { it >= 0 },
+            invalidReason = "CFA_VALUE_INVALID"
+        )
+        val staticBlack = staticProfile.staticBlackLevels
+            ?.map { it.toFloat() }
+            .toListField(
+                source = "CameraCharacteristics.SENSOR_BLACK_LEVEL_PATTERN",
+                expectedSize = 4,
+                validItem = { it.isFinite() && it >= 0f },
+                invalidReason = "STATIC_BLACK_LEVEL_INVALID"
+            )
+        val dynamicBlack = rawDynamicBlack.toListField(
+            source = "CaptureResult.SENSOR_DYNAMIC_BLACK_LEVEL",
+            expectedSize = 4,
+            validItem = { it.isFinite() && it >= 0f },
+            invalidReason = "DYNAMIC_BLACK_LEVEL_INVALID"
+        )
+        val effectiveBlack = preferDynamic(
+            dynamic = dynamicBlack,
+            static = staticBlack,
+            unavailableReason = "BLACK_LEVEL_METADATA_UNAVAILABLE"
+        )
+
+        val staticWhite = staticProfile.staticWhiteLevel.toField(
+            source = "CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL",
+            valid = { it > 0 },
+            invalidReason = "STATIC_WHITE_LEVEL_INVALID"
+        )
+        val dynamicWhite = metadata.get(CaptureResult.SENSOR_DYNAMIC_WHITE_LEVEL).toField(
+            source = "CaptureResult.SENSOR_DYNAMIC_WHITE_LEVEL",
+            valid = { it > 0 },
+            invalidReason = "DYNAMIC_WHITE_LEVEL_INVALID"
+        )
+        val effectiveWhite = preferDynamic(
+            dynamic = dynamicWhite,
+            static = staticWhite,
+            unavailableReason = "WHITE_LEVEL_METADATA_UNAVAILABLE"
+        )
+
+        val sensitivity = metadata.get(CaptureResult.SENSOR_SENSITIVITY).toField(
+            source = "CaptureResult.SENSOR_SENSITIVITY",
+            valid = { it > 0 },
+            invalidReason = "SENSOR_SENSITIVITY_INVALID"
+        )
+        val exposure = metadata.get(CaptureResult.SENSOR_EXPOSURE_TIME).toField(
+            source = "CaptureResult.SENSOR_EXPOSURE_TIME",
+            valid = { it > 0L },
+            invalidReason = "SENSOR_EXPOSURE_TIME_INVALID"
+        )
+        val frameDuration = metadata.get(CaptureResult.SENSOR_FRAME_DURATION).toField(
+            source = "CaptureResult.SENSOR_FRAME_DURATION",
+            valid = { it > 0L },
+            invalidReason = "SENSOR_FRAME_DURATION_INVALID"
+        )
+        val maxAnalog = staticProfile.maxAnalogSensitivityIso.toField(
+            source = "CameraCharacteristics.SENSOR_MAX_ANALOG_SENSITIVITY",
+            valid = { it > 0 },
+            invalidReason = "MAX_ANALOG_SENSITIVITY_INVALID"
+        )
+        val analogSensitivity = deriveAnalogSensitivity(sensitivity, maxAnalog)
+        val analogGainRelativeToMinimum = deriveAnalogGainRelativeToMinimum(
+            analogSensitivity = analogSensitivity,
+            sensitivityRange = staticProfile.sensitivityRange
+        )
+        val sensorDigitalGain = deriveSensorDigitalGain(sensitivity, analogSensitivity)
+        val postRawBoost = metadata.get(CaptureResult.CONTROL_POST_RAW_SENSITIVITY_BOOST).toField(
+            source = "CaptureResult.CONTROL_POST_RAW_SENSITIVITY_BOOST",
+            valid = { it > 0 },
+            invalidReason = "POST_RAW_SENSITIVITY_BOOST_INVALID"
+        )
+        val postRawGain = derivePostRawDigitalGain(postRawBoost)
+        val combinedDigitalGain = deriveCombinedDigitalGain(sensorDigitalGain, postRawGain)
+
+        val noise = rawNoise.toNoiseProfileField(
+            source = "CaptureResult.SENSOR_NOISE_PROFILE"
+        )
+        val wbGains = rawWb.toListField(
+            source = "CaptureResult.COLOR_CORRECTION_GAINS",
+            expectedSize = 4,
+            validItem = { it.isFinite() && it > 0f },
+            invalidReason = "COLOR_CORRECTION_GAINS_INVALID"
+        )
+        val colorCorrection = rawColorCorrection.toMatrixField(
+            "CaptureResult.COLOR_CORRECTION_TRANSFORM"
+        )
+        val neutral = rawNeutral.toListField(
+            source = "CaptureResult.SENSOR_NEUTRAL_COLOR_POINT",
+            expectedSize = 3,
+            validItem = { it.isFinite() && it > 0f },
+            invalidReason = "SENSOR_NEUTRAL_COLOR_POINT_INVALID"
+        )
+
+        val activeArray = staticProfile.activeArray.toField(
+            source = "CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE",
+            valid = { it.width > 0 && it.height > 0 },
+            invalidReason = "ACTIVE_ARRAY_INVALID"
+        )
+        val rawSize = rawFrameSize.toField(
+            source = "PipelineIdentity.ImageReader",
+            valid = { it.width > 0 && it.height > 0 },
+            invalidReason = "RAW_FRAME_SIZE_INVALID"
+        )
+        val orientation = staticProfile.sensorOrientationDegrees.toField(
+            source = "CameraCharacteristics.SENSOR_ORIENTATION",
+            valid = { it == 0 || it == 90 || it == 180 || it == 270 },
+            invalidReason = "SENSOR_ORIENTATION_INVALID"
+        )
+        val timestamp = SensorMetadataValue.valid(
+            value = sensorTimestampNs,
+            source = "CaptureResult.SENSOR_TIMESTAMP"
+        )
+        val frameNumber = SensorMetadataValue.valid(
+            value = metadata.frameNumber,
+            source = "CaptureResult.frameNumber"
+        )
+        val rollingSkew = metadata.get(CaptureResult.SENSOR_ROLLING_SHUTTER_SKEW).toField(
+            source = "CaptureResult.SENSOR_ROLLING_SHUTTER_SKEW",
+            valid = { it >= 0L },
+            invalidReason = "ROLLING_SHUTTER_SKEW_INVALID"
+        )
+
+        val snapshot = SensorMetadata(
             route = route,
             staticFingerprint = staticProfile.staticFingerprint,
             metadataSource = if (route.physicalCameraId != null) {
@@ -318,19 +372,53 @@ class PhysicalSensorProfileRegistry(private val cameraManager: CameraManager) {
             } else {
                 "STANDALONE_CAPTURE_RESULT"
             },
-            sensorTimestampNs = sensorTimestampNs,
-            frameNumber = metadata.frameNumber,
-            sensitivityIso = metadata.get(CaptureResult.SENSOR_SENSITIVITY),
-            exposureTimeNs = metadata.get(CaptureResult.SENSOR_EXPOSURE_TIME),
-            frameDurationNs = metadata.get(CaptureResult.SENSOR_FRAME_DURATION),
-            postRawSensitivityBoost = metadata.get(CaptureResult.CONTROL_POST_RAW_SENSITIVITY_BOOST),
-            rollingShutterSkewNs = metadata.get(CaptureResult.SENSOR_ROLLING_SHUTTER_SKEW),
-            dynamicBlackLevels = dynamicBlack,
-            dynamicWhiteLevel = metadata.get(CaptureResult.SENSOR_DYNAMIC_WHITE_LEVEL),
-            noiseProfileSo = noise,
-            colorCorrectionGains = metadata.get(CaptureResult.COLOR_CORRECTION_GAINS)?.asList(),
-            colorCorrectionTransform = metadata.get(CaptureResult.COLOR_CORRECTION_TRANSFORM).asFloatList(),
-            neutralColorPoint = neutral,
+            sensorIdentity = sensorIdentity,
+            captureIdentity = captureIdentity,
+            cfa = cfa,
+            staticBlackLevel = staticBlack,
+            dynamicBlackLevel = dynamicBlack,
+            effectiveBlackLevel = effectiveBlack,
+            staticWhiteLevelField = staticWhite,
+            dynamicWhiteLevelField = dynamicWhite,
+            effectiveWhiteLevelField = effectiveWhite,
+            sensitivityIsoField = sensitivity,
+            exposureTimeNsField = exposure,
+            frameDurationNsField = frameDuration,
+            maxAnalogSensitivityIso = maxAnalog,
+            analogSensitivityIso = analogSensitivity,
+            analogGainRelativeToMinimum = analogGainRelativeToMinimum,
+            sensorDigitalGainRatio = sensorDigitalGain,
+            postRawSensitivityBoostField = postRawBoost,
+            postRawDigitalGainRatio = postRawGain,
+            combinedDigitalGainRatio = combinedDigitalGain,
+            noiseProfileSoField = noise,
+            colorCorrectionGainsField = wbGains,
+            colorCorrectionTransformField = colorCorrection,
+            neutralColorPointField = neutral,
+            colorTransform1 = staticProfile.colorTransform1.toMatrixField(
+                "CameraCharacteristics.SENSOR_COLOR_TRANSFORM1"
+            ),
+            colorTransform2 = staticProfile.colorTransform2.toMatrixField(
+                "CameraCharacteristics.SENSOR_COLOR_TRANSFORM2"
+            ),
+            forwardMatrix1 = staticProfile.forwardMatrix1.toMatrixField(
+                "CameraCharacteristics.SENSOR_FORWARD_MATRIX1"
+            ),
+            forwardMatrix2 = staticProfile.forwardMatrix2.toMatrixField(
+                "CameraCharacteristics.SENSOR_FORWARD_MATRIX2"
+            ),
+            cameraCalibration1 = staticProfile.cameraCalibration1.toMatrixField(
+                "CameraCharacteristics.SENSOR_CALIBRATION_TRANSFORM1"
+            ),
+            cameraCalibration2 = staticProfile.cameraCalibration2.toMatrixField(
+                "CameraCharacteristics.SENSOR_CALIBRATION_TRANSFORM2"
+            ),
+            activeArrayField = activeArray,
+            rawSizeField = rawSize,
+            orientationField = orientation,
+            timestampField = timestamp,
+            frameNumberField = frameNumber,
+            rollingShutterSkewNsField = rollingSkew,
             lensShadingMapMode = metadata.get(CaptureResult.STATISTICS_LENS_SHADING_MAP_MODE),
             lensShadingRows = shading?.rows ?: 0,
             lensShadingColumns = shading?.columns ?: 0,
@@ -344,8 +432,6 @@ class PhysicalSensorProfileRegistry(private val cameraManager: CameraManager) {
             focusDistanceDiopters = metadata.get(CaptureResult.LENS_FOCUS_DISTANCE),
             focalLengthMm = metadata.get(CaptureResult.LENS_FOCAL_LENGTH),
             aperture = metadata.get(CaptureResult.LENS_APERTURE),
-            sensorIdentity = sensorIdentity,
-            captureIdentity = captureIdentity,
             rawSourceId = sensorIdentity.sourceId,
             captureResultSourceId = captureResultSourceId,
             characteristicsSourceId = staticProfile.characteristicsCameraId,
@@ -353,17 +439,18 @@ class PhysicalSensorProfileRegistry(private val cameraManager: CameraManager) {
             logicalMetadataFallbackUsed = false,
             foreignSensorMetadataUsed = false
         )
-        rememberFrameAuthority(sensorTimestampNs, snapshot.route, metadata, captureIdentity)
+        rememberFrameAuthority(sensorTimestampNs, snapshot.route, metadata, captureIdentity, snapshot)
         return snapshot
     }
 
     fun calibrationInputFor(
         @Suppress("UNUSED_PARAMETER") fallbackCharacteristics: CameraCharacteristics,
-        captureResult: CaptureResult?
+        captureResult: CaptureResult?,
+        sensorMetadataHint: SensorMetadata? = null
     ): SensorCalibrationInput {
-        val sensorTimestampNs = captureResult
-            ?.get(CaptureResult.SENSOR_TIMESTAMP)
+        val sensorTimestampNs = sensorMetadataHint?.captureIdentity?.sensorTimestampNs
             ?.takeIf { it > 0L }
+            ?: captureResult?.get(CaptureResult.SENSOR_TIMESTAMP)?.takeIf { it > 0L }
             ?: throw SensorAuthorityUnavailableException("SENSOR_TIMESTAMP_UNAVAILABLE")
 
         val rememberedRoute = rememberedFrameRoute(sensorTimestampNs)
@@ -373,9 +460,17 @@ class PhysicalSensorProfileRegistry(private val cameraManager: CameraManager) {
         val sensorIdentity = rememberedCaptureIdentity.sensorIdentity
         val exactCaptureResult = rememberedFrameResult(sensorTimestampNs)
             ?: throw SensorAuthorityUnavailableException("CAPTURE_RESULT_AUTHORITY_UNAVAILABLE")
+        val sensorMetadata = rememberedSensorMetadata(sensorTimestampNs)
+            ?: throw SensorAuthorityUnavailableException("SENSOR_METADATA_UNAVAILABLE")
 
-        if (captureResult.frameNumber != rememberedCaptureIdentity.frameNumber) {
+        if (captureResult != null && captureResult.frameNumber != rememberedCaptureIdentity.frameNumber) {
             throw SensorAuthorityUnavailableException("CAPTURE_FRAME_NUMBER_MISMATCH")
+        }
+        if (sensorMetadataHint != null &&
+            (sensorMetadataHint.captureIdentity != rememberedCaptureIdentity ||
+                sensorMetadataHint.sensorIdentity != rememberedCaptureIdentity.sensorIdentity)
+        ) {
+            throw SensorAuthorityUnavailableException("SENSOR_METADATA_HINT_IDENTITY_MISMATCH")
         }
         if (rememberedRoute.effectiveCameraId != sensorIdentity.sourceId) {
             throw SensorAuthorityUnavailableException("FRAME_ROUTE_AUTHORITY_MISMATCH")
@@ -391,11 +486,19 @@ class PhysicalSensorProfileRegistry(private val cameraManager: CameraManager) {
         if (profile.characteristicsCameraId != sensorIdentity.sourceId) {
             throw SensorAuthorityUnavailableException("FOREIGN_SENSOR_CHARACTERISTICS")
         }
+        if (sensorMetadata.captureIdentity != rememberedCaptureIdentity ||
+            sensorMetadata.sensorIdentity != sensorIdentity ||
+            sensorMetadata.characteristicsSourceId != sensorIdentity.sourceId ||
+            sensorMetadata.captureResultSourceId != sensorIdentity.sourceId
+        ) {
+            throw SensorAuthorityUnavailableException("SENSOR_METADATA_AUTHORITY_MISMATCH")
+        }
 
         return SensorCalibrationInput(
             physicalCameraId = rememberedRoute.physicalCameraId,
             characteristics = characteristics,
             captureResult = exactCaptureResult,
+            sensorMetadata = sensorMetadata,
             authority = if (rememberedRoute.physicalCameraId != null) {
                 "FRAME_SNAPSHOT_EXACT_PHYSICAL_RESULT"
             } else {
@@ -445,6 +548,8 @@ class PhysicalSensorProfileRegistry(private val cameraManager: CameraManager) {
             cfaArrangement = chars.get(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT),
             sensorOrientationDegrees = chars.get(CameraCharacteristics.SENSOR_ORIENTATION),
             pixelArraySize = chars.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE)?.let { SizeSnapshot(it.width, it.height) },
+            rawSensorOutputSizes = rawOutputSizes(chars, ImageFormat.RAW_SENSOR),
+            raw10OutputSizes = rawOutputSizes(chars, ImageFormat.RAW10),
             activeArray = chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)?.toSnapshot(),
             preCorrectionActiveArray = chars.get(CameraCharacteristics.SENSOR_INFO_PRE_CORRECTION_ACTIVE_ARRAY_SIZE)?.toSnapshot(),
             opticalBlackRegions = chars.get(CameraCharacteristics.SENSOR_OPTICAL_BLACK_REGIONS)?.map { it.toSnapshot() }.orEmpty(),
@@ -479,18 +584,21 @@ class PhysicalSensorProfileRegistry(private val cameraManager: CameraManager) {
         timestampNs: Long,
         route: SensorRouteKey,
         captureResult: CaptureResult,
-        captureIdentity: CaptureIdentity
+        captureIdentity: CaptureIdentity,
+        sensorMetadata: SensorMetadata
     ) {
         if (timestampNs <= 0L) return
         synchronized(recentFrameRouteLock) {
             recentFrameRoutesByTimestamp[timestampNs] = route
             recentFrameResultsByTimestamp[timestampNs] = captureResult
             recentFrameIdentitiesByTimestamp[timestampNs] = captureIdentity
+            recentFrameMetadataByTimestamp[timestampNs] = sensorMetadata
             while (recentFrameRoutesByTimestamp.size > RECENT_FRAME_ROUTE_CAPACITY) {
                 val eldest = recentFrameRoutesByTimestamp.entries.firstOrNull()?.key ?: break
                 recentFrameRoutesByTimestamp.remove(eldest)
                 recentFrameResultsByTimestamp.remove(eldest)
                 recentFrameIdentitiesByTimestamp.remove(eldest)
+                recentFrameMetadataByTimestamp.remove(eldest)
             }
         }
     }
@@ -503,6 +611,9 @@ class PhysicalSensorProfileRegistry(private val cameraManager: CameraManager) {
 
     private fun rememberedFrameIdentity(timestampNs: Long): CaptureIdentity? =
         synchronized(recentFrameRouteLock) { recentFrameIdentitiesByTimestamp[timestampNs] }
+
+    private fun rememberedSensorMetadata(timestampNs: Long): SensorMetadata? =
+        synchronized(recentFrameRouteLock) { recentFrameMetadataByTimestamp[timestampNs] }
 
     private fun isLogicalMultiCameraCameraId(cameraId: String): Boolean {
         val chars = characteristicsForCameraId(cameraId) ?: return false
@@ -537,6 +648,182 @@ class PhysicalSensorProfileRegistry(private val cameraManager: CameraManager) {
         } else {
             @Suppress("DEPRECATION") result.physicalCameraResults[physicalCameraId]
         }
+    }
+
+    private fun rawOutputSizes(chars: CameraCharacteristics, format: Int): List<SizeSnapshot> {
+        val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: return emptyList()
+        return runCatching { map.getOutputSizes(format)?.toList().orEmpty() }
+            .getOrElse { emptyList() }
+            .filter { it.width > 0 && it.height > 0 }
+            .map { SizeSnapshot(it.width, it.height) }
+            .distinct()
+            .sortedWith(compareByDescending<SizeSnapshot> { it.width.toLong() * it.height.toLong() }.thenByDescending { it.width })
+    }
+
+    private fun <T> T?.toField(
+        source: String,
+        valid: (T) -> Boolean,
+        invalidReason: String
+    ): SensorMetadataValue<T> = when {
+        this == null -> SensorMetadataValue.unavailable(source, "VALUE_UNAVAILABLE")
+        valid(this) -> SensorMetadataValue.valid(this, source)
+        else -> SensorMetadataValue.invalid(this, source, invalidReason)
+    }
+
+    private fun <T> List<T>?.toListField(
+        source: String,
+        expectedSize: Int? = null,
+        expectedMultiple: Int? = null,
+        validItem: (T) -> Boolean,
+        invalidReason: String
+    ): SensorMetadataValue<List<T>> {
+        if (this == null) return SensorMetadataValue.unavailable(source, "VALUE_UNAVAILABLE")
+        val copy = this.toList()
+        val validShape = copy.isNotEmpty() &&
+            (expectedSize == null || copy.size == expectedSize) &&
+            (expectedMultiple == null || (copy.size % expectedMultiple == 0))
+        return if (validShape && copy.all(validItem)) {
+            SensorMetadataValue.valid(copy, source)
+        } else {
+            SensorMetadataValue.invalid(copy, source, invalidReason)
+        }
+    }
+
+    private fun List<Float>?.toMatrixField(source: String): SensorMetadataValue<List<Float>> =
+        toListField(
+            source = source,
+            expectedSize = 9,
+            validItem = { it.isFinite() },
+            invalidReason = "MATRIX_INVALID"
+        )
+
+    private fun List<Double>?.toNoiseProfileField(source: String): SensorMetadataValue<List<Double>> {
+        val field = toListField(
+            source = source,
+            expectedMultiple = 2,
+            validItem = { it.isFinite() && it >= 0.0 },
+            invalidReason = "SENSOR_NOISE_PROFILE_INVALID"
+        )
+        val values = field.value
+        return if (field.isValid && values != null && values.all { kotlin.math.abs(it) < 1.0e-12 }) {
+            SensorMetadataValue.invalid(values, source, "SENSOR_NOISE_PROFILE_ALL_ZERO")
+        } else {
+            field
+        }
+    }
+
+    private fun <T> preferDynamic(
+        dynamic: SensorMetadataValue<T>,
+        static: SensorMetadataValue<T>,
+        unavailableReason: String
+    ): SensorMetadataValue<T> = when {
+        dynamic.isValid -> dynamic
+        static.isValid -> static
+        dynamic.validity == SensorMetadataValidity.INVALID ->
+            SensorMetadataValue.invalid(dynamic.value, dynamic.source, dynamic.reason)
+        static.validity == SensorMetadataValidity.INVALID ->
+            SensorMetadataValue.invalid(static.value, static.source, static.reason)
+        else -> SensorMetadataValue.unavailable("NONE", unavailableReason)
+    }
+
+    private fun deriveAnalogSensitivity(
+        sensitivity: SensorMetadataValue<Int>,
+        maxAnalog: SensorMetadataValue<Int>
+    ): SensorMetadataValue<Int> {
+        val iso = sensitivity.value
+        val maxIso = maxAnalog.value
+        if (!sensitivity.isValid || iso == null) {
+            return SensorMetadataValue.unavailable(
+                "DERIVED:SENSOR_SENSITIVITY+SENSOR_MAX_ANALOG_SENSITIVITY",
+                "SENSOR_SENSITIVITY_UNAVAILABLE"
+            )
+        }
+        if (!maxAnalog.isValid || maxIso == null) {
+            return SensorMetadataValue.unavailable(
+                "DERIVED:SENSOR_SENSITIVITY+SENSOR_MAX_ANALOG_SENSITIVITY",
+                "MAX_ANALOG_SENSITIVITY_UNAVAILABLE"
+            )
+        }
+        return SensorMetadataValue.valid(
+            minOf(iso, maxIso),
+            "DERIVED:min(SENSOR_SENSITIVITY,SENSOR_MAX_ANALOG_SENSITIVITY)"
+        )
+    }
+
+    private fun deriveAnalogGainRelativeToMinimum(
+        analogSensitivity: SensorMetadataValue<Int>,
+        sensitivityRange: IntRangeSnapshot?
+    ): SensorMetadataValue<Double> {
+        val analogIso = analogSensitivity.value
+        val minimumIso = sensitivityRange?.lower
+        if (!analogSensitivity.isValid || analogIso == null) {
+            return SensorMetadataValue.unavailable(
+                "DERIVED:ANALOG_SENSITIVITY/SENSITIVITY_RANGE.lower",
+                "ANALOG_SENSITIVITY_UNAVAILABLE"
+            )
+        }
+        if (minimumIso == null || minimumIso <= 0) {
+            return SensorMetadataValue.unavailable(
+                "DERIVED:ANALOG_SENSITIVITY/SENSITIVITY_RANGE.lower",
+                "MINIMUM_SENSITIVITY_UNAVAILABLE"
+            )
+        }
+        return SensorMetadataValue.valid(
+            analogIso.toDouble() / minimumIso.toDouble(),
+            "DERIVED:analogSensitivityIso/SENSOR_INFO_SENSITIVITY_RANGE.lower"
+        )
+    }
+
+    private fun deriveSensorDigitalGain(
+        sensitivity: SensorMetadataValue<Int>,
+        analogSensitivity: SensorMetadataValue<Int>
+    ): SensorMetadataValue<Double> {
+        val iso = sensitivity.value
+        val analogIso = analogSensitivity.value
+        if (!sensitivity.isValid || !analogSensitivity.isValid || iso == null || analogIso == null || analogIso <= 0) {
+            return SensorMetadataValue.unavailable(
+                "DERIVED:SENSOR_SENSITIVITY/ANALOG_SENSITIVITY",
+                "GAIN_INPUT_UNAVAILABLE"
+            )
+        }
+        return SensorMetadataValue.valid(
+            iso.toDouble() / analogIso.toDouble(),
+            "DERIVED:SENSOR_SENSITIVITY/analogSensitivityIso"
+        )
+    }
+
+    private fun derivePostRawDigitalGain(
+        postRawBoost: SensorMetadataValue<Int>
+    ): SensorMetadataValue<Double> {
+        val boost = postRawBoost.value
+        if (!postRawBoost.isValid || boost == null) {
+            return SensorMetadataValue.unavailable(
+                "DERIVED:CONTROL_POST_RAW_SENSITIVITY_BOOST/100",
+                "POST_RAW_SENSITIVITY_BOOST_UNAVAILABLE"
+            )
+        }
+        return SensorMetadataValue.valid(
+            boost.toDouble() / 100.0,
+            "DERIVED:CONTROL_POST_RAW_SENSITIVITY_BOOST/100"
+        )
+    }
+
+    private fun deriveCombinedDigitalGain(
+        sensorDigitalGain: SensorMetadataValue<Double>,
+        postRawDigitalGain: SensorMetadataValue<Double>
+    ): SensorMetadataValue<Double> {
+        val sensor = sensorDigitalGain.value
+        val postRaw = postRawDigitalGain.value
+        if (!sensorDigitalGain.isValid || !postRawDigitalGain.isValid || sensor == null || postRaw == null) {
+            return SensorMetadataValue.unavailable(
+                "DERIVED:sensorDigitalGain*postRawDigitalGain",
+                "DIGITAL_GAIN_COMPONENT_UNAVAILABLE"
+            )
+        }
+        return SensorMetadataValue.valid(
+            sensor * postRaw,
+            "DERIVED:sensorDigitalGain*postRawDigitalGain"
+        )
     }
 
     private fun recordFailure(message: String) {
@@ -597,11 +884,12 @@ class PhysicalSensorProfileRegistry(private val cameraManager: CameraManager) {
 
         fun resolveCurrentCalibrationInput(
             fallbackCharacteristics: CameraCharacteristics,
-            captureResult: CaptureResult?
+            captureResult: CaptureResult?,
+            sensorMetadata: SensorMetadata? = null
         ): SensorCalibrationInput {
             val registry = activeRegistry
                 ?: throw SensorAuthorityUnavailableException("SENSOR_AUTHORITY_REGISTRY_UNAVAILABLE")
-            return registry.calibrationInputFor(fallbackCharacteristics, captureResult)
+            return registry.calibrationInputFor(fallbackCharacteristics, captureResult, sensorMetadata)
         }
     }
 }

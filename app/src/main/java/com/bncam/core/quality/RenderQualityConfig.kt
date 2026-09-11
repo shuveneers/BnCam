@@ -670,6 +670,7 @@ data class RenderQualityConfig(
             captureMode: CaptureStrategy,
             characteristics: CameraCharacteristics,
             captureResult: CaptureResult?,
+            sensorMetadata: SensorMetadata? = null,
             lensHardwareSettings: ResolvedLensHardwareSettings? = null,
             preferenceSnapshot: RenderQualityPreferencesSnapshot? = null,
             stableAutoWhiteBalance: StableWhiteBalanceSnapshot? = null
@@ -681,7 +682,8 @@ data class RenderQualityConfig(
             // being interpreted against logical characteristics or an arbitrary physical child.
             val calibrationInput = PhysicalSensorProfileRegistry.resolveCurrentCalibrationInput(
                 fallbackCharacteristics = characteristics,
-                captureResult = captureResult
+                captureResult = captureResult,
+                sensorMetadata = sensorMetadata
             )
 
             // 1. Haal de keiharde waarheid en UI overrides op via de nieuwe architectuur!
@@ -690,7 +692,7 @@ data class RenderQualityConfig(
                 physicalCameraId = calibrationInput.physicalCameraId,
                 frameSourceFormat = frameSourceFormat,
                 characteristics = calibrationInput.characteristics,
-                captureResult = calibrationInput.captureResult,
+                sensorMetadata = calibrationInput.sensorMetadata,
                 lensSettings = lensHardwareSettings,
                 profileAwbSettings = preferenceSnapshot?.profileAwb
                     ?: repo.getProfileAwbSettingsFlow(profileId).first(),
@@ -701,7 +703,7 @@ data class RenderQualityConfig(
             // 2. Map the central SensorCalibrationResolver output to the legacy config fields.
             // This keeps SensorCalibrationResolver as the single source of truth for RAW metadata.
             val cfaPattern = finalCal.base.cfaPattern
-            val cfaSource = "CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT"
+            val cfaSource = calibrationInput.sensorMetadata.cfa.source
             val cfaName = finalCal.base.cfaName
             val cfaSupported = isSupportedBayerCfa(cfaPattern)
 
@@ -709,7 +711,7 @@ data class RenderQualityConfig(
             val whiteLevel = finalCal.effectiveWhiteLevel
             val blackLevelSource = finalCal.effectiveBlackLevelSource
             val whiteLevelSource = finalCal.effectiveWhiteLevelSource
-            val rawLevelNote = "SensorCalibrationResolver V2. appliedDomain=${finalCal.effectiveWhiteLevelAppliedDomain}; blackScale=${String.format(Locale.US, "%.6f", finalCal.blackLevelScaleFactor)}; whiteScale=${String.format(Locale.US, "%.6f", finalCal.effectiveWhiteLevelScaleFactor)}; sensorAuthority=${calibrationInput.authority}; physicalCameraId=${calibrationInput.physicalCameraId ?: "logical"}; deterministic=${calibrationInput.deterministic}; staticFingerprint=${calibrationInput.staticFingerprint ?: "none"}."
+            val rawLevelNote = "SensorCalibrationResolver V2. appliedDomain=${finalCal.effectiveWhiteLevelAppliedDomain}; blackScale=${String.format(Locale.US, "%.6f", finalCal.blackLevelScaleFactor)}; whiteScale=${String.format(Locale.US, "%.6f", finalCal.effectiveWhiteLevelScaleFactor)}; sensorAuthority=${calibrationInput.authority}; physicalCameraId=${calibrationInput.physicalCameraId ?: "STANDALONE"}; deterministic=${calibrationInput.deterministic}; sensorMetadataCore=${calibrationInput.sensorMetadata.coreRawMetadataStatus}; staticFingerprint=${calibrationInput.staticFingerprint ?: "none"}."
 
             val colorMatrix = ColorCorrectionMatrix(
                 values = finalCal.effectiveColorMatrix ?: ColorCorrectionMatrix.identityArray(),

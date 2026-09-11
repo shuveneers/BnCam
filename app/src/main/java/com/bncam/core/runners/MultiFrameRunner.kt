@@ -682,22 +682,29 @@ class MultiFrameRunner(
             captureMode = activeProfile.captureStrategy,
             characteristics = chars,
             captureResult = anchorMetadata,
+            sensorMetadata = anchorPair.sensorMetadataSnapshot,
             lensHardwareSettings = lensHardwareSettings,
             preferenceSnapshot = capturedSettings.renderPreferences,
             stableAutoWhiteBalance = stableAutoWhiteBalance
         )
         val selectedNoiseTraceFrames = burstFrames.mapNotNull { frame ->
             frame.metadata?.let { exactFrameMetadata ->
-                val exactFrameTimestampNs = exactFrameMetadata
-                    .get(CaptureResult.SENSOR_TIMESTAMP)
-                    ?.takeIf { it > 0L }
-                    ?: frame.timestamp
+                val calibrationInput = com.bncam.core.quality.PhysicalSensorProfileRegistry
+                    .resolveCurrentCalibrationInput(
+                        fallbackCharacteristics = chars,
+                        captureResult = exactFrameMetadata,
+                        sensorMetadata = frame.sensorMetadataSnapshot
+                    )
+                val exactFrameTimestampNs = calibrationInput.sensorMetadata.sensorTimestampNs
+                    ?: throw com.bncam.core.quality.SensorAuthorityUnavailableException(
+                        "SENSOR_TIMESTAMP_UNAVAILABLE_FOR_SUPPORT_FRAME"
+                    )
                 val calibration = com.bncam.core.quality.SensorCalibrationResolver.resolve(
                     lensId = activeLens.id,
-                    physicalCameraId = null,
+                    physicalCameraId = calibrationInput.physicalCameraId,
                     frameSourceFormat = activeZslFormat,
-                    characteristics = chars,
-                    captureResult = exactFrameMetadata,
+                    characteristics = calibrationInput.characteristics,
+                    sensorMetadata = calibrationInput.sensorMetadata,
                     lensSettings = lensHardwareSettings,
                     profileAwbSettings = capturedSettings.renderPreferences.profileAwb
                 )
@@ -2739,8 +2746,16 @@ class MultiFrameRunner(
                 rawMetadataTimestampMatch = frameIdentity?.rawMetadataTimestampMatch ?: false,
                 sensorAuthorityFallbackUsed =
                     sensorSnapshot?.let { it.logicalMetadataFallbackUsed || it.foreignSensorMetadataUsed } ?: false,
-                rawProcessingSafe = frameIdentity?.safeForRawProcessing ?: false,
-                sensorAuthorityStatus = frameIdentity?.rejectionReason() ?: "UNAVAILABLE"
+                rawProcessingSafe = frameIdentity?.safeForRawProcessing == true &&
+                    sensorSnapshot?.coreRawMetadataValid == true,
+                sensorAuthorityStatus = when {
+                    frameIdentity == null -> "UNAVAILABLE"
+                    !frameIdentity.safeForRawProcessing -> frameIdentity.rejectionReason()
+                    sensorSnapshot?.coreRawMetadataValid != true ->
+                        "UNSAFE_TO_PROCESS:${sensorSnapshot?.coreRawMetadataStatus ?: "SENSOR_METADATA_UNAVAILABLE"}"
+                    else -> "NONE"
+                },
+                sensorMetadataAuditLines = sensorSnapshot?.debugAuditLines().orEmpty()
             )
         }
     }

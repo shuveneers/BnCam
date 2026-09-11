@@ -1719,6 +1719,7 @@ class SingleFrameRunner(
             captureMode = activeProfile.captureStrategy,
             characteristics = chars,
             captureResult = captureMetadata,
+            sensorMetadata = anchorFrame.sensorMetadataSnapshot,
             lensHardwareSettings = lensHardwareSettings,
             preferenceSnapshot = capturedSettings.renderPreferences,
             stableAutoWhiteBalance = stableAutoWhiteBalance
@@ -1874,8 +1875,16 @@ class SingleFrameRunner(
                     rawMetadataTimestampMatch = frameIdentity?.rawMetadataTimestampMatch ?: false,
                     sensorAuthorityFallbackUsed =
                         sensorSnapshot?.let { it.logicalMetadataFallbackUsed || it.foreignSensorMetadataUsed } ?: false,
-                    rawProcessingSafe = frameIdentity?.safeForRawProcessing ?: false,
-                    sensorAuthorityStatus = frameIdentity?.rejectionReason() ?: "UNAVAILABLE",
+                    rawProcessingSafe = frameIdentity?.safeForRawProcessing == true &&
+                        sensorSnapshot?.coreRawMetadataValid == true,
+                    sensorAuthorityStatus = when {
+                        frameIdentity == null -> "UNAVAILABLE"
+                        !frameIdentity.safeForRawProcessing -> frameIdentity.rejectionReason()
+                        sensorSnapshot?.coreRawMetadataValid != true ->
+                            "UNSAFE_TO_PROCESS:${sensorSnapshot?.coreRawMetadataStatus ?: "SENSOR_METADATA_UNAVAILABLE"}"
+                        else -> "NONE"
+                    },
+                    sensorMetadataAuditLines = sensorSnapshot?.debugAuditLines().orEmpty(),
                     imageArrivalElapsedNs = frame.imageArrivalElapsedNs,
                     metadataArrivalElapsedNs = frame.metadataArrivalElapsedNs,
                     pairCompleteElapsedNs = frame.pairCompleteElapsedNs,

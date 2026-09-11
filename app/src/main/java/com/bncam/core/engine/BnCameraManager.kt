@@ -106,6 +106,7 @@ import com.bncam.core.debug.ShotLogger
 import com.bncam.core.quality.RenderQualityConfig
 import com.bncam.core.quality.PhysicalSensorProfileRegistry
 import com.bncam.core.quality.FrameSensorMetadataSnapshot
+import com.bncam.core.quality.SizeSnapshot
 import com.bncam.core.isp.raw10.RawCameraColorProfileRepository
 import com.bncam.core.quality.RawColorTransformEngine
 import com.bncam.core.quality.ProfileYuvAwbMapper
@@ -390,8 +391,16 @@ class BnCameraManager(private val context: Context) {
         val identity = synchronized(pipelineLock) { activePipelineIdentity }
         val logicalId = identity?.logicalCameraId ?: fallbackLogicalCameraId
         val physicalId = identity?.physicalCameraId
+        val rawFrameSize = identity
+            ?.takeIf { it.bufferFormat == ImageFormat.RAW10 || it.bufferFormat == ImageFormat.RAW_SENSOR }
+            ?.let { SizeSnapshot(it.width, it.height) }
         return runCatching {
-            sensorProfileRegistry.snapshotForFrame(logicalId, physicalId, result)
+            sensorProfileRegistry.snapshotForFrame(
+                logicalCameraId = logicalId,
+                physicalCameraId = physicalId,
+                result = result,
+                rawFrameSize = rawFrameSize
+            )
         }.onFailure { failure ->
             val reason = (failure as? com.bncam.core.quality.SensorAuthorityUnavailableException)
                 ?.authorityReason ?: failure.javaClass.simpleName
