@@ -82,9 +82,16 @@ bool VulkanNeuralRawProductionBridge::ensureBufferLocked(
     failure = "VMA_HEADER_NOT_AVAILABLE";
     return false;
 #else
-    if (allocator == nullptr || bytes == 0u ||
-        bytes > static_cast<std::uint64_t>(std::numeric_limits<VkDeviceSize>::max())) {
-        failure = "NEURAL_PRODUCTION_BUFFER_INVALID";
+    if (allocator == nullptr) {
+        failure = "NEURAL_PRODUCTION_ALLOCATOR_UNAVAILABLE";
+        return false;
+    }
+    if (bytes == 0u) {
+        failure = "NEURAL_PRODUCTION_BUFFER_SIZE_ZERO";
+        return false;
+    }
+    if (bytes > static_cast<std::uint64_t>(std::numeric_limits<VkDeviceSize>::max())) {
+        failure = "NEURAL_PRODUCTION_BUFFER_SIZE_OVERFLOW";
         return false;
     }
     if (buffer.buffer != VK_NULL_HANDLE && buffer.allocation != nullptr &&
@@ -362,10 +369,20 @@ NeuralProductionGpuResult VulkanNeuralRawProductionBridge::execute(
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
-    allocator_=allocatorOwner.handle();
     std::string failure;
+    // initializeLocked() may rebuild the bridge and therefore calls destroyLocked(),
+    // which clears allocator_. Bind the current authoritative VMA allocator only
+    // after bridge initialization has completed.
     if(!initializeLocked(device,commandPool,failure)){
         out.failureCode=NeuralBackendFailureCode::InternalError;out.bypassReason=NeuralBypassReason::BackendFailure;out.status="FAIL_BYPASS_"+failure;out.totalWallMs=elapsedMs(started);return out;
+    }
+    allocator_=allocatorOwner.handle();
+    if(allocator_==nullptr){
+        out.failureCode=NeuralBackendFailureCode::InternalError;
+        out.bypassReason=NeuralBypassReason::BackendFailure;
+        out.status="FAIL_BYPASS_NEURAL_PRODUCTION_ALLOCATOR_UNAVAILABLE";
+        out.totalWallMs=elapsedMs(started);
+        return out;
     }
     const std::uint64_t packedBytes=fp32Bytes(out.packedWidth,out.packedHeight,4u);
     const std::uint64_t scalarPackedBytes=fp32Bytes(out.packedWidth,out.packedHeight,1u);
