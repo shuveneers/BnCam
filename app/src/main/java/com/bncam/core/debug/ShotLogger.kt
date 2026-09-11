@@ -1820,6 +1820,7 @@ class ShotLogger(
                     kv("Sensor Authority ID", entry.sensorAuthorityId)
                     kv("Camera Device ID", entry.cameraDeviceId)
                     kv("Physical Camera ID", entry.physicalCameraId)
+                    kv("Authority Type", sensorAuthorityTypeLabel(entry))
                     kv("RAW Source ID", entry.rawSourceId)
                     kv("CaptureResult Source ID", entry.captureResultSourceId)
                     kv("Characteristics Source ID", entry.characteristicsSourceId)
@@ -1828,6 +1829,8 @@ class ShotLogger(
                     kv("Capture Sequence ID", entry.captureSequenceId)
                     kv("Sensor Metadata Timestamp Ns", entry.sensorMetadataTimestampNs)
                     kv("RAW/Metadata Timestamp Match", entry.rawMetadataTimestampMatch)
+                    kv("Logical Metadata Fallback", logicalMetadataFallbackLabel(entry))
+                    kv("Foreign Sensor Metadata Used", foreignSensorMetadataLabel(entry))
                     kv("Fallback Used", entry.sensorAuthorityFallbackUsed)
                     kv("Raw Processing Safe", entry.rawProcessingSafe)
                     kv("Sensor Authority Status", entry.sensorAuthorityStatus)
@@ -1866,6 +1869,7 @@ class ShotLogger(
                         kv("Sensor Authority ID", entry.sensorAuthorityId)
                         kv("Camera Device ID", entry.cameraDeviceId)
                         kv("Physical Camera ID", entry.physicalCameraId)
+                        kv("Authority Type", sensorAuthorityTypeLabel(entry))
                         kv("RAW Source ID", entry.rawSourceId)
                         kv("CaptureResult Source ID", entry.captureResultSourceId)
                         kv("Characteristics Source ID", entry.characteristicsSourceId)
@@ -1874,6 +1878,8 @@ class ShotLogger(
                         kv("Capture Sequence ID", entry.captureSequenceId)
                         kv("Sensor Metadata Timestamp Ns", entry.sensorMetadataTimestampNs)
                         kv("RAW/Metadata Timestamp Match", entry.rawMetadataTimestampMatch)
+                        kv("Logical Metadata Fallback", logicalMetadataFallbackLabel(entry))
+                        kv("Foreign Sensor Metadata Used", foreignSensorMetadataLabel(entry))
                         kv("Fallback Used", entry.sensorAuthorityFallbackUsed)
                         kv("Raw Processing Safe", entry.rawProcessingSafe)
                         kv("Sensor Authority Status", entry.sensorAuthorityStatus)
@@ -2225,6 +2231,24 @@ class ShotLogger(
         val leftDots = availableDots / 2
         val rightDots = availableDots - leftDots
         return "[${".".repeat(leftDots)} $clean ${".".repeat(rightDots)}]"
+    }
+
+    private fun sensorAuthorityTypeLabel(entry: FrameAnalysisDebugEntry): String = when (entry.physicalCameraId) {
+        "STANDALONE" -> "STANDALONE"
+        "UNAVAILABLE", "" -> "UNAVAILABLE"
+        else -> "PHYSICAL_CHILD"
+    }
+
+    private fun logicalMetadataFallbackLabel(entry: FrameAnalysisDebugEntry): String = when {
+        !entry.sensorAuthorityFallbackUsed -> "false"
+        entry.sensorAuthorityStatus == "LOGICAL_METADATA_FALLBACK_FORBIDDEN" -> "true"
+        else -> "unknown"
+    }
+
+    private fun foreignSensorMetadataLabel(entry: FrameAnalysisDebugEntry): String = when {
+        !entry.sensorAuthorityFallbackUsed -> "false"
+        entry.sensorAuthorityStatus == "FOREIGN_SENSOR_METADATA_FORBIDDEN" -> "true"
+        else -> "unknown"
     }
 
     private fun StringBuilder.kv(key: String, value: Any?) {
