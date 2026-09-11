@@ -4,7 +4,6 @@ import android.graphics.ImageFormat
 import android.util.Log
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CaptureResult
-import android.hardware.camera2.TotalCaptureResult
 import android.hardware.camera2.params.ColorSpaceTransform
 import com.bncam.data.settings.ProfileAwbModes
 import com.bncam.data.settings.ProfileAwbSettings
@@ -464,7 +463,7 @@ object SensorCalibrationResolver {
         profileNoiseTuning: ProfileNoiseTuning? = null,
         stableAutoWhiteBalance: StableWhiteBalanceSnapshot? = null
     ): FinalSensorCalibration {
-        val resolvedPhysicalCameraId = physicalCameraId ?: resolvePhysicalCameraId(captureResult)
+        val resolvedPhysicalCameraId = physicalCameraId
         val base = buildBaseCalibration(lensId, resolvedPhysicalCameraId, frameSourceFormat, characteristics, captureResult)
         val override = lensSettings?.toOverrideLayer() ?: defaultOverrideLayer()
         return buildFinalCalibration(
@@ -562,11 +561,6 @@ object SensorCalibrationResolver {
                     if (fallbackCount > 0) "; $fallbackCount frame(s) had no S/O and used explicit zero fallback" else ""
                 )
         ).also(LensCalibrationTelemetry::record)
-    }
-
-    private fun resolvePhysicalCameraId(captureResult: CaptureResult?): String? {
-        val physicalResults = (captureResult as? TotalCaptureResult)?.physicalCameraResults ?: return null
-        return physicalResults.keys.sorted().firstOrNull()
     }
 
     private fun buildBaseCalibration(

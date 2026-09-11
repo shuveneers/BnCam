@@ -2683,6 +2683,10 @@ class MultiFrameRunner(
                 else -> "Not used by native merge"
             }
 
+            val sensorSnapshot = frame.sensorMetadataSnapshot
+            val sensorIdentity = sensorSnapshot?.sensorIdentity
+            val frameIdentity = sensorSnapshot?.frameIdentityForRaw(frame.timestamp)
+
             FrameAnalysisDebugEntry(
                 index = index,
                 timestampNs = timestampNs,
@@ -2721,7 +2725,22 @@ class MultiFrameRunner(
                 candidateAwbState = candidateAwbState,
                 candidateFocusState = candidateFocusState,
                 candidateMetadataComplete = metadataComplete,
-                scoreComponentsUsed = scoreComponentsUsed
+                scoreComponentsUsed = scoreComponentsUsed,
+                sensorAuthorityId = sensorIdentity?.sensorAuthorityId ?: "UNAVAILABLE",
+                cameraDeviceId = sensorIdentity?.cameraDeviceId ?: "UNAVAILABLE",
+                physicalCameraId = sensorIdentity?.physicalLabel ?: "UNAVAILABLE",
+                rawSourceId = sensorSnapshot?.rawSourceId ?: "UNAVAILABLE",
+                captureResultSourceId = sensorSnapshot?.captureResultSourceId ?: "UNAVAILABLE",
+                characteristicsSourceId = sensorSnapshot?.characteristicsSourceId ?: "UNAVAILABLE",
+                calibrationSourceId = sensorSnapshot?.calibrationSourceId ?: "UNAVAILABLE",
+                sensorAuthorityFrameNumber = sensorSnapshot?.captureIdentity?.frameNumber ?: -1L,
+                captureSequenceId = sensorSnapshot?.captureIdentity?.captureSequenceId ?: -1,
+                sensorMetadataTimestampNs = sensorSnapshot?.captureIdentity?.sensorTimestampNs ?: 0L,
+                rawMetadataTimestampMatch = frameIdentity?.rawMetadataTimestampMatch ?: false,
+                sensorAuthorityFallbackUsed =
+                    sensorSnapshot?.let { it.logicalMetadataFallbackUsed || it.foreignSensorMetadataUsed } ?: false,
+                rawProcessingSafe = frameIdentity?.safeForRawProcessing ?: false,
+                sensorAuthorityStatus = frameIdentity?.rejectionReason() ?: "UNAVAILABLE"
             )
         }
     }

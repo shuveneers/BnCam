@@ -96,13 +96,39 @@ data class FrameSensorMetadataSnapshot(
     val oisMode: Int?,
     val focusDistanceDiopters: Float?,
     val focalLengthMm: Float?,
-    val aperture: Float?
+    val aperture: Float?,
+    val sensorIdentity: SensorIdentity? = null,
+    val captureIdentity: CaptureIdentity? = null,
+    val rawSourceId: String? = null,
+    val captureResultSourceId: String? = null,
+    val characteristicsSourceId: String? = null,
+    val calibrationSourceId: String? = null,
+    val logicalMetadataFallbackUsed: Boolean = false,
+    val foreignSensorMetadataUsed: Boolean = false
 ) {
     val hasPhysicalNoiseModel: Boolean
         get() = !noiseProfileSo.isNullOrEmpty() && noiseProfileSo.size % 2 == 0
     val hasDynamicLensShadingMap: Boolean
         get() = lensShadingRows > 0 && lensShadingColumns > 0 &&
             lensShadingGainFactors?.size == lensShadingRows * lensShadingColumns * 4
+
+    fun frameIdentityForRaw(rawSensorTimestampNs: Long): FrameIdentity? {
+        val capture = captureIdentity ?: return null
+        val rawSource = rawSourceId ?: return null
+        val resultSource = captureResultSourceId ?: return null
+        val characteristicsSource = characteristicsSourceId ?: return null
+        val calibrationSource = calibrationSourceId ?: return null
+        return FrameIdentity(
+            captureIdentity = capture,
+            rawSourceId = rawSource,
+            captureResultSourceId = resultSource,
+            characteristicsSourceId = characteristicsSource,
+            calibrationSourceId = calibrationSource,
+            rawSensorTimestampNs = rawSensorTimestampNs,
+            logicalMetadataFallbackUsed = logicalMetadataFallbackUsed,
+            foreignSensorMetadataUsed = foreignSensorMetadataUsed
+        )
+    }
 }
 
 data class SensorProfileRegistrySnapshot(
@@ -131,25 +157,14 @@ internal fun resolvePhysicalResultRoute(
             deterministic = true
         )
     }
-    if (physicalResultIds.size == 1) {
-        return PhysicalResultRouteDecision(
-            physicalCameraId = physicalResultIds.single(),
-            authority = if (active == null) {
-                "SOLE_PHYSICAL_RESULT"
-            } else {
-                "ACTIVE_ID_MISSING_SOLE_PHYSICAL_RESULT"
-            },
-            deterministic = true
-        )
-    }
+
     return PhysicalResultRouteDecision(
         physicalCameraId = null,
         authority = when {
-            active != null && physicalResultIds.isNotEmpty() -> "AMBIGUOUS_ACTIVE_ID_NOT_IN_RESULTS_LOGICAL_FALLBACK"
-            physicalResultIds.size > 1 -> "AMBIGUOUS_MULTIPLE_PHYSICAL_RESULTS_LOGICAL_FALLBACK"
-            else -> "NO_PHYSICAL_RESULT_LOGICAL_FALLBACK"
+            active == null && physicalResultIds.isNotEmpty() -> "PHYSICAL_AUTHORITY_UNSPECIFIED"
+            else -> "PHYSICAL_METADATA_UNAVAILABLE"
         },
-        deterministic = physicalResultIds.size <= 1
+        deterministic = false
     )
 }
 
@@ -159,7 +174,8 @@ data class SensorCalibrationInput(
     val captureResult: CaptureResult?,
     val authority: String,
     val deterministic: Boolean,
-    val staticFingerprint: String?
+    val staticFingerprint: String?,
+    val sensorIdentity: SensorIdentity? = null
 )
 
 /**
@@ -171,6 +187,8 @@ class PhysicalSensorProfileRegistry(private val cameraManager: CameraManager) {
     private val characteristicsByCameraId = ConcurrentHashMap<String, CameraCharacteristics>()
     private val recentFrameRouteLock = Any()
     private val recentFrameRoutesByTimestamp = LinkedHashMap<Long, SensorRouteKey>(RECENT_FRAME_ROUTE_CAPACITY)
+    private val recentFrameResultsByTimestamp = LinkedHashMap<Long, CaptureResult>(RECENT_FRAME_ROUTE_CAPACITY)
+    private val recentFrameIdentitiesByTimestamp = LinkedHashMap<Long, CaptureIdentity>(RECENT_FRAME_ROUTE_CAPACITY)
 
     init {
         activeRegistry = this
@@ -224,9 +242,65 @@ class PhysicalSensorProfileRegistry(private val cameraManager: CameraManager) {
         result: TotalCaptureResult
     ): FrameSensorMetadataSnapshot {
         val route = SensorRouteKey(logicalCameraId, physicalCameraId?.takeIf { it.isNotBlank() })
+        if (route.physicalCameraId == null && isLogicalMultiCameraCameraId(route.logicalCameraId)) {
+            throw SensorAuthorityUnavailableException("LOGICAL_PARENT_WITHOUT_PHYSICAL_AUTHORITY")
+        }
+
         val staticProfile = profileFor(route.logicalCameraId, route.physicalCameraId)
-        val physical = exactPhysicalResult(result, route.physicalCameraId)
-        val metadata: CaptureResult = physical ?: result
+            ?: throw SensorAuthorityUnavailableException("CHARACTERISTICS_UNAVAILABLE")
+
+        val metadata: CaptureResult = if (route.physicalCameraId != null) {
+            exactPhysicalResult(result, route.physicalCameraId)
+                ?: throw SensorAuthorityUnavailableException("PHYSICAL_METADATA_UNAVAILABLE")
+        } else {
+            result
+        }
+
+        val sensorIdentity = if (route.physicalCameraId != null) {
+            SensorIdentity(
+                sensorAuthorityId = route.physicalCameraId,
+                cameraDeviceId = route.logicalCameraId,
+                physicalCameraId = route.physicalCameraId,
+                authorityType = SensorAuthorityType.PHYSICAL_CHILD
+            )
+        } else {
+            SensorIdentity(
+                sensorAuthorityId = route.logicalCameraId,
+                cameraDeviceId = route.logicalCameraId,
+                physicalCameraId = null,
+                authorityType = SensorAuthorityType.STANDALONE
+            )
+        }
+
+        if (staticProfile.characteristicsCameraId != sensorIdentity.sourceId) {
+            throw SensorAuthorityUnavailableException("FOREIGN_SENSOR_CHARACTERISTICS")
+        }
+
+        val captureResultSourceId = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            metadata.cameraId
+        } else {
+            sensorIdentity.sourceId
+        }
+        if (captureResultSourceId != sensorIdentity.sourceId) {
+            throw SensorAuthorityUnavailableException("FOREIGN_SENSOR_CAPTURE_RESULT")
+        }
+        if (metadata.frameNumber != result.frameNumber) {
+            throw SensorAuthorityUnavailableException("PHYSICAL_RESULT_FRAME_NUMBER_MISMATCH")
+        }
+        if (metadata.sequenceId != result.sequenceId) {
+            throw SensorAuthorityUnavailableException("PHYSICAL_RESULT_SEQUENCE_ID_MISMATCH")
+        }
+
+        val sensorTimestampNs = metadata.get(CaptureResult.SENSOR_TIMESTAMP)
+            ?.takeIf { it > 0L }
+            ?: throw SensorAuthorityUnavailableException("SENSOR_TIMESTAMP_UNAVAILABLE")
+        val captureIdentity = CaptureIdentity(
+            sensorIdentity = sensorIdentity,
+            frameNumber = metadata.frameNumber,
+            sensorTimestampNs = sensorTimestampNs,
+            captureSequenceId = metadata.sequenceId
+        )
+
         val shading = metadata.get(CaptureResult.STATISTICS_LENS_SHADING_CORRECTION_MAP)?.copySnapshot()
         val noise = metadata.get(CaptureResult.SENSOR_NOISE_PROFILE)
             ?.flatMap { pair -> listOf(pair.first, pair.second) }
@@ -235,12 +309,17 @@ class PhysicalSensorProfileRegistry(private val cameraManager: CameraManager) {
             ?.map { it }?.takeIf { it.size == 4 }
         val neutral = metadata.get(CaptureResult.SENSOR_NEUTRAL_COLOR_POINT)
             ?.mapNotNull { it.safeFloatOrNull() }?.takeIf { it.isNotEmpty() }
+
         val snapshot = FrameSensorMetadataSnapshot(
             route = route,
-            staticFingerprint = staticProfile?.staticFingerprint,
-            metadataSource = if (physical != null) "PHYSICAL_CAPTURE_RESULT" else "LOGICAL_CAPTURE_RESULT",
-            sensorTimestampNs = metadata.get(CaptureResult.SENSOR_TIMESTAMP),
-            frameNumber = result.frameNumber,
+            staticFingerprint = staticProfile.staticFingerprint,
+            metadataSource = if (route.physicalCameraId != null) {
+                "PHYSICAL_CAPTURE_RESULT"
+            } else {
+                "STANDALONE_CAPTURE_RESULT"
+            },
+            sensorTimestampNs = sensorTimestampNs,
+            frameNumber = metadata.frameNumber,
             sensitivityIso = metadata.get(CaptureResult.SENSOR_SENSITIVITY),
             exposureTimeNs = metadata.get(CaptureResult.SENSOR_EXPOSURE_TIME),
             frameDurationNs = metadata.get(CaptureResult.SENSOR_FRAME_DURATION),
@@ -264,85 +343,67 @@ class PhysicalSensorProfileRegistry(private val cameraManager: CameraManager) {
             oisMode = metadata.get(CaptureResult.LENS_OPTICAL_STABILIZATION_MODE),
             focusDistanceDiopters = metadata.get(CaptureResult.LENS_FOCUS_DISTANCE),
             focalLengthMm = metadata.get(CaptureResult.LENS_FOCAL_LENGTH),
-            aperture = metadata.get(CaptureResult.LENS_APERTURE)
+            aperture = metadata.get(CaptureResult.LENS_APERTURE),
+            sensorIdentity = sensorIdentity,
+            captureIdentity = captureIdentity,
+            rawSourceId = sensorIdentity.sourceId,
+            captureResultSourceId = captureResultSourceId,
+            characteristicsSourceId = staticProfile.characteristicsCameraId,
+            calibrationSourceId = sensorIdentity.sourceId,
+            logicalMetadataFallbackUsed = false,
+            foreignSensorMetadataUsed = false
         )
-        snapshot.sensorTimestampNs?.let { timestamp -> rememberFrameRoute(timestamp, snapshot.route) }
+        rememberFrameAuthority(sensorTimestampNs, snapshot.route, metadata, captureIdentity)
         return snapshot
     }
 
     fun calibrationInputFor(
-        fallbackCharacteristics: CameraCharacteristics,
+        @Suppress("UNUSED_PARAMETER") fallbackCharacteristics: CameraCharacteristics,
         captureResult: CaptureResult?
     ): SensorCalibrationInput {
-        val total = captureResult as? TotalCaptureResult
-            ?: return SensorCalibrationInput(
-                physicalCameraId = null,
-                characteristics = fallbackCharacteristics,
-                captureResult = captureResult,
-                authority = "NON_TOTAL_CAPTURE_RESULT_LOGICAL_FALLBACK",
-                deterministic = true,
-                staticFingerprint = null
-            )
+        val sensorTimestampNs = captureResult
+            ?.get(CaptureResult.SENSOR_TIMESTAMP)
+            ?.takeIf { it > 0L }
+            ?: throw SensorAuthorityUnavailableException("SENSOR_TIMESTAMP_UNAVAILABLE")
 
-        val childIds = physicalResultIds(total)
-        val sensorTimestampNs = total.get(CaptureResult.SENSOR_TIMESTAMP)
-        val rememberedRoute = sensorTimestampNs?.let(::rememberedFrameRoute)
-        val frameSnapshotPhysicalId = rememberedRoute
-            ?.physicalCameraId
-            ?.takeIf { it.isNotBlank() && childIds.contains(it) }
-        val activePhysicalId = runCatching {
-            total.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID)
-        }.getOrNull()
-        val decision = if (frameSnapshotPhysicalId != null) {
-            PhysicalResultRouteDecision(
-                physicalCameraId = frameSnapshotPhysicalId,
-                authority = "FRAME_SNAPSHOT_EXACT_PHYSICAL_RESULT",
-                deterministic = true
-            )
-        } else {
-            resolvePhysicalResultRoute(activePhysicalId, childIds)
+        val rememberedRoute = rememberedFrameRoute(sensorTimestampNs)
+            ?: throw SensorAuthorityUnavailableException("SENSOR_AUTHORITY_FRAME_NOT_REGISTERED")
+        val rememberedCaptureIdentity = rememberedFrameIdentity(sensorTimestampNs)
+            ?: throw SensorAuthorityUnavailableException("CAPTURE_IDENTITY_UNAVAILABLE")
+        val sensorIdentity = rememberedCaptureIdentity.sensorIdentity
+        val exactCaptureResult = rememberedFrameResult(sensorTimestampNs)
+            ?: throw SensorAuthorityUnavailableException("CAPTURE_RESULT_AUTHORITY_UNAVAILABLE")
+
+        if (captureResult.frameNumber != rememberedCaptureIdentity.frameNumber) {
+            throw SensorAuthorityUnavailableException("CAPTURE_FRAME_NUMBER_MISMATCH")
         }
-        val physicalId = decision.physicalCameraId
-        if (physicalId == null) {
-            return SensorCalibrationInput(
-                physicalCameraId = null,
-                characteristics = fallbackCharacteristics,
-                captureResult = total,
-                authority = decision.authority,
-                deterministic = decision.deterministic,
-                staticFingerprint = null
-            )
+        if (rememberedRoute.effectiveCameraId != sensorIdentity.sourceId) {
+            throw SensorAuthorityUnavailableException("FRAME_ROUTE_AUTHORITY_MISMATCH")
         }
 
-        val childResult = exactPhysicalResult(total, physicalId)
-        val physicalCharacteristics = characteristicsForCameraId(physicalId)
-        if (childResult == null || physicalCharacteristics == null) {
-            return SensorCalibrationInput(
-                physicalCameraId = null,
-                characteristics = fallbackCharacteristics,
-                captureResult = total,
-                authority = "${decision.authority}_INCOMPLETE_PHYSICAL_ROUTE_LOGICAL_FALLBACK",
-                deterministic = false,
-                staticFingerprint = null
-            )
-        }
+        val characteristics = characteristicsForCameraId(sensorIdentity.sourceId)
+            ?: throw SensorAuthorityUnavailableException("CHARACTERISTICS_UNAVAILABLE")
+        val profile = profileFor(
+            rememberedRoute.logicalCameraId,
+            rememberedRoute.physicalCameraId
+        ) ?: throw SensorAuthorityUnavailableException("CALIBRATION_PROFILE_AUTHORITY_UNAVAILABLE")
 
-        val fingerprint = rememberedRoute
-            ?.takeIf { it.physicalCameraId == physicalId }
-            ?.let(profiles::get)
-            ?.staticFingerprint
-            ?: profiles.entries.firstOrNull { entry ->
-                entry.key.physicalCameraId == physicalId &&
-                    entry.value.characteristicsCameraId == physicalId
-            }?.value?.staticFingerprint
+        if (profile.characteristicsCameraId != sensorIdentity.sourceId) {
+            throw SensorAuthorityUnavailableException("FOREIGN_SENSOR_CHARACTERISTICS")
+        }
 
         return SensorCalibrationInput(
-            physicalCameraId = physicalId,
-            characteristics = physicalCharacteristics,
-            captureResult = childResult,
-            authority = decision.authority,
-            deterministic = decision.deterministic,
-            staticFingerprint = fingerprint
+            physicalCameraId = rememberedRoute.physicalCameraId,
+            characteristics = characteristics,
+            captureResult = exactCaptureResult,
+            authority = if (rememberedRoute.physicalCameraId != null) {
+                "FRAME_SNAPSHOT_EXACT_PHYSICAL_RESULT"
+            } else {
+                "FRAME_SNAPSHOT_STANDALONE_RESULT"
+            },
+            deterministic = true,
+            staticFingerprint = profile.staticFingerprint,
+            sensorIdentity = sensorIdentity
         )
     }
 
@@ -414,19 +475,44 @@ class PhysicalSensorProfileRegistry(private val cameraManager: CameraManager) {
         )
     }
 
-    private fun rememberFrameRoute(timestampNs: Long, route: SensorRouteKey) {
+    private fun rememberFrameAuthority(
+        timestampNs: Long,
+        route: SensorRouteKey,
+        captureResult: CaptureResult,
+        captureIdentity: CaptureIdentity
+    ) {
         if (timestampNs <= 0L) return
         synchronized(recentFrameRouteLock) {
             recentFrameRoutesByTimestamp[timestampNs] = route
+            recentFrameResultsByTimestamp[timestampNs] = captureResult
+            recentFrameIdentitiesByTimestamp[timestampNs] = captureIdentity
             while (recentFrameRoutesByTimestamp.size > RECENT_FRAME_ROUTE_CAPACITY) {
                 val eldest = recentFrameRoutesByTimestamp.entries.firstOrNull()?.key ?: break
                 recentFrameRoutesByTimestamp.remove(eldest)
+                recentFrameResultsByTimestamp.remove(eldest)
+                recentFrameIdentitiesByTimestamp.remove(eldest)
             }
         }
     }
 
     private fun rememberedFrameRoute(timestampNs: Long): SensorRouteKey? =
         synchronized(recentFrameRouteLock) { recentFrameRoutesByTimestamp[timestampNs] }
+
+    private fun rememberedFrameResult(timestampNs: Long): CaptureResult? =
+        synchronized(recentFrameRouteLock) { recentFrameResultsByTimestamp[timestampNs] }
+
+    private fun rememberedFrameIdentity(timestampNs: Long): CaptureIdentity? =
+        synchronized(recentFrameRouteLock) { recentFrameIdentitiesByTimestamp[timestampNs] }
+
+    private fun isLogicalMultiCameraCameraId(cameraId: String): Boolean {
+        val chars = characteristicsForCameraId(cameraId) ?: return false
+        val capabilities = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
+            ?.toList()
+            .orEmpty()
+        return capabilities.contains(
+            CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_LOGICAL_MULTI_CAMERA
+        ) && chars.physicalCameraIds.isNotEmpty()
+    }
 
     private fun characteristicsForCameraId(cameraId: String): CameraCharacteristics? {
         characteristicsByCameraId[cameraId]?.let { return it }
@@ -514,18 +600,8 @@ class PhysicalSensorProfileRegistry(private val cameraManager: CameraManager) {
             captureResult: CaptureResult?
         ): SensorCalibrationInput {
             val registry = activeRegistry
-            return if (registry != null) {
-                registry.calibrationInputFor(fallbackCharacteristics, captureResult)
-            } else {
-                SensorCalibrationInput(
-                    physicalCameraId = null,
-                    characteristics = fallbackCharacteristics,
-                    captureResult = captureResult,
-                    authority = "REGISTRY_UNAVAILABLE_LOGICAL_FALLBACK",
-                    deterministic = true,
-                    staticFingerprint = null
-                )
-            }
+                ?: throw SensorAuthorityUnavailableException("SENSOR_AUTHORITY_REGISTRY_UNAVAILABLE")
+            return registry.calibrationInputFor(fallbackCharacteristics, captureResult)
         }
     }
 }

@@ -146,6 +146,7 @@ class ZslFramePair {
     var timestampSource: Int = CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE_UNKNOWN
     var sensorTimestampComparableToElapsedRealtime: Boolean = false
     var completionCounted: Boolean = false
+    var sensorAuthorityRejectionCounted: Boolean = false
     @Volatile var focusScore: Float = 0f
     @Volatile var focusConfidence: Float = 0f
     @Volatile var confidenceState: com.bncam.core.quality.FocusConfidenceState = com.bncam.core.quality.FocusConfidenceState.INDETERMINATE
@@ -190,6 +191,7 @@ class ZslFramePair {
             timestampSource = CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE_UNKNOWN
             sensorTimestampComparableToElapsedRealtime = false
             completionCounted = false
+            sensorAuthorityRejectionCounted = false
             focusScore = 0f
             focusConfidence = 0f
             confidenceState = com.bncam.core.quality.FocusConfidenceState.INDETERMINATE
@@ -391,17 +393,37 @@ class FrameRingBuffer(private var capacity: Int = 35) {
         const val MAX_REASONABLE_FRAME_DURATION_NS = 1_000_000_000L
     }
 
-    private fun selectionExposureDecision(pair: ZslFramePair) =
+    private fun selectionExposureDecision(pair: ZslFramePair) = run {
+        val rawAuthorityRequired = requiresExactSensorAuthority(pair.format)
+        val snapshotExposureNs = pair.sensorMetadataSnapshot?.exposureTimeNs?.takeIf { it > 0L }
+        val snapshotIso = pair.sensorMetadataSnapshot?.sensitivityIso?.takeIf { it > 0 }
+
+        val actualExposureNs = snapshotExposureNs
+            ?: if (!rawAuthorityRequired) {
+                pair.exposureTimeNs.takeIf { it > 0L }
+                    ?: runCatching {
+                        pair.metadata?.get(CaptureResult.SENSOR_EXPOSURE_TIME)
+                    }.getOrNull()
+            } else {
+                null
+            }
+            ?: 0L
+        val actualIso = snapshotIso
+            ?: if (!rawAuthorityRequired) {
+                runCatching {
+                    pair.metadata?.get(CaptureResult.SENSOR_SENSITIVITY)
+                }.getOrNull()?.takeIf { it > 0 }
+            } else {
+                null
+            }
+
         FrameSelectionExposurePolicy.evaluate(
-            actualExposureNs = pair.sensorMetadataSnapshot?.exposureTimeNs?.takeIf { it > 0L }
-                ?: pair.exposureTimeNs.takeIf { it > 0L }
-                ?: runCatching { pair.metadata?.get(CaptureResult.SENSOR_EXPOSURE_TIME) }.getOrNull()
-                ?: 0L,
+            actualExposureNs = actualExposureNs,
             requestedExposureTargetNs = selectionExposureTargetNs,
-            actualIso = pair.sensorMetadataSnapshot?.sensitivityIso?.takeIf { it > 0 }
-                ?: runCatching { pair.metadata?.get(CaptureResult.SENSOR_SENSITIVITY) }.getOrNull()?.takeIf { it > 0 },
+            actualIso = actualIso,
             requestedIso = selectionExposureTargetIso.takeIf { it > 0 }
         )
+    }
 
     private fun selectionExposureAllows(pair: ZslFramePair, recordRejection: Boolean): Boolean {
         val active = selectionExposureTargetNs > 0L &&
@@ -479,8 +501,7 @@ class FrameRingBuffer(private var capacity: Int = 35) {
             )
         }
         return (preferredNewest + fallbackChosen).sortedBy { pair ->
-            try { pair.metadata?.get(CaptureResult.SENSOR_TIMESTAMP) } catch (_: Throwable) { null }
-                ?: pair.timestamp
+            pair.sensorMetadataSnapshot?.sensorTimestampNs ?: pair.timestamp
         }
     }
 
@@ -959,7 +980,13 @@ class FrameRingBuffer(private var capacity: Int = 35) {
         pair.generationId = generationId
         pair.controlRequestEpoch = requestProvenance.identity.controlRequestEpoch
         pair.requestProvenance = requestProvenance
-        pair.exposureTimeNs = result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 0L
+        pair.exposureTimeNs = sensorMetadataSnapshot?.exposureTimeNs?.takeIf { it > 0L }
+            ?: if (!requiresExactSensorAuthority(pair.format)) {
+                result.get(CaptureResult.SENSOR_EXPOSURE_TIME)
+            } else {
+                null
+            }
+            ?: 0L
         pair.metadataArrivalElapsedNs = metadataArrivalElapsedNs
         pair.timestampSource = timestampSource
         pair.sensorTimestampComparableToElapsedRealtime =
@@ -1017,6 +1044,21 @@ class FrameRingBuffer(private var capacity: Int = 35) {
                 provenance.snapshot.identity == provenance.identity
     }
 
+    private fun requiresExactSensorAuthority(format: Int): Boolean =
+        format == android.graphics.ImageFormat.RAW10 ||
+            format == android.graphics.ImageFormat.RAW_SENSOR
+
+    private fun frameIdentity(pair: ZslFramePair): com.bncam.core.quality.FrameIdentity? =
+        pair.sensorMetadataSnapshot?.frameIdentityForRaw(pair.timestamp)
+
+    private fun hasExactSensorAuthority(pair: ZslFramePair): Boolean {
+        if (!requiresExactSensorAuthority(pair.format)) return true
+        return frameIdentity(pair)?.safeForRawProcessing == true
+    }
+
+    private fun hasCompleteProvenance(pair: ZslFramePair): Boolean =
+        hasExactRequestProvenance(pair) && hasExactSensorAuthority(pair)
+
     private fun checkCompletion(pair: ZslFramePair) {
         if (pair.hardwareBuffer == null) {
             com.bncam.core.debug.RawRecoveryTrace.log("CHECK_COMPLETION_NO_HWBUF", "ts=${pair.timestamp}, format=${pair.format}")
@@ -1033,6 +1075,30 @@ class FrameRingBuffer(private var capacity: Int = 35) {
                 "ts=${pair.timestamp}, format=${pair.format}, pairEpoch=${pair.controlRequestEpoch}, provEpoch=${prov?.identity?.controlRequestEpoch}, gen=${pair.generationId}, provGen=${prov?.identity?.pipelineGeneration}"
             )
             return
+        }
+        if (!hasExactSensorAuthority(pair)) {
+            val identity = frameIdentity(pair)
+            val reason = identity?.rejectionReason() ?: "SENSOR_AUTHORITY_SNAPSHOT_UNAVAILABLE"
+            if (!pair.sensorAuthorityRejectionCounted) {
+                pair.sensorAuthorityRejectionCounted = true
+                pairingFailuresCount++
+            }
+            Log.w(
+                "SensorProvenance",
+                "event=RAW_PAIR_REJECTED_SENSOR_AUTHORITY sensorTimestampNs=${pair.timestamp} " +
+                    "frameNumber=${pair.sensorMetadataSnapshot?.frameNumber ?: -1L} " +
+                    "format=${pair.format} reason=$reason"
+            )
+            com.bncam.core.debug.RawRecoveryTrace.log(
+                "RAW_PAIR_REJECTED_SENSOR_AUTHORITY",
+                "ts=${pair.timestamp}, format=${pair.format}, reason=$reason"
+            )
+            return
+        }
+        if (requiresExactSensorAuthority(pair.format) && !pair.completionCounted) {
+            frameIdentity(pair)?.let { identity ->
+                Log.i("SensorProvenance", identity.debugText())
+            }
         }
         if (pair.pairCompleteElapsedNs == 0L) {
             pair.pairCompleteElapsedNs = currentElapsedRealtimeNanos()
@@ -1217,15 +1283,14 @@ class FrameRingBuffer(private var capacity: Int = 35) {
         val shutterSafe = buffer.asSequence()
             .filter {
                 it.generationId == activeGeneration &&
-                    hasExactRequestProvenance(it) &&
+                    hasCompleteProvenance(it) &&
                     it.timestamp != 0L &&
                     it.hardwareBuffer != null &&
                     it.metadata != null &&
                     selectionExposureAllows(it, recordRejection = false)
             }
             .sortedBy {
-                try { it.metadata?.get(CaptureResult.SENSOR_TIMESTAMP) } catch (_: Throwable) { null }
-                    ?: it.timestamp
+                it.sensorMetadataSnapshot?.sensorTimestampNs ?: it.timestamp
             }
             .toList()
         return preferSelectionExposureProduct(shutterSafe, count)
@@ -1245,7 +1310,7 @@ class FrameRingBuffer(private var capacity: Int = 35) {
         if (maxCount <= 0) return emptyList()
         val valid = buffer.filter {
             it.generationId == activeGeneration &&
-                hasExactRequestProvenance(it) &&
+                hasCompleteProvenance(it) &&
                 it.timestamp != 0L &&
                 (it.hardwareBuffer != null ||
                     (it.format == android.graphics.ImageFormat.YUV_420_888 && it.image != null)) &&
@@ -1263,9 +1328,14 @@ class FrameRingBuffer(private var capacity: Int = 35) {
         } else {
             valid
         }
-        val ordered = filtered.sortedBy {
-            try { it.metadata?.get(CaptureResult.SENSOR_TIMESTAMP) } catch (_: Throwable) { null }
-                ?: it.timestamp
+        val ordered = filtered.sortedBy { pair ->
+            pair.sensorMetadataSnapshot?.sensorTimestampNs?.takeIf { it > 0L }
+                ?: if (!requiresExactSensorAuthority(pair.format)) {
+                    try { pair.metadata?.get(CaptureResult.SENSOR_TIMESTAMP) } catch (_: Throwable) { null }
+                } else {
+                    null
+                }
+                ?: pair.timestamp
         }
         return preferSelectionExposureProduct(ordered, maxCount)
             .mapNotNull(::snapshotCandidate)
@@ -1280,7 +1350,7 @@ class FrameRingBuffer(private var capacity: Int = 35) {
         if (maxCount <= 0) return emptyList()
         val valid = buffer.filter {
             it.generationId == activeGeneration &&
-                hasExactRequestProvenance(it) &&
+                hasCompleteProvenance(it) &&
                 it.timestamp != 0L &&
                 (it.hardwareBuffer != null ||
                     (it.format == android.graphics.ImageFormat.YUV_420_888 && it.image != null)) &&
@@ -1298,9 +1368,14 @@ class FrameRingBuffer(private var capacity: Int = 35) {
         } else {
             valid
         }
-        val ordered = filtered.sortedBy {
-            try { it.metadata?.get(CaptureResult.SENSOR_TIMESTAMP) } catch (_: Throwable) { null }
-                ?: it.timestamp
+        val ordered = filtered.sortedBy { pair ->
+            pair.sensorMetadataSnapshot?.sensorTimestampNs?.takeIf { it > 0L }
+                ?: if (!requiresExactSensorAuthority(pair.format)) {
+                    try { pair.metadata?.get(CaptureResult.SENSOR_TIMESTAMP) } catch (_: Throwable) { null }
+                } else {
+                    null
+                }
+                ?: pair.timestamp
         }
         return preferSelectionExposureProduct(ordered, maxCount)
     }
@@ -1372,7 +1447,7 @@ class FrameRingBuffer(private var capacity: Int = 35) {
             it.generationId == activeGeneration &&
                     it.frameVersion !in excludeFrameVersions &&
                     (expectedFormat == null || it.format == expectedFormat) &&
-                    hasExactRequestProvenance(it) &&
+                    hasCompleteProvenance(it) &&
                     it.timestamp != 0L &&
                     it.hardwareBuffer != null &&
                     it.metadata != null &&
@@ -1390,7 +1465,7 @@ class FrameRingBuffer(private var capacity: Int = 35) {
             valid
         }
         val ordered = filtered.sortedBy {
-            try { it.metadata?.get(CaptureResult.SENSOR_TIMESTAMP) } catch (_: Throwable) { null } ?: it.timestamp
+            it.sensorMetadataSnapshot?.sensorTimestampNs ?: it.timestamp
         }
         val selected = preferSelectionExposureProduct(ordered, maxCount)
 
@@ -1442,7 +1517,7 @@ class FrameRingBuffer(private var capacity: Int = 35) {
                         candidate.format == expectedFormat &&
                         candidate.hardwareBuffer != null &&
                         candidate.metadata != null &&
-                        hasExactRequestProvenance(candidate)
+                        hasCompleteProvenance(candidate)
                 }
                 if (pair != null) {
                     return leaseFrameInternal(pair, pair.frameVersion)
@@ -1459,7 +1534,7 @@ class FrameRingBuffer(private var capacity: Int = 35) {
                     candidate.format == expectedFormat &&
                     candidate.hardwareBuffer != null &&
                     candidate.metadata != null &&
-                    hasExactRequestProvenance(candidate)
+                    hasCompleteProvenance(candidate)
             } ?: return@synchronized null
             leaseFrameInternal(pair, pair.frameVersion)
         }
@@ -1487,7 +1562,7 @@ class FrameRingBuffer(private var capacity: Int = 35) {
                         candidate.format == expectedFormat &&
                         candidate.hardwareBuffer != null &&
                         candidate.metadata != null &&
-                        hasExactRequestProvenance(candidate)
+                        hasCompleteProvenance(candidate)
                 }
                 if (pair != null) return leaseFrameInternal(pair, pair.frameVersion)
             }
@@ -1501,7 +1576,7 @@ class FrameRingBuffer(private var capacity: Int = 35) {
                     candidate.format == expectedFormat &&
                     candidate.hardwareBuffer != null &&
                     candidate.metadata != null &&
-                    hasExactRequestProvenance(candidate)
+                    hasCompleteProvenance(candidate)
             } ?: return@synchronized null
             leaseFrameInternal(pair, pair.frameVersion)
         }
@@ -1521,7 +1596,7 @@ class FrameRingBuffer(private var capacity: Int = 35) {
                 it.image != null &&
                 it.hardwareBuffer != null &&
                 it.metadata != null &&
-                hasExactRequestProvenance(it)
+                hasCompleteProvenance(it)
         } ?: return null
         return leaseFrameInternal(pair, pair.frameVersion)
     }
@@ -1543,7 +1618,7 @@ class FrameRingBuffer(private var capacity: Int = 35) {
                     it.metadata != null &&
                     !it.focusEvaluated &&
                     !it.isLeased &&
-                    hasExactRequestProvenance(it)
+                    hasCompleteProvenance(it)
             }
             .minByOrNull { it.timestamp }
             ?: return null
@@ -1612,7 +1687,7 @@ class FrameRingBuffer(private var capacity: Int = 35) {
         return buffer.firstOrNull {
             it.timestamp == timestampNs &&
                 it.generationId == generationId &&
-                hasExactRequestProvenance(it) &&
+                hasCompleteProvenance(it) &&
                 it.format == expectedFormat &&
                 it.image != null &&
                 it.hardwareBuffer != null &&
@@ -1631,7 +1706,7 @@ class FrameRingBuffer(private var capacity: Int = 35) {
                     (it.image != null || it.hardwareBuffer != null || it.metadata != null)
         }
         val completePairs = retainedPairs.filter {
-            hasExactRequestProvenance(it) &&
+            hasCompleteProvenance(it) &&
                     it.image != null &&
                     it.hardwareBuffer != null &&
                     it.metadata != null
@@ -1685,7 +1760,7 @@ class FrameRingBuffer(private var capacity: Int = 35) {
     }
 
     @Synchronized fun completeFrameCount(): Int = buffer.count {
-        it.generationId == activeGeneration && hasExactRequestProvenance(it) &&
+        it.generationId == activeGeneration && hasCompleteProvenance(it) &&
                 it.timestamp != 0L && it.hardwareBuffer != null && it.metadata != null
     }
 
@@ -1739,11 +1814,19 @@ class FrameRingBuffer(private var capacity: Int = 35) {
         val nowNs = currentElapsedRealtimeNanos()
         val completeList = buffer.filter {
             it.generationId == activeGeneration &&
-                    hasExactRequestProvenance(it) &&
+                    hasCompleteProvenance(it) &&
                     it.timestamp != 0L &&
                     it.hardwareBuffer != null &&
                     it.metadata != null
-        }.sortedBy { try { it.metadata?.get(CaptureResult.SENSOR_TIMESTAMP) } catch (_: Throwable) { null } ?: it.timestamp }
+        }.sortedBy { pair ->
+            pair.sensorMetadataSnapshot?.sensorTimestampNs?.takeIf { it > 0L }
+                ?: if (!requiresExactSensorAuthority(pair.format)) {
+                    try { pair.metadata?.get(CaptureResult.SENSOR_TIMESTAMP) } catch (_: Throwable) { null }
+                } else {
+                    null
+                }
+                ?: pair.timestamp
+        }
 
         val leasedCount = leasedFrameCount()
         val writableCount = writableSlotCount()
@@ -1896,7 +1979,7 @@ class FrameRingBuffer(private var capacity: Int = 35) {
     @Synchronized
     fun completeFrameFormats(): Set<Int> = buffer.asSequence()
         .filter {
-            it.generationId == activeGeneration && hasExactRequestProvenance(it) &&
+            it.generationId == activeGeneration && hasCompleteProvenance(it) &&
                     it.timestamp != 0L && it.image != null && it.hardwareBuffer != null && it.metadata != null
         }
         .map { it.format }
@@ -1906,11 +1989,30 @@ class FrameRingBuffer(private var capacity: Int = 35) {
     fun freshMetadataCompleteFrameCount(referenceTimestampNs: Long, freshnessWindowMs: Double): Int {
         return buffer.count { pair ->
             val metadata = pair.metadata
-            val timestampNs = metadata?.get(CaptureResult.SENSOR_TIMESTAMP) ?: pair.timestamp
-            val exposureNs = metadata?.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 0L
-            val iso = metadata?.get(CaptureResult.SENSOR_SENSITIVITY) ?: 0
+            val rawAuthorityRequired = requiresExactSensorAuthority(pair.format)
+            val timestampNs = pair.sensorMetadataSnapshot?.sensorTimestampNs
+                ?: if (!rawAuthorityRequired) {
+                    metadata?.get(CaptureResult.SENSOR_TIMESTAMP)
+                } else {
+                    null
+                }
+                ?: pair.timestamp
+            val exposureNs = pair.sensorMetadataSnapshot?.exposureTimeNs
+                ?: if (!rawAuthorityRequired) {
+                    metadata?.get(CaptureResult.SENSOR_EXPOSURE_TIME)
+                } else {
+                    null
+                }
+                ?: 0L
+            val iso = pair.sensorMetadataSnapshot?.sensitivityIso
+                ?: if (!rawAuthorityRequired) {
+                    metadata?.get(CaptureResult.SENSOR_SENSITIVITY)
+                } else {
+                    null
+                }
+                ?: 0
                 pair.generationId == activeGeneration &&
-                hasExactRequestProvenance(pair) &&
+                hasCompleteProvenance(pair) &&
                 pair.image != null &&
                 pair.hardwareBuffer != null &&
                 metadata != null &&
@@ -1943,7 +2045,7 @@ class FrameRingBuffer(private var capacity: Int = 35) {
         val oldBuffer = buffer
         val retained = oldBuffer
             .filter {
-                it.generationId == activeGeneration && hasExactRequestProvenance(it) &&
+                it.generationId == activeGeneration && hasCompleteProvenance(it) &&
                         it.timestamp != 0L && it.image != null && it.hardwareBuffer != null && it.metadata != null
             }
             .sortedBy { it.timestamp }

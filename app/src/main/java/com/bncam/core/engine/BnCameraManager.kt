@@ -393,11 +393,20 @@ class BnCameraManager(private val context: Context) {
         return runCatching {
             sensorProfileRegistry.snapshotForFrame(logicalId, physicalId, result)
         }.onFailure { failure ->
+            val reason = (failure as? com.bncam.core.quality.SensorAuthorityUnavailableException)
+                ?.authorityReason ?: failure.javaClass.simpleName
             Log.w(
                 "SensorProfileRegistry",
                 "frame snapshot failed logical=$logicalId physical=${physicalId ?: "none"} " +
-                    "generation=$expectedGeneration frame=${result.frameNumber}",
+                    "generation=$expectedGeneration frame=${result.frameNumber} reason=$reason",
                 failure
+            )
+            com.bncam.core.debug.DiagnosticsAggregator.record(
+                stream = com.bncam.core.debug.DiagnosticsAggregator.Stream.CAPTURE,
+                scope = "SESSION",
+                section = "CAPTURE_REJECT_SENSOR_AUTHORITY",
+                content = "reason=$reason;logical=$logicalId;physical=${physicalId ?: "STANDALONE"};" +
+                    "generation=$expectedGeneration;frame=${result.frameNumber};sequence=${result.sequenceId}"
             )
         }.getOrNull()
     }
@@ -2395,10 +2404,26 @@ class BnCameraManager(private val context: Context) {
     private fun previewCaptureResult(
         result: TotalCaptureResult,
         physicalCameraId: String?
-    ): CaptureResult {
+    ): CaptureResult? {
         if (physicalCameraId.isNullOrBlank()) return result
-        return runCatching { physicalCaptureResultOrNull(result, physicalCameraId) }
-            .getOrNull() ?: result
+        val physical = runCatching { physicalCaptureResultOrNull(result, physicalCameraId) }
+            .onFailure { failure ->
+                Log.w(
+                    "SensorAuthority",
+                    "PHYSICAL_METADATA_UNAVAILABLE physicalCameraId=$physicalCameraId " +
+                        "frameNumber=${result.frameNumber} sequenceId=${result.sequenceId}",
+                    failure
+                )
+            }
+            .getOrNull()
+        if (physical == null) {
+            Log.w(
+                "SensorAuthority",
+                "PHYSICAL_METADATA_UNAVAILABLE physicalCameraId=$physicalCameraId " +
+                    "frameNumber=${result.frameNumber} sequenceId=${result.sequenceId}; logical parent not substituted"
+            )
+        }
+        return physical
     }
 
     fun setPreviewOrientationCorrection(degrees: Int) {
@@ -2584,8 +2609,23 @@ class BnCameraManager(private val context: Context) {
         val physicalChars = activePhysicalId?.let { id ->
             runCatching { cameraManager.getCameraCharacteristics(id) }.getOrNull()
         }
-        val geometryChars = if (physicalMetadata != null && physicalChars != null) physicalChars else logicalChars
-        val resultForGeometry: CaptureResult = physicalMetadata ?: metadata
+        val geometryChars: CameraCharacteristics
+        val resultForGeometry: CaptureResult
+        if (activePhysicalId != null) {
+            if (physicalMetadata == null || physicalChars == null) {
+                Log.w(
+                    "SensorAuthority",
+                    "PHYSICAL_METADATA_UNAVAILABLE context=FOCUS_ANALYSIS physicalCameraId=$activePhysicalId " +
+                        "frameNumber=${metadata.frameNumber}; logical geometry metadata not substituted"
+                )
+                return null to null
+            }
+            geometryChars = physicalChars
+            resultForGeometry = physicalMetadata
+        } else {
+            geometryChars = logicalChars
+            resultForGeometry = metadata
+        }
         val activeArray = geometryChars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
             ?: return null to null
         val afRegion = resultForGeometry.get(CaptureResult.CONTROL_AF_REGIONS)
@@ -3440,9 +3480,19 @@ class BnCameraManager(private val context: Context) {
                 ?.physicalCameraId
         }
         val physicalResult = physicalCaptureResultOrNull(result, physicalId)
-        val physicalReported = physicalResult?.get(CaptureResult.STATISTICS_SCENE_FLICKER)
-        val reported = physicalReported ?: result.get(CaptureResult.STATISTICS_SCENE_FLICKER)
-        val resultOwner = if (physicalReported != null) "PHYSICAL:${physicalId ?: "unknown"}" else "LOGICAL"
+        val reported: Int?
+        val resultOwner: String
+        if (physicalId != null) {
+            reported = physicalResult?.get(CaptureResult.STATISTICS_SCENE_FLICKER)
+            resultOwner = if (physicalResult != null) {
+                "PHYSICAL:$physicalId"
+            } else {
+                "PHYSICAL_METADATA_UNAVAILABLE:$physicalId"
+            }
+        } else {
+            reported = result.get(CaptureResult.STATISTICS_SCENE_FLICKER)
+            resultOwner = "STANDALONE"
+        }
         val observation = when (reported) {
             CameraMetadata.STATISTICS_SCENE_FLICKER_50HZ -> RawFlickerObservation.HZ_50
             CameraMetadata.STATISTICS_SCENE_FLICKER_60HZ -> RawFlickerObservation.HZ_60
@@ -5102,7 +5152,11 @@ class BnCameraManager(private val context: Context) {
                 val mapped = AfCoordinateMapper.mapNormalizedPreviewPoint(
                     normPoint = NormalizedPoint(normX, normY),
                     characteristics = geometryChars,
-                    currentCropRegion = physicalResultCrop ?: request.get(CaptureRequest.SCALER_CROP_REGION),
+                    currentCropRegion = if (physicalId != null) {
+                        physicalResultCrop
+                    } else {
+                        request.get(CaptureRequest.SCALER_CROP_REGION)
+                    },
                     previewStreamWidth = configuredPreviewStreamWidth,
                     previewStreamHeight = configuredPreviewStreamHeight,
                     distortionCorrectionMode = request.get(CaptureRequest.DISTORTION_CORRECTION_MODE),
@@ -6328,10 +6382,13 @@ class BnCameraManager(private val context: Context) {
         } else {
             null
         }
-        val selectedPhysicalFocalLength =
+        val selectedPhysicalFocalLength = if (physicalCameraId != null) {
             physicalResult?.get(CaptureResult.LENS_FOCAL_LENGTH)
-                ?: result?.get(CaptureResult.LENS_FOCAL_LENGTH)
                 ?: availablePhysicalFocals?.singleOrNull()
+        } else {
+            result?.get(CaptureResult.LENS_FOCAL_LENGTH)
+                ?: availablePhysicalFocals?.singleOrNull()
+        }
 
         val requestedCrop = request?.get(CaptureRequest.SCALER_CROP_REGION)
         val resultCrop = result?.get(CaptureResult.SCALER_CROP_REGION)
@@ -9408,17 +9465,18 @@ class BnCameraManager(private val context: Context) {
                                     observedElapsedRealtimeMs = android.os.SystemClock.elapsedRealtime()
                                 )
                             )
+                            val sensorMetadataSnapshot = frameSensorMetadataSnapshot(
+                                result = result,
+                                expectedGeneration = sessionGeneration,
+                                fallbackLogicalCameraId = camera.id
+                            )
                             ringBuffer.addMetadata(
-                                timestamp = timestamp,
+                                timestamp = sensorMetadataSnapshot?.sensorTimestampNs ?: timestamp,
                                 result = result,
                                 generationId = sessionGeneration,
                                 requestProvenance =
                                     tagResolution.provenance,
-                                sensorMetadataSnapshot = frameSensorMetadataSnapshot(
-                                    result = result,
-                                    expectedGeneration = sessionGeneration,
-                                    fallbackLogicalCameraId = camera.id
-                                )
+                                sensorMetadataSnapshot = sensorMetadataSnapshot
                             )
                             scheduleFocusConfidenceAnalysis(
                                 generation = sessionGeneration,
@@ -10860,9 +10918,17 @@ class BnCameraManager(private val context: Context) {
             val identity = synchronized(pipelineLock) { activePipelineIdentity } ?: return
             val scopeKey = identity.physicalCameraId ?: identity.logicalCameraId
             val calibrationResult = previewCaptureResult(result, identity.physicalCameraId)
+                ?: run {
+                    Log.w(
+                        "SensorAuthority",
+                        "PHYSICAL_METADATA_UNAVAILABLE context=WB_OBSERVATION " +
+                            "physicalCameraId=${identity.physicalCameraId ?: "none"} " +
+                            "frameNumber=${result.frameNumber}; skipping WB observation"
+                    )
+                    return
+                }
             val gains = calibrationResult.get(CaptureResult.COLOR_CORRECTION_GAINS) ?: return
             val awbState = calibrationResult.get(CaptureResult.CONTROL_AWB_STATE)
-                ?: result.get(CaptureResult.CONTROL_AWB_STATE)
             val convergence = when (awbState) {
                 CaptureResult.CONTROL_AWB_STATE_CONVERGED -> WhiteBalanceConvergence.CONVERGED
                 CaptureResult.CONTROL_AWB_STATE_LOCKED -> WhiteBalanceConvergence.LOCKED
@@ -10881,12 +10947,10 @@ class BnCameraManager(private val context: Context) {
                 convergence = convergence,
                 colorMatrix = camera2Matrix,
                 sensorTimestampNs = calibrationResult.get(CaptureResult.SENSOR_TIMESTAMP)
-                    ?: result.get(CaptureResult.SENSOR_TIMESTAMP)
                     ?: 0L
             )
             if (liveWhiteBalanceTargetSensorGains == null) {
                 val timestampNs = calibrationResult.get(CaptureResult.SENSOR_TIMESTAMP)
-                    ?: result.get(CaptureResult.SENSOR_TIMESTAMP)
                     ?: 0L
                 if (camera2Matrix != null && timestampNs > 0L) {
                     // Exact timestamp-matched Camera2 metadata remains the independent physical
@@ -13747,16 +13811,17 @@ class BnCameraManager(private val context: Context) {
                         tag = request.tag,
                         expectedPipelineGeneration = generationAtStart
                     )
+                    val sensorMetadataSnapshot = frameSensorMetadataSnapshot(
+                        result = result,
+                        expectedGeneration = generationAtStart,
+                        fallbackLogicalCameraId = device.id
+                    )
                     ringBuffer.addMetadata(
-                        timestamp = sensorTimestamp,
+                        timestamp = sensorMetadataSnapshot?.sensorTimestampNs ?: sensorTimestamp,
                         result = result,
                         generationId = generationAtStart,
                         requestProvenance = tagResolution.provenance,
-                        sensorMetadataSnapshot = frameSensorMetadataSnapshot(
-                            result = result,
-                            expectedGeneration = generationAtStart,
-                            fallbackLogicalCameraId = device.id
-                        )
+                        sensorMetadataSnapshot = sensorMetadataSnapshot
                     )
                 }
                 resultChannel.trySend(result)
@@ -14179,16 +14244,17 @@ class BnCameraManager(private val context: Context) {
                                 tag = request.tag,
                                 expectedPipelineGeneration = generationAtStart
                             )
+                            val sensorMetadataSnapshot = frameSensorMetadataSnapshot(
+                                result = result,
+                                expectedGeneration = generationAtStart,
+                                fallbackLogicalCameraId = device.id
+                            )
                             ringBuffer.addMetadata(
-                                timestamp = sensorTimestamp,
+                                timestamp = sensorMetadataSnapshot?.sensorTimestampNs ?: sensorTimestamp,
                                 result = result,
                                 generationId = generationAtStart,
                                 requestProvenance = tagResolution.provenance,
-                                sensorMetadataSnapshot = frameSensorMetadataSnapshot(
-                                    result = result,
-                                    expectedGeneration = generationAtStart,
-                                    fallbackLogicalCameraId = device.id
-                                )
+                                sensorMetadataSnapshot = sensorMetadataSnapshot
                             )
                         }
                         if (!resultDeferred.isCompleted) resultDeferred.complete(result)

@@ -17,45 +17,53 @@ class PhysicalSensorCalibrationAuthorityTest {
     }
 
     @Test
-    fun `single physical result is deterministic fallback`() {
+    fun `single physical result without authority no longer becomes fallback`() {
         val decision = resolvePhysicalResultRoute(null, setOf("wide"))
-        assertEquals("wide", decision.physicalCameraId)
-        assertEquals("SOLE_PHYSICAL_RESULT", decision.authority)
-        assertTrue(decision.deterministic)
-    }
-
-    @Test
-    fun `multiple physical children without active id never choose alphabetically`() {
-        val decision = resolvePhysicalResultRoute(null, setOf("tele", "wide"))
         assertNull(decision.physicalCameraId)
-        assertEquals("AMBIGUOUS_MULTIPLE_PHYSICAL_RESULTS_LOGICAL_FALLBACK", decision.authority)
+        assertEquals("PHYSICAL_AUTHORITY_UNSPECIFIED", decision.authority)
         assertFalse(decision.deterministic)
     }
 
     @Test
-    fun `stale active id with multiple children fails closed to logical`() {
+    fun `stale active physical id fails closed`() {
         val decision = resolvePhysicalResultRoute("ultrawide", setOf("wide", "tele"))
         assertNull(decision.physicalCameraId)
-        assertEquals("AMBIGUOUS_ACTIVE_ID_NOT_IN_RESULTS_LOGICAL_FALLBACK", decision.authority)
+        assertEquals("PHYSICAL_METADATA_UNAVAILABLE", decision.authority)
         assertFalse(decision.deterministic)
     }
 
     @Test
-    fun `render config consumes central calibration input before resolver`() {
-        val appDir = sequenceOf(File("."), File("app"))
-            .firstOrNull { File(it, "src/main/java/com/bncam/core/quality/RenderQualityConfig.kt").isFile }
-            ?: error("Unable to locate app module")
-        val config = File(appDir, "src/main/java/com/bncam/core/quality/RenderQualityConfig.kt").readText()
-        val registry = File(appDir, "src/main/java/com/bncam/core/quality/PhysicalSensorProfileRegistry.kt").readText()
+    fun `missing physical result fails closed`() {
+        val decision = resolvePhysicalResultRoute("tele", emptySet())
+        assertNull(decision.physicalCameraId)
+        assertEquals("PHYSICAL_METADATA_UNAVAILABLE", decision.authority)
+        assertFalse(decision.deterministic)
+    }
 
-        assertTrue("PhysicalSensorProfileRegistry.resolveCurrentCalibrationInput(" in config)
-        assertTrue("physicalCameraId = calibrationInput.physicalCameraId" in config)
-        assertTrue("characteristics = calibrationInput.characteristics" in config)
-        assertTrue("captureResult = calibrationInput.captureResult" in config)
-        assertFalse("physicalCameraId = null" in config.substringAfter("SensorCalibrationResolver.resolve(").substringBefore(")\n"))
+    @Test
+    fun `registry contains no logical metadata substitution`() {
+        val appDir = sequenceOf(File("."), File("app"))
+            .firstOrNull {
+                File(it, "src/main/java/com/bncam/core/quality/PhysicalSensorProfileRegistry.kt").isFile
+            }
+            ?: error("Unable to locate app module")
+        val registry = File(
+            appDir,
+            "src/main/java/com/bncam/core/quality/PhysicalSensorProfileRegistry.kt"
+        ).readText()
+
+        assertTrue("SensorAuthorityUnavailableException" in registry)
         assertTrue("FRAME_SNAPSHOT_EXACT_PHYSICAL_RESULT" in registry)
-        assertTrue("recentFrameRoutesByTimestamp" in registry)
-        assertTrue("AMBIGUOUS_MULTIPLE_PHYSICAL_RESULTS_LOGICAL_FALLBACK" in registry)
-        assertFalse("physicalResultIds.sorted().firstOrNull()" in registry)
+        assertTrue("FRAME_SNAPSHOT_STANDALONE_RESULT" in registry)
+        assertTrue("recentFrameResultsByTimestamp" in registry)
+        assertTrue("logicalMetadataFallbackUsed = false" in registry)
+        assertTrue("metadata.cameraId" in registry)
+        assertTrue("PHYSICAL_RESULT_FRAME_NUMBER_MISMATCH" in registry)
+        assertTrue("PHYSICAL_RESULT_SEQUENCE_ID_MISMATCH" in registry)
+        assertTrue("FOREIGN_SENSOR_CAPTURE_RESULT" in registry)
+        assertFalse("LOGICAL_FALLBACK" in registry)
+        assertFalse("SOLE_PHYSICAL_RESULT" in registry)
+        assertFalse("physical ?: result" in registry)
+        assertFalse("physicalResultIds.single()" in registry)
     }
 }

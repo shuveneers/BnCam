@@ -75,6 +75,20 @@ data class FrameAnalysisDebugEntry(
     val pipelineGeneration: Int = -1,
     val controlRequestEpoch: Long = 0L,
     val requestProvenanceStatus: String = "UNPROVEN",
+    val sensorAuthorityId: String = "UNAVAILABLE",
+    val cameraDeviceId: String = "UNAVAILABLE",
+    val physicalCameraId: String = "UNAVAILABLE",
+    val rawSourceId: String = "UNAVAILABLE",
+    val captureResultSourceId: String = "UNAVAILABLE",
+    val characteristicsSourceId: String = "UNAVAILABLE",
+    val calibrationSourceId: String = "UNAVAILABLE",
+    val sensorAuthorityFrameNumber: Long = -1L,
+    val captureSequenceId: Int = -1,
+    val sensorMetadataTimestampNs: Long = 0L,
+    val rawMetadataTimestampMatch: Boolean = false,
+    val sensorAuthorityFallbackUsed: Boolean = false,
+    val rawProcessingSafe: Boolean = false,
+    val sensorAuthorityStatus: String = "UNAVAILABLE",
     val imageArrivalElapsedNs: Long = 0L,
     val metadataArrivalElapsedNs: Long = 0L,
     val pairCompleteElapsedNs: Long = 0L,
@@ -1738,6 +1752,20 @@ class ShotLogger(
                         "requestProvenanceStatus",
                         entry.requestProvenanceStatus
                     )
+                    kv("Sensor Authority ID", entry.sensorAuthorityId)
+                    kv("Camera Device ID", entry.cameraDeviceId)
+                    kv("Physical Camera ID", entry.physicalCameraId)
+                    kv("RAW Source ID", entry.rawSourceId)
+                    kv("CaptureResult Source ID", entry.captureResultSourceId)
+                    kv("Characteristics Source ID", entry.characteristicsSourceId)
+                    kv("Calibration Source ID", entry.calibrationSourceId)
+                    kv("Sensor Authority Frame Number", entry.sensorAuthorityFrameNumber)
+                    kv("Capture Sequence ID", entry.captureSequenceId)
+                    kv("Sensor Metadata Timestamp Ns", entry.sensorMetadataTimestampNs)
+                    kv("RAW/Metadata Timestamp Match", entry.rawMetadataTimestampMatch)
+                    kv("Fallback Used", entry.sensorAuthorityFallbackUsed)
+                    kv("Raw Processing Safe", entry.rawProcessingSafe)
+                    kv("Sensor Authority Status", entry.sensorAuthorityStatus)
                     kv("imageArrivalElapsedNs", entry.imageArrivalElapsedNs)
                     kv("metadataArrivalElapsedNs", entry.metadataArrivalElapsedNs)
                     kv("pairCompleteElapsedNs", entry.pairCompleteElapsedNs)
