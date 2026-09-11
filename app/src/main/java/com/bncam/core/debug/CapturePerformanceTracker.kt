@@ -201,8 +201,9 @@ class CapturePerformanceTracker(private val route: String) {
     }
 
     /**
-     * Persists a single terminal report. This method is safe to call from the processing/save worker.
-     * It is intentionally synchronous: the record is tiny and must survive terminal publication.
+     * Routes a single terminal report. This method is safe to call from the processing/save worker.
+     * Diagnostics remain in-memory here; durable JSONL persistence is queued to the dedicated
+     * Phase-0 writer so this method never adds filesystem I/O to the caller.
      */
     fun persistJsonLine(
         context: Context,
@@ -262,6 +263,7 @@ class CapturePerformanceTracker(private val route: String) {
                 section = "CAPTURE PERFORMANCE",
                 content = report
             )
+            Phase0PerformanceTrace.enqueueCaptureReport(context.applicationContext, report)
             Log.i(
                 "BnCamPerformance",
                 "capture_report_routed captureId=$captureId route=$route status=$status"

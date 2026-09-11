@@ -2,6 +2,7 @@ package com.bncam.core.output
 
 import android.os.SystemClock
 import android.util.Log
+import com.bncam.core.debug.Phase0PerformanceTrace
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -312,6 +313,7 @@ object CaptureProcessingQueue {
             return null
         }
         val snapshot = tracker.begin(route, captureStartedNs, temporaryPreviewPath)
+        Phase0PerformanceTrace.thumbnailShutter(snapshot.workId, route, captureStartedNs)
         val reservation = Reservation(snapshot.workId, snapshot.shotSequenceId, route)
         if (!reservation.markSubmitted()) {
             admission.release()
@@ -355,6 +357,7 @@ object CaptureProcessingQueue {
             return null
         }
         val snapshot = tracker.begin(route, captureStartedNs, temporaryPreviewPath)
+        Phase0PerformanceTrace.thumbnailShutter(snapshot.workId, route, captureStartedNs)
         Log.i(
             "BnCamProcessingQueue",
             "workId=${snapshot.workId} seqId=${snapshot.shotSequenceId} route=$route state=QUEUED " +
@@ -404,6 +407,7 @@ object CaptureProcessingQueue {
             runCatching { file.delete() }
             return false
         }
+        Phase0PerformanceTrace.bindTemporaryPreview(workId, path)
         emitStateUpdates()
         mutableSharedEvents.tryEmit(updated)
         return true

@@ -15,6 +15,7 @@ import android.util.Log
 import android.view.PixelCopy
 import android.view.Surface
 import com.bncam.core.debug.RawPreviewFirstActivationTrace
+import com.bncam.core.debug.Phase0PerformanceTrace
 import com.bncam.core.engine.ImageUtils
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -253,10 +254,21 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
     private var lastRawAcceptedLogMs: Long = 0L
     private var lastRawDrawnLogMs: Long = 0L
     private var lastDrawnRawFrame: RawPreviewFrame? = null
+    private data class Phase0PendingDisplayCommit(
+        val lensId: String,
+        val source: String,
+        val generation: Int
+    )
+    @Volatile private var phase0PendingDisplayCommit: Phase0PendingDisplayCommit? = null
+    @Volatile private var phase0DispatchingYuvFrame: Boolean = false
     private data class PendingPresentation(
         val sensorTimestampNs: Long,
         val eglFrameId: Long,
-        val queuedElapsedNs: Long
+        val queuedElapsedNs: Long,
+        val lensId: String,
+        val source: String,
+        val generation: Int,
+        val targetAuthorityAccepted: Boolean
     )
     private val pendingPresentations = ArrayDeque<PendingPresentation>()
     private val presentationLock = Any()
@@ -493,6 +505,16 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
     fun setDisplayedSource(source: ViewfinderEffectiveSource, generation: Int) {
         displayedSource = source
         displayedGeneration = generation
+        // RAW display ownership is validated again by submitRawPreviewFrame(). YUV authority is
+        // accepted only when this callback is synchronously issued while handling an actual OES
+        // frame; an eager callback-registration echo must not satisfy a lens-switch trace.
+        if (source != ViewfinderEffectiveSource.YUV || phase0DispatchingYuvFrame) {
+            phase0PendingDisplayCommit = Phase0PendingDisplayCommit(
+                lensId = diagnosticLensId,
+                source = source.name,
+                generation = generation
+            )
+        }
         acceptingRawFrames = !detached && source != ViewfinderEffectiveSource.YUV
         pendingRawFrame.getAndSet(null)?.close()
         synchronized(presentationLock) { pendingPresentations.clear() }
@@ -549,6 +571,18 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
         // previous completion, replace it: the viewfinder must never build latency or back-pressure
         // the authoritative warm RAW/ZSL stream.
         pendingRawFrame.getAndSet(frame)?.close()
+        Phase0PerformanceTrace.cameraFrameReceived(
+            lensId = diagnosticLensId,
+            source = frame.source.name,
+            generation = frame.pipelineGeneration,
+            sensorTimestampNs = frame.sensorTimestampNs
+        )
+        Phase0PerformanceTrace.targetSensorFrameReceived(
+            lensId = diagnosticLensId,
+            source = frame.source.name,
+            generation = frame.pipelineGeneration,
+            sensorTimestampNs = frame.sensorTimestampNs
+        )
         RawPreviewCadenceDiagnostics.viewAccepted(
             frame.source,
             frame.pipelineGeneration,
@@ -700,6 +734,7 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
         }
         collectPresentedRawFrames()
         val useRaw = displayedSource != ViewfinderEffectiveSource.YUV
+        var phase0YuvFrameUpdatedThisDraw = false
         // Drain the OES producer even while the last-known-good RAW texture is still displayed.
         // This lets the transition owner validate the exact Camera2 sensor timestamp of the first
         // YUV frame from a replacement session before switching display ownership to YUV.
@@ -710,7 +745,31 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
                 val surfaceTimestampNs = surfaceTexture?.timestamp ?: 0L
                 oesFrameAvailable = false
                 if (!useRaw) displayReady = true
-                if (surfaceTimestampNs > 0L) onYuvFrameAvailable?.invoke(surfaceTimestampNs)
+                if (surfaceTimestampNs > 0L) {
+                    phase0YuvFrameUpdatedThisDraw = true
+                    Phase0PerformanceTrace.cameraFrameReceived(
+                        lensId = diagnosticLensId,
+                        source = "YUV",
+                        generation = displayedGeneration,
+                        sensorTimestampNs = surfaceTimestampNs
+                    )
+                    phase0DispatchingYuvFrame = true
+                    try {
+                        onYuvFrameAvailable?.invoke(surfaceTimestampNs)
+                    } finally {
+                        phase0DispatchingYuvFrame = false
+                    }
+                    phase0PendingDisplayCommit
+                        ?.takeIf { it.source == ViewfinderEffectiveSource.YUV.name }
+                        ?.let { accepted ->
+                            Phase0PerformanceTrace.targetSensorFrameReceived(
+                                lensId = accepted.lensId,
+                                source = accepted.source,
+                                generation = accepted.generation,
+                                sensorTimestampNs = surfaceTimestampNs
+                            )
+                        }
+                }
             } catch (e: Exception) {
                 // Ignore transient update exceptions during surface teardown or stream switch.
             }
@@ -933,6 +992,46 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
             yuvFramesDrawnCount++
         }
 
+        val committedLensId = diagnosticLensId
+        val committedSource = lastDrawnSource
+        val committedGeneration = lastDrawnGeneration
+        val committedSensorTimestampNs = lastDrawnSensorTimestampNs
+        val phase0PendingCommit = phase0PendingDisplayCommit
+        val phase0TargetAuthorityAccepted = phase0PendingCommit != null &&
+            phase0PendingCommit.lensId == committedLensId &&
+            phase0PendingCommit.source == committedSource &&
+            phase0PendingCommit.generation == committedGeneration
+        val phase0NewFrameCommitted = if (useRaw) {
+            uploadedRawFrame != null
+        } else {
+            phase0YuvFrameUpdatedThisDraw || phase0TargetAuthorityAccepted
+        }
+        if (phase0NewFrameCommitted) {
+            Phase0PerformanceTrace.viewfinderFrameCommitted(
+                lensId = committedLensId,
+                source = committedSource,
+                generation = committedGeneration,
+                sensorTimestampNs = committedSensorTimestampNs,
+                targetAuthorityAccepted = phase0TargetAuthorityAccepted
+            )
+            if (phase0TargetAuthorityAccepted) phase0PendingDisplayCommit = null
+            if (!useRaw) {
+                // GLSurfaceView does not expose a SurfaceFlinger present fence for OES/YUV. Report
+                // the first UI-vsync after GL submit as an explicitly-labelled presentation proxy.
+                postOnAnimation {
+                    Phase0PerformanceTrace.viewfinderFramePresented(
+                        lensId = committedLensId,
+                        source = committedSource,
+                        generation = committedGeneration,
+                        sensorTimestampNs = committedSensorTimestampNs,
+                        presentationTimestampNs = SystemClock.elapsedRealtimeNanos(),
+                        presentationSignal = "NEXT_UI_VSYNC_AFTER_GL_SUBMIT_PROXY",
+                        targetAuthorityAccepted = phase0TargetAuthorityAccepted
+                    )
+                }
+            }
+        }
+
         gpuFrameToRetireAfterDraw?.let { frame ->
             // Fence retirement occurs only after a successor texture has been drawn. This preserves
             // the currently displayed AHB across arbitrary redraws without introducing a GL wait.
@@ -959,7 +1058,11 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
                         PendingPresentation(
                             sensorTimestampNs = frame.sensorTimestampNs,
                             eglFrameId = eglFrameId,
-                            queuedElapsedNs = SystemClock.elapsedRealtimeNanos()
+                            queuedElapsedNs = SystemClock.elapsedRealtimeNanos(),
+                            lensId = diagnosticLensId,
+                            source = frame.source.name,
+                            generation = frame.pipelineGeneration,
+                            targetAuthorityAccepted = phase0TargetAuthorityAccepted
                         )
                     )
                 }
@@ -1111,6 +1214,15 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
                     RawPreviewFirstActivationTrace.displayPresented(
                         sensorTimestampNs = pending.sensorTimestampNs,
                         displayPresentMonotonicNs = presentTimeNs
+                    )
+                    Phase0PerformanceTrace.viewfinderFramePresented(
+                        lensId = pending.lensId,
+                        source = pending.source,
+                        generation = pending.generation,
+                        sensorTimestampNs = pending.sensorTimestampNs,
+                        presentationTimestampNs = presentTimeNs,
+                        presentationSignal = "EGL_DISPLAY_PRESENT_TIME",
+                        targetAuthorityAccepted = pending.targetAuthorityAccepted
                     )
                     iterator.remove()
                 } else if (now - pending.queuedElapsedNs > PRESENTATION_QUERY_TIMEOUT_NS) {

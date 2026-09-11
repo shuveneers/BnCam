@@ -39,6 +39,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
 import com.bncam.R
+import com.bncam.core.debug.Phase0PerformanceTrace
 import com.bncam.core.output.CaptureWorkSnapshot
 import com.bncam.core.output.CaptureWorkState
 import kotlinx.coroutines.delay
@@ -134,6 +135,19 @@ internal fun CaptureThumbnailFeedback(
                 AsyncImage(
                     model = thumbnailModel,
                     contentDescription = "Latest capture",
+                    onSuccess = {
+                        latestSnapshot?.let { snapshot ->
+                            Phase0PerformanceTrace.thumbnailUiPresented(
+                                workId = snapshot.workId,
+                                modelKind = when {
+                                    feedback.busy && snapshot.temporaryPreviewPath != null -> "TEMPORARY_VIEWFINDER_JPEG"
+                                    snapshot.thumbnailUri != null -> "PUBLISHED_THUMBNAIL_URI"
+                                    snapshot.publishedUri != null -> "PUBLISHED_OUTPUT_URI"
+                                    else -> "FALLBACK_MODEL"
+                                }
+                            )
+                        }
+                    },
                     contentScale = ContentScale.Crop,
                     modifier = Modifier.fillMaxSize()
                 )

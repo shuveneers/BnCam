@@ -30,6 +30,7 @@ import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.lifecycle.lifecycleScope
 import com.bncam.core.debug.DiagnosticsAggregator
+import com.bncam.core.debug.Phase0PerformanceTrace
 import com.bncam.data.settings.SettingsRepository
 import com.bncam.ui.navigation.AppNavigation
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -51,7 +52,9 @@ class MainActivity : ComponentActivity() {
     private var lastHardwareCaptureElapsedMs: Long = 0L
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        val activityOnCreateNs = SystemClock.elapsedRealtimeNanos()
         super.onCreate(savedInstanceState)
+        Phase0PerformanceTrace.activityOnCreate(activityOnCreateNs)
         repository = SettingsRepository(this)
         lifecycleScope.launch {
             repository.volumeButtonActionFlow.collectLatest { action ->
@@ -90,6 +93,15 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        Phase0PerformanceTrace.activityOnResume()
+    }
+
+    override fun onPause() {
+        Phase0PerformanceTrace.activityOnPause()
+        super.onPause()
+    }
 
     override fun onStart() {
         super.onStart()

@@ -3,6 +3,7 @@ package com.bncam.ui.screens.capture
 import android.content.Context
 import android.graphics.Bitmap
 import android.util.Log
+import com.bncam.core.debug.Phase0PerformanceTrace
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
@@ -41,7 +42,8 @@ object TemporaryPreviewCapture {
 
     suspend fun writeTemporaryPreview(
         context: Context,
-        bitmap: Bitmap
+        bitmap: Bitmap,
+        phase0TraceToken: Long? = null
     ): String? = withContext(Dispatchers.IO) {
         val file = try {
             File.createTempFile("thumb_", ".jpg", context.cacheDir)
@@ -50,6 +52,9 @@ object TemporaryPreviewCapture {
             return@withContext null
         }
 
+        phase0TraceToken?.let {
+            Phase0PerformanceTrace.previewPersistStarted(it, file.absolutePath)
+        }
         try {
             val compressed = file.outputStream().buffered().use { output ->
                 bitmap.compress(
@@ -63,6 +68,7 @@ object TemporaryPreviewCapture {
                 file.delete()
                 null
             } else {
+                phase0TraceToken?.let { Phase0PerformanceTrace.previewPersistDone(it) }
                 file.absolutePath
             }
         } catch (error: Throwable) {
@@ -76,9 +82,11 @@ object TemporaryPreviewCapture {
         previewView: FocusPeakingView?,
         timeoutMs: Long = PREVIEW_TIMEOUT_MS
     ): String? {
+        val phase0TraceToken = Phase0PerformanceTrace.beginPreviewSnapshot()
         val bitmap = awaitTemporaryPreviewBitmap(previewView, timeoutMs) ?: return null
+        Phase0PerformanceTrace.previewFrameFrozen(phase0TraceToken)
         return try {
-            writeTemporaryPreview(context, bitmap)
+            writeTemporaryPreview(context, bitmap, phase0TraceToken)
         } finally {
             if (!bitmap.isRecycled) {
                 bitmap.recycle()

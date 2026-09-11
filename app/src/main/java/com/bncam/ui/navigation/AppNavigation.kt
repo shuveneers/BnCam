@@ -1,6 +1,7 @@
 package com.bncam.ui.navigation
 
 import android.os.SystemClock
+import com.bncam.core.debug.Phase0PerformanceTrace
 import android.util.Log
 import androidx.compose.runtime.*
 import androidx.compose.ui.platform.LocalContext
@@ -339,6 +340,7 @@ fun AppNavigation() {
         // Activity lifecycle and real lens/format transitions, never NavBackStackEntry lifetime.
         if (initialCameraRouteReleased) {
             LaunchedEffect(Unit) {
+                Phase0PerformanceTrace.cameraScreenComposed()
                 logNavigationEvent("CAMERA_SCREEN_COMPOSED", Routes.CAMERA)
             }
             CameraScreen(
@@ -379,6 +381,10 @@ fun AppNavigation() {
                 isRootCameraRoute = isRootCameraRoute,
                 onLensSelected = { selectedLens ->
                     if (selectedLens.id != activeLens.id && !lensSwitchResolutionInFlight) {
+                        Phase0PerformanceTrace.beginLensSwitch(
+                            fromLensId = activeLens.id,
+                            targetLensId = selectedLens.id
+                        )
                         val currentProfileIndex = profileIndexFromProfileId(activeProfile.id)
                         val targetProfileCount = preferences
                             ?.get(intPreferencesKey("profile_count_${selectedLens.id}"))
@@ -397,9 +403,14 @@ fun AppNavigation() {
                         } ?: targetProfiles.firstOrNull()
 
                         if (targetProfile != null) {
+                            Phase0PerformanceTrace.lensRouteResolutionDone(
+                                targetLensId = selectedLens.id,
+                                detail = "profile=${targetProfile.id}"
+                            )
                             lensSwitchResolutionInFlight = true
                             // Publish the coherent lens/profile pair immediately. Camera2 can start
                             // its transition in this frame instead of waiting for DataStore I/O.
+                            Phase0PerformanceTrace.lensTransitionStarted(selectedLens.id)
                             activeProfile = targetProfile
                             activeLens = selectedLens
                             requestedProfileIndexAfterLensSwitch = null
@@ -414,6 +425,11 @@ fun AppNavigation() {
                                     lensSwitchResolutionInFlight = false
                                 }
                             }
+                        } else {
+                            Phase0PerformanceTrace.lensSwitchCancelled(
+                                targetLensId = selectedLens.id,
+                                reason = "no_target_profile"
+                            )
                         }
                     }
                 }
