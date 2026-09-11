@@ -213,14 +213,15 @@ public:
 
 
     /**
-     * Phase 5: configure one release-approved Student package on the existing
-     * process-scoped Vulkan runtime. Test/unapproved packages fail closed.
+     * Configure the release-approved adaptive-v2 Neural package on the existing
+     * process-scoped Vulkan runtime. Production capture is serialized, so one
+     * in-flight slot is the normal production concurrency contract.
      */
     bool configureSpectraNeuralModel(
             const void* packageBytes,
             std::size_t packageSize,
             bool releaseApproved,
-            std::uint32_t inFlightSlots = 3u
+            std::uint32_t inFlightSlots = 1u
     ) noexcept;
 
     /** Clear neural model/resources without changing the authoritative Vulkan runtime. */

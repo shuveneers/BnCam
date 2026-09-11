@@ -1,9 +1,20 @@
 #include "../SpectraNeuralProductionPolicy.h"
 
 #include <cassert>
+#include <cmath>
 #include <iostream>
 
 using namespace bncam::spectra::neural;
+
+static_assert(kBaseSpatialConditioningChannelCount == 14u);
+static_assert(kGlobalConditioningValueCount == 18u);
+static_assert(!kAdaptiveV2Prod1ConsumesExplicitGainConditioning);
+static_assert(kAdaptiveV2Prod1NeutralAnalogGain == 1.0f);
+static_assert(kAdaptiveV2Prod1NeutralDigitalGain == 1.0f);
+
+static bool near(float a, float b, float epsilon = 1.0e-6f) {
+    return std::abs(a - b) <= epsilon;
+}
 
 static NeuralProductionFrameEvidence validEvidence() {
     NeuralProductionFrameEvidence in{};
@@ -36,6 +47,61 @@ static NeuralProductionFrameEvidence validEvidence() {
 
 int main() {
     {
+        const auto config = adaptiveV2Prod1ConditioningConfig();
+        assert(config.valid());
+        assert(config.logSigmaFloor == 1.0e-8f);
+        assert(config.headroomSpan == 0.08f);
+        assert(config.clippingEpsilon == 0.0f);
+    }
+    {
+        // Frozen 18-value ordering/formulas used by training and runtime.
+        auto in = validEvidence();
+        in.framePhysics.exposureTimeSeconds = 0.01;
+        in.framePhysics.analogGain = kAdaptiveV2Prod1NeutralAnalogGain;
+        in.framePhysics.digitalGain = kAdaptiveV2Prod1NeutralDigitalGain;
+        in.framePhysics.bitDepth = 10u;
+        in.noiseModelTrust = 0.90f;
+        in.blackResidual.trust = 0.85f;
+        in.remainingLsc.mapTrust = 0.80f;
+        in.structuredNoise.rowPeriodicity = 0.10f;
+        in.structuredNoise.columnPeriodicity = 0.05f;
+        in.structuredNoise.fixedPattern = 0.15f;
+        in.structuredNoise.dsnuLike = 0.08f;
+        in.structuredNoise.prnuLike = 0.04f;
+        in.structuredNoise.lowFrequencyResidual = 0.12f;
+        in.structuredNoise.lowFrequencyChroma = 0.07f;
+        in.structuredNoise.channelImbalance = 0.03f;
+        in.structuredNoise.spatialBlackDrift = 0.02f;
+        in.structuredNoise.rareReadoutPattern = 0.01f;
+        in.structuredNoise.confidence = 0.75f;
+
+        const auto prepared = prepareNeuralProductionContext(in);
+        assert(prepared.structuralOodSafe);
+        const auto global = buildGlobalConditioning(prepared.core, prepared.framePhysics);
+        assert(global.valid());
+        const auto values = encodeGlobalConditioning(global);
+
+        assert(near(values[globalConditioningIndex(GlobalConditioningField::LogExposureSeconds)],
+                    static_cast<float>(std::log(0.01))));
+        assert(near(values[globalConditioningIndex(GlobalConditioningField::LogAnalogGain)], 0.0f));
+        assert(near(values[globalConditioningIndex(GlobalConditioningField::LogDigitalGain)], 0.0f));
+        assert(near(values[globalConditioningIndex(GlobalConditioningField::BitDepthOver32)], 10.0f / 32.0f));
+        assert(near(values[globalConditioningIndex(GlobalConditioningField::NoiseModelTrust)], 0.90f));
+        assert(near(values[globalConditioningIndex(GlobalConditioningField::BlackLevelTrust)], 0.85f));
+        assert(near(values[globalConditioningIndex(GlobalConditioningField::RemainingLscTrust)], 0.80f));
+        assert(near(values[globalConditioningIndex(GlobalConditioningField::RowPeriodicity)], 0.10f));
+        assert(near(values[globalConditioningIndex(GlobalConditioningField::ColumnPeriodicity)], 0.05f));
+        assert(near(values[globalConditioningIndex(GlobalConditioningField::FixedPattern)], 0.15f));
+        assert(near(values[globalConditioningIndex(GlobalConditioningField::DsnuLike)], 0.08f));
+        assert(near(values[globalConditioningIndex(GlobalConditioningField::PrnuLike)], 0.04f));
+        assert(near(values[globalConditioningIndex(GlobalConditioningField::LowFrequencyResidual)], 0.12f));
+        assert(near(values[globalConditioningIndex(GlobalConditioningField::LowFrequencyChroma)], 0.07f));
+        assert(near(values[globalConditioningIndex(GlobalConditioningField::ChannelImbalance)], 0.03f));
+        assert(near(values[globalConditioningIndex(GlobalConditioningField::SpatialBlackDrift)], 0.02f));
+        assert(near(values[globalConditioningIndex(GlobalConditioningField::RareReadoutPattern)], 0.01f));
+        assert(near(values[globalConditioningIndex(GlobalConditioningField::StructuredConfidence)], 0.75f));
+    }
+    {
         auto in = validEvidence();
         in.mutationMode = NeuralProductionMutationMode::Off;
         in.rawWidth = 0u;
@@ -55,18 +121,18 @@ int main() {
         assert(out.framePhysics.valid());
     }
     {
-        // Student-v1 has no active gain FiLM projection. Missing explicit analog/digital split
-        // therefore stays structurally safe when the caller supplies neutral 1/1 placeholders.
+        // adaptive-v2-prod1 requires neutral gain slots after the accepted
+        // zero_forbidden_gain_film_columns_v1 production adapter.
         auto in = validEvidence();
         in.explicitGainMetadataValid = false;
-        in.framePhysics.analogGain = 1.0f;
-        in.framePhysics.digitalGain = 1.0f;
+        in.framePhysics.analogGain = kAdaptiveV2Prod1NeutralAnalogGain;
+        in.framePhysics.digitalGain = kAdaptiveV2Prod1NeutralDigitalGain;
         const auto out = prepareNeuralProductionContext(in);
         assert(out.structuralOodSafe);
         assert(out.structuralBypassReason == NeuralBypassReason::None);
     }
     {
-        // Invalid physics still fails closed; the relaxed gate never licenses malformed values.
+        // Invalid physics still fails closed.
         auto in = validEvidence();
         in.explicitGainMetadataValid = false;
         in.framePhysics.analogGain = 0.0f;

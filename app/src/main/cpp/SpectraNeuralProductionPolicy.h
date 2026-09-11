@@ -9,6 +9,24 @@
 
 namespace bncam::spectra::neural {
 
+// adaptive-v2-prod1 production-conditioning contract.
+//
+// The accepted Vulkan package applies zero_forbidden_gain_film_columns_v1.
+// Its provenance records exact output parity after zeroing global columns
+// 1 (analog gain) and 2 (digital gain). Production therefore feeds neutral
+// 1x gain values and never synthesizes a gain split from ISO for this package.
+constexpr bool kAdaptiveV2Prod1ConsumesExplicitGainConditioning = false;
+constexpr float kAdaptiveV2Prod1NeutralAnalogGain = 1.0f;
+constexpr float kAdaptiveV2Prod1NeutralDigitalGain = 1.0f;
+
+inline SpectraNeuralConditioningConfig adaptiveV2Prod1ConditioningConfig() noexcept {
+    SpectraNeuralConditioningConfig config{};
+    config.logSigmaFloor = 1.0e-8f;
+    config.headroomSpan = 0.08f;
+    config.clippingEpsilon = 0.0f;
+    return config;
+}
+
 // Production mutation authority. Values intentionally mirror the existing
 // FinalSensorCalibrationNative::spectraProcessingMode ABI without including
 // NativeRenderQualityConfig.h here.
@@ -40,8 +58,7 @@ struct NeuralProductionFrameEvidence {
     StructuredNoiseEvidence structuredNoise{};
 
     // Physics must come from explicit capture metadata or an equally explicit
-    // upstream calibration. In particular, Phase 5 never fabricates
-    // analogGain from ISO/base-ISO heuristics.
+    // upstream calibration. No ISO/base-ISO gain split may be fabricated.
     NeuralFramePhysicsContext framePhysics{};
     bool explicitGainMetadataValid = false;
 
@@ -200,11 +217,11 @@ inline NeuralProductionPreparedContext prepareNeuralProductionContext(
         out.structuralBypassReason = NeuralBypassReason::MissingRequiredLsc;
         return out;
     }
-    // Student-v1 does not consume an active analog/digital gain FiLM projection: the frozen
-    // release contract has those projections at exact zero. Therefore a missing reliable gain
-    // split must not force every production frame to bypass. The caller supplies neutral 1/1
-    // placeholders without synthesizing anything from ISO. A future model that activates gain
-    // conditioning must version its package contract and add an explicit required-metadata gate.
+    // adaptive-v2-prod1 does not consume active analog/digital gain FiLM projections.
+    // Its accepted deployment adapter zeros global columns 1/2 with exact frozen-set
+    // output parity, so neutral 1/1 is required model input rather than a fallback.
+    // A future package that activates gain conditioning must version its package
+    // contract and add an explicit required-metadata gate.
     if (!out.framePhysics.valid()) {
         out.structuralBypassReason = NeuralBypassReason::OodUnsafe;
         return out;

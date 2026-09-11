@@ -68,7 +68,6 @@ void accumulateEffectSample(uint packedBase, inout vec4 sums[EFFECT_SLOT_COUNT])
     sums[12] += posterior;
 
     if (!finiteVec4(x) || !finiteVec4(clean)) {
-        // Preserve posterior truth while making the optional effect reducer observably unavailable.
         sums[0].x = uintBitsToFloat(0x7fc00000u);
         return;
     }
@@ -125,7 +124,8 @@ void reduceAndWrite(uint outputGroupIndex, uint slotCount) {
     if (lid == 0u) {
         const uint outBase = outputGroupIndex * slotCount * 4u;
         for (uint slot = 0u; slot < slotCount; ++slot) {
-            const vec4 value = reductionPartial[slot * LOCAL_COUNT];
+            vec4 value;
+            value = reductionPartial[slot * LOCAL_COUNT];
             dst.data[outBase + slot * 4u + 0u] = value.x;
             dst.data[outBase + slot * 4u + 1u] = value.y;
             dst.data[outBase + slot * 4u + 2u] = value.z;
@@ -141,8 +141,6 @@ void main() {
         vec4 sums[EFFECT_SLOT_COUNT];
         for (uint slot = 0u; slot < EFFECT_SLOT_COUNT; ++slot) sums[slot] = vec4(0.0);
 
-        // Each invocation samples a 4x4 packed block. One 8x8 workgroup therefore summarizes
-        // up to 32x32 packed pixels (64x64 RAW sensels) without a full-frame CPU readback.
         const uint startX = gl_WorkGroupID.x * 32u + gl_LocalInvocationID.x * 4u;
         const uint startY = gl_WorkGroupID.y * 32u + gl_LocalInvocationID.y * 4u;
         for (uint dy = 0u; dy < 4u; ++dy) {
@@ -166,7 +164,8 @@ void main() {
 
     const uint px = gl_GlobalInvocationID.x;
     const uint py = gl_GlobalInvocationID.y;
-    const bool insidePacked = px < pc.packedWidth && py < pc.packedHeight;
+    bool insidePacked;
+    insidePacked = (px < pc.packedWidth) && (py < pc.packedHeight);
     const uint packedBase = insidePacked ? (py * pc.packedWidth + px) * 4u : 0u;
 
     if (pc.mode == 2u) {

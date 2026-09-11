@@ -60,8 +60,11 @@ Java_com_bncam_core_vulkan_VulkanNativeBridge_nativeConfigureSpectraNeuralModel(
     std::vector<std::uint8_t> bytes(static_cast<std::size_t>(size));
     env->GetByteArrayRegion(packageBytes, 0, size, reinterpret_cast<jbyte*>(bytes.data()));
     if (env->ExceptionCheck()) return JNI_FALSE;
+    // Production Neural capture is serialized by neuralOrchestrationMutex_ and
+    // run() resolves before returning. One scratch slot is therefore the exact
+    // production concurrency contract; extra slots only duplicate GPU memory.
     return VulkanRuntime::instance().configureSpectraNeuralModel(
-        bytes.data(), bytes.size(), true, 3u
+        bytes.data(), bytes.size(), true, 1u
     ) ? JNI_TRUE : JNI_FALSE;
 }
 

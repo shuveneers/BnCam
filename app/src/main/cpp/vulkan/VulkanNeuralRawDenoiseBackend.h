@@ -26,7 +26,7 @@ struct NeuralVulkanModelIdentity {
 class VulkanNeuralRawDenoiseBackend final : public bncam::spectra::neural::INeuralRawDenoiseBackend {
 public:
  VulkanNeuralRawDenoiseBackend()=default;~VulkanNeuralRawDenoiseBackend() override;VulkanNeuralRawDenoiseBackend(const VulkanNeuralRawDenoiseBackend&)=delete;VulkanNeuralRawDenoiseBackend& operator=(const VulkanNeuralRawDenoiseBackend&)=delete;
- bool initialize(VkPhysicalDevice,VkDevice,VkQueue,VkCommandPool,VulkanAllocatorOwner&,std::mutex& externalQueueMutex,const void* packageBytes,std::size_t packageSize,std::uint32_t inFlightSlots=3u) noexcept;
+ bool initialize(VkPhysicalDevice,VkDevice,VkQueue,VkCommandPool,VulkanAllocatorOwner&,std::mutex& externalQueueMutex,const void* packageBytes,std::size_t packageSize,std::uint32_t inFlightSlots=1u) noexcept;
  void destroy() noexcept; const char* backendName() const noexcept override{return "VulkanNeuralRawDenoiseBackend";} bool available() const noexcept override{return ready_.load();}
  bncam::spectra::neural::NeuralRawDenoiseResult run(const bncam::spectra::neural::NeuralRawDenoiseRequest&) noexcept override;
  NeuralVulkanSubmissionTicket submitAsync(const bncam::spectra::neural::NeuralRawDenoiseRequest&) noexcept; bncam::spectra::neural::NeuralRawDenoiseResult resolve(const NeuralVulkanSubmissionTicket&,std::uint64_t timeoutNs=UINT64_MAX) noexcept;

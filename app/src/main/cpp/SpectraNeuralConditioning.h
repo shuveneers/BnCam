@@ -13,6 +13,34 @@ namespace bncam::spectra::neural {
 
 constexpr std::uint32_t kSpectraNeuralConditioningSchemaVersion = 1;
 constexpr std::size_t kBaseSpatialConditioningChannelCount = 14;
+constexpr std::size_t kGlobalConditioningValueCount = 18;
+
+// Frozen field order shared with spectra_train.contracts.GLOBAL_CONDITIONING_FIELDS.
+// This is a model ABI. Reordering requires a versioned package/model contract.
+enum class GlobalConditioningField : std::uint8_t {
+    LogExposureSeconds = 0,
+    LogAnalogGain = 1,
+    LogDigitalGain = 2,
+    BitDepthOver32 = 3,
+    NoiseModelTrust = 4,
+    BlackLevelTrust = 5,
+    RemainingLscTrust = 6,
+    RowPeriodicity = 7,
+    ColumnPeriodicity = 8,
+    FixedPattern = 9,
+    DsnuLike = 10,
+    PrnuLike = 11,
+    LowFrequencyResidual = 12,
+    LowFrequencyChroma = 13,
+    ChannelImbalance = 14,
+    SpatialBlackDrift = 15,
+    RareReadoutPattern = 16,
+    StructuredConfidence = 17
+};
+
+constexpr std::size_t globalConditioningIndex(GlobalConditioningField field) noexcept {
+    return static_cast<std::size_t>(field);
+}
 
 enum class SpatialConditioningChannel : std::uint8_t {
     RawR = 0,
@@ -61,8 +89,7 @@ struct NeuralFramePhysicsContext {
 struct SpectraNeuralConditioningConfig {
     // Numerical floor only; it prevents log(0) and is not a denoise-strength knob.
     float logSigmaFloor = 1.0e-8f;
-    // Must be set deliberately by the inference/model contract. Phase 1 does
-    // not choose a tuning value for highlight protection.
+    // Must be set deliberately by the inference/model contract.
     float headroomSpan = 0.0f;
     // Numerical clipping tolerance in normalized sensor space.
     float clippingEpsilon = 0.0f;
@@ -153,6 +180,50 @@ inline SpectraNeuralGlobalConditioning buildGlobalConditioning(
     out.remainingLscExpected = snapshot.remainingLsc.remainingCorrectionExpected;
     out.structuredNoise = snapshot.structuredNoise;
     return out;
+}
+
+// Exact C++ representation of the frozen 18-value training/runtime global vector.
+// Formula and order must remain identical to spectra_train.contracts.physics_global_vector.
+inline std::array<float, kGlobalConditioningValueCount> encodeGlobalConditioning(
+        const SpectraNeuralGlobalConditioning& global) noexcept {
+    std::array<float, kGlobalConditioningValueCount> values{};
+    values[globalConditioningIndex(GlobalConditioningField::LogExposureSeconds)] =
+            static_cast<float>(std::log(std::max(global.frame.exposureTimeSeconds, 1.0e-12)));
+    values[globalConditioningIndex(GlobalConditioningField::LogAnalogGain)] =
+            std::log(std::max(global.frame.analogGain, 1.0e-8f));
+    values[globalConditioningIndex(GlobalConditioningField::LogDigitalGain)] =
+            std::log(std::max(global.frame.digitalGain, 1.0e-8f));
+    values[globalConditioningIndex(GlobalConditioningField::BitDepthOver32)] =
+            static_cast<float>(global.frame.bitDepth) / 32.0f;
+    values[globalConditioningIndex(GlobalConditioningField::NoiseModelTrust)] =
+            global.noiseModelTrust;
+    values[globalConditioningIndex(GlobalConditioningField::BlackLevelTrust)] =
+            global.blackLevelTrust;
+    values[globalConditioningIndex(GlobalConditioningField::RemainingLscTrust)] =
+            global.remainingLscTrust;
+    values[globalConditioningIndex(GlobalConditioningField::RowPeriodicity)] =
+            global.structuredNoise.rowPeriodicity;
+    values[globalConditioningIndex(GlobalConditioningField::ColumnPeriodicity)] =
+            global.structuredNoise.columnPeriodicity;
+    values[globalConditioningIndex(GlobalConditioningField::FixedPattern)] =
+            global.structuredNoise.fixedPattern;
+    values[globalConditioningIndex(GlobalConditioningField::DsnuLike)] =
+            global.structuredNoise.dsnuLike;
+    values[globalConditioningIndex(GlobalConditioningField::PrnuLike)] =
+            global.structuredNoise.prnuLike;
+    values[globalConditioningIndex(GlobalConditioningField::LowFrequencyResidual)] =
+            global.structuredNoise.lowFrequencyResidual;
+    values[globalConditioningIndex(GlobalConditioningField::LowFrequencyChroma)] =
+            global.structuredNoise.lowFrequencyChroma;
+    values[globalConditioningIndex(GlobalConditioningField::ChannelImbalance)] =
+            global.structuredNoise.channelImbalance;
+    values[globalConditioningIndex(GlobalConditioningField::SpatialBlackDrift)] =
+            global.structuredNoise.spatialBlackDrift;
+    values[globalConditioningIndex(GlobalConditioningField::RareReadoutPattern)] =
+            global.structuredNoise.rareReadoutPattern;
+    values[globalConditioningIndex(GlobalConditioningField::StructuredConfidence)] =
+            global.structuredNoise.confidence;
+    return values;
 }
 
 struct SpatialConditioningCell {

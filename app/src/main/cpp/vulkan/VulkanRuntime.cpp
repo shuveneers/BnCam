@@ -1084,7 +1084,7 @@ bool VulkanRuntime::configureSpectraNeuralModel(
     // A package cannot self-promote from a test fixture to production. Release
     // approval is an explicit caller contract supplied by the model deployment layer.
     if (!releaseApproved || packageBytes == nullptr || packageSize == 0u ||
-        inFlightSlots < 2u || inFlightSlots > 4u) {
+        inFlightSlots < 1u || inFlightSlots > 4u) {
         clearSpectraNeuralModel();
         return false;
     }
@@ -1384,7 +1384,9 @@ SpectraRawFinalizeResult VulkanRuntime::executeSpectraNeuralThenRawFinalizeFromR
                             if (trace.failureCode == NeuralBackendFailureCode::None) {
                                 trace.failureCode = NeuralBackendFailureCode::DispatchFailed;
                             }
-                            trace.status = "FAIL_BYPASS_NEURAL_PUBLICATION";
+                            trace.status = neuralResult.status.empty() || neuralResult.status == "NOT_RUN"
+                                    ? "FAIL_BYPASS_NEURAL_PUBLICATION"
+                                    : "FAIL_BYPASS_NEURAL_PUBLICATION_CAUSE_" + neuralResult.status;
                             trace.neuralPublished = false;
                             trace.originalPublished = true;
                             result = runExactBaselineFinalize();

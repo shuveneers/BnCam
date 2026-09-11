@@ -407,7 +407,15 @@ NeuralProductionGpuResult VulkanNeuralRawProductionBridge::execute(
     const NeuralRawDenoiseResult neural=neuralBackend.run(nr);
     out.neuralKernelDispatches=neural.dispatchedKernelCount;
     out.failureCode=neural.failureCode;out.bypassReason=neural.bypassReason;
-    if(selectNeuralPublicationSource(decision,neural)!=NeuralPublicationSource::NeuralOutput){out.status="FAIL_BYPASS_NEURAL_"+std::string(neuralBypassReasonName(neural.bypassReason));out.totalWallMs=elapsedMs(started);return out;}
+    if(selectNeuralPublicationSource(decision,neural)!=NeuralPublicationSource::NeuralOutput){
+        out.status="FAIL_BYPASS_NEURAL_"+std::string(neuralBypassReasonName(neural.bypassReason));
+        const auto backendDiagnostics=neuralBackend.diagnostics();
+        if(!backendDiagnostics.lastFailure.empty()&&backendDiagnostics.lastFailure!="none"){
+            out.status+="_"+backendDiagnostics.lastFailure;
+        }
+        out.totalWallMs=elapsedMs(started);
+        return out;
+    }
 
     // Phase-6 recovery truth: one compact GPU reduction measures the actual neural mutation
     // while preserving the existing posterior feedback. This does not alter neural pixels or
