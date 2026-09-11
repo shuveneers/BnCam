@@ -355,6 +355,90 @@ class ShotLogger(
         }
     }
 
+    @Synchronized
+    fun finalizeFailureWithPublicDiagnostics(
+        attemptId: String,
+        stage: String,
+        exception: Throwable
+    ): Boolean {
+        // Never redirect a late async failure into a newer shot folder. Deferred RAW work uses
+        // forkForDeferredWork(), so the attempt id is the immutable authority for this logger.
+        if (activeAttemptId != attemptId || activeAttemptState != CaptureStatusState.STARTED) {
+            safeLogW(
+                tag,
+                "Ignoring failure diagnostics for attempt $attemptId; activeAttemptId=$activeAttemptId state=$activeAttemptState"
+            )
+            return false
+        }
+
+        val message = exception.message?.takeIf { it.isNotBlank() } ?: "no_message"
+        recordWarning(
+            group = "Capture Terminal Failure",
+            message = "$stage: ${exception.javaClass.simpleName}: $message",
+            severity = "ERROR"
+        )
+        val finalized = finalizeAttemptOnce(
+            attemptId = attemptId,
+            terminalState = CaptureStatusState.FAILED,
+            stage = stage,
+            exception = exception
+        )
+        if (!finalized) return false
+
+        // A failure can happen before DiagnosticPayload exists (for example during candidate
+        // admission, RAW materialization, async ISP execution or save publication). Previously
+        // that left all public files permanently at "Waiting for capture diagnostics", erasing
+        // the only actionable failure stage. Publish a bounded terminal record instead.
+        if (lastDiagnosticPayload == null) {
+            fun terminalFile(title: String, includePipelineEvents: Boolean = false): String = buildString {
+                header(title)
+                section("Terminal Capture Failure")
+                kv("Folder", currentPublicFolderName)
+                kv("Attempt ID", attemptId)
+                kv("Capture succeeded", "no")
+                kv("Terminal state", CaptureStatusState.FAILED.name)
+                kv("Failure stage", stage)
+                kv("Exception class", exception.javaClass.name)
+                kv("Exception message", message)
+                kv("Diagnostic payload", "UNAVAILABLE_BEFORE_TERMINAL_FAILURE")
+
+                if (includePipelineEvents) {
+                    section("Last Recorded Pipeline Events")
+                    val recent = pipelineEvents.takeLast(32)
+                    if (recent.isEmpty()) {
+                        kv("Events", "none recorded before failure")
+                    } else {
+                        recent.forEachIndexed { index, event ->
+                            kv("Event ${index + 1}", "${event.group} / ${event.key} = ${event.value}")
+                        }
+                    }
+                }
+
+                if (warnings.isNotEmpty()) {
+                    section("Warnings / Errors Recorded Before Failure")
+                    warnings.takeLast(16).forEachIndexed { index, warning ->
+                        kv(
+                            "Finding ${index + 1}",
+                            "${warning.severity}: [${warning.group}] ${warning.message}"
+                        )
+                    }
+                }
+            }
+
+            publishPublicFile(SUMMARY_FILE, terminalFile("BNCAM SHOT DEBUG"))
+            publishPublicFile(CAPTURE_FILE, terminalFile("BNCAM CAPTURE", includePipelineEvents = true))
+            publishPublicFile(ISP_FILE, terminalFile("BNCAM ISP", includePipelineEvents = true))
+            publishPublicFile(WARNINGS_FILE, terminalFile("BNCAM WARNINGS & ERRORS", includePipelineEvents = true))
+            publishPublicFile(FRAME_FILE, terminalFile("BNCAM FRAME ANALYSIS"))
+        } else {
+            // If a rich payload already exists, retain it and only refresh the warning-bearing
+            // public views. Do not replace valid capture/ISP/frame evidence with a smaller record.
+            publishPublicFile(SUMMARY_FILE, buildSummaryFile(lastDiagnosticPayload))
+            publishPublicFile(WARNINGS_FILE, buildWarningsFile(lastDiagnosticPayload))
+        }
+        return true
+    }
+
     fun recoverStaleStartedAttempts() {
         if (!baseDir.exists()) return
         baseDir.listFiles()?.filter { it.isDirectory }?.forEach { dir ->

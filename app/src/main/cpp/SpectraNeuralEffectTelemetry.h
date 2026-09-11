@@ -1,5 +1,7 @@
 #pragma once
 
+#include "SpectraNeuralAdaptiveAuthority.h"
+
 #include <array>
 #include <cmath>
 #include <cstddef>
@@ -8,10 +10,10 @@
 namespace bncam::spectra::neural {
 
 // Phase-6 recovery telemetry layout emitted by neural_mosaic_bridge.comp mode 3.
-// One workgroup covers up to 32x32 packed Bayer samples and writes thirteen vec4 sums.
+// One workgroup covers up to 32x32 packed Bayer samples and writes fifteen vec4 sums.
 // CPU control code reduces only this compact buffer; full-frame RAW never leaves GPU residency.
-constexpr std::uint32_t kNeuralEffectSummaryVec4PerGroup = 13u;
-constexpr float kNeuralEffectHighSnrThreshold = 8.0f;
+constexpr std::uint32_t kNeuralEffectSummaryVec4PerGroup = 15u;
+constexpr float kNeuralEffectHighSnrThreshold = kNeuralAdaptiveIdentitySnr;
 
 struct SpectraNeuralEffectTelemetry {
     bool ready = false;
@@ -31,9 +33,13 @@ struct SpectraNeuralEffectTelemetry {
     std::array<float, 4> residualBasisRms{{0.0f, 0.0f, 0.0f, 0.0f}};
     std::array<float, 4> residualBasisRmsSigma{{0.0f, 0.0f, 0.0f, 0.0f}};
 
-    // High-SNR is telemetry only. It does not gate or alter inference.
+    // These high-SNR fields are observational; the shared identity threshold also gates Phase-9 writeback.
     std::array<float, 4> highSnrRmsCorrectionSigmaCfa{{0.0f, 0.0f, 0.0f, 0.0f}};
     std::array<float, 4> highSnrSampleFractionCfa{{0.0f, 0.0f, 0.0f, 0.0f}};
+
+    // Phase 9: direct observability of the sensor-independent authority evidence.
+    std::array<float, 4> meanInputSigmaCfa{{0.0f, 0.0f, 0.0f, 0.0f}};
+    std::array<float, 4> meanAdaptiveNoiseEvidenceCfa{{0.0f, 0.0f, 0.0f, 0.0f}};
 };
 
 
@@ -112,13 +118,15 @@ inline SpectraNeuralEffectTelemetry reduceNeuralEffectSummary(
         const double highSnrSigmaSq = sums[10][c];
         const double highSnrCount = sums[11][c];
         const double posteriorSum = sums[12][c];
+        const double inputSigmaSum = sums[13][c];
+        const double noiseEvidenceSum = sums[14][c];
 
         if (sumAbs < 0.0 || sumSq < 0.0 || sumSigmaSq < 0.0 ||
             halfCount < 0.0 || oneCount < 0.0 || twoCount < 0.0 ||
             posteriorRatio < 0.0 || highSnrSigmaSq < 0.0 || highSnrCount < 0.0 ||
-            posteriorSum < 0.0 ||
+            posteriorSum < 0.0 || inputSigmaSum < 0.0 || noiseEvidenceSum < 0.0 ||
             halfCount > n + 0.5 || oneCount > n + 0.5 || twoCount > n + 0.5 ||
-            highSnrCount > n + 0.5) {
+            highSnrCount > n + 0.5 || noiseEvidenceSum > n + 0.5) {
             return SpectraNeuralEffectTelemetry{};
         }
 
@@ -132,6 +140,8 @@ inline SpectraNeuralEffectTelemetry reduceNeuralEffectSummary(
         out.posteriorToInputVarianceRatioCfa[c] = static_cast<float>(posteriorRatio / n);
         out.posteriorMeanVarianceCfa[c] = static_cast<float>(posteriorSum / n);
         out.highSnrSampleFractionCfa[c] = static_cast<float>(highSnrCount / n);
+        out.meanInputSigmaCfa[c] = static_cast<float>(inputSigmaSum / n);
+        out.meanAdaptiveNoiseEvidenceCfa[c] = static_cast<float>(noiseEvidenceSum / n);
         out.highSnrRmsCorrectionSigmaCfa[c] = highSnrCount > 0.0
                 ? static_cast<float>(std::sqrt(highSnrSigmaSq / highSnrCount))
                 : 0.0f;

@@ -2119,6 +2119,11 @@ class SingleFrameRunner(
                             shotLogger.writeCaptureTrace(
                                 captureTrace.completeFailure("raw_only_publication", failure)
                             )
+                            shotLogger.finalizeFailureWithPublicDiagnostics(
+                                attemptId = attemptId,
+                                stage = "ASYNC_RAW_ONLY_PUBLICATION",
+                                exception = failure
+                            )
                         }
                         runCatching { context.contentResolver.delete(dngUri, null, null) }
                         performanceTracker.persistJsonLine(
@@ -2676,6 +2681,11 @@ class SingleFrameRunner(
                                         "dng_fallback_publication",
                                         failure
                                     )
+                                )
+                                shotLogger.finalizeFailureWithPublicDiagnostics(
+                                    attemptId = attemptId,
+                                    stage = "ASYNC_DNG_FALLBACK_PUBLICATION",
+                                    exception = failure
                                 )
                             }
                             runCatching { context.contentResolver.delete(dngUri, null, null) }
@@ -3955,6 +3965,11 @@ class SingleFrameRunner(
                     shotLogger.writeCaptureTrace(
                         captureTrace.completeFailure("output_publication", it)
                     )
+                    shotLogger.finalizeFailureWithPublicDiagnostics(
+                        attemptId = attemptId,
+                        stage = "ASYNC_OUTPUT_PUBLICATION",
+                        exception = it
+                    )
                 }
                 runCatching { context.contentResolver.delete(jpegPublicUri, null, null) }
                 performanceTracker.persistJsonLine(
@@ -4025,18 +4040,29 @@ class SingleFrameRunner(
         if (isRawFrameSource) {
             val reservation = requireNotNull(rawWorkReservation)
             val submitted = CaptureProcessingQueue.submit(context, reservation) { work ->
-                val saveAccepted = processAndQueueOutput(
-                    CaptureStageListener.NONE,
-                    work
-                )
-                if (!saveAccepted) {
-                    work.fail("save_queue_full_or_output_unavailable")
-                    reservedJpegUri?.let { uri ->
-                        runCatching { context.contentResolver.delete(uri, null, null) }
-                    }
-                    throw IllegalStateException(
-                        "RAW processing completed but output save was not accepted."
+                try {
+                    val saveAccepted = processAndQueueOutput(
+                        CaptureStageListener.NONE,
+                        work
                     )
+                    if (!saveAccepted) {
+                        work.fail("save_queue_full_or_output_unavailable")
+                        reservedJpegUri?.let { uri ->
+                            runCatching { context.contentResolver.delete(uri, null, null) }
+                        }
+                        throw IllegalStateException(
+                            "RAW processing completed but output save was not accepted."
+                        )
+                    }
+                } catch (failure: Throwable) {
+                    if (enableShotLogger) {
+                        shotLogger.finalizeFailureWithPublicDiagnostics(
+                            attemptId = attemptId,
+                            stage = "ASYNC_RAW_PROCESSING_WORKER",
+                            exception = failure
+                        )
+                    }
+                    throw failure
                 }
             }
             if (!submitted) {
@@ -4099,6 +4125,15 @@ class SingleFrameRunner(
                         "Single YUV processing completed but output save was not accepted."
                     )
                 }
+            } catch (failure: Throwable) {
+                if (enableShotLogger) {
+                    shotLogger.finalizeFailureWithPublicDiagnostics(
+                        attemptId = attemptId,
+                        stage = "ASYNC_YUV_PROCESSING_WORKER",
+                        exception = failure
+                    )
+                }
+                throw failure
             } finally {
                 // The selected Image/HardwareBuffer must stay pinned until native YUV rendering
                 // and output queueing have finished. This lease is the actual ownership handoff.

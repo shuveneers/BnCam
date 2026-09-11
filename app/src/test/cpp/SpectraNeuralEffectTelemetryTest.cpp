@@ -16,6 +16,7 @@ bool near(float actual, float expected, float tolerance = 1.0e-6f) {
 
 int main() {
     using namespace bncam::spectra::neural;
+    static_assert(kNeuralEffectHighSnrThreshold == kNeuralAdaptiveIdentitySnr);
     constexpr std::size_t groups = 2u;
     constexpr std::uint64_t samples = 10u;
     constexpr std::size_t lanes = 4u;
@@ -38,6 +39,8 @@ int main() {
     const float twoCount[4] = {0.0f, 1.0f, 2.0f, 3.0f};
     const float highSigmaSq[4] = {1.0f, 4.0f, 9.0f, 16.0f};
     const float highCount[4] = {2.0f, 2.0f, 3.0f, 4.0f};
+    const float inputSigmaSum[4] = {0.2f, 0.4f, 0.6f, 0.8f};
+    const float noiseEvidenceSum[4] = {9.0f, 7.0f, 5.0f, 1.0f};
 
     for (std::size_t c = 0u; c < 4u; ++c) {
         setTotal(0u, c, sumDelta[c]);
@@ -51,6 +54,8 @@ int main() {
         setTotal(10u, c, highSigmaSq[c]);
         setTotal(11u, c, highCount[c]);
         setTotal(12u, c, posteriorSum[c]);
+        setTotal(13u, c, inputSigmaSum[c]);
+        setTotal(14u, c, noiseEvidenceSum[c]);
     }
     const float basisRawSq[4] = {9.0f, 16.0f, 25.0f, 36.0f};
     const float basisSigmaSq[4] = {4.0f, 9.0f, 16.0f, 25.0f};
@@ -82,6 +87,10 @@ int main() {
     assert(near(telemetry.residualBasisRmsSigma[3], std::sqrt(2.5f)));
     assert(near(telemetry.highSnrRmsCorrectionSigmaCfa[1], std::sqrt(2.0f)));
     assert(near(telemetry.highSnrSampleFractionCfa[3], 0.4f));
+    assert(near(telemetry.meanInputSigmaCfa[0], 0.02f));
+    assert(near(telemetry.meanInputSigmaCfa[3], 0.08f));
+    assert(near(telemetry.meanAdaptiveNoiseEvidenceCfa[0], 0.9f));
+    assert(near(telemetry.meanAdaptiveNoiseEvidenceCfa[3], 0.1f));
 
     // Effect telemetry is observational. A corrupted effect slot must not hide a still-valid
     // posterior summary; callers can keep fail-closed posterior propagation while reporting the

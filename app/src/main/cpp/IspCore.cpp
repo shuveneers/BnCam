@@ -9544,6 +9544,18 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << neuralProductionTrace.effectTelemetry.residualBasisRmsSigma[2] << ","
             << neuralProductionTrace.effectTelemetry.residualBasisRmsSigma[3] << "]"
             << "; spectraNeuralResidualBasisOrder=COMMON_MODE,R_MINUS_B,CHROMA_GREEN,GREEN_SPLIT; spectraNeuralResidualBasisDomain=CANONICAL_PACKED_CFA_ORTHONORMAL_PROXY"
+            << "; spectraNeuralAdaptiveFullEvidenceSnr=" << bncam::spectra::neural::kNeuralAdaptiveFullEvidenceSnr
+            << "; spectraNeuralAdaptiveIdentitySnr=" << bncam::spectra::neural::kNeuralAdaptiveIdentitySnr
+            << "; spectraNeuralMeanInputSigmaCfa=["
+            << neuralProductionTrace.effectTelemetry.meanInputSigmaCfa[0] << ","
+            << neuralProductionTrace.effectTelemetry.meanInputSigmaCfa[1] << ","
+            << neuralProductionTrace.effectTelemetry.meanInputSigmaCfa[2] << ","
+            << neuralProductionTrace.effectTelemetry.meanInputSigmaCfa[3] << "]"
+            << "; spectraNeuralMeanNoiseEvidenceCfa=["
+            << neuralProductionTrace.effectTelemetry.meanAdaptiveNoiseEvidenceCfa[0] << ","
+            << neuralProductionTrace.effectTelemetry.meanAdaptiveNoiseEvidenceCfa[1] << ","
+            << neuralProductionTrace.effectTelemetry.meanAdaptiveNoiseEvidenceCfa[2] << ","
+            << neuralProductionTrace.effectTelemetry.meanAdaptiveNoiseEvidenceCfa[3] << "]"
             << "; spectraNeuralHighSnrThreshold=" << bncam::spectra::neural::kNeuralEffectHighSnrThreshold
             << "; spectraNeuralHighSnrRmsCorrectionSigmaCfa=["
             << neuralProductionTrace.effectTelemetry.highSnrRmsCorrectionSigmaCfa[0] << ","

@@ -15798,6 +15798,13 @@ class BnCameraManager(private val context: Context) {
                         "queue_submission_rejected" -> "The photo could not be handed to the processing queue."
                         else -> "Capture rejected: ${submissionResult.reason}"
                     }
+                    shotLogger.finalizeFailureWithPublicDiagnostics(
+                        attemptId = "${activeLens.id}-$userShutterTimestampNs",
+                        stage = "CAPTURE_SUBMISSION_REJECTED",
+                        exception = IllegalStateException(
+                            "Capture submission rejected: ${submissionResult.reason}"
+                        )
+                    )
                     finishCaptureAttempt(attemptId, null, finishReason)
                     return@withContext null
                 }
@@ -15810,6 +15817,21 @@ class BnCameraManager(private val context: Context) {
             )
             _captureContractError.value = e.message ?: "Capture contract failed."
             Log.e(tag, "Fatale fout in de Capture Router", e)
+            // The runner creates the public shot folder only after shutter-time admission. If a
+            // synchronous exception occurs after that point but before DiagnosticPayload exists,
+            // preserve the real terminal stage instead of leaving the folder permanently at
+            // "Waiting for capture diagnostics". The logger itself verifies that this attempt
+            // still owns the active folder, so an exception before startNewShot() cannot corrupt
+            // diagnostics from an older/newer shutter.
+            runCatching {
+                shotLogger.finalizeFailureWithPublicDiagnostics(
+                    attemptId = "${activeLens.id}-$userShutterTimestampNs",
+                    stage = "CAPTURE_ROUTER_EXCEPTION",
+                    exception = e
+                )
+            }.onFailure { diagnosticsFailure ->
+                Log.e(tag, "Failed to publish terminal capture diagnostics", diagnosticsFailure)
+            }
             finishCaptureAttempt(attemptId, null, finishReason)
             null
         } finally {

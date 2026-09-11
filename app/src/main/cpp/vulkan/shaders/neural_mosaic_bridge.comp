@@ -18,11 +18,12 @@ layout(push_constant) uniform PC {
     uint off3x; uint off3y;
     float shotS0; float shotS1; float shotS2; float shotS3;
     float readO0; float readO1; float readO2; float readO3;
+    float adaptiveFullEvidenceSnr;
+    float adaptiveIdentitySnr;
 } pc;
 
-const uint EFFECT_SLOT_COUNT = 13u;
+const uint EFFECT_SLOT_COUNT = 15u;
 const uint LOCAL_COUNT = 64u;
-const float HIGH_SNR_THRESHOLD = 8.0;
 const float INV_SQRT2 = 0.7071067811865475;
 
 uvec2 channelOffset(uint c) {
@@ -77,7 +78,9 @@ void accumulateEffectSample(uint packedBase, inout vec4 sums[EFFECT_SLOT_COUNT])
     const vec4 variance = max(shotS() * clamp(x, vec4(0.0), vec4(1.0)) + readO(), vec4(1.0e-12));
     const vec4 sigma = sqrt(variance);
     const vec4 deltaSigma = delta / sigma;
-    const vec4 snr = clamp(x, vec4(0.0), vec4(1.0)) / sigma;
+    const vec4 snr = abs(x) / sigma;
+    const vec4 noiseEvidence = vec4(1.0) - smoothstep(
+        vec4(pc.adaptiveFullEvidenceSnr), vec4(pc.adaptiveIdentitySnr), snr);
 
     sums[0] += delta;
     sums[1] += absDelta;
@@ -103,10 +106,12 @@ void accumulateEffectSample(uint packedBase, inout vec4 sums[EFFECT_SLOT_COUNT])
         0.5 * (variance.g + variance.b)), vec4(1.0e-12));
     sums[9] += (basis * basis) / basisVariance;
 
-    const bvec4 highSnr = greaterThanEqual(snr, vec4(HIGH_SNR_THRESHOLD));
+    const bvec4 highSnr = greaterThanEqual(snr, vec4(pc.adaptiveIdentitySnr));
     const vec4 highSnrMask = mix(vec4(0.0), vec4(1.0), highSnr);
     sums[10] += highSnrMask * (deltaSigma * deltaSigma);
     sums[11] += highSnrMask;
+    sums[13] += sigma;
+    sums[14] += noiseEvidence;
 }
 
 void reduceAndWrite(uint outputGroupIndex, uint slotCount) {

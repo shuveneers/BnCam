@@ -47,7 +47,7 @@ struct NeuralProductionGpuResult {
 
     VkBuffer posteriorVariancePacked = VK_NULL_HANDLE;
     // GPU-reduced posterior mean variance in canonical R/G1/G2/B order. Phase 6 shares
-    // one compact 13xvec4 summary per 32x32 packed region with effect telemetry; the CPU
+    // one compact 15xvec4 summary per 32x32 packed region with effect telemetry; the CPU
     // never sees the full posterior or full neural residual image.
     bool posteriorSummaryReady = false;
     std::array<float, 4> posteriorMeanVarianceCfa{{0.0f, 0.0f, 0.0f, 0.0f}};

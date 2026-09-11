@@ -36,8 +36,10 @@ struct BridgePushConstants {
     std::uint32_t off3x = 0u, off3y = 0u;
     float shotS0 = 0.0f, shotS1 = 0.0f, shotS2 = 0.0f, shotS3 = 0.0f;
     float readO0 = 0.0f, readO1 = 0.0f, readO2 = 0.0f, readO3 = 0.0f;
+    float adaptiveFullEvidenceSnr = bncam::spectra::neural::kNeuralAdaptiveFullEvidenceSnr;
+    float adaptiveIdentitySnr = bncam::spectra::neural::kNeuralAdaptiveIdentitySnr;
 };
-static_assert(sizeof(BridgePushConstants) == 84u, "neural mosaic bridge push layout");
+static_assert(sizeof(BridgePushConstants) == 92u, "neural mosaic bridge push layout");
 
 float elapsedMs(Clock::time_point start) noexcept {
     return std::chrono::duration<float, std::milli>(Clock::now() - start).count();
@@ -307,6 +309,8 @@ bool VulkanNeuralRawProductionBridge::dispatchBridgeLocked(
     pc.off3x = cfa.sourceOffsets[3].x; pc.off3y = cfa.sourceOffsets[3].y;
     pc.shotS0 = shotS[0]; pc.shotS1 = shotS[1]; pc.shotS2 = shotS[2]; pc.shotS3 = shotS[3];
     pc.readO0 = readO[0]; pc.readO1 = readO[1]; pc.readO2 = readO[2]; pc.readO3 = readO[3];
+    pc.adaptiveFullEvidenceSnr = bncam::spectra::neural::kNeuralAdaptiveFullEvidenceSnr;
+    pc.adaptiveIdentitySnr = bncam::spectra::neural::kNeuralAdaptiveIdentitySnr;
     vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
             0u, sizeof(pc), &pc);
 
@@ -436,7 +440,7 @@ NeuralProductionGpuResult VulkanNeuralRawProductionBridge::execute(
 
     // Phase-6 recovery truth: one compact GPU reduction measures the actual neural mutation
     // while preserving the existing posterior feedback. This does not alter neural pixels or
-    // inference authority. The CPU receives one 13xvec4 summary per 32x32 packed region only.
+    // inference authority. The CPU receives one 15xvec4 summary per 32x32 packed region only.
     const auto effectStarted = Clock::now();
     if(!dispatchBridgeLocked(device, queue, queueMutex,
             packedInput_.buffer, effectSummary_.buffer, cleanPacked_.buffer, posteriorPacked_.buffer,

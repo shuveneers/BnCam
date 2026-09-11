@@ -62,6 +62,7 @@ layout(push_constant)uniform PC{
     float kSigma; float qMin; float qMax;
     float authority; float lumaAuthority; float chromaAuthority;
     float detailProtection; float lowFrequencyCleanup; float adaptiveResponse;
+    float adaptiveFullEvidenceSnr; float adaptiveIdentitySnr;
     float clipThreshold; float nearThreshold;
     uint writeResidual; uint writeEvidence; uint hasConfidence;
 }pc;
@@ -94,9 +95,18 @@ void main(){
     vec4 controlled=componentControlled(fine,clamp(pc.lumaAuthority,0.0,1.0),clamp(pc.chromaAuthority,0.0,1.0));
     controlled+=clamp(pc.lowFrequencyCleanup,0.0,1.0)*componentControlled(coarse,clamp(pc.lumaAuthority,0.0,1.0),clamp(pc.chromaAuthority,0.0,1.0));
 
-    // Physics-adaptive response uses local dimensionless inverse SNR, never ISO.
+    // Phase 9: physical noise evidence, never sensor/lens identity, owns the clean-frame gate.
+    // Preserve the exact Phase-6 adaptive-response scale and only attenuate it: the new path
+    // can never increase writeback authority above the previous behavior. SNR >= identity
+    // threshold becomes exact identity with a smooth transition from full noise evidence.
     vec4 invSnr=sigma/(abs(x)+sigma+vec4(1.0e-8));
-    vec4 adaptiveGain=mix(vec4(1.0),sqrt(clamp(invSnr,vec4(0.0),vec4(1.0))),clamp(pc.adaptiveResponse,0.0,1.0));
+    vec4 snr=abs(x)/max(sigma,vec4(1.0e-8));
+    vec4 noiseEvidence=vec4(1.0)-smoothstep(
+        vec4(pc.adaptiveFullEvidenceSnr),vec4(pc.adaptiveIdentitySnr),snr);
+    float response=clamp(pc.adaptiveResponse,0.0,1.0);
+    vec4 phase6AdaptiveGain=mix(
+        vec4(1.0),sqrt(clamp(invSnr,vec4(0.0),vec4(1.0))),response);
+    vec4 adaptiveGain=phase6AdaptiveGain*noiseEvidence;
 
     // Detail Protection is a correction gate, not sharpening. Low correction
     // confidence and posterior uncertainty can only reduce mutation authority.

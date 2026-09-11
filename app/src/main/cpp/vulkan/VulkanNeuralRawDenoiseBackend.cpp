@@ -1,4 +1,5 @@
 #include "VulkanNeuralRawDenoiseBackend.h"
+#include "../SpectraNeuralAdaptiveAuthority.h"
 #ifndef BNCAM_VMA_HEADER_AVAILABLE
 #define BNCAM_VMA_HEADER_AVAILABLE 0
 #endif
@@ -40,7 +41,7 @@ std::vector<std::uint32_t> spirv(NeuralKernel k){
 struct CondPC{std::int32_t tileX,tileY;std::uint32_t tileW,tileH,fullW,fullH,paddedW,paddedH,lscW,lscH,lscChannels,hasLsc;};
 struct ConvPC{std::uint32_t inW,inH,inC,outW,outH,outC,kernel,stride,upsample2x,weightHalfBase,biasC4Base;std::int32_t inputGlobalX,inputGlobalY;std::uint32_t domainW,domainH,enforceDomain;};
 struct FilmParamPC{std::uint32_t outC,inC,weightHalfBase,biasC4Base,globalFloatBase;};struct BasicPC{std::uint32_t width,height,channels,extra;};
-struct WritePC{std::uint32_t tileW,tileH,validX,validY,validW,validH,fullW,fullH;std::int32_t globalX,globalY;float kSigma,qMin,qMax,authority,lumaAuthority,chromaAuthority,detailProtection,lowFrequencyCleanup,adaptiveResponse,clipThreshold,nearThreshold;std::uint32_t writeResidual,writeEvidence,hasConfidence;};
+struct WritePC{std::uint32_t tileW,tileH,validX,validY,validW,validH,fullW,fullH;std::int32_t globalX,globalY;float kSigma,qMin,qMax,authority,lumaAuthority,chromaAuthority,detailProtection,lowFrequencyCleanup,adaptiveResponse,adaptiveFullEvidenceSnr,adaptiveIdentitySnr,clipThreshold,nearThreshold;std::uint32_t writeResidual,writeEvidence,hasConfidence;};
 static_assert(sizeof(WritePC)<=128);
 }
 bool VulkanNeuralRawDenoiseBackend::ensureBuffer(Buffer&b,std::uint64_t bytes,bool host) noexcept{
@@ -864,6 +865,8 @@ bool VulkanNeuralRawDenoiseBackend::recordAndSubmit(
                             std::clamp(request.controls.detailProtection, 0.0f, 1.0f),
                             std::clamp(request.controls.lowFrequencyCleanup, 0.0f, 1.0f),
                             std::clamp(request.controls.adaptiveResponse, 0.0f, 1.0f),
+                            kNeuralAdaptiveFullEvidenceSnr,
+                            kNeuralAdaptiveIdentitySnr,
                             1.0f - request.conditioningConfig.clippingEpsilon,
                             1.0f - request.conditioningConfig.headroomSpan,
                             request.residualDebugRequested ? 1u : 0u,
