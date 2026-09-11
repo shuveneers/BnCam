@@ -156,6 +156,11 @@ object DngSemanticAuditor {
             sourceLabel = contract?.sourceFormat?.name ?: "unknown"
         )
         items += DngAuditItem("Bytes written", bytesWritten > 8L, "bytesWritten=$bytesWritten")
+        items += DngAuditItem(
+            "Captured DNG completeness",
+            capturedHeader.size.toLong() == bytesWritten,
+            "capturedBytes=${capturedHeader.size};bytesWritten=$bytesWritten"
+        )
 
         val tags = TiffHeaderParser.parse(capturedHeader)
         if (tags == null) {
@@ -163,21 +168,43 @@ object DngSemanticAuditor {
             lastCameraColorProfile = DngCameraColorProfileSnapshot(status = "TIFF_HEADER_UNAVAILABLE")
             items += DngAuditItem("TIFF header", false, "header_not_parseable_or_ifd_not_captured")
         } else {
+            val snapshot = DngTagSnapshot(
+                presentTagIds = tags.keys,
+                blackLevels = tags[50714]?.valuesAsLongs(16).orEmpty(),
+                whiteLevels = tags[50717]?.valuesAsLongs(4).orEmpty(),
+                orientation = tags[274]?.valuesAsLongs(1)?.firstOrNull(),
+                imageWidth = tags[256]?.valuesAsLongs(1)?.firstOrNull(),
+                imageHeight = tags[257]?.valuesAsLongs(1)?.firstOrNull(),
+                activeArea = tags[50829]?.valuesAsLongs(4).orEmpty(),
+                defaultCropOrigin = tags[50719]?.valuesAsLongs(2).orEmpty(),
+                defaultCropSize = tags[50720]?.valuesAsLongs(2).orEmpty(),
+                blackLevelValues = tags[50714]?.valuesAsDoubles(16)?.toList().orEmpty(),
+                dngVersion = tags[50706]?.valuesAsLongs(4).orEmpty(),
+                dngBackwardVersion = tags[50707]?.valuesAsLongs(4).orEmpty(),
+                bitsPerSample = tags[258]?.valuesAsLongs(1)?.firstOrNull(),
+                compression = tags[259]?.valuesAsLongs(1)?.firstOrNull(),
+                photometricInterpretation = tags[262]?.valuesAsLongs(1)?.firstOrNull(),
+                samplesPerPixel = tags[277]?.valuesAsLongs(1)?.firstOrNull(),
+                rowsPerStrip = tags[278]?.valuesAsLongs(1)?.firstOrNull(),
+                stripOffsets = tags[273]?.valuesAsLongs(height + 8).orEmpty(),
+                stripByteCounts = tags[279]?.valuesAsLongs(height + 8).orEmpty(),
+                cfaRepeatPatternDim = tags[33421]?.valuesAsLongs(2).orEmpty(),
+                cfaPattern = tags[33422]?.valuesAsLongs(4).orEmpty(),
+                blackLevelRepeatDim = tags[50713]?.valuesAsLongs(2).orEmpty(),
+                asShotNeutral = tags[50728]?.valuesAsDoubles(3)?.toList().orEmpty(),
+                noiseProfile = tags[51041]?.valuesAsDoubles(16)?.toList().orEmpty(),
+                littleEndian = capturedHeader.size >= 2 &&
+                    capturedHeader[0].toInt() == 0x49 && capturedHeader[1].toInt() == 0x49
+            )
+
             items += DngSemanticRules.validateTags(
-                snapshot = DngTagSnapshot(
-                    presentTagIds = tags.keys,
-                    blackLevels = tags[50714]?.valuesAsLongs(16).orEmpty(),
-                    whiteLevels = tags[50717]?.valuesAsLongs(4).orEmpty(),
-                    orientation = tags[274]?.valuesAsLongs(1)?.firstOrNull(),
-                    imageWidth = tags[256]?.valuesAsLongs(1)?.firstOrNull(),
-                    imageHeight = tags[257]?.valuesAsLongs(1)?.firstOrNull(),
-                    activeArea = tags[50829]?.valuesAsLongs(4).orEmpty(),
-                    defaultCropOrigin = tags[50719]?.valuesAsLongs(2).orEmpty(),
-                    defaultCropSize = tags[50720]?.valuesAsLongs(2).orEmpty()
-                ),
+                snapshot = snapshot,
                 expectedOrientation = orientationExif,
                 expectedWhiteLevel = contract?.payloadWhiteLevel,
-                expectedBlackLevels = contract?.payloadBlackLevels
+                expectedBlackLevels = contract?.payloadBlackLevels,
+                expectedCfaPattern = contract?.cfaPattern,
+                cfaOriginX = contract?.cfaOriginX ?: 0,
+                cfaOriginY = contract?.cfaOriginY ?: 0
             )
 
             val hueSatSnapshot = buildHueSatMapSnapshot(tags)
@@ -218,21 +245,10 @@ object DngSemanticAuditor {
                     "status=${cameraProfile.status}"
             )
 
-            val geometrySnapshot = DngTagSnapshot(
-                presentTagIds = tags.keys,
-                blackLevels = tags[50714]?.valuesAsLongs(16).orEmpty(),
-                whiteLevels = tags[50717]?.valuesAsLongs(4).orEmpty(),
-                orientation = tags[274]?.valuesAsLongs(1)?.firstOrNull(),
-                imageWidth = tags[256]?.valuesAsLongs(1)?.firstOrNull(),
-                imageHeight = tags[257]?.valuesAsLongs(1)?.firstOrNull(),
-                activeArea = tags[50829]?.valuesAsLongs(4).orEmpty(),
-                defaultCropOrigin = tags[50719]?.valuesAsLongs(2).orEmpty(),
-                defaultCropSize = tags[50720]?.valuesAsLongs(2).orEmpty()
-            )
             val pixelArray = characteristics?.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE)
             val activeArray = characteristics?.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
             items += DngSemanticRules.validateGeometry(
-                snapshot = geometrySnapshot,
+                snapshot = snapshot,
                 payloadWidth = width,
                 payloadHeight = height,
                 cameraPixelArrayWidth = pixelArray?.width,
@@ -242,26 +258,33 @@ object DngSemanticAuditor {
                 cameraActiveRight = activeArray?.right,
                 cameraActiveBottom = activeArray?.bottom
             )
+            items += DngSemanticRules.validateUncompressedStripTopology(
+                snapshot = snapshot,
+                payloadWidth = width,
+                payloadHeight = height,
+                capturedFileSize = capturedHeader.size
+            )
+            val payloadIdentity = DngSemanticRules.validateDngPayloadIdentity(
+                snapshot = snapshot,
+                sourceRaw16Bytes = raw16Bytes,
+                dngBytes = capturedHeader,
+                payloadWidth = width,
+                payloadHeight = height
+            )
+            items += payloadIdentity
+
+            if (payloadIdentity.passed) {
+                // Full strip-by-strip byte identity proves the DNG RAW payload is exactly the
+                // source RAW16. Reuse the source bytes for compact Stage-E statistics instead of
+                // allocating a second full-frame DNG payload copy.
+                com.bncam.core.isp.raw.RawColumnStatsAuditor.auditRaw16ByteArray(
+                    stage = "Stage-E (DNG Payload Exact-Identity Proven)",
+                    raw16Bytes = raw16Bytes,
+                    width = width,
+                    height = height
+                )
+            }
         }
-
-        val stripOffset = tags?.get(273)?.valuesAsLongs(1)?.firstOrNull()?.toInt() ?: -1
-        val stripByteCount = tags?.get(279)?.valuesAsLongs(1)?.firstOrNull()?.toInt() ?: (width * height * 2)
-
-        val dngPayloadBytes: ByteArray = if (
-            stripOffset > 0 && stripByteCount >= 0 &&
-            stripOffset.toLong() + stripByteCount.toLong() <= capturedHeader.size.toLong()
-        ) {
-            capturedHeader.copyOfRange(stripOffset, stripOffset + stripByteCount)
-        } else {
-            raw16Bytes
-        }
-
-        com.bncam.core.isp.raw.RawColumnStatsAuditor.auditRaw16ByteArray(
-            stage = "Stage-E (Resulting Written DNG File Payload)",
-            raw16Bytes = dngPayloadBytes,
-            width = width,
-            height = height
-        )
 
         val report = DngAuditReport(
             passed = items.all { it.passed },

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../SpectraNeuralProductionPolicy.h"
+#include "../SpectraNeuralEffectTelemetry.h"
 #include "VulkanNeuralRawDenoiseBackend.h"
 #include "VulkanVmaIntegration.h"
 
@@ -45,11 +46,18 @@ struct NeuralProductionGpuResult {
     std::uint64_t residentOutputGeneration = 0u;
 
     VkBuffer posteriorVariancePacked = VK_NULL_HANDLE;
-    // GPU-reduced posterior mean variance in canonical R/G1/G2/B order. The CPU sees only
-    // one vec4 per 8x8 packed workgroup, never the full posterior image.
+    // GPU-reduced posterior mean variance in canonical R/G1/G2/B order. Phase 6 shares
+    // one compact 13xvec4 summary per 32x32 packed region with effect telemetry; the CPU
+    // never sees the full posterior or full neural residual image.
     bool posteriorSummaryReady = false;
     std::array<float, 4> posteriorMeanVarianceCfa{{0.0f, 0.0f, 0.0f, 0.0f}};
     std::uint64_t compactPosteriorReadbackBytes = 0u;
+
+    bool effectTelemetryReady = false;
+    bncam::spectra::neural::SpectraNeuralEffectTelemetry effectTelemetry{};
+    std::uint64_t compactEffectReadbackBytes = 0u;
+    float effectSummaryMs = 0.0f;
+    std::string effectTelemetryStatus = "NOT_RUN";
     VkBuffer originalSaturationMaskPacked = VK_NULL_HANDLE;
     VkBuffer originalHeadroomPacked = VK_NULL_HANDLE;
     std::uint32_t packedWidth = 0u;
@@ -97,10 +105,13 @@ private:
     bool uploadRemainingLscLocked(VmaAllocator allocator, const NeuralProductionGpuRequest& request,
                                   std::uint64_t& uploadedBytes, std::string& failure) noexcept;
     bool dispatchBridgeLocked(VkDevice device, VkQueue queue, std::mutex& queueMutex,
-                              VkBuffer input, VkBuffer output,
+                              VkBuffer input, VkBuffer output, VkBuffer auxiliary0, VkBuffer auxiliary1,
                               const bncam::spectra::neural::CanonicalBayerPackContract& cfa,
                               std::uint32_t rawWidth, std::uint32_t rawHeight,
-                              std::uint32_t mode, std::string& failure) noexcept;
+                              std::uint32_t mode,
+                              const std::array<float, 4>& shotS,
+                              const std::array<float, 4>& readO,
+                              std::string& failure) noexcept;
     void freeBufferLocked(Buffer& buffer) noexcept;
     void destroyLocked(VkDevice device) noexcept;
 
@@ -120,7 +131,7 @@ private:
     Buffer packedInput_{};
     Buffer cleanPacked_{};
     Buffer posteriorPacked_{};
-    Buffer posteriorSummary_{};
+    Buffer effectSummary_{};
     Buffer saturationMask_{};
     Buffer headroom_{};
     Buffer downstreamMosaic_{};

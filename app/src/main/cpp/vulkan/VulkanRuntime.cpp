@@ -1154,7 +1154,6 @@ SpectraRawFinalizeResult VulkanRuntime::executeSpectraNeuralThenRawFinalizeFromR
     };
 
     neural::SpectraNeuralProductionTrace trace{};
-    trace.modelAvailable = spectraNeuralModelAvailable();
     trace.stageDumpsRequested = neuralRequest.collectStageDumps;
     neural::SpectraNeuralStageDumps stageDumps{};
     stageDumps.requested = neuralRequest.collectStageDumps;
@@ -1198,6 +1197,9 @@ SpectraRawFinalizeResult VulkanRuntime::executeSpectraNeuralThenRawFinalizeFromR
         // but we never recursively lock submissionMutex_. The orchestration mutex also
         // prevents model reconfiguration from invalidating neural resources mid-shot.
         std::lock_guard<std::mutex> orchestrationLock(neuralOrchestrationMutex_);
+        // Snapshot native model identity only after model reconfiguration is excluded.
+        trace.modelAvailable = spectraNeuralModelAvailable();
+        trace.modelIdentity = spectraNeuralRawDenoiseBackend_.modelIdentity();
 
         VkBuffer normalizedInput = VK_NULL_HANDLE;
         std::uint64_t normalizedBytes = 0u;
@@ -1357,6 +1359,12 @@ SpectraRawFinalizeResult VulkanRuntime::executeSpectraNeuralThenRawFinalizeFromR
                         trace.posteriorSummaryReady = neuralResult.posteriorSummaryReady;
                         trace.posteriorMeanVarianceCfa = neuralResult.posteriorMeanVarianceCfa;
                         trace.compactPosteriorReadbackBytes = neuralResult.compactPosteriorReadbackBytes;
+                        trace.effectTelemetryReady = neuralResult.effectTelemetryReady;
+                        trace.effectTelemetry = neuralResult.effectTelemetry;
+                        trace.compactEffectReadbackBytes = neuralResult.compactEffectReadbackBytes;
+                        trace.effectSummaryMs = neuralResult.effectSummaryMs;
+                        trace.effectTelemetryStatus = neuralResult.effectTelemetryStatus;
+                        trace.modelIdentity = spectraNeuralRawDenoiseBackend_.modelIdentity();
                         trace.persistentGpuBytes = neuralResult.persistentGpuBytes;
                         trace.fullFrameCpuReadbackBytes = neuralResult.fullFrameCpuReadbackBytes;
                         trace.cpuFallbackUsed = neuralResult.cpuFallbackUsed;
@@ -1518,6 +1526,11 @@ SpectraRawFinalizeResult VulkanRuntime::executeSpectraNeuralThenRawFinalizeFromR
         trace.stageDumpsCollected = stageDumps.stageCount > 0u;
         trace.debugStageDumpReadbackBytes = stageDumps.debugReadbackBytes;
         trace.debugStageDumpReadbackMs = stageDumps.debugReadbackMs;
+    }
+    if (!trace.effectTelemetryReady && trace.effectTelemetryStatus == "NOT_RUN" &&
+        trace.bypassReason != NeuralBypassReason::None) {
+        trace.effectTelemetryStatus = "BYPASS_" +
+                std::string(neuralBypassReasonName(trace.bypassReason));
     }
     trace.totalWallMs = orchestrationElapsedMs();
     if (traceOut != nullptr) *traceOut = trace;

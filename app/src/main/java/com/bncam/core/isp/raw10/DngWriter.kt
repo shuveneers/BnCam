@@ -124,7 +124,7 @@ object DngWriter {
                     0L
                 )
             }
-            DngSemanticAuditor.audit(
+            val auditReport = DngSemanticAuditor.audit(
                 width = width,
                 height = height,
                 raw16Bytes = raw16Bytes,
@@ -136,6 +136,14 @@ object DngWriter {
                 calibrationBinding = calibration?.base?.calibrationProfileBinding,
                 discoveryEffectiveCcm = calibration?.effectiveColorMatrix?.copyOf()
             )
+            if (!auditReport.passed) {
+                Log.e(TAG, "DNG_CORRECTNESS_BLOCKED:${auditReport.compact()}")
+                com.bncam.core.debug.DeviceTelemetryLogger.logEvent(
+                    "DNG_CORRECTNESS_BLOCKED",
+                    auditReport.compact()
+                )
+                return null
+            }
             calibration?.base?.calibrationProfileBinding?.let { calibrationBinding ->
                 RawCameraColorProfileRepository.installDiscoveredProfile(
                     snapshot = DngSemanticAuditor.lastCameraColorProfileSnapshot(),

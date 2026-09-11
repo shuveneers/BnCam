@@ -204,6 +204,21 @@ enum class NeuralBackendFailureCode : std::uint16_t {
     InternalError
 };
 
+inline const char* neuralBackendFailureCodeName(NeuralBackendFailureCode code) noexcept {
+    switch (code) {
+        case NeuralBackendFailureCode::None: return "none";
+        case NeuralBackendFailureCode::InvalidRequest: return "invalid_request";
+        case NeuralBackendFailureCode::ResourceImportFailed: return "resource_import_failed";
+        case NeuralBackendFailureCode::ModelLoadFailed: return "model_load_failed";
+        case NeuralBackendFailureCode::DispatchFailed: return "dispatch_failed";
+        case NeuralBackendFailureCode::SynchronizationFailed: return "synchronization_failed";
+        case NeuralBackendFailureCode::NonFiniteModelOutput: return "non_finite_model_output";
+        case NeuralBackendFailureCode::InvalidPosteriorOutput: return "invalid_posterior_output";
+        case NeuralBackendFailureCode::InternalError: return "internal_error";
+        default: return "unknown";
+    }
+}
+
 struct NeuralRawDenoiseResult {
     std::uint32_t schemaVersion = kNeuralRawDenoiseResultSchemaVersion;
     NeuralBackendStatus status = NeuralBackendStatus::Bypassed;

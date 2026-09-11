@@ -84,6 +84,12 @@ struct SpectraNeuralProductionTrace {
     bool posteriorSummaryReady = false;
     std::array<float, 4> posteriorMeanVarianceCfa{{0.0f, 0.0f, 0.0f, 0.0f}};
     std::uint64_t compactPosteriorReadbackBytes = 0u;
+    bool effectTelemetryReady = false;
+    bncam::spectra::neural::SpectraNeuralEffectTelemetry effectTelemetry{};
+    std::uint64_t compactEffectReadbackBytes = 0u;
+    float effectSummaryMs = 0.0f;
+    std::string effectTelemetryStatus = "NOT_RUN";
+    NeuralVulkanModelIdentity modelIdentity{};
     std::uint64_t persistentGpuBytes = 0u;
     std::uint64_t fullFrameCpuReadbackBytes = 0u;
     bool cpuFallbackUsed = false;
