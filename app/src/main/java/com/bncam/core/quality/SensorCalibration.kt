@@ -44,6 +44,7 @@ data class BaseSensorCalibration(
     val lensId: String,
     val physicalCameraId: String?,
     val calibrationProfileId: String,
+    val calibrationProfileBinding: CalibrationProfileBinding? = null,
     val frameSource: String,
     val cfaPattern: Int,
     val cfaName: String,
@@ -193,7 +194,18 @@ data class FinalSensorCalibration(
         pairs.add("ISP Working Domain" to ispWorkingDomain.name)
         pairs.add("Lens ID" to base.lensId)
         pairs.add("Physical Camera ID" to (base.physicalCameraId ?: "not reported"))
+        val calibrationBinding = base.calibrationProfileBinding
+        pairs.add("Calibration Authority ID" to (calibrationBinding?.provenance?.sensorAuthorityId ?: "UNAVAILABLE"))
         pairs.add("Calibration Profile ID" to base.calibrationProfileId)
+        pairs.add("Calibration Profile Authority Match" to (calibrationBinding?.provenance?.authorityMatches?.toString() ?: "false"))
+        pairs.add("Calibration Static Fingerprint" to (calibrationBinding?.staticCalibrationFingerprint ?: "UNAVAILABLE"))
+        pairs.add("Calibration Characteristics Source ID" to (calibrationBinding?.provenance?.characteristicsSourceId ?: "UNAVAILABLE"))
+        pairs.add("Calibration CaptureResult Source ID" to (calibrationBinding?.provenance?.captureResultSourceId ?: "UNAVAILABLE"))
+        pairs.add("Calibration Binding Safe" to (calibrationBinding?.safeForProfileBinding?.toString() ?: "false"))
+        pairs.add("Calibration Binding Reason" to (calibrationBinding?.rejectionReason ?: "CALIBRATION_BINDING_UNAVAILABLE"))
+        pairs.add("Reference Illuminant 1" to (calibrationBinding?.referenceIlluminant1?.toString() ?: "UNAVAILABLE"))
+        pairs.add("Reference Illuminant 2" to (calibrationBinding?.referenceIlluminant2?.toString() ?: "UNAVAILABLE"))
+        pairs.add("Generic Calibration Fallback Used" to "false")
         pairs.add("Sensor Timestamp Ns" to (base.sensorTimestampNs?.toString() ?: "missing"))
         pairs.add("CFA Pattern" to "${base.cfaPattern} / ${base.cfaName}")
         pairs.add("Sensor Orientation" to base.sensorOrientation.toString())
@@ -676,14 +688,18 @@ object SensorCalibrationResolver {
         val baseNoiseApplied = hasNoiseProfile && noiseProfileValid &&
             normalizationCalibrationValid && cfaSupportedForBayer
 
+        val calibrationProfileBinding = CalibrationProfileBinding.from(sensorMetadata)
+        if (isRaw && !calibrationProfileBinding.provenance.safeForCalibration) {
+            throw SensorAuthorityUnavailableException(
+                "UNSAFE_TO_PROCESS:CALIBRATION_PROVENANCE_${calibrationProfileBinding.provenance.rejectionReason}"
+            )
+        }
+
         return BaseSensorCalibration(
             lensId = lensId,
             physicalCameraId = physicalCameraId,
-            calibrationProfileId = if (!physicalCameraId.isNullOrBlank() && physicalCameraId != lensId) {
-                "$lensId/$physicalCameraId"
-            } else {
-                lensId
-            },
+            calibrationProfileId = calibrationProfileBinding.calibrationProfileId,
+            calibrationProfileBinding = calibrationProfileBinding,
             frameSource = label,
             cfaPattern = cfa,
             cfaName = cfaName(cfa),

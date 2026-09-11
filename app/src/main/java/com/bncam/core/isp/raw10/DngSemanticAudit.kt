@@ -3,6 +3,7 @@ package com.bncam.core.isp.raw10
 import android.hardware.camera2.CameraCharacteristics
 import android.util.Log
 import com.bncam.core.isp.raw.RawDomainContract
+import com.bncam.core.quality.CalibrationProfileBinding
 import java.nio.ByteOrder
 import java.util.ArrayDeque
 
@@ -60,6 +61,11 @@ data class DngCameraColorProfileSnapshot(
     val valid: Boolean = false,
     val source: String = "OEM_DNGCREATOR",
     val calibrationProfileId: String = "unknown",
+    val sensorAuthorityId: String = "unknown",
+    val cameraDeviceId: String = "unknown",
+    val physicalCameraId: String? = null,
+    val staticCalibrationFingerprint: String = "",
+    val calibrationBindingStatus: String = "UNBOUND",
     val calibrationIlluminant1: Int = 0,
     val calibrationIlluminant2: Int = 0,
     val colorMatrix1: FloatArray? = null,
@@ -109,21 +115,21 @@ object DngSemanticAuditor {
 
     fun parseCameraColorProfileBytes(
         bytes: ByteArray,
-        calibrationProfileId: String,
+        calibrationBinding: CalibrationProfileBinding,
         discoveryEffectiveCcm: FloatArray?,
         source: String
     ): DngCameraColorProfileSnapshot {
         val tags = TiffHeaderParser.parse(bytes)
-            ?: return DngCameraColorProfileSnapshot(
+            ?: return unboundProfileSnapshot(
+                calibrationBinding = calibrationBinding,
                 source = source,
-                calibrationProfileId = calibrationProfileId,
                 status = "TIFF_HEADER_UNAVAILABLE"
             )
         val hueSatMap = buildHueSatMapSnapshot(tags)
         return buildCameraColorProfileSnapshot(
             tags = tags,
             hueSatMap = hueSatMap,
-            calibrationProfileId = calibrationProfileId,
+            calibrationBinding = calibrationBinding,
             discoveryEffectiveCcm = discoveryEffectiveCcm,
             source = source
         )
@@ -138,7 +144,7 @@ object DngSemanticAuditor {
         orientationExif: Int,
         contract: RawDomainContract?,
         characteristics: CameraCharacteristics?,
-        calibrationProfileId: String = "unknown",
+        calibrationBinding: CalibrationProfileBinding? = null,
         discoveryEffectiveCcm: FloatArray? = null
     ): DngAuditReport {
         val items = mutableListOf<DngAuditItem>()
@@ -185,19 +191,26 @@ object DngSemanticAuditor {
                     listOf(hueSatSnapshot.data1, hueSatSnapshot.data2, hueSatSnapshot.data3).count { it != null } +
                     ",status=${hueSatSnapshot.status}"
             )
-            val cameraProfile = buildCameraColorProfileSnapshot(
-                tags = tags,
-                hueSatMap = hueSatSnapshot,
-                calibrationProfileId = calibrationProfileId,
-                discoveryEffectiveCcm = discoveryEffectiveCcm,
-                source = "OEM_DNGCREATOR"
-            )
+            val cameraProfile = if (calibrationBinding != null) {
+                buildCameraColorProfileSnapshot(
+                    tags = tags,
+                    hueSatMap = hueSatSnapshot,
+                    calibrationBinding = calibrationBinding,
+                    discoveryEffectiveCcm = discoveryEffectiveCcm,
+                    source = "OEM_DNGCREATOR"
+                )
+            } else {
+                DngCameraColorProfileSnapshot(status = "CALIBRATION_BINDING_UNAVAILABLE")
+            }
             lastCameraColorProfile = cameraProfile
             items += DngAuditItem(
                 name = "Camera color profile",
                 passed = !cameraProfile.available || cameraProfile.valid,
                 detail = "available=${cameraProfile.available},valid=${cameraProfile.valid}," +
                     "profileId=${cameraProfile.calibrationProfileId}," +
+                    "authority=${cameraProfile.sensorAuthorityId}," +
+                    "binding=${cameraProfile.calibrationBindingStatus}," +
+                    "fingerprint=${cameraProfile.staticCalibrationFingerprint.ifBlank { "none" }}," +
                     "illuminants=${cameraProfile.calibrationIlluminant1}/${cameraProfile.calibrationIlluminant2}," +
                     "colorMatrices=${listOf(cameraProfile.colorMatrix1, cameraProfile.colorMatrix2).count { it != null }}," +
                     "forwardMatrices=${listOf(cameraProfile.forwardMatrix1, cameraProfile.forwardMatrix2).count { it != null }}," +
@@ -464,7 +477,7 @@ private fun buildHueSatMapSnapshot(tags: Map<Int, TiffTag>): DngHueSatMapProfile
 private fun buildCameraColorProfileSnapshot(
     tags: Map<Int, TiffTag>,
     hueSatMap: DngHueSatMapProfileSnapshot,
-    calibrationProfileId: String,
+    calibrationBinding: CalibrationProfileBinding,
     discoveryEffectiveCcm: FloatArray?,
     source: String = "OEM_DNGCREATOR"
 ): DngCameraColorProfileSnapshot {
@@ -505,7 +518,12 @@ private fun buildCameraColorProfileSnapshot(
             available = cm1 != null || illuminant1 != 0 || hueSatMap.available,
             valid = valid,
             source = source,
-            calibrationProfileId = calibrationProfileId,
+            calibrationProfileId = calibrationBinding.calibrationProfileId,
+            sensorAuthorityId = calibrationBinding.provenance.sensorAuthorityId,
+            cameraDeviceId = calibrationBinding.provenance.cameraDeviceId,
+            physicalCameraId = calibrationBinding.provenance.physicalCameraId,
+            staticCalibrationFingerprint = calibrationBinding.staticCalibrationFingerprint,
+            calibrationBindingStatus = "EXACT_SENSOR_METADATA_PENDING_DNG_MATCH",
             calibrationIlluminant1 = illuminant1,
             calibrationIlluminant2 = illuminant2,
             colorMatrix1 = cm1,
@@ -520,6 +538,23 @@ private fun buildCameraColorProfileSnapshot(
             hueSatMap = hueSatMap,
             status = status
         )
+
+    if (!calibrationBinding.safeForProfileBinding) {
+        return snapshot("CALIBRATION_BINDING_${calibrationBinding.rejectionReason}")
+    }
+    if (!calibrationBinding.matchesDngCharacterization(
+            illuminant1 = illuminant1,
+            illuminant2 = illuminant2,
+            dngColor1 = cm1,
+            dngColor2 = cm2,
+            dngCalibration1 = cc1,
+            dngCalibration2 = cc2,
+            dngForward1 = fm1,
+            dngForward2 = fm2
+        )
+    ) {
+        return snapshot("DNG_STATIC_CALIBRATION_MISMATCH")
+    }
 
     if (hueSatMap.available && !hueSatMap.valid) return snapshot("HUESATMAP_INVALID")
     if (analogBalanceMalformed) return snapshot("ANALOG_BALANCE_MALFORMED")
@@ -544,8 +579,29 @@ private fun buildCameraColorProfileSnapshot(
         secondaryComplete -> "VALID_DUAL_MATRIX_CAMERA_PROFILE_NO_HUESATMAP"
         else -> "VALID_SINGLE_MATRIX_CAMERA_PROFILE_NO_HUESATMAP"
     }
-    return snapshot(status = status, valid = true)
+    return snapshot(status = status, valid = true).copy(
+        calibrationBindingStatus = "EXACT_SENSOR_METADATA_AND_DNG_STATIC_MATCH"
+    )
 }
+
+private fun unboundProfileSnapshot(
+    calibrationBinding: CalibrationProfileBinding,
+    source: String,
+    status: String
+): DngCameraColorProfileSnapshot = DngCameraColorProfileSnapshot(
+    source = source,
+    calibrationProfileId = calibrationBinding.calibrationProfileId,
+    sensorAuthorityId = calibrationBinding.provenance.sensorAuthorityId,
+    cameraDeviceId = calibrationBinding.provenance.cameraDeviceId,
+    physicalCameraId = calibrationBinding.provenance.physicalCameraId,
+    staticCalibrationFingerprint = calibrationBinding.staticCalibrationFingerprint,
+    calibrationBindingStatus = if (calibrationBinding.safeForProfileBinding) {
+        "EXACT_SENSOR_METADATA_DNG_UNAVAILABLE"
+    } else {
+        "INVALID_SENSOR_BINDING:${calibrationBinding.rejectionReason}"
+    },
+    status = status
+)
 
 private object TiffHeaderParser {
     private const val MAX_IFDS = 64

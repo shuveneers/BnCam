@@ -49,6 +49,8 @@ class FrameSensorMetadataSnapshotTest {
             colorCorrectionGainsField = valid(listOf(2f, 1f, 1f, 1.5f), "CaptureResult.COLOR_CORRECTION_GAINS"),
             colorCorrectionTransformField = unavailable("CaptureResult.COLOR_CORRECTION_TRANSFORM"),
             neutralColorPointField = valid(listOf(0.5f, 1f, 0.67f), "CaptureResult.SENSOR_NEUTRAL_COLOR_POINT"),
+            referenceIlluminant1Field = valid(21, "CameraCharacteristics.SENSOR_REFERENCE_ILLUMINANT1"),
+            referenceIlluminant2Field = valid(17, "CameraCharacteristics.SENSOR_REFERENCE_ILLUMINANT2"),
             colorTransform1 = unavailable("CameraCharacteristics.SENSOR_COLOR_TRANSFORM1"),
             colorTransform2 = unavailable("CameraCharacteristics.SENSOR_COLOR_TRANSFORM2"),
             forwardMatrix1 = unavailable("CameraCharacteristics.SENSOR_FORWARD_MATRIX1"),

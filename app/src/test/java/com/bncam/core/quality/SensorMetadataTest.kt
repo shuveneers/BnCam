@@ -39,6 +39,8 @@ class SensorMetadataTest {
             colorCorrectionGainsField = v(listOf(2f, 1f, 1f, 1.5f), "CaptureResult.COLOR_CORRECTION_GAINS"),
             colorCorrectionTransformField = u("CaptureResult.COLOR_CORRECTION_TRANSFORM"),
             neutralColorPointField = v(listOf(0.5f, 1f, 0.67f), "CaptureResult.SENSOR_NEUTRAL_COLOR_POINT"),
+            referenceIlluminant1Field = v(21, "CameraCharacteristics.SENSOR_REFERENCE_ILLUMINANT1"),
+            referenceIlluminant2Field = v(17, "CameraCharacteristics.SENSOR_REFERENCE_ILLUMINANT2"),
             colorTransform1 = u("CameraCharacteristics.SENSOR_COLOR_TRANSFORM1"),
             colorTransform2 = u("CameraCharacteristics.SENSOR_COLOR_TRANSFORM2"),
             forwardMatrix1 = u("CameraCharacteristics.SENSOR_FORWARD_MATRIX1"),

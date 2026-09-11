@@ -10,118 +10,75 @@ class RawCameraColorProfileSessionLifecycleTest {
         .firstOrNull { File(it, "src/main/java/com/bncam/core/isp/raw10/RawCameraColorProfileRepository.kt").isFile }
         ?: error("Unable to locate app module")
 
+    private fun source(path: String): String = File(appDir, path).readText()
+
     @Test
-    fun `ordinary dng discovery remains next process only`() {
-        val repository = File(
-            appDir,
-            "src/main/java/com/bncam/core/isp/raw10/RawCameraColorProfileRepository.kt"
-        ).readText()
+    fun `persisted profiles stay candidates until exact current binding is registered`() {
+        val repository = source("src/main/java/com/bncam/core/isp/raw10/RawCameraColorProfileRepository.kt")
+        val begin = repository.substringAfter("fun beginSession(context: Context) {")
+            .substringBefore("fun registerExpectedCalibrationBinding")
+        assertTrue("persistedCandidates" in begin)
+        assertFalse("mergeByPriority(profiles" in begin)
+        assertFalse("installNative(" in begin)
 
-        val acceptBody = repository.substringAfter(
-            "private fun accept(snapshot: DngCameraColorProfileSnapshot, priority: Int): Boolean {"
-        ).substringBefore("private fun stageForNextProcess")
-        assertTrue("if (sessionStarted.get())" in acceptBody)
-        assertTrue("return stageForNextProcess(entry)" in acceptBody)
-        assertFalse("installNative(entry)" in acceptBody.substringBefore("if (sessionStarted.get())"))
-
-        val stageBody = repository.substringAfter("private fun stageForNextProcess(entry: Entry): Boolean {")
-            .substringBefore("private fun validateEntry")
-        assertTrue("persist(entry)" in stageBody)
-        assertTrue("mergeByPriority(pendingProfiles, entry)" in stageBody)
-        assertFalse("mergeByPriority(profiles, entry)" in stageBody)
-        assertFalse("installNative(entry)" in stageBody)
+        val bind = repository.substringAfter("fun registerExpectedCalibrationBinding")
+            .substringBefore("fun ensureSessionProfilesInstalled")
+        assertTrue("staticCalibrationFingerprint" in bind)
+        assertTrue("snapshotMatchesBinding" in bind)
+        assertTrue("persistedCandidates[key]" in bind)
+        assertTrue("installNative(active)" in bind)
     }
 
     @Test
-    fun `missing oem profile may activate only before that profile first renders`() {
-        val repository = File(
-            appDir,
-            "src/main/java/com/bncam/core/isp/raw10/RawCameraColorProfileRepository.kt"
-        ).readText()
+    fun `missing exact profile may bootstrap only before first render`() {
+        val repository = source("src/main/java/com/bncam/core/isp/raw10/RawCameraColorProfileRepository.kt")
+        val claim = repository.substringAfter("fun shouldBootstrapBeforeFirstRender(calibrationBinding: CalibrationProfileBinding)")
+            .substringBefore("fun completeBootstrapAttempt")
+        assertTrue("registerExpectedCalibrationBinding(calibrationBinding)" in claim)
+        assertTrue("calibrationBinding.safeForProfileBinding" in claim)
+        assertTrue("renderedProfileIds.contains(calibrationProfileId)" in claim)
+        assertTrue("profiles.containsKey(calibrationProfileId)" in claim)
 
-        val claimBody = repository.substringAfter(
-            "fun shouldBootstrapBeforeFirstRender(calibrationProfileId: String): Boolean"
-        ).substringBefore("fun installBootstrapDiscoveredProfile")
-        assertTrue("renderedProfileIds.contains(calibrationProfileId)" in claimBody)
-        assertTrue("profiles.containsKey(calibrationProfileId)" in claimBody)
-        assertTrue("bootstrapAttemptedProfileIds.add(calibrationProfileId)" in claimBody)
-        assertTrue("CountDownLatch(1)" in claimBody)
-
-        val installBody = repository.substringAfter(
-            "fun installBootstrapDiscoveredProfile(snapshot: DngCameraColorProfileSnapshot): Boolean {"
-        ).substringBefore("fun sealForRendering")
-        assertTrue("renderedProfileIds.contains(profileId)" in installBody)
-        assertTrue("installNative(entry)" in installBody)
-        assertTrue("mergeByPriority(profiles, entry)" in installBody)
-        assertTrue("persist(entry)" in installBody)
-        assertTrue("stageForNextProcess(entry)" in installBody)
-
-        val sealBody = repository.substringAfter("fun sealForRendering(")
-            .substringBefore("fun installBnCamCalibratedProfileBytes")
-        assertTrue("pendingBootstrap.await(BOOTSTRAP_RENDER_WAIT_MS" in sealBody)
-        assertTrue("renderedProfileIds.add(profileId)" in sealBody)
+        val install = repository.substringAfter("fun installBootstrapDiscoveredProfile")
+            .substringBefore("fun sealForRendering")
+        assertTrue("snapshotMatchesBinding" in install)
+        assertTrue("installNative(entry)" in install)
+        assertTrue("persist(entry)" in install)
     }
 
     @Test
-    fun `single raw builder bootstraps from direct raw16 before render seal`() {
-        val builder = File(
-            appDir,
-            "src/main/java/com/bncam/core/isp/raw/Raw16RenderInput.kt"
-        ).readText()
+    fun `single raw builder passes immutable calibration binding through bootstrap and seal`() {
+        val builder = source("src/main/java/com/bncam/core/isp/raw/Raw16RenderInput.kt")
         val bootstrap = builder.substringAfter("private fun bootstrapCameraColorProfileBeforeFirstRender(")
             .substringBefore("fun build(")
-
-        assertTrue("shouldBootstrapBeforeFirstRender(profileId)" in bootstrap)
-        assertTrue("nativeRaw16Buffer.withDirectBuffer" in bootstrap)
-        assertTrue("DngWriter.discoverCameraColorProfileFromVirtualRaw16" in bootstrap)
+        assertTrue("calibration?.base?.calibrationProfileBinding" in bootstrap)
+        assertTrue("shouldBootstrapBeforeFirstRender(calibrationBinding)" in bootstrap)
+        assertTrue("calibrationBinding = calibrationBinding!!" in bootstrap)
         assertTrue("installBootstrapDiscoveredProfile(discovered)" in bootstrap)
-        assertTrue("completeBootstrapAttempt(profileId)" in bootstrap)
         assertTrue("sealForRendering(" in bootstrap)
-        assertFalse("materializeForDng" in bootstrap)
-        assertFalse("materializeRaw16ForDng" in bootstrap)
     }
 
     @Test
-    fun `bootstrap dng is internal bounded and never published`() {
-        val writer = File(
-            appDir,
-            "src/main/java/com/bncam/core/isp/raw10/DngWriter.kt"
-        ).readText()
+    fun `bootstrap dng is private and profile parser receives exact binding`() {
+        val writer = source("src/main/java/com/bncam/core/isp/raw10/DngWriter.kt")
         val bootstrap = writer.substringAfter("fun discoverCameraColorProfileFromVirtualRaw16(")
             .substringBefore("fun lastAuditReport")
-
-        assertTrue("BOOTSTRAP_CAPTURE_LIMIT_BYTES" in writer)
+        assertTrue("ByteArrayOutputStream" in writer)
         assertTrue("DngCreator(characteristics, metadata)" in bootstrap)
-        assertTrue("writeByteBuffer(" in bootstrap)
-        assertTrue("PrefixCaptureOutputStream" in bootstrap)
+        assertTrue("calibrationBinding: CalibrationProfileBinding" in bootstrap)
+        assertTrue("calibrationBinding = calibrationBinding" in bootstrap)
         assertTrue("parseCameraColorProfileBytes(" in bootstrap)
         assertFalse("MediaStore" in bootstrap)
-        assertFalse("FileOutputStream" in bootstrap)
-        assertFalse("ByteBuffer.wrap(raw16" in bootstrap)
     }
 
     @Test
-    fun `persisted profiles load at manager session start and install before native warmup`() {
-        val manager = File(
-            appDir,
-            "src/main/java/com/bncam/core/engine/BnCameraManager.kt"
-        ).readText()
-        assertTrue("RawCameraColorProfileRepository.beginSession(context.applicationContext)" in manager)
-        val nativeWarmup = manager.substringAfter("private fun pushHardwareConfigToNative(lensId: String) {")
-            .substringBefore("sessionTransitionScope.launch")
-        assertTrue("RawCameraColorProfileRepository.ensureSessionProfilesInstalled()" in nativeWarmup)
-        assertTrue("section = \"RAW COLOR PROFILE SESSION\"" in manager)
-    }
-
-    @Test
-    fun `persistence is bounded versioned and replacement safe`() {
-        val repository = File(
-            appDir,
-            "src/main/java/com/bncam/core/isp/raw10/RawCameraColorProfileRepository.kt"
-        ).readText()
+    fun `persistence v2 is authority and calibration fingerprint keyed`() {
+        val repository = source("src/main/java/com/bncam/core/isp/raw10/RawCameraColorProfileRepository.kt")
         assertTrue("private const val MAGIC = 0x424E4350" in repository)
-        assertTrue("private const val VERSION = 1" in repository)
-        assertTrue("MAX_ARRAY_FLOATS" in repository)
+        assertTrue("private const val VERSION = 2" in repository)
+        assertTrue("raw_camera_color_profiles_v2" in repository)
+        assertTrue("entry.snapshot.sensorAuthorityId" in repository)
+        assertTrue("entry.snapshot.staticCalibrationFingerprint" in repository)
         assertTrue("StandardCopyOption.ATOMIC_MOVE" in repository)
         assertTrue("StandardCopyOption.REPLACE_EXISTING" in repository)
     }

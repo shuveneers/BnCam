@@ -675,13 +675,32 @@ class MultiFrameRunner(
         val height = anchorBuffer.height
         val rowStride = 0 // RowStride wordt nu onzichtbaar en efficiënt door C++ HardwareBuffer API afgehandeld
 
+        val rawFrameSource =
+            activeZslFormat == ImageFormat.RAW10 || activeZslFormat == ImageFormat.RAW_SENSOR
+        val anchorRawAuthorityInput = if (rawFrameSource) {
+            com.bncam.core.quality.PhysicalSensorProfileRegistry.resolveCurrentCalibrationInput(
+                fallbackCharacteristics = chars,
+                captureResult = anchorMetadata,
+                sensorMetadata = anchorPair.sensorMetadataSnapshot
+            ).also { authority ->
+                val expectedSource = anchorPair.sensorMetadataSnapshot?.sensorIdentity?.sourceId
+                if (expectedSource == null || authority.sensorIdentity?.sourceId != expectedSource) {
+                    throw com.bncam.core.quality.SensorAuthorityUnavailableException(
+                        "UNSAFE_TO_PROCESS:RAW_MATERIALIZATION_AUTHORITY_MISMATCH"
+                    )
+                }
+            }
+        } else null
+        val rawAuthorityCharacteristics = anchorRawAuthorityInput?.characteristics ?: chars
+        val rawAuthorityCaptureResult = anchorRawAuthorityInput?.captureResult ?: anchorMetadata
+
         val baseRenderQualityConfig = RenderQualityConfig.load(
             repo = settingsRepo,
             profileId = profileId,
             frameSourceFormat = activeZslFormat,
             captureMode = activeProfile.captureStrategy,
-            characteristics = chars,
-            captureResult = anchorMetadata,
+            characteristics = rawAuthorityCharacteristics,
+            captureResult = rawAuthorityCaptureResult,
             sensorMetadata = anchorPair.sensorMetadataSnapshot,
             lensHardwareSettings = lensHardwareSettings,
             preferenceSnapshot = capturedSettings.renderPreferences,
@@ -713,7 +732,7 @@ class MultiFrameRunner(
                     frameTimestampNs = exactFrameTimestampNs,
                     lensId = activeLens.id,
                     calibration = calibration,
-                    captureResult = exactFrameMetadata
+                    captureResult = calibrationInput.captureResult
                 )
             }
         }
@@ -934,8 +953,8 @@ class MultiFrameRunner(
                                 sourceFormat = activeZslFormat,
                                 width = width,
                                 height = height,
-                                characteristics = chars,
-                                captureResult = anchorMetadata,
+                                characteristics = rawAuthorityCharacteristics,
+                                captureResult = rawAuthorityCaptureResult,
                                 // DngMerger needs the pre-fusion per-frame S/O model. It
                                 // derives actual observer/fusion scaling from aligned supports;
                                 // passing the already 1/N-scaled display calibration here would
@@ -1091,6 +1110,71 @@ class MultiFrameRunner(
                                 }
                             }
                             if (renderedJpegBytes != null && renderedJpegBytes.isNotEmpty()) {
+                                val colorAudit = com.bncam.core.capture.RawColorPipelineAuditor.audit(
+                                    sensorMetadata = anchorPair.sensorMetadataSnapshot,
+                                    cfaPattern = renderQualityConfig.finalCalibration?.base?.cfaPattern ?: 0,
+                                    effectiveWbGains = renderQualityConfig.finalCalibration?.effectiveWbGains
+                                        ?: floatArrayOf(1.0f, 1.0f, 1.0f, 1.0f),
+                                    colorMatrix = renderQualityConfig.finalCalibration?.effectiveColorMatrix
+                                        ?: floatArrayOf(1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f),
+                                    lensShadingMap = rawAuthorityCaptureResult
+                                        .get(CaptureResult.STATISTICS_LENS_SHADING_CORRECTION_MAP),
+                                    jniStatsString = masterIspStats
+                                )
+                                val calibration = renderQualityConfig.finalCalibration
+                                val binding = calibration?.base?.calibrationProfileBinding
+                                val frameIdentity = anchorPair.sensorMetadataSnapshot
+                                    ?.frameIdentityForRaw(anchorPair.timestamp)
+                                val white = calibration?.effectiveWhiteLevel ?: 0
+                                val blacks = calibration?.effectiveBlackLevels
+                                val blackWhiteRangeValid = white > 1 && blacks?.size == 4 &&
+                                    blacks.all { level ->
+                                        level.isFinite() && level >= 0.0f && level < white.toFloat()
+                                    }
+                                val publicationIntegrity =
+                                    com.bncam.core.capture.RawPublicationIntegrityGate.evaluate(
+                                        com.bncam.core.capture.RawPublicationIntegrityGate.Input(
+                                            provenanceSafe = frameIdentity?.safeForRawProcessing == true,
+                                            coreMetadataSafe = anchorPair.sensorMetadataSnapshot
+                                                ?.coreRawMetadataValid == true,
+                                            calibrationBindingSafe = binding?.safeForProfileBinding == true,
+                                            authorityProfileMatch = binding?.provenance?.authorityMatches == true,
+                                            cfaMatched = colorAudit.cfaPatternMatched,
+                                            whiteBalanceValid = colorAudit.wbGainsConsistent,
+                                            colorMatrixValid = colorAudit.ccmDeterminantValid &&
+                                                calibration?.effectiveColorMatrixApplied == true,
+                                            colorMatrixIdentityFallbackUsed =
+                                                calibration?.effectiveColorMatrixIdentityFallbackUsed != false,
+                                            blackWhiteRangeValid = blackWhiteRangeValid
+                                        )
+                                    )
+                                if (enableShotLogger) {
+                                    shotLogger.recordPipelineEvent(
+                                        "RAW Publication Integrity",
+                                        "Safe",
+                                        publicationIntegrity.safeForPublication.toString()
+                                    )
+                                    shotLogger.recordPipelineEvent(
+                                        "RAW Publication Integrity",
+                                        "Reason",
+                                        publicationIntegrity.reason
+                                    )
+                                    shotLogger.recordPipelineEvent(
+                                        "RAW Publication Integrity",
+                                        "Sensor Authority ID",
+                                        binding?.provenance?.sensorAuthorityId ?: "UNAVAILABLE"
+                                    )
+                                    shotLogger.recordPipelineEvent(
+                                        "RAW Publication Integrity",
+                                        "Calibration Profile ID",
+                                        binding?.calibrationProfileId ?: "UNAVAILABLE"
+                                    )
+                                }
+                                if (!publicationIntegrity.safeForPublication) {
+                                    throw IllegalStateException(
+                                        "RAW_PUBLICATION_INTEGRITY_BLOCKED:${publicationIntegrity.reason}"
+                                    )
+                                }
                                 finalJpegBytes = renderedJpegBytes
                                 if (hdrEnhancedActive) {
                                     hdrEnhancedJpegCompletedActual = true
@@ -1515,12 +1599,13 @@ class MultiFrameRunner(
                                 raw16Bytes = raw16,
                                 width = nativeMaster.width,
                                 height = nativeMaster.height,
-                                metadata = anchorMetadata,
-                                characteristics = chars,
+                                metadata = rawAuthorityCaptureResult,
+                                characteristics = rawAuthorityCharacteristics,
                                 orientation = exifOrientation,
                                 dngMergeStats = dngMergeStats,
                                 lensHardwareDescription = lensHardwareSettings.dngDescription(),
-                                rawDomainContract = nativeMaster.rawFrameInfo
+                                rawDomainContract = nativeMaster.rawFrameInfo,
+                                calibration = nativeMaster.finalCalibration
                             )
                             performanceTracker.recordDuration(
                                 "dng_export_and_mediastore_write",
@@ -2956,7 +3041,8 @@ class MultiFrameRunner(
         orientation: Int,
         dngMergeStats: String,
         lensHardwareDescription: String,
-        rawDomainContract: com.bncam.core.isp.raw.RawDomainContract?
+        rawDomainContract: com.bncam.core.isp.raw.RawDomainContract?,
+        calibration: com.bncam.core.quality.FinalSensorCalibration? = null
     ) = withContext(Dispatchers.IO) {
         val resolver = context.contentResolver
         val bytesWritten = resolver.openOutputStream(uri)?.use { output ->
@@ -2970,7 +3056,8 @@ class MultiFrameRunner(
                 dngMergeStats = dngMergeStats,
                 lensHardwareDescription = lensHardwareDescription,
                 rawDomainContract = rawDomainContract,
-                outputStream = output
+                outputStream = output,
+                calibration = calibration
             )
         } ?: 0L
         if (bytesWritten <= 0L) throw IllegalStateException("DNG writer produced no bytes.")

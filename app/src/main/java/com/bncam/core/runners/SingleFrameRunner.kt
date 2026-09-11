@@ -1648,6 +1648,25 @@ class SingleFrameRunner(
         }
         captureStageListener.sourceImageAcquired()
         val captureMetadata: TotalCaptureResult? = anchorFrame.metadata
+        val isRawFrameSource =
+            activeZslFormat == ImageFormat.RAW10 ||
+                activeZslFormat == ImageFormat.RAW_SENSOR
+        val exactRawAuthorityInput = if (isRawFrameSource) {
+            com.bncam.core.quality.PhysicalSensorProfileRegistry.resolveCurrentCalibrationInput(
+                fallbackCharacteristics = chars,
+                captureResult = captureMetadata,
+                sensorMetadata = anchorFrame.sensorMetadataSnapshot
+            ).also { authority ->
+                val expectedSource = anchorFrame.sensorMetadataSnapshot?.sensorIdentity?.sourceId
+                if (expectedSource == null || authority.sensorIdentity?.sourceId != expectedSource) {
+                    throw com.bncam.core.quality.SensorAuthorityUnavailableException(
+                        "UNSAFE_TO_PROCESS:RAW_MATERIALIZATION_AUTHORITY_MISMATCH"
+                    )
+                }
+            }
+        } else null
+        val rawAuthorityCharacteristics = exactRawAuthorityInput?.characteristics ?: chars
+        val rawAuthorityCaptureResult = exactRawAuthorityInput?.captureResult ?: captureMetadata
         val colorSensorReading = if (phoneAssistanceSensorsEnabled) {
             colorSensorHelper.getBestReading(captureMetadata)
         } else {
@@ -1918,10 +1937,6 @@ class SingleFrameRunner(
             shotLogger.recordFrameAnalysisEntries(frameDebugEntries)
         }
 
-        val isRawFrameSource =
-            activeZslFormat == ImageFormat.RAW10 ||
-                activeZslFormat == ImageFormat.RAW_SENSOR
-
         // SPECTRA observes one real compatible warm-buffer support frame even in
         // single-frame mode. It is aligned and measured natively but never fused into
         // the single-frame output. This replaces the invalid render-to-render observer.
@@ -2005,8 +2020,8 @@ class SingleFrameRunner(
                         sourceFormat = activeZslFormat,
                         width = frameWidth,
                         height = frameHeight,
-                        characteristics = chars,
-                        captureResult = captureMetadata,
+                        characteristics = rawAuthorityCharacteristics,
+                        captureResult = rawAuthorityCaptureResult,
                         qualityConfig = renderQualityConfig,
                         orientationDegrees = finalJpegRotation,
                         demosaicAfHints = demosaicAfHints,
@@ -2086,7 +2101,7 @@ class SingleFrameRunner(
                     rawWorkReservation?.fail("raw_only_dng_reservation_failed")
                     throw IllegalStateException("RAW-only DNG MediaStore reservation failed.")
                 }
-            val metadata = captureMetadata
+            val metadata = rawAuthorityCaptureResult
                 ?: run {
                     rawWorkReservation?.fail("raw_only_metadata_missing")
                     runCatching { context.contentResolver.delete(dngUri, null, null) }
@@ -2131,11 +2146,12 @@ class SingleFrameRunner(
                         width = rawInput.width,
                         height = rawInput.height,
                         metadata = metadata,
-                        characteristics = chars,
+                        characteristics = rawAuthorityCharacteristics,
                         orientation = getExifOrientation(finalJpegRotation),
                         dngMergeStats = rawInput.dngMergeStats,
                         lensHardwareDescription = lensHardwareSettings.dngDescription(),
-                        rawDomainContract = rawInput.rawFrameInfo
+                        rawDomainContract = rawInput.rawFrameInfo,
+                        calibration = rawInput.finalCalibration
                     )
                     performanceTracker.recordDuration(
                         "dng_export_and_mediastore_write",
@@ -2379,18 +2395,86 @@ class SingleFrameRunner(
 
                     val renderedJpegBytes = jpegResult?.jpegBytes
                     if (renderedJpegBytes != null && renderedJpegBytes.isNotEmpty()) {
-                        finalJpegBytes = renderedJpegBytes
-                        Log.i(tag, "Single RAW16 profile render succeeded. JPEG received (${renderedJpegBytes.size} bytes).")
-
                         val colorAudit = RawColorPipelineAuditor.audit(
-                            characteristics = chars,
-                            result = captureMetadata,
+                            sensorMetadata = anchorFrame.sensorMetadataSnapshot,
                             cfaPattern = renderQualityConfig.finalCalibration?.base?.cfaPattern ?: 0,
                             effectiveWbGains = renderQualityConfig.finalCalibration?.effectiveWbGains ?: floatArrayOf(1.0f, 1.0f, 1.0f, 1.0f),
                             colorMatrix = renderQualityConfig.finalCalibration?.effectiveColorMatrix ?: floatArrayOf(1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f),
                             lensShadingMap = captureMetadata?.get(CaptureResult.STATISTICS_LENS_SHADING_CORRECTION_MAP),
                             jniStatsString = masterIspStats
                         )
+
+                        val calibration = renderQualityConfig.finalCalibration
+                        val calibrationBinding = calibration?.base?.calibrationProfileBinding
+                        val frameIdentity = anchorFrame.sensorMetadataSnapshot?.frameIdentityForRaw(anchorFrame.timestamp)
+                        val white = calibration?.effectiveWhiteLevel ?: 0
+                        val blackLevels = calibration?.effectiveBlackLevels
+                        val blackWhiteRangeValid = white > 1 &&
+                            blackLevels?.size == 4 &&
+                            blackLevels.all { level ->
+                                level.isFinite() && level >= 0.0f && level < white.toFloat()
+                            }
+                        val publicationIntegrity = com.bncam.core.capture.RawPublicationIntegrityGate.evaluate(
+                            com.bncam.core.capture.RawPublicationIntegrityGate.Input(
+                                provenanceSafe = frameIdentity?.safeForRawProcessing == true,
+                                coreMetadataSafe = anchorFrame.sensorMetadataSnapshot?.coreRawMetadataValid == true,
+                                calibrationBindingSafe = calibrationBinding?.safeForProfileBinding == true,
+                                authorityProfileMatch = calibrationBinding?.provenance?.authorityMatches == true,
+                                cfaMatched = colorAudit.cfaPatternMatched,
+                                whiteBalanceValid = colorAudit.wbGainsConsistent,
+                                colorMatrixValid = colorAudit.ccmDeterminantValid &&
+                                    calibration?.effectiveColorMatrixApplied == true,
+                                colorMatrixIdentityFallbackUsed =
+                                    calibration?.effectiveColorMatrixIdentityFallbackUsed != false,
+                                blackWhiteRangeValid = blackWhiteRangeValid
+                            )
+                        )
+                        if (enableShotLogger) {
+                            shotLogger.recordPipelineEvent(
+                                "RAW Publication Integrity",
+                                "Safe",
+                                publicationIntegrity.safeForPublication.toString()
+                            )
+                            shotLogger.recordPipelineEvent(
+                                "RAW Publication Integrity",
+                                "Reason",
+                                publicationIntegrity.reason
+                            )
+                            shotLogger.recordPipelineEvent(
+                                "RAW Publication Integrity",
+                                "Sensor Authority ID",
+                                calibrationBinding?.provenance?.sensorAuthorityId ?: "UNAVAILABLE"
+                            )
+                            shotLogger.recordPipelineEvent(
+                                "RAW Publication Integrity",
+                                "Calibration Profile ID",
+                                calibrationBinding?.calibrationProfileId ?: "UNAVAILABLE"
+                            )
+                            shotLogger.recordPipelineEvent(
+                                "RAW Publication Integrity",
+                                "DNG/RAW CaptureResult Source",
+                                exactRawAuthorityInput?.sensorIdentity?.sourceId ?: "UNAVAILABLE"
+                            )
+                        }
+                        if (!publicationIntegrity.safeForPublication) {
+                            if (enableShotLogger) {
+                                shotLogger.recordWarning(
+                                    "RAW Publication Integrity",
+                                    "RAW_PUBLICATION_INTEGRITY_BLOCKED:${publicationIntegrity.reason}",
+                                    "ERROR"
+                                )
+                            }
+                            throw IllegalStateException(
+                                "RAW_PUBLICATION_INTEGRITY_BLOCKED:${publicationIntegrity.reason}"
+                            )
+                        }
+                        finalJpegBytes = renderedJpegBytes
+                        Log.i(
+                            tag,
+                            "RAW_PUBLICATION_INTEGRITY_PASS authority=${calibrationBinding?.provenance?.sensorAuthorityId} " +
+                                "profile=${calibrationBinding?.calibrationProfileId} reason=${publicationIntegrity.reason}"
+                        )
+                        Log.i(tag, "Single RAW16 profile render succeeded. JPEG received (${renderedJpegBytes.size} bytes).")
 
                         val rejectedReasons = ZslCandidateAuditor.getLogs()
                             .associate { it.timestampNs to it.rejectReason }
@@ -2436,6 +2520,12 @@ class SingleFrameRunner(
                         shotLogger.recordPipelineEvent("Single RAW16 Frame", "Master RAW16 Builder Used", "false")
                         shotLogger.recordPipelineEvent("Single RAW16 Frame", "Stats", dngMergeStats)
                         shotLogger.recordPipelineEvent("Single RAW16 ISP Render", "Stats", masterIspStats)
+                        val calibrationProfileId = renderQualityConfig.finalCalibration?.base?.calibrationProfileId ?: "unknown"
+                        shotLogger.recordPipelineEvent(
+                            "Calibration Profile Repository",
+                            "Binding",
+                            com.bncam.core.isp.raw10.RawCameraColorProfileRepository.bindingDebugSummary(calibrationProfileId)
+                        )
                         val masterIspStatsMap = parseNativeStats(masterIspStats)
                         if (masterIspStatsMap["colorMatrixApplied"] == "false" || masterIspStats.contains("colorMatrixApplied=false")) {
                             shotLogger.recordWarning("RAW ISP", "Color Matrix Applied=false during Master RAW JPEG render. This is a quality warning, not a clean success.", "WARN")
@@ -2526,9 +2616,9 @@ class SingleFrameRunner(
                         SingleRawProcessingFeedback(
                             nativeStats = masterIspStats,
                             exposureTimeNs =
-                                captureMetadata?.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 0L,
+                                rawAuthorityCaptureResult?.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 0L,
                             sensitivityIso =
-                                captureMetadata?.get(CaptureResult.SENSOR_SENSITIVITY) ?: 0,
+                                rawAuthorityCaptureResult?.get(CaptureResult.SENSOR_SENSITIVITY) ?: 0,
                             succeeded = finalJpegBytes?.isNotEmpty() == true
                         )
                     )
@@ -2554,7 +2644,7 @@ class SingleFrameRunner(
                     finalProcessingFailure = IllegalStateException("JPEG MediaStore reservation failed.")
                 }
                 val rawInput = singleRawFrame
-                val metadata = captureMetadata
+                val metadata = rawAuthorityCaptureResult
                 if (plan.outputPolicy.producesRaw &&
                     rawInput != null && rawInput.raw16ByteCount > 0 && metadata != null
                 ) {
@@ -2610,11 +2700,12 @@ class SingleFrameRunner(
                                 width = rawInput.width,
                                 height = rawInput.height,
                                 metadata = metadata,
-                                characteristics = chars,
+                                characteristics = rawAuthorityCharacteristics,
                                 orientation = getExifOrientation(finalJpegRotation),
                                 dngMergeStats = rawInput.dngMergeStats,
                                 lensHardwareDescription = lensHardwareSettings.dngDescription(),
-                                rawDomainContract = rawInput.rawFrameInfo
+                                rawDomainContract = rawInput.rawFrameInfo,
+                                calibration = rawInput.finalCalibration
                             )
                             performanceTracker.incrementCounter("dngMediaStorePublicationCount")
                             performanceTracker.incrementCounter("terminalPublicationCount")
@@ -2993,7 +3084,7 @@ class SingleFrameRunner(
                 }
             } else null
             var dngPublicUri: Uri? = null
-            if (plan.outputPolicy.producesRaw && raw16ForDngSave != null && raw16ForDngSave.isNotEmpty() && captureMetadata != null) {
+            if (plan.outputPolicy.producesRaw && raw16ForDngSave != null && raw16ForDngSave.isNotEmpty() && rawAuthorityCaptureResult != null) {
                 val dngWriteStartedNs = android.os.SystemClock.elapsedRealtimeNanos()
                 val dngSaveResult = saveVirtualDngToMediaStore(
                     raw16Bytes = raw16ForDngSave,
@@ -3001,12 +3092,13 @@ class SingleFrameRunner(
                     saveLocation = saveLocation,
                     width = singleRawFrame?.width ?: frameWidth,
                     height = singleRawFrame?.height ?: frameHeight,
-                    metadata = captureMetadata,
-                    characteristics = chars,
+                    metadata = rawAuthorityCaptureResult,
+                    characteristics = rawAuthorityCharacteristics,
                     orientation = getExifOrientation(finalJpegRotation),
                     dngMergeStats = dngMergeStats,
                     lensHardwareDescription = lensHardwareSettings.dngDescription(),
-                    rawDomainContract = singleRawFrame?.rawFrameInfo
+                    rawDomainContract = singleRawFrame?.rawFrameInfo,
+                    calibration = singleRawFrame?.finalCalibration
                 )
                 dngPublicUri = dngSaveResult.first
                 dngBytesSize = dngSaveResult.second.toInt().coerceAtLeast(raw16ForDngSave.size)
@@ -4080,7 +4172,8 @@ class SingleFrameRunner(
         orientation: Int,
         dngMergeStats: String,
         lensHardwareDescription: String = "",
-        rawDomainContract: com.bncam.core.isp.raw.RawDomainContract? = null
+        rawDomainContract: com.bncam.core.isp.raw.RawDomainContract? = null,
+        calibration: com.bncam.core.quality.FinalSensorCalibration? = null
     ): Pair<Uri?, Long> {
         return withContext(Dispatchers.IO) {
             val contentValues = ContentValues().apply {
@@ -4117,7 +4210,8 @@ class SingleFrameRunner(
                         dngMergeStats = dngMergeStats,
                         lensHardwareDescription = lensHardwareDescription,
                         rawDomainContract = rawDomainContract,
-                        outputStream = outputStream
+                        outputStream = outputStream,
+                        calibration = calibration
                     ) ?: 0L
                 }
 
@@ -4154,7 +4248,8 @@ class SingleFrameRunner(
         orientation: Int,
         dngMergeStats: String,
         lensHardwareDescription: String,
-        rawDomainContract: com.bncam.core.isp.raw.RawDomainContract?
+        rawDomainContract: com.bncam.core.isp.raw.RawDomainContract?,
+        calibration: com.bncam.core.quality.FinalSensorCalibration? = null
     ) = withContext(Dispatchers.IO) {
         val resolver = context.contentResolver
         val bytesWritten = resolver.openOutputStream(uri)?.use { outputStream ->
@@ -4168,7 +4263,8 @@ class SingleFrameRunner(
                 dngMergeStats = dngMergeStats,
                 lensHardwareDescription = lensHardwareDescription,
                 rawDomainContract = rawDomainContract,
-                outputStream = outputStream
+                outputStream = outputStream,
+                calibration = calibration
             )
         } ?: 0L
         if (bytesWritten <= 0L) throw IllegalStateException("DNG writer produced no bytes.")

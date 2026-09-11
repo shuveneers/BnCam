@@ -90,10 +90,12 @@ object SingleRaw16FrameBuilder {
         characteristics: CameraCharacteristics,
         calibration: FinalSensorCalibration?
     ) {
-        val profileId = calibration?.base?.calibrationProfileId ?: "unknown"
+        val calibrationBinding = calibration?.base?.calibrationProfileBinding
+        val profileId = calibrationBinding?.calibrationProfileId ?: "unknown"
         val effectiveCcm = calibration?.effectiveColorMatrix
-        val bootstrapClaimed = captureResult != null && effectiveCcm?.size == 9 &&
-            RawCameraColorProfileRepository.shouldBootstrapBeforeFirstRender(profileId)
+        val bootstrapClaimed = captureResult != null && calibrationBinding != null &&
+            calibrationBinding.safeForProfileBinding && effectiveCcm?.size == 9 &&
+            RawCameraColorProfileRepository.shouldBootstrapBeforeFirstRender(calibrationBinding)
         try {
             if (bootstrapClaimed) {
                 val discovered = nativeRaw16Buffer.withDirectBuffer { directRaw16 ->
@@ -103,7 +105,7 @@ object SingleRaw16FrameBuilder {
                         raw16Buffer = directRaw16,
                         metadata = captureResult!!,
                         characteristics = characteristics,
-                        calibrationProfileId = profileId,
+                        calibrationBinding = calibrationBinding!!,
                         discoveryEffectiveCcm = effectiveCcm!!
                     )
                 }
@@ -118,10 +120,12 @@ object SingleRaw16FrameBuilder {
             // The unpublished DNG bootstrap completes before this RAW16 object is exposed to the
             // JPEG renderer. The current process therefore sees one frozen physical-colour owner,
             // while JPEG-only remains JPEG-only at the publication boundary.
-            RawCameraColorProfileRepository.sealForRendering(
-                calibrationProfileId = profileId,
-                source = if (sourceFormat == ImageFormat.RAW10) "SINGLE_RAW10" else "SINGLE_RAW_SENSOR"
-            )
+            if (calibrationBinding != null) {
+                RawCameraColorProfileRepository.sealForRendering(
+                    calibrationBinding = calibrationBinding,
+                    source = if (sourceFormat == ImageFormat.RAW10) "SINGLE_RAW10" else "SINGLE_RAW_SENSOR"
+                )
+            }
         }
     }
 

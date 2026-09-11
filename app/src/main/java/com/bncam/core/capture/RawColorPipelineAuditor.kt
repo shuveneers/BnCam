@@ -1,8 +1,8 @@
 package com.bncam.core.capture
 
 import android.hardware.camera2.CameraCharacteristics
-import android.hardware.camera2.CaptureResult
 import android.util.Log
+import com.bncam.core.quality.SensorMetadata
 import kotlin.math.abs
 
 object RawColorPipelineAuditor {
@@ -85,59 +85,31 @@ object RawColorPipelineAuditor {
     }
 
     private fun auditRawStaticCalibration(
-        characteristics: CameraCharacteristics?,
+        sensorMetadata: SensorMetadata?,
         diagnostics: MutableList<String>
     ): RawCalibrationAudit {
-        if (characteristics == null) {
-            diagnostics.add("RAW_COLOR_CALIBRATION: characteristics unavailable")
+        if (sensorMetadata == null) {
+            diagnostics.add("RAW_COLOR_CALIBRATION: uniform SensorMetadata unavailable")
             return RawCalibrationAudit()
         }
 
-        val reference1 = try {
-            characteristics.get(CameraCharacteristics.SENSOR_REFERENCE_ILLUMINANT1)
-        } catch (_: Throwable) {
-            null
-        }
-        val reference2 = try {
-            characteristics.get(CameraCharacteristics.SENSOR_REFERENCE_ILLUMINANT2)?.toInt()
-        } catch (_: Throwable) {
-            null
-        }
-        val color1 = try {
-            characteristics.get(CameraCharacteristics.SENSOR_COLOR_TRANSFORM1)
-        } catch (_: Throwable) {
-            null
-        }
-        val color2 = try {
-            characteristics.get(CameraCharacteristics.SENSOR_COLOR_TRANSFORM2)
-        } catch (_: Throwable) {
-            null
-        }
-        val calibration1 = try {
-            characteristics.get(CameraCharacteristics.SENSOR_CALIBRATION_TRANSFORM1)
-        } catch (_: Throwable) {
-            null
-        }
-        val calibration2 = try {
-            characteristics.get(CameraCharacteristics.SENSOR_CALIBRATION_TRANSFORM2)
-        } catch (_: Throwable) {
-            null
-        }
-        val forward1 = try {
-            characteristics.get(CameraCharacteristics.SENSOR_FORWARD_MATRIX1)
-        } catch (_: Throwable) {
-            null
-        }
-        val forward2 = try {
-            characteristics.get(CameraCharacteristics.SENSOR_FORWARD_MATRIX2)
-        } catch (_: Throwable) {
-            null
-        }
+        val reference1 = sensorMetadata.referenceIlluminant1Field.value
+        val reference2 = sensorMetadata.referenceIlluminant2Field.value
+        val color1 = sensorMetadata.colorTransform1.value
+        val color2 = sensorMetadata.colorTransform2.value
+        val calibration1 = sensorMetadata.cameraCalibration1.value
+        val calibration2 = sensorMetadata.cameraCalibration2.value
+        val forward1 = sensorMetadata.forwardMatrix1.value
+        val forward2 = sensorMetadata.forwardMatrix2.value
 
         val calibrationTemperature1 = dngCalibrationTemperatureKelvin(reference1)
         val calibrationTemperature2 = dngCalibrationTemperatureKelvin(reference2)
-        val set1Complete = reference1 != null && color1 != null && calibration1 != null && forward1 != null
-        val set2Complete = reference2 != null && color2 != null && calibration2 != null && forward2 != null
+        val set1Complete = sensorMetadata.referenceIlluminant1Field.isValid &&
+            sensorMetadata.colorTransform1.isValid && sensorMetadata.cameraCalibration1.isValid &&
+            sensorMetadata.forwardMatrix1.isValid
+        val set2Complete = sensorMetadata.referenceIlluminant2Field.isValid &&
+            sensorMetadata.colorTransform2.isValid && sensorMetadata.cameraCalibration2.isValid &&
+            sensorMetadata.forwardMatrix2.isValid
         val dualReady = set1Complete && set2Complete
         val dualInterpolationTemperatureReady = dualReady &&
             calibrationTemperature1 != null && calibrationTemperature2 != null
@@ -189,8 +161,7 @@ object RawColorPipelineAuditor {
     }
 
     fun audit(
-        characteristics: CameraCharacteristics?,
-        result: CaptureResult?,
+        sensorMetadata: SensorMetadata?,
         cfaPattern: Int,
         effectiveWbGains: FloatArray,
         colorMatrix: FloatArray,
@@ -199,11 +170,7 @@ object RawColorPipelineAuditor {
     ): ColorAuditResult {
         val diagnostics = mutableListOf<String>()
 
-        val hardwareCfa = testCfaOverride ?: try {
-            characteristics?.get(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT) ?: -1
-        } catch (_: Throwable) {
-            -1
-        }
+        val hardwareCfa = testCfaOverride ?: sensorMetadata?.cfa?.value ?: -1
         val cfaPatternMatched = hardwareCfa == cfaPattern
         val cfaName = when (cfaPattern) {
             0 -> "RGGB"
@@ -258,7 +225,7 @@ object RawColorPipelineAuditor {
         // Phase 2 / DELTA 0139: audit the RAW static calibration as a complete provenance set.
         // Do not infer Kelvin or synthesize a ForwardMatrix from the exact-frame Camera2 CCM.
         // The DNG HueSatMap path may only become eligible when its paired profile transform is known.
-        val rawCalibration = auditRawStaticCalibration(characteristics, diagnostics)
+        val rawCalibration = auditRawStaticCalibration(sensorMetadata, diagnostics)
 
         val lensShadingMapObj = lensShadingMap as? android.hardware.camera2.params.LensShadingMap
         val lensShadingConsistent = lensShadingMapObj == null || lensShadingMapObj.gainFactorCount > 0

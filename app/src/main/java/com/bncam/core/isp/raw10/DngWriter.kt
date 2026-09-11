@@ -3,15 +3,18 @@ package com.bncam.core.isp.raw10
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.DngCreator
+import android.os.Build
 import android.util.Log
 import android.util.Size
 import com.bncam.core.isp.raw.RawDomainContract
+import com.bncam.core.quality.CalibrationProfileBinding
 import java.io.ByteArrayOutputStream
 import java.io.OutputStream
 import java.nio.ByteBuffer
 
 object DngWriter {
     private const val TAG = "DngWriter"
+    @Volatile private var lastAuthorityReport: String = "DNG_AUTHORITY_NOT_EVALUATED"
 
     /**
      * Streams a virtual RAW16/Bayer buffer directly to an OutputStream.
@@ -34,6 +37,42 @@ object DngWriter {
         rawDomainContract: RawDomainContract? = null
     ): Long? {
         return try {
+            val binding = calibration?.base?.calibrationProfileBinding
+            val expectedAuthority = binding?.provenance?.sensorAuthorityId
+            val metadataTimestamp = metadata.get(CaptureResult.SENSOR_TIMESTAMP)
+            val runtimeCameraId = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                metadata.cameraId
+            } else {
+                expectedAuthority
+            }
+            val authorityDecision = RawDngAuthorityContract.evaluate(
+                RawDngAuthorityContract.Input(
+                    calibrationPresent = calibration != null && binding != null,
+                    bindingSafe = binding?.safeForProfileBinding == true,
+                    authorityProfileMatch = binding?.provenance?.authorityMatches == true,
+                    characteristicsSourceMatches = binding?.provenance?.characteristicsSourceId == expectedAuthority,
+                    captureResultSourceMatches = binding?.provenance?.captureResultSourceId == expectedAuthority,
+                    runtimeCameraIdMatches = expectedAuthority != null && runtimeCameraId == expectedAuthority,
+                    frameTimestampMatches = calibration?.base?.sensorTimestampNs != null &&
+                        calibration.base.sensorTimestampNs == metadataTimestamp
+                )
+            )
+            lastAuthorityReport = buildString {
+                append("safe=").append(authorityDecision.safeForDng)
+                append(";reason=").append(authorityDecision.reason)
+                append(";authority=").append(expectedAuthority ?: "UNAVAILABLE")
+                append(";profile=").append(binding?.calibrationProfileId ?: "UNAVAILABLE")
+                append(";captureResultCameraId=").append(runtimeCameraId ?: "UNAVAILABLE")
+                append(";timestampMatch=").append(
+                    calibration?.base?.sensorTimestampNs != null &&
+                        calibration.base.sensorTimestampNs == metadataTimestamp
+                )
+            }
+            if (!authorityDecision.safeForDng) {
+                Log.e(TAG, "DNG_AUTHORITY_BLOCKED:$lastAuthorityReport")
+                return null
+            }
+
             if (!isValidRaw16Payload(width, height, raw16Bytes)) {
                 Log.e(TAG, "Invalid virtual RAW16 payload: ${raw16Bytes.size} bytes for ${width}x$height")
                 return null
@@ -62,6 +101,10 @@ object DngWriter {
                 val description = buildString {
                     append("BnCam DNG Engine V2")
                     append(" | Semantic audit enabled")
+                    append(" | DNG Authority=EXACT_FRAME_SENSOR_AUTHORITY")
+                    append(" | SensorAuthority=").append(expectedAuthority ?: "UNAVAILABLE")
+                    append(" | CalibrationFingerprint=")
+                        .append(binding?.staticCalibrationFingerprint ?: "UNAVAILABLE")
                     if (calibration != null) {
                         append(" | BASE: BL=[${calibration.base.baseBlackLevels.joinToString(",")}] WL=${calibration.base.baseWhiteLevel}")
                         append(" | OVERRIDE: BL Mode=${calibration.override.blackLevelMode}")
@@ -90,12 +133,15 @@ object DngWriter {
                 orientationExif = exifOrientation,
                 contract = rawDomainContract,
                 characteristics = characteristics,
-                calibrationProfileId = calibration?.base?.calibrationProfileId ?: "unknown",
+                calibrationBinding = calibration?.base?.calibrationProfileBinding,
                 discoveryEffectiveCcm = calibration?.effectiveColorMatrix?.copyOf()
             )
-            RawCameraColorProfileRepository.installDiscoveredProfile(
-                DngSemanticAuditor.lastCameraColorProfileSnapshot()
-            )
+            calibration?.base?.calibrationProfileBinding?.let { calibrationBinding ->
+                RawCameraColorProfileRepository.installDiscoveredProfile(
+                    snapshot = DngSemanticAuditor.lastCameraColorProfileSnapshot(),
+                    calibrationBinding = calibrationBinding
+                )
+            }
             auditOut.bytesWritten
         } catch (t: Throwable) {
             Log.e(TAG, "DngCreator execution failed", t)
@@ -119,17 +165,19 @@ object DngWriter {
         raw16Buffer: ByteBuffer,
         metadata: CaptureResult,
         characteristics: CameraCharacteristics,
-        calibrationProfileId: String,
+        calibrationBinding: CalibrationProfileBinding,
         discoveryEffectiveCcm: FloatArray?
     ): DngCameraColorProfileSnapshot? {
-        if (width <= 0 || height <= 0 || calibrationProfileId.isBlank() ||
-            calibrationProfileId == "unknown" || discoveryEffectiveCcm?.size != 9 ||
-            !raw16Buffer.isDirect
+        val calibrationProfileId = calibrationBinding.calibrationProfileId
+        if (width <= 0 || height <= 0 || !calibrationBinding.safeForProfileBinding ||
+            calibrationProfileId.isBlank() || calibrationProfileId == "unknown" ||
+            discoveryEffectiveCcm?.size != 9 || !raw16Buffer.isDirect
         ) {
             Log.i(
                 TAG,
                 "pre-render colour bootstrap skipped: invalid contract size=${width}x$height " +
-                    "profileId=$calibrationProfileId direct=${raw16Buffer.isDirect} " +
+                    "profileId=$calibrationProfileId bindingSafe=${calibrationBinding.safeForProfileBinding} " +
+                    "bindingReason=${calibrationBinding.rejectionReason} direct=${raw16Buffer.isDirect} " +
                     "ccmSize=${discoveryEffectiveCcm?.size ?: 0}"
             )
             return null
@@ -161,7 +209,7 @@ object DngWriter {
             val dngBytes = privateDng.toByteArray()
             DngSemanticAuditor.parseCameraColorProfileBytes(
                 bytes = dngBytes,
-                calibrationProfileId = calibrationProfileId,
+                calibrationBinding = calibrationBinding,
                 discoveryEffectiveCcm = discoveryEffectiveCcm.copyOf(),
                 source = "OEM_DNGCREATOR_BOOTSTRAP"
             ).also { snapshot ->
@@ -181,7 +229,8 @@ object DngWriter {
         }
     }
 
-    fun lastAuditReport(): String = DngSemanticAuditor.lastReportString()
+    fun lastAuditReport(): String =
+        DngSemanticAuditor.lastReportString() + "; DngAuthority={" + lastAuthorityReport + "}"
 
     private fun isValidRaw16Payload(width: Int, height: Int, raw16Bytes: ByteArray): Boolean {
         if (width <= 0 || height <= 0) return false

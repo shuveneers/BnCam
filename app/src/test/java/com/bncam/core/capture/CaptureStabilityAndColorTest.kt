@@ -335,8 +335,7 @@ class CaptureStabilityAndColorTest {
         // CFA pattern mismatch check
         RawColorPipelineAuditor.testCfaOverride = 0 // RGGB
         val auditMismatched = RawColorPipelineAuditor.audit(
-            characteristics = null,
-            result = null,
+            sensorMetadata = null,
             cfaPattern = 1, // GRBG
             effectiveWbGains = floatArrayOf(1.5f, 1.0f, 1.0f, 2.0f),
             colorMatrix = floatArrayOf(1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f),
@@ -347,8 +346,7 @@ class CaptureStabilityAndColorTest {
 
         // CFA pattern matched check
         val auditMatched = RawColorPipelineAuditor.audit(
-            characteristics = null,
-            result = null,
+            sensorMetadata = null,
             cfaPattern = 0, // RGGB
             effectiveWbGains = floatArrayOf(1.5f, 1.0f, 1.0f, 2.0f),
             colorMatrix = floatArrayOf(1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f),

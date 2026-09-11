@@ -2,6 +2,7 @@ package com.bncam.core.isp.raw10
 
 import android.content.Context
 import android.util.Log
+import com.bncam.core.quality.CalibrationProfileBinding
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.DataInputStream
@@ -31,14 +32,18 @@ object RawCameraColorProfileRepository {
     private const val PRIORITY_BNCAM = 200
     private const val PRIORITY_EXTERNAL = 100
     private const val MAGIC = 0x424E4350 // BNCP
-    private const val VERSION = 1
+    private const val VERSION = 2
     private const val MAX_ARRAY_FLOATS = (1 shl 20) * 3
-    private const val STORE_DIR = "raw_camera_color_profiles_v1"
+    private const val STORE_DIR = "raw_camera_color_profiles_v2"
     private const val BOOTSTRAP_RENDER_WAIT_MS = 1_500L
 
     private data class Entry(val snapshot: DngCameraColorProfileSnapshot, val priority: Int)
 
+    /** Active profiles are always exact-bound to a registered calibration binding. */
     private val profiles = ConcurrentHashMap<String, Entry>()
+    /** Persisted candidates are loaded but never installed until an exact current binding is registered. */
+    private val persistedCandidates = ConcurrentHashMap<String, Entry>()
+    private val expectedBindings = ConcurrentHashMap<String, CalibrationProfileBinding>()
     private val pendingProfiles = ConcurrentHashMap<String, Entry>()
     private val nativeInstalled = ConcurrentHashMap.newKeySet<String>()
     private val sessionStarted = AtomicBoolean(false)
@@ -54,6 +59,8 @@ object RawCameraColorProfileRepository {
     @Volatile private var bootstrapInstallCount: Int = 0
     @Volatile private var bootstrapStatus: String = "NOT_ATTEMPTED"
     @Volatile private var lastRenderSealSource: String = "NOT_SEALED"
+    @Volatile private var calibrationBindingStatus: String = "NO_BINDING_REGISTERED"
+    @Volatile private var rejectedBindingCount: Int = 0
 
     fun beginSession(context: Context) {
         if (!sessionStarted.compareAndSet(false, true)) return
@@ -66,14 +73,81 @@ object RawCameraColorProfileRepository {
                 return@synchronized
             }
             val loaded = loadPersistedEntries(dir)
-            loaded.forEach { entry -> mergeByPriority(profiles, entry) }
-            sessionLoadCount = profiles.size
+            loaded.forEach(::mergePersistedCandidate)
+            sessionLoadCount = persistedCandidates.size
             Log.i(
                 TAG,
-                "session loaded: persistedCandidates=${profiles.size}; missing OEM profile may bootstrap before first RAW render"
+                "session loaded: persistedCandidates=${persistedCandidates.size}; " +
+                    "native installation deferred until exact sensor calibration binding is registered"
             )
         }
-        ensureSessionProfilesInstalled()
+    }
+
+    fun registerExpectedCalibrationBinding(binding: CalibrationProfileBinding): Boolean {
+        if (!binding.provenance.safeForCalibration) {
+            rejectedBindingCount++
+            calibrationBindingStatus =
+                "REJECTED:${binding.calibrationProfileId}:${binding.provenance.rejectionReason}"
+            Log.w(TAG, "calibration binding rejected: $calibrationBindingStatus")
+            return false
+        }
+        return synchronized(lock) {
+            val profileId = binding.calibrationProfileId
+            val existingBinding = expectedBindings[profileId]
+            if (existingBinding != null &&
+                (existingBinding.staticCalibrationFingerprint != binding.staticCalibrationFingerprint ||
+                    existingBinding.provenance.cameraDeviceId != binding.provenance.cameraDeviceId ||
+                    existingBinding.provenance.physicalCameraId != binding.provenance.physicalCameraId)
+            ) {
+                rejectedBindingCount++
+                calibrationBindingStatus = "REJECTED_SESSION_BINDING_CHANGE:$profileId"
+                Log.e(
+                    TAG,
+                    "calibration binding changed inside frozen session: id=$profileId " +
+                        "old=${existingBinding.staticCalibrationFingerprint} " +
+                        "new=${binding.staticCalibrationFingerprint}"
+                )
+                return@synchronized false
+            }
+            expectedBindings[profileId] = binding
+            if (!binding.safeForProfileBinding) {
+                calibrationBindingStatus =
+                    "BOUND_PROFILE_CHARACTERIZATION_UNAVAILABLE:$profileId:${binding.rejectionReason}"
+                return@synchronized true
+            }
+            val key = profileBindingKey(binding)
+            val candidate = persistedCandidates[key]
+            if (candidate == null) {
+                calibrationBindingStatus = "BOUND_NO_PERSISTED_PROFILE:$profileId"
+                return@synchronized true
+            }
+            if (!snapshotMatchesBinding(candidate.snapshot, binding)) {
+                rejectedBindingCount++
+                calibrationBindingStatus = "REJECTED_PERSISTED_BINDING_MISMATCH:$profileId"
+                Log.e(TAG, "persisted profile binding mismatch despite key match: id=$profileId")
+                return@synchronized false
+            }
+            val existing = profiles[profileId]
+            if (existing == null || candidate.priority >= existing.priority) {
+                mergeByPriority(profiles, candidate)
+            }
+            val active = profiles[profileId] ?: return@synchronized false
+            if (!nativeInstalled.contains(profileId)) {
+                if (!installNative(active)) {
+                    calibrationBindingStatus = "BOUND_NATIVE_INSTALL_FAILED:$profileId"
+                    return@synchronized false
+                }
+                nativeInstalled.add(profileId)
+            }
+            sessionNativeReady.set(profiles.keys.all(nativeInstalled::contains))
+            calibrationBindingStatus = "BOUND_PERSISTED_PROFILE_EXACT:$profileId"
+            Log.i(
+                TAG,
+                "persisted colour profile exact-bound and installed: id=$profileId " +
+                    "fingerprint=${binding.staticCalibrationFingerprint}"
+            )
+            true
+        }
     }
 
     fun ensureSessionProfilesInstalled(): Boolean {
@@ -83,6 +157,11 @@ object RawCameraColorProfileRepository {
             profiles.entries
                 .sortedWith(compareByDescending<Map.Entry<String, Entry>> { it.value.priority }.thenBy { it.key })
                 .forEach { (id, entry) ->
+                    val binding = expectedBindings[id]
+                    if (binding == null || !snapshotMatchesBinding(entry.snapshot, binding)) {
+                        allInstalled = false
+                        return@forEach
+                    }
                     if (!nativeInstalled.contains(id)) {
                         val installed = installNative(entry)
                         if (installed) nativeInstalled.add(id) else allInstalled = false
@@ -93,23 +172,46 @@ object RawCameraColorProfileRepository {
         }
     }
 
-    fun installDiscoveredProfile(snapshot: DngCameraColorProfileSnapshot): Boolean =
-        accept(snapshot.copy(source = "OEM_DNGCREATOR"), PRIORITY_OEM)
-
-    fun shouldBootstrapBeforeFirstRender(calibrationProfileId: String): Boolean = synchronized(lock) {
-        if (!sessionStarted.get() || renderedProfileIds.contains(calibrationProfileId) ||
-            calibrationProfileId.isBlank() || calibrationProfileId == "unknown" ||
-            profiles.containsKey(calibrationProfileId)
+    fun installDiscoveredProfile(
+        snapshot: DngCameraColorProfileSnapshot,
+        calibrationBinding: CalibrationProfileBinding
+    ): Boolean {
+        if (!registerExpectedCalibrationBinding(calibrationBinding) ||
+            !snapshotMatchesBinding(snapshot, calibrationBinding)
         ) {
-            return@synchronized false
+            rejectedBindingCount++
+            calibrationBindingStatus =
+                "REJECTED_DISCOVERED_BINDING_MISMATCH:${calibrationBinding.calibrationProfileId}"
+            Log.e(TAG, "discovered profile rejected: exact calibration binding mismatch")
+            return false
         }
-        val claimed = bootstrapAttemptedProfileIds.add(calibrationProfileId)
-        if (claimed) {
-            bootstrapCompletionSignals.putIfAbsent(calibrationProfileId, CountDownLatch(1))
-            bootstrapStatus = "CLAIMED:$calibrationProfileId"
-            Log.i(TAG, "pre-render OEM colour bootstrap claimed: id=$calibrationProfileId")
+        return accept(snapshot.copy(source = "OEM_DNGCREATOR"), PRIORITY_OEM)
+    }
+
+    fun shouldBootstrapBeforeFirstRender(calibrationBinding: CalibrationProfileBinding): Boolean {
+        if (!registerExpectedCalibrationBinding(calibrationBinding) ||
+            !calibrationBinding.safeForProfileBinding
+        ) return false
+        val calibrationProfileId = calibrationBinding.calibrationProfileId
+        return synchronized(lock) {
+            if (!sessionStarted.get() || renderedProfileIds.contains(calibrationProfileId) ||
+                calibrationProfileId.isBlank() || calibrationProfileId == "unknown" ||
+                profiles.containsKey(calibrationProfileId)
+            ) {
+                return@synchronized false
+            }
+            val claimed = bootstrapAttemptedProfileIds.add(calibrationProfileId)
+            if (claimed) {
+                bootstrapCompletionSignals.putIfAbsent(calibrationProfileId, CountDownLatch(1))
+                bootstrapStatus = "CLAIMED:$calibrationProfileId"
+                Log.i(
+                    TAG,
+                    "pre-render OEM colour bootstrap claimed: id=$calibrationProfileId " +
+                        "fingerprint=${calibrationBinding.staticCalibrationFingerprint}"
+                )
+            }
+            claimed
         }
-        claimed
     }
 
     fun completeBootstrapAttempt(calibrationProfileId: String) {
@@ -132,6 +234,13 @@ object RawCameraColorProfileRepository {
         }
         return synchronized(lock) {
             val profileId = entry.snapshot.calibrationProfileId
+            val expectedBinding = expectedBindings[profileId]
+            if (expectedBinding == null || !snapshotMatchesBinding(entry.snapshot, expectedBinding)) {
+                rejectedBindingCount++
+                bootstrapStatus = "REJECTED_BINDING_MISMATCH:$profileId"
+                Log.e(TAG, "pre-render OEM colour bootstrap rejected: calibration binding mismatch id=$profileId")
+                return@synchronized false
+            }
             if (!sessionStarted.get() || renderedProfileIds.contains(profileId) ||
                 !bootstrapAttemptedProfileIds.contains(profileId)
             ) {
@@ -155,6 +264,8 @@ object RawCameraColorProfileRepository {
             val persisted = persist(entry)
             if (!persisted) {
                 Log.w(TAG, "bootstrap profile active but persistence failed: id=$profileId")
+            } else {
+                mergePersistedCandidate(entry)
             }
             bootstrapInstallCount++
             bootstrapStatus = "INSTALLED:$profileId"
@@ -168,10 +279,13 @@ object RawCameraColorProfileRepository {
     }
 
     fun sealForRendering(
-        calibrationProfileId: String,
+        calibrationBinding: CalibrationProfileBinding,
         source: String = "RAW_RENDER"
     ): Boolean {
-        val profileId = calibrationProfileId.ifBlank { "unknown" }
+        check(registerExpectedCalibrationBinding(calibrationBinding)) {
+            "CALIBRATION_PROFILE_BINDING_REJECTED:${calibrationBinding.rejectionReason}"
+        }
+        val profileId = calibrationBinding.calibrationProfileId.ifBlank { "unknown" }
         val pendingBootstrap = bootstrapCompletionSignals[profileId]
         if (pendingBootstrap != null && pendingBootstrap.count > 0L) {
             val completed = runCatching {
@@ -200,36 +314,60 @@ object RawCameraColorProfileRepository {
 
     fun installBnCamCalibratedProfileBytes(
         bytes: ByteArray,
-        calibrationProfileId: String,
+        calibrationBinding: CalibrationProfileBinding,
         discoveryEffectiveCcm: FloatArray
-    ): Boolean = accept(
-        DngSemanticAuditor.parseCameraColorProfileBytes(
-            bytes, calibrationProfileId, discoveryEffectiveCcm, "BNCAM_CALIBRATED_PROFILE"
-        ),
-        PRIORITY_BNCAM
-    )
+    ): Boolean {
+        if (!registerExpectedCalibrationBinding(calibrationBinding)) return false
+        return accept(
+            DngSemanticAuditor.parseCameraColorProfileBytes(
+                bytes, calibrationBinding, discoveryEffectiveCcm, "BNCAM_CALIBRATED_PROFILE"
+            ),
+            PRIORITY_BNCAM
+        )
+    }
 
     fun installExternalDngOrDcpProfileBytes(
         bytes: ByteArray,
-        calibrationProfileId: String,
+        calibrationBinding: CalibrationProfileBinding,
         discoveryEffectiveCcm: FloatArray
-    ): Boolean = accept(
-        DngSemanticAuditor.parseCameraColorProfileBytes(
-            bytes, calibrationProfileId, discoveryEffectiveCcm, "EXTERNAL_DNG_DCP_PROFILE"
-        ),
-        PRIORITY_EXTERNAL
-    )
+    ): Boolean {
+        if (!registerExpectedCalibrationBinding(calibrationBinding)) return false
+        return accept(
+            DngSemanticAuditor.parseCameraColorProfileBytes(
+                bytes, calibrationBinding, discoveryEffectiveCcm, "EXTERNAL_DNG_DCP_PROFILE"
+            ),
+            PRIORITY_EXTERNAL
+        )
+    }
 
-    fun snapshot(calibrationProfileId: String): DngCameraColorProfileSnapshot? =
-        profiles[calibrationProfileId]?.snapshot?.copied()
+    fun snapshot(calibrationBinding: CalibrationProfileBinding): DngCameraColorProfileSnapshot? {
+        if (!registerExpectedCalibrationBinding(calibrationBinding)) return null
+        return profiles[calibrationBinding.calibrationProfileId]?.snapshot?.copied()
+    }
 
     fun debugSummary(): String =
         "sessionStarted=${sessionStarted.get()}; renderedProfileOwners=${renderedProfileIds.size}; " +
             "lastRenderSealSource=$lastRenderSealSource; persistedLoaded=$sessionLoadCount; " +
+            "persistedCandidates=${persistedCandidates.size}; expectedBindings=${expectedBindings.size}; " +
             "activeProfiles=${profiles.size}; nativeInstalled=${nativeInstalled.size}; " +
-            "nativeReady=${sessionNativeReady.get()}; preRenderBootstrapAttempts=${bootstrapAttemptedProfileIds.size}; " +
+            "nativeReady=${sessionNativeReady.get()}; calibrationBindingStatus=$calibrationBindingStatus; " +
+            "rejectedBindings=$rejectedBindingCount; preRenderBootstrapAttempts=${bootstrapAttemptedProfileIds.size}; " +
             "preRenderBootstrapInstalled=$bootstrapInstallCount; bootstrapStatus=$bootstrapStatus; " +
             "pendingNextProcess=${pendingProfiles.size}; persistenceError=$lastPersistenceError"
+
+    fun bindingDebugSummary(calibrationProfileId: String): String = synchronized(lock) {
+        val profileId = calibrationProfileId.ifBlank { "unknown" }
+        val binding = expectedBindings[profileId]
+        val active = profiles[profileId]
+        val exactPersistedCandidate = binding?.let { persistedCandidates[profileBindingKey(it)] }
+        val match = binding != null && active != null && snapshotMatchesBinding(active.snapshot, binding)
+        "profileId=$profileId; authority=${binding?.sensorAuthorityId ?: "UNAVAILABLE"}; " +
+            "fingerprint=${binding?.staticCalibrationFingerprint ?: "UNAVAILABLE"}; " +
+            "expectedBinding=${binding != null}; persistedExactCandidate=${exactPersistedCandidate != null}; " +
+            "activeProfile=${active != null}; nativeInstalled=${nativeInstalled.contains(profileId)}; " +
+            "bindingMatch=${if (active == null) "NO_ACTIVE_PROFILE" else match.toString()}; " +
+            "status=$calibrationBindingStatus"
+    }
 
     private fun accept(snapshot: DngCameraColorProfileSnapshot, priority: Int): Boolean {
         val entry = validateEntry(snapshot, priority) ?: return false
@@ -249,12 +387,21 @@ object RawCameraColorProfileRepository {
     }
 
     private fun stageForNextProcess(entry: Entry): Boolean {
-        val existingActive = profiles[entry.snapshot.calibrationProfileId]
+        val profileId = entry.snapshot.calibrationProfileId
+        val expectedBinding = expectedBindings[profileId]
+        if (expectedBinding == null || !snapshotMatchesBinding(entry.snapshot, expectedBinding)) {
+            rejectedBindingCount++
+            calibrationBindingStatus = "REJECTED_STAGE_BINDING_MISMATCH:$profileId"
+            Log.e(TAG, "profile staging rejected: exact calibration binding unavailable/mismatched id=$profileId")
+            return false
+        }
+        val existingActive = profiles[profileId]
         if (existingActive != null && existingActive.priority > entry.priority) return false
-        val existingPending = pendingProfiles[entry.snapshot.calibrationProfileId]
+        val existingPending = pendingProfiles[profileId]
         if (existingPending != null && existingPending.priority > entry.priority) return false
         val persisted = persist(entry)
         if (!persisted) return false
+        mergePersistedCandidate(entry)
         mergeByPriority(pendingProfiles, entry)
         Log.i(
             TAG,
@@ -266,12 +413,26 @@ object RawCameraColorProfileRepository {
 
     private fun validateEntry(snapshot: DngCameraColorProfileSnapshot, priority: Int): Entry? {
         if (!snapshot.available || !snapshot.valid || snapshot.calibrationProfileId.isBlank() ||
-            snapshot.calibrationProfileId == "unknown"
+            snapshot.calibrationProfileId == "unknown" || snapshot.sensorAuthorityId.isBlank() ||
+            snapshot.sensorAuthorityId == "unknown" ||
+            snapshot.calibrationProfileId != snapshot.sensorAuthorityId ||
+            snapshot.cameraDeviceId.isBlank() || snapshot.cameraDeviceId == "unknown" ||
+            !snapshot.staticCalibrationFingerprint.matches(Regex("[0-9a-f]{64}")) ||
+            snapshot.calibrationBindingStatus != "EXACT_SENSOR_METADATA_AND_DNG_STATIC_MATCH"
         ) {
             Log.i(
                 TAG,
                 "profile rejected: id=${snapshot.calibrationProfileId} source=${snapshot.source} status=${snapshot.status}"
             )
+            return null
+        }
+        val routeBindingValid = if (snapshot.physicalCameraId.isNullOrBlank()) {
+            snapshot.sensorAuthorityId == snapshot.cameraDeviceId
+        } else {
+            snapshot.sensorAuthorityId == snapshot.physicalCameraId
+        }
+        if (!routeBindingValid) {
+            Log.w(TAG, "profile rejected: route authority mismatch id=${snapshot.calibrationProfileId}")
             return null
         }
 
@@ -323,6 +484,8 @@ object RawCameraColorProfileRepository {
 
     private fun installNative(entry: Entry): Boolean {
         val snapshot = entry.snapshot
+        val expectedBinding = expectedBindings[snapshot.calibrationProfileId] ?: return false
+        if (!snapshotMatchesBinding(snapshot, expectedBinding)) return false
         val hsm = snapshot.hueSatMap
         val cm1 = snapshot.colorMatrix1 ?: return false
         val discovery = snapshot.discoveryEffectiveCcm ?: return false
@@ -359,11 +522,21 @@ object RawCameraColorProfileRepository {
         }
     }
 
+    private fun mergePersistedCandidate(entry: Entry) {
+        val key = profileBindingKey(entry.snapshot)
+        persistedCandidates.compute(key) { _, existing ->
+            if (existing == null || entry.priority >= existing.priority) entry else existing
+        }
+    }
+
     private fun persist(entry: Entry): Boolean {
         val dir = storageDirectory ?: return false.also {
             lastPersistenceError = "session_store_not_initialized"
         }
-        val target = File(dir, "${stableFileKey(entry.snapshot.calibrationProfileId)}.bncp")
+        val target = File(dir, "${stableFileKey(
+            entry.snapshot.sensorAuthorityId,
+            entry.snapshot.staticCalibrationFingerprint
+        )}.bncp")
         val tmp = File(dir, "${target.name}.tmp")
         return runCatching {
             DataOutputStream(BufferedOutputStream(FileOutputStream(tmp))).use { out ->
@@ -416,6 +589,12 @@ object RawCameraColorProfileRepository {
         out.writeInt(entry.priority)
         out.writeUTF(s.source)
         out.writeUTF(s.calibrationProfileId)
+        out.writeUTF(s.sensorAuthorityId)
+        out.writeUTF(s.cameraDeviceId)
+        out.writeBoolean(s.physicalCameraId != null)
+        if (s.physicalCameraId != null) out.writeUTF(s.physicalCameraId)
+        out.writeUTF(s.staticCalibrationFingerprint)
+        out.writeUTF(s.calibrationBindingStatus)
         out.writeBoolean(s.available)
         out.writeBoolean(s.valid)
         out.writeInt(s.calibrationIlluminant1)
@@ -449,6 +628,11 @@ object RawCameraColorProfileRepository {
         require(priority == PRIORITY_EXTERNAL || priority == PRIORITY_BNCAM || priority == PRIORITY_OEM) { "priority_invalid" }
         val source = input.readUTF()
         val profileId = input.readUTF()
+        val sensorAuthorityId = input.readUTF()
+        val cameraDeviceId = input.readUTF()
+        val physicalCameraId = if (input.readBoolean()) input.readUTF() else null
+        val staticCalibrationFingerprint = input.readUTF()
+        val calibrationBindingStatus = input.readUTF()
         val available = input.readBoolean()
         val valid = input.readBoolean()
         val illuminant1 = input.readInt()
@@ -479,6 +663,11 @@ object RawCameraColorProfileRepository {
                 valid = valid,
                 source = source,
                 calibrationProfileId = profileId,
+                sensorAuthorityId = sensorAuthorityId,
+                cameraDeviceId = cameraDeviceId,
+                physicalCameraId = physicalCameraId,
+                staticCalibrationFingerprint = staticCalibrationFingerprint,
+                calibrationBindingStatus = calibrationBindingStatus,
                 calibrationIlluminant1 = illuminant1,
                 calibrationIlluminant2 = illuminant2,
                 colorMatrix1 = colorMatrix1,
@@ -525,8 +714,36 @@ object RawCameraColorProfileRepository {
         return FloatArray(count) { input.readFloat() }
     }
 
-    private fun stableFileKey(profileId: String): String {
-        val digest = MessageDigest.getInstance("SHA-256").digest(profileId.toByteArray(Charsets.UTF_8))
+    private fun profileBindingKey(snapshot: DngCameraColorProfileSnapshot): String =
+        "${snapshot.sensorAuthorityId}|${snapshot.staticCalibrationFingerprint}"
+
+    private fun profileBindingKey(binding: CalibrationProfileBinding): String =
+        "${binding.sensorAuthorityId}|${binding.staticCalibrationFingerprint}"
+
+    private fun snapshotMatchesBinding(
+        snapshot: DngCameraColorProfileSnapshot,
+        binding: CalibrationProfileBinding
+    ): Boolean = binding.matchesPersistedBinding(
+        profileId = snapshot.calibrationProfileId,
+        authorityId = snapshot.sensorAuthorityId,
+        staticFingerprint = snapshot.staticCalibrationFingerprint
+    ) && snapshot.cameraDeviceId == binding.provenance.cameraDeviceId &&
+        snapshot.physicalCameraId == binding.provenance.physicalCameraId &&
+        snapshot.calibrationBindingStatus == "EXACT_SENSOR_METADATA_AND_DNG_STATIC_MATCH" &&
+        binding.matchesDngCharacterization(
+            illuminant1 = snapshot.calibrationIlluminant1,
+            illuminant2 = snapshot.calibrationIlluminant2,
+            dngColor1 = snapshot.colorMatrix1,
+            dngColor2 = snapshot.colorMatrix2,
+            dngCalibration1 = snapshot.cameraCalibration1,
+            dngCalibration2 = snapshot.cameraCalibration2,
+            dngForward1 = snapshot.forwardMatrix1,
+            dngForward2 = snapshot.forwardMatrix2
+        )
+
+    private fun stableFileKey(sensorAuthorityId: String, staticCalibrationFingerprint: String): String {
+        val canonical = "$sensorAuthorityId|$staticCalibrationFingerprint"
+        val digest = MessageDigest.getInstance("SHA-256").digest(canonical.toByteArray(Charsets.UTF_8))
         return digest.take(16).joinToString("") { "%02x".format(it) }
     }
 }

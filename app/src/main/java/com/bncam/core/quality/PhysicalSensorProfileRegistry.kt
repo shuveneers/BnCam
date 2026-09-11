@@ -395,6 +395,16 @@ class PhysicalSensorProfileRegistry(private val cameraManager: CameraManager) {
             colorCorrectionGainsField = wbGains,
             colorCorrectionTransformField = colorCorrection,
             neutralColorPointField = neutral,
+            referenceIlluminant1Field = staticProfile.referenceIlluminant1.toField(
+                source = "CameraCharacteristics.SENSOR_REFERENCE_ILLUMINANT1",
+                valid = { it > 0 },
+                invalidReason = "REFERENCE_ILLUMINANT1_INVALID"
+            ),
+            referenceIlluminant2Field = staticProfile.referenceIlluminant2.toField(
+                source = "CameraCharacteristics.SENSOR_REFERENCE_ILLUMINANT2",
+                valid = { it > 0 },
+                invalidReason = "REFERENCE_ILLUMINANT2_INVALID"
+            ),
             colorTransform1 = staticProfile.colorTransform1.toMatrixField(
                 "CameraCharacteristics.SENSOR_COLOR_TRANSFORM1"
             ),
