@@ -28,7 +28,9 @@ class Phase7CaptureFeedbackContractTest {
             assertTrue(feedback.contains("CaptureWorkState.$state"), "Missing queue state $state")
         }
         assertTrue(feedback.contains("current.shotSequenceId != lastAnimatedPublishedSequence"))
-        assertTrue(feedback.contains("latestSnapshot.thumbnailUri ?: latestSnapshot.publishedUri"))
+        assertTrue(feedback.contains("it.jpegUri ?: it.thumbnailUri"))
+        assertTrue(feedback.contains("immediateShutterStartedNs > snapshotStartedNs"))
+        assertTrue(feedback.contains("publishedCaptureStartedNs == snapshotStartedNs"))
         assertTrue(feedback.contains("if (feedback.busy)"))
         assertTrue(feedback.contains("rememberInfiniteTransition"))
         assertFalse(feedback.contains("estimatedTotalMs"))

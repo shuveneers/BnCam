@@ -65,6 +65,7 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
     var onSurfaceTextureCreated: ((SurfaceTexture) -> Unit)? = null
     var onRawUploadTiming: ((Float) -> Unit)? = null
     var onYuvFrameAvailable: ((Long) -> Unit)? = null
+    var onTargetFramePresented: ((String, String, Int) -> Unit)? = null
 
     var isPeakingEnabled: Boolean = false
     var peakingColor: FloatArray = floatArrayOf(1.0f, 0.0f, 0.0f) // Standaard Rood
@@ -628,6 +629,7 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
         onSurfaceTextureCreated = null
         onRawUploadTiming = null
         onYuvFrameAvailable = null
+        onTargetFramePresented = null
         surfaceTexture?.setOnFrameAvailableListener(null)
         displayReady = false
         oesFrameAvailable = false
@@ -1028,6 +1030,13 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
                         presentationSignal = "NEXT_UI_VSYNC_AFTER_GL_SUBMIT_PROXY",
                         targetAuthorityAccepted = phase0TargetAuthorityAccepted
                     )
+                    if (phase0TargetAuthorityAccepted) {
+                        onTargetFramePresented?.invoke(
+                            committedLensId,
+                            committedSource,
+                            committedGeneration
+                        )
+                    }
                 }
             }
         }
@@ -1224,6 +1233,15 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
                         presentationSignal = "EGL_DISPLAY_PRESENT_TIME",
                         targetAuthorityAccepted = pending.targetAuthorityAccepted
                     )
+                    if (pending.targetAuthorityAccepted) {
+                        post {
+                            onTargetFramePresented?.invoke(
+                                pending.lensId,
+                                pending.source,
+                                pending.generation
+                            )
+                        }
+                    }
                     iterator.remove()
                 } else if (now - pending.queuedElapsedNs > PRESENTATION_QUERY_TIMEOUT_NS) {
                     iterator.remove()

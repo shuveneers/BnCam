@@ -39,10 +39,13 @@ class TemporaryPreviewCaptureTest {
     }
 
     @Test
-    fun test4_cameraScreenPassesPathToExecuteCaptureAndCleansUpOnException() {
+    fun test4_cameraScreenStartsShutterPreviewBeforeCaptureAndAttachesByTimestamp() {
         val cameraScreen = File(appDir, "src/main/java/com/bncam/ui/screens/capture/CameraScreen.kt").readText()
-        assertTrue(cameraScreen.contains("temporaryPreviewPath = tempPreviewPath"))
-        assertTrue(cameraScreen.contains("tempPreviewPath?.let"))
-        assertTrue(cameraScreen.contains("java.io.File(path).takeIf { it.exists() }?.delete()"))
+        val previewStart = cameraScreen.indexOf("val shutterPreviewDeferred = async")
+        val captureStart = cameraScreen.indexOf("bnCameraManager.executeCapture(")
+        assertTrue(previewStart >= 0 && previewStart < captureStart)
+        assertTrue(cameraScreen.contains("snapshotForCaptureStartedNs(userShutterTimestampNs)"))
+        assertTrue(cameraScreen.contains("CaptureProcessingQueue.attachTemporaryPreview("))
+        assertTrue(cameraScreen.contains("immediateShutterPreviewPath = path"))
     }
 }

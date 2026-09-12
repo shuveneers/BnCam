@@ -62,22 +62,21 @@ internal fun captureFeedbackModel(snapshot: CaptureWorkSnapshot?): CaptureFeedba
 internal fun CaptureThumbnailFeedback(
     latestSnapshot: CaptureWorkSnapshot?,
     publishedModel: Any?,
+    publishedCaptureStartedNs: Long,
+    immediateShutterPreviewPath: String?,
+    immediateShutterStartedNs: Long,
     uiRotationDegrees: Float,
     onOpenPublished: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val feedback = captureFeedbackModel(latestSnapshot)
-    val terminalSnapshotModel: Any? = if (latestSnapshot?.state == CaptureWorkState.PUBLISHED) {
-        latestSnapshot.thumbnailUri ?: latestSnapshot.publishedUri ?: publishedModel
-    } else {
-        null
-    }
-    val thumbnailModel: Any? = when {
-        feedback.busy -> latestSnapshot?.temporaryPreviewPath ?: publishedModel ?: R.mipmap.ic_launcher
-        terminalSnapshotModel != null -> terminalSnapshotModel
-        publishedModel != null -> publishedModel
-        else -> R.mipmap.ic_launcher
-    }
+    val thumbnailModel = resolveCaptureThumbnailModel(
+        latestSnapshot = latestSnapshot,
+        publishedModel = publishedModel,
+        publishedCaptureStartedNs = publishedCaptureStartedNs,
+        immediateShutterPreviewPath = immediateShutterPreviewPath,
+        immediateShutterStartedNs = immediateShutterStartedNs
+    )
 
     var pulseTarget by remember { mutableFloatStateOf(1f) }
     var lastAnimatedPublishedSequence by remember {
@@ -140,7 +139,13 @@ internal fun CaptureThumbnailFeedback(
                             Phase0PerformanceTrace.thumbnailUiPresented(
                                 workId = snapshot.workId,
                                 modelKind = when {
-                                    feedback.busy && snapshot.temporaryPreviewPath != null -> "TEMPORARY_VIEWFINDER_JPEG"
+                                    immediateShutterPreviewPath != null &&
+                                        thumbnailModel == immediateShutterPreviewPath ->
+                                        "TEMPORARY_VIEWFINDER_JPEG"
+                                    publishedCaptureStartedNs == snapshot.captureStartedNs &&
+                                        snapshot.jpegUri == null && snapshot.dngUri != null &&
+                                        thumbnailModel == publishedModel ->
+                                        "DNG_DERIVED_THUMBNAIL_JPEG"
                                     snapshot.thumbnailUri != null -> "PUBLISHED_THUMBNAIL_URI"
                                     snapshot.publishedUri != null -> "PUBLISHED_OUTPUT_URI"
                                     else -> "FALLBACK_MODEL"
@@ -174,6 +179,36 @@ internal fun CaptureThumbnailFeedback(
                 )
             }
         }
+    }
+}
+
+internal fun resolveCaptureThumbnailModel(
+    latestSnapshot: CaptureWorkSnapshot?,
+    publishedModel: Any?,
+    publishedCaptureStartedNs: Long,
+    immediateShutterPreviewPath: String?,
+    immediateShutterStartedNs: Long
+): Any {
+    val snapshotStartedNs = latestSnapshot?.captureStartedNs ?: Long.MIN_VALUE
+    val publishedJpeg = latestSnapshot
+        ?.takeIf { it.state == CaptureWorkState.PUBLISHED }
+        ?.let { it.jpegUri ?: it.thumbnailUri }
+
+    return when {
+        // The shutter preview for a newly pressed shot outranks every older completed job.
+        immediateShutterPreviewPath != null && immediateShutterStartedNs > snapshotStartedNs ->
+            immediateShutterPreviewPath
+        // Once processing for this shot publishes JPEG, it always owns the final thumbnail.
+        !publishedJpeg.isNullOrBlank() -> publishedJpeg
+        // DNG-only publication installs a bitmap decoded from that DNG asynchronously.
+        latestSnapshot?.state == CaptureWorkState.PUBLISHED &&
+            publishedCaptureStartedNs == snapshotStartedNs && publishedModel != null -> publishedModel
+        // Keep the exact shutter frame visible while this same shot is being processed/published.
+        immediateShutterPreviewPath != null && immediateShutterStartedNs == snapshotStartedNs ->
+            immediateShutterPreviewPath
+        latestSnapshot?.temporaryPreviewPath != null -> latestSnapshot.temporaryPreviewPath
+        publishedModel != null -> publishedModel
+        else -> R.mipmap.ic_launcher
     }
 }
 

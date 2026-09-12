@@ -84,6 +84,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -96,8 +97,11 @@ import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect as ComposeRect
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.PathFillType
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.graphics.graphicsLayer
@@ -136,6 +140,8 @@ import com.bncam.data.settings.SettingsRepository
 import com.bncam.data.settings.ProfileAwbSettings
 import com.bncam.data.settings.ViewfinderSliderAssignment
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.async
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.Locale
@@ -1294,6 +1300,10 @@ fun CameraScreen(
     val forceGooglePhotos by repository.forceGooglePhotosFlow.collectAsState(initial = false)
     val initialPublishedUri = remember { com.bncam.core.utils.ThumbnailScanner.findLatestPublishedImageUri(context) }
     var publishedUriState by remember { mutableStateOf<Uri?>(initialPublishedUri) }
+    var publishedThumbnailModelState by remember { mutableStateOf<Any?>(initialPublishedUri) }
+    var publishedThumbnailCaptureStartedNs by remember { mutableLongStateOf(0L) }
+    var latestThumbnailShutterNs by remember { mutableLongStateOf(0L) }
+    var immediateShutterPreviewPath by remember { mutableStateOf<String?>(null) }
 
     val latestSnapshot by CaptureProcessingQueue.latestSnapshotFlow.collectAsState()
     val previewViewRef = remember { arrayOfNulls<FocusPeakingView>(1) }
@@ -1332,12 +1342,23 @@ fun CameraScreen(
                     immediateShutterClickNs
                 }
 
-                // The camera transaction has priority over thumbnail cosmetics. The old path waited
-                // up to 150 ms for a 128x128 viewfinder JPEG *before* executeCapture(), even though
-                // userShutterTimestampNs had already been frozen. At high preview cadence that delay
-                // can churn a substantial part of the Near-ZSL ring before MultiFrameRunner pins its
-                // shutter-time source. Admit/lease the photo first; attach the temporary thumbnail to
-                // the newly created processing job afterwards.
+                // Request PixelCopy synchronously at the authoritative user-shutter instant, but do
+                // not await or serialize its JPEG write in front of capture admission. Starting this
+                // child undispatched guarantees captureSnapshot() is invoked before executeCapture;
+                // the copy/write then proceeds in parallel with Near-ZSL leasing and processing.
+                latestThumbnailShutterNs = userShutterTimestampNs
+                immediateShutterPreviewPath = null
+                val shutterPreviewDeferred = async(start = CoroutineStart.UNDISPATCHED) {
+                    TemporaryPreviewCapture.captureTemporaryPreview(
+                        context = context,
+                        previewView = previewViewRef[0]
+                    )?.also { path ->
+                        if (latestThumbnailShutterNs == userShutterTimestampNs) {
+                            immediateShutterPreviewPath = path
+                        }
+                    }
+                }
+
                 if (useHaptics) haptic.performHapticFeedback(androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress)
                 onCapture()
 
@@ -1351,9 +1372,20 @@ fun CameraScreen(
                         userShutterTimestampNs = userShutterTimestampNs,
                         viewfinderMode = viewfinderMode
                     )
+                    val shutterPreviewPath = shutterPreviewDeferred.await()
 
                     if (resultUri != null) {
                         publishedUriState = resultUri
+                        publishedThumbnailModelState = resultUri
+                        publishedThumbnailCaptureStartedNs = userShutterTimestampNs
+                        if (latestThumbnailShutterNs == userShutterTimestampNs) {
+                            immediateShutterPreviewPath = null
+                        }
+                        // Synchronous routes do not hand the shutter preview to the processing
+                        // queue, so they also own its cleanup once the final output takes over.
+                        shutterPreviewPath?.let { path ->
+                            runCatching { java.io.File(path).delete() }
+                        }
                     } else {
                         // Match the temporary preview to this exact shutter timestamp. Using the
                         // globally latest queue item is racy when multiple RAW jobs overlap and can
@@ -1366,14 +1398,10 @@ fun CameraScreen(
                                     snapshot.state != CaptureWorkState.FAILED
                             }
                         if (submittedWork != null) {
-                            val tempPreviewPath = TemporaryPreviewCapture.captureTemporaryPreview(
-                                context = context,
-                                previewView = previewViewRef[0]
-                            )
-                            if (tempPreviewPath != null) {
+                            if (shutterPreviewPath != null) {
                                 CaptureProcessingQueue.attachTemporaryPreview(
                                     workId = submittedWork.workId,
-                                    path = tempPreviewPath
+                                    path = shutterPreviewPath
                                 )
                             }
                         }
@@ -1422,9 +1450,35 @@ fun CameraScreen(
     LaunchedEffect(Unit) {
         CaptureProcessingQueue.events.collect { work ->
             if (work.state == CaptureWorkState.PUBLISHED) {
-                val thumbUri = work.thumbnailUri ?: work.publishedUri
-                if (!thumbUri.isNullOrBlank()) {
-                    publishedUriState = Uri.parse(thumbUri)
+                // An older RAW job completing must never overwrite the shutter preview belonging
+                // to a newer shot. JPEG is the preferred final thumbnail; DNG-only gets a decoded
+                // MediaStore thumbnail after publication is complete.
+                if (work.captureStartedNs >= latestThumbnailShutterNs) {
+                    val jpegUri = work.jpegUri ?: work.thumbnailUri
+                    val dngUri = work.dngUri
+                    val openUri = jpegUri ?: dngUri ?: work.publishedUri
+                    if (!openUri.isNullOrBlank()) {
+                        publishedUriState = Uri.parse(openUri)
+                    }
+                    if (!jpegUri.isNullOrBlank()) {
+                        publishedThumbnailModelState = jpegUri
+                        publishedThumbnailCaptureStartedNs = work.captureStartedNs
+                        if (latestThumbnailShutterNs == work.captureStartedNs) {
+                            immediateShutterPreviewPath = null
+                        }
+                    } else if (!dngUri.isNullOrBlank()) {
+                        val dngThumbnail = TemporaryPreviewCapture.createPublishedDngThumbnail(
+                            context = context,
+                            dngUri = Uri.parse(dngUri)
+                        )
+                        if (dngThumbnail != null && work.captureStartedNs >= latestThumbnailShutterNs) {
+                            publishedThumbnailModelState = dngThumbnail
+                            publishedThumbnailCaptureStartedNs = work.captureStartedNs
+                            if (latestThumbnailShutterNs == work.captureStartedNs) {
+                                immediateShutterPreviewPath = null
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -2363,7 +2417,10 @@ fun CameraScreen(
 
                 CaptureThumbnailFeedback(
                     latestSnapshot = latestSnapshot,
-                    publishedModel = publishedUriState,
+                    publishedModel = publishedThumbnailModelState,
+                    publishedCaptureStartedNs = publishedThumbnailCaptureStartedNs,
+                    immediateShutterPreviewPath = immediateShutterPreviewPath,
+                    immediateShutterStartedNs = latestThumbnailShutterNs,
                     uiRotationDegrees = animatedUiRotation,
                     onOpenPublished = {
                         publishedUriState?.let { uri ->
@@ -2536,6 +2593,58 @@ fun CameraPreview(
         animationSpec = tween(durationMillis = if (viewfinderRebuildVisualState.active) 70 else 120),
         label = "viewfinderProducerRebuildBlackTransition"
     )
+    val lensTransitionProgress = remember { Animatable(0f) }
+    val lensTransitionScope = rememberCoroutineScope()
+    var previousComposedLensId by remember { mutableStateOf<String?>(null) }
+    var transitioningToLensId by remember { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(cameraId) {
+        val previousLensId = previousComposedLensId
+        previousComposedLensId = cameraId
+        if (previousLensId != null && previousLensId != cameraId) {
+            transitioningToLensId = cameraId
+            Log.i(
+                "BnCamPreviewDiag",
+                "event=LENS_TRANSITION_VISUAL_BEGIN fromLensId=$previousLensId targetLensId=$cameraId"
+            )
+            lensTransitionProgress.snapTo(0f)
+            lensTransitionProgress.animateTo(
+                targetValue = 1f,
+                animationSpec = tween(durationMillis = 190)
+            )
+            // Presentation normally ends the transition in under one second. This guard is visual
+            // only: it cannot mark a switch successful and prevents a camera failure from leaving
+            // the viewfinder permanently shaded.
+            delay(1_800L)
+            if (transitioningToLensId == cameraId) {
+                transitioningToLensId = null
+                Log.w(
+                    "BnCamPreviewDiag",
+                    "event=LENS_TRANSITION_VISUAL_END targetLensId=$cameraId reason=visual_timeout"
+                )
+                lensTransitionProgress.animateTo(
+                    targetValue = 0f,
+                    animationSpec = tween(durationMillis = 240)
+                )
+            }
+        }
+    }
+
+    fun finishLensTransitionOnPresentedFrame(lensId: String, source: String, generation: Int) {
+        if (transitioningToLensId != lensId) return
+        transitioningToLensId = null
+        Log.i(
+            "BnCamPreviewDiag",
+            "event=LENS_TRANSITION_VISUAL_END targetLensId=$lensId source=$source " +
+                "generation=$generation reason=target_frame_presented"
+        )
+        lensTransitionScope.launch {
+            lensTransitionProgress.animateTo(
+                targetValue = 0f,
+                animationSpec = tween(durationMillis = 240)
+            )
+        }
+    }
 
     // UI reset identity is deliberately only the producer buffer source. Settings/profile
     // edits that leave YUV/RAW10/RAW_SENSOR unchanged keep the warm ImageReader/ring buffer.
@@ -2639,6 +2748,9 @@ fun CameraPreview(
                             this.onYuvFrameAvailable = { sensorTimestampNs ->
                                 bnCameraManager.reportYuvViewfinderFrameAvailable(sensorTimestampNs)
                             }
+                            this.onTargetFramePresented = { lensId, source, generation ->
+                                finishLensTransitionOnPresentedFrame(lensId, source, generation)
+                            }
                         }
                     },
                     update = { view ->
@@ -2665,6 +2777,9 @@ fun CameraPreview(
                         // Camera2 owns YUV zoom. RAW buffers keep their full sensor payload, so
                         // mirror the same user zoom in the RAW-only texture-coordinate path.
                         view.setRawDisplayZoom(digitalZoom())
+                        view.onTargetFramePresented = { lensId, source, generation ->
+                            finishLensTransitionOnPresentedFrame(lensId, source, generation)
+                        }
                         view.setLiveColorTuning(
                             saturationOffset = livePreviewTuning.saturationOffset,
                             contrastOffset = livePreviewTuning.contrastOffset,
@@ -2692,6 +2807,55 @@ fun CameraPreview(
                         .background(Color.Black)
                 )
             }
+
+            val irisProgress = lensTransitionProgress.value
+            if (irisProgress > 0.001f) {
+                Canvas(
+                    modifier = Modifier.fillMaxSize()
+                ) {
+                    // A real iris wipe visibly separates the retained old frame from the first
+                    // authoritative target frame. At progress 0 the aperture is larger than the
+                    // viewport; at progress 1 only a deliberate centre window remains.
+                    val openRadius = kotlin.math.hypot(size.width, size.height) * 0.56f
+                    val closedRadius = size.minDimension * 0.25f
+                    val apertureRadius = openRadius + (closedRadius - openRadius) * irisProgress
+                    val irisMask = Path().apply {
+                        fillType = PathFillType.EvenOdd
+                        addRect(ComposeRect(0f, 0f, size.width, size.height))
+                        addOval(
+                            ComposeRect(
+                                center.x - apertureRadius,
+                                center.y - apertureRadius,
+                                center.x + apertureRadius,
+                                center.y + apertureRadius
+                            )
+                        )
+                    }
+                    drawPath(
+                        path = irisMask,
+                        color = Color.Black.copy(alpha = 0.42f)
+                    )
+                    drawCircle(
+                        color = AccentPistachio.copy(alpha = 0.30f * irisProgress),
+                        radius = apertureRadius,
+                        center = center,
+                        style = Stroke(width = 2.dp.toPx())
+                    )
+                    repeat(6) { bladeIndex ->
+                        rotate(
+                            degrees = bladeIndex * 60f + irisProgress * 22f,
+                            pivot = center
+                        ) {
+                            drawLine(
+                                color = AccentPistachio.copy(alpha = 0.18f * irisProgress),
+                                start = Offset(center.x, center.y - apertureRadius * 0.91f),
+                                end = Offset(center.x, center.y - apertureRadius * 1.04f),
+                                strokeWidth = 2.dp.toPx()
+                            )
+                        }
+                    }
+                }
+            }
         }
 
         DisposableEffect(bnCameraManager, previewView, viewfinderStream, activeProfile.id) {
@@ -2700,6 +2864,7 @@ fun CameraPreview(
                 bnCameraManager.configureViewfinderStream(
                     setting = viewfinderStream,
                     profileId = activeProfile.id,
+                    requestedLensId = cameraId,
                     onEffectiveSourceChanged = { source, generation ->
                         target.setDisplayedSource(source, generation)
                     },

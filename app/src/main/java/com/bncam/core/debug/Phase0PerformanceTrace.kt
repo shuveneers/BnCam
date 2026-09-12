@@ -154,6 +154,20 @@ object Phase0PerformanceTrace {
         }
     }
 
+    fun lensTransitionMilestone(
+        targetLensId: String,
+        event: String,
+        timestampNs: Long = SystemClock.elapsedRealtimeNanos(),
+        detail: String? = null
+    ) {
+        synchronized(lock) {
+            lensTrace?.takeIf { it.targetLensId == targetLensId }?.let { trace ->
+                trace.events.putIfAbsent(event, timestampNs)
+                if (detail != null) trace.details.putIfAbsent(event, detail)
+            }
+        }
+    }
+
     fun lensSwitchCancelled(targetLensId: String, reason: String) {
         val report = synchronized(lock) {
             val trace = lensTrace?.takeIf { it.targetLensId == targetLensId } ?: return

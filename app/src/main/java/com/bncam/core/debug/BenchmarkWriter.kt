@@ -135,6 +135,7 @@ object BenchmarkWriter {
                 parsed["rawSensorToMasterRaw16Ms"] ?: dngParsed["rawSensorToMasterRaw16Ms"] ?: "",
                 parsed["jniArrayLockMs"] ?: "",
                 parsed["metadataResolveMs"] ?: "",
+                parsed["rawPreprocessOuterMs"] ?: "",
                 parsed["rawJpegRenderCallOuterMs"] ?: "",
                 parsed["captureSensitivityIso"] ?: "",
                 parsed["captureExposureTimeNs"] ?: "",

@@ -236,6 +236,7 @@ data class LensInfo(
 )
 
 data class PipelineIdentity(
+    val selectedLensId: String,
     val requestedProfileId: String,
     val requestedFrameSource: String,
     val effectiveFrameSource: String,
@@ -380,6 +381,9 @@ class BnCameraManager(private val context: Context) {
     }
 
     private val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+    private val publicCameraIds: Set<String> by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        cameraManager.cameraIdList.toSet()
+    }
     private val sensorProfileRegistry = PhysicalSensorProfileRegistry(cameraManager)
 
     private fun frameSensorMetadataSnapshot(
@@ -1451,6 +1455,7 @@ class BnCameraManager(private val context: Context) {
     fun configureViewfinderStream(
         setting: ViewfinderStream,
         profileId: String,
+        requestedLensId: String? = null,
         onEffectiveSourceChanged: (ViewfinderEffectiveSource, Int) -> Unit,
         onRawFrame: (RawPreviewFrame) -> Unit
     ): Long {
@@ -1497,10 +1502,24 @@ class BnCameraManager(private val context: Context) {
             tag,
             "VIEWFINDER_STREAM_SETTING=${setting.persistedValue} registration=$registrationId"
         )
-        refreshEffectiveViewfinderSource(
-            expectedCallbackRegistrationId = registrationId,
-            preserveResidentRawConfig = canPreserveResidentRawConfig
-        )
+        val callbackMatchesActiveSensor = requestedLensId == null ||
+            traceIdentity?.selectedLensId == requestedLensId
+        if (callbackMatchesActiveSensor) {
+            refreshEffectiveViewfinderSource(
+                expectedCallbackRegistrationId = registrationId,
+                preserveResidentRawConfig = canPreserveResidentRawConfig
+            )
+        } else {
+            // Compose publishes the target lens/profile pair before Camera2 finishes its serialized
+            // handover. Keep the callbacks registered, but do not restage the old generation under
+            // the target UI lens. The real pipeline transition calls refreshEffectiveViewfinderSource
+            // after it owns the requested sensor and a new generation.
+            Log.i(
+                tag,
+                "VIEWFINDER_TARGET_DEFERRED requestedLens=$requestedLensId " +
+                    "activeSensor=${traceIdentity?.selectedLensId ?: "none"} generation=$pipelineGeneration"
+            )
+        }
         return registrationId
     }
 
@@ -5784,15 +5803,11 @@ class BnCameraManager(private val context: Context) {
      */
     fun resolveCameraDeviceRoute(cameraId: String): CameraDeviceRoute {
         return try {
-            val directIds = cameraManager.cameraIdList.toSet()
+            val directIds = publicCameraIds
 
-            // A user-selected camera ID that CameraManager advertises as directly openable owns
-            // its own active-array, zoom/crop coordinate space and standard lens controls. Do not
-            // silently reroute such a lens through a logical parent merely because the vendor also
-            // lists it as one of that parent's physical children. On several multi-camera HALs that
-            // logical route inherits the parent's 1.0x crop/control space and defeats the full FOV
-            // of an independently openable ultra-wide lens. Hidden physical IDs that are not in
-            // cameraIdList still correctly use setPhysicalCameraId through their logical owner.
+            // A selected ID advertised by CameraManager is always opened directly. This includes
+            // public physical children: never replace the requested sensor with its logical owner.
+            // Only hidden physical IDs continue to the direct-probe/physical-output qualification.
             if (CameraDeviceRoutePolicy.shouldOpenDirectly(cameraId, directIds)) {
                 Log.i(
                     previewDiagnosticsTag,
@@ -5850,10 +5865,10 @@ class BnCameraManager(private val context: Context) {
 
     private fun findLogicalParentCameraId(
         physicalCameraId: String,
-        publicCameraIds: Set<String> = cameraManager.cameraIdList.toSet()
+        publicCameraIds: Set<String> = this.publicCameraIds
     ): String? = publicCameraIds.firstOrNull { candidateLogicalId ->
         runCatching {
-            val chars = cameraManager.getCameraCharacteristics(candidateLogicalId)
+            val chars = getCachedCameraCharacteristics(candidateLogicalId)
             val caps = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
             val isLogicalMultiCamera =
                 caps?.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_LOGICAL_MULTI_CAMERA) == true
@@ -6048,7 +6063,7 @@ class BnCameraManager(private val context: Context) {
 
         val role = getLensRole(cameraId)
         val chars = try {
-            cameraManager.getCameraCharacteristics(cameraId)
+            getCachedCameraCharacteristics(cameraId)
         } catch (e: Exception) {
             Log.e(tag, "Failed to get characteristics for $cameraId", e)
             return null
@@ -6202,6 +6217,7 @@ class BnCameraManager(private val context: Context) {
         val rawPreviewBinding = resolveCustomRawPreviewBinding(cameraId, requestedSource)
 
         return PipelineIdentity(
+            selectedLensId = cameraId,
             requestedProfileId = requestedProfileId,
             requestedFrameSource = requestedSource,
             effectiveFrameSource = formatName(effectiveFormat),
@@ -6265,7 +6281,7 @@ class BnCameraManager(private val context: Context) {
     }
 
     private fun PipelineIdentity.toDebugString(): String {
-        return "profile=$requestedProfileId requested=$requestedFrameSource effective=$effectiveFrameSource " +
+        return "selectedLens=$selectedLensId profile=$requestedProfileId requested=$requestedFrameSource effective=$effectiveFrameSource " +
                 "format=${formatName(bufferFormat)} camera=$logicalCameraId physical=${physicalCameraId ?: "none"} " +
                 "cameraRoute=$cameraRouteKind " +
                 "lensRole=${lensRole ?: "none"} route=$backendRoute size=${width}x$height maxImages=$maxImages " +
@@ -7448,9 +7464,14 @@ class BnCameraManager(private val context: Context) {
             // Settings/vendor discovery can run in parallel with CameraDevice.openCamera(). The
             // CameraDevice callback itself never waits on DataStore or scanner IO.
             val initialSessionSettingsDeferred = sessionTransitionScope.async {
-                loadSessionRequestSettings(requestedIdentity.logicalCameraId)
+                loadSessionRequestSettings(requestedIdentity.selectedLensId)
             }
             beginCameraOpenRequest(startGeneration)
+            com.bncam.core.debug.Phase0PerformanceTrace.lensTransitionMilestone(
+                targetLensId = cameraId,
+                event = "camera_open_requested",
+                detail = "logical=${requestedIdentity.logicalCameraId}"
+            )
             lifetimeCameraOpenRequestCount.incrementAndGet()
             logCameraLifetimeCounters(
                 event = "CAMERA_OPEN_REQUEST",
@@ -7466,6 +7487,11 @@ class BnCameraManager(private val context: Context) {
                     }
                     settleCameraOpenRequest(startGeneration)
                     cameraDevice = camera
+                    com.bncam.core.debug.Phase0PerformanceTrace.lensTransitionMilestone(
+                        targetLensId = cameraId,
+                        event = "camera_device_opened",
+                        detail = "logical=${camera.id}"
+                    )
                     lifetimeCameraOpenedCount.incrementAndGet()
                     logCameraLifetimeCounters(
                         event = "CAMERA_DEVICE_OPENED",
@@ -9574,6 +9600,15 @@ class BnCameraManager(private val context: Context) {
                             }
                             ringBuffer.recordSessionConfigured(sessionGeneration)
                             startWarmBufferWatchdog(sessionGeneration)
+                            synchronized(pipelineLock) {
+                                activePipelineIdentity?.selectedLensId
+                            }?.let { targetLensId ->
+                                com.bncam.core.debug.Phase0PerformanceTrace.lensTransitionMilestone(
+                                    targetLensId = targetLensId,
+                                    event = "session_configured",
+                                    detail = "logical=${camera.id};reason=$reason"
+                                )
+                            }
                             Log.d(tag, "ZSL Engine Draait! Hartslag (metadata) geactiveerd.")
                             onSessionReady?.invoke(true)
                         } catch (e: Exception) {
@@ -9793,6 +9828,16 @@ class BnCameraManager(private val context: Context) {
                         ).uppercase()
                     }\noutputs=${outputs.size}\nhasSessionParameters=${sessionParameters != null}"
                 )
+                val phase0TargetLensId = synchronized(pipelineLock) {
+                    activePipelineIdentity?.selectedLensId
+                }
+                phase0TargetLensId?.let { targetLensId ->
+                    com.bncam.core.debug.Phase0PerformanceTrace.lensTransitionMilestone(
+                        targetLensId = targetLensId,
+                        event = "session_creation_requested",
+                        detail = "logical=${camera.id};reason=$reason"
+                    )
+                }
                 camera.createCaptureSession(sessionConfig)
 
             } catch (e: Exception) {
@@ -9881,8 +9926,11 @@ class BnCameraManager(private val context: Context) {
         timeoutMs: Long = SESSION_TRANSITION_TIMEOUT_MS
     ): Boolean {
         val completion = CompletableDeferred<Boolean>()
+        val settingsLensId = synchronized(pipelineLock) {
+            activePipelineIdentity?.selectedLensId
+        } ?: camera.id
         val sessionSettings = runCatching {
-            loadSessionRequestSettings(camera.id)
+            loadSessionRequestSettings(settingsLensId)
         }.getOrElse { error ->
             Log.e(tag, "Camera2 session settings load failed reason=$reason camera=${camera.id}", error)
             return false
@@ -10227,11 +10275,29 @@ class BnCameraManager(private val context: Context) {
             extra = "reason=$reason\nreaderReleaseDeferred=true\nactivePipelineAfterReset=none"
         )
 
-        val sessionClosed = sessionTicket?.let { awaitCaptureSessionClosed(it) } ?: true
         val deviceClosed = deviceTicket?.let { awaitCameraDeviceClosed(it) } ?: true
         val hardwareSettled = deviceClosed && awaitCameraHardwareClosed(
             maxWaitMs = CAMERA_HARD_CLOSE_RECOVERY_TIMEOUT_MS
         )
+        val sessionClosed = when {
+            sessionTicket == null -> true
+            // CameraDevice.StateCallback.onClosed is the authoritative hardware-ownership
+            // barrier. Android closes every session owned by that device before this callback.
+            // Some HALs never dispatch the separate session onClosed callback after device.close;
+            // waiting for it serialized every direct physical-ID switch behind a 2.5 s timeout.
+            deviceTicket != null && hardwareSettled -> {
+                if (!sessionTicket.closeBarrier.isCompleted) {
+                    Log.i(
+                        previewDiagnosticsTag,
+                        "event=CAPTURE_SESSION_CLOSE_IMPLIED_BY_DEVICE_ACK " +
+                            "generation=${sessionTicket.generation} epoch=${sessionTicket.sessionEpoch} " +
+                            "reason=${sessionTicket.reason}"
+                    )
+                }
+                true
+            }
+            else -> awaitCaptureSessionClosed(sessionTicket)
+        }
         val safeToRelease = sessionClosed && hardwareSettled
 
         if (safeToRelease) {
