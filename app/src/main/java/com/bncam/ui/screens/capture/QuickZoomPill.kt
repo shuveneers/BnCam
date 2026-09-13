@@ -1,6 +1,9 @@
 package com.bncam.ui.screens.capture
 
 import androidx.compose.animation.Crossfade
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.tween
@@ -15,6 +18,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -22,6 +26,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.rotate
@@ -37,6 +42,7 @@ import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.exp
 import kotlin.math.ln
+import kotlin.math.roundToInt
 
 internal data class ZoomSensorStop(
     val lensId: String,
@@ -47,6 +53,7 @@ internal data class ZoomSensorStop(
 @Composable
 internal fun QuickZoomPill(
     currentZoom: () -> Float,
+    currentFocalMm: () -> Float,
     minZoom: Float,
     maxZoom: Float,
     sensorStops: List<ZoomSensorStop>,
@@ -70,44 +77,74 @@ internal fun QuickZoomPill(
         label = "quick_zoom_pill_width"
     )
 
-    Surface(
+    Box(
         modifier = modifier.width(animatedWidth.value),
-        color = Color(0xC91C1C1C),
-        shape = RoundedCornerShape(50),
-        border = BorderStroke(0.75.dp, Color.White.copy(alpha = 0.14f)),
-        shadowElevation = 4.dp
+        contentAlignment = Alignment.BottomCenter
     ) {
-        Crossfade(
-            targetState = expanded,
-            animationSpec = tween(durationMillis = 150),
-            label = "quick_zoom_pill_content"
-        ) { showSlider ->
-            if (showSlider) {
-                QuickZoomSlider(
-                    zoom = currentZoomValue,
-                    minZoom = safeMinZoom,
-                    maxZoom = safeMaxZoom,
-                    sensorStops = sensorStops,
-                    rotationDegrees = uiRotationDegrees,
-                    onZoomScrubbed = onZoomScrubbed,
-                    onScrubActiveChange = onScrubActiveChange
+        AnimatedVisibility(
+            visible = expanded,
+            enter = fadeIn(animationSpec = tween(140)),
+            exit = fadeOut(animationSpec = tween(120)),
+            modifier = Modifier
+                .align(Alignment.TopCenter)
+                .offset(y = (-34).dp)
+        ) {
+            Surface(
+                color = Color(0xD91C1C1C),
+                shape = RoundedCornerShape(14.dp),
+                border = BorderStroke(0.8.dp, AccentPistachio.copy(alpha = 0.42f)),
+                shadowElevation = 3.dp
+            ) {
+                Text(
+                    text = "${currentFocalMm().coerceAtLeast(1f).roundToInt()}mm",
+                    color = AccentPistachio,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier
+                        .padding(horizontal = 12.dp, vertical = 6.dp)
+                        .rotate(uiRotationDegrees)
                 )
-            } else {
-                Row(modifier = Modifier.padding(3.dp)) {
-                    QuickZoomSegment(
-                        label = "1x",
-                        selected = oneXSelected,
-                        enabled = oneXAvailable,
+            }
+        }
+
+        Surface(
+            color = Color(0xC91C1C1C),
+            shape = RoundedCornerShape(50),
+            border = BorderStroke(0.75.dp, Color.White.copy(alpha = 0.14f)),
+            shadowElevation = 4.dp
+        ) {
+            Crossfade(
+                targetState = expanded,
+                animationSpec = tween(durationMillis = 150),
+                label = "quick_zoom_pill_content"
+            ) { showSlider ->
+                if (showSlider) {
+                    QuickZoomSlider(
+                        zoom = currentZoomValue,
+                        minZoom = safeMinZoom,
+                        maxZoom = safeMaxZoom,
+                        sensorStops = sensorStops,
                         rotationDegrees = uiRotationDegrees,
-                        onClick = { onZoomSelected(1f) }
+                        onZoomScrubbed = onZoomScrubbed,
+                        onScrubActiveChange = onScrubActiveChange
                     )
-                    QuickZoomSegment(
-                        label = "2x",
-                        selected = twoXSelected,
-                        enabled = twoXAvailable,
-                        rotationDegrees = uiRotationDegrees,
-                        onClick = { onZoomSelected(2f) }
-                    )
+                } else {
+                    Row(modifier = Modifier.padding(3.dp)) {
+                        QuickZoomSegment(
+                            label = "1x",
+                            selected = oneXSelected,
+                            enabled = oneXAvailable,
+                            rotationDegrees = uiRotationDegrees,
+                            onClick = { onZoomSelected(1f) }
+                        )
+                        QuickZoomSegment(
+                            label = "2x",
+                            selected = twoXSelected,
+                            enabled = twoXAvailable,
+                            rotationDegrees = uiRotationDegrees,
+                            onClick = { onZoomSelected(2f) }
+                        )
+                    }
                 }
             }
         }
@@ -126,6 +163,8 @@ private fun QuickZoomSlider(
 ) {
     val safeZoom = zoom.coerceIn(minZoom, maxZoom)
     val fraction = zoomToFraction(safeZoom, minZoom, maxZoom)
+    val latestOnZoomScrubbed = rememberUpdatedState(onZoomScrubbed)
+    val latestOnScrubActiveChange = rememberUpdatedState(onScrubActiveChange)
     val visibleStops = sensorStops
         .asSequence()
         .filter { it.zoomRatio.isFinite() && it.zoomRatio in minZoom..maxZoom }
@@ -162,12 +201,12 @@ private fun QuickZoomSlider(
                 .pointerInput(minZoom, maxZoom) {
                     awaitEachGesture {
                         val down = awaitFirstDown(requireUnconsumed = false)
-                        onScrubActiveChange(true)
+                        latestOnScrubActiveChange.value(true)
                         val insetPx = 9.dp.toPx()
                         val usableWidth = (size.width.toFloat() - insetPx * 2f).coerceAtLeast(1f)
                         fun emitZoom(x: Float) {
                             val sliderFraction = ((x - insetPx) / usableWidth).coerceIn(0f, 1f)
-                            onZoomScrubbed(
+                            latestOnZoomScrubbed.value(
                                 fractionToZoom(
                                     fraction = sliderFraction,
                                     minZoom = minZoom,
@@ -186,7 +225,7 @@ private fun QuickZoomSlider(
                                 change.consume()
                             }
                         } finally {
-                            onScrubActiveChange(false)
+                            latestOnScrubActiveChange.value(false)
                         }
                     }
                 },

@@ -881,7 +881,47 @@ fun CameraScreen(
             }
         }
     }
-    val adaptiveViewfinderAspect = cameraUiHardwareState.adaptiveViewfinderAspect
+    // Keep the visible rear-camera viewport geometry stable across physical-lens handovers.
+    // Individual sensors can report slightly different active-array aspect ratios; binding the
+    // outer Compose viewport directly to each one makes BottomCenter overlays visibly jump by a
+    // pixel or two when switching lenses. Anchor the UI viewport to the rear lens nearest 1.0x
+    // while CameraPreview/Camera2 continue using the real per-lens stream/sensor geometry.
+    val rearViewfinderAspectAnchorLensId = remember(visibleLenses) {
+        visibleLenses
+            .asSequence()
+            .filter { it.facing != CameraCharacteristics.LENS_FACING_FRONT }
+            .minByOrNull { kotlin.math.abs(it.opticalZoomRatio - 1f) }
+            ?.id
+    }
+    var stableRearViewfinderAspect by remember(rearViewfinderAspectAnchorLensId) {
+        mutableFloatStateOf(3f / 4f)
+    }
+    LaunchedEffect(rearViewfinderAspectAnchorLensId) {
+        val anchorLensId = rearViewfinderAspectAnchorLensId ?: return@LaunchedEffect
+        val resolvedAspect = withContext(kotlinx.coroutines.Dispatchers.IO) {
+            val chars = runCatching {
+                uiCameraManager.getCameraCharacteristics(anchorLensId)
+            }.recoverCatching {
+                val route = bnCameraManager.resolveCameraDeviceRoute(anchorLensId)
+                uiCameraManager.getCameraCharacteristics(route.logicalCameraId)
+            }.getOrNull() ?: return@withContext null
+            val rawRect =
+                chars.get(CameraCharacteristics.SENSOR_INFO_PRE_CORRECTION_ACTIVE_ARRAY_SIZE)
+                    ?: chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+            rawRect?.takeIf { it.width() > 0 && it.height() > 0 }?.let { rect ->
+                val shortSide = min(rect.width(), rect.height()).toFloat()
+                val longSide = max(rect.width(), rect.height()).toFloat()
+                (shortSide / longSide).coerceIn(0.50f, 1.0f)
+            }
+        }
+        if (resolvedAspect != null) stableRearViewfinderAspect = resolvedAspect
+    }
+    val adaptiveViewfinderAspect =
+        if (activeLens.facing != CameraCharacteristics.LENS_FACING_FRONT) {
+            stableRearViewfinderAspect
+        } else {
+            cameraUiHardwareState.adaptiveViewfinderAspect
+        }
     val lifecycleOwner = LocalLifecycleOwner.current
     val coroutineScope = rememberCoroutineScope()
     // Capture work must survive recomposition and temporary removal of CameraScreen. The regular
@@ -1011,9 +1051,26 @@ fun CameraScreen(
     var manualExposureValue by remember { mutableFloatStateOf(0f) }
     var manualFocusDistance by remember { mutableFloatStateOf(0.5f) }
     var manualFocusOverrideActive by remember(activeLens.id) { mutableStateOf(false) }
-    var currentZoomLevel by remember(activeLens.id) { mutableFloatStateOf(1f) }
+    var pendingPinchLensId by remember { mutableStateOf<String?>(null) }
+    var pendingPinchFocalMm by remember { mutableStateOf<Float?>(null) }
+    // A reverse handover enters the wider sensor at a >1x local crop. Seed the new lens-owned
+    // Compose state from that pending equivalent FOV instead of rendering one native-1x frame
+    // first and correcting it in LaunchedEffect afterwards.
+    val initialHandoverZoom = if (pendingPinchLensId == activeLens.id) {
+        val nativeFocal = activeLens.equivalentFocalLength35mm?.takeIf { it > 0f }
+        if (nativeFocal != null) {
+            pendingPinchFocalMm
+                ?.let { requestedFocal -> (requestedFocal / nativeFocal).coerceAtLeast(1f) }
+                ?: 1f
+        } else {
+            1f
+        }
+    } else {
+        1f
+    }
+    var currentZoomLevel by remember(activeLens.id) { mutableFloatStateOf(initialHandoverZoom) }
     val currentZoomLevelState = rememberUpdatedState(currentZoomLevel)
-    var requestedZoomLevel by remember(activeLens.id) { mutableFloatStateOf(1f) }
+    var requestedZoomLevel by remember(activeLens.id) { mutableFloatStateOf(initialHandoverZoom) }
     var zoomAnimationDurationMs by remember(activeLens.id) { mutableIntStateOf(90) }
     var exposureDialState by remember { mutableStateOf(ViewfinderExposureDialState()) }
     var pinchZoomDialVisible by remember { mutableStateOf(false) }
@@ -1022,8 +1079,6 @@ fun CameraScreen(
     var pinchHandoverArmedLensId by remember(activeLens.id) { mutableStateOf<String?>(null) }
     var pinchHandoverArmedDirection by remember(activeLens.id) { mutableIntStateOf(0) }
     var pinchLensTransitionInFlight by remember(activeLens.id) { mutableStateOf(false) }
-    var pendingPinchLensId by remember { mutableStateOf<String?>(null) }
-    var pendingPinchFocalMm by remember { mutableStateOf<Float?>(null) }
     val pinchHandoverArmedLensIdState = rememberUpdatedState(pinchHandoverArmedLensId)
     val pinchHandoverArmedDirectionState = rememberUpdatedState(pinchHandoverArmedDirection)
     val pinchLensTransitionInFlightState = rememberUpdatedState(pinchLensTransitionInFlight)
@@ -1346,8 +1401,29 @@ fun CameraScreen(
         zoomAnimationDurationMs,
         maxDigitalZoom,
         activeLens.id,
-        directZoomInteraction
+        directZoomInteraction,
+        pendingPinchLensId,
+        pendingPinchFocalMm
     ) {
+        val pendingHandoverResidual = if (pendingPinchLensId == activeLens.id) {
+            pendingPinchFocalMm
+                ?.let { requestedFocal -> (requestedFocal / activeNativeFocalMm).coerceAtLeast(1f) }
+        } else {
+            null
+        }
+        // During a reverse physical-lens handover CameraUiHardwareState briefly exposes its 1x
+        // placeholder before the target sensor characteristics arrive. Do not let that temporary
+        // maxDigitalZoom=1 value pull the global rail/RAW display back to the new sensor's native
+        // start. Preserve the equivalent-FOV residual until Camera2 can accept it.
+        if (pendingHandoverResidual != null &&
+            pendingHandoverResidual > 1.001f &&
+            maxDigitalZoom <= 1.001f
+        ) {
+            zoomActuator.snapTo(pendingHandoverResidual)
+            currentZoomLevel = pendingHandoverResidual
+            return@LaunchedEffect
+        }
+
         val target = requestedZoomLevel.coerceIn(1f, maxDigitalZoom.coerceAtLeast(1f))
         if (directZoomInteraction) {
             // Gesture path: hardware is paced by applyInteractiveZoom(). Keep the actuator
@@ -1401,34 +1477,58 @@ fun CameraScreen(
         bnCameraManager.setMeteringStyle(meteringStyle)
     }
 
-    // A physical lens transition starts at native 1x. If the transition originated from a pinch
-    // gesture, restore the requested equivalent focal length on the new sensor immediately after
-    // its zoom capability is known.
+    // Normal lens selection starts at the target sensor's native 1x. A zoom-driven physical
+    // handover is different: when zooming out from 3.7x -> 1.0x or 1.0x -> 0.6x, the wider sensor
+    // must initially be digitally cropped to the same equivalent FOV. Publish that residual zoom
+    // immediately so the global rail and RAW viewfinder never flash to the sensor's native start.
     LaunchedEffect(activeLens.id) {
         directZoomInteraction = false
-        currentZoomLevel = 1f
-        requestedZoomLevel = 1f
         pinchHandoverArmedLensId = null
         pinchHandoverArmedDirection = 0
         pinchLensTransitionInFlight = false
-        zoomActuator.snapTo(1f)
-        interactiveZoomLastTarget[0] = 1f
-        interactiveZoomLastSubmitted[0] = 1f
         interactiveZoomSubmitNs[0] = 0L
-        bnCameraManager.setZoom(1f)
+
+        val handoverFocal = pendingPinchFocalMm
+            .takeIf { pendingPinchLensId == activeLens.id }
+        if (handoverFocal != null) {
+            val residualZoom = (handoverFocal / activeNativeFocalMm).coerceAtLeast(1f)
+            currentZoomLevel = residualZoom
+            requestedZoomLevel = residualZoom
+            zoomActuator.snapTo(residualZoom)
+            interactiveZoomLastTarget[0] = residualZoom
+            // The target Camera2 session has not necessarily accepted this value yet. Keep the
+            // submitted marker at native so the capability-ready effect below still commits it.
+            interactiveZoomLastSubmitted[0] = 1f
+        } else {
+            currentZoomLevel = 1f
+            requestedZoomLevel = 1f
+            zoomActuator.snapTo(1f)
+            interactiveZoomLastTarget[0] = 1f
+            interactiveZoomLastSubmitted[0] = 1f
+            bnCameraManager.setZoom(1f)
+        }
     }
 
     LaunchedEffect(activeLens.id, maxDigitalZoom, pendingPinchLensId, pendingPinchFocalMm) {
         if (pendingPinchLensId != activeLens.id) return@LaunchedEffect
         val requestedFocal = pendingPinchFocalMm ?: return@LaunchedEffect
         val residualZoom = (requestedFocal / activeNativeFocalMm).coerceAtLeast(1f)
-        // CameraUiHardwareState is intentionally reset while a new sensor is opening. Do not lose
-        // a >1x residual request during that short 1x placeholder window.
+        // CameraUiHardwareState intentionally has a 1x placeholder while target characteristics
+        // load. The display continuity state above already holds the correct FOV; wait only for
+        // the real hardware limit before committing the Camera2 crop.
         if (residualZoom > 1.001f && maxDigitalZoom <= 1.001f) return@LaunchedEffect
-        requestSmoothZoom(
-            residualZoom.coerceIn(1f, maxDigitalZoom.coerceAtLeast(1f)),
-            durationMs = 120
-        )
+
+        val safeResidual = residualZoom.coerceIn(1f, maxDigitalZoom.coerceAtLeast(1f))
+        // Handover zoom is a continuity correction, not a user-visible zoom animation. Snap both
+        // UI and Camera2 to the final residual in one step so the first stable target view matches
+        // the outgoing sensor boundary instead of travelling native-1x -> residual.
+        zoomActuator.snapTo(safeResidual)
+        currentZoomLevel = safeResidual
+        requestedZoomLevel = safeResidual
+        interactiveZoomLastTarget[0] = safeResidual
+        bnCameraManager.setZoom(safeResidual)
+        interactiveZoomLastSubmitted[0] = safeResidual
+        interactiveZoomSubmitNs[0] = SystemClock.elapsedRealtimeNanos()
         pendingPinchLensId = null
         pendingPinchFocalMm = null
     }
@@ -2168,12 +2268,15 @@ fun CameraScreen(
                                     zoomMultiplier < 1f
                                 ) {
                                     val previousDetent = activeNativeFocalMm
-                                    val previousRelease = activeNativeFocalMm * 0.970f
                                     val armedForPrevious =
                                         gestureArmedLensId == previousLens.id &&
                                             gestureArmedDirection == -1
 
-                                    if (armedForPrevious && rawRequestedFocal <= previousRelease) {
+                                    if (armedForPrevious && zoomMultiplier < 0.998f) {
+                                        // The first pinch-out gesture already proved intent by landing
+                                        // on the native endpoint. On the next deliberate pinch-out,
+                                        // switch immediately to the previous physical sensor instead
+                                        // of requiring an invisible extra ~3% push below Camera2 1x.
                                         targetLens = previousLens
                                     } else if (rawRequestedFocal <= previousDetent) {
                                         effectiveFocal = previousDetent
@@ -2250,6 +2353,7 @@ fun CameraScreen(
                 activeProfile = activeProfile,
                 previewViewRef = previewViewRef,
                 digitalZoom = { currentZoomLevelState.value },
+                lensHandoverZoomSettled = pendingPinchLensId != activeLens.id,
                 modifier = Modifier.fillMaxSize()
             )
 
@@ -2335,6 +2439,7 @@ fun CameraScreen(
             if (!exposureDialState.visible) {
                 QuickZoomPill(
                     currentZoom = { currentGlobalZoom },
+                    currentFocalMm = { activeNativeFocalMm * currentZoomLevel },
                     minZoom = globalZoomRailMin,
                     maxZoom = globalZoomRailMax,
                     sensorStops = globalZoomSensorStops,
@@ -2880,6 +2985,7 @@ fun CameraPreview(
     activeProfile: CameraProfile,
     previewViewRef: Array<FocusPeakingView?>? = null,
     digitalZoom: () -> Float = { 1f },
+    lensHandoverZoomSettled: Boolean = true,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -2944,6 +3050,14 @@ fun CameraPreview(
 
     fun finishLensTransitionOnPresentedFrame(lensId: String, source: String, generation: Int) {
         if (transitioningToLensId != lensId) return
+        if (!lensHandoverZoomSettled) {
+            Log.d(
+                "BnCamPreviewDiag",
+                "event=LENS_TRANSITION_VISUAL_HOLD targetLensId=$lensId source=$source " +
+                    "generation=$generation reason=handover_zoom_pending"
+            )
+            return
+        }
         transitioningToLensId = null
         Log.i(
             "BnCamPreviewDiag",
