@@ -120,19 +120,24 @@ internal fun ViewfinderProfileSelector(
     uiRotationDegrees: Float = 0f
 ) {
     var expanded by remember { mutableStateOf(false) }
-    val disabledProfile = activeProfile.id.endsWith("_disabled")
+    val activeProfileDisabled = activeProfile.id.endsWith("_disabled")
     BackHandler(enabled = expanded) { expanded = false }
 
     val gapPx = with(LocalDensity.current) { 8.dp.roundToPx() }
     val positionProvider = remember(gapPx) {
         AnchorPopupPositionProvider(placeAbove = false, gapPx = gapPx)
     }
+    val disabledProfileEntry = remember(visibleProfiles) {
+        visibleProfiles.firstOrNull { it.id.endsWith("_disabled") }
+    }
     val orderedProfiles = remember(visibleProfiles) {
-        visibleProfiles.sortedWith(
-            compareBy<CameraProfile> { if (it.id.endsWith("_disabled")) 0 else 1 }
-                .thenBy { it.id.substringAfterLast("_profile_", "999").toIntOrNull() ?: 999 }
-                .thenBy { it.id }
-        )
+        visibleProfiles
+            .filterNot { it.id.endsWith("_disabled") }
+            .sortedWith(
+                compareBy<CameraProfile> {
+                    it.id.substringAfterLast("_profile_", "999").toIntOrNull() ?: 999
+                }.thenBy { it.id }
+            )
     }
 
     Box(modifier = modifier) {
@@ -145,7 +150,7 @@ internal fun ViewfinderProfileSelector(
                 .combinedClickable(
                     onClick = { expanded = !expanded },
                     onLongClick = {
-                        if (!disabledProfile) onOpenProfileSettings(activeProfile)
+                        if (!activeProfileDisabled) onOpenProfileSettings(activeProfile)
                     }
                 )
         ) {
@@ -222,18 +227,42 @@ internal fun ViewfinderProfileSelector(
                                 contentAlignment = Alignment.Center
                             ) {
                                 Surface(
-                                    color = AccentPistachio.copy(alpha = 0.11f),
+                                    color = if (activeProfileDisabled) {
+                                        AccentPistachio.copy(alpha = 0.14f)
+                                    } else {
+                                        Color.White.copy(alpha = 0.055f)
+                                    },
                                     shape = RoundedCornerShape(50),
                                     border = androidx.compose.foundation.BorderStroke(
-                                        1.dp,
-                                        AccentPistachio.copy(alpha = 0.52f)
+                                        if (activeProfileDisabled) 1.dp else 0.75.dp,
+                                        if (activeProfileDisabled) {
+                                            AccentPistachio.copy(alpha = 0.62f)
+                                        } else {
+                                            Color.White.copy(alpha = 0.12f)
+                                        }
+                                    ),
+                                    modifier = Modifier.combinedClickable(
+                                        enabled = disabledProfileEntry != null,
+                                        onClick = {
+                                            disabledProfileEntry?.let { disabled ->
+                                                onProfileSelected(disabled)
+                                                expanded = false
+                                            }
+                                        },
+                                        onLongClick = {}
                                     )
                                 ) {
                                     Text(
-                                        text = activeProfile.name.replaceFirstChar { it.uppercase() },
-                                        color = AccentPistachio,
+                                        text = disabledProfileEntry?.name
+                                            ?.replaceFirstChar { it.uppercase() }
+                                            ?: "Disabled",
+                                        color = if (activeProfileDisabled) {
+                                            AccentPistachio
+                                        } else {
+                                            Color.White.copy(alpha = 0.82f)
+                                        },
                                         fontSize = 12.sp,
-                                        fontWeight = FontWeight.SemiBold,
+                                        fontWeight = if (activeProfileDisabled) FontWeight.SemiBold else FontWeight.Normal,
                                         maxLines = 1,
                                         modifier = Modifier
                                             .padding(horizontal = 12.dp, vertical = 7.dp)
@@ -248,14 +277,14 @@ internal fun ViewfinderProfileSelector(
                             ) {
                                 Surface(
                                     shape = CircleShape,
-                                    color = if (disabledProfile) {
+                                    color = if (activeProfileDisabled) {
                                         Color.White.copy(alpha = 0.035f)
                                     } else {
                                         AccentPistachio.copy(alpha = 0.12f)
                                     },
                                     border = androidx.compose.foundation.BorderStroke(
                                         0.75.dp,
-                                        if (disabledProfile) {
+                                        if (activeProfileDisabled) {
                                             Color.White.copy(alpha = 0.09f)
                                         } else {
                                             AccentPistachio.copy(alpha = 0.44f)
@@ -264,7 +293,7 @@ internal fun ViewfinderProfileSelector(
                                     modifier = Modifier
                                         .size(36.dp)
                                         .combinedClickable(
-                                            enabled = !disabledProfile,
+                                            enabled = !activeProfileDisabled,
                                             onClick = {
                                                 expanded = false
                                                 onOpenProfileSettings(activeProfile)
@@ -276,7 +305,7 @@ internal fun ViewfinderProfileSelector(
                                         Icon(
                                             imageVector = Icons.Default.Settings,
                                             contentDescription = "Profile settings",
-                                            tint = if (disabledProfile) {
+                                            tint = if (activeProfileDisabled) {
                                                 Color.White.copy(alpha = 0.24f)
                                             } else {
                                                 AccentPistachio
