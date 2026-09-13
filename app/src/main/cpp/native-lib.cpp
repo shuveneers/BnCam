@@ -3461,6 +3461,7 @@ Java_com_bncam_core_engine_ImageUtils_renderJpegFromMasterNative(
         jfloat portraitTargetBottom,
         jint portraitMaskRotationDegrees
 ) {
+    const auto outerStart = NativeClock::now();
     const char* routeChars = routeLabelString != nullptr ? env->GetStringUTFChars(routeLabelString, nullptr) : nullptr;
     std::string routeLabel = routeChars != nullptr ? routeChars : (isRaw10 == JNI_TRUE ? "JPEG_WORKING_LINEAR_RAW_FROM_RAW10_MASTER" : "JPEG_WORKING_LINEAR_RAW_FROM_RAW_SENSOR_MASTER");
     if (routeChars != nullptr) env->ReleaseStringUTFChars(routeLabelString, routeChars);
@@ -4292,6 +4293,10 @@ Java_com_bncam_core_engine_ImageUtils_renderJpegFromMasterNative(
     } else {
         std::ostringstream ownershipStats;
         ownershipStats << masterIspDebug
+                       << ";metadataResolveOuterMs=" << nativeFmtMs(metadataResolveMs)
+                       << ";rawPreprocessOuterMs=" << nativeFmtMs(rawPreprocessOuterMs)
+                       << ";rawJpegRenderCallOuterMs=" << nativeFmtMs(rawJpegRenderCallOuterMs)
+                       << ";totalNativeRawIspOuterMs=" << nativeFmtMs(nativeElapsedMs(outerStart))
                        << ";raw16Ownership=NATIVE_DIRECT_BUFFER_V1"
                        << ";raw16ManagedHeapCopyCount=0"
                        << ";raw16ManagedHeapCopyBytes=0"

@@ -15,6 +15,7 @@
 #include <exception>
 #include <iomanip>
 #include <limits>
+#include <memory>
 #include <new>
 #include <mutex>
 #include <numeric>
@@ -455,6 +456,34 @@ Raw16FullStats computeRaw16FullStats(const cv::Mat& bayer16, int saturationLevel
     }
     stats.saturatedCount = saturated;
     stats.saturatedPct = total > 0 ? (static_cast<double>(saturated) * 100.0 / static_cast<double>(total)) : 0.0;
+    return stats;
+}
+
+Raw16FullStats estimateRaw16FullStatsFromBoundedSample(
+        const cv::Mat& bayer16, int saturationLevel, const Raw16SampleStats& sampled) {
+    Raw16FullStats stats{};
+    if (bayer16.empty() || bayer16.type() != CV_16UC1) return stats;
+    const size_t total = static_cast<size_t>(bayer16.rows) * static_cast<size_t>(bayer16.cols);
+    if (total == 0u) return stats;
+    const size_t step = std::max<size_t>(1u, total / 20000u);
+    const uint16_t saturatedThreshold = static_cast<uint16_t>(std::clamp(saturationLevel, 1, 65535));
+    uint64_t sampledCount = 0u;
+    uint64_t sampledSaturated = 0u;
+    for (size_t linear = 0u; linear < total; linear += step) {
+        const size_t y = linear / static_cast<size_t>(bayer16.cols);
+        const size_t x = linear % static_cast<size_t>(bayer16.cols);
+        if (bayer16.ptr<uint16_t>(static_cast<int>(y))[x] >= saturatedThreshold) {
+            ++sampledSaturated;
+        }
+        ++sampledCount;
+    }
+    stats.minValue = sampled.minValue;
+    stats.maxValue = sampled.maxValue;
+    stats.saturatedPct = sampledCount > 0u
+            ? static_cast<double>(sampledSaturated) * 100.0 / static_cast<double>(sampledCount)
+            : 0.0;
+    stats.saturatedCount = static_cast<uint64_t>(std::llround(
+            static_cast<double>(total) * stats.saturatedPct / 100.0));
     return stats;
 }
 
@@ -2093,6 +2122,10 @@ jobject mergeRawToDngRaw16Internal(
     };
 
     std::uint64_t singleFrameResidentGeneration = 0u;
+    // True single-frame Vulkan success already owns the exact dense RAW16 CPU readback in a
+    // std::vector. Retain that vector until JNI publication so we do not copy it into cv::Mat
+    // and then copy it again into a second native payload. Multi-frame/observer paths stay unchanged.
+    std::unique_ptr<std::vector<std::uint16_t>> singleFrameGpuVectorOwner;
 
     auto decodeFrame = [&](AHardwareBuffer* buffer, cv::Mat& output, DecodedSourceLayout& layout) -> bool {
         bncam::vulkan::RawCaptureCanonicalizeRequest request{};
@@ -2119,9 +2152,19 @@ jobject mergeRawToDngRaw16Internal(
         if (gpu.success && gpu.width == static_cast<uint32_t>(sourceCropWidth) &&
             gpu.height == static_cast<uint32_t>(sourceCropHeight) &&
             gpu.outputRaw16.size() == static_cast<size_t>(sourceCropWidth) * static_cast<size_t>(sourceCropHeight)) {
-            output = cv::Mat(sourceCropHeight, sourceCropWidth, CV_16UC1);
-            std::memcpy(output.ptr<uint16_t>(0), gpu.outputRaw16.data(),
-                        gpu.outputRaw16.size() * sizeof(uint16_t));
+            const bool directSingleOwner = selected.size() == 1u && buffer == anchor;
+            if (directSingleOwner) {
+                singleFrameGpuVectorOwner =
+                        std::make_unique<std::vector<std::uint16_t>>(std::move(gpu.outputRaw16));
+                if (!singleFrameGpuVectorOwner || singleFrameGpuVectorOwner->empty()) return false;
+                output = cv::Mat(
+                        sourceCropHeight, sourceCropWidth, CV_16UC1,
+                        static_cast<void*>(singleFrameGpuVectorOwner->data()));
+            } else {
+                output = cv::Mat(sourceCropHeight, sourceCropWidth, CV_16UC1);
+                std::memcpy(output.ptr<uint16_t>(0), gpu.outputRaw16.data(),
+                            gpu.outputRaw16.size() * sizeof(uint16_t));
+            }
             AHardwareBuffer_Desc desc{};
             AHardwareBuffer_describe(buffer, &desc);
             layout.width = desc.width;
@@ -2296,6 +2339,7 @@ jobject mergeRawToDngRaw16Internal(
                 localStats.fullRaw16Max = gpuMulti.finalRawMax;
                 localStats.fullRaw16SaturatedCount = gpuMulti.finalRawSaturatedCount;
                 localStats.fullRaw16SaturatedPct = gpuMulti.finalRawSaturatedPct;
+                localStats.raw16FullStatsSource = "VULKAN_FINALIZE_REDUCTION_EXACT";
                 localStats.raw16Min = gpuMulti.finalRawMin;
                 localStats.raw16P01 = finalStats.p01;
                 localStats.raw16P50 = finalStats.p50;
@@ -2417,37 +2461,46 @@ jobject mergeRawToDngRaw16Internal(
         localStats.unpackedP99 = unpackedStats.p99;
         localStats.unpackedMax = unpackedStats.maxValue;
 
-        // Stage B Non-Destructive Column Statistics Audit (100% Full-Frame)
-        int firstNonZeroCol = -1;
-        int lastNonZeroCol = -1;
-        uint64_t sum0_383 = 0;
-        uint64_t nonZero0_383 = 0;
-        uint64_t sum384 = 0;
-        uint64_t nonZero384 = 0;
-        const int checkBoundary = std::min(384, anchorBayer16.cols);
+        // Stage A already performs the non-destructive two-axis payload audit. Do not make a
+        // second 100%-pixel diagnostic pass over a true single-frame GPU publication. Retain the
+        // exact legacy audit on CPU fallback and multi-frame reference paths.
+        if (singleFrameGpuVectorOwner == nullptr) {
+            int firstNonZeroCol = -1;
+            int lastNonZeroCol = -1;
+            uint64_t sum0_383 = 0;
+            uint64_t nonZero0_383 = 0;
+            uint64_t sum384 = 0;
+            uint64_t nonZero384 = 0;
+            const int checkBoundary = std::min(384, anchorBayer16.cols);
 
-        for (int y = 0; y < anchorBayer16.rows; ++y) {
-            const uint16_t* ptr = anchorBayer16.ptr<uint16_t>(y);
-            for (int x = 0; x < anchorBayer16.cols; ++x) {
-                uint16_t val = ptr[x];
-                if (val > 0) {
-                    if (firstNonZeroCol < 0 || x < firstNonZeroCol) firstNonZeroCol = x;
-                    if (x > lastNonZeroCol) lastNonZeroCol = x;
-                }
-                if (x < checkBoundary) {
-                    sum0_383 += val;
-                    if (val > 0) nonZero0_383++;
-                } else {
-                    sum384 += val;
-                    if (val > 0) nonZero384++;
+            for (int y = 0; y < anchorBayer16.rows; ++y) {
+                const uint16_t* ptr = anchorBayer16.ptr<uint16_t>(y);
+                for (int x = 0; x < anchorBayer16.cols; ++x) {
+                    uint16_t val = ptr[x];
+                    if (val > 0) {
+                        if (firstNonZeroCol < 0 || x < firstNonZeroCol) firstNonZeroCol = x;
+                        if (x > lastNonZeroCol) lastNonZeroCol = x;
+                    }
+                    if (x < checkBoundary) {
+                        sum0_383 += val;
+                        if (val > 0) nonZero0_383++;
+                    } else {
+                        sum384 += val;
+                        if (val > 0) nonZero384++;
+                    }
                 }
             }
-        }
-        double mean0_383 = static_cast<double>(sum0_383) / std::max(1.0, static_cast<double>(anchorBayer16.rows * checkBoundary));
-        double mean384 = static_cast<double>(sum384) / std::max(1.0, static_cast<double>(anchorBayer16.rows * (anchorBayer16.cols - checkBoundary)));
+            double mean0_383 = static_cast<double>(sum0_383) /
+                    std::max(1.0, static_cast<double>(anchorBayer16.rows * checkBoundary));
+            double mean384 = static_cast<double>(sum384) /
+                    std::max(1.0, static_cast<double>(anchorBayer16.rows * (anchorBayer16.cols - checkBoundary)));
 
-        DNG_LOGI("STAGE_COLUMN_AUDIT stage=Stage-B (Unpacked RAW) dimensions=%dx%d evalMode=FULL_FRAME_100_PERCENT firstNonZeroCol=%d lastNonZeroCol=%d col0_383Mean=%.2f col0_383NonZero=%" PRIu64 " col384_EndMean=%.2f col384_EndNonZero=%" PRIu64,
-                 anchorBayer16.cols, anchorBayer16.rows, firstNonZeroCol, lastNonZeroCol, mean0_383, nonZero0_383, mean384, nonZero384);
+            DNG_LOGI("STAGE_COLUMN_AUDIT stage=Stage-B (Unpacked RAW) dimensions=%dx%d evalMode=FULL_FRAME_100_PERCENT firstNonZeroCol=%d lastNonZeroCol=%d col0_383Mean=%.2f col0_383NonZero=%" PRIu64 " col384_EndMean=%.2f col384_EndNonZero=%" PRIu64,
+                     anchorBayer16.cols, anchorBayer16.rows, firstNonZeroCol, lastNonZeroCol, mean0_383, nonZero0_383, mean384, nonZero384);
+        } else {
+            DNG_LOGI("STAGE_COLUMN_AUDIT stage=Stage-B (Unpacked RAW) dimensions=%dx%d evalMode=SKIPPED_SINGLE_GPU_FAST_PATH stageA_payload_audit_retained=true",
+                     anchorBayer16.cols, anchorBayer16.rows);
+        }
 
         cv::Mat finalBayer16;
         if (selected.size() > 1) {
@@ -3175,7 +3228,15 @@ jobject mergeRawToDngRaw16Internal(
         }
 
         Raw16SampleStats finalStats = computeRaw16SampleStats(finalBayer16);
-        Raw16FullStats finalFullStats = computeRaw16FullStats(finalBayer16, localStats.payloadWhiteLevel);
+        const bool directSingleGpuPublication =
+                selected.size() == 1u && singleFrameGpuVectorOwner != nullptr;
+        Raw16FullStats finalFullStats = directSingleGpuPublication
+                ? estimateRaw16FullStatsFromBoundedSample(
+                        finalBayer16, localStats.payloadWhiteLevel, finalStats)
+                : computeRaw16FullStats(finalBayer16, localStats.payloadWhiteLevel);
+        localStats.raw16FullStatsSource = directSingleGpuPublication
+                ? "BOUNDED_SAMPLE_SINGLE_GPU_FAST_PATH"
+                : "FULL_FRAME_CPU_EXACT";
         localStats.sampledRaw16Min = finalStats.minValue;
         localStats.sampledRaw16P01 = finalStats.p01;
         localStats.sampledRaw16P50 = finalStats.p50;
@@ -3198,11 +3259,37 @@ jobject mergeRawToDngRaw16Internal(
         size_t totalBytes = static_cast<size_t>(finalBayer16.cols) * static_cast<size_t>(finalBayer16.rows) * 2u;
         localStats.raw16Bytes = totalBytes;
 
-        // Keep the canonical Master RAW16 in native memory. Kotlin receives only a direct
-        // ByteBuffer view and must release it explicitly through ImageUtils.
-        auto* nativePayload = new (std::nothrow) uint8_t[totalBytes];
+        // Keep the canonical Master RAW16 in native memory. On true single-frame Vulkan success
+        // the canonicalizer's already-materialized vector is the publication owner itself: no
+        // vector->cv::Mat copy and no cv::Mat->nativePayload copy. All fallback/multi reference
+        // paths retain the legacy allocation contract below.
         const std::uint64_t residentGenerationForPublication =
                 selected.size() == 1u ? singleFrameResidentGeneration : 0u;
+        if (directSingleGpuPublication && singleFrameGpuVectorOwner != nullptr) {
+            auto* vectorOwner = singleFrameGpuVectorOwner.release();
+            void* nativePayload = vectorOwner != nullptr && !vectorOwner->empty()
+                    ? static_cast<void*>(vectorOwner->data()) : nullptr;
+            if (nativePayload != nullptr &&
+                trackNativeRaw16VectorAllocation(vectorOwner, residentGenerationForPublication)) {
+                jobject directBuffer = env->NewDirectByteBuffer(nativePayload, static_cast<jlong>(totalBytes));
+                if (directBuffer != nullptr) {
+                    localStats.outputArrayMs = elapsedDngMs(stageStart);
+                    localStats.totalNativeDngMergeMs = elapsedDngMs(totalMergeStart);
+                    localStats.nativeRaw16OutstandingBuffersAtReturn = trackedNativeRaw16AllocationCount();
+                    copyStats();
+                    return directBuffer;
+                }
+                releaseTrackedNativeRaw16Allocation(nativePayload);
+                env->ExceptionClear();
+            } else if (vectorOwner != nullptr) {
+                delete vectorOwner;
+            }
+            localStats.failureReason = "Single GPU RAW16 publication ownership transfer failed";
+            copyStats();
+            return nullptr;
+        }
+
+        auto* nativePayload = new (std::nothrow) uint8_t[totalBytes];
         if (nativePayload != nullptr && trackNativeRaw16Allocation(
                     nativePayload, residentGenerationForPublication)) {
             if (finalBayer16.isContinuous()) {
@@ -3427,6 +3514,7 @@ std::string formatDngMergeStats(const DngMergeStats& stats) {
         << ";fullRaw16Max=" << stats.fullRaw16Max
         << ";fullRaw16SaturatedCount=" << stats.fullRaw16SaturatedCount
         << ";fullRaw16SaturatedPct=" << stats.fullRaw16SaturatedPct
+        << ";raw16FullStatsSource=" << stats.raw16FullStatsSource
         << ";raw10InputWidth=" << stats.width
         << ";raw10InputHeight=" << stats.height
         << ";raw10RowStride=" << stats.rowStrideBytes

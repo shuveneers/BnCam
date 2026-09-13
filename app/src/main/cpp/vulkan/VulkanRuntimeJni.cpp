@@ -149,6 +149,11 @@ Java_com_bncam_core_vulkan_VulkanNativeBridge_nativeGetRawPreviewOutputHardwareB
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
+Java_com_bncam_core_vulkan_VulkanNativeBridge_nativePrepareYuvSingleFrameBackend(JNIEnv*, jobject) {
+    return VulkanRuntime::instance().prepareYuvSingleFrameBackend() ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
 Java_com_bncam_core_vulkan_VulkanNativeBridge_nativePrepareRawPreviewBackend(JNIEnv*, jobject) {
     return VulkanRuntime::instance().prepareRawPreviewBackend() ? JNI_TRUE : JNI_FALSE;
 }

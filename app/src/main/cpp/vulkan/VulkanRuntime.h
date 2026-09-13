@@ -262,6 +262,9 @@ public:
             const YuvExposureStatisticsRequest& request
     ) noexcept;
 
+    /** Prepare the YUV single-frame capture pipeline without requiring a capture frame. */
+    bool prepareYuvSingleFrameBackend() noexcept;
+
     /** Prepare immutable RAW-preview Vulkan resources without requiring a RAW frame. */
     bool prepareRawPreviewBackend() noexcept;
 

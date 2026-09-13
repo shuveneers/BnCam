@@ -817,6 +817,11 @@ RuntimeFailure VulkanRuntimeBootstrap::destroy(OwnedRuntimeHandles& handles) noe
             }
 
             if (handles.pipelineCache != VK_NULL_HANDLE) {
+                // DELTA 0219: serialize the process-lifetime pipeline cache before releasing it.
+                // Bootstrap already loads this file on the next process, but prior production
+                // code cleared/destroyed the cache without ever writing its compiled contents.
+                // Persist is best-effort and fail-open: shutdown ownership is never blocked.
+                VulkanPipelineCacheRegistry::persist(handles.device);
                 VulkanPipelineCacheRegistry::clear(handles.device, handles.pipelineCache);
                 vkDestroyPipelineCache(handles.device, handles.pipelineCache, nullptr);
                 handles.pipelineCache = VK_NULL_HANDLE;

@@ -408,12 +408,15 @@ NeuralProductionGpuResult VulkanNeuralRawProductionBridge::execute(
     if(!uploadRemainingLscLocked(allocator_,request,out.compactMetadataUploadBytes,failure)){
         out.failureCode=NeuralBackendFailureCode::InvalidRequest;out.bypassReason=NeuralBypassReason::MissingRequiredLsc;out.status="FAIL_BYPASS_"+failure;out.totalWallMs=elapsedMs(started);return out;
     }
+    const auto packBridgeStarted = Clock::now();
     if(!dispatchBridgeLocked(device,queue,queueMutex,request.normalizedBayerInput,packedInput_.buffer,
             packedInput_.buffer, packedInput_.buffer, request.prepared.core.cfa,
             request.prepared.core.rawWidth, request.prepared.core.rawHeight, 0u,
             request.prepared.core.noise.shotS, request.prepared.core.noise.readO, failure)){
+        out.packBridgeMs = elapsedMs(packBridgeStarted);
         out.failureCode=NeuralBackendFailureCode::DispatchFailed;out.bypassReason=NeuralBypassReason::BackendFailure;out.status="FAIL_BYPASS_"+failure;out.totalWallMs=elapsedMs(started);return out;
     }
+    out.packBridgeMs = elapsedMs(packBridgeStarted);
     out.bridgeKernelDispatches=1u;
 
     NeuralRawDenoiseRequest nr{};nr.core=request.prepared.core;nr.framePhysics=request.prepared.framePhysics;nr.conditioningConfig=request.conditioningConfig;nr.controls=request.prepared.controls;
@@ -425,7 +428,13 @@ NeuralProductionGpuResult VulkanNeuralRawProductionBridge::execute(
     nr.originalSaturationMaskOutput=makeBufferView(saturationMask_.buffer,NeuralElementType::U32,NeuralResourceAccess::WriteOnly,out.packedWidth,out.packedHeight,1u,4u);
     nr.originalHeadroomEvidenceOutput=makeBufferView(headroom_.buffer,NeuralElementType::Fp32,NeuralResourceAccess::WriteOnly,out.packedWidth,out.packedHeight,1u,4u);
 
+    const auto backendStarted = Clock::now();
     const NeuralRawDenoiseResult neural=neuralBackend.run(nr);
+    out.backendRunMs = elapsedMs(backendStarted);
+    out.backendSlotReadyWaitMs = neural.slotReadyWaitMs;
+    out.backendCommandRecordMs = neural.commandRecordMs;
+    out.backendQueueSubmitMs = neural.queueSubmitMs;
+    out.backendCompletionWaitMs = neural.completionWaitMs;
     out.neuralKernelDispatches=neural.dispatchedKernelCount;
     out.failureCode=neural.failureCode;out.bypassReason=neural.bypassReason;
     if(selectNeuralPublicationSource(decision,neural)!=NeuralPublicationSource::NeuralOutput){
@@ -482,12 +491,15 @@ NeuralProductionGpuResult VulkanNeuralRawProductionBridge::execute(
             ? "MEASURED_NEURAL_OUTPUT"
             : "UNAVAILABLE_EFFECT_REDUCTION_INVALID";
 
+    const auto unpackBridgeStarted = Clock::now();
     if(!dispatchBridgeLocked(device,queue,queueMutex,cleanPacked_.buffer,downstreamMosaic_.buffer,
             cleanPacked_.buffer, cleanPacked_.buffer, request.prepared.core.cfa,
             request.prepared.core.rawWidth, request.prepared.core.rawHeight, 1u,
             request.prepared.core.noise.shotS, request.prepared.core.noise.readO, failure)){
+        out.unpackBridgeMs = elapsedMs(unpackBridgeStarted);
         out.failureCode=NeuralBackendFailureCode::DispatchFailed;out.bypassReason=NeuralBypassReason::BackendFailure;out.status="FAIL_BYPASS_UNPACK_"+failure;out.totalWallMs=elapsedMs(started);return out;
     }
+    out.unpackBridgeMs = elapsedMs(unpackBridgeStarted);
     out.bridgeKernelDispatches=3u;out.success=true;out.neuralPublished=true;out.originalPublished=false;
     out.downstreamBayerBuffer=downstreamMosaic_.buffer;out.downstreamBayerBytes=request.normalizedBayerBytes;out.residentOutputGeneration=request.generationId!=0u?request.generationId:++generationCounter_;
     out.posteriorVariancePacked=posteriorPacked_.buffer;out.originalSaturationMaskPacked=saturationMask_.buffer;out.originalHeadroomPacked=headroom_.buffer;

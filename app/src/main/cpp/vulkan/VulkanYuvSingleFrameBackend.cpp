@@ -185,9 +185,18 @@ void VulkanYuvSingleFrameBackend::destroy(VkDevice device) noexcept {
     destroyLocked(device);
 }
 
+bool VulkanYuvSingleFrameBackend::prepare(VkDevice device) noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::string failureReason;
+    // Do not monopolize the shared pipeline-cache host mutex during a potentially slow driver
+    // compile. The process-local VkPipeline object itself is what removes first-capture cost.
+    return initializeLocked(device, failureReason, false);
+}
+
 bool VulkanYuvSingleFrameBackend::initializeLocked(
         VkDevice device,
-        std::string& failureReason) noexcept {
+        std::string& failureReason,
+        bool usePublishedCache) noexcept {
     if (initialized_) {
         if (initializedDevice_ == device) return true;
         failureReason = "YUV_SINGLE_FRAME_RUNTIME_OWNERSHIP_CHANGED";
@@ -256,7 +265,7 @@ bool VulkanYuvSingleFrameBackend::initializeLocked(
     VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     pipelineInfo.stage = stageInfo;
     pipelineInfo.layout = pipelineLayout_;
-    if (VulkanPipelineCacheRegistry::createComputePipelines(device, 1u, &pipelineInfo, nullptr, &pipeline_) != VK_SUCCESS) {
+    if (VulkanPipelineCacheRegistry::createComputePipelines(device, 1u, &pipelineInfo, nullptr, &pipeline_, nullptr, nullptr, nullptr, usePublishedCache) != VK_SUCCESS) {
         failureReason = "YUV_SINGLE_FRAME_PIPELINE_FAILED";
         destroyLocked(device);
         return false;
@@ -286,6 +295,14 @@ bool VulkanYuvSingleFrameBackend::initializeLocked(
 
     initializedDevice_ = device;
     initialized_ = true;
+
+    // DELTA 0219: YUV single-frame pipeline creation is the dominant first-use cold cost on
+    // device. Persist immediately after the expensive pipeline has been compiled so Android
+    // process termination does not discard the cache before an orderly Vulkan shutdown.
+    // This is best-effort and cannot change render success/failure semantics.
+    if (usePublishedCache) {
+        (void)VulkanPipelineCacheRegistry::persist(device);
+    }
     return true;
 #endif
 }

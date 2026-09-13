@@ -53,6 +53,7 @@ struct DngMergeStats {
     uint16_t fullRaw16Max = 0;
     uint64_t fullRaw16SaturatedCount = 0;
     double fullRaw16SaturatedPct = 0.0;
+    std::string raw16FullStatsSource = "NOT_RECORDED";
     uint16_t unpackedMin = 0;
     uint16_t unpackedP01 = 0;
     uint16_t unpackedP50 = 0;

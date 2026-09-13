@@ -141,12 +141,10 @@ float RawNormalizedSampleView::sample(int x, int y) const noexcept {
             static_cast<size_t>(y) * rowStrideBytes);
     const int blackIndex = (((y + info.cfaOffsetY) & 1) << 1) |
             ((x + info.cfaOffsetX) & 1);
-    const float black = info.effectiveBlackLevelPatternInMasterUnits[
-            static_cast<size_t>(blackIndex)];
-    const float white = info.effectiveWhiteLevelInMasterUnits;
-    const float inverseRange = 1.0f / std::max(1.0f, white - black);
+    const float black = sampleBlack[static_cast<size_t>(blackIndex)];
     return std::clamp(
-            (static_cast<float>(sourceRow[x]) - black) * inverseRange,
+            (static_cast<float>(sourceRow[x]) - black) *
+                    sampleInverseRange[static_cast<size_t>(blackIndex)],
             0.0f, 1.0f);
 }
 
@@ -180,11 +178,15 @@ RawNormalizedSampleView makeRawNormalizedSampleView(
         view.failureReason = "invalid_effective_white_level_in_master_units";
         return view;
     }
-    for (float black : view.info.effectiveBlackLevelPatternInMasterUnits) {
+    for (size_t channel = 0u;
+         channel < view.info.effectiveBlackLevelPatternInMasterUnits.size(); ++channel) {
+        const float black = view.info.effectiveBlackLevelPatternInMasterUnits[channel];
         if (!std::isfinite(black) || black < 0.0f || black >= white) {
             view.failureReason = "invalid_effective_black_level_pattern_in_master_units";
             return view;
         }
+        view.sampleBlack[channel] = black;
+        view.sampleInverseRange[channel] = 1.0f / std::max(1.0f, white - black);
     }
 
     view.valid = true;

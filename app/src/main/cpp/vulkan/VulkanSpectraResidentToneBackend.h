@@ -6,11 +6,29 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <mutex>
+#include <utility>
 #include <string>
 #include <vector>
 
 namespace bncam::vulkan {
+
+/**
+ * Pins the host-visible BGR8 publication surface while JPEG consumes it.
+ * Holding this lock prevents publicationPacked_ from being reused/reallocated by a later tone
+ * execution until the consumer releases the lease at the JPEG boundary.
+ */
+class ResidentToneBgr8PublicationLease final {
+public:
+    explicit ResidentToneBgr8PublicationLease(std::unique_lock<std::mutex>&& lock) noexcept
+            : lock_(std::move(lock)) {}
+    ResidentToneBgr8PublicationLease(const ResidentToneBgr8PublicationLease&) = delete;
+    ResidentToneBgr8PublicationLease& operator=(const ResidentToneBgr8PublicationLease&) = delete;
+
+private:
+    std::unique_lock<std::mutex> lock_;
+};
 
 struct SpectraResidentSceneObserverRequest {
     std::uint32_t frameWidth = 0;
@@ -152,6 +170,9 @@ struct SpectraResidentToneRequest {
     const float* toneLut = nullptr;
     std::size_t toneLutFloatCount = 0u;
     bool deferFullReadback = false;
+    // Single-frame publication fast path: quantize exact sRGB BGR8 and rotate on the resident
+    // Vulkan surface. The CPU receives only the JPEG-boundary BGR8 bytes instead of full float RGB.
+    bool bgr8PublicationRequested = false;
     // Ultra HDR gainmap generation is entirely Vulkan/GPU based. The CPU only receives the
     // already quantized, quarter-resolution gainmap artifact and compact scalar metadata.
     bool ultraHdrGainmapRequested = false;
@@ -214,6 +235,20 @@ struct SpectraResidentToneResult {
     float perceptualDetailKernelMs = 0.0f;
     std::uint64_t perceptualDetailScratchBytes = 0u;
     std::vector<float> outputRgb;
+    bool bgr8PublicationRequested = false;
+    bool bgr8PublicationGenerated = false;
+    std::uint32_t bgr8Width = 0u;
+    std::uint32_t bgr8Height = 0u;
+    std::uint32_t bgr8RowStrideBytes = 0u;
+    // Direct mapped publication fast path. The vector is retained as an exact fallback for
+    // non-host-cached memory or lease-allocation failure.
+    const std::uint8_t* bgr8PublicationData = nullptr;
+    std::uint64_t bgr8PublicationBytes = 0u;
+    bool bgr8PublicationDirectMapped = false;
+    bool bgr8PublicationHostCached = false;
+    std::shared_ptr<ResidentToneBgr8PublicationLease> bgr8PublicationLease;
+    std::vector<std::uint8_t> outputBgr8;
+    float bgr8PublicationReadbackMs = 0.0f;
     float lutUploadMs = 0.0f;
     float kernelMs = 0.0f;
     float readbackMs = 0.0f;
@@ -331,7 +366,9 @@ private:
     PersistentBuffer telemetry_;
     PersistentBuffer ultraHdrLuma_;
     PersistentBuffer ultraHdrGainLog_;
-    PersistentBuffer ultraHdrGainmapPacked_;
+    // Shared packed host-visible publication buffer. BGR8 occupies the prefix; an optional
+    // Ultra-HDR gainmap follows at a 32-bit aligned offset in the same transfer.
+    PersistentBuffer publicationPacked_;
     PersistentBuffer portraitMask_;
     PersistentBuffer portraitBlurRgb_;
     // Legacy quarter-resolution YUV local-tone base. Not used by RAW Phase 5.

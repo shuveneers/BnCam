@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <chrono>
 #include <cstring>
 #include <limits>
 #include <type_traits>
@@ -300,7 +301,12 @@ NeuralVulkanSubmissionTicket VulkanNeuralRawDenoiseBackend::submitAsync(
 
     auto& slot = slots_[slotIndex];
     std::string failure;
-    if (!recordAndSubmit(slot, plan, request, input, failure)) {
+    float slotReadyWaitMs = 0.0f;
+    float commandRecordMs = 0.0f;
+    float queueSubmitMs = 0.0f;
+    if (!recordAndSubmit(
+                slot, plan, request, input, failure,
+                slotReadyWaitMs, commandRecordMs, queueSubmitMs)) {
         VulkanNeuralResourceBridge::releaseImported(device_, input);
         ticket.immediate.status = NeuralBackendStatus::Failed;
         ticket.immediate.failureCode = NeuralBackendFailureCode::DispatchFailed;
@@ -321,6 +327,9 @@ NeuralVulkanSubmissionTicket VulkanNeuralRawDenoiseBackend::submitAsync(
     slot.pending.originalSaturationMaskWritten = request.originalSaturationEvidenceRequested;
     slot.pending.originalHeadroomEvidenceWritten = request.originalSaturationEvidenceRequested;
     slot.pending.dispatchedKernelCount = plan.tileCount * plan.kernelDispatchesPerTile;
+    slot.pending.slotReadyWaitMs = slotReadyWaitMs;
+    slot.pending.commandRecordMs = commandRecordMs;
+    slot.pending.queueSubmitMs = queueSubmitMs;
 
     ticket.accepted = true;
     ticket.generation = slot.generation;
@@ -363,7 +372,10 @@ NeuralRawDenoiseResult VulkanNeuralRawDenoiseBackend::resolve(
 
     // Do not hold the backend state mutex while the GPU is in flight. Other
     // slots/captures may continue to submit concurrently.
+    const auto completionWaitStarted = std::chrono::steady_clock::now();
     const VkResult waitResult = vkWaitForFences(device_, 1u, &fence, VK_TRUE, timeoutNs);
+    const float completionWaitMs = std::chrono::duration<float, std::milli>(
+            std::chrono::steady_clock::now() - completionWaitStarted).count();
     if (waitResult != VK_SUCCESS) {
         NeuralRawDenoiseResult result{};
         result.status = NeuralBackendStatus::Failed;
@@ -382,6 +394,7 @@ NeuralRawDenoiseResult VulkanNeuralRawDenoiseBackend::resolve(
         return result;
     }
     slot.busy = false;
+    slot.pending.completionWaitMs = completionWaitMs;
     VulkanNeuralResourceBridge::releaseImported(device_, slot.imported);
     ++diag_.completed;
     return slot.pending;
@@ -424,9 +437,21 @@ bool VulkanNeuralRawDenoiseBackend::recordAndSubmit(
         const NeuralExecutionPlan& plan,
         const NeuralRawDenoiseRequest& request,
         NeuralResolvedGpuInput& input,
-        std::string& failure) noexcept {
+        std::string& failure,
+        float& slotReadyWaitMs,
+        float& commandRecordMs,
+        float& queueSubmitMs) noexcept {
     try {
-        if (vkWaitForFences(device_, 1u, &slot.fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS ||
+        slotReadyWaitMs = 0.0f;
+        commandRecordMs = 0.0f;
+        queueSubmitMs = 0.0f;
+
+        const auto slotReadyStarted = std::chrono::steady_clock::now();
+        const VkResult slotWaitResult =
+                vkWaitForFences(device_, 1u, &slot.fence, VK_TRUE, UINT64_MAX);
+        slotReadyWaitMs = std::chrono::duration<float, std::milli>(
+                std::chrono::steady_clock::now() - slotReadyStarted).count();
+        if (slotWaitResult != VK_SUCCESS ||
             vkResetFences(device_, 1u, &slot.fence) != VK_SUCCESS ||
             vkResetCommandBuffer(slot.command, 0u) != VK_SUCCESS) {
             failure = "NEURAL_SLOT_RESET_FAILED";
@@ -506,6 +531,7 @@ bool VulkanNeuralRawDenoiseBackend::recordAndSubmit(
             return false;
         }
 
+        const auto commandRecordStarted = std::chrono::steady_clock::now();
         VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         if (vkBeginCommandBuffer(slot.command, &beginInfo) != VK_SUCCESS) {
@@ -926,6 +952,8 @@ bool VulkanNeuralRawDenoiseBackend::recordAndSubmit(
             failure = "NEURAL_COMMAND_END_FAILED";
             return false;
         }
+        commandRecordMs = std::chrono::duration<float, std::milli>(
+                std::chrono::steady_clock::now() - commandRecordStarted).count();
 
         VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
         VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -936,6 +964,7 @@ bool VulkanNeuralRawDenoiseBackend::recordAndSubmit(
         }
         submitInfo.commandBufferCount = 1u;
         submitInfo.pCommandBuffers = &slot.command;
+        const auto queueSubmitStarted = std::chrono::steady_clock::now();
         {
             std::lock_guard<std::mutex> queueLock(*queueMutex_);
             if (vkQueueSubmit(queue_, 1u, &submitInfo, slot.fence) != VK_SUCCESS) {
@@ -943,6 +972,8 @@ bool VulkanNeuralRawDenoiseBackend::recordAndSubmit(
                 return false;
             }
         }
+        queueSubmitMs = std::chrono::duration<float, std::milli>(
+                std::chrono::steady_clock::now() - queueSubmitStarted).count();
 
         failure = "none";
         return true;

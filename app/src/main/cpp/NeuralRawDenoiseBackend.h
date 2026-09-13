@@ -230,6 +230,13 @@ struct NeuralRawDenoiseResult {
     bool originalSaturationMaskWritten = false;
     bool originalHeadroomEvidenceWritten = false;
     std::uint32_t dispatchedKernelCount = 0u;
+
+    // Performance-only telemetry. These fields do not affect publication decisions,
+    // model outputs or backend schema semantics.
+    float slotReadyWaitMs = 0.0f;
+    float commandRecordMs = 0.0f;
+    float queueSubmitMs = 0.0f;
+    float completionWaitMs = 0.0f;
 };
 
 enum class NeuralPublicationSource : std::uint8_t {

@@ -3421,6 +3421,9 @@ SpectraProvenanceField IspCore::buildSpectraProvenanceFieldCompact(
     field.tiles.resize(static_cast<size_t>(field.gridCols) * static_cast<size_t>(field.gridRows));
     const int cfaPattern = cfaPatternOrDefault(raw.info.effectiveCfaPattern);
     const float modelConfidence = std::clamp(meta.calibration.signalModelConfidence, 0.0f, 1.0f);
+    // DELTA 0218: same bilinear lens-shading interpolation, but x/y cell coordinates and
+    // sanitized map values are calculated once instead of for every compact RAW sample.
+    const LensShadingLookup lensShadingLookup(meta, width, height);
 
     double totalRawVar = 0.0;
     double totalVisibleVar = 0.0;
@@ -3438,6 +3441,12 @@ SpectraProvenanceField IspCore::buildSpectraProvenanceFieldCompact(
     std::vector<float> shadingRedToGreenSamples;
     std::vector<float> shadingBlueToGreenSamples;
     std::vector<float> shadingOpponentDifferentialStopsSamples;
+    const size_t provenanceTileCapacity = field.tiles.size();
+    confidenceSamples.reserve(provenanceTileCapacity);
+    shadingGainSamples.reserve(provenanceTileCapacity);
+    shadingRedToGreenSamples.reserve(provenanceTileCapacity);
+    shadingBlueToGreenSamples.reserve(provenanceTileCapacity);
+    shadingOpponentDifferentialStopsSamples.reserve(provenanceTileCapacity);
     double centerRedToGreenSum = 0.0;
     double centerBlueToGreenSum = 0.0;
     double outerRedToGreenSum = 0.0;
@@ -3446,6 +3455,8 @@ SpectraProvenanceField IspCore::buildSpectraProvenanceFieldCompact(
     int outerShadingTileCount = 0;
     std::vector<float> noiseBudgetSamples;
     std::vector<float> modelMismatchSamples;
+    noiseBudgetSamples.reserve(provenanceTileCapacity);
+    modelMismatchSamples.reserve(provenanceTileCapacity);
 
     for (int gy = 0; gy < field.gridRows; ++gy) {
         const int y0 = std::max(4, gy * field.tileHeight);
@@ -3500,7 +3511,7 @@ SpectraProvenanceField IspCore::buildSpectraProvenanceFieldCompact(
                             const double predicted = isVstValid(sValue, oValue)
                                     ? bncam::raw_noise::sensorVariance(signal, sValue, oValue)
                                     : 0.0;
-                            const float gain = lensShadingGainAt(meta, ch, xx, yy, width, height);
+                            const float gain = lensShadingLookup.gain(ch, xx, yy);
                             predictedSumByChannel[ch] += predicted;
                             visiblePredictedSumByChannel[ch] +=
                                     bncam::raw_noise::visibleVarianceAfterMultiplicativeGain(
@@ -6218,6 +6229,20 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     if (demosaicResolution.algorithm == DemosaicAlgorithm::Menon2007 && !vulkanDemosaic.gpuUsedForOutput) {
         recordMenonDemosaicTimeMs(demosaicMs);
     }
+    // DELTA 0215: expensive residual observability is not part of the pixel path.
+    // Keep it only when SPECTRA is active. Tone-noise propagation additionally remains
+    // available when profile-owned perceptual detail is requested, because that policy
+    // consumes the propagated display-domain physical sigma.
+    const bool spectraNoiseActive = meta.calibration.spectraProcessingMode != 0;
+    // profileDetailRadius is a retired legacy ABI slot. Phase 12 decodes active Legibility
+    // from the packed profileDetailDetail carrier, so the production gate mirrors the resolver.
+    const bool profilePerceptualDetailRequested =
+            std::abs(uiConfig.profileDetailAmount) > 1.0e-4f ||
+            std::abs(uiConfig.profileDetailDetail) > 1.0e-4f ||
+            std::abs(uiConfig.profileDetailMasking) > 1.0e-4f;
+    const bool toneNoisePropagationRequired =
+            spectraNoiseActive || profilePerceptualDetailRequested;
+
     const auto demosaicPropagationStart = IspClock::now();
     residualNoiseState.postDemosaic = autoHybridUsedForOutput
             ? bncam::spectra2::propagateAutoHybridDemosaic(
@@ -6231,17 +6256,23 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                     resolvedDemosaicNoiseModel(demosaicResolution.algorithm),
                     "POST_DEMOSAIC_RGB");
     residualNoiseState.demosaicPropagationMs = elapsedMs(demosaicPropagationStart);
-    const auto measuredPostDemosaicStart = IspClock::now();
-    residualNoiseState.measuredPostDemosaic = vulkanDemosaicResident
-            ? measureLinearResidualGpuCandidates(
-                    vulkanDemosaic.residualCandidates, "POST_DEMOSAIC_RGB")
-            : measureLinearResidualFlatRegions(linearRgb, "POST_DEMOSAIC_RGB");
-    residualNoiseState.measuredPostDemosaicResidualMs = elapsedMs(measuredPostDemosaicStart);
-    residualNoiseState.postDemosaicCalibration =
-            bncam::spectra2::comparePredictionToObservation(
-                    residualNoiseState.postDemosaic,
-                    residualNoiseState.measuredPostDemosaic
-            );
+    if (spectraNoiseActive) {
+        const auto measuredPostDemosaicStart = IspClock::now();
+        residualNoiseState.measuredPostDemosaic = vulkanDemosaicResident
+                ? measureLinearResidualGpuCandidates(
+                        vulkanDemosaic.residualCandidates, "POST_DEMOSAIC_RGB")
+                : measureLinearResidualFlatRegions(linearRgb, "POST_DEMOSAIC_RGB");
+        residualNoiseState.measuredPostDemosaicResidualMs = elapsedMs(measuredPostDemosaicStart);
+        residualNoiseState.postDemosaicCalibration =
+                bncam::spectra2::comparePredictionToObservation(
+                        residualNoiseState.postDemosaic,
+                        residualNoiseState.measuredPostDemosaic
+                );
+    } else {
+        residualNoiseState.measuredPostDemosaic = {};
+        residualNoiseState.measuredPostDemosaicResidualMs = 0.0f;
+        residualNoiseState.postDemosaicCalibration = {};
+    }
 
     // Delta 18: explicit demosaic chroma-amplification audit. This intentionally reuses the
     // already-computed SPECTRA states/flat-region observation and therefore adds no extra image
@@ -6906,34 +6937,38 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         cpuColorTransformApplied = true;
     }
     const float awbColourTransformMs = elapsedMs(awbColourTransformStart);
-    const auto measuredPostColourTransformStart = IspClock::now();
-    residualNoiseState.measuredPostColourTransform = vulkanColorTransform.success
-            ? measureLinearResidualGpuCandidates(
-                    vulkanColorTransform.residualCandidates,
-                    "POST_COLOUR_MATRIX_RGB_AFTER_NONNEGATIVE_CLAMP")
-            : measureLinearResidualFlatRegions(
-                    linearRgb, "POST_COLOUR_MATRIX_RGB_AFTER_NONNEGATIVE_CLAMP");
-    residualNoiseState.measuredPostColourTransformResidualMs =
-            elapsedMs(measuredPostColourTransformStart);
-    // 8H-J delays releasing the CPU RAW mosaic until the resident scene/tone chain has either
-    // succeeded or selected its typed CPU fallback. That keeps failure recovery available without
-    // forcing a normal full-frame post-CCM readback.
-    residualNoiseState.postColourTransformCalibration =
-            bncam::spectra2::comparePredictionToObservation(
-                    residualNoiseState.postColourTransform,
-                    residualNoiseState.measuredPostColourTransform
-            );
-    if (residualNoiseState.postDemosaicCalibration.ready &&
-        residualNoiseState.postColourTransformCalibration.ready) {
-        residualNoiseState.calibrationStatus =
-                "MILESTONE_2B_STAGE_OBSERVATIONS_READY_NO_AUTO_CALIBRATION";
-    } else if (residualNoiseState.postDemosaicCalibration.ready ||
-               residualNoiseState.postColourTransformCalibration.ready) {
-        residualNoiseState.calibrationStatus =
-                "MILESTONE_2B_PARTIAL_STAGE_OBSERVATION";
+    if (spectraNoiseActive) {
+        const auto measuredPostColourTransformStart = IspClock::now();
+        residualNoiseState.measuredPostColourTransform = vulkanColorTransform.success
+                ? measureLinearResidualGpuCandidates(
+                        vulkanColorTransform.residualCandidates,
+                        "POST_COLOUR_MATRIX_RGB_AFTER_NONNEGATIVE_CLAMP")
+                : measureLinearResidualFlatRegions(
+                        linearRgb, "POST_COLOUR_MATRIX_RGB_AFTER_NONNEGATIVE_CLAMP");
+        residualNoiseState.measuredPostColourTransformResidualMs =
+                elapsedMs(measuredPostColourTransformStart);
+        residualNoiseState.postColourTransformCalibration =
+                bncam::spectra2::comparePredictionToObservation(
+                        residualNoiseState.postColourTransform,
+                        residualNoiseState.measuredPostColourTransform
+                );
+        if (residualNoiseState.postDemosaicCalibration.ready &&
+            residualNoiseState.postColourTransformCalibration.ready) {
+            residualNoiseState.calibrationStatus =
+                    "MILESTONE_2B_STAGE_OBSERVATIONS_READY_NO_AUTO_CALIBRATION";
+        } else if (residualNoiseState.postDemosaicCalibration.ready ||
+                   residualNoiseState.postColourTransformCalibration.ready) {
+            residualNoiseState.calibrationStatus =
+                    "MILESTONE_2B_PARTIAL_STAGE_OBSERVATION";
+        } else {
+            residualNoiseState.calibrationStatus =
+                    "MILESTONE_2B_INSUFFICIENT_FLAT_SUPPORT";
+        }
     } else {
-        residualNoiseState.calibrationStatus =
-                "MILESTONE_2B_INSUFFICIENT_FLAT_SUPPORT";
+        residualNoiseState.measuredPostColourTransform = {};
+        residualNoiseState.measuredPostColourTransformResidualMs = 0.0f;
+        residualNoiseState.postColourTransformCalibration = {};
+        residualNoiseState.calibrationStatus = "SKIPPED_SPECTRA_OFF";
     }
 
     const double totalPixelsD = static_cast<double>(std::max<size_t>(1u, expectedColorPixels));
@@ -7711,136 +7746,152 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         vulkanToneLut[i * 2u + 1u] = toneLookLut[i].safeMidtoneGate;
     }
 
-    const auto tonePropagationStart = IspClock::now();
-    std::vector<double> actualToneDerivatives;
-    std::vector<double> actualSectionDerivatives;
-    std::vector<double> actualGammaDerivatives;
-    std::vector<double> actualTotalToneDerivatives;
-    std::vector<double> actualToneChromaScales;
-    actualToneDerivatives.reserve(lumaSamples.size());
-    actualSectionDerivatives.reserve(lumaSamples.size());
-    actualGammaDerivatives.reserve(lumaSamples.size());
-    actualTotalToneDerivatives.reserve(lumaSamples.size());
-    actualToneChromaScales.reserve(lumaSamples.size());
-
-    const auto lutTotalDerivativeAt = [&](int index) -> double {
-        const int previous = std::max(0, index - 1);
-        const int next = std::min(4095, index + 1);
-        const double dx = static_cast<double>(next - previous) / 4095.0;
-        if (dx <= 0.0) return 1.0;
-        const double derivative = (
-                static_cast<double>(toneLookLut[next].curvedLuma) -
-                static_cast<double>(toneLookLut[previous].curvedLuma)
-        ) / dx;
-        return std::max(0.0, std::isfinite(derivative) ? derivative : 1.0);
-    };
-
-    // FLLF is spatial, so compact covariance planning cannot reproduce its exact per-pixel
-    // Jacobian without a full-frame readback. Use the maximum permitted positive strict-ratio
-    // gain as a conservative bound; local compression receives no fictitious denoise credit.
+    // Cheap scalar needed by both the propagation path and unconditional debug output.
+    // Keep this outside the optional propagation scope.
     const float phase5FllfConservativePropagationGain = fllfPlan.enabled
             ? std::exp2(std::max(0.0f, fllfPlan.maxLiftEv))
             : 1.0f;
 
-    std::vector<double> actualToneRgJacobians;
-    std::vector<double> actualToneBgJacobians;
-    actualToneRgJacobians.reserve(sceneRgbSamples.size());
-    actualToneBgJacobians.reserve(sceneRgbSamples.size());
+    if (toneNoisePropagationRequired) {
+        const auto tonePropagationStart = IspClock::now();
+        std::vector<double> actualToneDerivatives;
+        std::vector<double> actualSectionDerivatives;
+        std::vector<double> actualGammaDerivatives;
+        std::vector<double> actualTotalToneDerivatives;
+        std::vector<double> actualToneChromaScales;
+        actualToneDerivatives.reserve(lumaSamples.size());
+        actualSectionDerivatives.reserve(lumaSamples.size());
+        actualGammaDerivatives.reserve(lumaSamples.size());
+        actualTotalToneDerivatives.reserve(lumaSamples.size());
+        actualToneChromaScales.reserve(lumaSamples.size());
 
-    // Exact opponent inverse columns: a unit perturbation changes only Y, R-G, or B-G at input.
-    const cv::Vec3f phase5YAxis(1.0f, 1.0f, 1.0f);
-    const cv::Vec3f phase5RgAxis(0.7874f, -0.2126f, -0.2126f);
-    const cv::Vec3f phase5BgAxis(-0.0722f, -0.0722f, 0.9278f);
-    const auto phase5Opponent = [](const cv::Vec3f& rgb) noexcept -> cv::Vec3f {
-        return cv::Vec3f(
-                phase5LumaCpu(rgb),
-                rgb[0] - rgb[1],
-                rgb[2] - rgb[1]);
-    };
-
-    for (const cv::Vec3f& sampledRgb : sceneRgbSamples) {
-        cv::Vec3f scene(
-                std::max(0.0f, sampledRgb[0]),
-                std::max(0.0f, sampledRgb[1]),
-                std::max(0.0f, sampledRgb[2]));
-        scene *= phase5FllfConservativePropagationGain;
-        scene *= exposureGain;
-        const cv::Vec3f pbrMid = phase5PbrNeutralCpu(scene);
-        const double pbrLuma = std::max(0.0, static_cast<double>(phase5LumaCpu(pbrMid)));
-        const float reference = std::max(0.02f, phase5LumaCpu(scene));
-        const float eps = std::max(1.0e-5f, 0.002f * reference);
-
-        const auto numericAxisDerivative = [&](const cv::Vec3f& axis) noexcept -> cv::Vec3f {
-            const cv::Vec3f low = phase5PbrNeutralCpu(scene - axis * eps);
-            const cv::Vec3f high = phase5PbrNeutralCpu(scene + axis * eps);
-            return (phase5Opponent(high) - phase5Opponent(low)) *
-                    (1.0f / std::max(2.0f * eps, 1.0e-8f));
+        const auto lutTotalDerivativeAt = [&](int index) -> double {
+            const int previous = std::max(0, index - 1);
+            const int next = std::min(4095, index + 1);
+            const double dx = static_cast<double>(next - previous) / 4095.0;
+            if (dx <= 0.0) return 1.0;
+            const double derivative = (
+                    static_cast<double>(toneLookLut[next].curvedLuma) -
+                    static_cast<double>(toneLookLut[previous].curvedLuma)
+            ) / dx;
+            return std::max(0.0, std::isfinite(derivative) ? derivative : 1.0);
         };
-        const cv::Vec3f yJacobian = numericAxisDerivative(phase5YAxis);
-        const cv::Vec3f rgJacobian = numericAxisDerivative(phase5RgAxis);
-        const cv::Vec3f bgJacobian = numericAxisDerivative(phase5BgAxis);
 
-        // PBR Neutral can weakly couple the opponent axes during its highlight desaturation. Use
-        // the norm of each numerical opponent response as a conservative diagonal envelope for the
-        // existing propagated Y/(R-G)/(B-G) covariance contract.
-        const double pbrYGain = std::max(0.0, std::abs(static_cast<double>(yJacobian[0])));
-        const double pbrRgGain = std::hypot(
-                static_cast<double>(rgJacobian[1]), static_cast<double>(rgJacobian[2]));
-        const double pbrBgGain = std::hypot(
-                static_cast<double>(bgJacobian[1]), static_cast<double>(bgJacobian[2]));
+        std::vector<double> actualToneRgJacobians;
+        std::vector<double> actualToneBgJacobians;
+        actualToneRgJacobians.reserve(sceneRgbSamples.size());
+        actualToneBgJacobians.reserve(sceneRgbSamples.size());
 
-        const double clampedLook = std::clamp(pbrLuma, 0.0, 1.0);
-        const double lutPosition = clampedLook * 4095.0;
-        const int lutIndex = std::clamp(static_cast<int>(std::floor(lutPosition)), 0, 4095);
-        const int lutNext = std::min(4095, lutIndex + 1);
-        const double fraction = lutPosition - static_cast<double>(lutIndex);
-        const auto interpolate = [&](float ToneLutEntry::*member) -> double {
-            return static_cast<double>(toneLookLut[lutIndex].*member) * (1.0 - fraction) +
-                    static_cast<double>(toneLookLut[lutNext].*member) * fraction;
+        // Exact opponent inverse columns: a unit perturbation changes only Y, R-G, or B-G at input.
+        const cv::Vec3f phase5YAxis(1.0f, 1.0f, 1.0f);
+        const cv::Vec3f phase5RgAxis(0.7874f, -0.2126f, -0.2126f);
+        const cv::Vec3f phase5BgAxis(-0.0722f, -0.0722f, 0.9278f);
+        const auto phase5Opponent = [](const cv::Vec3f& rgb) noexcept -> cv::Vec3f {
+            return cv::Vec3f(
+                    phase5LumaCpu(rgb),
+                    rgb[0] - rgb[1],
+                    rgb[2] - rgb[1]);
         };
-        const double curvedLuma = interpolate(&ToneLutEntry::curvedLuma);
-        const double profileLumaDerivative = lutTotalDerivativeAt(lutIndex);
-        const double profileChromaScale = curvedLuma / std::max(pbrLuma, 1.0e-6);
 
-        const double sceneLinearUserExposureGain = static_cast<double>(exposureGain);
-        const double totalYGain = static_cast<double>(phase5FllfConservativePropagationGain) *
-                sceneLinearUserExposureGain * pbrYGain * profileLumaDerivative;
-        const double totalRgGain = static_cast<double>(phase5FllfConservativePropagationGain) *
-                sceneLinearUserExposureGain * pbrRgGain * profileChromaScale;
-        const double totalBgGain = static_cast<double>(phase5FllfConservativePropagationGain) *
-                sceneLinearUserExposureGain * pbrBgGain * profileChromaScale;
+        for (const cv::Vec3f& sampledRgb : sceneRgbSamples) {
+            cv::Vec3f scene(
+                    std::max(0.0f, sampledRgb[0]),
+                    std::max(0.0f, sampledRgb[1]),
+                    std::max(0.0f, sampledRgb[2]));
+            scene *= phase5FllfConservativePropagationGain;
+            scene *= exposureGain;
+            const cv::Vec3f pbrMid = phase5PbrNeutralCpu(scene);
+            const double pbrLuma = std::max(0.0, static_cast<double>(phase5LumaCpu(pbrMid)));
+            const float reference = std::max(0.02f, phase5LumaCpu(scene));
+            const float eps = std::max(1.0e-5f, 0.002f * reference);
 
-        actualToneDerivatives.push_back(interpolate(&ToneLutEntry::toneCurveDerivative));
-        actualSectionDerivatives.push_back(interpolate(&ToneLutEntry::sectionCurveDerivative));
-        actualGammaDerivatives.push_back(interpolate(&ToneLutEntry::gammaCurveDerivative));
-        actualTotalToneDerivatives.push_back(std::max(0.0, totalYGain));
-        actualToneRgJacobians.push_back(std::max(0.0, totalRgGain));
-        actualToneBgJacobians.push_back(std::max(0.0, totalBgGain));
-        actualToneChromaScales.push_back(std::max({0.0, totalRgGain, totalBgGain}));
+            const auto numericAxisDerivative = [&](const cv::Vec3f& axis) noexcept -> cv::Vec3f {
+                const cv::Vec3f low = phase5PbrNeutralCpu(scene - axis * eps);
+                const cv::Vec3f high = phase5PbrNeutralCpu(scene + axis * eps);
+                return (phase5Opponent(high) - phase5Opponent(low)) *
+                        (1.0f / std::max(2.0f * eps, 1.0e-8f));
+            };
+            const cv::Vec3f yJacobian = numericAxisDerivative(phase5YAxis);
+            const cv::Vec3f rgJacobian = numericAxisDerivative(phase5RgAxis);
+            const cv::Vec3f bgJacobian = numericAxisDerivative(phase5BgAxis);
+
+            // PBR Neutral can weakly couple the opponent axes during its highlight desaturation. Use
+            // the norm of each numerical opponent response as a conservative diagonal envelope for the
+            // existing propagated Y/(R-G)/(B-G) covariance contract.
+            const double pbrYGain = std::max(0.0, std::abs(static_cast<double>(yJacobian[0])));
+            const double pbrRgGain = std::hypot(
+                    static_cast<double>(rgJacobian[1]), static_cast<double>(rgJacobian[2]));
+            const double pbrBgGain = std::hypot(
+                    static_cast<double>(bgJacobian[1]), static_cast<double>(bgJacobian[2]));
+
+            const double clampedLook = std::clamp(pbrLuma, 0.0, 1.0);
+            const double lutPosition = clampedLook * 4095.0;
+            const int lutIndex = std::clamp(static_cast<int>(std::floor(lutPosition)), 0, 4095);
+            const int lutNext = std::min(4095, lutIndex + 1);
+            const double fraction = lutPosition - static_cast<double>(lutIndex);
+            const auto interpolate = [&](float ToneLutEntry::*member) -> double {
+                return static_cast<double>(toneLookLut[lutIndex].*member) * (1.0 - fraction) +
+                        static_cast<double>(toneLookLut[lutNext].*member) * fraction;
+            };
+            const double curvedLuma = interpolate(&ToneLutEntry::curvedLuma);
+            const double profileLumaDerivative = lutTotalDerivativeAt(lutIndex);
+            const double profileChromaScale = curvedLuma / std::max(pbrLuma, 1.0e-6);
+
+            const double sceneLinearUserExposureGain = static_cast<double>(exposureGain);
+            const double totalYGain = static_cast<double>(phase5FllfConservativePropagationGain) *
+                    sceneLinearUserExposureGain * pbrYGain * profileLumaDerivative;
+            const double totalRgGain = static_cast<double>(phase5FllfConservativePropagationGain) *
+                    sceneLinearUserExposureGain * pbrRgGain * profileChromaScale;
+            const double totalBgGain = static_cast<double>(phase5FllfConservativePropagationGain) *
+                    sceneLinearUserExposureGain * pbrBgGain * profileChromaScale;
+
+            actualToneDerivatives.push_back(interpolate(&ToneLutEntry::toneCurveDerivative));
+            actualSectionDerivatives.push_back(interpolate(&ToneLutEntry::sectionCurveDerivative));
+            actualGammaDerivatives.push_back(interpolate(&ToneLutEntry::gammaCurveDerivative));
+            actualTotalToneDerivatives.push_back(std::max(0.0, totalYGain));
+            actualToneRgJacobians.push_back(std::max(0.0, totalRgGain));
+            actualToneBgJacobians.push_back(std::max(0.0, totalBgGain));
+            actualToneChromaScales.push_back(std::max({0.0, totalRgGain, totalBgGain}));
+        }
+
+        residualNoiseState.toneCurveDerivative =
+                derivativeStatsFromSamples(std::move(actualToneDerivatives));
+        residualNoiseState.sectionCurveDerivative =
+                derivativeStatsFromSamples(std::move(actualSectionDerivatives));
+        residualNoiseState.gammaCurveDerivative =
+                derivativeStatsFromSamples(std::move(actualGammaDerivatives));
+        residualNoiseState.totalToneDerivative =
+                derivativeStatsFromSamples(std::move(actualTotalToneDerivatives));
+        residualNoiseState.toneChromaScale =
+                derivativeStatsFromSamples(std::move(actualToneChromaScales));
+        const auto phase5ToneRgJacobian = derivativeStatsFromSamples(std::move(actualToneRgJacobians));
+        const auto phase5ToneBgJacobian = derivativeStatsFromSamples(std::move(actualToneBgJacobians));
+        residualNoiseState.postTone = bncam::spectra2::propagateOpponentGains(
+                residualNoiseState.postLinearDetail,
+                residualNoiseState.totalToneDerivative.rms,
+                phase5ToneRgJacobian.rms,
+                phase5ToneBgJacobian.rms,
+                "POST_PHASE5_FLLF_PBR_NEUTRAL_PROFILE_TONE_PRE_PROFILE_COLOR",
+                "FLLF_CONSERVATIVE_STRICT_RATIO_PLUS_NUMERIC_PBR_NEUTRAL_Y_RG_BG_JACOBIANS",
+                0.86
+        );
+        residualNoiseState.tonePropagationMs = elapsedMs(tonePropagationStart);
+    } else {
+        // No active SPECTRA consumer and profile perceptual detail is exact identity.
+        // Do not spend capture latency deriving display-domain residual telemetry that cannot
+        // affect output pixels. Preserve a typed identity state so later debug fields remain valid.
+        residualNoiseState.postTone = residualNoiseState.postLinearDetail;
+        residualNoiseState.postTone.stage = "POST_TONE_PROPAGATION_SKIPPED";
+        residualNoiseState.postTone.method =
+                "SPECTRA_OFF_PROFILE_PERCEPTUAL_DETAIL_IDENTITY";
+        residualNoiseState.postTone.status = "TELEMETRY_SKIPPED";
+        residualNoiseState.toneCurveDerivative = {};
+        residualNoiseState.sectionCurveDerivative = {};
+        residualNoiseState.gammaCurveDerivative = {};
+        residualNoiseState.totalToneDerivative = {};
+        residualNoiseState.toneChromaScale = {};
+        residualNoiseState.tonePropagationMs = 0.0f;
     }
-
-    residualNoiseState.toneCurveDerivative =
-            derivativeStatsFromSamples(std::move(actualToneDerivatives));
-    residualNoiseState.sectionCurveDerivative =
-            derivativeStatsFromSamples(std::move(actualSectionDerivatives));
-    residualNoiseState.gammaCurveDerivative =
-            derivativeStatsFromSamples(std::move(actualGammaDerivatives));
-    residualNoiseState.totalToneDerivative =
-            derivativeStatsFromSamples(std::move(actualTotalToneDerivatives));
-    residualNoiseState.toneChromaScale =
-            derivativeStatsFromSamples(std::move(actualToneChromaScales));
-    const auto phase5ToneRgJacobian = derivativeStatsFromSamples(std::move(actualToneRgJacobians));
-    const auto phase5ToneBgJacobian = derivativeStatsFromSamples(std::move(actualToneBgJacobians));
-    residualNoiseState.postTone = bncam::spectra2::propagateOpponentGains(
-            residualNoiseState.postLinearDetail,
-            residualNoiseState.totalToneDerivative.rms,
-            phase5ToneRgJacobian.rms,
-            phase5ToneBgJacobian.rms,
-            "POST_PHASE5_FLLF_PBR_NEUTRAL_PROFILE_TONE_PRE_PROFILE_COLOR",
-            "FLLF_CONSERVATIVE_STRICT_RATIO_PLUS_NUMERIC_PBR_NEUTRAL_Y_RG_BG_JACOBIANS",
-            0.86
-    );
-    residualNoiseState.tonePropagationMs = elapsedMs(tonePropagationStart);
 
     // Delta 32: explicit tone-domain amplification audit and bounded Tone Guard input.
     // This delta does not alter the LUT or pixels; it only quantifies whether tone processing is
@@ -7986,9 +8037,11 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         request.portraitTargetRight = uiConfig.portraitTargetRight;
         request.portraitTargetBottom = uiConfig.portraitTargetBottom;
         request.portraitMaskRotationDegrees = uiConfig.portraitMaskRotationDegrees;
-        // Phase N003: legacy post-demosaic NR/visible-chroma ownership is retired.
-        // Materialize the tone output directly for neutral quantization/publication.
-        request.deferFullReadback = false;
+        // Single-frame resident publication: keep full float RGB on-device and publish exact
+        // sRGB BGR8 directly from Vulkan in final JPEG orientation. The old float readback remains
+        // available as a typed fallback if packed publication cannot be produced.
+        request.deferFullReadback = true;
+        request.bgr8PublicationRequested = true;
         vulkanTone = bncam::vulkan::VulkanRuntime::instance().executeSpectraResidentTone(request);
         if (vulkanTone.ultraHdrGainmapGenerated && vulkanTone.ultraHdrMeaningfulHeadroom &&
             !vulkanTone.ultraHdrGainmapBytes.empty()) {
@@ -8088,7 +8141,6 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     // === PHASE N003: NEUTRAL POST-TONE PATH ===
     // Sensor S/O and propagated covariance remain measurement-only. None of the values below
     // grants post-demosaic pixel authority; the future SPECTRA Neural owner will consume them.
-    const bool spectraNoiseActive = meta.calibration.spectraProcessingMode != 0;
     const bool physicalNoiseModelAvailable = meta.calibration.noiseModelMode != 0 &&
             meta.calibration.hasNoiseProfile && meta.calibration.noiseProfileApplied;
 
@@ -8126,8 +8178,36 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
 
     bool residentPostDemosaicApplied = false;
     bool residentOutputSrgbEncoded = false;
+    bool residentOutputRotationApplied = false;
     cv::Mat residentPublishedBgr8;
     bncam::publication::Bgr8PublicationStats residentPublicationStats{};
+
+    const std::size_t requiredResidentBgr8Bytes =
+            static_cast<std::size_t>(vulkanTone.bgr8RowStrideBytes) * vulkanTone.bgr8Height;
+    const bool residentBgr8DirectMapped =
+            vulkanTone.bgr8PublicationDirectMapped &&
+            vulkanTone.bgr8PublicationData != nullptr &&
+            vulkanTone.bgr8PublicationLease != nullptr &&
+            vulkanTone.bgr8PublicationBytes >= requiredResidentBgr8Bytes;
+    const bool residentBgr8VectorFallback =
+            vulkanTone.outputBgr8.size() >= requiredResidentBgr8Bytes;
+    if (vulkanToneApplied && vulkanTone.bgr8PublicationGenerated &&
+        vulkanTone.bgr8Width > 0u && vulkanTone.bgr8Height > 0u &&
+        vulkanTone.bgr8RowStrideBytes >= vulkanTone.bgr8Width * 3u &&
+        (residentBgr8DirectMapped || residentBgr8VectorFallback)) {
+        auto* publicationData = residentBgr8DirectMapped
+                ? const_cast<std::uint8_t*>(vulkanTone.bgr8PublicationData)
+                : vulkanTone.outputBgr8.data();
+        residentPublishedBgr8 = cv::Mat(
+                static_cast<int>(vulkanTone.bgr8Height),
+                static_cast<int>(vulkanTone.bgr8Width),
+                CV_8UC3,
+                publicationData,
+                static_cast<std::size_t>(vulkanTone.bgr8RowStrideBytes));
+        residentPostDemosaicApplied = true;
+        residentOutputSrgbEncoded = true;
+        residentOutputRotationApplied = true;
+    }
 
     // 8H-K typed recovery: if the resident tone->post-demosaic handoff failed (or the
     // post-demosaic stage is intentionally bypassed), materialize the already-computed tone
@@ -8296,11 +8376,17 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     downstreamIspState.resultStatus = "RETIRED_PHASE11_LINEAR_DETAIL_OWNER";
 
 
-    const auto measuredVisibleResidualStart = IspClock::now();
-    const VisibleResidualMeasurement measuredVisibleResidual = spectraNoiseActive
-            ? measuredPreSharpenResidual
-            : measureVisibleResidual8Bit(bgr8);
-    residualNoiseState.measuredVisibleResidualMs = elapsedMs(measuredVisibleResidualStart);
+    VisibleResidualMeasurement measuredVisibleResidual{};
+    if (spectraNoiseActive) {
+        const auto measuredVisibleResidualStart = IspClock::now();
+        // Post-quantization sharpening is retired, so the already measured pre-sharpen surface
+        // is also the final visible residual surface.
+        measuredVisibleResidual = measuredPreSharpenResidual;
+        residualNoiseState.measuredVisibleResidualMs = elapsedMs(measuredVisibleResidualStart);
+    } else {
+        // DELTA 0215: this full BGR8 scan was diagnostics-only with SPECTRA disabled.
+        residualNoiseState.measuredVisibleResidualMs = 0.0f;
+    }
     residualNoiseState.measuredPostIspVarianceY =
             static_cast<float>(measuredVisibleResidual.varianceY);
     residualNoiseState.measuredPostIspVarianceRG =
@@ -8353,7 +8439,9 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             "FINAL_JPEG_RESIDUAL_STATE_MEASURED_PRE_ENCODE_JPEG_COMPRESSION_NOT_PROPAGATED";
 
     const auto rotateStart = IspClock::now();
-    rotateMatForOutput(bgr8, rotationDegrees);
+    if (!residentOutputRotationApplied) {
+        rotateMatForOutput(bgr8, rotationDegrees);
+    }
     const float outputRotateMs = elapsedMs(rotateStart);
 
     if (bgr8.empty() || bgr8.type() != CV_8UC3) {
@@ -8366,6 +8454,9 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     const auto jpegEncodeStart = IspClock::now();
     const bool encoded = cv::imencode(".jpg", bgr8, jpegData, encodeParameters);
     const float jpegEncodeMs = elapsedMs(jpegEncodeStart);
+    // The JPEG encoder has now consumed all BGR8 pixels. Release the mapped publication lease
+    // before the remaining telemetry/debug assembly so the next capture can reuse the buffer.
+    vulkanTone.bgr8PublicationLease.reset();
 
     if (!encoded || jpegData.empty()) {
         ISP_LOGE("RAW_BASELINE_RENDER: cv::imencode failed or produced empty JPEG bytes");
@@ -9671,6 +9762,9 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; spectraMeasuredVisibleResidualMs=" << residualNoiseState.measuredVisibleResidualMs
             << "; spectraPropagationMathMs=" << spectraPropagationMathMs
             << "; spectraPropagationSequentialMs=" << spectraPropagationSequentialMs
+            << "; spectraResidualTelemetryEnabled=" << (spectraNoiseActive ? "true" : "false")
+            << "; spectraToneNoisePropagationEnabled="
+            << (toneNoisePropagationRequired ? "true" : "false")
             << "; phase7ExactCamera2ColorPair=" << (exactCamera2ColorPair ? "true" : "false")
             << "; phase7AwbEstimatorMs=" << phase7AwbEstimatorMs
             << "; phase7AwbSampleSource=" << phase7AwbSampleSource
@@ -9783,6 +9877,20 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; vulkanToneLutUploadMs=" << vulkanTone.lutUploadMs
             << "; vulkanToneKernelMs=" << vulkanTone.kernelMs
             << "; vulkanToneReadbackMs=" << vulkanTone.readbackMs
+            << "; vulkanToneBgr8PublicationRequested=" << (vulkanTone.bgr8PublicationRequested ? "true" : "false")
+            << "; vulkanToneBgr8PublicationGenerated=" << (vulkanTone.bgr8PublicationGenerated ? "true" : "false")
+            << "; vulkanToneBgr8PublicationReadbackMs=" << vulkanTone.bgr8PublicationReadbackMs
+            << "; vulkanToneBgr8PublicationDirectMapped="
+            << (vulkanTone.bgr8PublicationDirectMapped ? "true" : "false")
+            << "; vulkanToneBgr8PublicationHostCached="
+            << (vulkanTone.bgr8PublicationHostCached ? "true" : "false")
+            << "; vulkanToneBgr8Bytes="
+            << (vulkanTone.bgr8PublicationBytes > 0u
+                    ? vulkanTone.bgr8PublicationBytes
+                    : static_cast<std::uint64_t>(vulkanTone.outputBgr8.size()))
+            << "; vulkanToneBgr8HeapCopyBytes=" << vulkanTone.outputBgr8.size()
+            << "; vulkanToneBgr8Dimensions=" << vulkanTone.bgr8Width << "x" << vulkanTone.bgr8Height
+            << "; residentOutputRotationApplied=" << (residentOutputRotationApplied ? "true" : "false")
             << "; vulkanToneSynchronizationMs=" << vulkanTone.synchronizationMs
             << "; vulkanToneTotalMs=" << vulkanTone.totalMs
             << "; vulkanToneFullReadbackDeferred=" << (vulkanTone.fullReadbackDeferred ? "true" : "false")

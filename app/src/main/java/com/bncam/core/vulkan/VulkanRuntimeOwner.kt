@@ -58,6 +58,12 @@ object VulkanRuntimeOwner {
         0L
     }
 
+    fun prepareYuvSingleFrameBackend(): Boolean = try {
+        VulkanNativeBridge.nativePrepareYuvSingleFrameBackend()
+    } catch (_: Throwable) {
+        false
+    }
+
     fun prepareRawPreviewBackend(): Boolean = try {
         VulkanNativeBridge.nativePrepareRawPreviewBackend()
     } catch (_: Throwable) {

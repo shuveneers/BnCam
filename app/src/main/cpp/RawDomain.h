@@ -135,6 +135,10 @@ struct RawNormalizedSampleView {
     const uint16_t* masterRaw16 = nullptr;
     RawDomainInfo info{};
     size_t rowStrideBytes = 0u;
+    // DELTA 0218: immutable per-CFA normalization scalars. These are derived once from
+    // RawDomainInfo so compact planning samples do not repeat a floating-point divide.
+    std::array<float, 4> sampleBlack{0.0f, 0.0f, 0.0f, 0.0f};
+    std::array<float, 4> sampleInverseRange{1.0f, 1.0f, 1.0f, 1.0f};
     bool valid = false;
     std::string failureReason = "not_initialized";
 

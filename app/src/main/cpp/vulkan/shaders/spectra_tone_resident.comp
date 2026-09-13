@@ -2294,6 +2294,45 @@ void commitPerceptualDetail(uvec2 gid) {
     writeWorking(gid, linearDetailScratchAt(int(gid.x), int(gid.y)));
 }
 
+const uint kSrgbByteLutOffset = 8192u;
+
+uint quantizeSrgbByteExact(float value) {
+    float v = clamp(value, 0.0, 1.0);
+    uint index = uint(v * 4096.0 + 0.5);
+    return uint(clamp(toneLut[kSrgbByteLutOffset + index], 0.0, 255.0));
+}
+
+uvec2 bgrOutputToSource(uint x, uint y) {
+    uint rotation = pc.outputRotationDegrees % 360u;
+    if (rotation == 90u) return uvec2(y, pc.frameHeight - 1u - x);
+    if (rotation == 180u) return uvec2(pc.frameWidth - 1u - x, pc.frameHeight - 1u - y);
+    if (rotation == 270u) return uvec2(pc.frameWidth - 1u - y, x);
+    return uvec2(x, y);
+}
+
+void packBgr8Publication(uvec2 gid) {
+    if (gid.x >= pc.ultraHdrPackedWordsPerRow || gid.y >= pc.ultraHdrOutputMapHeight) return;
+    uint rowByteCount = pc.ultraHdrOutputMapWidth * 3u;
+    uint packed = 0u;
+    for (uint lane = 0u; lane < 4u; ++lane) {
+        uint byteOffset = gid.x * 4u + lane;
+        uint byteValue = 0u; // row padding is explicitly zeroed
+        if (byteOffset < rowByteCount) {
+            uint outX = byteOffset / 3u;
+            uint channel = byteOffset - outX * 3u;
+            uvec2 src = bgrOutputToSource(outX, gid.y);
+            if (src.x < pc.frameWidth && src.y < pc.frameHeight) {
+                vec3 rgb = workingAt(int(src.x), int(src.y));
+                float value = channel == 0u ? rgb.b : (channel == 1u ? rgb.g : rgb.r);
+                byteValue = quantizeSrgbByteExact(value);
+            }
+        }
+        packed |= (byteValue & 0xffu) << (lane * 8u);
+    }
+    uint outIndex = gid.y * pc.ultraHdrPackedWordsPerRow + gid.x;
+    ultraHdrGainmapPacked[outIndex] = packed;
+}
+
 void packUltraHdrGainmap(uvec2 gid) {
     if (gid.x >= pc.ultraHdrPackedWordsPerRow || gid.y >= pc.ultraHdrOutputMapHeight) return;
     float maxLogGain = max(float(telemetry[2]) / 65536.0, 1.0 / 65536.0);
@@ -2311,7 +2350,7 @@ void packUltraHdrGainmap(uvec2 gid) {
         }
         packed |= (byteValue & 0xffu) << (lane * 8u);
     }
-    uint outIndex = gid.y * pc.ultraHdrPackedWordsPerRow + gid.x;
+    uint outIndex = pc.displayOffsetFloats + gid.y * pc.ultraHdrPackedWordsPerRow + gid.x;
     ultraHdrGainmapPacked[outIndex] = packed;
 }
 
@@ -2358,5 +2397,7 @@ void main() {
         proposePerceptualDetail(gid);
     } else if (pc.mode == 17u) {
         commitPerceptualDetail(gid);
+    } else if (pc.mode == 18u) {
+        packBgr8Publication(gid);
     }
 }

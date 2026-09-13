@@ -69,6 +69,15 @@ struct NeuralProductionGpuResult {
     std::uint64_t persistentGpuBytes = 0u;
     std::uint64_t fullFrameCpuReadbackBytes = 0u;
     bool cpuFallbackUsed = false;
+
+    // Split performance telemetry for the production path.
+    float packBridgeMs = 0.0f;
+    float backendRunMs = 0.0f;
+    float backendSlotReadyWaitMs = 0.0f;
+    float backendCommandRecordMs = 0.0f;
+    float backendQueueSubmitMs = 0.0f;
+    float backendCompletionWaitMs = 0.0f;
+    float unpackBridgeMs = 0.0f;
     float totalWallMs = 0.0f;
     std::string status = "NOT_RUN";
 };

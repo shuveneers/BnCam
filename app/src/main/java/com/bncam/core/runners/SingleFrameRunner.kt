@@ -61,6 +61,9 @@ import com.bncam.data.profile.CameraProfile
 import com.bncam.data.settings.SettingsRepository
 import com.bncam.vendor.VendorInjectionEngine
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
@@ -1395,51 +1398,60 @@ class SingleFrameRunner(
             return 0.0
         }
 
-        // Sample actual pixels from each warm-buffer candidate without copying the full frame.
-        val analyzedCandidates = prunedList.map { candidateFrame: ZslFramePair ->
-            val metadata = candidateFrame.metadata
-            val tsNs = metadata?.get(CaptureResult.SENSOR_TIMESTAMP) ?: 0L
-            val expTimeNs = metadata?.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 0L
-            val iso = metadata?.get(CaptureResult.SENSOR_SENSITIVITY) ?: 0
-            val deltaMs = clockSafeCandidateDeltaMs(candidateFrame, tsNs)
-            val syncProxy = max(
-                0.0,
-                1.0 - (
-                        abs(deltaMs) /
-                                ShutterCandidateFreshnessPolicy
-                                    .GENUINE_NEAR_ZSL_WINDOW_MS
+        // DELTA 0220: the three Near-ZSL candidates are independent, already-complete
+        // HardwareBuffers. Analyze them concurrently instead of paying three serial CPU-read
+        // sampling passes after shutter. awaitAll() preserves prunedList order, so scoring,
+        // freshness, selection weights and tie-breaking remain byte-for-byte policy-equivalent.
+        val analyzedCandidates = coroutineScope {
+            prunedList.map { candidateFrame: ZslFramePair ->
+                async(Dispatchers.Default) {
+                    val metadata = candidateFrame.metadata
+                    val tsNs = metadata?.get(CaptureResult.SENSOR_TIMESTAMP) ?: 0L
+                    val expTimeNs = metadata?.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 0L
+                    val iso = metadata?.get(CaptureResult.SENSOR_SENSITIVITY) ?: 0
+                    val deltaMs = clockSafeCandidateDeltaMs(candidateFrame, tsNs)
+                    val syncProxy = max(
+                        0.0,
+                        1.0 - (
+                                abs(deltaMs) /
+                                        ShutterCandidateFreshnessPolicy
+                                            .GENUINE_NEAR_ZSL_WINDOW_MS
+                                )
+                    ).coerceIn(0.0, 1.0)
+                    val exposureMs = expTimeNs / 1_000_000.0
+                    val brightnessProxy = if (expTimeNs > 0L && iso > 0) exposureMs * (iso / 100.0) else 20.0
+                    val evProxy = when {
+                        brightnessProxy < 2.0 -> 0.35
+                        brightnessProxy > 120.0 -> 0.55
+                        else -> 0.80
+                    }
+                    val sharpnessProxy = 0.50
+                    val alignabilityProxy = (0.35 + (syncProxy * 0.65)).coerceIn(0.0, 1.0)
+                    val buffer = candidateFrame.hardwareBuffer
+                    val domain = nativeSampleDomain(metadata)
+                    val pixelMetrics = if (buffer != null) {
+                        ImageUtils.analyzeFrameCandidateSafe(
+                            buffer, activeZslFormat, domain.first, domain.second
                         )
-            ).coerceIn(0.0, 1.0)
-            val exposureMs = expTimeNs / 1_000_000.0
-            val brightnessProxy = if (expTimeNs > 0L && iso > 0) exposureMs * (iso / 100.0) else 20.0
-            val evProxy = when {
-                brightnessProxy < 2.0 -> 0.35
-                brightnessProxy > 120.0 -> 0.55
-                else -> 0.80
-            }
-            val sharpnessProxy = 0.50
-            val alignabilityProxy = (0.35 + (syncProxy * 0.65)).coerceIn(0.0, 1.0)
-            val buffer = candidateFrame.hardwareBuffer
-            val domain = nativeSampleDomain(metadata)
-            val pixelMetrics = if (buffer != null) {
-                ImageUtils.analyzeFrameCandidateSafe(buffer, activeZslFormat, domain.first, domain.second)
-            } else {
-                com.bncam.core.engine.FrameCandidatePixelMetrics(
-                    false, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, "hardware_buffer_missing"
-                )
-            }
+                    } else {
+                        com.bncam.core.engine.FrameCandidatePixelMetrics(
+                            false, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, "hardware_buffer_missing"
+                        )
+                    }
 
-            AnalysisWrapper(
-                frame = candidateFrame,
-                sharpness = if (pixelMetrics.valid) pixelMetrics.sharpnessScore else sharpnessProxy,
-                ev = if (pixelMetrics.valid) pixelMetrics.exposureScore else evProxy,
-                alignability = alignabilityProxy,
-                clippingScore = if (pixelMetrics.valid) pixelMetrics.clippingScore else 0.5,
-                lowClippedFraction = pixelMetrics.lowClippedFraction,
-                highClippedFraction = pixelMetrics.highClippedFraction,
-                source = pixelMetrics.source,
-                analysisTimeMs = pixelMetrics.analysisTimeMs
-            )
+                    AnalysisWrapper(
+                        frame = candidateFrame,
+                        sharpness = if (pixelMetrics.valid) pixelMetrics.sharpnessScore else sharpnessProxy,
+                        ev = if (pixelMetrics.valid) pixelMetrics.exposureScore else evProxy,
+                        alignability = alignabilityProxy,
+                        clippingScore = if (pixelMetrics.valid) pixelMetrics.clippingScore else 0.5,
+                        lowClippedFraction = pixelMetrics.lowClippedFraction,
+                        highClippedFraction = pixelMetrics.highClippedFraction,
+                        source = pixelMetrics.source,
+                        analysisTimeMs = pixelMetrics.analysisTimeMs
+                    )
+                }
+            }.awaitAll()
         }
 
         if (analyzedCandidates.isEmpty()) {
@@ -1997,9 +2009,11 @@ class SingleFrameRunner(
             if (isRawFrameSource) android.os.SystemClock.elapsedRealtimeNanos() else 0L
         val acquiredRawInput: Raw16RenderInput? = if (isRawFrameSource) {
             try {
-                anchorFrame.image?.let {
-                    com.bncam.core.isp.raw.RawColumnStatsAuditor.auditImagePlaneStageA("Stage-A (Acquired Image)", it, frameWidth, frameHeight)
-                }
+                // DELTA 0217: Stage-A RAW column/payload auditing is diagnostics-only here.
+                // Its return value was discarded and it does not participate in frame selection,
+                // RAW-domain construction, publication integrity, DNG export, or JPEG pixels.
+                // Keep the auditor available for explicit diagnostics, but do not scan the full
+                // acquired RAW image on every shutter-critical single-frame capture.
                 withContext(rawMaterializationDispatcher) {
                     val predictiveEstimate = ringBuffer.predictiveAfTracker
                         ?.predictFocusDistance(anchorFrame.timestamp)
@@ -2444,6 +2458,22 @@ class SingleFrameRunner(
                                 "RAW Publication Integrity",
                                 "Reason",
                                 publicationIntegrity.reason
+                            )
+                            shotLogger.recordPipelineEvent(
+                                "RAW Publication Integrity",
+                                "Frame Identity Reason",
+                                frameIdentity?.rejectionReason() ?: "FRAME_IDENTITY_UNAVAILABLE"
+                            )
+                            shotLogger.recordPipelineEvent(
+                                "RAW Publication Integrity",
+                                "Frame Timestamp Ns",
+                                anchorFrame.timestamp.toString()
+                            )
+                            shotLogger.recordPipelineEvent(
+                                "RAW Publication Integrity",
+                                "Metadata Timestamp Ns",
+                                frameIdentity?.captureIdentity?.sensorTimestampNs?.toString()
+                                    ?: "UNAVAILABLE"
                             )
                             shotLogger.recordPipelineEvent(
                                 "RAW Publication Integrity",
@@ -4039,6 +4069,15 @@ class SingleFrameRunner(
 
         if (isRawFrameSource) {
             val reservation = requireNotNull(rawWorkReservation)
+            // DELTA 0222: RAW processing continues to read immutable capture metadata through the
+            // selected ZslFramePair after the native HardwareBuffer has been retained/materialized.
+            // Keep the ring slot leased until the detached RAW worker has finished its render and
+            // publication-integrity decision. Releasing here allowed the ring to recycle/mutate the
+            // same ZslFramePair while the worker was still using anchorFrame, creating intermittent
+            // RAW_METADATA_TIMESTAMP_MISMATCH / RAW_METADATA_PROVENANCE_UNSAFE failures.
+            val rawAnchorLease = requireNotNull(anchorLease) {
+                "Single RAW requires the selected Near-ZSL FrameLease before processing handoff."
+            }
             val submitted = CaptureProcessingQueue.submit(context, reservation) { work ->
                 try {
                     val saveAccepted = processAndQueueOutput(
@@ -4063,6 +4102,8 @@ class SingleFrameRunner(
                         )
                     }
                     throw failure
+                } finally {
+                    rawAnchorLease.release()
                 }
             }
             if (!submitted) {
@@ -4081,6 +4122,13 @@ class SingleFrameRunner(
             }
             rawWorkHandedOff = true
             acquiredRawInputForCleanup = null
+            // The detached worker now owns the selected frame lease. Clear the capture-side
+            // reference so the outer finally cannot release/recycle the mutable ring slot early.
+            anchorLease = null
+            performanceTracker.setMetric(
+                "sourceFrameOwnership",
+                "SELECTED_FRAME_LEASE_TRANSFERRED_TO_RAW_PROCESSING_QUEUE"
+            )
             Log.i(
                 "BnCamCaptureTiming",
                 "route=${plan.route.id} lifecycle=PROCESSING_QUEUED " +

@@ -1768,6 +1768,26 @@ YuvExposureStatisticsResult VulkanRuntime::executeYuvExposureStatistics(
     return result;
 }
 
+bool VulkanRuntime::prepareYuvSingleFrameBackend() noexcept {
+    VkDevice device = VK_NULL_HANDLE;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_ != RuntimeState::READY || !handles_.complete() ||
+            gpuStalled_.load(std::memory_order_acquire) ||
+            quarantined_.load(std::memory_order_acquire)) {
+            return false;
+        }
+        inFlightSubmissionCount_.fetch_add(1, std::memory_order_acq_rel);
+        device = handles_.device;
+    }
+
+    // Backend-local mutex serializes preparation against the first real YUV execute(). No queue
+    // submission occurs here, so camera preview/RAW preview queues remain untouched.
+    const bool prepared = yuvSingleFrameBackend_.prepare(device);
+    completeSubmission();
+    return prepared;
+}
+
 bool VulkanRuntime::prepareRawPreviewBackend() noexcept {
     VkDevice device = VK_NULL_HANDLE;
     VkCommandPool commandPool = VK_NULL_HANDLE;

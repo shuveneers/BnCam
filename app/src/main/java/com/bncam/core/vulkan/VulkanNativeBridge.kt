@@ -29,6 +29,7 @@ internal object VulkanNativeBridge {
     external fun nativeGetCreationCounters(): LongArray
     external fun nativeGetInFlightSubmissionCount(): Long
     external fun nativeGetRawPreviewOutputHardwareBufferUsage(): Long
+    external fun nativePrepareYuvSingleFrameBackend(): Boolean
     external fun nativePrepareRawPreviewBackend(): Boolean
     external fun nativeGetLastFailureCode(): String
     external fun nativeGetLastFailureMessage(): String

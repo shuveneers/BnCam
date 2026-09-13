@@ -16,6 +16,7 @@
 #endif
 
 #include "VulkanRuntime.h"
+#include "../SrgbByteLut.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -79,6 +80,8 @@ static_assert(sizeof(PushConstants) == 128u, "resident tone push constants misma
 [[maybe_unused]] constexpr std::uint32_t kDisplayGridHeight = 24u;
 [[maybe_unused]] constexpr std::uint32_t kTelemetryWords = 64u;
 constexpr std::size_t kToneLutFloats = 4096u * 2u;
+constexpr std::size_t kSrgbByteLutEntries = 4097u;
+constexpr std::size_t kToneUploadFloats = kToneLutFloats + kSrgbByteLutEntries;
 
 // Capture-time RAW preview survival: mode-0 scene preparation is a full-resolution, expensive
 // 16x16 compute kernel. Keep each capture submission well below one 33 ms RAW-preview frame
@@ -179,7 +182,7 @@ void VulkanSpectraResidentToneBackend::destroyBuffersLocked() noexcept {
 #if BNCAM_VMA_HEADER_AVAILABLE
     if (allocator_ != nullptr) {
         for (PersistentBuffer* b : {&workingRgb_, &compact_, &toneLut_, &readback_, &telemetry_,
-                                    &ultraHdrLuma_, &ultraHdrGainLog_, &ultraHdrGainmapPacked_, &portraitMask_, &portraitBlurRgb_,
+                                    &ultraHdrLuma_, &ultraHdrGainLog_, &publicationPacked_, &portraitMask_, &portraitBlurRgb_,
                                     &localToneBase_, &fllfGaussian_, &fllfCorrection_}) {
             if (b->buffer != VK_NULL_HANDLE && b->allocation != nullptr) {
                 vmaDestroyBuffer(allocator_, b->buffer, b->allocation);
@@ -356,7 +359,7 @@ void VulkanSpectraResidentToneBackend::updateDescriptorsLocked(
     infos[4].buffer = telemetry_.buffer;
     infos[5].buffer = ultraHdrLuma_.buffer != VK_NULL_HANDLE ? ultraHdrLuma_.buffer : compact_.buffer;
     infos[6].buffer = ultraHdrGainLog_.buffer != VK_NULL_HANDLE ? ultraHdrGainLog_.buffer : compact_.buffer;
-    infos[7].buffer = ultraHdrGainmapPacked_.buffer != VK_NULL_HANDLE ? ultraHdrGainmapPacked_.buffer : telemetry_.buffer;
+    infos[7].buffer = publicationPacked_.buffer != VK_NULL_HANDLE ? publicationPacked_.buffer : telemetry_.buffer;
     infos[8].buffer = portraitMask_.buffer != VK_NULL_HANDLE ? portraitMask_.buffer : compact_.buffer;
     infos[9].buffer = portraitBlurRgb_.buffer != VK_NULL_HANDLE ? portraitBlurRgb_.buffer : workingRgb_.buffer;
     infos[10].buffer = localToneBase_.buffer != VK_NULL_HANDLE ? localToneBase_.buffer : compact_.buffer;
@@ -446,7 +449,7 @@ SpectraResidentSceneObserverResult VulkanSpectraResidentToneBackend::executeScen
     const std::uint32_t writeAccess = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
     if (!ensureBufferLocked(allocator_, rgbBytes, 0u, workingRgb_, reallocated, failure) ||
         !ensureBufferLocked(allocator_, std::max<std::uint64_t>(result.compactBytes, 16u), readAccess, compact_, reallocated, failure) ||
-        !ensureBufferLocked(allocator_, kToneLutFloats * sizeof(float), writeAccess, toneLut_, reallocated, failure) ||
+        !ensureBufferLocked(allocator_, kToneUploadFloats * sizeof(float), writeAccess, toneLut_, reallocated, failure) ||
         !ensureBufferLocked(allocator_, kTelemetryWords * sizeof(std::uint32_t), readAccess, telemetry_, reallocated, failure)) {
         result.status = "GPU_SCENE_OBSERVER_BUFFER_ALLOCATION_FAILED";
         result.failureReason = failure;
@@ -458,7 +461,7 @@ SpectraResidentSceneObserverResult VulkanSpectraResidentToneBackend::executeScen
     result.persistentAllocationGeneration = allocationGeneration_;
     result.persistentResidentBytes = workingRgb_.capacityBytes + compact_.capacityBytes +
             toneLut_.capacityBytes + readback_.capacityBytes + telemetry_.capacityBytes +
-            ultraHdrLuma_.capacityBytes + ultraHdrGainLog_.capacityBytes + ultraHdrGainmapPacked_.capacityBytes +
+            ultraHdrLuma_.capacityBytes + ultraHdrGainLog_.capacityBytes + publicationPacked_.capacityBytes +
             portraitMask_.capacityBytes + portraitBlurRgb_.capacityBytes + localToneBase_.capacityBytes +
             fllfGaussian_.capacityBytes + fllfCorrection_.capacityBytes;
     updateDescriptorsLocked(device, residentInputBuffer);
@@ -796,7 +799,9 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
     result.totalMs = elapsedMs(totalStart);
     return result;
 #else
-    std::lock_guard<std::mutex> lock(mutex_);
+    // This lock can be transferred to the publication result so the mapped BGR8 surface stays
+    // stable until cv::imencode has consumed it.
+    std::unique_lock<std::mutex> lock(mutex_);
     std::string failure;
     if (!initializeLocked(device, commandPool, failure)) {
         result.status = "GPU_TONE_INITIALIZATION_FAILED";
@@ -847,6 +852,19 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
     const std::uint64_t mapPixels = static_cast<std::uint64_t>(sourceMapWidth) * sourceMapHeight;
     const std::uint64_t packedBytes = static_cast<std::uint64_t>(packedWordsPerRow) *
             outputMapHeight * sizeof(std::uint32_t);
+    const bool bgr8Requested = request.bgr8PublicationRequested && supportedRotation;
+    result.bgr8PublicationRequested = request.bgr8PublicationRequested;
+    const bool swapBgrAxes = normalizedRotation == 90u || normalizedRotation == 270u;
+    const std::uint32_t bgr8Width = swapBgrAxes ? request.frameHeight : request.frameWidth;
+    const std::uint32_t bgr8Height = swapBgrAxes ? request.frameWidth : request.frameHeight;
+    const std::uint32_t bgr8RowStrideBytes = static_cast<std::uint32_t>(
+            bncam::color::packedBgr8RowStride(bgr8Width));
+    const std::uint32_t bgr8WordsPerRow = bgr8RowStrideBytes / sizeof(std::uint32_t);
+    const std::uint64_t bgr8Bytes = static_cast<std::uint64_t>(bgr8RowStrideBytes) * bgr8Height;
+    const std::uint64_t publicationBytes =
+            (bgr8Requested ? bgr8Bytes : 0u) + (ultraHdrRequested ? packedBytes : 0u);
+    const std::uint64_t gainmapOffsetBytes = bgr8Requested ? bgr8Bytes : 0u;
+    const std::uint32_t gainmapOffsetWords = static_cast<std::uint32_t>(gainmapOffsetBytes / sizeof(std::uint32_t));
     const bool localToneRequested = request.localToneStrength > 1.0e-4f;
     result.localToneRequested = localToneRequested;
     const bool fllfRequested = request.isRawBayer && request.fllfEnabled && request.fllfStrength > 1.0e-4f;
@@ -871,12 +889,14 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
     bool reallocated = false;
     const std::uint32_t writeAccess = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
     const std::uint32_t readAccess = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
-    if (!ensureBufferLocked(allocator_, kToneLutFloats * sizeof(float), writeAccess, toneLut_, reallocated, failure) ||
+    if (!ensureBufferLocked(allocator_, kToneUploadFloats * sizeof(float), writeAccess, toneLut_, reallocated, failure) ||
         !ensureBufferLocked(allocator_, kTelemetryWords * sizeof(std::uint32_t), readAccess, telemetry_, reallocated, failure) ||
         (!request.deferFullReadback && !ensureBufferLocked(allocator_, rgbBytes, readAccess, readback_, reallocated, failure)) ||
         (ultraHdrRequested && !ensureBufferLocked(allocator_, mapPixels * sizeof(float), 0u, ultraHdrLuma_, reallocated, failure)) ||
         (ultraHdrRequested && !ensureBufferLocked(allocator_, mapPixels * sizeof(float), 0u, ultraHdrGainLog_, reallocated, failure)) ||
-        (ultraHdrRequested && !ensureBufferLocked(allocator_, packedBytes, readAccess, ultraHdrGainmapPacked_, reallocated, failure)) ||
+        ((bgr8Requested || ultraHdrRequested) &&
+         !ensureBufferLocked(allocator_, std::max<std::uint64_t>(publicationBytes, 16u),
+                             readAccess, publicationPacked_, reallocated, failure)) ||
         (portraitRequested && !ensureBufferLocked(allocator_, portraitMaskPixels * sizeof(float), writeAccess, portraitMask_, reallocated, failure)) ||
         ((portraitRequested || linearDetailRequested || perceptualDetailRequested) && !ensureBufferLocked(allocator_, rgbBytes, 0u, portraitBlurRgb_, reallocated, failure)) ||
         (localToneRequested && !ensureBufferLocked(allocator_, mapPixels * sizeof(float), 0u, localToneBase_, reallocated, failure)) ||
@@ -892,7 +912,7 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
     result.persistentAllocationGeneration = allocationGeneration_;
     result.persistentResidentBytes = workingRgb_.capacityBytes + compact_.capacityBytes +
             toneLut_.capacityBytes + readback_.capacityBytes + telemetry_.capacityBytes +
-            ultraHdrLuma_.capacityBytes + ultraHdrGainLog_.capacityBytes + ultraHdrGainmapPacked_.capacityBytes +
+            ultraHdrLuma_.capacityBytes + ultraHdrGainLog_.capacityBytes + publicationPacked_.capacityBytes +
             portraitMask_.capacityBytes + portraitBlurRgb_.capacityBytes + localToneBase_.capacityBytes +
             fllfGaussian_.capacityBytes + fllfCorrection_.capacityBytes;
     result.fllfResidentBytes = fllfRequested
@@ -901,8 +921,13 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
     result.linearDetailScratchBytes = linearDetailRequested ? portraitBlurRgb_.capacityBytes : 0u;
     result.perceptualDetailScratchBytes = perceptualDetailRequested ? portraitBlurRgb_.capacityBytes : 0u;
     const auto uploadStart = Clock::now();
-    std::memcpy(toneLut_.mapped, request.toneLut, kToneLutFloats * sizeof(float));
-    vmaFlushAllocation(allocator_, toneLut_.allocation, 0u, kToneLutFloats * sizeof(float));
+    auto* toneUpload = static_cast<float*>(toneLut_.mapped);
+    std::memcpy(toneUpload, request.toneLut, kToneLutFloats * sizeof(float));
+    const auto& srgbLut = bncam::color::srgbByteLut();
+    for (std::size_t i = 0u; i < srgbLut.size(); ++i) {
+        toneUpload[kToneLutFloats + i] = static_cast<float>(srgbLut[i]);
+    }
+    vmaFlushAllocation(allocator_, toneLut_.allocation, 0u, kToneUploadFloats * sizeof(float));
     if (portraitRequested) {
         const auto portraitBytes = portraitMaskPixels * sizeof(float);
         std::memcpy(portraitMask_.mapped, request.portraitMask, static_cast<std::size_t>(portraitBytes));
@@ -936,7 +961,7 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
     ready[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     ready[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     ready[1].buffer = toneLut_.buffer;
-    ready[1].size = kToneLutFloats * sizeof(float);
+    ready[1].size = kToneUploadFloats * sizeof(float);
     vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr, 2u, ready, 0u, nullptr);
     // Reset tone/gainmap/local-adaptation/detail telemetry while preserving Phase-9 scene-observer
@@ -1413,21 +1438,53 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
         // Pass 2: normalize from the GPU-computed maximum, rotate into final JPEG orientation and
         // pack four 8-bit gainmap pixels per uint. The mapped output is already publication-ready.
         push.mode = 6u;
+        // Binding 7 is shared with normal BGR8 publication. Ultra HDR starts after the
+        // 32-bit-aligned BGR8 prefix (or at zero when BGR8 publication is not requested).
+        push.displayOffsetFloats = gainmapOffsetWords;
         vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
                            0u, sizeof(push), &push);
         vkCmdDispatch(commandBuffer_, (packedWordsPerRow + 15u) / 16u,
                        (outputMapHeight + 15u) / 16u, 1u);
-        VkBufferMemoryBarrier gainmapToHost{};
-        gainmapToHost.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-        gainmapToHost.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        gainmapToHost.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-        gainmapToHost.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        gainmapToHost.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        gainmapToHost.buffer = ultraHdrGainmapPacked_.buffer;
-        gainmapToHost.size = static_cast<VkDeviceSize>(packedBytes);
+    }
+
+    if (bgr8Requested) {
+        // Publish the final tone surface directly as JPEG-boundary BGR8 in final orientation.
+        // The exact CPU sRGB byte LUT is appended to binding 3, so this is quantization-equivalent
+        // to quantizeSrgbByte() without a 151 MiB float-RGB host roundtrip.
+        VkBufferMemoryBarrier toneReady{};
+        toneReady.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        toneReady.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        toneReady.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        toneReady.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toneReady.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toneReady.buffer = workingRgb_.buffer;
+        toneReady.size = static_cast<VkDeviceSize>(rgbBytes);
+        vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u,
+                             0u, nullptr, 1u, &toneReady, 0u, nullptr);
+        push.mode = 18u;
+        push.displayOffsetFloats = 0u;
+        push.ultraHdrOutputMapWidth = bgr8Width;
+        push.ultraHdrOutputMapHeight = bgr8Height;
+        push.ultraHdrPackedWordsPerRow = bgr8WordsPerRow;
+        vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
+                           0u, sizeof(push), &push);
+        vkCmdDispatch(commandBuffer_, (bgr8WordsPerRow + 15u) / 16u,
+                       (bgr8Height + 15u) / 16u, 1u);
+    }
+
+    if (bgr8Requested || ultraHdrRequested) {
+        VkBufferMemoryBarrier publicationToHost{};
+        publicationToHost.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        publicationToHost.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        publicationToHost.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        publicationToHost.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        publicationToHost.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        publicationToHost.buffer = publicationPacked_.buffer;
+        publicationToHost.size = static_cast<VkDeviceSize>(publicationBytes);
         vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                              VK_PIPELINE_STAGE_HOST_BIT, 0u,
-                             0u, nullptr, 1u, &gainmapToHost, 0u, nullptr);
+                             0u, nullptr, 1u, &publicationToHost, 0u, nullptr);
     }
 
     if (!request.deferFullReadback) {
@@ -1567,6 +1624,37 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
     std::uint32_t perceptualMaxBits = telemetry[55];
     std::memcpy(&result.perceptualDetailMaxAbsCorrection, &perceptualMaxBits, sizeof(float));
     result.perceptualDetailApplied = perceptualDetailRequested && result.perceptualDetailChangedPixels > 0u;
+    if ((bgr8Requested || ultraHdrRequested) && publicationPacked_.mapped != nullptr) {
+        const auto publicationReadStart = Clock::now();
+        vmaInvalidateAllocation(allocator_, publicationPacked_.allocation, 0u,
+                                static_cast<VkDeviceSize>(publicationBytes));
+        if (bgr8Requested) {
+            result.bgr8Width = bgr8Width;
+            result.bgr8Height = bgr8Height;
+            result.bgr8RowStrideBytes = bgr8RowStrideBytes;
+            result.bgr8PublicationBytes = bgr8Bytes;
+
+            VkMemoryPropertyFlags publicationMemoryProperties = 0u;
+            vmaGetAllocationMemoryProperties(allocator_, publicationPacked_.allocation,
+                                             &publicationMemoryProperties);
+            result.bgr8PublicationHostCached =
+                    (publicationMemoryProperties & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0u;
+            if (result.bgr8PublicationHostCached) {
+                // The GPU has already produced the exact final rotated BGR8 bytes. Do not copy
+                // another ~38 MB to the heap merely to hand them to the JPEG encoder.
+                result.bgr8PublicationData =
+                        static_cast<const std::uint8_t*>(publicationPacked_.mapped);
+            } else {
+                // Random reads from uncached mapped memory can make JPEG slower than one linear
+                // copy. Preserve the previous exact heap path on such memory types.
+                result.outputBgr8.resize(static_cast<std::size_t>(bgr8Bytes));
+                std::memcpy(result.outputBgr8.data(), publicationPacked_.mapped,
+                            static_cast<std::size_t>(bgr8Bytes));
+            }
+            result.bgr8PublicationGenerated = true;
+        }
+        result.bgr8PublicationReadbackMs = elapsedMs(publicationReadStart);
+    }
     if (ultraHdrRequested) {
         constexpr float kMeaningfulGainLog2 = 0.111031312f; // log2(1.08)
         const float maxLog2Boost = static_cast<float>(telemetry[2]) / 65536.0f;
@@ -1575,13 +1663,13 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
         result.ultraHdrGainmapWidth = outputMapWidth;
         result.ultraHdrGainmapHeight = outputMapHeight;
         result.ultraHdrGainmapRowStrideBytes = packedWordsPerRow * sizeof(std::uint32_t);
-        if (result.ultraHdrMeaningfulHeadroom && ultraHdrGainmapPacked_.mapped != nullptr) {
-            vmaInvalidateAllocation(allocator_, ultraHdrGainmapPacked_.allocation, 0u,
-                                    static_cast<VkDeviceSize>(packedBytes));
+        if (result.ultraHdrMeaningfulHeadroom && publicationPacked_.mapped != nullptr) {
             result.ultraHdrGainmapBytes.resize(static_cast<std::size_t>(packedBytes));
-            // GPU already produced final 8-bit pixels and row padding. This is an artifact
-            // transfer only; there is no CPU gainmap computation or pixel conversion.
-            std::memcpy(result.ultraHdrGainmapBytes.data(), ultraHdrGainmapPacked_.mapped,
+            // GPU already produced final 8-bit pixels and row padding. The gainmap follows the
+            // optional BGR8 prefix in the shared host-visible publication buffer.
+            const auto* publicationBytesPtr = static_cast<const std::uint8_t*>(publicationPacked_.mapped);
+            std::memcpy(result.ultraHdrGainmapBytes.data(),
+                        publicationBytesPtr + static_cast<std::size_t>(gainmapOffsetBytes),
                         static_cast<std::size_t>(packedBytes));
             result.ultraHdrGainmapGenerated = true;
             result.ultraHdrStatus = "GPU_GAINMAP_READY";
@@ -1610,6 +1698,30 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
             ? (request.deferFullReadback ? "GPU_PRIMARY_TONE_RESIDENT_OUTPUT" : "GPU_PRIMARY_TONE_FINAL_READBACK")
             : "GPU_TONE_READBACK_SIZE_MISMATCH";
     result.failureReason = result.success ? "none" : "FULL_RGB_READBACK_INCOMPLETE";
+
+    if (result.success && result.bgr8PublicationGenerated &&
+        result.bgr8PublicationData != nullptr && result.bgr8PublicationBytes > 0u) {
+        try {
+            result.bgr8PublicationLease =
+                    std::make_shared<ResidentToneBgr8PublicationLease>(std::move(lock));
+            result.bgr8PublicationDirectMapped = true;
+        } catch (...) {
+            // executeTone is noexcept. A lease allocation failure must never make capture fail.
+            // Fall back to the exact pre-0221 heap materialization while the local lock still
+            // protects publicationPacked_.
+            try {
+                result.outputBgr8.resize(static_cast<std::size_t>(result.bgr8PublicationBytes));
+                std::memcpy(result.outputBgr8.data(), result.bgr8PublicationData,
+                            static_cast<std::size_t>(result.bgr8PublicationBytes));
+            } catch (...) {
+                result.outputBgr8.clear();
+                result.bgr8PublicationGenerated = false;
+            }
+            result.bgr8PublicationData = nullptr;
+            result.bgr8PublicationDirectMapped = false;
+        }
+    }
+
     result.totalMs = elapsedMs(totalStart);
     return result;
 #endif

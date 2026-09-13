@@ -57,6 +57,26 @@ class BnCamApplication : Application() {
         com.bncam.core.debug.ShotLogger(applicationContext).recoverStaleStartedAttempts()
         Phase0PerformanceTrace.markStartup("recovery_initialize_end")
         Phase0PerformanceTrace.markStartup("application_onCreate_end")
+
+        // DELTA 0223: the first YUV capture previously paid ~9.6 s of backend/pipeline first-use
+        // initialization on the shutter-critical path. Start immutable pipeline preparation only
+        // after synchronous Application startup has completed, and do it on a daemon thread so
+        // Activity/viewfinder startup remains unblocked. No full-resolution capture buffers are
+        // allocated and no GPU queue work is submitted by this preparation step.
+        Thread({
+            val startNs = SystemClock.elapsedRealtimeNanos()
+            val prepared = VulkanRuntimeOwner.prepareYuvSingleFrameBackend()
+            val wallMs = (SystemClock.elapsedRealtimeNanos() - startNs) / 1_000_000.0
+            com.bncam.core.debug.DiagnosticsAggregator.record(
+                com.bncam.core.debug.DiagnosticsAggregator.Stream.PERFORMANCE,
+                "APPLICATION",
+                "YUV SINGLE FRAME PREWARM",
+                "prepared=$prepared;wallMs=${String.format(java.util.Locale.US, "%.3f", wallMs)}"
+            )
+        }, "BnCam-YuvSingleFramePrewarm").apply {
+            isDaemon = true
+            start()
+        }
     }
 
     override fun onTerminate() {

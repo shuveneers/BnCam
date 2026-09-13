@@ -110,6 +110,13 @@ struct YuvSingleFrameIspResult {
 
 class VulkanYuvSingleFrameBackend final {
 public:
+    /**
+     * Pipeline-only cold-start preparation. This creates the immutable Vulkan pipeline/descriptor
+     * objects without allocating full-resolution capture buffers and without submitting GPU work.
+     * Safe to call asynchronously before the first YUV capture.
+     */
+    bool prepare(VkDevice device) noexcept;
+
     YuvSingleFrameIspResult execute(
             VkDevice device,
             VkQueue computeQueue,
@@ -127,7 +134,7 @@ private:
         std::uint64_t capacityBytes = 0u;
     };
 
-    bool initializeLocked(VkDevice device, std::string& failureReason) noexcept;
+    bool initializeLocked(VkDevice device, std::string& failureReason, bool usePublishedCache = true) noexcept;
     bool ensureBufferLocked(
             VmaAllocator allocator,
             std::uint64_t bytes,
