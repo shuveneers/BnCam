@@ -1809,6 +1809,47 @@ bool VulkanRuntime::prepareRawPreviewBackend() noexcept {
     return prepared;
 }
 
+bool VulkanRuntime::prepareRawSingleFrameWorkingSet(
+        std::uint32_t frameWidth,
+        std::uint32_t frameHeight
+) noexcept {
+    if (frameWidth == 0u || frameHeight == 0u) return false;
+
+    VkDevice device = VK_NULL_HANDLE;
+    VkCommandPool commandPool = VK_NULL_HANDLE;
+    VulkanAllocatorOwner* allocator = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_ != RuntimeState::READY || !handles_.complete() ||
+            handles_.commandPool == VK_NULL_HANDLE ||
+            gpuStalled_.load(std::memory_order_acquire) ||
+            quarantined_.load(std::memory_order_acquire)) {
+            return false;
+        }
+        inFlightSubmissionCount_.fetch_add(1, std::memory_order_acq_rel);
+        device = handles_.device;
+        commandPool = handles_.commandPool;
+        allocator = &handles_.allocator;
+    }
+
+    bool demosaicPrepared = false;
+    bool tonePrepared = false;
+    {
+        // VkCommandPool is externally synchronized. A shutter pressed while prewarm is still
+        // running waits on this same capture-domain mutex instead of racing resource setup.
+        std::lock_guard<std::mutex> submitLock(submissionMutex_);
+        std::string demosaicFailure;
+        std::string toneFailure;
+        demosaicPrepared = spectraResidentDemosaicBackend_.prepareWorkingSet(
+                device, commandPool, *allocator, frameWidth, frameHeight, demosaicFailure);
+        tonePrepared = spectraResidentToneBackend_.prepareWorkingSet(
+                device, commandPool, *allocator, frameWidth, frameHeight, toneFailure);
+    }
+
+    completeSubmission();
+    return demosaicPrepared && tonePrepared;
+}
+
 RawPreviewGpuResult VulkanRuntime::executeRawPreview(
         const RawPreviewGpuRequest& request
 ) noexcept {

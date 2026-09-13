@@ -609,11 +609,24 @@ vec3 preToneChroma444FromInput(uvec2 gid, vec3 centerRgb) {
 }
 
 void runPreTonePreparation(uvec2 gid) {
-    // All 256 local invocations must participate in the barriers, including the partial
-    // workgroups on the right/bottom frame edge.
+    // DELTA 0224: when pre-tone chroma cleanup is explicitly disabled, the historical
+    // mode-0 tile regression/telemetry work cannot affect output pixels. The normal path
+    // eventually returns centerRgb unchanged in preToneChroma444FromInput(), so preserve
+    // exact output by performing only the required resident input -> workingRgb copy.
+    //
+    // The predicate uses only push constants and is therefore uniform for the entire
+    // workgroup; all invocations take this return before any workgroup barrier.
     bool valid = gid.x < pc.frameWidth && gid.y < pc.frameHeight;
-    uint lane = gl_LocalInvocationIndex;
     vec3 originalCenter = valid ? inputAt(int(gid.x), int(gid.y)) : vec3(0.0);
+    float requestedPreToneChromaStrength = clamp(pc.presenceReserved1, 0.0, 0.94);
+    if (pc.presenceReserved0 == 0u || requestedPreToneChromaStrength <= 1.0e-4) {
+        if (valid) writeWorking(gid, originalCenter);
+        return;
+    }
+
+    // Active cleanup path: all 256 local invocations must participate in the barriers,
+    // including the partial workgroups on the right/bottom frame edge.
+    uint lane = gl_LocalInvocationIndex;
     vec3 opponentCenter = valid ? preToneOpponent444(originalCenter) : vec3(0.0);
     phase9TileOpponent[lane] = vec4(opponentCenter, valid ? 1.0 : 0.0);
     barrier();

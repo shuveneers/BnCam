@@ -115,6 +115,72 @@ bool VulkanSpectraResidentDemosaicBackend::pipelineInitialized() const noexcept 
     return initialized_;
 }
 
+bool VulkanSpectraResidentDemosaicBackend::prepareWorkingSet(
+        VkDevice device, VkCommandPool commandPool, VulkanAllocatorOwner& allocatorOwner,
+        std::uint32_t frameWidth, std::uint32_t frameHeight,
+        std::string& failureReason) noexcept {
+#if !BNCAM_VMA_HEADER_AVAILABLE || !BNCAM_SPECTRA_DEMOSAIC_SHADER_AVAILABLE
+    (void)device; (void)commandPool; (void)allocatorOwner; (void)frameWidth; (void)frameHeight;
+    failureReason = !BNCAM_VMA_HEADER_AVAILABLE ? "VMA_HEADER_NOT_AVAILABLE"
+                                                : "RESIDENT_DEMOSAIC_SHADER_NOT_COMPILED";
+    return false;
+#else
+    if (device == VK_NULL_HANDLE || commandPool == VK_NULL_HANDLE ||
+        frameWidth == 0u || frameHeight == 0u) {
+        failureReason = "INVALID_RAW_STILL_PREWARM_DIMENSIONS";
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!initializeLocked(device, commandPool, failureReason)) return false;
+    VmaAllocator allocator = allocatorOwner.handle();
+    if (allocator == nullptr) {
+        failureReason = "VMA_ALLOCATOR_NOT_READY";
+        return false;
+    }
+    allocator_ = allocator;
+
+    const std::uint64_t pixels =
+            static_cast<std::uint64_t>(frameWidth) * frameHeight;
+    const std::uint64_t outputBytes = pixels * 3u * sizeof(float);
+    const std::uint64_t sourceClipBytes =
+            static_cast<std::uint64_t>((frameWidth + 1u) / 2u) *
+            ((frameHeight + 1u) / 2u) * sizeof(float);
+    const std::uint64_t groups =
+            static_cast<std::uint64_t>((frameWidth + 15u) / 16u) *
+            ((frameHeight + 15u) / 16u);
+    const std::uint64_t statisticsBytes =
+            std::max<std::uint64_t>(48u, groups * 12u * sizeof(float));
+    const ResidualSampling residualSampling = residualSamplingFor(frameWidth, frameHeight);
+
+    bool reallocated = false;
+    const std::uint32_t writeAccess = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
+    const std::uint32_t readAccess = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
+    const bool ok =
+            // Production RAW single-frame reaches demosaic through a resident mosaic generation:
+            // no host input staging, duplicate device input, or full RGB readback is required.
+            ensureBufferLocked(allocator, outputBytes, 0u, deviceOutput_, reallocated, failureReason) &&
+            ensureBufferLocked(allocator, outputBytes, 0u, rgbUpload_, reallocated, failureReason) &&
+            ensureBufferLocked(allocator, statisticsBytes, readAccess, colorStatistics_, reallocated, failureReason) &&
+            ensureBufferLocked(allocator, kColorTelemetryWords * sizeof(std::uint32_t), readAccess,
+                               colorTelemetry_, reallocated, failureReason) &&
+            ensureBufferLocked(allocator, sourceClipBytes, 0u, sourceClipConfidence_, reallocated, failureReason) &&
+            ensureBufferLocked(allocator, 192u * 4u * sizeof(float), writeAccess,
+                               cloudCorrectionMap_, reallocated, failureReason) &&
+            ensureBufferLocked(allocator, kHueSatHeaderFloats * sizeof(float), writeAccess,
+                               hueSatProfile_, reallocated, failureReason) &&
+            ensureBufferLocked(allocator, std::max<std::uint64_t>(24u, residualSampling.bytes), readAccess,
+                               residualCandidates_, reallocated, failureReason);
+    if (!ok) return false;
+
+    if (reallocated) {
+        residentDemosaicValid_ = false;
+        sourceClipConfidenceValid_ = false;
+    }
+    failureReason = "none";
+    return true;
+#endif
+}
+
 bool VulkanSpectraResidentDemosaicBackend::ensureBufferLocked(
         VmaAllocator allocator,
         std::uint64_t bytes,
@@ -496,9 +562,10 @@ SpectraResidentDemosaicResult VulkanSpectraResidentDemosaicBackend::executeInter
     bool reallocated = false;
     const std::uint32_t writeAccess = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
     const std::uint32_t readAccess = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
-    if (!ensureBufferLocked(allocator, inputBytes, writeAccess, inputStaging_, reallocated, failure) ||
-        !ensureBufferLocked(allocator, outputBytes, readAccess, outputReadback_, reallocated, failure) ||
-        !ensureBufferLocked(allocator, inputBytes, 0u, deviceInput_, reallocated, failure) ||
+    if ((!residentInput &&
+         !ensureBufferLocked(allocator, inputBytes, writeAccess, inputStaging_, reallocated, failure)) ||
+        (!residentInput &&
+         !ensureBufferLocked(allocator, inputBytes, 0u, deviceInput_, reallocated, failure)) ||
         !ensureBufferLocked(allocator, outputBytes, 0u, deviceOutput_, reallocated, failure) ||
         (requiredScratchBytes > 0u &&
          !ensureBufferLocked(allocator, requiredScratchBytes,

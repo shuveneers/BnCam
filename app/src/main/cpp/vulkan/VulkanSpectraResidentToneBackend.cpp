@@ -131,6 +131,78 @@ bool VulkanSpectraResidentToneBackend::productionKernelConnected() const noexcep
 #endif
 }
 
+bool VulkanSpectraResidentToneBackend::prepareWorkingSet(
+        VkDevice device, VkCommandPool commandPool, VulkanAllocatorOwner& allocatorOwner,
+        std::uint32_t frameWidth, std::uint32_t frameHeight,
+        std::string& failureReason) noexcept {
+#if !BNCAM_VMA_HEADER_AVAILABLE || !BNCAM_SPECTRA_TONE_SHADER_AVAILABLE
+    (void)device; (void)commandPool; (void)allocatorOwner; (void)frameWidth; (void)frameHeight;
+    failureReason = !BNCAM_VMA_HEADER_AVAILABLE ? "VMA_HEADER_NOT_AVAILABLE"
+                                                : "RESIDENT_TONE_SHADER_NOT_COMPILED";
+    return false;
+#else
+    if (device == VK_NULL_HANDLE || commandPool == VK_NULL_HANDLE ||
+        frameWidth == 0u || frameHeight == 0u) {
+        failureReason = "INVALID_RAW_TONE_PREWARM_DIMENSIONS";
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!initializeLocked(device, commandPool, failureReason)) return false;
+    allocator_ = allocatorOwner.handle();
+    if (allocator_ == nullptr) {
+        failureReason = "VMA_ALLOCATOR_NOT_READY";
+        return false;
+    }
+
+    const std::uint64_t pixels =
+            static_cast<std::uint64_t>(frameWidth) * frameHeight;
+    const std::uint64_t rgbBytes = pixels * 3u * sizeof(float);
+    constexpr std::uint32_t targetSamples = 50000u;
+    const std::uint32_t sampleStep = static_cast<std::uint32_t>(
+            std::max<std::uint64_t>(1u, pixels / targetSamples));
+    const std::uint32_t sampleCount = static_cast<std::uint32_t>(
+            (pixels + sampleStep - 1u) / sampleStep);
+    const std::uint64_t compactBytes =
+            (static_cast<std::uint64_t>(sampleCount) * 3u +
+             kDisplayGridWidth * kDisplayGridHeight) * sizeof(float);
+
+    const std::uint64_t publication0 =
+            static_cast<std::uint64_t>(bncam::color::packedBgr8RowStride(frameWidth)) * frameHeight;
+    const std::uint64_t publication90 =
+            static_cast<std::uint64_t>(bncam::color::packedBgr8RowStride(frameHeight)) * frameWidth;
+    const std::uint64_t publicationBytes = std::max(publication0, publication90);
+
+    const FllfPyramidLayout fllfLayout =
+            buildFllfPyramidLayout(frameWidth, frameHeight, kFllfMaxLevels);
+    const std::uint64_t fllfBytes =
+            std::max<std::uint64_t>(16u, fllfLayout.totalFloats * sizeof(float));
+
+    bool reallocated = false;
+    const std::uint32_t writeAccess = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
+    const std::uint32_t readAccess = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
+    const bool ok =
+            ensureBufferLocked(allocator_, rgbBytes, 0u, workingRgb_, reallocated, failureReason) &&
+            ensureBufferLocked(allocator_, std::max<std::uint64_t>(compactBytes, 16u), readAccess,
+                               compact_, reallocated, failureReason) &&
+            ensureBufferLocked(allocator_, kToneUploadFloats * sizeof(float), writeAccess,
+                               toneLut_, reallocated, failureReason) &&
+            ensureBufferLocked(allocator_, kTelemetryWords * sizeof(std::uint32_t), readAccess,
+                               telemetry_, reallocated, failureReason) &&
+            ensureBufferLocked(allocator_, std::max<std::uint64_t>(publicationBytes, 16u), readAccess,
+                               publicationPacked_, reallocated, failureReason) &&
+            ensureBufferLocked(allocator_, fllfBytes, 0u, fllfGaussian_, reallocated, failureReason) &&
+            ensureBufferLocked(allocator_, fllfBytes, 0u, fllfCorrection_, reallocated, failureReason);
+    if (!ok) return false;
+
+    if (reallocated) {
+        residentSceneValid_ = false;
+        residentToneValid_ = false;
+    }
+    failureReason = "none";
+    return true;
+#endif
+}
+
 bool VulkanSpectraResidentToneBackend::ensureBufferLocked(
         VmaAllocator allocator, std::uint64_t bytes, std::uint32_t hostAccess,
         PersistentBuffer& buffer, bool& reallocated, std::string& failureReason) noexcept {

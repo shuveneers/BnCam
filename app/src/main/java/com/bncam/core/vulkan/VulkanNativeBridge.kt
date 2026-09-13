@@ -31,6 +31,7 @@ internal object VulkanNativeBridge {
     external fun nativeGetRawPreviewOutputHardwareBufferUsage(): Long
     external fun nativePrepareYuvSingleFrameBackend(): Boolean
     external fun nativePrepareRawPreviewBackend(): Boolean
+    external fun nativePrepareRawSingleFrameWorkingSet(frameWidth: Int, frameHeight: Int): Boolean
     external fun nativeGetLastFailureCode(): String
     external fun nativeGetLastFailureMessage(): String
     external fun nativeIsLastFailureRetryable(): Boolean

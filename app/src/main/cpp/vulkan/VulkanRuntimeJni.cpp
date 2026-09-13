@@ -158,6 +158,15 @@ Java_com_bncam_core_vulkan_VulkanNativeBridge_nativePrepareRawPreviewBackend(JNI
     return VulkanRuntime::instance().prepareRawPreviewBackend() ? JNI_TRUE : JNI_FALSE;
 }
 
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_bncam_core_vulkan_VulkanNativeBridge_nativePrepareRawSingleFrameWorkingSet(
+        JNIEnv*, jobject, jint frameWidth, jint frameHeight) {
+    if (frameWidth <= 0 || frameHeight <= 0) return JNI_FALSE;
+    return VulkanRuntime::instance().prepareRawSingleFrameWorkingSet(
+            static_cast<std::uint32_t>(frameWidth),
+            static_cast<std::uint32_t>(frameHeight)) ? JNI_TRUE : JNI_FALSE;
+}
+
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_bncam_core_vulkan_VulkanNativeBridge_nativeGetLastFailureCode(JNIEnv* env, jobject) {
     return toJString(env, VulkanRuntime::instance().snapshot().lastFailure.code);

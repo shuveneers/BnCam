@@ -268,6 +268,15 @@ public:
     /** Prepare immutable RAW-preview Vulkan resources without requiring a RAW frame. */
     bool prepareRawPreviewBackend() noexcept;
 
+    /**
+     * Prepare persistent full-resolution RAW single-frame still resources for the exact active
+     * RAW stream dimensions. Allocation-only: no pixel processing or resident generation.
+     */
+    bool prepareRawSingleFrameWorkingSet(
+            std::uint32_t frameWidth,
+            std::uint32_t frameHeight
+    ) noexcept;
+
     /** Fused preview-only RAW demosaic/colour/tone/RGBA path. */
     RawPreviewGpuResult executeRawPreview(const RawPreviewGpuRequest& request) noexcept;
 

@@ -70,6 +70,15 @@ object VulkanRuntimeOwner {
         false
     }
 
+    fun prepareRawSingleFrameWorkingSet(frameWidth: Int, frameHeight: Int): Boolean {
+        if (frameWidth <= 0 || frameHeight <= 0) return false
+        return try {
+            VulkanNativeBridge.nativePrepareRawSingleFrameWorkingSet(frameWidth, frameHeight)
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
     fun exportApplicationDiagnostics(): Boolean = try {
         val export = diagnosticExport()
         DiagnosticsAggregator.record(

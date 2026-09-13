@@ -10,6 +10,7 @@ import android.util.Log
 import com.bncam.core.capture.FrameRequestProvenance
 import com.bncam.core.quality.FrameSensorMetadataSnapshot
 import com.bncam.core.capture.FrameSelectionExposurePolicy
+import com.bncam.core.vulkan.RawStillWorkingSetPrewarmer
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
 import java.util.ArrayDeque
@@ -870,6 +871,19 @@ class FrameRingBuffer(private var capacity: Int = 35) {
             null
         }
         if (acquiredBuffer == null) return false
+
+        // First accepted RAW producer frames carry the authoritative still-stream dimensions.
+        // Prewarm is asynchronous and allocation-only; addImage never waits for it.
+        if (actualFormat == android.graphics.ImageFormat.RAW10 ||
+            actualFormat == android.graphics.ImageFormat.RAW_SENSOR
+        ) {
+            RawStillWorkingSetPrewarmer.request(
+                width = image.width,
+                height = image.height,
+                generation = generationId
+            )
+        }
+
         if (firstImageArrivalNs == 0L) {
             firstImageArrivalNs = imageArrivalElapsedNs
             val fromConfiguredMs = if (sessionConfiguredElapsedNs > 0L) {

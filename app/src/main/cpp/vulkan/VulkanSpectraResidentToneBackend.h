@@ -287,6 +287,16 @@ struct SpectraResidentToneResult {
  */
 class VulkanSpectraResidentToneBackend final {
 public:
+    /** Prepare normal RAW single-frame scene/tone buffers without dispatching work. */
+    bool prepareWorkingSet(
+            VkDevice device,
+            VkCommandPool commandPool,
+            VulkanAllocatorOwner& allocatorOwner,
+            std::uint32_t frameWidth,
+            std::uint32_t frameHeight,
+            std::string& failureReason
+    ) noexcept;
+
     SpectraResidentSceneObserverResult executeSceneObserverFromResident(
             VkPhysicalDevice physicalDevice,
             VkDevice device,

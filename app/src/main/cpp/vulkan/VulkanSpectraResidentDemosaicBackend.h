@@ -244,6 +244,16 @@ public:
     VulkanSpectraResidentDemosaicBackend(const VulkanSpectraResidentDemosaicBackend&) = delete;
     VulkanSpectraResidentDemosaicBackend& operator=(const VulkanSpectraResidentDemosaicBackend&) = delete;
 
+    /** Prepare persistent single-frame still buffers without processing pixels. */
+    bool prepareWorkingSet(
+            VkDevice device,
+            VkCommandPool commandPool,
+            VulkanAllocatorOwner& allocatorOwner,
+            std::uint32_t frameWidth,
+            std::uint32_t frameHeight,
+            std::string& failureReason
+    ) noexcept;
+
     SpectraResidentDemosaicResult execute(
             VkPhysicalDevice physicalDevice,
             VkDevice device,
