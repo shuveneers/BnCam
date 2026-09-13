@@ -28,6 +28,7 @@
 #include "ProfileColorManagement.h"
 #include "IspCore.h"
 #include "RawCfaLevelMapping.h"
+#include "RawDigitalZoomCrop.h"
 #include "ultrahdr/UltraHdrJpegPackager.h"
 #include "JpegEncodingPolicy.h"
 #include "Demosaic.h"
@@ -4040,6 +4041,42 @@ Java_com_bncam_core_engine_ImageUtils_renderJpegFromMasterNative(
             jpegCloneRaw16Max = static_cast<int>(cloneMax);
         }
 #endif
+
+        // Camera2 RAW buffers intentionally remain full-sensor even when SCALER_CROP_REGION is
+        // active. Apply that sensor-space crop only to the private JPEG working view. The Master
+        // RAW16/DNG owner remains untouched, while the existing working-origin and resident-RAW
+        // offsets keep CFA phase, row stride and the Vulkan normalizer in the same geometry.
+        const auto rawDigitalZoomCrop = bncam::raw::resolveRawDigitalZoomCrop(
+                jpegWorkingOriginX,
+                jpegWorkingOriginY,
+                bayer16Isp.cols,
+                bayer16Isp.rows,
+                rawDomainInfo.cropRegion);
+        if (rawDigitalZoomCrop.applied) {
+            bayer16Isp = bayer16Isp(cv::Rect(
+                    rawDigitalZoomCrop.localLeft,
+                    rawDigitalZoomCrop.localTop,
+                    rawDigitalZoomCrop.width,
+                    rawDigitalZoomCrop.height));
+            jpegCropLeftInResidentRaw += rawDigitalZoomCrop.localLeft;
+            jpegCropTopInResidentRaw += rawDigitalZoomCrop.localTop;
+            jpegWorkingOriginX += rawDigitalZoomCrop.localLeft;
+            jpegWorkingOriginY += rawDigitalZoomCrop.localTop;
+            __android_log_print(
+                    ANDROID_LOG_INFO,
+                    "BnCam_RawZoom",
+                    "RAW JPEG crop applied sensorOrigin=%d,%d local=%d,%d size=%dx%d request=%d,%d,%d,%d",
+                    jpegWorkingOriginX,
+                    jpegWorkingOriginY,
+                    rawDigitalZoomCrop.localLeft,
+                    rawDigitalZoomCrop.localTop,
+                    rawDigitalZoomCrop.width,
+                    rawDigitalZoomCrop.height,
+                    rawDomainInfo.cropRegion[0],
+                    rawDomainInfo.cropRegion[1],
+                    rawDomainInfo.cropRegion[2],
+                    rawDomainInfo.cropRegion[3]);
+        }
 
         // Configure the private JPEG float working layer; the native RAW16 owner remains read-only.
         rawDomainInfo.width = bayer16Isp.cols;

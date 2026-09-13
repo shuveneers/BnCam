@@ -47,7 +47,7 @@ import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
@@ -1018,9 +1018,15 @@ fun CameraScreen(
     var exposureDialState by remember { mutableStateOf(ViewfinderExposureDialState()) }
     var pinchZoomDialVisible by remember { mutableStateOf(false) }
     var pinchGestureGeneration by remember { mutableIntStateOf(0) }
-    var pinchVirtualFocalMm by remember { mutableStateOf<Float?>(null) }
+    var directZoomInteraction by remember(activeLens.id) { mutableStateOf(false) }
+    var pinchHandoverArmedLensId by remember(activeLens.id) { mutableStateOf<String?>(null) }
+    var pinchHandoverArmedDirection by remember(activeLens.id) { mutableIntStateOf(0) }
+    var pinchLensTransitionInFlight by remember(activeLens.id) { mutableStateOf(false) }
     var pendingPinchLensId by remember { mutableStateOf<String?>(null) }
     var pendingPinchFocalMm by remember { mutableStateOf<Float?>(null) }
+    val pinchHandoverArmedLensIdState = rememberUpdatedState(pinchHandoverArmedLensId)
+    val pinchHandoverArmedDirectionState = rememberUpdatedState(pinchHandoverArmedDirection)
+    val pinchLensTransitionInFlightState = rememberUpdatedState(pinchLensTransitionInFlight)
     val maxDigitalZoom = cameraUiHardwareState.maxDigitalZoom
     val manualWhiteBalanceSupported = cameraUiHardwareState.manualWhiteBalanceSupported
     val rearFocalLenses = remember(visibleLenses) {
@@ -1031,14 +1037,167 @@ fun CameraScreen(
             .sortedBy { it.equivalentFocalLength35mm }
             .toList()
     }
+    val rearFocalLensIds = remember(rearFocalLenses) { rearFocalLenses.map { it.id } }
+    var rearLensDigitalZoomLimits by remember { mutableStateOf<Map<String, Float>>(emptyMap()) }
+    LaunchedEffect(rearFocalLensIds) {
+        rearLensDigitalZoomLimits = withContext(kotlinx.coroutines.Dispatchers.IO) {
+            rearFocalLenses.associate { lens ->
+                val maxZoom = runCatching {
+                    uiCameraManager.getCameraCharacteristics(lens.id)
+                }.recoverCatching {
+                    val route = bnCameraManager.resolveCameraDeviceRoute(lens.id)
+                    uiCameraManager.getCameraCharacteristics(route.logicalCameraId)
+                }.getOrNull()
+                    ?.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM)
+                    ?.coerceAtLeast(1f)
+                    ?: 1f
+                lens.id to maxZoom
+            }
+        }
+    }
     val activeNativeFocalMm = activeLens.equivalentFocalLength35mm
         ?.takeIf { it > 0f }
         ?: rearFocalLenses.minByOrNull { kotlin.math.abs(it.opticalZoomRatio - activeLens.opticalZoomRatio) }
             ?.equivalentFocalLength35mm
         ?: 24f
+    val activeOpticalZoomRatio = activeLens.opticalZoomRatio.takeIf { it.isFinite() && it > 0f } ?: 1f
+    val activeIsRear = activeLens.facing != CameraCharacteristics.LENS_FACING_FRONT
+    val globalZoomRailMin = if (activeIsRear) {
+        rearFocalLenses
+            .map { it.opticalZoomRatio }
+            .filter { it.isFinite() && it > 0f }
+            .minOrNull()
+            ?: activeOpticalZoomRatio
+    } else {
+        1f
+    }
+    val globalZoomRailMax = if (activeIsRear) {
+        maxOf(
+            activeOpticalZoomRatio * maxDigitalZoom.coerceAtLeast(1f),
+            rearFocalLenses.maxOfOrNull { lens ->
+                val nativeRatio = lens.opticalZoomRatio.takeIf { it.isFinite() && it > 0f } ?: 1f
+                nativeRatio * (rearLensDigitalZoomLimits[lens.id] ?: 1f)
+            } ?: activeOpticalZoomRatio
+        )
+    } else {
+        maxDigitalZoom.coerceAtLeast(1f)
+    }.coerceAtLeast(globalZoomRailMin)
+    val globalZoomSensorStops = remember(rearFocalLenses, activeLens.id, activeIsRear) {
+        if (activeIsRear) {
+            rearFocalLenses.mapNotNull { lens ->
+                lens.opticalZoomRatio
+                    .takeIf { it.isFinite() && it > 0f }
+                    ?.let { ratio ->
+                        ZoomSensorStop(
+                            lensId = lens.id,
+                            zoomRatio = ratio,
+                            active = lens.id == activeLens.id
+                        )
+                    }
+            }
+        } else {
+            listOf(
+                ZoomSensorStop(
+                    lensId = activeLens.id,
+                    zoomRatio = 1f,
+                    active = true
+                )
+            )
+        }
+    }
+    val currentGlobalZoom = if (activeIsRear) {
+        activeOpticalZoomRatio * currentZoomLevel
+    } else {
+        currentZoomLevel
+    }
+    val globalReferenceFocalMm = if (activeIsRear) {
+        activeNativeFocalMm / activeOpticalZoomRatio.coerceAtLeast(0.01f)
+    } else {
+        activeNativeFocalMm
+    }
+    // Camera2 setRepeatingRequest is not a touch-rate API. Keep UI/RAW-preview motion immediate,
+    // but pace hardware zoom submissions to about one command per 40 ms and always flush the exact
+    // final value when the interaction ends. This prevents YUV preview starvation while retaining
+    // the responsive slider/pinch feel.
+    val interactiveZoomSubmitNs = remember(activeLens.id) { longArrayOf(0L) }
+    val interactiveZoomLastSubmitted = remember(activeLens.id) { floatArrayOf(1f) }
+    val interactiveZoomLastTarget = remember(activeLens.id) { floatArrayOf(1f) }
     fun requestSmoothZoom(targetZoom: Float, durationMs: Int = 90) {
+        directZoomInteraction = false
         requestedZoomLevel = targetZoom.coerceIn(1f, maxDigitalZoom.coerceAtLeast(1f))
         zoomAnimationDurationMs = durationMs.coerceIn(45, 360)
+    }
+    fun applyInteractiveZoom(targetZoom: Float) {
+        val safeZoom = targetZoom.coerceIn(1f, maxDigitalZoom.coerceAtLeast(1f))
+        directZoomInteraction = true
+        requestedZoomLevel = safeZoom
+        currentZoomLevel = safeZoom
+        interactiveZoomLastTarget[0] = safeZoom
+
+        val nowNs = SystemClock.elapsedRealtimeNanos()
+        if (nowNs - interactiveZoomSubmitNs[0] >= 40_000_000L &&
+            abs(safeZoom - interactiveZoomLastSubmitted[0]) > 0.0005f
+        ) {
+            interactiveZoomSubmitNs[0] = nowNs
+            interactiveZoomLastSubmitted[0] = safeZoom
+            bnCameraManager.setZoom(safeZoom)
+        }
+    }
+    fun finishInteractiveZoom() {
+        val finalZoom = interactiveZoomLastTarget[0]
+            .coerceIn(1f, maxDigitalZoom.coerceAtLeast(1f))
+        if (abs(finalZoom - interactiveZoomLastSubmitted[0]) > 0.0005f) {
+            bnCameraManager.setZoom(finalZoom)
+            interactiveZoomLastSubmitted[0] = finalZoom
+            interactiveZoomSubmitNs[0] = SystemClock.elapsedRealtimeNanos()
+        }
+        directZoomInteraction = false
+    }
+
+    fun resolveGlobalZoomLens(targetGlobalZoom: Float): LensInfo {
+        if (!activeIsRear || rearFocalLenses.isEmpty()) return activeLens
+        return rearFocalLenses
+            .lastOrNull { lens ->
+                val nativeRatio = lens.opticalZoomRatio.takeIf { it.isFinite() && it > 0f }
+                    ?: return@lastOrNull false
+                nativeRatio <= targetGlobalZoom + 0.001f
+            }
+            ?: rearFocalLenses.first()
+    }
+
+    fun applyGlobalZoom(targetGlobalZoom: Float, interactive: Boolean) {
+        val safeGlobalZoom = targetGlobalZoom.coerceIn(globalZoomRailMin, globalZoomRailMax)
+        if (!activeIsRear) {
+            if (interactive) applyInteractiveZoom(safeGlobalZoom)
+            else requestSmoothZoom(safeGlobalZoom, durationMs = 180)
+            return
+        }
+
+        val targetLens = resolveGlobalZoomLens(safeGlobalZoom)
+        val targetNativeRatio = targetLens.opticalZoomRatio
+            .takeIf { it.isFinite() && it > 0f }
+            ?: 1f
+        if (targetLens.id == activeLens.id) {
+            val targetLocalZoom = (safeGlobalZoom / activeOpticalZoomRatio)
+                .coerceIn(1f, maxDigitalZoom.coerceAtLeast(1f))
+            if (interactive) applyInteractiveZoom(targetLocalZoom)
+            else requestSmoothZoom(targetLocalZoom, durationMs = 180)
+            return
+        }
+
+        if (pinchLensTransitionInFlight) return
+        pinchLensTransitionInFlight = true
+        pinchHandoverArmedLensId = null
+        pinchHandoverArmedDirection = 0
+        pendingPinchLensId = targetLens.id
+        pendingPinchFocalMm = globalReferenceFocalMm * safeGlobalZoom
+        onLensSelected(targetLens)
+
+        // Keep the intended residual zoom in the same global coordinate system. The new sensor's
+        // activeLens effect converts this focal target back into its local Camera2 zoom ratio.
+        val expectedLocalZoom = safeGlobalZoom / targetNativeRatio
+        interactiveZoomLastTarget[0] = expectedLocalZoom.coerceAtLeast(1f)
+        directZoomInteraction = false
     }
 
     // --- Timer States ---
@@ -1182,8 +1341,25 @@ fun CameraScreen(
     }
 
     val zoomActuator = remember(activeLens.id) { Animatable(1f) }
-    LaunchedEffect(requestedZoomLevel, zoomAnimationDurationMs, maxDigitalZoom, activeLens.id) {
+    LaunchedEffect(
+        requestedZoomLevel,
+        zoomAnimationDurationMs,
+        maxDigitalZoom,
+        activeLens.id,
+        directZoomInteraction
+    ) {
         val target = requestedZoomLevel.coerceIn(1f, maxDigitalZoom.coerceAtLeast(1f))
+        if (directZoomInteraction) {
+            // Gesture path: hardware is paced by applyInteractiveZoom(). Keep the actuator
+            // synchronized without issuing a duplicate Camera2 request.
+            zoomActuator.snapTo(target)
+            currentZoomLevel = target
+            return@LaunchedEffect
+        }
+        if (abs(zoomActuator.value - target) <= 0.0005f) {
+            currentZoomLevel = target
+            return@LaunchedEffect
+        }
         zoomActuator.animateTo(
             targetValue = target,
             animationSpec = tween(
@@ -1199,9 +1375,10 @@ fun CameraScreen(
     LaunchedEffect(pinchGestureGeneration) {
         if (pinchGestureGeneration > 0) {
             pinchZoomDialVisible = true
-            delay(420)
+            // Keep the morphed zoom slider available after the last zoom input so the user can
+            // make a precise follow-up adjustment without reopening it.
+            delay(3_000)
             pinchZoomDialVisible = false
-            pinchVirtualFocalMm = null
         }
     }
 
@@ -1228,9 +1405,16 @@ fun CameraScreen(
     // gesture, restore the requested equivalent focal length on the new sensor immediately after
     // its zoom capability is known.
     LaunchedEffect(activeLens.id) {
+        directZoomInteraction = false
         currentZoomLevel = 1f
         requestedZoomLevel = 1f
+        pinchHandoverArmedLensId = null
+        pinchHandoverArmedDirection = 0
+        pinchLensTransitionInFlight = false
         zoomActuator.snapTo(1f)
+        interactiveZoomLastTarget[0] = 1f
+        interactiveZoomLastSubmitted[0] = 1f
+        interactiveZoomSubmitNs[0] = 0L
         bnCameraManager.setZoom(1f)
     }
 
@@ -1241,8 +1425,10 @@ fun CameraScreen(
         // CameraUiHardwareState is intentionally reset while a new sensor is opening. Do not lose
         // a >1x residual request during that short 1x placeholder window.
         if (residualZoom > 1.001f && maxDigitalZoom <= 1.001f) return@LaunchedEffect
-        requestedZoomLevel = residualZoom.coerceIn(1f, maxDigitalZoom.coerceAtLeast(1f))
-        zoomAnimationDurationMs = 70
+        requestSmoothZoom(
+            residualZoom.coerceIn(1f, maxDigitalZoom.coerceAtLeast(1f)),
+            durationMs = 120
+        )
         pendingPinchLensId = null
         pendingPinchFocalMm = null
     }
@@ -1899,40 +2085,156 @@ fun CameraScreen(
                         }
                     )
                 }
-                .pointerInput(activeLens.id, rearFocalLenses, maxDigitalZoom) {
-                    detectTransformGestures { _, _, zoomMultiplier, _ ->
-                        if (!zoomMultiplier.isFinite() || zoomMultiplier <= 0f) return@detectTransformGestures
-                        if (abs(zoomMultiplier - 1f) < 0.002f) return@detectTransformGestures
-                        pinchGestureGeneration += 1
+                .pointerInput(activeLens.id, rearFocalLenses, maxDigitalZoom, useHaptics) {
+                    awaitEachGesture {
+                        awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Main)
 
-                        val firstNative = rearFocalLenses.firstOrNull()?.equivalentFocalLength35mm ?: activeNativeFocalMm
-                        val lastNative = rearFocalLenses.lastOrNull()?.equivalentFocalLength35mm ?: activeNativeFocalMm
-                        val minFocal = firstNative.coerceAtMost(activeNativeFocalMm)
-                        val maxFocal = (lastNative * maxDigitalZoom.coerceAtLeast(1f))
-                            .coerceAtLeast(activeNativeFocalMm)
-                        val currentVirtual = pinchVirtualFocalMm
-                            ?: (activeNativeFocalMm * requestedZoomLevel)
-                        val requestedFocal = (currentVirtual * zoomMultiplier).coerceIn(minFocal, maxFocal)
-                        pinchVirtualFocalMm = requestedFocal
+                        var gestureFocal = activeNativeFocalMm * currentZoomLevelState.value
+                        var detentTargetLensId: String? = null
+                        var detentDirection = 0
+                        var detentHapticSent = false
+                        var transitionRequested = false
 
-                        val targetLens = rearFocalLenses
-                            .lastOrNull { (it.equivalentFocalLength35mm ?: Float.MAX_VALUE) <= requestedFocal + 0.15f }
-                            ?: rearFocalLenses.firstOrNull()
-                            ?: activeLens
+                        val gestureArmedLensId = pinchHandoverArmedLensIdState.value
+                        val gestureArmedDirection = pinchHandoverArmedDirectionState.value
 
-                        if (targetLens.id != activeLens.id) {
-                            pendingPinchFocalMm = requestedFocal
-                            if (pendingPinchLensId != targetLens.id) {
+                        while (true) {
+                            val event = awaitPointerEvent(PointerEventPass.Main)
+                            if (event.changes.none { it.pressed }) break
+
+                            val pressedCount = event.changes.count { it.pressed }
+                            if (pressedCount < 2 || transitionRequested || pinchLensTransitionInFlightState.value) {
+                                continue
+                            }
+
+                            val zoomMultiplier = event.calculateZoom()
+                            if (!zoomMultiplier.isFinite() || zoomMultiplier <= 0f) continue
+                            if (abs(zoomMultiplier - 1f) < 0.002f) continue
+
+                            pinchGestureGeneration += 1
+
+                            val firstNative = rearFocalLenses.firstOrNull()
+                                ?.equivalentFocalLength35mm ?: activeNativeFocalMm
+                            val lastNative = rearFocalLenses.lastOrNull()
+                                ?.equivalentFocalLength35mm ?: activeNativeFocalMm
+                            val minFocal = firstNative.coerceAtMost(activeNativeFocalMm)
+                            val maxFocal = (lastNative * maxDigitalZoom.coerceAtLeast(1f))
+                                .coerceAtLeast(activeNativeFocalMm)
+                            var rawRequestedFocal = (gestureFocal * zoomMultiplier)
+                                .coerceIn(minFocal, maxFocal)
+
+                            val activeLensIndex = rearFocalLenses.indexOfFirst { it.id == activeLens.id }
+                            val previousLens =
+                                if (activeLensIndex > 0) rearFocalLenses[activeLensIndex - 1] else null
+                            val nextLens =
+                                if (activeLensIndex >= 0 && activeLensIndex < rearFocalLenses.lastIndex) {
+                                    rearFocalLenses[activeLensIndex + 1]
+                                } else {
+                                    null
+                                }
+
+                            var effectiveFocal = rawRequestedFocal
+                            var targetLens: LensInfo? = null
+                            detentTargetLensId = null
+                            detentDirection = 0
+
+                            if (activeLensIndex >= 0) {
+                                val nextNative = nextLens?.equivalentFocalLength35mm?.takeIf { it > 0f }
+                                if (nextLens != null && nextNative != null && zoomMultiplier > 1f) {
+                                    val nextDetent = nextNative * 0.985f
+                                    val nextRelease = nextNative * 1.020f
+                                    val armedForNext =
+                                        gestureArmedLensId == nextLens.id && gestureArmedDirection == 1
+
+                                    if (armedForNext && rawRequestedFocal >= nextRelease) {
+                                        targetLens = nextLens
+                                    } else if (rawRequestedFocal >= nextDetent) {
+                                        // First gesture ends here. Even if the fingers keep moving,
+                                        // do not cross sensors in the same gesture. A subsequent
+                                        // pinch from this stable endpoint provides the deliberate
+                                        // extra push required for physical-lens handover.
+                                        effectiveFocal = nextDetent
+                                        detentTargetLensId = nextLens.id
+                                        detentDirection = 1
+                                        if (!armedForNext) {
+                                            rawRequestedFocal = nextDetent
+                                        }
+                                    }
+                                }
+
+                                val previousNative =
+                                    previousLens?.equivalentFocalLength35mm?.takeIf { it > 0f }
+                                if (targetLens == null && previousLens != null && previousNative != null &&
+                                    zoomMultiplier < 1f
+                                ) {
+                                    val previousDetent = activeNativeFocalMm
+                                    val previousRelease = activeNativeFocalMm * 0.970f
+                                    val armedForPrevious =
+                                        gestureArmedLensId == previousLens.id &&
+                                            gestureArmedDirection == -1
+
+                                    if (armedForPrevious && rawRequestedFocal <= previousRelease) {
+                                        targetLens = previousLens
+                                    } else if (rawRequestedFocal <= previousDetent) {
+                                        effectiveFocal = previousDetent
+                                        detentTargetLensId = previousLens.id
+                                        detentDirection = -1
+                                        if (!armedForPrevious) {
+                                            rawRequestedFocal = previousDetent
+                                        }
+                                    }
+                                }
+                            }
+
+                            if (detentTargetLensId != null && !detentHapticSent) {
+                                detentHapticSent = true
+                                if (useHaptics) {
+                                    haptic.performHapticFeedback(
+                                        androidx.compose.ui.hapticfeedback.HapticFeedbackType.TextHandleMove
+                                    )
+                                }
+                            }
+
+                            gestureFocal = rawRequestedFocal
+
+                            if (targetLens != null && targetLens.id != activeLens.id) {
+                                transitionRequested = true
+                                pinchLensTransitionInFlight = true
+                                pinchHandoverArmedLensId = null
+                                pinchHandoverArmedDirection = 0
+                                pendingPinchFocalMm = rawRequestedFocal
                                 pendingPinchLensId = targetLens.id
                                 onLensSelected(targetLens)
+
+                                // Once a physical transition is requested, freeze all remaining
+                                // samples from this gesture. The new Camera2 generation owns zoom
+                                // again after activeLens changes.
+                                event.changes.forEach { change ->
+                                    if (change.pressed) change.consume()
+                                }
+                                continue
                             }
-                        } else if (pendingPinchLensId == null) {
-                            requestSmoothZoom(
-                                targetZoom = requestedFocal / activeNativeFocalMm,
-                                durationMs = 70
-                            )
+
+                            val effectiveZoom = (effectiveFocal / activeNativeFocalMm)
+                                .coerceIn(1f, maxDigitalZoom.coerceAtLeast(1f))
+                            applyInteractiveZoom(effectiveZoom)
+
+                            event.changes.forEach { change ->
+                                if (change.pressed) change.consume()
+                            }
+                        }
+
+                        if (!transitionRequested) {
+                            finishInteractiveZoom()
+                            if (detentTargetLensId != null && detentDirection != 0) {
+                                pinchHandoverArmedLensId = detentTargetLensId
+                                pinchHandoverArmedDirection = detentDirection
+                            } else {
+                                pinchHandoverArmedLensId = null
+                                pinchHandoverArmedDirection = 0
+                            }
                         } else {
-                            pendingPinchFocalMm = requestedFocal
+                            directZoomInteraction = false
                         }
                     }
                 }
@@ -2019,19 +2321,7 @@ fun CameraScreen(
                 uiRotationDegrees = animatedUiRotation
             )
 
-            if (pinchZoomDialVisible) {
-                FullWidthFocalLengthDial(
-                    currentFocalMm = pinchVirtualFocalMm ?: (activeNativeFocalMm * currentZoomLevel),
-                    sensorFocalLengthsMm = rearFocalLenses.mapNotNull { it.equivalentFocalLength35mm },
-                    maxFocalMm = ((rearFocalLenses.lastOrNull()?.equivalentFocalLength35mm
-                        ?: activeNativeFocalMm) * maxDigitalZoom.coerceAtLeast(1f)),
-                    modifier = Modifier
-                        .align(Alignment.BottomCenter)
-                        .fillMaxWidth()
-                        .padding(horizontal = 2.dp, vertical = 4.dp)
-                        .zIndex(8f)
-                )
-            } else if (exposureDialState.visible) {
+            if (exposureDialState.visible) {
                 FullWidthExposureDial(
                     state = exposureDialState,
                     modifier = Modifier
@@ -2042,14 +2332,36 @@ fun CameraScreen(
                 )
             }
 
-            if (!exposureDialState.visible && !pinchZoomDialVisible) {
+            if (!exposureDialState.visible) {
                 QuickZoomPill(
-                    currentZoom = { requestedZoomLevel },
-                    maxZoom = maxDigitalZoom,
+                    currentZoom = { currentGlobalZoom },
+                    minZoom = globalZoomRailMin,
+                    maxZoom = globalZoomRailMax,
+                    sensorStops = globalZoomSensorStops,
                     uiRotationDegrees = animatedUiRotation,
+                    expanded = pinchZoomDialVisible,
                     onZoomSelected = { target ->
-                        pinchVirtualFocalMm = activeNativeFocalMm * target
-                        requestSmoothZoom(target, durationMs = 180)
+                        pinchGestureGeneration += 1
+                        if (!pinchLensTransitionInFlight) {
+                            pinchHandoverArmedLensId = null
+                            pinchHandoverArmedDirection = 0
+                            applyGlobalZoom(targetGlobalZoom = target, interactive = false)
+                        }
+                    },
+                    onZoomScrubbed = { target ->
+                        pinchGestureGeneration += 1
+                        if (!pinchLensTransitionInFlight) {
+                            pinchHandoverArmedLensId = null
+                            pinchHandoverArmedDirection = 0
+                            applyGlobalZoom(targetGlobalZoom = target, interactive = true)
+                        }
+                    },
+                    onScrubActiveChange = { active ->
+                        pinchGestureGeneration += 1
+                        if (!active) {
+                            if (!pinchLensTransitionInFlight) finishInteractiveZoom()
+                            else directZoomInteraction = false
+                        }
                     },
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
