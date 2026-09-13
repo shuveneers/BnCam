@@ -21,7 +21,7 @@ class Phase7QuickSettingsContractTest {
     }
 
     @Test
-    fun `camera screen writes quick controls through canonical settings repository setters`() {
+    fun `camera screen writes quick controls and layout through canonical settings repository setters`() {
         val camera = source("src/main/java/com/bncam/ui/screens/capture/CameraScreen.kt")
         listOf(
             "repository.setFlashMode(mode)",
@@ -36,15 +36,25 @@ class Phase7QuickSettingsContractTest {
             "repository.setHistogram(enabled)",
             "repository.setFocusTracking(enabled)",
             "repository.setHorizonLeveler(enabled)",
-            "repository.setFaceDetection(enabled)"
+            "repository.setFaceDetection(enabled)",
+            "repository.setQuickSettingsAssignments(normalized.take(9))",
+            "repository.setUltraHdrGainmapEnabled(true)",
+            "repository.setUltraHdrGainmapEnabled(false)"
         ).forEach { expected -> assertTrue(camera.contains(expected), expected) }
     }
 
     @Test
-    fun `quick settings uses three columns and swipe down is observed before child consumers`() {
+    fun `quick settings exposes nine assignable slots pencil editor and three shot modes`() {
         val camera = source("src/main/java/com/bncam/ui/screens/capture/CameraScreen.kt")
         val overlay = source("src/main/java/com/bncam/ui/screens/capture/ViewfinderQuickSettingsOverlay.kt")
-        assertTrue(overlay.contains("tiles.chunked(3)"))
+        assertTrue(overlay.contains("normalizedAssignments.take(9).chunked(3)"))
+        assertTrue(overlay.contains("Icons.Default.Edit"))
+        assertFalse(overlay.contains("\"Close\""))
+        assertTrue(overlay.contains("onQuickSettingAssigned"))
+        assertTrue(overlay.contains("ViewfinderQuickSettingIds.all"))
+        assertTrue(overlay.contains("QuickShotMode.PORTRAIT"))
+        assertTrue(overlay.contains("QuickShotMode.ULTRA_HDR"))
+        assertTrue(overlay.contains("QuickShotMode.NIGHT"))
         assertTrue(overlay.contains("viewfinderStream: ViewfinderStream"))
         assertTrue(overlay.contains("uiRotationDegrees: Float"))
         assertTrue(overlay.contains("Modifier.weight(1f)"))

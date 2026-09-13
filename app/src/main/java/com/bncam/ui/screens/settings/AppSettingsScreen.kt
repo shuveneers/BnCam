@@ -27,6 +27,9 @@ import com.bncam.core.capture.OutputPolicy
 import com.bncam.core.capture.FrameCapacityPolicy
 import com.bncam.core.capture.FrameOrigin
 import com.bncam.data.settings.DngSourcePolicy
+import com.bncam.data.settings.LensIndicatorStyle
+import com.bncam.data.settings.lensIndicatorStyleFlow
+import com.bncam.data.settings.setLensIndicatorStyle
 import com.bncam.ui.components.SettingSliderRow
 import com.bncam.ui.components.SettingToggleRow
 import com.bncam.ui.components.SettingValueRow
@@ -37,14 +40,13 @@ val CardBackground = Color(0xFF1E1E1E)
 
 @Composable
 fun AppSettingsScreen(
-    activeProfileId: String, // <-- NIEUW: Om de buffer state van de actieve lens te checken
+    activeProfileId: String,
     onNavigateBack: () -> Unit
 ) {
     val context = LocalContext.current
     val repository = remember { SettingsRepository(context) }
     val scope = rememberCoroutineScope()
 
-    // --- File & Storage States ---
     val saveLocation by repository.saveLocationFlow.collectAsState(initial = "DCIM/BnCam")
     val outputPolicy by repository.outputPolicyFlow.collectAsState(initial = OutputPolicy.JPEG)
     val outputModeSettings by repository.getOutputModeSettingsFlow().collectAsState(
@@ -63,23 +65,21 @@ fun AppSettingsScreen(
     val dngFrameOrigin = if (preferredFrame == "RAW_SENSOR") FrameOrigin.RAW_SENSOR else FrameOrigin.RAW10
     val maxDngMasterFrames = FrameCapacityPolicy.maximumDngMasterFrames(dngFrameOrigin)
 
-    // --- Device & Interaction States ---
     val hapticFeedback by repository.hapticFeedbackFlow.collectAsState(initial = true)
     val cameraSounds by repository.cameraSoundsFlow.collectAsState(initial = true)
     val volumeButtonAction by repository.volumeButtonActionFlow.collectAsState(initial = "Take Photo")
     val forceMaxBrightness by repository.forceMaxBrightnessFlow.collectAsState(initial = false)
+    val lensIndicatorStyle by context.lensIndicatorStyleFlow.collectAsState(initial = LensIndicatorStyle.FLOATING)
 
-    // --- Privacy & Advanced States ---
     val saveLocationData by repository.saveLocationDataFlow.collectAsState(initial = false)
     val enableShotLogger by repository.enableShotLoggerFlow.collectAsState(initial = false)
     val phoneAssistanceSensors by repository.phoneAssistanceSensorsFlow.collectAsState(initial = false)
 
-    // --- GPS Permissie Launcher ---
     val locationPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions(),
         onResult = { permissions ->
             val granted = permissions[Manifest.permission.ACCESS_FINE_LOCATION] == true ||
-                    permissions[Manifest.permission.ACCESS_COARSE_LOCATION] == true
+                permissions[Manifest.permission.ACCESS_COARSE_LOCATION] == true
             scope.launch { repository.setSaveLocationData(granted) }
             if (!granted) {
                 Toast.makeText(context, "Location permission denied", Toast.LENGTH_SHORT).show()
@@ -87,13 +87,11 @@ fun AppSettingsScreen(
         }
     )
 
-    // --- Dialog Triggers ---
     var showShotLoggerConfig by remember { mutableStateOf(false) }
     var showPhotoPrefixDialog by remember { mutableStateOf(false) }
     var showLocationDialog by remember { mutableStateOf(false) }
     var tempInput by remember { mutableStateOf("") }
 
-    // --- ShotLogger Config States ---
     val logSummary by repository.logSummaryFlow.collectAsState(initial = true)
     val logActiveMode by repository.logActiveModeFlow.collectAsState(initial = true)
     val logProfileSettings by repository.logProfileSettingsFlow.collectAsState(initial = true)
@@ -133,7 +131,6 @@ fun AppSettingsScreen(
                 .verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            // KAART 1: FILE & STORAGE
             SettingsCard(title = "File & Storage") {
                 SettingValueRow(
                     title = "Save location",
@@ -145,7 +142,6 @@ fun AppSettingsScreen(
                     }
                 )
 
-                // DE GEÜPDATE SAVE FORMAT KNOP
                 SettingValueRow(
                     title = "Save format",
                     description = if (isRawDngCapableBuffer) {
@@ -245,7 +241,6 @@ fun AppSettingsScreen(
                 )
             }
 
-            // KAART 2: DEVICE & INTERACTION
             SettingsCard(title = "Device & Interaction") {
                 SettingToggleRow(
                     title = "Haptic feedback",
@@ -265,13 +260,29 @@ fun AppSettingsScreen(
                     value = "Change",
                     onClick = {
                         scope.launch {
-                            val next = when(volumeButtonAction) {
+                            val next = when (volumeButtonAction) {
                                 "Take Photo" -> "Zoom"
                                 "Zoom" -> "Device Volume"
                                 "Device Volume" -> "Do Nothing"
                                 else -> "Take Photo"
                             }
                             repository.setVolumeButtonAction(next)
+                        }
+                    }
+                )
+                SettingValueRow(
+                    title = "Lens indicator style",
+                    description = "Floating uses the arc selector. List keeps the same lens button and opens a compact sensor list above it. Direct list keeps every active sensor visible.",
+                    value = lensIndicatorStyle.displayName,
+                    onClick = {
+                        scope.launch {
+                            context.setLensIndicatorStyle(
+                                when (lensIndicatorStyle) {
+                                    LensIndicatorStyle.FLOATING -> LensIndicatorStyle.LIST
+                                    LensIndicatorStyle.LIST -> LensIndicatorStyle.DIRECT_LIST
+                                    LensIndicatorStyle.DIRECT_LIST -> LensIndicatorStyle.FLOATING
+                                }
+                            )
                         }
                     }
                 )
@@ -283,7 +294,6 @@ fun AppSettingsScreen(
                 )
             }
 
-            // KAART 3: PRIVACY & ADVANCED
             SettingsCard(title = "Privacy & Advanced") {
                 SettingToggleRow(
                     title = "Computational HDR",
@@ -374,10 +384,6 @@ fun AppSettingsScreen(
         }
     }
 
-    // ==========================================
-    // DIALOGS
-    // ==========================================
-
     if (showPhotoPrefixDialog) {
         TextInputDialog(
             title = "Edit Photo Prefix",
@@ -439,10 +445,6 @@ fun AppSettingsScreen(
         )
     }
 }
-
-// ==========================================
-// HELPER COMPONENTS
-// ==========================================
 
 @Composable
 fun TextInputDialog(

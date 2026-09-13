@@ -306,6 +306,13 @@ class SettingsRepository(private val context: Context) {
 
     private val activeLensIdKey = stringPreferencesKey("active_lens_id")
     private val activeProfileIdKey = stringPreferencesKey("active_profile_id")
+    private val quickSettingsAssignmentsKey = stringPreferencesKey("vf_quick_settings_assignments")
+    private val supportedQuickSettingIds = listOf(
+        "flash", "timer", "watermark", "output", "viewfinder", "geotag",
+        "focus_peaking", "metering", "histogram", "focus_track",
+        "horizon_leveler", "face_detection"
+    )
+    private val defaultQuickSettingAssignments = supportedQuickSettingIds.take(9)
 
     // ShotLogger Toggles
     private val logSummaryKey = booleanPreferencesKey("log_summary")
@@ -358,6 +365,22 @@ class SettingsRepository(private val context: Context) {
 
     val activeLensIdFlow: Flow<String?> = context.dataStore.data.map { it[activeLensIdKey] }
     val activeProfileIdFlow: Flow<String?> = context.dataStore.data.map { it[activeProfileIdKey] }
+    val quickSettingsAssignmentsFlow: Flow<List<String>> = context.dataStore.data.map { preferences ->
+        val stored = preferences[quickSettingsAssignmentsKey]
+            ?.split(',')
+            ?.map { it.trim() }
+            ?.filter { it in supportedQuickSettingIds }
+            ?.distinct()
+            .orEmpty()
+        val resolved = stored.take(9).toMutableList()
+        defaultQuickSettingAssignments.forEach { id ->
+            if (resolved.size < 9 && id !in resolved) resolved += id
+        }
+        supportedQuickSettingIds.forEach { id ->
+            if (resolved.size < 9 && id !in resolved) resolved += id
+        }
+        resolved.take(9)
+    }
 
     // --- SETTERS (Suspend functions) ---
     suspend fun setForceGooglePhotos(enabled: Boolean) = context.dataStore.edit { it[forceGooglePhotosKey] = enabled }
@@ -389,6 +412,17 @@ class SettingsRepository(private val context: Context) {
 
     suspend fun setActiveLensId(lensId: String) = context.dataStore.edit { it[activeLensIdKey] = lensId }
     suspend fun setActiveProfileId(profileId: String) = context.dataStore.edit { it[activeProfileIdKey] = profileId }
+    suspend fun setQuickSettingsAssignments(assignments: List<String>) = context.dataStore.edit { preferences ->
+        val resolved = assignments
+            .filter { it in supportedQuickSettingIds }
+            .distinct()
+            .take(9)
+            .toMutableList()
+        defaultQuickSettingAssignments.forEach { id ->
+            if (resolved.size < 9 && id !in resolved) resolved += id
+        }
+        preferences[quickSettingsAssignmentsKey] = resolved.joinToString(",")
+    }
 
     /** Persist the user-visible camera route atomically so collectors never observe a new lens
      * paired with the previous lens' profile (or vice versa). */

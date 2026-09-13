@@ -137,6 +137,8 @@ import com.bncam.core.quality.ViewfinderLiveTuning
 import com.bncam.core.output.CaptureWorkState
 import com.bncam.data.profile.CameraProfile
 import com.bncam.data.settings.SettingsRepository
+import com.bncam.data.settings.LensIndicatorStyle
+import com.bncam.data.settings.lensIndicatorStyleFlow
 import com.bncam.data.settings.ProfileAwbSettings
 import com.bncam.data.settings.ViewfinderSliderAssignment
 import kotlinx.coroutines.delay
@@ -948,6 +950,22 @@ fun CameraScreen(
     val centerCrosshair by repository.centerCrosshairFlow.collectAsState(initial = false)
     val outputPolicy by repository.outputPolicyFlow.collectAsState(initial = OutputPolicy.JPEG)
     val viewfinderStream by repository.viewfinderStreamFlow.collectAsState(initial = ViewfinderStream.YUV)
+    val activeProfileFrameSource by repository.getProfileFrameSourceFlow(activeProfile.id)
+        .collectAsState(initial = "YUV")
+    val activeProfileStreamLabel = remember(activeProfileFrameSource) {
+        when {
+            activeProfileFrameSource.uppercase(Locale.US).contains("RAW_SENSOR") -> "RawSensor"
+            activeProfileFrameSource.uppercase(Locale.US).contains("RAW10") -> "RAW10"
+            else -> "YUV"
+        }
+    }
+    val quickSettingAssignments by repository.quickSettingsAssignmentsFlow.collectAsState(
+        initial = ViewfinderQuickSettingIds.defaults
+    )
+    val ultraHdrGainmapEnabled by repository.ultraHdrGainmapEnabledFlow.collectAsState(initial = false)
+    val lensIndicatorStyle by context.lensIndicatorStyleFlow.collectAsState(
+        initial = LensIndicatorStyle.FLOATING
+    )
 
     // --- Focus Settings Ophalen ---
     val focusData by repository.focusDataFlow.collectAsState(initial = false)
@@ -1808,10 +1826,51 @@ fun CameraScreen(
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
+    // Floating shade is deliberately drawn after the screen content: it sits over the
+    // viewfinder and shutter. The expanded lens Popup redraws the master lens control and sensor
+    // buttons above this shade, so the selector itself remains crisp and fully interactive.
+    var lensSelectorExpanded by remember { mutableStateOf(false) }
+    LaunchedEffect(lensIndicatorStyle) {
+        if (lensIndicatorStyle != LensIndicatorStyle.FLOATING) lensSelectorExpanded = false
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
             .background(Color.Black)
+            .drawWithContent {
+                drawContent()
+                if (lensIndicatorStyle == LensIndicatorStyle.FLOATING && lensSelectorExpanded) {
+                    val radius = minOf(size.width * 0.96f, 380.dp.toPx())
+                    val right = size.width
+                    val bottom = size.height
+                    val quarterArcKappa = 0.55228475f
+                    val shadePath = Path().apply {
+                        moveTo(right, bottom)
+                        lineTo(right - radius, bottom)
+                        cubicTo(
+                            right - radius, bottom - quarterArcKappa * radius,
+                            right - quarterArcKappa * radius, bottom - radius,
+                            right, bottom - radius
+                        )
+                        lineTo(right, bottom)
+                        close()
+                    }
+                    drawPath(
+                        path = shadePath,
+                        brush = Brush.radialGradient(
+                            colors = listOf(
+                                Color(0xB8181B17),
+                                Color(0x94181B17),
+                                Color(0x5E181B17),
+                                Color.Transparent
+                            ),
+                            center = Offset(right, bottom),
+                            radius = radius
+                        )
+                    )
+                }
+            }
             .systemBarsPadding()
     ) {
         // --- GEDEELDE ROTATIE VOOR HET HELE SCHERM ---
@@ -1887,6 +1946,7 @@ fun CameraScreen(
                 ViewfinderProfileSelector(
                     activeProfile = activeProfile,
                     visibleProfiles = visibleProfiles,
+                    activeStreamLabel = activeProfileStreamLabel,
                     onProfileSelected = onProfileSelected,
                     onOpenProfileSettings = { profile -> onNavigateToProfileSettings(profile.id) },
                     uiRotationDegrees = animatedUiRotation
@@ -1923,6 +1983,9 @@ fun CameraScreen(
                     focusTrackingEnabled = focusTracking,
                     horizonLevelerEnabled = horizonLeveler,
                     faceDetectionEnabled = faceDetection,
+                    quickSettingAssignments = quickSettingAssignments,
+                    viewfinderMode = viewfinderMode,
+                    ultraHdrEnabled = ultraHdrGainmapEnabled,
                     onFlashModeChange = { mode -> coroutineScope.launch { repository.setFlashMode(mode) } },
                     onTimerDurationChange = { seconds -> coroutineScope.launch { repository.setTimerDuration(seconds) } },
                     onWatermarkEnabledChange = { enabled -> coroutineScope.launch { repository.setWatermarkEnabled(enabled) } },
@@ -1948,6 +2011,42 @@ fun CameraScreen(
                     onFocusTrackingEnabledChange = { enabled -> coroutineScope.launch { repository.setFocusTracking(enabled) } },
                     onHorizonLevelerEnabledChange = { enabled -> coroutineScope.launch { repository.setHorizonLeveler(enabled) } },
                     onFaceDetectionEnabledChange = { enabled -> coroutineScope.launch { repository.setFaceDetection(enabled) } },
+                    onQuickSettingAssigned = { slotIndex, settingId ->
+                        val normalized = quickSettingAssignments
+                            .filter { it in ViewfinderQuickSettingIds.all }
+                            .distinct()
+                            .toMutableList()
+                        ViewfinderQuickSettingIds.all.forEach { id ->
+                            if (normalized.size < 9 && id !in normalized) normalized += id
+                        }
+                        if (slotIndex in 0 until minOf(9, normalized.size)) {
+                            val previousId = normalized[slotIndex]
+                            val existingIndex = normalized.indexOf(settingId)
+                            if (existingIndex >= 0 && existingIndex != slotIndex) {
+                                normalized[existingIndex] = previousId
+                            }
+                            normalized[slotIndex] = settingId
+                            coroutineScope.launch {
+                                repository.setQuickSettingsAssignments(normalized.take(9))
+                            }
+                        }
+                    },
+                    onShotModeSelected = { mode ->
+                        when (mode) {
+                            QuickShotMode.PORTRAIT -> {
+                                viewfinderMode = ViewfinderMode.PORTRAIT
+                                coroutineScope.launch { repository.setUltraHdrGainmapEnabled(false) }
+                            }
+                            QuickShotMode.ULTRA_HDR -> {
+                                viewfinderMode = ViewfinderMode.PHOTO
+                                coroutineScope.launch { repository.setUltraHdrGainmapEnabled(true) }
+                            }
+                            QuickShotMode.NIGHT -> {
+                                viewfinderMode = ViewfinderMode.NIGHT
+                                coroutineScope.launch { repository.setUltraHdrGainmapEnabled(false) }
+                            }
+                        }
+                    },
                     onDismiss = { quickSettingsExpanded = false },
                     uiRotationDegrees = animatedUiRotation,
                     modifier = Modifier
@@ -2829,7 +2928,7 @@ fun CameraScreen(
                     .fillMaxWidth()
                     .padding(horizontal = 24.dp),
                 horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
+                verticalAlignment = if (lensIndicatorStyle == LensIndicatorStyle.DIRECT_LIST) Alignment.Bottom else Alignment.CenterVertically
             ) {
 
                 CaptureThumbnailFeedback(
@@ -2950,16 +3049,41 @@ fun CameraScreen(
                     }
                 }
 
-                // Lens routing remains owned by AppNavigation/BnCameraManager. This control only
-                // chooses among the capability-derived visible routes already supplied to CameraScreen.
-                ViewfinderLensSelector(
-                    activeLens = activeLens,
-                    visibleLenses = visibleLenses,
-                    uiRotationDegrees = animatedUiRotation,
-                    onLensSelected = onLensSelected,
-                    modifier = Modifier.size(72.dp),
-                    hapticsEnabled = useHaptics
-                )
+                // Lens routing remains owned by AppNavigation/BnCameraManager. Indicator style
+                // changes only the presentation; both variants select the same capability-derived routes.
+                when (lensIndicatorStyle) {
+                    LensIndicatorStyle.FLOATING -> {
+                        ViewfinderLensSelector(
+                            activeLens = activeLens,
+                            visibleLenses = visibleLenses,
+                            uiRotationDegrees = animatedUiRotation,
+                            onLensSelected = onLensSelected,
+                            onExpandedChange = { lensSelectorExpanded = it },
+                            modifier = Modifier.size(72.dp),
+                            hapticsEnabled = useHaptics
+                        )
+                    }
+
+                    LensIndicatorStyle.LIST -> {
+                        ViewfinderLensPopupList(
+                            activeLens = activeLens,
+                            visibleLenses = visibleLenses,
+                            uiRotationDegrees = animatedUiRotation,
+                            onLensSelected = onLensSelected,
+                            modifier = Modifier.size(72.dp)
+                        )
+                    }
+
+                    LensIndicatorStyle.DIRECT_LIST -> {
+                        ViewfinderLensList(
+                            activeLens = activeLens,
+                            visibleLenses = visibleLenses,
+                            uiRotationDegrees = animatedUiRotation,
+                            onLensSelected = onLensSelected,
+                            modifier = Modifier.width(66.dp)
+                        )
+                    }
+                }
             }
 
             // 3. Bottom buffer: Houdt de knoppen flexibel en veilig boven de Android systeem-navigatiebalk

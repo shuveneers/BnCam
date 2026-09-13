@@ -18,6 +18,13 @@ class Phase7ViewfinderSelectorsContractTest {
         assertFalse(camera.contains("DropdownMenu("))
         assertTrue(camera.contains("ViewfinderProfileSelector("))
         assertTrue(camera.contains("ViewfinderLensSelector("))
+        assertTrue(camera.contains("onExpandedChange = { lensSelectorExpanded = it }"))
+        assertTrue(camera.contains("Brush.radialGradient("))
+        assertTrue(camera.contains("val radius = minOf(size.width * 0.96f, 380.dp.toPx())"))
+        assertTrue(camera.contains("ViewfinderLensPopupList("))
+        assertTrue(camera.contains("ViewfinderLensList("))
+        assertTrue(camera.contains("LensIndicatorStyle.FLOATING"))
+        assertTrue(camera.contains("LensIndicatorStyle.DIRECT_LIST"))
     }
 
     @Test
@@ -25,12 +32,22 @@ class Phase7ViewfinderSelectorsContractTest {
         val selector = source("src/main/java/com/bncam/ui/screens/capture/ViewfinderSelectors.kt")
         assertTrue(selector.contains("visibleLenses: List<LensInfo>"))
         assertTrue(selector.contains("detectDragGestures("))
-        assertTrue(selector.contains("nearestRadialSelectorIndex("))
+        assertTrue(selector.contains("nearestLensSelectorIndex("))
+        assertTrue(selector.contains("lensSelectorPoint("))
+        assertTrue(selector.contains("buttonDiameterDp = 42f"))
+        assertTrue(selector.contains("onExpandedChange: (Boolean) -> Unit = {}"))
+        assertTrue(selector.contains("tapping the same lens indicator a second time always closes Floating mode"))
+        assertTrue(selector.contains("internal fun ViewfinderLensPopupList("))
+        assertTrue(selector.contains("internal fun ViewfinderLensList("))
+        assertTrue(selector.contains("selfieUsesOuterArc = selfieLens != null && rearLenses.size >= 3"))
+        assertFalse(selector.contains("One free-form cloud behind the entire selector"))
         assertTrue(selector.contains("HapticFeedbackType.LongPress"))
         assertTrue(selector.contains("Icons.Default.Cameraswitch"))
         assertTrue(selector.contains("hoveredIndex?.let { index -> selectorLenses.getOrNull(index)?.let(onLensSelected) }"))
         assertTrue(selector.contains("CameraCharacteristics.LENS_FACING_FRONT"))
-        assertFalse(selector.contains("text = \"Selfie\""))
+        val floatingSection = selector.substringAfter("internal fun ViewfinderLensSelector(")
+            .substringBefore("internal fun ViewfinderLensPopupList(")
+        assertFalse(floatingSection.contains("text = \"Selfie\""))
     }
 
     @Test

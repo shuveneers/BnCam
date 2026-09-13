@@ -35,7 +35,7 @@ class PostPhase10ViewfinderInputHardeningSourceContractTest {
         val camera = read("src/main/java/com/bncam/ui/screens/capture/CameraScreen.kt")
         val selectors = read("src/main/java/com/bncam/ui/screens/capture/ViewfinderSelectors.kt")
         assertTrue("uiRotationDegrees = animatedUiRotation" in camera)
-        assertTrue("modifier = Modifier.rotate(uiRotationDegrees)" in selectors)
+        assertTrue("rotate(uiRotationDegrees)" in selectors)
         assertTrue("onGestureActiveChange: (Boolean) -> Unit" in camera)
     }
 }
