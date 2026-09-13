@@ -370,104 +370,36 @@ fun CameraModeSelector(
     onModeSelected: (ViewfinderMode) -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val modes = remember {
-        listOf(ViewfinderMode.NIGHT, ViewfinderMode.PHOTO, ViewfinderMode.PORTRAIT, ViewfinderMode.VIDEO)
-    }
-    var targetIndex by remember { mutableIntStateOf(modes.indexOf(selectedMode).coerceAtLeast(0)) }
-    var dragOffsetPx by remember { mutableFloatStateOf(0f) }
-    val density = LocalDensity.current
-    val itemSpacingPx = with(density) { 88.dp.toPx() }
-    val commitThresholdPx = with(density) { 58.dp.toPx() }
-    val dragResistance = 0.42f
+    // Shot modes (Portrait / UHDR / Night) live in Quick settings. The primary capture strip is
+    // intentionally reduced to the two product-level destinations: Photo and Video. Any still
+    // shot mode therefore keeps Photo visually selected.
+    val videoSelected = selectedMode == ViewfinderMode.VIDEO
 
-    LaunchedEffect(selectedMode) {
-        val resolvedIndex = modes.indexOf(selectedMode)
-        if (resolvedIndex >= 0 && resolvedIndex != targetIndex) {
-            targetIndex = resolvedIndex
-            dragOffsetPx = 0f
-        }
-    }
-
-    val animatedIndex by animateFloatAsState(
-        targetValue = targetIndex.toFloat(),
-        animationSpec = spring(
-            dampingRatio = Spring.DampingRatioNoBouncy,
-            stiffness = Spring.StiffnessMedium
-        ),
-        label = "mode_snap"
-    )
-    val currentIndexFloat = animatedIndex - (dragOffsetPx / itemSpacingPx)
-
-    Box(
-        modifier = modifier
-            .height(40.dp)
-            .pointerInput(targetIndex, modes) {
-                var gestureDragPx = 0f
-                detectHorizontalDragGestures(
-                    onDragStart = {
-                        gestureDragPx = 0f
-                        dragOffsetPx = 0f
-                    },
-                    onDragEnd = {
-                        val direction = when {
-                            gestureDragPx <= -commitThresholdPx -> 1
-                            gestureDragPx >= commitThresholdPx -> -1
-                            else -> 0
-                        }
-                        val nextIndex = (targetIndex + direction).coerceIn(0, modes.size - 1)
-                        targetIndex = nextIndex
-                        dragOffsetPx = 0f
-                        if (nextIndex != modes.indexOf(selectedMode)) {
-                            onModeSelected(modes[nextIndex])
-                        }
-                    },
-                    onDragCancel = {
-                        gestureDragPx = 0f
-                        dragOffsetPx = 0f
-                    }
-                ) { change, dragAmount ->
-                    change.consume()
-                    gestureDragPx += dragAmount
-                    dragOffsetPx = (gestureDragPx * dragResistance)
-                        .coerceIn(-itemSpacingPx * 0.68f, itemSpacingPx * 0.68f)
-                }
-            },
-        contentAlignment = Alignment.Center
+    Row(
+        modifier = modifier.height(40.dp),
+        horizontalArrangement = Arrangement.spacedBy(18.dp, Alignment.CenterHorizontally),
+        verticalAlignment = Alignment.CenterVertically
     ) {
-        val fadeBrush = androidx.compose.ui.graphics.Brush.horizontalGradient(
-            0.0f to Color.Transparent,
-            0.15f to Color.Black,
-            0.85f to Color.Black,
-            1.0f to Color.Transparent
-        )
-        Box(
+        Text(
+            text = "Photo",
+            color = if (!videoSelected) AccentPistachio else Color.White.copy(alpha = 0.48f),
+            fontSize = 17.sp,
+            fontWeight = FontWeight.Light,
+            letterSpacing = 2.4.sp,
             modifier = Modifier
-                .fillMaxSize()
-                .graphicsLayer { alpha = 0.99f }
-                .drawWithContent {
-                    drawContent()
-                    drawRect(brush = fadeBrush, blendMode = androidx.compose.ui.graphics.BlendMode.DstIn)
-                },
-            contentAlignment = Alignment.Center
-        ) {
-            modes.forEachIndexed { index, mode ->
-                val distance = index - currentIndexFloat
-                val xOffset = distance * itemSpacingPx
-                val alpha = (1f - abs(distance) * 0.5f).coerceIn(0f, 1f)
-                val scale = (1f - abs(distance) * 0.15f).coerceIn(0.7f, 1f)
-                val isCenter = abs(distance) < 0.3f
-                Text(
-                    text = mode.label,
-                    color = (if (isCenter) AccentPistachio else Color.White).copy(alpha = alpha),
-                    fontSize = 16.sp,
-                    fontWeight = FontWeight.Light,
-                    letterSpacing = 2.sp,
-                    modifier = Modifier
-                        .offset { IntOffset(xOffset.roundToInt(), 0) }
-                        .graphicsLayer { scaleX = scale; scaleY = scale }
-                )
-            }
-        }
+                .padding(horizontal = 10.dp, vertical = 7.dp)
+                .clickable { onModeSelected(ViewfinderMode.PHOTO) }
+        )
+        Text(
+            text = "Video",
+            color = if (videoSelected) AccentPistachio else Color.White.copy(alpha = 0.48f),
+            fontSize = 17.sp,
+            fontWeight = FontWeight.Light,
+            letterSpacing = 2.4.sp,
+            modifier = Modifier
+                .padding(horizontal = 10.dp, vertical = 7.dp)
+                .clickable { onModeSelected(ViewfinderMode.VIDEO) }
+        )
     }
 }
 
@@ -2032,18 +1964,29 @@ fun CameraScreen(
                         }
                     },
                     onShotModeSelected = { mode ->
+                        // The three Quick-settings shot modes behave as explicit On/Off buttons.
+                        // Enabling one returns to the still-photo product path and disables the
+                        // mutually exclusive UHDR flag where appropriate. Tapping the active tile
+                        // again returns to standard Photo.
                         when (mode) {
                             QuickShotMode.PORTRAIT -> {
-                                viewfinderMode = ViewfinderMode.PORTRAIT
-                                coroutineScope.launch { repository.setUltraHdrGainmapEnabled(false) }
+                                val turnOff = viewfinderMode == ViewfinderMode.PORTRAIT
+                                viewfinderMode = if (turnOff) ViewfinderMode.PHOTO else ViewfinderMode.PORTRAIT
+                                if (!turnOff) {
+                                    coroutineScope.launch { repository.setUltraHdrGainmapEnabled(false) }
+                                }
                             }
                             QuickShotMode.ULTRA_HDR -> {
+                                val turnOff = viewfinderMode == ViewfinderMode.PHOTO && ultraHdrGainmapEnabled
                                 viewfinderMode = ViewfinderMode.PHOTO
-                                coroutineScope.launch { repository.setUltraHdrGainmapEnabled(true) }
+                                coroutineScope.launch { repository.setUltraHdrGainmapEnabled(!turnOff) }
                             }
                             QuickShotMode.NIGHT -> {
-                                viewfinderMode = ViewfinderMode.NIGHT
-                                coroutineScope.launch { repository.setUltraHdrGainmapEnabled(false) }
+                                val turnOff = viewfinderMode == ViewfinderMode.NIGHT
+                                viewfinderMode = if (turnOff) ViewfinderMode.PHOTO else ViewfinderMode.NIGHT
+                                if (!turnOff) {
+                                    coroutineScope.launch { repository.setUltraHdrGainmapEnabled(false) }
+                                }
                             }
                         }
                     },

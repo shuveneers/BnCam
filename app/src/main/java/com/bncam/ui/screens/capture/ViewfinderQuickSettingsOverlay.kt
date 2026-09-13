@@ -1,6 +1,8 @@
 package com.bncam.ui.screens.capture
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -15,6 +17,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Surface
@@ -75,6 +78,12 @@ internal enum class QuickShotMode {
     NIGHT
 }
 
+private enum class ShotModeGlyph {
+    PORTRAIT,
+    HDR,
+    NIGHT
+}
+
 /**
  * Canonical quick-settings surface for the viewfinder.
  *
@@ -119,6 +128,14 @@ internal fun ViewfinderQuickSettingsOverlay(
 ) {
     var editMode by remember { mutableStateOf(false) }
     var editingSlot by remember { mutableStateOf<Int?>(null) }
+
+    BackHandler(enabled = editMode || editingSlot != null) {
+        if (editingSlot != null) {
+            editingSlot = null
+        } else {
+            editMode = false
+        }
+    }
 
     val normalizedAssignments = remember(quickSettingAssignments) {
         val result = quickSettingAssignments
@@ -311,12 +328,13 @@ internal fun ViewfinderQuickSettingsOverlay(
                     modifier = Modifier.rotate(uiRotationDegrees)
                 )
 
+                val editorActive = editMode || editingSlot != null
                 Surface(
                     shape = CircleShape,
-                    color = if (editMode) AccentPistachio.copy(alpha = 0.18f) else Color.White.copy(alpha = 0.05f),
+                    color = if (editorActive) AccentPistachio.copy(alpha = 0.18f) else Color.White.copy(alpha = 0.05f),
                     border = BorderStroke(
                         0.75.dp,
-                        if (editMode) AccentPistachio.copy(alpha = 0.62f) else Color.White.copy(alpha = 0.10f)
+                        if (editorActive) AccentPistachio.copy(alpha = 0.62f) else Color.White.copy(alpha = 0.10f)
                     ),
                     modifier = Modifier
                         .size(36.dp)
@@ -324,19 +342,22 @@ internal fun ViewfinderQuickSettingsOverlay(
                             interactionSource = remember { MutableInteractionSource() },
                             indication = null
                         ) {
-                            if (editMode) {
-                                editMode = false
-                                editingSlot = null
-                            } else {
-                                editMode = true
+                            when {
+                                editingSlot != null -> editingSlot = null
+                                editMode -> editMode = false
+                                else -> editMode = true
                             }
                         }
                 ) {
                     Box(contentAlignment = Alignment.Center) {
                         Icon(
-                            imageVector = Icons.Default.Edit,
-                            contentDescription = "Edit quick settings",
-                            tint = if (editMode) AccentPistachio else Color.White.copy(alpha = 0.90f),
+                            imageVector = if (editorActive) {
+                                Icons.AutoMirrored.Filled.ArrowBack
+                            } else {
+                                Icons.Default.Edit
+                            },
+                            contentDescription = if (editorActive) "Back" else "Edit quick settings",
+                            tint = if (editorActive) AccentPistachio else Color.White.copy(alpha = 0.90f),
                             modifier = Modifier
                                 .size(18.dp)
                                 .rotate(uiRotationDegrees)
@@ -348,14 +369,6 @@ internal fun ViewfinderQuickSettingsOverlay(
             when {
                 editingSlot != null -> {
                     val slot = editingSlot!!
-                    Text(
-                        text = "Choose a function for this tile",
-                        color = Color.White.copy(alpha = 0.48f),
-                        fontSize = 10.sp,
-                        modifier = Modifier
-                            .padding(horizontal = 2.dp)
-                            .rotate(uiRotationDegrees)
-                    )
                     ViewfinderQuickSettingIds.all.chunked(3).forEach { rowIds ->
                         Row(
                             modifier = Modifier.fillMaxWidth(),
@@ -374,26 +387,27 @@ internal fun ViewfinderQuickSettingsOverlay(
                                         }
                                     ),
                                     uiRotationDegrees = uiRotationDegrees,
-                                    modifier = Modifier.weight(1f),
-                                    compact = true
+                                    modifier = Modifier.weight(1f)
                                 )
                             }
                             repeat(3 - rowIds.size) {
-                                Box(modifier = Modifier.weight(1f).height(58.dp))
+                                Box(modifier = Modifier.weight(1f).height(70.dp))
                             }
                         }
                     }
+                    Text(
+                        text = "Choose a function for this tile",
+                        color = Color.White.copy(alpha = 0.48f),
+                        fontSize = 10.sp,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 2.dp, vertical = 1.dp)
+                            .rotate(uiRotationDegrees)
+                    )
                 }
 
                 editMode -> {
-                    Text(
-                        text = "Tap a slot, then choose its function",
-                        color = Color.White.copy(alpha = 0.48f),
-                        fontSize = 10.sp,
-                        modifier = Modifier
-                            .padding(horizontal = 2.dp)
-                            .rotate(uiRotationDegrees)
-                    )
                     normalizedAssignments.take(9).chunked(3).forEachIndexed { rowIndex, rowIds ->
                         Row(
                             modifier = Modifier.fillMaxWidth(),
@@ -409,15 +423,24 @@ internal fun ViewfinderQuickSettingsOverlay(
                                         onClick = { editingSlot = slot }
                                     ),
                                     uiRotationDegrees = uiRotationDegrees,
-                                    modifier = Modifier.weight(1f),
-                                    compact = true
+                                    modifier = Modifier.weight(1f)
                                 )
                             }
                             repeat(3 - rowIds.size) {
-                                Box(modifier = Modifier.weight(1f).height(58.dp))
+                                Box(modifier = Modifier.weight(1f).height(70.dp))
                             }
                         }
                     }
+                    Text(
+                        text = "Tap a slot, then choose its function",
+                        color = Color.White.copy(alpha = 0.48f),
+                        fontSize = 10.sp,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 2.dp, vertical = 1.dp)
+                            .rotate(uiRotationDegrees)
+                    )
                 }
 
                 else -> {
@@ -458,6 +481,7 @@ internal fun ViewfinderQuickSettingsOverlay(
                     ) {
                         ShotModeTile(
                             label = "Portrait",
+                            glyph = ShotModeGlyph.PORTRAIT,
                             selected = selectedShotMode == QuickShotMode.PORTRAIT,
                             uiRotationDegrees = uiRotationDegrees,
                             onClick = { onShotModeSelected(QuickShotMode.PORTRAIT) },
@@ -465,6 +489,7 @@ internal fun ViewfinderQuickSettingsOverlay(
                         )
                         ShotModeTile(
                             label = "UHDR",
+                            glyph = ShotModeGlyph.HDR,
                             selected = selectedShotMode == QuickShotMode.ULTRA_HDR,
                             uiRotationDegrees = uiRotationDegrees,
                             onClick = { onShotModeSelected(QuickShotMode.ULTRA_HDR) },
@@ -472,6 +497,7 @@ internal fun ViewfinderQuickSettingsOverlay(
                         )
                         ShotModeTile(
                             label = "Night",
+                            glyph = ShotModeGlyph.NIGHT,
                             selected = selectedShotMode == QuickShotMode.NIGHT,
                             uiRotationDegrees = uiRotationDegrees,
                             onClick = { onShotModeSelected(QuickShotMode.NIGHT) },
@@ -496,8 +522,7 @@ private data class QuickTileSpec(
 private fun QuickTile(
     tile: QuickTileSpec,
     uiRotationDegrees: Float,
-    modifier: Modifier = Modifier,
-    compact: Boolean = false
+    modifier: Modifier = Modifier
 ) {
     val borderColor = when {
         !tile.enabled -> Color.White.copy(alpha = 0.07f)
@@ -511,7 +536,7 @@ private fun QuickTile(
     }
     Surface(
         modifier = modifier
-            .height(if (compact) 58.dp else 70.dp)
+            .height(70.dp)
             .clickable(enabled = tile.enabled, onClick = tile.onClick),
         shape = RoundedCornerShape(16.dp),
         color = background,
@@ -519,7 +544,7 @@ private fun QuickTile(
     ) {
         Column(
             modifier = Modifier
-                .padding(horizontal = 6.dp, vertical = if (compact) 6.dp else 8.dp)
+                .padding(horizontal = 6.dp, vertical = 8.dp)
                 .rotate(uiRotationDegrees),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center
@@ -531,8 +556,8 @@ private fun QuickTile(
                     tile.active -> AccentPistachio
                     else -> Color.White.copy(alpha = 0.88f)
                 },
-                fontSize = if (compact) 10.sp else 11.sp,
-                lineHeight = if (compact) 11.sp else 13.sp,
+                fontSize = 11.sp,
+                lineHeight = 13.sp,
                 textAlign = TextAlign.Center,
                 fontWeight = if (tile.active) FontWeight.SemiBold else FontWeight.Normal,
                 maxLines = 2
@@ -545,12 +570,12 @@ private fun QuickTile(
                         tile.active -> AccentPistachio.copy(alpha = 0.90f)
                         else -> Color.White.copy(alpha = 0.58f)
                     },
-                    fontSize = if (compact) 9.sp else 10.sp,
-                    lineHeight = if (compact) 10.sp else 12.sp,
+                    fontSize = 10.sp,
+                    lineHeight = 12.sp,
                     fontWeight = if (tile.active) FontWeight.SemiBold else FontWeight.Normal,
                     maxLines = 2,
                     textAlign = TextAlign.Center,
-                    modifier = Modifier.padding(top = if (compact) 2.dp else 4.dp)
+                    modifier = Modifier.padding(top = 4.dp)
                 )
             }
         }
@@ -560,14 +585,16 @@ private fun QuickTile(
 @Composable
 private fun ShotModeTile(
     label: String,
+    glyph: ShotModeGlyph,
     selected: Boolean,
     uiRotationDegrees: Float,
     onClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val contentColor = if (selected) AccentPistachio else Color.White.copy(alpha = 0.82f)
     Surface(
         modifier = modifier
-            .height(52.dp)
+            .height(58.dp)
             .clickable(onClick = onClick),
         shape = RoundedCornerShape(16.dp),
         color = if (selected) AccentPistachio.copy(alpha = 0.16f) else Color.White.copy(alpha = 0.04f),
@@ -576,14 +603,115 @@ private fun ShotModeTile(
             if (selected) AccentPistachio.copy(alpha = 0.82f) else Color.White.copy(alpha = 0.12f)
         )
     ) {
-        Box(contentAlignment = Alignment.Center) {
-            Text(
-                text = label,
-                color = if (selected) AccentPistachio else Color.White.copy(alpha = 0.82f),
-                fontSize = 11.sp,
-                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
-                modifier = Modifier.rotate(uiRotationDegrees)
+        Row(
+            modifier = Modifier
+                .padding(horizontal = 10.dp, vertical = 8.dp)
+                .rotate(uiRotationDegrees),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.Center
+        ) {
+            ShotModeGlyphIcon(
+                glyph = glyph,
+                color = contentColor,
+                modifier = Modifier.size(20.dp)
             )
+            Column(
+                modifier = Modifier.padding(start = 7.dp),
+                verticalArrangement = Arrangement.Center
+            ) {
+                Text(
+                    text = label,
+                    color = contentColor,
+                    fontSize = 10.5.sp,
+                    lineHeight = 12.sp,
+                    fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
+                    maxLines = 1
+                )
+                Text(
+                    text = if (selected) "On" else "Off",
+                    color = if (selected) AccentPistachio.copy(alpha = 0.90f) else Color.White.copy(alpha = 0.46f),
+                    fontSize = 9.sp,
+                    lineHeight = 10.sp,
+                    fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                    maxLines = 1,
+                    modifier = Modifier.padding(top = 2.dp)
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ShotModeGlyphIcon(
+    glyph: ShotModeGlyph,
+    color: Color,
+    modifier: Modifier = Modifier
+) {
+    Canvas(modifier = modifier) {
+        val stroke = 1.45.dp.toPx()
+        val cx = size.width / 2f
+        val cy = size.height / 2f
+        when (glyph) {
+            ShotModeGlyph.PORTRAIT -> {
+                drawCircle(
+                    color = color,
+                    radius = size.minDimension * 0.17f,
+                    center = androidx.compose.ui.geometry.Offset(cx, size.height * 0.31f),
+                    style = androidx.compose.ui.graphics.drawscope.Stroke(width = stroke)
+                )
+                drawArc(
+                    color = color,
+                    startAngle = 202f,
+                    sweepAngle = 136f,
+                    useCenter = false,
+                    topLeft = androidx.compose.ui.geometry.Offset(size.width * 0.20f, size.height * 0.42f),
+                    size = androidx.compose.ui.geometry.Size(size.width * 0.60f, size.height * 0.48f),
+                    style = androidx.compose.ui.graphics.drawscope.Stroke(width = stroke)
+                )
+            }
+
+            ShotModeGlyph.HDR -> {
+                drawCircle(
+                    color = color,
+                    radius = size.minDimension * 0.18f,
+                    center = androidx.compose.ui.geometry.Offset(cx, cy),
+                    style = androidx.compose.ui.graphics.drawscope.Stroke(width = stroke)
+                )
+                val inner = size.minDimension * 0.30f
+                val outer = size.minDimension * 0.44f
+                listOf(0f, 45f, 90f, 135f, 180f, 225f, 270f, 315f).forEach { deg ->
+                    val rad = Math.toRadians(deg.toDouble())
+                    val cos = kotlin.math.cos(rad).toFloat()
+                    val sin = kotlin.math.sin(rad).toFloat()
+                    drawLine(
+                        color = color,
+                        start = androidx.compose.ui.geometry.Offset(cx + cos * inner, cy + sin * inner),
+                        end = androidx.compose.ui.geometry.Offset(cx + cos * outer, cy + sin * outer),
+                        strokeWidth = stroke
+                    )
+                }
+            }
+
+            ShotModeGlyph.NIGHT -> {
+                drawArc(
+                    color = color,
+                    startAngle = 58f,
+                    sweepAngle = 244f,
+                    useCenter = false,
+                    topLeft = androidx.compose.ui.geometry.Offset(size.width * 0.18f, size.height * 0.12f),
+                    size = androidx.compose.ui.geometry.Size(size.width * 0.62f, size.height * 0.76f),
+                    style = androidx.compose.ui.graphics.drawscope.Stroke(width = stroke)
+                )
+                drawArc(
+                    color = color.copy(alpha = 0.58f),
+                    startAngle = 80f,
+                    sweepAngle = 198f,
+                    useCenter = false,
+                    topLeft = androidx.compose.ui.geometry.Offset(size.width * 0.37f, size.height * 0.18f),
+                    size = androidx.compose.ui.geometry.Size(size.width * 0.34f, size.height * 0.64f),
+                    style = androidx.compose.ui.graphics.drawscope.Stroke(width = stroke)
+                )
+            }
         }
     }
 }
