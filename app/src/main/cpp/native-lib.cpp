@@ -957,6 +957,10 @@ struct YuvEncodeTiming {
     std::uint64_t yuvIspCpuUploadBytes = 0u;
     std::uint64_t yuvIspGpuReadbackBytes = 0u;
     float yuvIspInputUploadMs = 0.0f;
+    float yuvIspCallMs = 0.0f;
+    float yuvIspBackendMutexWaitMs = 0.0f;
+    float yuvIspPipelineSetupMs = 0.0f;
+    float yuvIspBufferSetupMs = 0.0f;
     float yuvIspGpuExecutionWallMs = 0.0f;
     float yuvIspGpuSyncMs = 0.0f;
     float yuvIspPublicationReadbackMs = 0.0f;
@@ -1323,8 +1327,10 @@ bool encodeNv21ToJpeg(
     request.portraitTargetBottom = qualityConfig.portraitTargetBottom;
     request.portraitMaskRotationDegrees = qualityConfig.portraitMaskRotationDegrees;
 
+    const auto gpuCallStart = NativeClock::now();
     bncam::vulkan::YuvSingleFrameIspResult gpu =
             bncam::vulkan::VulkanRuntime::instance().executeYuvSingleFrameIsp(request);
+    const float gpuCallMs = nativeElapsedMs(gpuCallStart);
 
     const bool residentLumaSatisfied = residentLumaGeneration == 0u ||
             (gpu.residentLumaConsumed && gpu.residentLumaGeneration == residentLumaGeneration);
@@ -1345,6 +1351,10 @@ bool encodeNv21ToJpeg(
         timingOut->yuvIspCpuUploadBytes = gpu.fullFrameCpuUploadBytes;
         timingOut->yuvIspGpuReadbackBytes = gpu.fullFrameGpuReadbackBytes;
         timingOut->yuvIspInputUploadMs = gpu.inputUploadMs;
+        timingOut->yuvIspCallMs = gpuCallMs;
+        timingOut->yuvIspBackendMutexWaitMs = gpu.backendMutexWaitMs;
+        timingOut->yuvIspPipelineSetupMs = gpu.pipelineSetupMs;
+        timingOut->yuvIspBufferSetupMs = gpu.bufferSetupMs;
         timingOut->yuvIspGpuExecutionWallMs = gpu.gpuExecutionWallMs;
         timingOut->yuvIspGpuSyncMs = gpu.gpuSynchronizationMs;
         timingOut->yuvIspPublicationReadbackMs = gpu.publicationReadbackMs;
@@ -2809,6 +2819,10 @@ Java_com_bncam_core_engine_ImageUtils_processNativeYuv(
           << ";yuvSingleFrameCpuUploadBytes=" << encodeTiming.yuvIspCpuUploadBytes
           << ";yuvSingleFrameGpuReadbackBytes=" << encodeTiming.yuvIspGpuReadbackBytes
           << ";yuvSingleFrameInputUploadMs=" << nativeFmtMs(encodeTiming.yuvIspInputUploadMs)
+          << ";yuvSingleFrameIspCallMs=" << nativeFmtMs(encodeTiming.yuvIspCallMs)
+          << ";yuvSingleFrameBackendMutexWaitMs=" << nativeFmtMs(encodeTiming.yuvIspBackendMutexWaitMs)
+          << ";yuvSingleFramePipelineSetupMs=" << nativeFmtMs(encodeTiming.yuvIspPipelineSetupMs)
+          << ";yuvSingleFrameBufferSetupMs=" << nativeFmtMs(encodeTiming.yuvIspBufferSetupMs)
           << ";yuvSingleFrameGpuExecutionWallMs=" << nativeFmtMs(encodeTiming.yuvIspGpuExecutionWallMs)
           << ";yuvSingleFrameGpuSyncMs=" << nativeFmtMs(encodeTiming.yuvIspGpuSyncMs)
           << ";yuvSingleFramePublicationReadbackMs=" << nativeFmtMs(encodeTiming.yuvIspPublicationReadbackMs)

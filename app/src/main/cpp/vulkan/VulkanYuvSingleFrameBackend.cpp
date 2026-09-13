@@ -188,9 +188,9 @@ void VulkanYuvSingleFrameBackend::destroy(VkDevice device) noexcept {
 bool VulkanYuvSingleFrameBackend::prepare(VkDevice device) noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
     std::string failureReason;
-    // Do not monopolize the shared pipeline-cache host mutex during a potentially slow driver
-    // compile. The process-local VkPipeline object itself is what removes first-capture cost.
-    return initializeLocked(device, failureReason, false);
+    // The first capture can arrive while this preparation still owns the backend mutex. Populate
+    // and persist the Vulkan cache so subsequent process-cold preparations finish quickly too.
+    return initializeLocked(device, failureReason, true);
 }
 
 bool VulkanYuvSingleFrameBackend::initializeLocked(
@@ -395,13 +395,18 @@ YuvSingleFrameIspResult VulkanYuvSingleFrameBackend::execute(
             ? static_cast<std::uint64_t>(gainmapWordsPerRow) * sizeof(std::uint32_t) * gainmapHeight
             : 0u;
 
+    const auto mutexWaitStart = Clock::now();
     std::lock_guard<std::mutex> lock(mutex_);
+    out.backendMutexWaitMs = elapsedMs(mutexWaitStart);
     allocator_ = allocatorOwner.handle();
     if (allocator_ == nullptr) {
         out.failureReason = "YUV_SINGLE_FRAME_VMA_ALLOCATOR_UNAVAILABLE";
         return out;
     }
+    const auto pipelineSetupStart = Clock::now();
     if (!initializeLocked(device, out.failureReason)) return out;
+    out.pipelineSetupMs = elapsedMs(pipelineSetupStart);
+    const auto bufferSetupStart = Clock::now();
     if (!ensureBufferLocked(allocator_, paddedInputBytes, true, inputStaging_, out.failureReason) ||
         !ensureBufferLocked(allocator_, paddedInputBytes, false, inputDevice_, out.failureReason) ||
         !ensureBufferLocked(allocator_, toneBytes, true, toneStaging_, out.failureReason) ||
@@ -413,8 +418,10 @@ YuvSingleFrameIspResult VulkanYuvSingleFrameBackend::execute(
         (useUltraHdr && !ensureBufferLocked(allocator_, gainmapPackedBytes, true, gainmapReadback_, out.failureReason)) ||
         !ensureBufferLocked(allocator_, telemetryBytes, true, ultraHdrTelemetry_, out.failureReason) ||
         (usePortrait && !ensureBufferLocked(allocator_, portraitMaskPixels * sizeof(float), true, portraitMask_, out.failureReason))) {
+        out.bufferSetupMs = elapsedMs(bufferSetupStart);
         return out;
     }
+    out.bufferSetupMs = elapsedMs(bufferSetupStart);
 
     auto uploadStart = Clock::now();
     if (useResidentLuma) {

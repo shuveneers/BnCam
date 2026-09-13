@@ -21,7 +21,17 @@ object VulkanRuntimeOwner {
     fun attach(context: Context) {
         val appContext = context.applicationContext
         applicationPackageName = appContext.packageName
-        pipelineCachePath = File(appContext.codeCacheDir, "bncam_vulkan_pipeline_cache.bin").absolutePath
+        val cacheName = "bncam_vulkan_pipeline_cache.bin"
+        val persistentCache = File(appContext.noBackupFilesDir, cacheName)
+        // Android may clear codeCacheDir on an app update. Preserve an existing compatible cache
+        // once, then keep future YUV pipeline compilations in storage that survives updates.
+        if (!persistentCache.exists()) {
+            val previousCache = File(appContext.codeCacheDir, cacheName)
+            if (previousCache.isFile) {
+                runCatching { previousCache.copyTo(persistentCache, overwrite = false) }
+            }
+        }
+        pipelineCachePath = persistentCache.absolutePath
         attached.set(true)
     }
 

@@ -101,6 +101,9 @@ struct YuvSingleFrameIspResult {
     bool portraitEffectApplied = false;
     std::string portraitStatus = "NOT_REQUESTED";
     float inputUploadMs = 0.0f;
+    float backendMutexWaitMs = 0.0f;
+    float pipelineSetupMs = 0.0f;
+    float bufferSetupMs = 0.0f;
     float gpuExecutionWallMs = 0.0f;
     float gpuSynchronizationMs = 0.0f;
     float publicationReadbackMs = 0.0f;
