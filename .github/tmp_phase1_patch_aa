@@ -1,0 +1,170 @@
+--- a/app/src/main/java/com/bncam/ui/screens/capture/RawPreviewRenderer.kt
++++ b/app/src/main/java/com/bncam/ui/screens/capture/RawPreviewRenderer.kt
+@@ -20,6 +20,7 @@
+ import java.util.concurrent.ConcurrentHashMap
+ import java.util.concurrent.atomic.AtomicBoolean
+ import java.util.concurrent.atomic.AtomicLong
++import java.util.concurrent.atomic.AtomicLongArray
+ import java.util.concurrent.atomic.AtomicReference
+ 
+ data class RawPreviewRenderConfig(
+@@ -156,27 +157,28 @@
+     val spatialExposureLowerNeutralEv: Float,
+     val spatialExposureUpperNeutralEv: Float,
+     val spatialExposureAuthority: Float,
++    private val createGlFence: () -> Long,
+     private val releaseSlot: (Long) -> Unit
+ ) : Closeable {
+     private val closed = AtomicBoolean(false)
+ 
+     /** Frame was never submitted to GL, so the Vulkan-complete slot is immediately reusable. */
+     override fun close() {
+-        if (closed.compareAndSet(false, true)) releaseSlot(GL_NOT_USED)
++        if (closed.compareAndSet(false, true)) releaseSlot(GL_NOT_USED_HANDLE)
+     }
+ 
+     /** Called only after GLES sampled a GPU-resident HardwareBuffer in a submitted draw. */
+-    fun closeAfterGlFence(fenceHandle: Long) {
+-        if (closed.compareAndSet(false, true)) releaseSlot(fenceHandle)
++    fun closeAfterGlSampled() {
++        if (closed.compareAndSet(false, true)) releaseSlot(createGlFence())
+     }
+ 
+     fun closeAfterGlInteropFailure() {
+-        if (closed.compareAndSet(false, true)) releaseSlot(GL_INTEROP_FAILED)
+-    }
+-
+-    private companion object {
+-        const val GL_NOT_USED = -1L
+-        const val GL_INTEROP_FAILED = -2L
++        if (closed.compareAndSet(false, true)) releaseSlot(GL_INTEROP_FAILED_HANDLE)
++    }
++
++    internal companion object {
++        const val GL_NOT_USED_HANDLE = -1L
++        const val GL_INTEROP_FAILED_HANDLE = -2L
+     }
+ }
+ 
+@@ -187,7 +189,8 @@
+  * request, so backlog can never grow without bound or silently trade cadence for latency.
+  */
+ class RawPreviewRenderer(
+-    private val onFrame: (RawPreviewFrame) -> Unit
++    private val onFrame: (RawPreviewFrame) -> Unit,
++    private val fenceBackend: RawPreviewFenceBackend = PlatformRawPreviewFenceBackend
+ ) : Closeable {
+     private data class Request(
+         val retainedHardwareBuffer: Long,
+@@ -227,6 +230,8 @@
+     private val exactFrameColorPairs = ConcurrentHashMap<Long, ExactFrameColorPair>()
+     private val autoWhiteBalanceColorPair = AtomicReference<ExactFrameColorPair?>(null)
+     private val latestOfferedSensorTimestampNs = AtomicLong(Long.MIN_VALUE)
++    private val lastRendererOfferElapsedNs = AtomicLong(0L)
++    private val lastRendererPublishElapsedNs = AtomicLong(0L)
+     private class OutputSlot(val id: Int) {
+         private var cpuRgba: ByteBuffer? = null
+         private var analysisNv21Buffer: ByteBuffer? = null
+@@ -235,6 +240,9 @@
+         var hardwareBufferHeight: Int = 0
+         var hardwareBufferUsage: Long = 0L
+         var pendingGlFenceHandle: Long = 0L
++        var pendingSource: ViewfinderEffectiveSource? = null
++        var pendingGeneration: Int = -1
++        var pendingSensorTimestampNs: Long = 0L
+         var quarantined: Boolean = false
+ 
+         fun ensureCpuRgbaBuffer(): ByteBuffer {
+@@ -296,6 +304,8 @@
+     private val allOutputSlots = List(OUTPUT_SLOT_COUNT) { OutputSlot(it) }
+     private val availableOutputSlots = ConcurrentLinkedQueue<OutputSlot>()
+     private val pendingGpuOutputSlots = ConcurrentLinkedQueue<OutputSlot>()
++    private val outputSlotLedger = RawPreviewOutputSlotLedger(OUTPUT_SLOT_COUNT)
++    private val dropCounters = AtomicLongArray(RawPreviewDropReason.values().size)
+     private var gpuFallbackScratchRgba: ByteBuffer? = null
+ 
+     @Volatile private var activeConfig: RawPreviewRenderConfig? = null
+@@ -312,11 +322,94 @@
+     private var renderCostEmaMs = 0.0f
+     @Volatile private var glUploadCostEmaMs = 0.0f
+     @Volatile private var gpuResidentOutputDisabled = false
++    @Volatile private var gpuFallbackReason = "none"
+     @Volatile private var mlAnalysisRequested = false
+     private var gpuOutputFailures = 0L
+ 
+     init {
+         allOutputSlots.forEach(availableOutputSlots::offer)
++        outputSlotLedger.assertInternalInvariant()
++    }
++
++    private fun recordDrop(reason: RawPreviewDropReason, request: Request? = null) {
++        dropCounters.incrementAndGet(reason.ordinal)
++        val source = request?.config?.source ?: activeConfig?.source
++        val generation = request?.config?.pipelineGeneration ?: activeConfig?.pipelineGeneration
++        val timestampNs = request?.sensorTimestampNs ?: 0L
++        if (source != null && generation != null) {
++            RawPreviewCadenceDiagnostics.dropped(source, generation, timestampNs, reason)
++        }
++    }
++
++    private fun acquireOutputSlot(): OutputSlot? {
++        while (true) {
++            val slot = availableOutputSlots.poll() ?: return null
++            if (outputSlotLedger.tryAcquire(slot.id)) return slot
++            Log.e(
++                TAG,
++                "RAW_PREVIEW_SLOT_QUEUE_STATE_MISMATCH action=acquire slot=${slot.id} " +
++                    "ledger=${outputSlotLedger.state(slot.id)} ${outputSlotHealth()}"
++            )
++        }
++    }
++
++    private fun returnOutputSlot(slot: OutputSlot, reason: String) {
++        if (closed) return
++        if (outputSlotLedger.releaseToAvailable(slot.id)) {
++            availableOutputSlots.offer(slot)
++        } else {
++            Log.e(
++                TAG,
++                "RAW_PREVIEW_SLOT_QUEUE_STATE_MISMATCH action=return slot=${slot.id} reason=$reason " +
++                    "ledger=${outputSlotLedger.state(slot.id)} ${outputSlotHealth()}"
++            )
++        }
++    }
++
++    private fun markOutputSlotPendingFence(slot: OutputSlot): Boolean {
++        val ok = outputSlotLedger.markPendingFence(slot.id)
++        if (!ok) {
++            Log.e(
++                TAG,
++                "RAW_PREVIEW_SLOT_QUEUE_STATE_MISMATCH action=pending_fence slot=${slot.id} " +
++                    "ledger=${outputSlotLedger.state(slot.id)} ${outputSlotHealth()}"
++            )
++        }
++        return ok
++    }
++
++    private fun outputSlotHealth(): String {
++        val snapshot = outputSlotLedger.snapshot()
++        val quarantined = allOutputSlots.count { it.quarantined }
++        return "available=${snapshot.available} inFlight=${snapshot.inFlight} " +
++            "pendingFence=${snapshot.pendingFence} closed=${snapshot.closed} " +
++            "availableQueue=${availableOutputSlots.size} pendingFenceQueue=${pendingGpuOutputSlots.size} " +
++            "gpuQuarantined=$quarantined gpuDisabled=$gpuResidentOutputDisabled " +
++            "gpuFallbackReason=$gpuFallbackReason gpuOutputFailures=$gpuOutputFailures " +
++            "lastOfferElapsedNs=${lastRendererOfferElapsedNs.get()} " +
++            "lastPublishElapsedNs=${lastRendererPublishElapsedNs.get()}"
++    }
++
++    private fun logOutputSlotInvariantIfBroken(reason: String) {
++        val snapshot = outputSlotLedger.snapshot()
++        outputSlotLedger.assertInternalInvariant()
++        val queueMismatch = availableOutputSlots.size != snapshot.available ||
++            pendingGpuOutputSlots.size != snapshot.pendingFence
++        val impossibleStarvation = snapshot.available == 0 &&
++            snapshot.pendingFence == 0 &&
++            snapshot.inFlight == 0 &&
++            snapshot.closed == 0
++        if (queueMismatch || impossibleStarvation) {
++            Log.e(
++                TAG,
