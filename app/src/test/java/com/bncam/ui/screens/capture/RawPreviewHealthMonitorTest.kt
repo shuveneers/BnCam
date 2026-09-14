@@ -72,13 +72,70 @@ class RawPreviewHealthMonitorTest {
     }
 
     @Test
-    fun exactBlackRendererOutputIsClassifiedWithoutChangingExposure() {
+    fun impossibleBlackRequiresThreeSignalBackedFramesBeforeClassification() {
         val g = 106
         val start = 5_000_000_000L
         startHealthy(g, start)
-        RawPreviewHealthMonitor.rendererPublication(g, 4, 0f, 0f, 0f, "available=3", start + 20)
-        val snapshot = RawPreviewHealthMonitor.snapshot(start + 21)
+
+        repeat(2) { index ->
+            RawPreviewHealthMonitor.rendererPublication(
+                g, 4, 0f, 0f, 0f, "available=3", start + 20 + index,
+                normalizedRawMax = 0.25f,
+                sceneP50 = 0.05f
+            )
+        }
+        assertEquals(RawPreviewHealthStage.HEALTHY, RawPreviewHealthMonitor.snapshot(start + 23).stage)
+
+        RawPreviewHealthMonitor.rendererPublication(
+            g, 4, 0f, 0f, 0f, "available=3", start + 24,
+            normalizedRawMax = 0.25f,
+            sceneP50 = 0.05f
+        )
+        val snapshot = RawPreviewHealthMonitor.snapshot(start + 25)
         assertEquals(RawPreviewHealthStage.RGB_OUTPUT, snapshot.stage)
-        assertTrue(snapshot.outputRgbMax <= 1.0e-6f)
+        assertTrue(snapshot.impossibleBlackConfirmed)
+        assertEquals(3, snapshot.consecutiveImpossibleBlackFrames)
+    }
+
+    @Test
+    fun trulyDarkRawInputNeverConfirmsImpossibleBlack() {
+        val g = 107
+        val start = 6_000_000_000L
+        startHealthy(g, start)
+
+        repeat(6) { index ->
+            RawPreviewHealthMonitor.rendererPublication(
+                g, 4, 0f, 0f, 0f, "available=3", start + 20 + index,
+                normalizedRawMax = 0.001f,
+                sceneP50 = 0.0001f
+            )
+        }
+        val snapshot = RawPreviewHealthMonitor.snapshot(start + 30)
+        assertEquals(RawPreviewHealthStage.HEALTHY, snapshot.stage)
+        assertFalse(snapshot.impossibleBlackConfirmed)
+        assertEquals(0, snapshot.consecutiveImpossibleBlackFrames)
+    }
+
+    @Test
+    fun oneGoodOutputClearsBlackFaultQuorum() {
+        val g = 108
+        val start = 7_000_000_000L
+        startHealthy(g, start)
+
+        repeat(2) { index ->
+            RawPreviewHealthMonitor.rendererPublication(
+                g, 4, 0f, 0f, 0f, "available=3", start + 20 + index,
+                normalizedRawMax = 0.2f,
+                sceneP50 = 0.04f
+            )
+        }
+        RawPreviewHealthMonitor.rendererPublication(
+            g, 4, 0.01f, 0.2f, 0.05f, "available=3", start + 30,
+            normalizedRawMax = 0.2f,
+            sceneP50 = 0.04f
+        )
+        val snapshot = RawPreviewHealthMonitor.snapshot(start + 31)
+        assertEquals(RawPreviewHealthStage.HEALTHY, snapshot.stage)
+        assertEquals(0, snapshot.consecutiveImpossibleBlackFrames)
     }
 }

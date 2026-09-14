@@ -217,7 +217,9 @@ object RawPreviewCadenceDiagnostics {
         rgbMax: Float,
         rgbMean: Float,
         slotHealth: String,
-        publicationElapsedNs: Long = SystemClock.elapsedRealtimeNanos()
+        publicationElapsedNs: Long = SystemClock.elapsedRealtimeNanos(),
+        normalizedRawMax: Float = Float.NaN,
+        sceneP50: Float = Float.NaN
     ) {
         RawPreviewHealthMonitor.rendererPublication(
             generation = generation,
@@ -226,7 +228,9 @@ object RawPreviewCadenceDiagnostics {
             rgbMax = rgbMax,
             rgbMean = rgbMean,
             slotHealth = slotHealth,
-            nowElapsedNs = publicationElapsedNs
+            nowElapsedNs = publicationElapsedNs,
+            normalizedRawMax = normalizedRawMax,
+            sceneP50 = sceneP50
         )
         update(source, generation, sensorTimestampNs) { record ->
             record.rendererPublicationNs = publicationElapsedNs

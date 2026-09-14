@@ -30,6 +30,7 @@ class RawPreviewPhase1SourceContractTest {
         assertTrue(renderer.contains("dropReasons={"))
         listOf(
             "INPUT_QUEUE_OVERFLOW",
+            "COALESCED_STALE_PENDING",
             "NO_OUTPUT_SLOT",
             "STALE_GENERATION",
             "RETAIN_FAILED",
@@ -47,12 +48,32 @@ class RawPreviewPhase1SourceContractTest {
         assertTrue(renderer.contains("const val MAX_PENDING_REQUESTS = 2"))
         assertTrue(renderer.contains("stale = pendingRequests.removeFirst()"))
         assertTrue(renderer.contains("pendingRequests.addLast(request)"))
+        assertTrue(renderer.contains("private fun pollNewestPendingRequest()"))
+        assertTrue(renderer.contains("while (pendingRequests.size > 1) dropped.add(pendingRequests.removeFirst())"))
+        assertTrue(renderer.contains("pendingRequests.removeLast()"))
+        assertTrue(renderer.contains("RawPreviewDropReason.COALESCED_STALE_PENDING"))
+        assertTrue(renderer.contains("coalesced_stale_pending"))
         assertTrue(renderer.contains("latestOfferedSensorTimestampNs"))
         assertTrue(renderer.contains("sensorTimestampNs <= previous"))
         assertTrue(renderer.contains("duplicateOfferRejected"))
         assertTrue(renderer.contains("latestOfferedSensorTimestampNs.set(Long.MIN_VALUE)"))
         assertTrue(renderer.contains("clearPendingRequests()"))
         assertTrue(renderer.contains("RawPreviewDropReason.STALE_GENERATION"))
+    }
+
+
+    @Test
+    fun rendererDrainIsSingleFlightAndCannotQueueObsoleteWorkBehindActiveRender() {
+        val renderer = source("src/main/java/com/bncam/ui/screens/capture/RawPreviewRenderer.kt")
+        val schedule = renderer.substringAfter("private fun scheduleDrain").substringBefore("private fun drainLatest")
+        assertTrue(schedule.contains("drainScheduled.compareAndSet(false, true)"))
+        assertTrue(schedule.contains("try {"))
+        assertTrue(schedule.contains("drainLatest()"))
+        assertTrue(schedule.contains("finally {"))
+        assertTrue(schedule.contains("drainScheduled.set(false)"))
+        assertTrue(schedule.contains("if (!closed && hasPendingRequest()) scheduleDrain()"))
+        assertFalse(schedule.contains("drainScheduled.set(false)\n            drainLatest()"))
+        assertTrue(renderer.contains("queuePolicy=COALESCE_TO_NEWEST_BEFORE_RENDER drainSingleFlight=true"))
     }
 
     @Test

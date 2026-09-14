@@ -38,6 +38,10 @@ data class RawPreviewHealthSnapshot(
     val outputRgbMin: Float,
     val outputRgbMax: Float,
     val outputRgbMean: Float,
+    val inputRawMax: Float,
+    val inputSceneP50: Float,
+    val consecutiveImpossibleBlackFrames: Int,
+    val impossibleBlackConfirmed: Boolean,
     val outputSlotHealth: String,
     val ringPressure: String,
     val actualPresentationObserved: Boolean,
@@ -51,7 +55,13 @@ data class RawPreviewHealthSnapshot(
         appendLine("ageCaptureResultMs=${age(lastCaptureResultElapsedNs)} ageImageReaderMs=${age(lastImageReaderElapsedNs)} ageRendererOfferMs=${age(lastRendererOfferElapsedNs)}")
         appendLine("ageRendererPublicationMs=${age(lastRendererPublicationElapsedNs)} ageGlAcceptedMs=${age(lastGlAcceptedElapsedNs)} ageGlDrawMs=${age(lastGlDrawElapsedNs)} ageDisplayPresentMs=${age(lastDisplayPresentElapsedNs)}")
         appendLine("latestSensorTimestampNs=$latestSensorTimestampNs frameDurationNs=$latestSensorFrameDurationNs exposureTimeNs=$latestExposureTimeNs advertisedMinFrameDurationNs=$advertisedMinFrameDurationNs")
-        appendLine("rgbMin=$outputRgbMin rgbMax=$outputRgbMax rgbMean=$outputRgbMean actualPresentationObserved=$actualPresentationObserved")
+        appendLine(
+            "rgbMin=$outputRgbMin rgbMax=$outputRgbMax rgbMean=$outputRgbMean " +
+                "inputRawMax=$inputRawMax inputSceneP50=$inputSceneP50 " +
+                "consecutiveImpossibleBlackFrames=$consecutiveImpossibleBlackFrames " +
+                "impossibleBlackConfirmed=$impossibleBlackConfirmed " +
+                "actualPresentationObserved=$actualPresentationObserved"
+        )
         appendLine("outputSlotHealth={$outputSlotHealth}")
         appendLine("ringPressure={$ringPressure}")
         appendLine("lastRecoveryReason=$lastRecoveryReason lastRecoveryAgeMs=${age(lastRecoveryElapsedNs)}")
@@ -87,6 +97,10 @@ object RawPreviewHealthMonitor {
     private var outputRgbMin: Float = Float.NaN
     private var outputRgbMax: Float = Float.NaN
     private var outputRgbMean: Float = Float.NaN
+    private var inputRawMax: Float = Float.NaN
+    private var inputSceneP50: Float = Float.NaN
+    private var consecutiveImpossibleBlackFrames: Int = 0
+    private var impossibleBlackConfirmed: Boolean = false
     private var outputSlotHealth: String = "unavailable"
     private var ringPressure: String = "unavailable"
     private var lastRecoveryReason: String = "none"
@@ -123,6 +137,10 @@ object RawPreviewHealthMonitor {
         outputRgbMin = Float.NaN
         outputRgbMax = Float.NaN
         outputRgbMean = Float.NaN
+        inputRawMax = Float.NaN
+        inputSceneP50 = Float.NaN
+        consecutiveImpossibleBlackFrames = 0
+        impossibleBlackConfirmed = false
         outputSlotHealth = "unavailable"
         ringPressure = "unavailable"
         lastRecoveryReason = "none"
@@ -165,7 +183,9 @@ object RawPreviewHealthMonitor {
         rgbMax: Float,
         rgbMean: Float,
         slotHealth: String,
-        nowElapsedNs: Long
+        nowElapsedNs: Long,
+        normalizedRawMax: Float = Float.NaN,
+        sceneP50: Float = Float.NaN
     ) {
         if (!matches(generation)) return
         lastRendererPublicationElapsedNs = nowElapsedNs
@@ -173,6 +193,27 @@ object RawPreviewHealthMonitor {
         outputRgbMin = rgbMin
         outputRgbMax = rgbMax
         outputRgbMean = rgbMean
+        inputRawMax = normalizedRawMax
+        inputSceneP50 = sceneP50
+
+        val outputExactlyBlack =
+            rgbMax.isFinite() && rgbMean.isFinite() &&
+                rgbMax <= BROKEN_RGB_MAX_EPSILON &&
+                rgbMean <= BROKEN_RGB_MEAN_EPSILON
+        val rawSignalProven =
+            normalizedRawMax.isFinite() && sceneP50.isFinite() &&
+                normalizedRawMax >= MIN_RAW_SIGNAL_FOR_BLACK_FAULT &&
+                sceneP50 >= MIN_SCENE_P50_FOR_BLACK_FAULT
+        if (outputExactlyBlack && rawSignalProven) {
+            consecutiveImpossibleBlackFrames =
+                (consecutiveImpossibleBlackFrames + 1)
+                    .coerceAtMost(BLACK_FAULT_CONFIRMATION_FRAMES)
+        } else {
+            consecutiveImpossibleBlackFrames = 0
+        }
+        impossibleBlackConfirmed =
+            consecutiveImpossibleBlackFrames >= BLACK_FAULT_CONFIRMATION_FRAMES
+
         if (slotHealth.isNotBlank()) outputSlotHealth = slotHealth
     }
 
@@ -254,6 +295,10 @@ object RawPreviewHealthMonitor {
             outputRgbMin = outputRgbMin,
             outputRgbMax = outputRgbMax,
             outputRgbMean = outputRgbMean,
+            inputRawMax = inputRawMax,
+            inputSceneP50 = inputSceneP50,
+            consecutiveImpossibleBlackFrames = consecutiveImpossibleBlackFrames,
+            impossibleBlackConfirmed = impossibleBlackConfirmed,
             outputSlotHealth = outputSlotHealth,
             ringPressure = ringPressure,
             actualPresentationObserved = actualPresentationObserved,
@@ -280,8 +325,7 @@ object RawPreviewHealthMonitor {
         if (actualPresentationObserved && !recent(lastDisplayPresentElapsedNs)) {
             return RawPreviewHealthStage.EGL_PRESENTATION
         }
-        val validRgb = outputRgbMin.isFinite() && outputRgbMax.isFinite() && outputRgbMean.isFinite()
-        if (validRgb && outputRgbMax <= BROKEN_RGB_MAX_EPSILON && outputRgbMean <= BROKEN_RGB_MEAN_EPSILON) {
+        if (impossibleBlackConfirmed) {
             return RawPreviewHealthStage.RGB_OUTPUT
         }
         return RawPreviewHealthStage.HEALTHY
@@ -292,6 +336,9 @@ object RawPreviewHealthMonitor {
     internal const val MIN_STALL_THRESHOLD_NS: Long = 1_000_000_000L
     internal const val STALL_INTERVAL_MULTIPLIER: Long = 6L
     internal const val DEFAULT_EXPECTED_INTERVAL_NS: Long = 33_333_333L
+    internal const val BLACK_FAULT_CONFIRMATION_FRAMES = 3
+    internal const val MIN_RAW_SIGNAL_FOR_BLACK_FAULT = 0.005f
+    internal const val MIN_SCENE_P50_FOR_BLACK_FAULT = 0.001f
     private const val BROKEN_RGB_MAX_EPSILON = 1.0e-6f
     private const val BROKEN_RGB_MEAN_EPSILON = 1.0e-7f
 }

@@ -45,6 +45,17 @@ class RawPreviewProducerAuthorityTracker {
         return "customPublicationProven=$customPublicationProven;customPublishedFrames=$customPublishedFrames"
     }
 
+    /** Read-only diagnostic view. Unlike [summary], this never resets tracker authority. */
+    @Synchronized
+    fun diagnosticSummary(currentGeneration: Int): String =
+        if (generation == currentGeneration) {
+            "trackerGeneration=$generation;generationMatch=true;" +
+                "customPublicationProven=$customPublicationProven;customPublishedFrames=$customPublishedFrames"
+        } else {
+            "trackerGeneration=$generation;requestedGeneration=$currentGeneration;generationMatch=false;" +
+                "customPublicationProven=false;customPublishedFrames=0;status=STALE_GENERATION"
+        }
+
     private fun ensureGeneration(currentGeneration: Int) {
         if (generation != currentGeneration) reset(currentGeneration)
     }

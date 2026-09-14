@@ -31,6 +31,7 @@ class CaptureNoiseState(
     val lensShadingGainP90: Float?,
     val profileSpectraSettings: ProfileNoiseTuning,
     val modelSourceFlags: Long,
+    /** Physical/effective sensor-model confidence. It does not become zero merely because SPECTRA is Off. */
     val modelConfidence: Float,
     val timestampNs: Long
 ) {
@@ -45,6 +46,22 @@ class CaptureNoiseState(
     val cameraOCanonical: DoubleArray get() = cameraOValues.clone()
     val effectiveSCanonical: DoubleArray get() = effectiveSValues.clone()
     val effectiveOCanonical: DoubleArray get() = effectiveOValues.clone()
+
+    /** Camera2 physical S/O availability; independent from whether SPECTRA mutates pixels. */
+    val physicalNoiseModelAvailable: Boolean
+        get() = validSoModel(cameraSValues, cameraOValues)
+
+    /** Effective S/O availability after an explicit manual/fusion authority may have replaced Camera2. */
+    val effectiveNoiseModelAvailable: Boolean
+        get() = validSoModel(effectiveSValues, effectiveOValues)
+
+    /** Pixel-mutation authority remains separate from sensor-model measurement authority. */
+    val spectraProcessingEnabled: Boolean
+        get() = profileSpectraSettings.spectraEnabled && modelConfidence > 0f
+
+    /** Processing confidence is zero when mutation is disabled; physical model confidence is retained above. */
+    val spectraProcessingConfidence: Float
+        get() = if (spectraProcessingEnabled) modelConfidence.coerceIn(0f, 1f) else 0f
 
     init {
         require(lensKey.isNotBlank()) { "lensKey cannot be blank" }
@@ -63,8 +80,12 @@ class CaptureNoiseState(
         "sourceFormat" to sourceFormat,
         "sensorPixelMode" to sensorPixelMode,
         "captureIso" to captureIso,
+        // SENSOR_SENSITIVITY is the RAW-domain sensitivity observation. Post-RAW boost is retained
+        // as metadata/telemetry, but 0220 forbids folding it into pre-demosaic RAW noise evidence.
+        "rawNoiseEvidenceIso" to captureIso,
         "exposureTimeNs" to exposureTimeNs,
         "postRawSensitivityBoost" to postRawSensitivityBoost,
+        "postRawBoostAffectsRawNoiseEvidence" to false,
         "cfaPattern" to cfaPattern,
         "cfaName" to cfaName,
         "canonicalSoOrder" to "R,G1,G2,B",
@@ -75,6 +96,8 @@ class CaptureNoiseState(
         "cameraOCanonical" to cameraOValues.toList(),
         "effectiveSCanonical" to effectiveSValues.toList(),
         "effectiveOCanonical" to effectiveOValues.toList(),
+        "physicalNoiseModelAvailable" to physicalNoiseModelAvailable,
+        "effectiveNoiseModelAvailable" to effectiveNoiseModelAvailable,
         "lensShadingAlreadyApplied" to lensShadingAlreadyApplied,
         "lensShadingMapFromMetadata" to lensShadingMapFromMetadata,
         "lensShadingMapColumns" to lensShadingMapColumns,
@@ -86,10 +109,19 @@ class CaptureNoiseState(
         "profileSpectraSettings" to profileSpectraSettings.toTraceMap(),
         "modelSourceFlags" to modelSourceFlags,
         "modelConfidence" to modelConfidence,
+        "spectraProcessingEnabled" to spectraProcessingEnabled,
+        "spectraProcessingConfidence" to spectraProcessingConfidence,
+        "noiseAuthorityContract" to "PHYSICAL_SO_PRIMARY_ISO_FALLBACK_NO_LENS_ID_STRENGTH_SHORTCUT",
         "timestampNs" to timestampNs
     )
 
     companion object {
+        private fun validSoModel(s: DoubleArray, o: DoubleArray): Boolean =
+            s.size == 4 && o.size == 4 &&
+                s.all { it.isFinite() && it >= 0.0 } &&
+                o.all { it.isFinite() && it >= 0.0 } &&
+                (s.any { it > 1.0e-12 } || o.any { it > 1.0e-12 })
+
         fun from(
             snapshot: NoiseModelSnapshotV3,
             profileNoiseTuning: ProfileNoiseTuning,
@@ -101,42 +133,51 @@ class CaptureNoiseState(
             lensShadingGainP50: Float? = null,
             lensShadingGainP90: Float? = null,
             sensorPixelMode: String = "UNAVAILABLE_IN_V3_SNAPSHOT"
-        ): CaptureNoiseState = CaptureNoiseState(
-            lensKey = snapshot.lensKey,
-            sourceFormat = snapshot.sourceFormat,
-            sensorPixelMode = sensorPixelMode,
-            captureIso = snapshot.iso,
-            exposureTimeNs = snapshot.exposureTimeNs,
-            postRawSensitivityBoost = snapshot.postRawSensitivityBoost,
-            cfaPattern = snapshot.cfaPattern,
-            cfaName = snapshot.cfaName,
-            whiteLevel = snapshot.whiteLevel,
-            blackLevelMosaicOrder = snapshot.blackLevel,
-            cameraSCanonical = snapshot.cameraS,
-            cameraOCanonical = snapshot.cameraO,
-            effectiveSCanonical = snapshot.effectiveS,
-            effectiveOCanonical = snapshot.effectiveO,
-            lensShadingAlreadyApplied = lensShadingAlreadyApplied,
-            lensShadingMapFromMetadata = lensShadingMapFromMetadata,
-            lensShadingMapColumns = lensShadingMapColumns,
-            lensShadingMapRows = lensShadingMapRows,
-            lensShadingGainP10 = lensShadingGainP10,
-            lensShadingGainP50 = lensShadingGainP50,
-            lensShadingGainP90 = lensShadingGainP90,
-            profileSpectraSettings = profileNoiseTuning.sanitized(),
-            modelSourceFlags = snapshot.sourceFlags,
-            modelConfidence = if (snapshot.isSpectraActive()) {
-                snapshot.signalModelConfidence.coerceIn(0f, 1f)
-            } else {
-                0f
-            },
-            timestampNs = snapshot.timestampNs
-        )
+        ): CaptureNoiseState {
+            val cameraS = snapshot.cameraS
+            val cameraO = snapshot.cameraO
+            val effectiveS = snapshot.effectiveS
+            val effectiveO = snapshot.effectiveO
+            val effectiveModelValid = validSoModel(effectiveS, effectiveO)
+            return CaptureNoiseState(
+                lensKey = snapshot.lensKey,
+                sourceFormat = snapshot.sourceFormat,
+                sensorPixelMode = sensorPixelMode,
+                captureIso = snapshot.iso,
+                exposureTimeNs = snapshot.exposureTimeNs,
+                postRawSensitivityBoost = snapshot.postRawSensitivityBoost,
+                cfaPattern = snapshot.cfaPattern,
+                cfaName = snapshot.cfaName,
+                whiteLevel = snapshot.whiteLevel,
+                blackLevelMosaicOrder = snapshot.blackLevel,
+                cameraSCanonical = cameraS,
+                cameraOCanonical = cameraO,
+                effectiveSCanonical = effectiveS,
+                effectiveOCanonical = effectiveO,
+                lensShadingAlreadyApplied = lensShadingAlreadyApplied,
+                lensShadingMapFromMetadata = lensShadingMapFromMetadata,
+                lensShadingMapColumns = lensShadingMapColumns,
+                lensShadingMapRows = lensShadingMapRows,
+                lensShadingGainP10 = lensShadingGainP10,
+                lensShadingGainP50 = lensShadingGainP50,
+                lensShadingGainP90 = lensShadingGainP90,
+                profileSpectraSettings = profileNoiseTuning.sanitized(),
+                modelSourceFlags = snapshot.sourceFlags,
+                modelConfidence = if (effectiveModelValid) {
+                    snapshot.signalModelConfidence.coerceIn(0f, 1f)
+                } else {
+                    0f
+                },
+                timestampNs = snapshot.timestampNs
+            )
+        }
     }
 }
 
 internal fun ProfileNoiseTuning.toTraceMap(): Map<String, Any> = linkedMapOf(
-    "spectraStrength" to spectraStrength,
+    "spectraEnabled" to spectraEnabled,
+    "neuralDenoiseStrength" to neuralDenoiseStrength,
+    "neuralAdaptiveResponse" to neuralAdaptiveResponse,
     "spectraLuma" to spectraLuma,
     "spectraChroma" to spectraChroma,
     "spectraDetailProtection" to spectraDetailProtection,

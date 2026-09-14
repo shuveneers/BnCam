@@ -2,6 +2,11 @@ package com.bncam.core.quality
 
 import com.bncam.data.baseline.CameraTopologyType
 
+/**
+ * Legacy Phase-5 route status kept for baseline/test compatibility.
+ *
+ * This is not Camera2 discovery authority and must not be used to derive image tuning.
+ */
 enum class RouteSupportStatus {
     SUPPORTED_AND_CAPTURED,
     SUPPORTED_BUT_CAPTURE_FAILED,
@@ -9,6 +14,12 @@ enum class RouteSupportStatus {
     UNSUPPORTED
 }
 
+/**
+ * Legacy synthetic capability model used by the Phase-5 baseline matrix.
+ *
+ * It intentionally remains separate from [CameraCapabilitySnapshot], which represents detached
+ * Camera2 facts used by the production capability policy introduced in 0221.
+ */
 data class PhysicalLensCapability(
     val logicalCameraId: String,
     val physicalCameraId: String?,
@@ -34,8 +45,104 @@ data class PhysicalLensCapability(
     val routeStatuses: Map<String, RouteSupportStatus> = emptyMap()
 )
 
-object CameraCapabilityInspector {
+/**
+ * Detached Camera2 capability facts. This snapshot reports what the camera advertises; it does
+ * not choose BnCam tuning, processing strength, profile values or runtime algorithms.
+ */
+data class CameraCapabilitySnapshot(
+    val awbModes: IntArray,
+    val edgeModes: IntArray,
+    val noiseReductionModes: IntArray,
+    val hotPixelModes: IntArray,
+    val shadingModes: IntArray,
+    val aberrationModes: IntArray,
+    val supportsLensShadingMap: Boolean,
+    val supportsTonemapCurve: Boolean,
+    val tonemapMaxCurvePoints: Int,
+    val supportsDistortionCorrection: Boolean,
+    val supportsRaw: Boolean,
+    val pipelineMaxDepth: Int,
+    val partialResultCount: Int,
+    val maxDigitalZoom: Float,
+    val hyperfocalDistanceDiopters: Float?,
+    val minimumFocusDistanceDiopters: Float?,
+    val focalLengthsMm: FloatArray,
+    val apertures: FloatArray,
+    val sensitivityRange: IntRange?,
+    val exposureTimeRangeNs: LongRange?
+)
 
+object CameraCapabilityInspector {
+    private const val CAMERA2_MODE_OFF = 0
+
+    /**
+     * Converts CameraCharacteristics values into immutable-by-ownership facts.
+     *
+     * Important separation rule: this function may sanitize malformed metadata but may never turn
+     * capabilities into image tuning. A feature still needs an explicit BnCam implementation/policy
+     * decision before it can become runtime authority.
+     */
+    fun inspect(
+        awbModes: IntArray?,
+        edgeModes: IntArray?,
+        noiseReductionModes: IntArray?,
+        hotPixelModes: IntArray?,
+        shadingModes: IntArray?,
+        aberrationModes: IntArray?,
+        lensShadingMapModes: IntArray?,
+        tonemapMaxCurvePoints: Int?,
+        distortionCorrectionModes: IntArray?,
+        capabilities: IntArray?,
+        pipelineMaxDepth: Int?,
+        partialResultCount: Int?,
+        maxDigitalZoom: Float?,
+        hyperfocalDistanceDiopters: Float?,
+        minimumFocusDistanceDiopters: Float?,
+        focalLengthsMm: FloatArray?,
+        apertures: FloatArray?,
+        sensitivityLower: Int?,
+        sensitivityUpper: Int?,
+        exposureTimeLowerNs: Long?,
+        exposureTimeUpperNs: Long?,
+        rawCapabilityConstant: Int
+    ): CameraCapabilitySnapshot {
+        val tones = tonemapMaxCurvePoints?.coerceAtLeast(0) ?: 0
+        val lensShading = lensShadingMapModes?.copyOf() ?: IntArray(0)
+        val distortion = distortionCorrectionModes?.copyOf() ?: IntArray(0)
+        val caps = capabilities?.copyOf() ?: IntArray(0)
+
+        return CameraCapabilitySnapshot(
+            awbModes = awbModes?.copyOf() ?: IntArray(0),
+            edgeModes = edgeModes?.copyOf() ?: IntArray(0),
+            noiseReductionModes = noiseReductionModes?.copyOf() ?: IntArray(0),
+            hotPixelModes = hotPixelModes?.copyOf() ?: IntArray(0),
+            shadingModes = shadingModes?.copyOf() ?: IntArray(0),
+            aberrationModes = aberrationModes?.copyOf() ?: IntArray(0),
+            // OFF-only is not a usable correction capability.
+            supportsLensShadingMap = lensShading.any { it != CAMERA2_MODE_OFF },
+            supportsTonemapCurve = tones >= 2,
+            tonemapMaxCurvePoints = tones,
+            // OFF-only is not a usable correction capability.
+            supportsDistortionCorrection = distortion.any { it != CAMERA2_MODE_OFF },
+            supportsRaw = caps.contains(rawCapabilityConstant),
+            pipelineMaxDepth = pipelineMaxDepth?.coerceAtLeast(0) ?: 0,
+            partialResultCount = partialResultCount?.coerceAtLeast(1) ?: 1,
+            maxDigitalZoom = maxDigitalZoom
+                ?.takeIf { it.isFinite() && it >= 1.0f }
+                ?: 1.0f,
+            hyperfocalDistanceDiopters = hyperfocalDistanceDiopters.validFocusDistanceOrNull(),
+            minimumFocusDistanceDiopters = minimumFocusDistanceDiopters.validFocusDistanceOrNull(),
+            focalLengthsMm = focalLengthsMm.validPositiveFiniteValues(),
+            apertures = apertures.validPositiveFiniteValues(),
+            sensitivityRange = validPositiveRange(sensitivityLower, sensitivityUpper),
+            exposureTimeRangeNs = validPositiveRange(exposureTimeLowerNs, exposureTimeUpperNs)
+        )
+    }
+
+    /**
+     * Legacy Phase-5 baseline matrix retained as a compatibility seam for existing regression tests.
+     * These are synthetic fixtures, not live Camera2 discovery and not production tuning inputs.
+     */
     fun inspectDiscoveredCapabilities(): List<PhysicalLensCapability> {
         return listOf(
             PhysicalLensCapability(
@@ -133,9 +240,7 @@ object CameraCapabilityInspector {
         )
     }
 
-    /**
-     * Synthetic device fixture generator covering scenarios A through T.
-     */
+    /** Synthetic device fixture generator covering the historical Phase-5 scenarios A through T. */
     fun createFixture(fixtureId: String): PhysicalLensCapability {
         return when (fixtureId) {
             "A" -> PhysicalLensCapability(logicalCameraId = "0", physicalCameraId = null, stableLensKey = "lens_v2_0_yuv_only", lensFacing = "BACK", isRawCapable = false, supportsRaw10 = false, supportsRawSensor = false, supportsYuv = true, supportsDng = false)
@@ -158,7 +263,18 @@ object CameraCapabilityInspector {
         }
     }
 
-    fun inspectStandaloneRearCameras(): List<PhysicalLensCapability> {
-        return inspectDiscoveredCapabilities().filter { it.lensFacing == "BACK" }
-    }
+    fun inspectStandaloneRearCameras(): List<PhysicalLensCapability> =
+        inspectDiscoveredCapabilities().filter { it.lensFacing == "BACK" }
+
+    private fun Float?.validFocusDistanceOrNull(): Float? =
+        this?.takeIf { it.isFinite() && it >= 0.0f }
+
+    private fun FloatArray?.validPositiveFiniteValues(): FloatArray =
+        this?.filter { it.isFinite() && it > 0.0f }?.toFloatArray() ?: FloatArray(0)
+
+    private fun validPositiveRange(lower: Int?, upper: Int?): IntRange? =
+        if (lower != null && upper != null && lower > 0 && upper >= lower) lower..upper else null
+
+    private fun validPositiveRange(lower: Long?, upper: Long?): LongRange? =
+        if (lower != null && upper != null && lower > 0L && upper >= lower) lower..upper else null
 }

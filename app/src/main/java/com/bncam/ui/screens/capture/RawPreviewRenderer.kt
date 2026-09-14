@@ -190,8 +190,9 @@ class RawPreviewFrame internal constructor(
 /**
  * Bounded-jitter RAW viewfinder renderer. The input handle is an independently retained native
  * AHardwareBuffer reference; neither this class nor native code owns the Image/ring-buffer handle.
- * Two pending frames absorb Camera2 delivery jitter while overflow still drops the oldest queued
- * request, so backlog can never grow without bound or silently trade cadence for latency.
+ * Two pending slots absorb Camera2 delivery jitter, but the renderer always coalesces pending
+ * work to the newest sensor timestamp before spending GPU time. Backlog can therefore never grow
+ * without bound or silently trade viewfinder latency for obsolete-frame throughput.
  */
 class RawPreviewRenderer(
     private val fenceBackend: RawPreviewFenceBackend = PlatformRawPreviewFenceBackend,
@@ -447,6 +448,24 @@ class RawPreviewRenderer(
     fun healthSummary(): String = outputSlotHealth()
 
     /**
+     * Read-only compact runtime evidence for per-shot diagnostics. This does not probe, recover,
+     * reconfigure or otherwise influence preview authority.
+     */
+    fun runtimeDiagnosticsSummary(): String =
+        "fastPath=${lastFastPathKind ?: "UNPROVEN"};" +
+            "directAhbFrames=$directAhbGpuFastFrames;" +
+            "hostInputFrames=$hostInputGpuResidentFrames;" +
+            "gpuCompatFrames=$gpuResidentCompatibilityFrames;" +
+            "cpuFallbackFrames=$cpuVisibleFallbackFrames;" +
+            "compactNv21Requested=$mlAnalysisRequested;compactNv21Frames=$compactAnalysisFrames;" +
+            "slotHealth={${outputSlotHealth()}};" +
+            "dropReasons={${dropCountsSummary()}};" +
+            "frameLifecycle={${RawPreviewFrameLifecycleRegistry.latest()?.summary() ?: "unavailable"}};" +
+            "activeLifecycleFrames=${RawPreviewFrameLifecycleRegistry.activeCount()};" +
+            "retainFailures=$retainFailures;renderFailures=$renderFailures;" +
+            "generation=${activeConfig?.pipelineGeneration ?: -1}"
+
+    /**
      * Stage-aware watchdog recovery. This only retires GPU presentation authority for the active
      * camera/EGL boundary; it never restarts Camera2 and never recycles an AHB whose GL completion
      * is unknown. Available CPU-capable slots continue servicing newest-frame-wins requests.
@@ -523,8 +542,30 @@ class RawPreviewRenderer(
         }
     }
 
-    private fun pollPendingRequest(): Request? = synchronized(pendingRequestLock) {
-        pendingRequests.pollFirst()
+    private fun pollNewestPendingRequest(): Request? {
+        var superseded: MutableList<Request>? = null
+        val newest = synchronized(pendingRequestLock) {
+            if (pendingRequests.isEmpty()) return@synchronized null
+            if (pendingRequests.size > 1) {
+                superseded = ArrayList<Request>(pendingRequests.size - 1).also { dropped ->
+                    while (pendingRequests.size > 1) dropped.add(pendingRequests.removeFirst())
+                }
+            }
+            pendingRequests.removeLast()
+        }
+        superseded?.forEach { dropped ->
+            droppedBusy++
+            recordDrop(RawPreviewDropReason.COALESCED_STALE_PENDING, dropped)
+            exactFrameColorPairs.remove(dropped.sensorTimestampNs)
+            releaseRequest(dropped)
+            RawPreviewFrameLifecycleRegistry.released(
+                dropped.config.pipelineGeneration,
+                dropped.sensorTimestampNs,
+                SystemClock.elapsedRealtimeNanos(),
+                "coalesced_stale_pending"
+            )
+        }
+        return newest
     }
 
     private fun hasPendingRequest(): Boolean = synchronized(pendingRequestLock) {
@@ -821,15 +862,22 @@ class RawPreviewRenderer(
 
     private fun scheduleDrain(delayMs: Long = 0L) {
         if (closed || !drainScheduled.compareAndSet(false, true)) return
-        executor.schedule({
-            drainScheduled.set(false)
-            drainLatest()
-        }, delayMs.coerceAtLeast(0L), TimeUnit.MILLISECONDS)
+        val scheduled = runCatching {
+            executor.schedule({
+                try {
+                    drainLatest()
+                } finally {
+                    drainScheduled.set(false)
+                    if (!closed && hasPendingRequest()) scheduleDrain()
+                }
+            }, delayMs.coerceAtLeast(0L), TimeUnit.MILLISECONDS)
+        }.isSuccess
+        if (!scheduled) drainScheduled.set(false)
     }
 
     private fun drainLatest() {
         if (closed) return
-        val request = pollPendingRequest() ?: return
+        val request = pollNewestPendingRequest() ?: return
         reclaimCompletedGpuOutputSlots()
         val slot = acquireOutputSlot()
         if (slot == null) {
@@ -844,7 +892,6 @@ class RawPreviewRenderer(
                 "no_output_slot"
             )
             logDiagnostics()
-            if (hasPendingRequest()) scheduleDrain()
             return
         }
 
@@ -1286,7 +1333,9 @@ class RawPreviewRenderer(
                 rgbMax = frame.outputRgbMax,
                 rgbMean = frame.outputRgbMean,
                 slotHealth = outputSlotHealth(),
-                publicationElapsedNs = publicationNs
+                publicationElapsedNs = publicationNs,
+                normalizedRawMax = frame.normalizedRawMax,
+                sceneP50 = frame.spatialExposureSceneP50
             )
             onFrame(frame)
             delivered = true
@@ -1306,7 +1355,6 @@ class RawPreviewRenderer(
                 )
                 returnOutputSlot(slot, "undelivered")
             }
-            if (hasPendingRequest()) scheduleDrain()
         }
     }
 
@@ -1389,7 +1437,6 @@ class RawPreviewRenderer(
                 )
             }
         }
-        if (hasPendingRequest()) scheduleDrain()
     }
 
     private fun recordDropForFrame(
@@ -1622,7 +1669,8 @@ class RawPreviewRenderer(
                 "${RawPreviewResolutionPolicy.SHARP_PROTOTYPE_MAX_HEIGHT} sharpPrototypeActive=false " +
                 "settingsConnectivity={${rawPreviewSettingsConnectivitySummary(activeConfig)}} " +
                 "renderEmaMs=$renderCostEmaMs glUploadEmaMs=$glUploadCostEmaMs " +
-                "RAW_PREVIEW_DROPPED_BUSY=$droppedBusy pendingQueue=${pendingRequestCount()}/$MAX_PENDING_REQUESTS rendered=$rendered " +
+                "RAW_PREVIEW_DROPPED_BUSY=$droppedBusy pendingQueue=${pendingRequestCount()}/$MAX_PENDING_REQUESTS " +
+                "queuePolicy=COALESCE_TO_NEWEST_BEFORE_RENDER drainSingleFlight=true rendered=$rendered " +
                 "slotHealth={${outputSlotHealth()}} dropReasons={${dropCountsSummary()}} " +
                 "frameLifecycle={${RawPreviewFrameLifecycleRegistry.latest()?.summary() ?: "unavailable"}} " +
                 "activeLifecycleFrames=${RawPreviewFrameLifecycleRegistry.activeCount()} " +

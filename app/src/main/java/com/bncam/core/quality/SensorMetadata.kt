@@ -154,8 +154,17 @@ data class SensorMetadata(
         get() = lensShadingRows > 0 && lensShadingColumns > 0 &&
             lensShadingGainFactors?.size == lensShadingRows * lensShadingColumns * 4
 
+    /**
+     * Role-by-role calibration authority. This is deliberately computed from the same immutable
+     * SensorMetadata instance that is consumed by the RAW pipeline; no lens-role or device-model
+     * shortcut participates in the decision.
+     */
+    val calibrationOwnership: RawSensorCalibrationOwnershipSnapshot by lazy(LazyThreadSafetyMode.PUBLICATION) {
+        RawSensorCalibrationOwnershipPolicy.resolve(this)
+    }
+
     val coreRawMetadataValid: Boolean
-        get() = cfa.isValid && effectiveBlackLevel.isValid && effectiveWhiteLevelField.isValid &&
+        get() = calibrationOwnership.mandatoryRawNormalizationReady &&
             sensitivityIsoField.isValid && exposureTimeNsField.isValid && rawSizeField.isValid &&
             orientationField.isValid && timestampField.isValid && frameNumberField.isValid
 
@@ -173,54 +182,58 @@ data class SensorMetadata(
         foreignSensorMetadataUsed = foreignSensorMetadataUsed
     )
 
-    fun debugAuditLines(): List<String> = listOf(
-        audit("CFA", cfa, { it.toString() }),
-        audit("Black Static", staticBlackLevel, ::formatFloatList),
-        audit("Black Dynamic", dynamicBlackLevel, ::formatFloatList),
-        audit("Black Effective", effectiveBlackLevel, ::formatFloatList),
-        audit("White Static", staticWhiteLevelField, { it.toString() }),
-        audit("White Dynamic", dynamicWhiteLevelField, { it.toString() }),
-        audit("White Effective", effectiveWhiteLevelField, { it.toString() }),
-        audit("ISO", sensitivityIsoField, { it.toString() }),
-        audit("Exposure Ns", exposureTimeNsField, { it.toString() }),
-        audit("Analog Sensitivity ISO", analogSensitivityIso, { it.toString() }),
-        audit("Analog Gain Relative To Minimum", analogGainRelativeToMinimum, { formatDouble(it) }),
-        audit("Sensor Digital Gain Ratio", sensorDigitalGainRatio, { formatDouble(it) }),
-        audit("Post-RAW Sensitivity Boost", postRawSensitivityBoostField, { it.toString() }),
-        audit("Post-RAW Digital Gain Ratio", postRawDigitalGainRatio, { formatDouble(it) }),
-        audit("Combined Digital Gain Ratio", combinedDigitalGainRatio, { formatDouble(it) }),
-        audit("NoiseProfile S/O", noiseProfileSoField, ::formatDoubleList),
-        audit("WB Gains", colorCorrectionGainsField, ::formatFloatList),
-        audit("Neutral Color Point", neutralColorPointField, ::formatFloatList),
-        audit("Color Correction Transform", colorCorrectionTransformField, ::formatFloatList),
-        audit("Reference Illuminant1", referenceIlluminant1Field, { it.toString() }),
-        audit("Reference Illuminant2", referenceIlluminant2Field, { it.toString() }),
-        audit("ColorTransform1", colorTransform1, ::formatFloatList),
-        audit("ColorTransform2", colorTransform2, ::formatFloatList),
-        audit("ForwardMatrix1", forwardMatrix1, ::formatFloatList),
-        audit("ForwardMatrix2", forwardMatrix2, ::formatFloatList),
-        audit("CameraCalibration1", cameraCalibration1, ::formatFloatList),
-        audit("CameraCalibration2", cameraCalibration2, ::formatFloatList),
-        audit("Active Array", activeArrayField, { "${it.left},${it.top},${it.right},${it.bottom}" }),
-        audit("RAW Size", rawSizeField, { "${it.width}x${it.height}" }),
-        audit("Orientation", orientationField, { it.toString() }),
-        audit("Timestamp Ns", timestampField, { it.toString() }),
-        audit("Frame Number", frameNumberField, { it.toString() }),
-        "Core RAW Metadata | value=$coreRawMetadataStatus; source=UNIFORM_SENSOR_METADATA; validity=" +
-            if (coreRawMetadataValid) "VALID; reason=none" else "INVALID; reason=$coreRawMetadataStatus"
-    )
+    fun debugAuditLines(): List<String> = buildList {
+        add(audit("CFA", cfa, { it.toString() }))
+        add(audit("Black Static", staticBlackLevel, ::formatFloatList))
+        add(audit("Black Dynamic", dynamicBlackLevel, ::formatFloatList))
+        add(audit("Black Effective", effectiveBlackLevel, ::formatFloatList))
+        add(audit("White Static", staticWhiteLevelField, { it.toString() }))
+        add(audit("White Dynamic", dynamicWhiteLevelField, { it.toString() }))
+        add(audit("White Effective", effectiveWhiteLevelField, { it.toString() }))
+        add(audit("ISO", sensitivityIsoField, { it.toString() }))
+        add(audit("Exposure Ns", exposureTimeNsField, { it.toString() }))
+        add(audit("Analog Sensitivity ISO", analogSensitivityIso, { it.toString() }))
+        add(audit("Analog Gain Relative To Minimum", analogGainRelativeToMinimum, { formatDouble(it) }))
+        add(audit("Sensor Digital Gain Ratio", sensorDigitalGainRatio, { formatDouble(it) }))
+        add(audit("Post-RAW Sensitivity Boost", postRawSensitivityBoostField, { it.toString() }))
+        add(audit("Post-RAW Digital Gain Ratio", postRawDigitalGainRatio, { formatDouble(it) }))
+        add(audit("Combined Digital Gain Ratio", combinedDigitalGainRatio, { formatDouble(it) }))
+        add(audit("NoiseProfile S/O", noiseProfileSoField, ::formatDoubleList))
+        add(audit("WB Gains", colorCorrectionGainsField, ::formatFloatList))
+        add(audit("Neutral Color Point", neutralColorPointField, ::formatFloatList))
+        add(audit("Color Correction Transform", colorCorrectionTransformField, ::formatFloatList))
+        add(audit("Reference Illuminant1", referenceIlluminant1Field, { it.toString() }))
+        add(audit("Reference Illuminant2", referenceIlluminant2Field, { it.toString() }))
+        add(audit("ColorTransform1", colorTransform1, ::formatFloatList))
+        add(audit("ColorTransform2", colorTransform2, ::formatFloatList))
+        add(audit("ForwardMatrix1", forwardMatrix1, ::formatFloatList))
+        add(audit("ForwardMatrix2", forwardMatrix2, ::formatFloatList))
+        add(audit("CameraCalibration1", cameraCalibration1, ::formatFloatList))
+        add(audit("CameraCalibration2", cameraCalibration2, ::formatFloatList))
+        add(audit("Active Array", activeArrayField, { "${it.left},${it.top},${it.right},${it.bottom}" }))
+        add(audit("RAW Size", rawSizeField, { "${it.width}x${it.height}" }))
+        add(audit("Orientation", orientationField, { it.toString() }))
+        add(audit("Timestamp Ns", timestampField, { it.toString() }))
+        add(audit("Frame Number", frameNumberField, { it.toString() }))
+        add(
+            "Core RAW Metadata | value=$coreRawMetadataStatus; source=UNIFORM_SENSOR_METADATA; validity=" +
+                if (coreRawMetadataValid) "VALID; reason=none" else "INVALID; reason=$coreRawMetadataStatus"
+        )
+        addAll(calibrationOwnership.debugAuditLines())
+    }
 
-    private fun firstCoreRawMetadataFailure(): String? = when {
-        !cfa.isValid -> "CFA_${cfa.validity.name}:${cfa.reason}"
-        !effectiveBlackLevel.isValid -> "BLACK_LEVEL_${effectiveBlackLevel.validity.name}:${effectiveBlackLevel.reason}"
-        !effectiveWhiteLevelField.isValid -> "WHITE_LEVEL_${effectiveWhiteLevelField.validity.name}:${effectiveWhiteLevelField.reason}"
-        !sensitivityIsoField.isValid -> "ISO_${sensitivityIsoField.validity.name}:${sensitivityIsoField.reason}"
-        !exposureTimeNsField.isValid -> "EXPOSURE_${exposureTimeNsField.validity.name}:${exposureTimeNsField.reason}"
-        !rawSizeField.isValid -> "RAW_SIZE_${rawSizeField.validity.name}:${rawSizeField.reason}"
-        !orientationField.isValid -> "ORIENTATION_${orientationField.validity.name}:${orientationField.reason}"
-        !timestampField.isValid -> "TIMESTAMP_${timestampField.validity.name}:${timestampField.reason}"
-        !frameNumberField.isValid -> "FRAME_NUMBER_${frameNumberField.validity.name}:${frameNumberField.reason}"
-        else -> null
+    private fun firstCoreRawMetadataFailure(): String? {
+        val ownership = calibrationOwnership
+        return when {
+            !ownership.mandatoryRawNormalizationReady -> ownership.mandatoryRejectionReason
+            !sensitivityIsoField.isValid -> "ISO_${sensitivityIsoField.validity.name}:${sensitivityIsoField.reason}"
+            !exposureTimeNsField.isValid -> "EXPOSURE_${exposureTimeNsField.validity.name}:${exposureTimeNsField.reason}"
+            !rawSizeField.isValid -> "RAW_SIZE_${rawSizeField.validity.name}:${rawSizeField.reason}"
+            !orientationField.isValid -> "ORIENTATION_${orientationField.validity.name}:${orientationField.reason}"
+            !timestampField.isValid -> "TIMESTAMP_${timestampField.validity.name}:${timestampField.reason}"
+            !frameNumberField.isValid -> "FRAME_NUMBER_${frameNumberField.validity.name}:${frameNumberField.reason}"
+            else -> null
+        }
     }
 
     private fun <T> audit(
