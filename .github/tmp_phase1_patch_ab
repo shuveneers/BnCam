@@ -1,0 +1,170 @@
++                "RAW_PREVIEW_SLOT_STARVATION reason=$reason queueMismatch=$queueMismatch " +
++                    "impossibleStarvation=$impossibleStarvation ${outputSlotHealth()}"
++            )
++        }
++    }
++
++    private fun dropCountsSummary(): String = RawPreviewDropReason.values().joinToString(separator = ",") { reason ->
++        "${reason.name}=${dropCounters.get(reason.ordinal)}"
+     }
+ 
+     private fun enqueuePendingRequest(request: Request) {
+@@ -329,6 +422,7 @@
+         }
+         stale?.let { dropped ->
+             droppedBusy++
++            recordDrop(RawPreviewDropReason.INPUT_QUEUE_OVERFLOW, dropped)
+             exactFrameColorPairs.remove(dropped.sensorTimestampNs)
+             releaseRequest(dropped)
+         }
+@@ -571,9 +665,14 @@
+             if (latestOfferedSensorTimestampNs.compareAndSet(previous, sensorTimestampNs)) break
+         }
+         RawPreviewCadenceDiagnostics.offered(config.source, pipelineGeneration, sensorTimestampNs)
++        lastRendererOfferElapsedNs.set(SystemClock.elapsedRealtimeNanos())
+         val retained = ImageUtils.retainRawPreviewHardwareBuffer(buffer)
+         if (retained == 0L) {
+             retainFailures++
++            dropCounters.incrementAndGet(RawPreviewDropReason.RETAIN_FAILED.ordinal)
++            RawPreviewCadenceDiagnostics.dropped(
++                config.source, pipelineGeneration, sensorTimestampNs, RawPreviewDropReason.RETAIN_FAILED
++            )
+             logDiagnostics()
+             return
+         }
+@@ -617,9 +716,11 @@
+         if (closed) return
+         val request = pollPendingRequest() ?: return
+         reclaimCompletedGpuOutputSlots()
+-        val slot = availableOutputSlots.poll()
++        val slot = acquireOutputSlot()
+         if (slot == null) {
+             droppedBusy++
++            recordDrop(RawPreviewDropReason.NO_OUTPUT_SLOT, request)
++            logOutputSlotInvariantIfBroken("no_output_slot")
+             releaseRequest(request)
+             logDiagnostics()
+             if (hasPendingRequest()) scheduleDrain()
+@@ -628,7 +729,10 @@
+ 
+         var delivered = false
+         try {
+-            if (!isCurrent(request)) return
++            if (!isCurrent(request)) {
++                recordDrop(RawPreviewDropReason.STALE_GENERATION, request)
++                return
++            }
+             RawPreviewCadenceDiagnostics.processingStarted(
+                 request.config.source,
+                 request.config.pipelineGeneration,
+@@ -691,6 +795,7 @@
+                     if (buffer == null && usage != 0L) {
+                         gpuOutputFailures++
+                         gpuResidentOutputDisabled = true
++                        gpuFallbackReason = "ahb_allocation_unsupported"
+                         RawPreviewInteropCapabilities.recordActivePath(
+                             "CPU_VISIBLE_RGBA_TO_GLES_AHB_ALLOCATION_UNSUPPORTED"
+                         )
+@@ -796,14 +901,20 @@
+                 maxHeight = targetMaxHeight
+             )
+             if (result == null || result.size < 5 || result[0] <= 0 || result[1] <= 0 || !isCurrent(request)) {
++                val current = isCurrent(request)
+                 Log.w(
+                     TAG,
+                     "RENDER_FAILED resultIsNull=${result == null} resultSize=${result?.size} " +
+-                    "w=${result?.getOrNull(0)} h=${result?.getOrNull(1)} isCurrent=${isCurrent(request)} " +
++                    "w=${result?.getOrNull(0)} h=${result?.getOrNull(1)} isCurrent=$current " +
+                     "activeConfig=${activeConfig?.pipelineGeneration}/${activeConfig?.source} " +
+                     "reqGen=${request.config.pipelineGeneration}/${request.config.source}"
+                 )
+                 renderFailures++
++                recordDrop(
++                    if (current) RawPreviewDropReason.NATIVE_RENDER_FAILED
++                    else RawPreviewDropReason.STALE_GENERATION,
++                    request
++                )
+                 logDiagnostics()
+                 return
+             }
+@@ -839,10 +950,12 @@
+             if (outputHardwareBuffer != null && !gpuResidentOutputUsed) {
+                 gpuOutputFailures++
+                 gpuResidentOutputDisabled = true
++                gpuFallbackReason = "native_output_import_failed"
+                 // The shared scratch target may be overwritten by the next render before GLES can
+                 // upload it. Drop this one transition frame; the next frame receives a slot-owned
+                 // CPU buffer with the exact same resolution/quality contract.
+                 gpuFallbackScratchRgba = null
++                recordDrop(RawPreviewDropReason.GPU_OUTPUT_IMPORT_FAILED, request)
+                 RawPreviewInteropCapabilities.recordActivePath("CPU_VISIBLE_RGBA_TO_GLES_OUTPUT_IMPORT_FAILED")
+                 Log.w(
+                     TAG,
+@@ -980,8 +1093,18 @@
+                 spatialExposureLowerNeutralEv = result.getOrElse(622) { 0 } / 1_000_000.0f,
+                 spatialExposureUpperNeutralEv = result.getOrElse(623) { 0 } / 1_000_000.0f,
+                 spatialExposureAuthority = result.getOrElse(624) { 0 } / 1_000_000.0f,
+-                releaseSlot = { glFenceHandle -> releaseOutputSlot(slot, glFenceHandle) }
++                createGlFence = fenceBackend::createFence,
++                releaseSlot = { glFenceHandle ->
++                    releaseOutputSlot(
++                        slot = slot,
++                        glFenceHandle = glFenceHandle,
++                        source = request.config.source,
++                        generation = request.config.pipelineGeneration,
++                        sensorTimestampNs = request.sensorTimestampNs
++                    )
++                }
+             )
++            lastRendererPublishElapsedNs.set(SystemClock.elapsedRealtimeNanos())
+             onFrame(frame)
+             delivered = true
+             logDiagnostics(frame)
+@@ -992,41 +1115,82 @@
+             // return it here; delivered paths returned above after onFrame.
+             if (!delivered) {
+                 slot.clearCpuRgbaBuffer()
+-                availableOutputSlots.offer(slot)
++                returnOutputSlot(slot, "undelivered")
+             }
+             if (hasPendingRequest()) scheduleDrain()
+         }
+     }
+ 
+-    private fun releaseOutputSlot(slot: OutputSlot, glFenceHandle: Long) {
++    private fun releaseOutputSlot(
++        slot: OutputSlot,
++        glFenceHandle: Long,
++        source: ViewfinderEffectiveSource,
++        generation: Int,
++        sensorTimestampNs: Long
++    ) {
+         slot.clearCpuRgbaBuffer()
+         when {
+-            glFenceHandle == -2L -> {
++            glFenceHandle == RawPreviewFrame.GL_INTEROP_FAILED_HANDLE -> {
+                 gpuOutputFailures++
++                recordDropForFrame(source, generation, sensorTimestampNs, RawPreviewDropReason.GL_INTEROP_FAILED)
+                 gpuResidentOutputDisabled = true
++                gpuFallbackReason = "eglimage_bind_failed"
+                 gpuFallbackScratchRgba = null
++                // EGLImage import/bind never became a valid sampled GL owner, so this backing may
++                // be retired immediately. The enclosing CPU-capable slot remains reusable.
+                 slot.releaseGpuBuffer()
+-                availableOutputSlots.offer(slot)
++                returnOutputSlot(slot, "gl_interop_failed")
+                 RawPreviewInteropCapabilities.recordActivePath("CPU_VISIBLE_RGBA_TO_GLES_GL_INTEROP_FAILED")
+-                Log.e(TAG, "RAW_PREVIEW_GPU_OUTPUT_DISABLED slot=${slot.id} reason=eglimage_bind_failed")
+-            }
+-            glFenceHandle < 0L -> availableOutputSlots.offer(slot)
++                Log.e(TAG, "RAW_PREVIEW_GPU_OUTPUT_DISABLED slot=${slot.id} reason=eglimage_bind_failed ${outputSlotHealth()}")
++            }
++            glFenceHandle < 0L -> returnOutputSlot(slot, "gl_not_used")
+             glFenceHandle > 0L -> {
+                 slot.pendingGlFenceHandle = glFenceHandle
+-                pendingGpuOutputSlots.offer(slot)
++                slot.pendingSource = source
++                slot.pendingGeneration = generation
++                slot.pendingSensorTimestampNs = sensorTimestampNs
++                if (markOutputSlotPendingFence(slot)) {
++                    pendingGpuOutputSlots.offer(slot)
