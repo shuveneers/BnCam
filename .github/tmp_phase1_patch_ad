@@ -1,0 +1,170 @@
+                 duplicateOffersRejected = duplicateOffersRejected,
++                dropReasonCounts = dropReasonCounts.copyOf(),
+                 frames = records.values.map { it.copy() }
+             )
+         }
+@@ -334,6 +358,11 @@
+             appendLine("presentationFrameIntervalMeanMs=$presentationFrameIntervalMeanMs presentationFrameIntervalP95Ms=$presentationFrameIntervalP95Ms presentationFrameIntervalP99Ms=$presentationFrameIntervalP99Ms")
+             appendLine("sensorToPresentLatencyP50Ms=$sensorToPresentLatencyP50Ms sensorToPresentLatencyP95Ms=$sensorToPresentLatencyP95Ms")
+             appendLine("droppedSourceFrames=$droppedSource droppedGpuBusyFrames=$droppedGpuBusy repeatedPresentedFrames=0 framesInFlight=3 maxQueueDepth=2")
++            appendLine(
++                "dropReasons=" + RawPreviewDropReason.values().joinToString(separator = ",") { reason ->
++                    "${reason.name}=${snapshot.dropReasonCounts.getOrElse(reason.ordinal) { 0L }}"
++                }
++            )
+             appendLine(
+                 "cpuVisibleRgbaHandoffBytes=$cpuVisibleRgbaHandoffBytes " +
+                     "glFullFrameUploadBytes=$fullFrameGlUploadBytes " +
+--- a/app/src/main/java/com/bncam/ui/screens/capture/FocusPeakingView.kt
++++ b/app/src/main/java/com/bncam/ui/screens/capture/FocusPeakingView.kt
+@@ -1045,7 +1045,7 @@
+             // Fence retirement occurs only after a successor texture has been drawn. This preserves
+             // the currently displayed AHB across arbitrary redraws without introducing a GL wait.
+             // If fence creation fails the backing slot is quarantined rather than reused unsafely.
+-            frame.closeAfterGlFence(ImageUtils.createRawPreviewGlFence())
++            frame.closeAfterGlSampled()
+         }
+ 
+         uploadedRawFrame?.let { frame ->
+@@ -1175,7 +1175,7 @@
+         pinnedDisplayedGpuFrame = null
+         // queueEvent executes on the GL owner thread. A fence inserted here is ordered after every
+         // previous draw that could have sampled this AHB, while remaining fully non-blocking.
+-        frame.closeAfterGlFence(ImageUtils.createRawPreviewGlFence())
++        frame.closeAfterGlSampled()
+     }
+ 
+     private fun clearRawSurfaceFrameRate() {
+--- a/app/src/main/java/com/bncam/ui/screens/capture/RawPreviewOutputSlotLedger.kt
++++ b/app/src/main/java/com/bncam/ui/screens/capture/RawPreviewOutputSlotLedger.kt
+@@ -0,0 +1,104 @@
++package com.bncam.ui.screens.capture
++
++import java.util.concurrent.atomic.AtomicReferenceArray
++
++internal enum class RawPreviewOutputSlotState {
++    AVAILABLE,
++    IN_FLIGHT,
++    PENDING_GL_FENCE,
++    CLOSED
++}
++
++internal data class RawPreviewOutputSlotSnapshot(
++    val available: Int,
++    val inFlight: Int,
++    val pendingFence: Int,
++    val closed: Int,
++    val total: Int
++)
++
++/**
++ * Pure ownership ledger for the finite RAW-preview output-slot pool.
++ *
++ * GPU backing quarantine is deliberately not represented here: an OutputSlot whose AHardwareBuffer
++ * is quarantined is still a valid CPU-visible slot. The ledger therefore models slot ownership only,
++ * while RawPreviewRenderer separately guards whether a slot may use its GPU backing.
++ */
++internal class RawPreviewOutputSlotLedger(private val slotCount: Int) {
++    private val states = AtomicReferenceArray<RawPreviewOutputSlotState>(slotCount)
++
++    init {
++        require(slotCount > 0)
++        for (index in 0 until slotCount) states.set(index, RawPreviewOutputSlotState.AVAILABLE)
++        assertInternalInvariant()
++    }
++
++    fun state(slotId: Int): RawPreviewOutputSlotState = states.get(valid(slotId))
++
++    fun tryAcquire(slotId: Int): Boolean = states.compareAndSet(
++        valid(slotId),
++        RawPreviewOutputSlotState.AVAILABLE,
++        RawPreviewOutputSlotState.IN_FLIGHT
++    )
++
++    fun markPendingFence(slotId: Int): Boolean = states.compareAndSet(
++        valid(slotId),
++        RawPreviewOutputSlotState.IN_FLIGHT,
++        RawPreviewOutputSlotState.PENDING_GL_FENCE
++    )
++
++    /**
++     * Returns an in-flight or fence-pending slot to CPU service. Idempotent duplicate returns are
++     * rejected so the ConcurrentLinkedQueue can never acquire duplicate entries for one slot.
++     */
++    fun releaseToAvailable(slotId: Int): Boolean {
++        val id = valid(slotId)
++        while (true) {
++            when (val current = states.get(id)) {
++                RawPreviewOutputSlotState.IN_FLIGHT,
++                RawPreviewOutputSlotState.PENDING_GL_FENCE -> {
++                    if (states.compareAndSet(id, current, RawPreviewOutputSlotState.AVAILABLE)) return true
++                }
++                RawPreviewOutputSlotState.AVAILABLE,
++                RawPreviewOutputSlotState.CLOSED -> return false
++            }
++        }
++    }
++
++    fun close(slotId: Int) {
++        states.set(valid(slotId), RawPreviewOutputSlotState.CLOSED)
++    }
++
++    fun snapshot(): RawPreviewOutputSlotSnapshot {
++        var available = 0
++        var inFlight = 0
++        var pending = 0
++        var closed = 0
++        for (index in 0 until slotCount) {
++            when (states.get(index)) {
++                RawPreviewOutputSlotState.AVAILABLE -> available++
++                RawPreviewOutputSlotState.IN_FLIGHT -> inFlight++
++                RawPreviewOutputSlotState.PENDING_GL_FENCE -> pending++
++                RawPreviewOutputSlotState.CLOSED -> closed++
++            }
++        }
++        return RawPreviewOutputSlotSnapshot(
++            available = available,
++            inFlight = inFlight,
++            pendingFence = pending,
++            closed = closed,
++            total = available + inFlight + pending + closed
++        )
++    }
++
++    fun assertInternalInvariant() {
++        check(snapshot().total == slotCount) {
++            "RAW preview output-slot accounting lost ownership: ${snapshot()} expected=$slotCount"
++        }
++    }
++
++    private fun valid(slotId: Int): Int {
++        require(slotId in 0 until slotCount) { "RAW preview output slot out of range: $slotId/$slotCount" }
++        return slotId
++    }
++}
+--- a/app/src/main/java/com/bncam/ui/screens/capture/RawPreviewFenceBackend.kt
++++ b/app/src/main/java/com/bncam/ui/screens/capture/RawPreviewFenceBackend.kt
+@@ -0,0 +1,16 @@
++package com.bncam.ui.screens.capture
++
++import com.bncam.core.engine.ImageUtils
++
++/** Boundary around GL-fence primitives so failure behavior can be exercised deterministically. */
++interface RawPreviewFenceBackend {
++    fun createFence(): Long
++    fun pollFence(handle: Long): Int
++    fun destroyFence(handle: Long)
++}
++
++internal object PlatformRawPreviewFenceBackend : RawPreviewFenceBackend {
++    override fun createFence(): Long = ImageUtils.createRawPreviewGlFence()
++    override fun pollFence(handle: Long): Int = ImageUtils.pollRawPreviewGlFence(handle)
++    override fun destroyFence(handle: Long) = ImageUtils.destroyRawPreviewGlFence(handle)
++}
+--- a/app/src/main/java/com/bncam/ui/screens/capture/RawPreviewDropReason.kt
++++ b/app/src/main/java/com/bncam/ui/screens/capture/RawPreviewDropReason.kt
+@@ -0,0 +1,13 @@
++package com.bncam.ui.screens.capture
++
++internal enum class RawPreviewDropReason {
++    INPUT_QUEUE_OVERFLOW,
