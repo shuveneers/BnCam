@@ -1,0 +1,170 @@
++                } else {
++                    fenceBackend.destroyFence(glFenceHandle)
++                    slot.pendingGlFenceHandle = 0L
++                    slot.quarantined = true
++                    gpuResidentOutputDisabled = true
++                    gpuFallbackReason = "pending_fence_state_mismatch"
++                    returnOutputSlot(slot, "pending_fence_state_mismatch")
++                }
+             }
+             else -> {
+-                // A GPU-resident frame was sampled by GLES but no fence could be created. Never
+-                // recycle that backing store blindly; quarantine it and use the CPU-visible slots
+-                // that remain instead of risking GL/Vulkan overlap.
++                gpuOutputFailures++
++                // GLES sampled this AHardwareBuffer, but safe completion could not be proven.
++                // Quarantine ONLY the GPU backing. The OutputSlot itself owns an independent CPU
++                // RGBA store, so returning the slot keeps preview alive on the CPU-visible path.
++                // The suspect AHB stays retained until renderer lifecycle teardown.
+                 slot.quarantined = true
+                 gpuResidentOutputDisabled = true
++                gpuFallbackReason = "gl_fence_create_failed"
+                 gpuFallbackScratchRgba = null
++                recordDropForFrame(source, generation, sensorTimestampNs, RawPreviewDropReason.GL_FENCE_CREATE_FAILED)
++                returnOutputSlot(slot, "gl_fence_create_failed_gpu_backing_quarantined")
+                 RawPreviewInteropCapabilities.recordActivePath("CPU_VISIBLE_RGBA_TO_GLES_GL_FENCE_FAILED")
+-                Log.e(TAG, "RAW_PREVIEW_GPU_OUTPUT_QUARANTINED slot=${slot.id} reason=gl_fence_unavailable")
++                Log.e(
++                    TAG,
++                    "RAW_PREVIEW_GPU_OUTPUT_QUARANTINED slot=${slot.id} reason=gl_fence_unavailable " +
++                        outputSlotHealth()
++                )
+             }
+         }
+         if (hasPendingRequest()) scheduleDrain()
++    }
++
++    private fun recordDropForFrame(
++        source: ViewfinderEffectiveSource,
++        generation: Int,
++        sensorTimestampNs: Long,
++        reason: RawPreviewDropReason
++    ) {
++        dropCounters.incrementAndGet(reason.ordinal)
++        RawPreviewCadenceDiagnostics.dropped(source, generation, sensorTimestampNs, reason)
+     }
+ 
+     private fun reclaimCompletedGpuOutputSlots() {
+@@ -1034,19 +1198,43 @@
+         repeat(count) {
+             val slot = pendingGpuOutputSlots.poll() ?: return@repeat
+             val handle = slot.pendingGlFenceHandle
+-            val state = if (handle > 0L) ImageUtils.pollRawPreviewGlFence(handle) else -1
++            val state = if (handle > 0L) fenceBackend.pollFence(handle) else -1
+             when (state) {
+                 1 -> {
+                     slot.pendingGlFenceHandle = 0L
+-                    if (!slot.quarantined) availableOutputSlots.offer(slot)
++                    slot.pendingSource = null
++                    slot.pendingGeneration = -1
++                    slot.pendingSensorTimestampNs = 0L
++                    returnOutputSlot(slot, "gl_fence_signaled")
+                 }
+                 0 -> pendingGpuOutputSlots.offer(slot)
+                 else -> {
++                    gpuOutputFailures++
+                     slot.pendingGlFenceHandle = 0L
+                     slot.quarantined = true
+                     gpuResidentOutputDisabled = true
++                    gpuFallbackReason = "gl_fence_poll_failed"
++                    gpuFallbackScratchRgba = null
++                    slot.pendingSource?.let { source ->
++                        recordDropForFrame(
++                            source,
++                            slot.pendingGeneration,
++                            slot.pendingSensorTimestampNs,
++                            RawPreviewDropReason.GL_FENCE_POLL_FAILED
++                        )
++                    }
++                    slot.pendingSource = null
++                    slot.pendingGeneration = -1
++                    slot.pendingSensorTimestampNs = 0L
++                    // Do not destroy or recycle the suspect AHB here: completion is unknown.
++                    // The CPU store is independent and is immediately returned to service.
++                    returnOutputSlot(slot, "gl_fence_poll_failed_gpu_backing_quarantined")
+                     RawPreviewInteropCapabilities.recordActivePath("CPU_VISIBLE_RGBA_TO_GLES_GL_FENCE_FAILED")
+-                    Log.e(TAG, "RAW_PREVIEW_GPU_OUTPUT_QUARANTINED slot=${slot.id} reason=gl_fence_poll_failed")
++                    Log.e(
++                        TAG,
++                        "RAW_PREVIEW_GPU_OUTPUT_QUARANTINED slot=${slot.id} reason=gl_fence_poll_failed " +
++                            outputSlotHealth()
++                    )
+                 }
+             }
+         }
+@@ -1164,6 +1352,7 @@
+                 "resolutionPolicy=FIXED_QUALITY max=${PREVIEW_MAX_WIDTH}x${PREVIEW_MAX_HEIGHT} " +
+                 "renderEmaMs=$renderCostEmaMs glUploadEmaMs=$glUploadCostEmaMs " +
+                 "RAW_PREVIEW_DROPPED_BUSY=$droppedBusy pendingQueue=${pendingRequestCount()}/$MAX_PENDING_REQUESTS rendered=$rendered " +
++                "slotHealth={${outputSlotHealth()}} dropReasons={${dropCountsSummary()}} " +
+                 "retainFailures=$retainFailures renderFailures=$renderFailures " +
+                 "generation=${activeConfig?.pipelineGeneration ?: -1}"
+         )
+@@ -1203,9 +1392,10 @@
+         allOutputSlots.forEach { slot ->
+             slot.releaseCpuBufferReferences()
+             if (slot.pendingGlFenceHandle > 0L) {
+-                ImageUtils.destroyRawPreviewGlFence(slot.pendingGlFenceHandle)
++                fenceBackend.destroyFence(slot.pendingGlFenceHandle)
+                 slot.pendingGlFenceHandle = 0L
+             }
++            outputSlotLedger.close(slot.id)
+             slot.releaseGpuBuffer()
+         }
+         availableOutputSlots.clear()
+--- a/app/src/main/java/com/bncam/ui/screens/capture/RawPreviewCadenceDiagnostics.kt
++++ b/app/src/main/java/com/bncam/ui/screens/capture/RawPreviewCadenceDiagnostics.kt
+@@ -45,6 +45,7 @@
+         val generation: Int,
+         val advertisedMinFrameDurationNs: Long,
+         val duplicateOffersRejected: Long,
++        val dropReasonCounts: LongArray,
+         val frames: List<FrameRecord>
+     )
+ 
+@@ -74,6 +75,7 @@
+     private var activeGeneration = -1
+     private var advertisedMinFrameDurationNs = 0L
+     private var duplicateOffersRejected = 0L
++    private val dropReasonCounts = LongArray(RawPreviewDropReason.values().size)
+     @Volatile private var latestRenderedReport: String? = null
+ 
+     fun initialize(context: Context) {
+@@ -92,6 +94,7 @@
+                 activeGeneration = generation
+                 advertisedMinFrameDurationNs = minFrameDurationNs
+                 duplicateOffersRejected = 0L
++                dropReasonCounts.fill(0L)
+                 records.clear()
+                 latestRenderedReport = null
+             } else if (minFrameDurationNs > 0L) {
+@@ -135,6 +138,26 @@
+     ) {
+         synchronized(lock) { duplicateOffersRejected++ }
+         update(source, generation, sensorTimestampNs) { it.offerCount++ }
++    }
++
++    internal fun dropped(
++        source: ViewfinderEffectiveSource,
++        generation: Int,
++        sensorTimestampNs: Long,
++        reason: RawPreviewDropReason
++    ) {
++        if (!enabled) return
++        synchronized(lock) {
++            if (activeSource != source.name || activeGeneration != generation) return
++            dropReasonCounts[reason.ordinal]++
++            if (sensorTimestampNs > 0L) {
++                val record = records.getOrPut(sensorTimestampNs) { FrameRecord(sensorTimestampNs) }
++                while (records.size > MAX_RECORDS) {
++                    records.entries.iterator().run { if (hasNext()) { next(); remove() } }
++                }
++            }
++        }
++        queueWrite()
+     }
+ 
+     fun processingStarted(source: ViewfinderEffectiveSource, generation: Int, sensorTimestampNs: Long) =
+@@ -242,6 +265,7 @@
+                 generation = activeGeneration,
+                 advertisedMinFrameDurationNs = advertisedMinFrameDurationNs,
