@@ -187,6 +187,42 @@ float rawAtSource(int sourceX, int sourceY) {
     return clamp((float(readRaw(sx, sy)) - black) / max(1.0, pc.whiteLevel - black), 0.0, 1.0);
 }
 
+// DELTA 0225: physical Camera2 S/O is the primary preview-noise authority. ISO remains
+// only the fallback share when the physical model is unavailable or carries partial confidence.
+// Keeping this decision in the Bayer domain prevents ISO alone from softening a clean/high-SNR
+// RAW viewfinder before demosaic.
+float previewPhysicalNoiseSigma(float signal) {
+    float s = uintBitsToFloat(statsBuffer[PHYSICAL_NOISE_GREEN_S_INDEX]);
+    float o = uintBitsToFloat(statsBuffer[PHYSICAL_NOISE_GREEN_O_INDEX]);
+    float confidence = clamp(uintBitsToFloat(statsBuffer[PHYSICAL_NOISE_CONFIDENCE_INDEX]), 0.0, 1.0);
+    if (!(confidence > 0.0) || isnan(s) || isnan(o) || isinf(s) || isinf(o) ||
+        s < 0.0 || o < 0.0 || !(s > 0.0 || o > 0.0)) return 0.0;
+    return sqrt(max(0.0, s * max(0.0, signal) + o));
+}
+
+float previewPhysicalNoisePressure(float signal) {
+    float confidence = clamp(uintBitsToFloat(statsBuffer[PHYSICAL_NOISE_CONFIDENCE_INDEX]), 0.0, 1.0);
+    float sigma = previewPhysicalNoiseSigma(signal);
+    float relativeSigma = sigma / max(0.025, signal);
+    return confidence * smoothstep(0.025, 0.16, relativeSigma);
+}
+
+float previewIsoFallbackNoiseSigma(float localSignal) {
+    float iso = max(50.0, pc.captureIso);
+    float isoFactor = iso / 100.0;
+    float readNoise = (0.0010 + 0.0015 * isoFactor) * (1023.0 / max(1.0, pc.whiteLevel));
+    float shotNoise = sqrt(max(0.0, localSignal)) * (0.010 * sqrt(isoFactor));
+    return max(0.0010, readNoise + shotNoise);
+}
+
+float previewEffectiveNoiseSigma(float localSignal) {
+    float fallbackSigma = previewIsoFallbackNoiseSigma(localSignal);
+    float confidence = clamp(uintBitsToFloat(statsBuffer[PHYSICAL_NOISE_CONFIDENCE_INDEX]), 0.0, 1.0);
+    float physicalSigma = previewPhysicalNoiseSigma(localSignal);
+    if (!(physicalSigma > 0.0) || isnan(physicalSigma) || isinf(physicalSigma)) return fallbackSigma;
+    return mix(fallbackSigma, max(0.00025, physicalSigma), confidence);
+}
+
 float normalizedAtUncached(int previewX, int previewY) {
     uint x = uint(cfaMirrorCoordinate(previewX, int(pc.previewWidth)));
     uint y = uint(cfaMirrorCoordinate(previewY, int(pc.previewHeight)));
@@ -200,20 +236,27 @@ float normalizedAtUncached(int previewX, int previewY) {
     }
 
     int radius = max(2, (int(decimation) / 2) * 2);
-    float noiseBlend = smoothstep(800.0, 3200.0, max(0.0, pc.captureIso));
-    float centreAxisWeight = mix(6.5, 1.6, noiseBlend);
+    float centreSample = rawAtSource(baseX, baseY);
+    float sigmaN = previewEffectiveNoiseSigma(centreSample);
+    float relativeNoise = sigmaN / max(0.025, centreSample);
+    float noisePressure = smoothstep(0.025, 0.16, relativeNoise);
+
+    // Preserve the existing nine same-CFA-site fetch budget, but let measured noise decide how
+    // much anti-alias averaging is needed. Strong structure keeps the native centre sample; flat
+    // low-SNR regions retain the stabilising average. This avoids adding a sharpening pass.
+    float centreAxisWeight = mix(6.5, 1.8, noisePressure);
     float sum = 0.0;
     float weightSum = 0.0;
     float localMin = 1.0;
     float localMax = 0.0;
-    float centreSample = 0.0;
     for (int iy = -1; iy <= 1; ++iy) {
         float wy = iy == 0 ? centreAxisWeight : 1.0;
         for (int ix = -1; ix <= 1; ++ix) {
             float wx = ix == 0 ? centreAxisWeight : 1.0;
             float weight = wx * wy;
-            float sampleValue = rawAtSource(baseX + ix * radius, baseY + iy * radius);
-            if (ix == 0 && iy == 0) centreSample = sampleValue;
+            float sampleValue = (ix == 0 && iy == 0)
+                    ? centreSample
+                    : rawAtSource(baseX + ix * radius, baseY + iy * radius);
             localMin = min(localMin, sampleValue);
             localMax = max(localMax, sampleValue);
             sum += sampleValue * weight;
@@ -221,9 +264,10 @@ float normalizedAtUncached(int previewX, int previewY) {
         }
     }
     float filtered = sum / max(weightSum, 1.0);
-    float structure = smoothstep(0.018, 0.090, localMax - localMin);
-    float cleanAuthority = 1.0 - noiseBlend;
-    float centreRecovery = 0.24 * structure * cleanAuthority;
+    float structureLow = max(0.006, sigmaN * 1.75);
+    float structureHigh = max(structureLow + 0.010, sigmaN * 5.5);
+    float structureConfidence = smoothstep(structureLow, structureHigh, localMax - localMin);
+    float centreRecovery = 0.38 * structureConfidence * mix(1.0, 0.72, noisePressure);
     return mix(filtered, centreSample, centreRecovery);
 }
 
@@ -345,11 +389,7 @@ float previewGreenStructureAt(int x, int y) {
 }
 
 float estimatePreviewNoiseSigma(float localSignal) {
-    float iso = max(50.0, pc.captureIso);
-    float isoFactor = iso / 100.0;
-    float readNoise = (0.0010 + 0.0015 * isoFactor) * (1023.0 / max(1.0, pc.whiteLevel));
-    float shotNoise = sqrt(max(0.0, localSignal)) * (0.010 * sqrt(isoFactor));
-    return max(0.0010, readNoise + shotNoise);
+    return previewEffectiveNoiseSigma(localSignal);
 }
 
 float previewLumaDetail(int x, int y, float denoisedLuma) {
@@ -408,9 +448,9 @@ float previewProfileLumaDetail(int x, int y) {
     float mpMid = avgCross - avgDiagonal;
     float edgeEnergy = 0.25 * (abs(center - n) + abs(center - s) + abs(center - w) + abs(center - e));
 
-    float isoNoise = smoothstep(500.0, 3200.0, max(0.0, pc.captureIso));
-    float exposureNoise = smoothstep(24.0, 80.0, max(0.0, pc.captureExposureMs));
-    float noisePressure = clamp(max(isoNoise, 0.70 * exposureNoise), 0.0, 1.0);
+    float sigmaN = previewEffectiveNoiseSigma(center);
+    float relativeNoise = sigmaN / max(0.025, center);
+    float noisePressure = smoothstep(0.025, 0.16, relativeNoise);
     float noiseFloor = mix(0.0035, 0.014, noisePressure);
     float structureConfidence = smoothstep(noiseFloor * 1.2, noiseFloor * 4.5, edgeEnergy + abs(hpHigh));
     float noiseGate = mix(0.10, 1.0, structureConfidence);
@@ -603,8 +643,6 @@ float percentileFromPreviewHistogram(uint total, float quantile) {
     }
     return 1.0;
 }
-float previewPhysicalNoiseSigma(float signal);
-float previewPhysicalNoisePressure(float signal);
 float spatialExposureEvAtPreview(uvec2 gid);
 
 vec3 resolvePreviewFllfPolicy(
@@ -1133,21 +1171,6 @@ vec3 applyPreviewProfileNoiseReduction(int x, int y, vec3 sensorRgb) {
 }
 
 
-float previewPhysicalNoiseSigma(float signal) {
-    float s = uintBitsToFloat(statsBuffer[PHYSICAL_NOISE_GREEN_S_INDEX]);
-    float o = uintBitsToFloat(statsBuffer[PHYSICAL_NOISE_GREEN_O_INDEX]);
-    float confidence = clamp(uintBitsToFloat(statsBuffer[PHYSICAL_NOISE_CONFIDENCE_INDEX]), 0.0, 1.0);
-    if (!(confidence > 0.0) || isnan(s) || isnan(o) || s < 0.0 || o < 0.0) return 0.0;
-    return sqrt(max(0.0, s * max(0.0, signal) + o));
-}
-
-float previewPhysicalNoisePressure(float signal) {
-    float confidence = clamp(uintBitsToFloat(statsBuffer[PHYSICAL_NOISE_CONFIDENCE_INDEX]), 0.0, 1.0);
-    float sigma = previewPhysicalNoiseSigma(signal);
-    float relativeSigma = sigma / max(0.025, signal);
-    return confidence * smoothstep(0.025, 0.16, relativeSigma);
-}
-
 float exposureSafeLog2(float v) { return log2(max(v, 1.0e-6)); }
 float exposureSmoothstep(float e0, float e1, float x) {
     if (!(e1 > e0)) return x >= e1 ? 1.0 : 0.0;
@@ -1432,14 +1455,15 @@ void renderPass() {
     float totalWeight = wCenter + wN + wS + wW + wE;
 
     vec2 filteredChroma = (cd0 * wCenter + cdN * wN + cdS * wS + cdW * wW + cdE * wE) / totalWeight;
-    float isoNoise = smoothstep(100.0, 1600.0, max(0.0, pc.captureIso));
+    float relativeNoise = sigmaN / max(0.025, g0);
+    float noisePressure = smoothstep(0.025, 0.16, relativeNoise);
     float shadowNoise = 1.0 - smoothstep(0.04, 0.25, g0);
-    float chromaStrength = clamp(0.35 + 0.55 * max(isoNoise, shadowNoise), 0.0, 0.92);
+    float chromaStrength = clamp(0.35 + 0.55 * max(noisePressure, shadowNoise), 0.0, 0.92);
     vec2 resultChroma = mix(cd0, filteredChroma, chromaStrength);
 
     float localGreenGrad = 0.25 * (abs(gN - g0) + abs(gS - g0) + abs(gW - g0) + abs(gE - g0));
     float flatShadowArea = 1.0 - smoothstep(sigmaN * 0.8, sigmaN * 2.5, localGreenGrad);
-    float lumaDenoiseStrength = clamp(0.40 * isoNoise * flatShadowArea, 0.0, 0.40);
+    float lumaDenoiseStrength = clamp(0.40 * noisePressure * flatShadowArea, 0.0, 0.40);
     float filteredGreen = (g0 * wCenter + gN * wN + gS * wS + gW * wW + gE * wE) / totalWeight;
     float resultGreen = mix(g0, filteredGreen, lumaDenoiseStrength);
 
