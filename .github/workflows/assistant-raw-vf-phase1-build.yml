@@ -30,6 +30,7 @@ jobs:
           grep -Fq 'RawPreviewOutputSlotLedger(OUTPUT_SLOT_COUNT)' app/src/main/java/com/bncam/ui/screens/capture/RawPreviewRenderer.kt
           ! grep -Fq 'ImageUtils.pollRawPreviewGlFence' app/src/main/java/com/bncam/ui/screens/capture/RawPreviewRenderer.kt
           ! grep -Fq 'ImageUtils.createRawPreviewGlFence()' app/src/main/java/com/bncam/ui/screens/capture/FocusPeakingView.kt
+          chmod +x gradlew
       - name: Compile debug Kotlin
         run: ./gradlew :app:compileDebugKotlin --no-daemon --stacktrace
       - name: Run Phase 1 unit tests
