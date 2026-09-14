@@ -1,0 +1,36 @@
+name: Assistant RAW VF Phase1 Build
+on:
+  push:
+    branches: [assistant-raw-vf-phase1]
+permissions:
+  contents: read
+jobs:
+  phase1:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - name: Prepare Android SDK
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager 'platforms;android-36' 'build-tools;36.0.0' >/dev/null
+      - name: Apply Phase 1 candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .github/tmp_phase1_patch_aa .github/tmp_phase1_patch_ab .github/tmp_phase1_patch_ac .github/tmp_phase1_patch_ad .github/tmp_phase1_patch_ae > /tmp/phase1.patch
+          patch -p1 < /tmp/phase1.patch
+          grep -Fq 'gl_fence_create_failed_gpu_backing_quarantined' app/src/main/java/com/bncam/ui/screens/capture/RawPreviewRenderer.kt
+          grep -Fq 'gl_fence_poll_failed_gpu_backing_quarantined' app/src/main/java/com/bncam/ui/screens/capture/RawPreviewRenderer.kt
+          grep -Fq 'RawPreviewOutputSlotLedger(OUTPUT_SLOT_COUNT)' app/src/main/java/com/bncam/ui/screens/capture/RawPreviewRenderer.kt
+          ! grep -Fq 'ImageUtils.pollRawPreviewGlFence' app/src/main/java/com/bncam/ui/screens/capture/RawPreviewRenderer.kt
+          ! grep -Fq 'ImageUtils.createRawPreviewGlFence()' app/src/main/java/com/bncam/ui/screens/capture/FocusPeakingView.kt
+      - name: Compile debug Kotlin
+        run: ./gradlew :app:compileDebugKotlin --no-daemon --stacktrace
+      - name: Run Phase 1 unit tests
+        run: ./gradlew :app:testDebugUnitTest --tests 'com.bncam.ui.screens.capture.RawPreviewOutputSlotLedgerTest' --tests 'com.bncam.ui.screens.capture.RawPreviewPhase1SourceContractTest' --no-daemon --stacktrace
