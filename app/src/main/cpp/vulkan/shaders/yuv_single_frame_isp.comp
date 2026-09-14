@@ -408,12 +408,14 @@ vec2 yuvMeasuredSigmaUv() {
         yuvTelemetryFloat(kYuvSigmaVWord)), vec2(0.0), vec2(0.08));
 }
 
+// DELTA 0204: residual-noise telemetry is observer-only. BnCam must not create
+// hidden YUV denoise authority; future denoise authority belongs to explicit user controls.
 float yuvMeasuredLumaAuthority() {
-    return clamp(yuvTelemetryFloat(kYuvLumaAuthorityWord), 0.0, 0.75);
+    return 0.0;
 }
 
 float yuvMeasuredChromaAuthority() {
-    return clamp(yuvTelemetryFloat(kYuvChromaAuthorityWord), 0.0, 0.85);
+    return 0.0;
 }
 
 float yuvResidualPreserve(float residualSnr, float protection, bool chroma) {
@@ -424,32 +426,8 @@ float yuvResidualPreserve(float residualSnr, float protection, bool chroma) {
 }
 
 float denoisedInputYAtOutput(int outputX, int outputY) {
-    float center = inputYAtOutput(outputX, outputY);
-    float authority = yuvMeasuredLumaAuthority();
-    if (authority <= 1.0e-6) return center;
-
-    float n = inputYAtOutput(outputX, outputY - 1);
-    float s = inputYAtOutput(outputX, outputY + 1);
-    float w = inputYAtOutput(outputX - 1, outputY);
-    float e = inputYAtOutput(outputX + 1, outputY);
-
-    float sigmaY = max(yuvMeasuredSigmaY(), 1.0 / 255.0);
-    float protection = max(clamp(pc.profileNrLumaProtection, 0.0, 1.0), 0.65);
-    float guideScale = sigmaY * mix(3.10, 1.85, protection) + 1.0 / 255.0;
-    float wn = exp(-0.5 * pow((n - center) / guideScale, 2.0));
-    float ws = exp(-0.5 * pow((s - center) / guideScale, 2.0));
-    float ww = exp(-0.5 * pow((w - center) / guideScale, 2.0));
-    float we = exp(-0.5 * pow((e - center) / guideScale, 2.0));
-    float weightSum = wn + ws + ww + we;
-    if (weightSum <= 1.0e-5) return center;
-
-    float predictor = (wn * n + ws * s + ww * w + we * e) / weightSum;
-    float residual = center - predictor;
-    float residualSnr = abs(residual) / max(1.15 * sigmaY, 1.0 / 255.0);
-    float preserve = yuvResidualPreserve(residualSnr, protection, false);
-    float correction = residual * authority * (1.0 - preserve);
-    float correctionCap = sigmaY * mix(2.10, 1.45, protection);
-    return clamp(center - clamp(correction, -correctionCap, correctionCap), 0.0, 1.0);
+    // Exact identity while YUV denoise has no explicit user-owned authority.
+    return inputYAtOutput(outputX, outputY);
 }
 
 float toneMappedYAtOutput(int outputX, int outputY) {
@@ -469,48 +447,8 @@ vec2 inputUvAtOutput(int outputX, int outputY) {
 }
 
 vec2 denoisedUvAtOutput(uint outputX, uint outputY) {
-    vec2 center = inputUvAtOutput(int(outputX), int(outputY));
-    float authority = yuvMeasuredChromaAuthority();
-    if (authority <= 1.0e-6) return center;
-
-    vec2 n = inputUvAtOutput(int(outputX), int(outputY) - 2);
-    vec2 s = inputUvAtOutput(int(outputX), int(outputY) + 2);
-    vec2 w = inputUvAtOutput(int(outputX) - 2, int(outputY));
-    vec2 e = inputUvAtOutput(int(outputX) + 2, int(outputY));
-    float yCenter = inputYAtOutput(int(outputX), int(outputY));
-    float yn = inputYAtOutput(int(outputX), int(outputY) - 2);
-    float ys = inputYAtOutput(int(outputX), int(outputY) + 2);
-    float yw = inputYAtOutput(int(outputX) - 2, int(outputY));
-    float ye = inputYAtOutput(int(outputX) + 2, int(outputY));
-
-    float sigmaY = max(yuvMeasuredSigmaY(), 1.0 / 255.0);
-    vec2 sigmaUv = max(yuvMeasuredSigmaUv(), vec2(0.65 / 255.0));
-    float protection = max(clamp(pc.profileNrChromaProtection, 0.0, 1.0), 0.55);
-    float guideScale = sigmaY * mix(4.00, 2.15, protection) + 2.0 / 255.0;
-    float wn = exp(-0.5 * pow((yn - yCenter) / guideScale, 2.0));
-    float ws = exp(-0.5 * pow((ys - yCenter) / guideScale, 2.0));
-    float ww = exp(-0.5 * pow((yw - yCenter) / guideScale, 2.0));
-    float we = exp(-0.5 * pow((ye - yCenter) / guideScale, 2.0));
-    float weightSum = wn + ws + ww + we;
-    if (weightSum <= 1.0e-5) return center;
-
-    vec2 predictor = (wn * n + ws * s + ww * w + we * e) / weightSum;
-    vec2 residual = center - predictor;
-    vec2 residualSigma = 1.25 * sigmaUv;
-    float q = sqrt(
-        pow(residual.x / max(residualSigma.x, 1.0 / 255.0), 2.0) +
-        pow(residual.y / max(residualSigma.y, 1.0 / 255.0), 2.0));
-    float preserve = yuvResidualPreserve(q, protection, true);
-
-    // Near-black authority is SNR-based rather than an absolute black threshold. A dark
-    // but coherent colour remains untouched when its UV residual is statistically real.
-    float lumaSnr = max(0.0, yCenter) / sigmaY;
-    float nearBlack = 1.0 - smoothstep(4.0, 12.0, lumaSnr);
-    float localAuthority = clamp(authority * (1.0 + 0.25 * nearBlack), 0.0, 0.90);
-    vec2 cap = sigmaUv * mix(vec2(3.20), vec2(2.35), vec2(protection));
-    vec2 correction = residual * localAuthority * (1.0 - preserve);
-    correction = clamp(correction, -cap, cap);
-    return clamp(center - correction, vec2(0.0), vec2(1.0));
+    // Exact identity while YUV denoise has no explicit user-owned authority.
+    return inputUvAtOutput(int(outputX), int(outputY));
 }
 
 float yuvLaplacianY(int x, int y) {
@@ -611,16 +549,11 @@ void finalizeYuvResidualModel() {
     sigmaU = clamp(sigmaU, 0.0, 0.08);
     sigmaV = clamp(sigmaV, 0.0, 0.08);
 
-    float lumaPressure = smoothstep(0.70, 4.00, sigmaY * 255.0);
-    float sigmaC = sqrt(max(0.0, 0.5 * (sigmaU * sigmaU + sigmaV * sigmaV)));
-    float chromaPressure = smoothstep(0.50, 4.00, sigmaC * 255.0);
-    float measuredLuma = clamp(0.38 * lumaPressure * confidence, 0.0, 0.38);
-    float measuredChroma = clamp(0.70 * chromaPressure * confidence, 0.0, 0.70);
-
-    // Request fields now contain creative profile authority only. The physical baseline is
-    // entirely residual-measured here, so capture ISO cannot double-denoise a vendor-clean YUV.
-    float lumaAuthority = clamp(max(measuredLuma, pc.profileNrLumaBlend), 0.0, 0.75);
-    float chromaAuthority = clamp(max(measuredChroma, pc.profileNrChromaBlend), 0.0, 0.85);
+    // DELTA 0204: keep the residual estimate as observer telemetry only. Until denoise is
+    // reintroduced behind explicit libpatcher/user controls, no measured or legacy profile
+    // value may acquire YUV pixel authority.
+    float lumaAuthority = 0.0;
+    float chromaAuthority = 0.0;
 
     ultraHdrTelemetry.values[kYuvSigmaYWord] = yuvQ24(sigmaY);
     ultraHdrTelemetry.values[kYuvSigmaUWord] = yuvQ24(sigmaU);

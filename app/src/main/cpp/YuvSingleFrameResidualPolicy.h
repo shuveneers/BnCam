@@ -49,21 +49,27 @@ inline float modelConfidence(std::uint32_t lumaSamples, std::uint32_t chromaSamp
     return std::min(luma, chroma);
 }
 
+// DELTA 0204 — BnCam's YUV baseline is measurement-only. Noise evidence may remain
+// available for diagnostics/future libpatcher controls, but it owns zero pixels.
+// Until the user-facing denoise authority is rebuilt, every YUV denoise authority is exact zero.
 inline float measuredLumaAuthority(float sigmaY, float confidence) {
-    const float pressure = smoothstep(0.70f, 4.00f, sigmaY * 255.0f);
-    return std::clamp(0.38f * pressure * std::clamp(confidence, 0.0f, 1.0f), 0.0f, 0.38f);
+    (void)sigmaY;
+    (void)confidence;
+    return 0.0f;
 }
 
 inline float measuredChromaAuthority(float sigmaU, float sigmaV, float confidence) {
-    const float sigmaC = std::sqrt(std::max(0.0f, 0.5f * (sigmaU * sigmaU + sigmaV * sigmaV)));
-    const float pressure = smoothstep(0.50f, 4.00f, sigmaC * 255.0f);
-    return std::clamp(0.70f * pressure * std::clamp(confidence, 0.0f, 1.0f), 0.0f, 0.70f);
+    (void)sigmaU;
+    (void)sigmaV;
+    (void)confidence;
+    return 0.0f;
 }
 
 inline float finalAuthority(float measuredAuthority, float creativeAuthority, float ceiling) {
-    return std::clamp(std::max(
-            std::isfinite(measuredAuthority) ? measuredAuthority : 0.0f,
-            std::isfinite(creativeAuthority) ? creativeAuthority : 0.0f), 0.0f, ceiling);
+    (void)measuredAuthority;
+    (void)creativeAuthority;
+    (void)ceiling;
+    return 0.0f;
 }
 
 inline float nearBlackPressure(float luma, float sigmaY) {

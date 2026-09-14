@@ -8724,6 +8724,10 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; profileToneExposureEv=" << profileTonePlan.exposureEv
             << "; profileToneExposureMultiplier=" << profileTonePlan.exposureMultiplier
             << "; rawToneInputGain=" << 1.0f
+            << "; automaticGlobalSceneEv=" << 0.0f
+            << "; postRawSensitivityBoost=" << isoState.postRawSensitivityBoost
+            << "; postRawToneGain=" << postRawGain
+            << "; totalPostFllfExposureGain=" << exposureGain
             << "; profileToneExposureStage=POST_FLLF_SCENE_LINEAR_PRE_PBR_NEUTRAL"
             << "; profileToneExposure=" << uiConfig.profileToneExposure
             << "; profileToneExposureEv=" << profileTonePlan.exposureEv
@@ -8834,6 +8838,9 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; fllfAdjustedPixels=" << vulkanTone.fllfAdjustedPixels
             << "; fllfEdgeProtectedSamples=" << vulkanTone.fllfEdgeProtectedSamples
             << "; fllfMeanAbsCorrectionEv=" << vulkanTone.fllfMeanAbsCorrectionEv
+            << "; fllfMeanSignedCorrectionEv=" << vulkanTone.fllfMeanSignedCorrectionEv
+            << "; fllfPositiveCorrectionFraction=" << vulkanTone.fllfPositiveCorrectionFraction
+            << "; fllfNegativeCorrectionFraction=" << vulkanTone.fllfNegativeCorrectionFraction
             << "; fllfMaxAbsCorrectionEv=" << vulkanTone.fllfMaxAbsCorrectionEv
             << "; fllfPyramidBuildMs=" << vulkanTone.fllfPyramidBuildMs
             << "; fllfRemapReconstructMs=" << vulkanTone.fllfRemapReconstructMs
@@ -9522,6 +9529,9 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; fllfAdjustedPixels=" << vulkanTone.fllfAdjustedPixels
             << "; fllfEdgeProtectedSamples=" << vulkanTone.fllfEdgeProtectedSamples
             << "; fllfMeanAbsCorrectionEv=" << vulkanTone.fllfMeanAbsCorrectionEv
+            << "; fllfMeanSignedCorrectionEv=" << vulkanTone.fllfMeanSignedCorrectionEv
+            << "; fllfPositiveCorrectionFraction=" << vulkanTone.fllfPositiveCorrectionFraction
+            << "; fllfNegativeCorrectionFraction=" << vulkanTone.fllfNegativeCorrectionFraction
             << "; fllfMaxAbsCorrectionEv=" << vulkanTone.fllfMaxAbsCorrectionEv
             << "; fllfPyramidBuildMs=" << vulkanTone.fllfPyramidBuildMs
             << "; fllfRemapReconstructMs=" << vulkanTone.fllfRemapReconstructMs

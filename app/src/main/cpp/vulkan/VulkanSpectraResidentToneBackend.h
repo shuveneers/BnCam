@@ -205,6 +205,9 @@ struct SpectraResidentToneResult {
     std::uint64_t fllfAdjustedPixels = 0u;
     std::uint64_t fllfEdgeProtectedSamples = 0u;
     float fllfMeanAbsCorrectionEv = 0.0f;
+    float fllfMeanSignedCorrectionEv = 0.0f;
+    float fllfPositiveCorrectionFraction = 0.0f;
+    float fllfNegativeCorrectionFraction = 0.0f;
     float fllfMaxAbsCorrectionEv = 0.0f;
     // Physical post-detail luma sigma propagated through LSC -> spatial exposure -> demosaic ->
     // AWB -> CCM -> detail. Vulkan converts it to log2-luma sigma for correction coring.

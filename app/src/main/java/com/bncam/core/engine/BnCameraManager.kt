@@ -50,6 +50,17 @@ import com.bncam.core.capture.DefaultRawExposureRealizationTruth
 import com.bncam.core.capture.DefaultRawExposureRealizationEvaluator
 import com.bncam.core.capture.DefaultRawApi36AuthorityAction
 import com.bncam.core.capture.DefaultRawApi36AuthorityTracker
+import com.bncam.core.capture.DefaultRawApi36RoutePolicy
+import com.bncam.core.capture.DefaultRawPhotometricConvergenceSnapshot
+import com.bncam.core.capture.DefaultRawPhotometricConvergenceTracker
+import com.bncam.core.capture.DefaultRawMeteringSnapshot
+import com.bncam.core.capture.DefaultRawMeteringTracker
+import com.bncam.core.capture.DefaultRawAeReferenceGate
+import com.bncam.core.capture.DefaultRawTargetContinuity
+import com.bncam.core.capture.DefaultRawFinalExposureTarget
+import com.bncam.core.capture.DefaultRawExposureTargetModel
+import com.bncam.core.capture.DefaultRawExposureAllocation
+import com.bncam.core.capture.DefaultRawExposureAllocator
 import com.bncam.core.capture.RawMotionMeasurement
 import com.bncam.core.capture.RawPreviewMotionMeter
 import com.bncam.core.capture.WarmRawMotionSampler
@@ -61,6 +72,7 @@ import com.bncam.core.capture.RawFlickerStabilitySnapshot
 import com.bncam.core.capture.RawFlickerStabilityTracker
 import com.bncam.core.capture.FlickerFpsRange
 import com.bncam.core.capture.RawFlickerCadencePolicy
+import com.bncam.core.capture.PreviewFlickerAuthorityPolicy
 import com.bncam.core.capture.DynamicSensorProfile
 import com.bncam.core.capture.MeteringMode
 import com.bncam.core.capture.MeteringPlan
@@ -114,6 +126,10 @@ import com.bncam.core.quality.StableWhiteBalanceSnapshot
 import com.bncam.core.quality.WhiteBalanceConvergence
 import com.bncam.core.quality.WhiteBalanceStateEngine
 import com.bncam.core.runtime.RawPipelineRuntimeOwner
+import com.bncam.core.runtime.RawPreviewAnalysisDemand
+import com.bncam.core.runtime.RawPreviewFastPathPolicy
+import com.bncam.core.runtime.RawPreviewProducerAuthorityTracker
+import com.bncam.core.runtime.RawPreviewProducerKind
 import com.bncam.data.profile.CameraProfile
 import com.bncam.data.settings.SettingsRepository
 import com.bncam.data.settings.CaptureSettingKeys
@@ -577,7 +593,11 @@ class BnCameraManager(private val context: Context) {
     // A custom/vendor RAW preview output is preferred only after it has actually produced a
     // renderable frame for the active generation. Until then the canonical warm RAW ring remains
     // the live-preview source so the first Selected-buffer activation can never wait on shutter.
-    @Volatile private var customRawPreviewInputReadyGeneration: Int = -1
+    @Volatile private var customRawPreviewPublicationReadyGeneration: Int = -1
+    private val rawPreviewProducerAuthorityTracker = RawPreviewProducerAuthorityTracker()
+    @Volatile private var customRawPreviewLastFrameElapsedNs: Long = 0L
+    @Volatile private var customRawPreviewLastSensorTimestampNs: Long = 0L
+    @Volatile private var customRawPreviewFrameCount: Long = 0L
 
     @Volatile
     var activeZslFormat: Int = ImageFormat.YUV_420_888
@@ -757,6 +777,20 @@ class BnCameraManager(private val context: Context) {
             frame.close()
             return@rawPreviewFrame
         }
+        if (frame.producerKind == RawPreviewProducerKind.CUSTOM_IMAGE_READER) {
+            val binding = customRawPreviewBinding
+            if (binding != null && binding.generation == frame.pipelineGeneration && binding.source == frame.source &&
+                frame.source == targetViewfinderSource && customRawPreviewDisabledGeneration != frame.pipelineGeneration
+            ) {
+                rawPreviewProducerAuthorityTracker.customRendererPublished(frame.pipelineGeneration)
+                customRawPreviewPublicationReadyGeneration = frame.pipelineGeneration
+                Log.i(
+                    tag,
+                    "CUSTOM_RAW_PREVIEW_PUBLICATION_PROVEN source=${frame.source.name} " +
+                        "generation=${frame.pipelineGeneration} timestampNs=${frame.sensorTimestampNs}"
+                )
+            }
+        }
         capturePreviewContinuityTracker.previewFrame()
         capturePreviewContinuityTracker.repeatingRequestState(
             captureSession != null && currentCaptureRequest != null
@@ -902,6 +936,10 @@ class BnCameraManager(private val context: Context) {
     // identity-bound close barrier and wait for CameraCaptureSession.StateCallback.onClosed().
     private val sessionLifecycleLock = Any()
     private val sessionCloseBarriers = IdentityHashMap<CameraCaptureSession, CompletableDeferred<Unit>>()
+    private val sessionSurfaceNames = IdentityHashMap<CameraCaptureSession, IdentityHashMap<Surface, String>>()
+    private val sessionOwnedReaders = IdentityHashMap<CameraCaptureSession, Set<ImageReader>>()
+    private val readerOwningSessions = IdentityHashMap<ImageReader, MutableSet<CameraCaptureSession>>()
+    private val retiringImageReaders = IdentityHashMap<ImageReader, String>()
     private val controlRequestEpochTracker = ControlRequestEpochTracker()
     private var activeOisDecision: OisDecision? = null
     private val directOisValidationLock = Any()
@@ -1020,6 +1058,42 @@ class BnCameraManager(private val context: Context) {
     private var lastDefaultRawExposureTruthLogKey: String = ""
 
     private val defaultRawApi36AuthorityTracker = DefaultRawApi36AuthorityTracker()
+    private val defaultRawPhotometricConvergenceTracker = DefaultRawPhotometricConvergenceTracker()
+    private val defaultRawMeteringTracker = DefaultRawMeteringTracker()
+    private val defaultRawAeReferenceGate = DefaultRawAeReferenceGate()
+
+    @Volatile
+    private var latestDefaultRawMetering: DefaultRawMeteringSnapshot? = null
+
+    @Volatile
+    private var latestDefaultRawExposureTarget: DefaultRawFinalExposureTarget? = null
+
+    @Volatile
+    private var lastDefaultRawExposureTargetLogKey: String = ""
+
+    @Volatile
+    private var latestDefaultRawExposureAllocation: DefaultRawExposureAllocation? = null
+
+    @Volatile
+    private var latestDefaultRawPhotometricConvergence: DefaultRawPhotometricConvergenceSnapshot? = null
+
+    @Volatile
+    private var defaultRawPhotometricTargetLuma: Float? = null
+
+    @Volatile
+    private var defaultRawAllocationReady: Boolean = false
+
+    @Volatile
+    private var defaultRawFramesSinceExposureRequest: Int = 0
+
+    @Volatile
+    private var defaultRawLastObservedControlEpoch: Long = -1L
+
+    @Volatile
+    private var defaultRawLastAeStable: Boolean = false
+
+    @Volatile
+    private var lastDefaultRawPhotometricConvergenceLogKey: String = ""
 
     @Volatile
     private var defaultRawShutterFallbackPlan: DefaultRawManualFallbackPlan? = null
@@ -1488,9 +1562,9 @@ class BnCameraManager(private val context: Context) {
             (traceIdentity.bufferFormat == ImageFormat.RAW10 ||
                 traceIdentity.bufferFormat == ImageFormat.RAW_SENSOR)
         ) {
-            // Phase 1 motion metering reuses the compact Vulkan NV21 analysis output. It does not
-            // materialize the full RAW/RGBA frame on the CPU.
-            rawPreviewRenderer.setMlAnalysisRequested(true)
+            // Exposure statistics and default RAW motion metering have dedicated sensor/GPU-domain
+            // sources. Keep compact NV21 disabled unless an image-domain consumer actually needs it.
+            refreshRawPreviewCompactAnalysisRequest()
             prepareRawPreviewBackendAsync(
                 "selected_buffer_request:${formatName(traceIdentity.bufferFormat)}"
             )
@@ -1991,24 +2065,68 @@ class BnCameraManager(private val context: Context) {
         )
     }
 
+    private fun customRawPreviewStallThresholdNs(generation: Int): Long {
+        val timing = ringBuffer.streamTimingEstimate()
+        val cadenceNs = ((timing.frameDurationMedianMs ?: 33.3) * 1_000_000.0).toLong()
+            .coerceAtLeast(8_000_000L)
+        val exposureNs = if (lastCaptureResultGeneration == generation) {
+            (lastCaptureResult as? TotalCaptureResult)
+                ?.get(CaptureResult.SENSOR_EXPOSURE_TIME)
+                ?.coerceAtLeast(0L) ?: 0L
+        } else 0L
+        val expectedIntervalNs = maxOf(cadenceNs, exposureNs)
+        return maxOf(1_000_000_000L, expectedIntervalNs * 6L)
+    }
+
+    private fun isCustomRawPreviewFresh(
+        generation: Int,
+        nowElapsedNs: Long = android.os.SystemClock.elapsedRealtimeNanos()
+    ): Boolean {
+        if (customRawPreviewDisabledGeneration == generation) return false
+        if (customRawPreviewBinding?.generation != generation || customRawPreviewReader == null ||
+            customRawPreviewPublicationReadyGeneration != generation
+        ) return false
+        val last = customRawPreviewLastFrameElapsedNs
+        if (last <= 0L) return false
+        val inputFresh = nowElapsedNs - last <= customRawPreviewStallThresholdNs(generation)
+        return rawPreviewProducerAuthorityTracker.maySuppressCanonical(generation, inputFresh)
+    }
+
+    private fun disableCustomRawPreviewForGeneration(generation: Int, reason: String) {
+        if (generation != pipelineGeneration || customRawPreviewBinding?.generation != generation) return
+        if (customRawPreviewDisabledGeneration == generation && customRawPreviewPublicationReadyGeneration != generation) return
+        customRawPreviewDisabledGeneration = generation
+        customRawPreviewPublicationReadyGeneration = -1
+        rawPreviewProducerAuthorityTracker.reset(generation)
+        recordRawSessionOutputDiagnostic(
+            section = "CUSTOM_RAW_PREVIEW_FALLBACK_CANONICAL",
+            content = "generation=$generation;reason=$reason;" +
+                "lastCustomFrameElapsedNs=$customRawPreviewLastFrameElapsedNs;" +
+                "lastCustomSensorTimestampNs=$customRawPreviewLastSensorTimestampNs;" +
+                "customFrameCount=$customRawPreviewFrameCount;${rawRingPressureSummary()}"
+        )
+    }
+
     private fun offerRawPreviewImage(timestamp: Long, generation: Int) {
         // RAW preview owns an independently retained AHardwareBuffer handle and therefore does not
         // need to stop while capture leases the warm-buffer frame. Keep the live view running
         // during single- and multi-frame capture; the one-pending-frame renderer naturally drops
         // obsolete preview work if the GPU is busy instead of freezing the last displayed frame.
         if (targetViewfinderSource == ViewfinderEffectiveSource.YUV) return
-        val customInputProven = customRawPreviewBinding?.generation == generation &&
-            customRawPreviewReader != null &&
-            customRawPreviewInputReadyGeneration == generation
-        if (customInputProven) return
+        if (isCustomRawPreviewFresh(generation)) return
         val recentMetadata = if (lastCaptureResultGeneration == generation) {
             lastCaptureResult as? TotalCaptureResult
         } else null
-        ringBuffer.withBorrowedImageFrame(timestamp, generation) { hardwareBuffer ->
-            if (rawPreviewConfiguredGeneration != generation) {
-                recentMetadata?.let { ensureRawPreviewConfig(it, generation) }
+        val ringHandoffTrace = com.bncam.ui.screens.capture.RawPreviewTrace.beginRingHandoff()
+        try {
+            ringBuffer.withBorrowedImageFrame(timestamp, generation) { hardwareBuffer ->
+                if (rawPreviewConfiguredGeneration != generation) {
+                    recentMetadata?.let { ensureRawPreviewConfig(it, generation) }
+                }
+                rawPreviewRenderer.offerBorrowedHardwareBuffer(hardwareBuffer, timestamp, generation)
             }
-            rawPreviewRenderer.offerBorrowedHardwareBuffer(hardwareBuffer, timestamp, generation)
+        } finally {
+            com.bncam.ui.screens.capture.RawPreviewTrace.end(ringHandoffTrace)
         }
     }
 
@@ -2513,6 +2631,19 @@ class BnCameraManager(private val context: Context) {
     private val yuvExposureSampleLock = Any()
     private var yuvExposureSampleBuffer: ByteBuffer? = null
 
+    private fun refreshRawPreviewCompactAnalysisRequest() {
+        val demand = RawPreviewAnalysisDemand(
+            qrEnabled = qrAnalysisEnabled,
+            objectTrackingEnabled = objectTrackingAnalysisEnabled,
+            focusTrackingActive = _focusTrackingActive.value,
+            portraitEnabled = portraitAnalysisEnabled,
+            capturing = isCapturing
+        )
+        rawPreviewRenderer.setMlAnalysisRequested(
+            RawPreviewFastPathPolicy.needsCompactNv21(demand)
+        )
+    }
+
     fun setOptionalAnalysisEnabled(
         histogram: Boolean,
         qr: Boolean,
@@ -2523,9 +2654,7 @@ class BnCameraManager(private val context: Context) {
         qrAnalysisEnabled = qr
         objectTrackingAnalysisEnabled = objectTracking
         portraitAnalysisEnabled = portraitEffect
-        rawPreviewRenderer.setMlAnalysisRequested(
-            qr || portraitEffect || objectTracking
-        )
+        refreshRawPreviewCompactAnalysisRequest()
         if (!histogram) {
             _liveHistogram.value = List(16) { 0f }
             _liveRgbHistogram.value = LiveRgbHistogram.empty()
@@ -3356,8 +3485,24 @@ class BnCameraManager(private val context: Context) {
         defaultRawShutterLastSafeExposureCeilingNs = 0L
         defaultRawShutterManualFallbackActive = false
         defaultRawShutterFallbackTargetLuma = null
+        defaultRawPhotometricTargetLuma = null
+        defaultRawMeteringTracker.reset(pipelineGeneration)
+        defaultRawAeReferenceGate.reset(pipelineGeneration)
+        latestDefaultRawMetering = null
+        latestDefaultRawExposureTarget = null
+        latestDefaultRawExposureAllocation = null
+        lastDefaultRawExposureTargetLogKey = ""
+        defaultRawAllocationReady = false
+        defaultRawFramesSinceExposureRequest = 0
+        defaultRawLastObservedControlEpoch = -1L
+        defaultRawLastAeStable = false
+        lastDefaultRawPhotometricConvergenceLogKey = ""
         latestDefaultRawExposureTruth = null
         lastDefaultRawExposureTruthLogKey = ""
+        latestDefaultRawPhotometricConvergence = defaultRawPhotometricConvergenceTracker.reset(
+            currentGeneration = pipelineGeneration,
+            nowElapsedNs = android.os.SystemClock.elapsedRealtimeNanos()
+        )
         defaultRawShutterFallbackPlan = null
         defaultRawShutterFallbackLastAdaptationNs = 0L
         if (resetMotion) {
@@ -3395,6 +3540,11 @@ class BnCameraManager(private val context: Context) {
         )
         return true
     }
+
+    private fun isDefaultRawAeStateStable(aeState: Int?): Boolean =
+        aeState == CaptureResult.CONTROL_AE_STATE_CONVERGED ||
+            aeState == CaptureResult.CONTROL_AE_STATE_FLASH_REQUIRED ||
+            aeState == CaptureResult.CONTROL_AE_STATE_LOCKED
 
     private fun updateDefaultRawExposureRealizationTruth(
         request: CaptureRequest,
@@ -3439,6 +3589,21 @@ class BnCameraManager(private val context: Context) {
             actualFrameDurationNs = result.get(CaptureResult.SENSOR_FRAME_DURATION)?.takeIf { it > 0L }
         )
         latestDefaultRawExposureTruth = truth
+        val repeatingResult = snapshot.submissionType == CameraRequestSubmissionType.REPEATING
+        if (repeatingResult) {
+            if (defaultRawLastObservedControlEpoch != truth.controlRequestEpoch) {
+                defaultRawLastObservedControlEpoch = truth.controlRequestEpoch
+                defaultRawFramesSinceExposureRequest = 0
+            } else {
+                defaultRawFramesSinceExposureRequest++
+            }
+        }
+        defaultRawLastAeStable = isDefaultRawAeStateStable(result.get(CaptureResult.CONTROL_AE_STATE))
+        defaultRawAeReferenceGate.observeAeState(
+            currentGeneration = generation,
+            stable = defaultRawLastAeStable,
+            nowElapsedNs = android.os.SystemClock.elapsedRealtimeNanos()
+        )
 
         val logKey = "${truth.route}:${truth.status}:${truth.controlRequestEpoch}"
         if (logKey != lastDefaultRawExposureTruthLogKey) {
@@ -3455,28 +3620,35 @@ class BnCameraManager(private val context: Context) {
         if (route == DefaultRawExposureRoute.API36_EXPOSURE_TIME_PRIORITY && generation == pipelineGeneration) {
             val identity = synchronized(pipelineLock) { activePipelineIdentity }
             val sensitivityCameraId = identity?.physicalCameraId ?: identity?.logicalCameraId ?: cameraDevice?.id
-            val minIso = sensitivityCameraId?.let { id ->
+            val sensitivityRange = sensitivityCameraId?.let { id ->
                 runCatching {
                     cameraManager.getCameraCharacteristics(id)
-                        .get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)?.lower
+                        .get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
                 }.getOrNull()
             }
             val decision = defaultRawApi36AuthorityTracker.observe(
                 currentGeneration = generation,
-                repeatingResult = snapshot.submissionType == CameraRequestSubmissionType.REPEATING,
+                repeatingResult = repeatingResult,
                 realizationStatus = truth.status,
                 aeSearching = result.get(CaptureResult.CONTROL_AE_STATE) == CaptureResult.CONTROL_AE_STATE_SEARCHING,
                 actualIso = truth.actualIso,
-                minIso = minIso
+                minIso = sensitivityRange?.lower,
+                maxIso = sensitivityRange?.upper
             )
             if (decision.action != DefaultRawApi36AuthorityAction.KEEP_PRIORITY) {
                 Log.w(tag, "DEFAULT_RAW_API36_AUTHORITY ${decision.summary()}")
                 if (!defaultRawShutterAwaitingAeBaseline) {
                     val reason = when (decision.action) {
-                        DefaultRawApi36AuthorityAction.REBOOTSTRAP_AE_REFERENCE ->
-                            "API36_AE_SEARCHING_AT_MIN_ISO"
-                        DefaultRawApi36AuthorityAction.REJECT_API36_PRIORITY ->
-                            "API36_PRIORITY_NOT_REALIZED"
+                        DefaultRawApi36AuthorityAction.REBOOTSTRAP_AE_REFERENCE -> when {
+                            decision.reason.contains("max_iso") -> "API36_AE_SEARCHING_AT_MAX_ISO"
+                            decision.reason.contains("min_iso") -> "API36_AE_SEARCHING_AT_MIN_ISO"
+                            else -> "API36_AE_REFERENCE_REBOOTSTRAP"
+                        }
+                        DefaultRawApi36AuthorityAction.REJECT_API36_PRIORITY -> when {
+                            decision.reason.contains("max_iso") -> "API36_MAX_ISO_UNSOLVED_REJECTED"
+                            decision.reason.contains("min_iso") -> "API36_MIN_ISO_UNSOLVED_REJECTED"
+                            else -> "API36_PRIORITY_NOT_REALIZED"
+                        }
                         DefaultRawApi36AuthorityAction.KEEP_PRIORITY -> "API36_KEEP"
                     }
                     if (restartDefaultRawAeReference(reason, preserveRealizationTruth = true)) {
@@ -3494,7 +3666,10 @@ class BnCameraManager(private val context: Context) {
     }
 
     private fun updateRawFlickerAuthority(result: TotalCaptureResult, generation: Int) {
-        if (generation != pipelineGeneration ||
+        val rawOwnsDynamicFlicker = PreviewFlickerAuthorityPolicy.shouldObserveSceneFlicker(
+            isRawWarmProducer = isActiveRawWarmProducer()
+        )
+        if (!rawOwnsDynamicFlicker || generation != pipelineGeneration ||
             activeResolvedAntibandingMode != CaptureRequest.CONTROL_AE_ANTIBANDING_MODE_AUTO
         ) return
 
@@ -3544,6 +3719,12 @@ class BnCameraManager(private val context: Context) {
             "RAW_FLICKER_AUTHORITY_CHANGED generation=$generation observation=$observation resultOwner=$resultOwner " +
                 "frequency=${next.stableFrequency} fallback=${next.fallbackActive} source=${next.source}"
         )
+        // A stream switch may race this capture-result callback. Re-check ownership before a
+        // control resubmission so a retiring RAW result can never perturb the new YUV AE loop.
+        if (!PreviewFlickerAuthorityPolicy.shouldResubmitForFlickerAuthorityChange(
+                isRawWarmProducer = isActiveRawWarmProducer()
+            )
+        ) return
         enqueuePreviewControl("flicker_cadence", "FLICKER_AUTHORITY_CHANGED:${next.stableFrequency}") {
             updatePreviewRepeatingRequest()
         }
@@ -3661,6 +3842,129 @@ class BnCameraManager(private val context: Context) {
             needsDefaultRawShutterFallbackStatistics() ||
             shouldRequestDefaultRawShutterMotionAnalysis()
 
+    private fun updateDefaultRawPhotometricConvergence(statistics: ExposureStatistics) {
+        if (!shouldRequestDefaultRawShutterMotionAnalysis() || statistics.sampleCount <= 0) return
+        val observedLuma = statistics.exposureControllerLuma()
+            .takeIf { it.isFinite() && it > 0f }
+
+        if (defaultRawPhotometricTargetLuma == null &&
+            defaultRawShutterAeBaselineGeneration == pipelineGeneration &&
+            !defaultRawShutterAwaitingAeBaseline && observedLuma != null
+        ) {
+            // Do not bind the set-point to a statistic produced before the HAL convergence window.
+            // The AE result and RAW histogram are asynchronous; only the synchronized reference gate
+            // is allowed to create a new photometric anchor.
+            val candidate = defaultRawMeteringTracker.resolve(
+                currentGeneration = pipelineGeneration,
+                nowElapsedRealtimeNs = android.os.SystemClock.elapsedRealtimeNanos(),
+                source = "PHOTOMETRIC_TARGET_RESOLVE"
+            )
+            if (defaultRawAeReferenceGate.canAccept(pipelineGeneration, candidate)) {
+                defaultRawPhotometricTargetLuma = candidate.controllerLuma
+            }
+        }
+
+        val truth = latestDefaultRawExposureTruth
+        val route = truth?.route ?: when {
+            defaultRawShutterManualFallbackActive -> DefaultRawExposureRoute.MANUAL_FALLBACK
+            lastExposurePlanSummary.contains("priorityModeRequested=EXPOSURE_TIME") ->
+                DefaultRawExposureRoute.API36_EXPOSURE_TIME_PRIORITY
+            else -> DefaultRawExposureRoute.AE_BOOTSTRAP
+        }
+        val targetLuma = defaultRawPhotometricTargetLuma ?: defaultRawShutterFallbackTargetLuma
+        val snapshot = defaultRawPhotometricConvergenceTracker.observe(
+            currentGeneration = pipelineGeneration,
+            currentRoute = route,
+            allocationReady = defaultRawAllocationReady,
+            targetLuma = targetLuma,
+            observedLuma = observedLuma,
+            realizationStatus = truth?.status,
+            aeStable = defaultRawLastAeStable,
+            nowElapsedNs = android.os.SystemClock.elapsedRealtimeNanos()
+        )
+        latestDefaultRawPhotometricConvergence = snapshot
+        val key = "${snapshot.route}:${snapshot.photometricConverged}:${snapshot.reason}"
+        if (key != lastDefaultRawPhotometricConvergenceLogKey) {
+            lastDefaultRawPhotometricConvergenceLogKey = key
+            Log.i(tag, "DEFAULT_RAW_PHOTOMETRIC_STATE ${snapshot.summary()}")
+        }
+    }
+
+    private fun updateDefaultRawMeteringArchitecture(statistics: ExposureStatistics) {
+        if (!shouldRequestDefaultRawShutterMotionAnalysis()) return
+        val now = android.os.SystemClock.elapsedRealtimeNanos()
+        val observedLuma = statistics.exposureControllerLuma()
+            .takeIf { it.isFinite() && it > 0f }
+        val metering = defaultRawMeteringTracker.observe(
+            currentGeneration = pipelineGeneration,
+            source = statistics.source,
+            controllerLuma = observedLuma,
+            rawNearClipFraction = statistics.rawNearClipFraction ?: statistics.maximumDisplayClipFraction,
+            sampleCount = statistics.sampleCount,
+            nowElapsedRealtimeNs = now
+        )
+        latestDefaultRawMetering = metering
+
+        val currentProduct = defaultRawShutterFallbackPlan?.exposureProduct
+            ?: if (defaultRawShutterAeBaselineGeneration == pipelineGeneration) {
+                val iso = defaultRawShutterAeBaselineIso
+                val exposure = defaultRawShutterAeBaselineExposureNs
+                if (iso != null && iso > 0 && exposure != null && exposure > 0L) {
+                    iso.toDouble() * exposure.toDouble()
+                } else {
+                    null
+                }
+            } else {
+                null
+            }
+        val targetLuma = defaultRawPhotometricTargetLuma ?: defaultRawShutterFallbackTargetLuma
+        val target = if (targetLuma != null && currentProduct != null) {
+            DefaultRawExposureTargetModel.resolve(
+                targetLuma = targetLuma,
+                metering = metering,
+                currentExposureProduct = currentProduct
+            )
+        } else {
+            null
+        }
+        latestDefaultRawExposureTarget = target
+
+        val key = if (target != null) {
+            "${metering.freshness}:${kotlin.math.round(target.ideal.exposureErrorEv * 20f) / 20f}:" +
+                "${kotlin.math.round(target.highlightProtectionEv * 20f) / 20f}:${target.reason}"
+        } else {
+            "${metering.freshness}:target_unavailable"
+        }
+        if (key != lastDefaultRawExposureTargetLogKey) {
+            lastDefaultRawExposureTargetLogKey = key
+            Log.i(
+                tag,
+                "DEFAULT_RAW_EXPOSURE_TARGET ${metering.summary()};" +
+                    (target?.summary() ?: "idealTarget=unavailable")
+            )
+        }
+    }
+
+    private fun defaultRawConvergenceSummarySuffix(): String {
+        val convergence = latestDefaultRawPhotometricConvergence
+        val fallback = defaultRawShutterFallbackPlan
+        val metering = latestDefaultRawMetering
+        val target = latestDefaultRawExposureTarget
+        return "allocationReady=$defaultRawAllocationReady;" +
+            "photometricConverged=${convergence?.photometricConverged ?: false};" +
+            "exposureErrorEv=${convergence?.exposureErrorEv ?: "unavailable"};" +
+            "meteringFreshness=${metering?.freshness ?: "unavailable"};" +
+            "idealExposureProduct=${target?.ideal?.idealExposureProduct ?: "unavailable"};" +
+            "finalExposureProduct=${target?.finalExposureProduct ?: "unavailable"};" +
+            "highlightProtectionEv=${target?.highlightProtectionEv ?: 0f};" +
+            "allocatedExposureNs=${latestDefaultRawExposureAllocation?.exposureTimeNs ?: fallback?.exposureTimeNs ?: "unavailable"};" +
+            "allocatedIso=${latestDefaultRawExposureAllocation?.sensitivityIso ?: fallback?.sensitivityIso ?: "unavailable"};" +
+            "allocationLimit=${latestDefaultRawExposureAllocation?.limitingConstraint ?: fallback?.limitingConstraint ?: "unavailable"};" +
+            "feedbackCorrectionEv=${fallback?.feedbackCorrectionEv ?: 0f};" +
+            "motionReallocationEv=${fallback?.motionReallocationEv ?: 0f};" +
+            "framesSinceExposureRequest=$defaultRawFramesSinceExposureRequest"
+    }
+
     private fun maybeAdaptDefaultRawShutterFallback(statistics: ExposureStatistics) {
         if (!needsDefaultRawShutterFallbackStatistics() || isCapturing || statistics.sampleCount <= 0) return
         val observedLuma = statistics.exposureControllerLuma()
@@ -3670,29 +3974,43 @@ class BnCameraManager(private val context: Context) {
             if (defaultRawShutterAeBaselineGeneration != pipelineGeneration ||
                 defaultRawShutterAeBaselineIso == null || defaultRawShutterAeBaselineExposureNs == null
             ) return
-            // This statistic is still produced under Camera2 AE because the fallback remains in
-            // bootstrap until an anchor exists. It therefore inherits the HAL metering target.
-            defaultRawShutterFallbackTargetLuma = observedLuma
+            val target = DefaultRawTargetContinuity.resolveFallbackTarget(
+                fallbackTargetLuma = defaultRawShutterFallbackTargetLuma,
+                photometricTargetLuma = defaultRawPhotometricTargetLuma,
+                observedLuma = observedLuma
+            ) ?: return
+            // Route changes must preserve the established photometric set-point. Re-anchoring to
+            // the current observation here would turn residual underexposure into the new target.
+            defaultRawShutterFallbackTargetLuma = target
+            if (defaultRawPhotometricTargetLuma == null) defaultRawPhotometricTargetLuma = target
             defaultRawShutterFallbackLastAdaptationNs = android.os.SystemClock.elapsedRealtimeNanos()
-            Log.i(tag, "DEFAULT_RAW_SHUTTER_FALLBACK_LUMA_ANCHOR luma=$observedLuma source=${statistics.source}")
-            enqueuePreviewControl("default_raw_shutter_fallback", "RAW_FALLBACK_LUMA_ANCHOR") {
+            Log.i(
+                tag,
+                "DEFAULT_RAW_SHUTTER_FALLBACK_TARGET_CONTINUITY targetLuma=$target " +
+                    "observedLuma=$observedLuma source=${statistics.source}"
+            )
+            enqueuePreviewControl("default_raw_shutter_fallback", "RAW_FALLBACK_TARGET_CONTINUITY") {
                 updatePreviewRepeatingRequest()
             }
             return
         }
 
-        val now = android.os.SystemClock.elapsedRealtimeNanos()
-        val flickerResolved = resolveDefaultRawFlickerConstraint().frequency != RawFlickerFrequency.NONE
-        val minimumAdaptationIntervalNs = if (flickerResolved) 500_000_000L else 250_000_000L
-        if (now - defaultRawShutterFallbackLastAdaptationNs < minimumAdaptationIntervalNs) return
         val previous = defaultRawShutterFallbackPlan ?: return
+        val clipping = statistics.rawNearClipFraction ?: statistics.maximumDisplayClipFraction
+        val now = android.os.SystemClock.elapsedRealtimeNanos()
+        val minimumAdaptationIntervalNs =
+            DefaultRawShutterManualFallbackPolicy.recommendedUpdateIntervalNs(
+                previous = previous,
+                observedLuma = observedLuma,
+                rawNearClipFraction = clipping
+            )
+        if (now - defaultRawShutterFallbackLastAdaptationNs < minimumAdaptationIntervalNs) return
         val safeCeiling = defaultRawShutterLastSafeExposureCeilingNs.takeIf { it > 0L } ?: return
         val deviceId = cameraDevice?.id ?: return
         val chars = runCatching { cameraManager.getCameraCharacteristics(deviceId) }.getOrNull() ?: return
         val isoRange = chars.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE) ?: return
         val exposureRange = chars.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE) ?: return
         val bounds = ExposureBounds(isoRange.lower, isoRange.upper, exposureRange.lower, exposureRange.upper)
-        val clipping = statistics.rawNearClipFraction ?: statistics.maximumDisplayClipFraction
 
         val adapted = synchronized(defaultRawShutterFallbackLock) {
             val latest = defaultRawShutterFallbackPlan ?: return@synchronized null
@@ -3791,6 +4109,8 @@ class BnCameraManager(private val context: Context) {
         latestExposureStatistics = statistics
         maybeAdaptDefaultRawShutterFallback(statistics)
         maybeAdaptProfileExposurePriority(statistics)
+        updateDefaultRawPhotometricConvergence(statistics)
+        updateDefaultRawMeteringArchitecture(statistics)
 
         // Standard AE metering is fully Camera2-region driven. Statistics remain useful for the
         // optional live histogram and diagnostics, but no longer inject hidden EV compensation.
@@ -3981,7 +4301,23 @@ class BnCameraManager(private val context: Context) {
             val availableRanges = chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES) ?: return
             if (availableRanges.isEmpty()) return
 
-            val flickerConstraint = resolveDefaultRawFlickerConstraint()
+            val identity = synchronized(pipelineLock) { activePipelineIdentity }
+            val rawIdentity = identity?.takeIf { candidate ->
+                candidate.bufferFormat == ImageFormat.RAW10 ||
+                    candidate.bufferFormat == ImageFormat.RAW_SENSOR
+            }
+            // Dynamic STATISTICS_SCENE_FLICKER authority is RAW-only. Normal YUV preview already
+            // runs Camera2 AE with the configured anti-banding mode; feeding YUV flicker-result
+            // transitions back into acquisition control creates a redundant AE feedback loop.
+            val flickerConstraint = if (rawIdentity != null) {
+                resolveDefaultRawFlickerConstraint()
+            } else {
+                RawFlickerConstraint(
+                    frequency = RawFlickerFrequency.NONE,
+                    source = "CAMERA2_HAL_OWNS_NON_RAW_ANTIBANDING",
+                    fallbackActive = false
+                )
+            }
             fun flickerRangeFor(sustainableUpperFps: Int?): Pair<android.util.Range<Int>?, String> {
                 val plan = RawFlickerCadencePolicy.resolve(
                     availableRanges = availableRanges.map { FlickerFpsRange(it.lower, it.upper) },
@@ -3991,12 +4327,6 @@ class BnCameraManager(private val context: Context) {
                 )
                 val selected = plan.selected?.let { android.util.Range(it.lower, it.upper) }
                 return selected to plan.strategy
-            }
-
-            val identity = synchronized(pipelineLock) { activePipelineIdentity }
-            val rawIdentity = identity?.takeIf { candidate ->
-                candidate.bufferFormat == ImageFormat.RAW10 ||
-                    candidate.bufferFormat == ImageFormat.RAW_SENSOR
             }
 
             if (rawIdentity != null) {
@@ -6830,6 +7160,8 @@ class BnCameraManager(private val context: Context) {
             var lastResubmitMs = 0L
             var resubmittedInEpisode = false
             var resubmitElapsedMs = 0L
+            var lastRawHealthRecoveryMs = 0L
+            var lastRawHealthStage: com.bncam.ui.screens.capture.RawPreviewHealthStage? = null
 
             while (sessionGeneration == pipelineGeneration) {
                 val timing = ringBuffer.streamTimingEstimate()
@@ -6849,10 +7181,116 @@ class BnCameraManager(private val context: Context) {
                     format = activeZslFormat,
                     bufferCapacity = ringBuffer.currentCapacity()
                 )
+                val watchdogNowNs = android.os.SystemClock.elapsedRealtimeNanos()
+                val ringPressure = rawRingPressureSummary()
+                com.bncam.ui.screens.capture.RawPreviewHealthMonitor.updateRingPressure(
+                    sessionGeneration,
+                    ringPressure
+                )
+                rawPreviewRenderer.currentConfig?.takeIf {
+                    it.pipelineGeneration == sessionGeneration && it.source != ViewfinderEffectiveSource.YUV
+                }?.let {
+                    com.bncam.ui.screens.capture.RawPreviewHealthMonitor.updateOutputSlotHealth(
+                        sessionGeneration,
+                        rawPreviewRenderer.healthSummary()
+                    )
+                }
+                val rawHealth = com.bncam.ui.screens.capture.RawPreviewHealthMonitor.snapshot(watchdogNowNs)
+                val targetRawHealthApplies = targetViewfinderSource != ViewfinderEffectiveSource.YUV &&
+                    targetViewfinderGeneration == sessionGeneration &&
+                    rawHealth.pipelineGeneration == sessionGeneration
+                if (targetRawHealthApplies &&
+                    rawHealth.stage != com.bncam.ui.screens.capture.RawPreviewHealthStage.HEALTHY &&
+                    rawHealth.stage != com.bncam.ui.screens.capture.RawPreviewHealthStage.STARTING &&
+                    rawHealth.stage != com.bncam.ui.screens.capture.RawPreviewHealthStage.INACTIVE
+                ) {
+                    val nowMsForHealth = android.os.SystemClock.elapsedRealtime()
+                    val stageChanged = lastRawHealthStage != rawHealth.stage
+                    val recoveryCooldownMs = (rawHealth.stallThresholdNs / 1_000_000L).coerceAtLeast(1_000L)
+                    if (stageChanged || nowMsForHealth - lastRawHealthRecoveryMs >= recoveryCooldownMs) {
+                        com.bncam.core.debug.DiagnosticsAggregator.record(
+                            stream = com.bncam.core.debug.DiagnosticsAggregator.Stream.PERFORMANCE,
+                            scope = "VIEWFINDER source=${rawHealth.source} generation=$sessionGeneration",
+                            section = "RAW PREVIEW HEALTH STALL",
+                            content = rawHealth.report(watchdogNowNs)
+                        )
+                        Log.w(
+                            "RawPreviewHealth",
+                            "event=STALL stage=${rawHealth.stage} generation=$sessionGeneration " +
+                                "thresholdMs=${rawHealth.stallThresholdNs / 1_000_000.0} " +
+                                "eglGeneration=${rawHealth.eglGeneration}"
+                        )
+                    }
+                    lastRawHealthStage = rawHealth.stage
+                    if (nowMsForHealth - lastRawHealthRecoveryMs >= recoveryCooldownMs) {
+                        val recoveryAttempted = when (rawHealth.stage) {
+                            com.bncam.ui.screens.capture.RawPreviewHealthStage.RENDERER_PUBLICATION ->
+                                rawPreviewRenderer.forceCpuFallbackForHealth("renderer_publication_stall")
+                            com.bncam.ui.screens.capture.RawPreviewHealthStage.RENDERER_OFFER -> {
+                                primeRawViewfinderFromWarmBuffer(
+                                    targetViewfinderSource,
+                                    sessionGeneration,
+                                    rawPreviewRouteRevision
+                                )
+                                true
+                            }
+                            com.bncam.ui.screens.capture.RawPreviewHealthStage.GL_ACCEPT,
+                            com.bncam.ui.screens.capture.RawPreviewHealthStage.GL_DRAW ->
+                                com.bncam.ui.screens.capture.FocusPeakingView.requestRawDisplayRecovery(
+                                    sessionGeneration,
+                                    rawHealth.stage.name.lowercase(),
+                                    rebuildRawTexturePool = false
+                                )
+                            com.bncam.ui.screens.capture.RawPreviewHealthStage.EGL_PRESENTATION ->
+                                com.bncam.ui.screens.capture.FocusPeakingView.requestRawDisplayRecovery(
+                                    sessionGeneration,
+                                    "egl_presentation_stall",
+                                    rebuildRawTexturePool = true
+                                )
+                            com.bncam.ui.screens.capture.RawPreviewHealthStage.RAW_IMAGE_READER -> {
+                                if (customRawPreviewBinding?.generation == sessionGeneration &&
+                                    customRawPreviewPublicationReadyGeneration == sessionGeneration
+                                ) {
+                                    disableCustomRawPreviewForGeneration(
+                                        sessionGeneration,
+                                        "health_raw_image_reader_stall"
+                                    )
+                                    true
+                                } else {
+                                    false // Existing warm-buffer transport watchdog owns session recovery.
+                                }
+                            }
+                            com.bncam.ui.screens.capture.RawPreviewHealthStage.CAMERA_CAPTURE_RESULT ->
+                                false // Existing Camera2 transport watchdog owns repeating/session recovery.
+                            com.bncam.ui.screens.capture.RawPreviewHealthStage.RGB_OUTPUT ->
+                                false // Diagnostic only: never alter exposure/tone to hide a black-output fault.
+                            else -> false
+                        }
+                        if (recoveryAttempted) {
+                            lastRawHealthRecoveryMs = nowMsForHealth
+                            com.bncam.ui.screens.capture.RawPreviewHealthMonitor.recoveryAttempt(
+                                sessionGeneration,
+                                "stage=${rawHealth.stage}",
+                                watchdogNowNs
+                            )
+                        }
+                    }
+                } else if (targetRawHealthApplies) {
+                    lastRawHealthStage = rawHealth.stage
+                }
                 val freshCompleteFrames = ringBuffer.freshMetadataCompleteFrameCount(
-                    referenceTimestampNs = android.os.SystemClock.elapsedRealtimeNanos(),
+                    referenceTimestampNs = watchdogNowNs,
                     freshnessWindowMs = streamHealthRequirement.streamHealthFreshnessWindowMs
                 )
+                if (customRawPreviewBinding?.generation == sessionGeneration &&
+                    customRawPreviewPublicationReadyGeneration == sessionGeneration &&
+                    !isCustomRawPreviewFresh(sessionGeneration, watchdogNowNs)
+                ) {
+                    disableCustomRawPreviewForGeneration(
+                        sessionGeneration,
+                        "custom_stream_stalled_after_ready"
+                    )
+                }
                 // Old complete pairs are not proof that the repeating producer is still alive.
                 // The capture gate already rejects a stale ring; the watchdog must use the same
                 // freshness truth or it can declare a frozen producer healthy forever simply
@@ -6980,22 +7418,199 @@ class BnCameraManager(private val context: Context) {
         }
     }
 
+    private fun registerSessionOutputOwnership(
+        session: CameraCaptureSession,
+        namedSurfaces: List<Pair<Surface, String>>,
+        readers: List<ImageReader>,
+        generation: Int,
+        epoch: Long,
+        reason: String
+    ) {
+        synchronized(sessionLifecycleLock) {
+            sessionCloseBarriers.getOrPut(session) { CompletableDeferred() }
+            val names = sessionSurfaceNames.getOrPut(session) { IdentityHashMap() }
+            namedSurfaces.forEach { (surface, name) -> names[surface] = name }
+            val exactReaders = readers.toSet()
+            sessionOwnedReaders[session] = exactReaders
+            exactReaders.forEach { reader ->
+                readerOwningSessions.getOrPut(reader) {
+                    java.util.Collections.newSetFromMap(IdentityHashMap<CameraCaptureSession, Boolean>())
+                }.add(session)
+            }
+        }
+        Log.i(
+            previewDiagnosticsTag,
+            "event=SESSION_OUTPUT_OWNERSHIP_REGISTERED generation=$generation epoch=$epoch " +
+                "sessionIdentity=${System.identityHashCode(session)} reason=$reason " +
+                "surfaces=${namedSurfaces.joinToString { (surface, name) -> "$name@${System.identityHashCode(surface)}" }} " +
+                "readers=${readers.joinToString { System.identityHashCode(it).toString() }}"
+        )
+    }
+
+    private fun sessionSurfaceDiagnosticName(session: CameraCaptureSession, surface: Surface): String =
+        synchronized(sessionLifecycleLock) {
+            sessionSurfaceNames[session]?.get(surface)
+        } ?: "UNKNOWN_SURFACE"
+
+    // CaptureRequest does not expose its target Surface set through the public Camera2 API.
+    // Keep diagnostics truthful: onCaptureBufferLost() already supplies the exact lost target,
+    // while generic capture failures can only report the outputs owned by this session.
+    private fun sessionOutputDiagnostics(session: CameraCaptureSession): String =
+        synchronized(sessionLifecycleLock) {
+            sessionSurfaceNames[session]
+                ?.entries
+                ?.joinToString(prefix = "[", postfix = "]") { (surface, name) ->
+                    "$name@${System.identityHashCode(surface)}"
+                }
+                ?: "[]"
+        }
+
+    private fun rawRingPressureSummary(): String {
+        val pressure = ringBuffer.imageReaderPressureDiagnostics()
+        return "ringCapacity=${pressure.ringCapacity};imageReaderMaxImages=${pressure.imageReaderMaxImages};" +
+            "residentImageSlots=${pressure.ringResidentImageSlots};producerHeadroom=${pressure.producerHeadroom};" +
+            "leasedFrames=${pressure.leasedFrames};cumulativeImagesAcquired=${pressure.cumulativeImagesAcquired};" +
+            "acquireFailures=${pressure.imageReaderAcquireFailureCount};" +
+            "maxImagesExhaustion=${pressure.imageReaderMaxImagesExhaustionCount};" +
+            "drainCallbacks=${pressure.drainCallbackCount};drainBatchHighWatermark=${pressure.drainBatchHighWatermark};" +
+            "drainServiceMedianMs=${pressure.drainServiceMedianMs ?: -1.0};" +
+            "drainServiceMaxMs=${pressure.drainServiceMaxMs ?: -1.0};" +
+            "ringOverwriteCount=${pressure.ringOverwriteCount};droppedIncomingFrames=${pressure.droppedIncomingFrames};" +
+            "backpressureDetected=${pressure.backpressureDetected}"
+    }
+
+    private fun recordRawPreviewValidationEnvironment(reason: String, generation: Int) {
+        val identity = synchronized(pipelineLock) { activePipelineIdentity } ?: return
+        if (identity.bufferFormat != ImageFormat.RAW10 && identity.bufferFormat != ImageFormat.RAW_SENSOR) return
+        val characteristicsId = identity.physicalCameraId ?: identity.logicalCameraId
+        val characteristics = runCatching { cameraManager.getCameraCharacteristics(characteristicsId) }.getOrNull()
+        val map = characteristics?.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+        fun sizes(format: Int): String = runCatching {
+            map?.getOutputSizes(format).orEmpty()
+                .sortedByDescending { it.width.toLong() * it.height.toLong() }
+                .take(12)
+                .joinToString(prefix = "[", postfix = "]") { "${it.width}x${it.height}" }
+        }.getOrDefault("[]")
+        val activeMinDurationNs = runCatching {
+            map?.getOutputMinFrameDuration(
+                identity.bufferFormat,
+                android.util.Size(identity.width, identity.height)
+            ) ?: 0L
+        }.getOrDefault(0L)
+        val fpsRanges = characteristics?.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+            ?.joinToString(prefix = "[", postfix = "]") { "${it.lower}:${it.upper}" } ?: "[]"
+        val timestampSource = characteristics?.get(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE) ?: -1
+        val hardwareLevel = characteristics?.get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL) ?: -1
+        val interop = com.bncam.ui.screens.capture.RawPreviewInteropCapabilities.latest
+        val display = com.bncam.ui.screens.capture.FocusPeakingView.getProvenanceSummary()
+        val content = buildString {
+            appendLine("reason=$reason generation=$generation")
+            appendLine("manufacturer=${Build.MANUFACTURER} model=${Build.MODEL} fingerprint=${Build.FINGERPRINT} sdk=${Build.VERSION.SDK_INT} buildType=${com.bncam.BuildConfig.BUILD_TYPE}")
+            appendLine("selectedLens=${identity.selectedLensId} logicalCamera=${identity.logicalCameraId} physicalCamera=${identity.physicalCameraId ?: "none"} characteristicsId=$characteristicsId hardwareLevel=$hardwareLevel")
+            appendLine("source=${identity.effectiveFrameSource} format=${identity.bufferFormat} activeSize=${identity.width}x${identity.height} maxImages=${identity.maxImages} activeMinFrameDurationNs=$activeMinDurationNs")
+            appendLine("rawSensorSizes=${sizes(ImageFormat.RAW_SENSOR)}")
+            appendLine("raw10Sizes=${sizes(ImageFormat.RAW10)}")
+            appendLine("aeTargetFpsRanges=$fpsRanges timestampSource=$timestampSource")
+            appendLine("customRawPreviewFormatCode=${identity.rawPreviewFormatCode ?: "none"} customBinding=${customRawPreviewBinding ?: "none"} " +
+                "customPublicationReadyGeneration=$customRawPreviewPublicationReadyGeneration " +
+                rawPreviewProducerAuthorityTracker.summary(pipelineGeneration))
+            appendLine("interopEglGeneration=${interop?.eglGeneration ?: -1} interopReady=${interop?.readyForAhbEglImageInterop ?: false} interopBlockers=${interop?.blockers?.joinToString() ?: "unprobed"} vulkanAhbUsage=0x${(interop?.vulkanOutputAhbUsage ?: 0L).toString(16)}")
+            appendLine("displayProvenance=$display")
+        }
+        com.bncam.core.debug.DiagnosticsAggregator.record(
+            stream = com.bncam.core.debug.DiagnosticsAggregator.Stream.PERFORMANCE,
+            scope = "VIEWFINDER source=${identity.effectiveFrameSource} generation=$generation",
+            section = "RAW PREVIEW VALIDATION ENVIRONMENT",
+            content = content
+        )
+        Log.i(previewDiagnosticsTag, "event=RAW_PREVIEW_VALIDATION_ENVIRONMENT generation=$generation reason=$reason")
+    }
+
+    private fun recordRawSessionOutputDiagnostic(section: String, content: String) {
+        Log.w(previewDiagnosticsTag, "event=$section $content")
+        com.bncam.core.debug.DiagnosticsAggregator.record(
+            stream = com.bncam.core.debug.DiagnosticsAggregator.Stream.CAPTURE,
+            scope = "VIEWFINDER",
+            section = section,
+            content = content
+        )
+    }
+
+    private fun closeImageReaderNow(reader: ImageReader, reason: String) {
+        runCatching { reader.close() }
+            .onFailure { Log.w(tag, "Retired ImageReader close failed reason=$reason", it) }
+        Log.i(
+            previewDiagnosticsTag,
+            "event=IMAGE_READER_PHYSICALLY_CLOSED readerIdentity=${System.identityHashCode(reader)} reason=$reason"
+        )
+    }
+
+    /**
+     * Physical ImageReader close is forbidden while any configured/retiring CameraCaptureSession
+     * can still reference its Surface. Retirement is therefore a two-step operation: detach the
+     * producer listener now, close only after every owning session has acknowledged onClosed().
+     */
+    private fun closeRetiredImageReader(reader: ImageReader?, reason: String) {
+        if (reader == null) return
+        val closeNow = synchronized(sessionLifecycleLock) {
+            val owners = readerOwningSessions[reader]
+            if (owners.isNullOrEmpty()) {
+                retiringImageReaders.remove(reader)
+                true
+            } else {
+                retiringImageReaders[reader] = reason
+                false
+            }
+        }
+        if (closeNow) {
+            closeImageReaderNow(reader, reason)
+        } else {
+            Log.i(
+                previewDiagnosticsTag,
+                "event=IMAGE_READER_CLOSE_DEFERRED readerIdentity=${System.identityHashCode(reader)} " +
+                    "reason=$reason"
+            )
+        }
+    }
+
+    private fun releaseSessionOutputOwnership(session: CameraCaptureSession) {
+        val readyToClose = mutableListOf<Pair<ImageReader, String>>()
+        synchronized(sessionLifecycleLock) {
+            sessionSurfaceNames.remove(session)
+            val readers = sessionOwnedReaders.remove(session).orEmpty()
+            readers.forEach { reader ->
+                val owners = readerOwningSessions[reader]
+                owners?.remove(session)
+                if (owners.isNullOrEmpty()) {
+                    readerOwningSessions.remove(reader)
+                    retiringImageReaders.remove(reader)?.let { reason ->
+                        readyToClose += reader to reason
+                    }
+                }
+            }
+        }
+        readyToClose.forEach { (reader, reason) -> closeImageReaderNow(reader, reason) }
+    }
+
     private fun closeCustomRawPreviewReader(reason: String) {
-        customRawPreviewReader?.setOnImageAvailableListener(null, null)
-        runCatching { customRawPreviewReader?.close() }
-            .onFailure { Log.w(tag, "Custom RAW preview reader close failed reason=$reason", it) }
-        if (customRawPreviewReader != null || customRawPreviewBinding != null) {
-            Log.i(tag, "CUSTOM_RAW_PREVIEW_CLOSED reason=$reason binding=$customRawPreviewBinding")
+        val retiring = customRawPreviewReader
+        retiring?.setOnImageAvailableListener(null, null)
+        if (retiring != null || customRawPreviewBinding != null) {
+            Log.i(tag, "CUSTOM_RAW_PREVIEW_RETIRE_REQUESTED reason=$reason binding=$customRawPreviewBinding")
         }
         customRawPreviewReader = null
         customRawPreviewBinding = null
-        customRawPreviewInputReadyGeneration = -1
+        customRawPreviewPublicationReadyGeneration = -1
+        rawPreviewProducerAuthorityTracker.reset(pipelineGeneration)
+        customRawPreviewLastFrameElapsedNs = 0L
+        customRawPreviewLastSensorTimestampNs = 0L
+        customRawPreviewFrameCount = 0L
+        closeRetiredImageReader(retiring, "custom_raw:$reason")
     }
 
     /**
      * Removes the current custom RAW preview reader from active ownership without closing it.
-     * The caller must close the returned reader only after the Camera2 session that referenced
-     * its Surface has delivered onClosed().
+     * The caller marks the returned reader for retirement against the exact Camera2 session.
      */
     private fun detachCustomRawPreviewReaderForRetirement(reason: String): ImageReader? {
         val retiring = customRawPreviewReader
@@ -7005,14 +7620,12 @@ class BnCameraManager(private val context: Context) {
         }
         customRawPreviewReader = null
         customRawPreviewBinding = null
-        customRawPreviewInputReadyGeneration = -1
+        customRawPreviewPublicationReadyGeneration = -1
+        rawPreviewProducerAuthorityTracker.reset(pipelineGeneration)
+        customRawPreviewLastFrameElapsedNs = 0L
+        customRawPreviewLastSensorTimestampNs = 0L
+        customRawPreviewFrameCount = 0L
         return retiring
-    }
-
-    private fun closeRetiredImageReader(reader: ImageReader?, reason: String) {
-        if (reader == null) return
-        runCatching { reader.close() }
-            .onFailure { Log.w(tag, "Retired ImageReader close failed reason=$reason", it) }
     }
 
     private fun retireReadersWhenSessionCloses(
@@ -7022,9 +7635,9 @@ class BnCameraManager(private val context: Context) {
     ) {
         val ownedReaders = readers.filterNotNull()
         if (ownedReaders.isEmpty()) return
+        ownedReaders.forEach { reader -> closeRetiredImageReader(reader, reason) }
         sessionTransitionScope.launch {
             ticket.closeBarrier.await()
-            ownedReaders.forEach { closeRetiredImageReader(it, reason) }
             Log.i(
                 previewDiagnosticsTag,
                 "event=RETIRED_SESSION_OUTPUTS_RELEASED generation=${ticket.generation} " +
@@ -7133,15 +7746,23 @@ class BnCameraManager(private val context: Context) {
         val binding = CustomRawPreviewBinding(source, requestedCode, size.width, size.height, generation, advertised)
         customRawPreviewReader = reader
         customRawPreviewBinding = binding
-        customRawPreviewInputReadyGeneration = -1
+        customRawPreviewPublicationReadyGeneration = -1
+        rawPreviewProducerAuthorityTracker.reset(generation)
+        customRawPreviewLastFrameElapsedNs = 0L
+        customRawPreviewLastSensorTimestampNs = 0L
+        customRawPreviewFrameCount = 0L
         reader.setOnImageAvailableListener({ available ->
             val image = runCatching { available.acquireLatestImage() }.getOrNull() ?: return@setOnImageAvailableListener
+            val rawImageTrace = com.bncam.ui.screens.capture.RawPreviewTrace.beginImageAvailable()
             try {
                 if (generation != pipelineGeneration || customRawPreviewBinding != binding) return@setOnImageAvailableListener
                 if (targetViewfinderSource != source || targetViewfinderGeneration != generation) {
                     return@setOnImageAvailableListener
                 }
                 val timestamp = image.timestamp.takeIf { it > 0L } ?: android.os.SystemClock.elapsedRealtimeNanos()
+                customRawPreviewLastFrameElapsedNs = android.os.SystemClock.elapsedRealtimeNanos()
+                customRawPreviewLastSensorTimestampNs = timestamp
+                customRawPreviewFrameCount += 1L
                 RawPreviewCadenceDiagnostics.sourceArrived(source, generation, timestamp)
                 com.bncam.core.debug.RawPreviewFirstActivationTrace.rawFrameAvailable(
                     source = source.name,
@@ -7151,20 +7772,29 @@ class BnCameraManager(private val context: Context) {
                 )
                 val recentMetadata = if (lastCaptureResultGeneration == generation) lastCaptureResult as? TotalCaptureResult else null
                 if (rawPreviewConfiguredGeneration != generation) recentMetadata?.let { ensureRawPreviewConfig(it, generation) }
+                if (customRawPreviewDisabledGeneration == generation) {
+                    return@setOnImageAvailableListener
+                }
                 val hardwareBuffer = runCatching { image.hardwareBuffer }.getOrNull()
                 if (hardwareBuffer != null && rawPreviewConfiguredGeneration == generation) {
-                    // Only now is the vendor/custom path proven alive. Before this exact point the
-                    // canonical warm RAW ring remains the fallback source for live preview.
-                    customRawPreviewInputReadyGeneration = generation
-                    rawPreviewRenderer.offerBorrowedHardwareBuffer(
-                        buffer = hardwareBuffer,
-                        sensorTimestampNs = timestamp,
-                        pipelineGeneration = generation,
-                        useRuntimeCrop = false
-                    )
+                    // Input arrival alone is not renderer proof. Keep the canonical warm RAW ring
+                    // authoritative until a custom frame has actually completed renderer publication.
+                    val ringHandoffTrace = com.bncam.ui.screens.capture.RawPreviewTrace.beginRingHandoff()
+                    try {
+                        rawPreviewRenderer.offerBorrowedHardwareBuffer(
+                            buffer = hardwareBuffer,
+                            sensorTimestampNs = timestamp,
+                            pipelineGeneration = generation,
+                            useRuntimeCrop = false,
+                            producerKind = RawPreviewProducerKind.CUSTOM_IMAGE_READER
+                        )
+                    } finally {
+                        com.bncam.ui.screens.capture.RawPreviewTrace.end(ringHandoffTrace)
+                    }
                 }
             } finally {
                 image.close()
+                com.bncam.ui.screens.capture.RawPreviewTrace.end(rawImageTrace)
             }
         }, backgroundHandler)
         Log.i(
@@ -7423,6 +8053,9 @@ class BnCameraManager(private val context: Context) {
 
             imageReader?.setOnImageAvailableListener({ reader ->
                 val callbackStartNs = android.os.SystemClock.elapsedRealtimeNanos()
+                val rawImageTrace = if (requestedIdentity.bufferFormat == ImageFormat.RAW10 ||
+                    requestedIdentity.bufferFormat == ImageFormat.RAW_SENSOR
+                ) com.bncam.ui.screens.capture.RawPreviewTrace.beginImageAvailable() else false
                 var drainedImages = 0
                 captureAttempts.imageAvailable()
                 try {
@@ -7442,6 +8075,11 @@ class BnCameraManager(private val context: Context) {
                                     "pressure=${ringBuffer.imageReaderPressureDiagnostics()}",
                                 e
                             )
+                            recordRawSessionOutputDiagnostic(
+                                "IMAGE_READER_ACQUIRE_FAILED",
+                                "generation=$startGeneration;maxImages=${reader.maxImages};" +
+                                    "maxImagesExhausted=$maxImagesExhausted;${rawRingPressureSummary()}"
+                            )
                             null
                         } catch (e: Exception) {
                             ringBuffer.recordImageReaderAcquireFailure(generationId = startGeneration)
@@ -7457,6 +8095,7 @@ class BnCameraManager(private val context: Context) {
                         callbackServiceNs = android.os.SystemClock.elapsedRealtimeNanos() - callbackStartNs,
                         drainedImages = drainedImages
                     )
+                    com.bncam.ui.screens.capture.RawPreviewTrace.end(rawImageTrace)
                 }
             }, backgroundHandler)
 
@@ -8096,6 +8735,11 @@ class BnCameraManager(private val context: Context) {
                                         "maxImages=${reader.maxImages} maxImagesExhausted=$maxImagesExhausted " +
                                         "pressure=${ringBuffer.imageReaderPressureDiagnostics()}",
                                     e
+                                )
+                                recordRawSessionOutputDiagnostic(
+                                    "IMAGE_READER_ACQUIRE_FAILED",
+                                    "generation=$resetGeneration;maxImages=${reader.maxImages};" +
+                                        "maxImagesExhausted=$maxImagesExhausted;${rawRingPressureSummary()}"
                                 )
                                 null
                             } catch (e: Exception) {
@@ -8888,9 +9532,10 @@ class BnCameraManager(private val context: Context) {
                 applyMeteringPolicy(requestBuilder)
 
                 // All buffer modes, including RAW_SENSOR, must be real warm-buffer routes.
-                // If RAW_SENSOR cannot run as preview + RAW_SENSOR repeating stream, the
-                // pipeline must fail honestly instead of silently degrading to post-shutter.
-                imageReader?.surface?.let { requestBuilder.addTarget(it) }
+                // Capture the exact reader identity used by this session; mutable manager fields
+                // may already point at a replacement before this session finally dispatches onClosed().
+                val sessionCanonicalReader = imageReader
+                sessionCanonicalReader?.surface?.let { requestBuilder.addTarget(it) }
                 // A custom RAW preview reader is display-only and exists only while a real
                 // preview Surface is attached. UI navigation itself never rebuilds this session.
                 val customRawPreviewSurface = if (previewSurface != null) {
@@ -8905,6 +9550,19 @@ class BnCameraManager(private val context: Context) {
                     null
                 }
                 customRawPreviewSurface?.let { requestBuilder.addTarget(it) }
+                val sessionCustomRawReader = if (customRawPreviewSurface != null) customRawPreviewReader else null
+                val sessionNamedSurfaces = buildList<Pair<Surface, String>> {
+                    previewSurface?.let { add(it to "YUV_VIEWFINDER") }
+                    sessionCanonicalReader?.surface?.let { surface ->
+                        add(
+                            surface to if (sessionBufferFormat == ImageFormat.RAW10 ||
+                                sessionBufferFormat == ImageFormat.RAW_SENSOR
+                            ) "CANONICAL_RAW_RING" else "YUV_WARM_RING"
+                        )
+                    }
+                    customRawPreviewSurface?.let { add(it to "CUSTOM_RAW_PREVIEW") }
+                }
+                val sessionReaders = listOfNotNull(sessionCanonicalReader, sessionCustomRawReader)
 
                 var sessionParameters: CaptureRequest? = null
                 var vendorSessionType: Int = SessionConfiguration.SESSION_REGULAR
@@ -9269,10 +9927,23 @@ class BnCameraManager(private val context: Context) {
                                 requestSnapshot?.submissionType == CameraRequestSubmissionType.REPEATING &&
                                     requestSnapshot.identity.controlRequestEpoch >= defaultRawShutterBootstrapMinControlEpoch &&
                                     requestAeMode != null && requestAeMode != CaptureRequest.CONTROL_AE_MODE_OFF
-                            if (freshRepeatingAe && aeStable && measuredIso != null && measuredExposureNs != null) {
+                            val referenceMetering = defaultRawMeteringTracker.resolve(
+                                currentGeneration = sessionGeneration,
+                                nowElapsedRealtimeNs = android.os.SystemClock.elapsedRealtimeNanos(),
+                                source = "AE_REFERENCE_ACCEPTANCE"
+                            )
+                            val synchronizedMeteringReady =
+                                defaultRawAeReferenceGate.canAccept(sessionGeneration, referenceMetering)
+                            if (freshRepeatingAe && aeStable && measuredIso != null && measuredExposureNs != null &&
+                                synchronizedMeteringReady
+                            ) {
+                                val referenceLuma = requireNotNull(referenceMetering.controllerLuma)
                                 defaultRawShutterAeBaselineIso = measuredIso
                                 defaultRawShutterAeBaselineExposureNs = measuredExposureNs
                                 defaultRawShutterAeBaselineGeneration = sessionGeneration
+                                defaultRawPhotometricTargetLuma = referenceLuma
+                                defaultRawShutterFallbackTargetLuma = referenceLuma
+                                latestDefaultRawMetering = referenceMetering
                                 val handler = backgroundHandler
                                 if (handler != null && handler.post { updatePreviewRepeatingRequest() }) {
                                     defaultRawShutterAwaitingAeBaseline = false
@@ -9281,7 +9952,8 @@ class BnCameraManager(private val context: Context) {
                                         tag,
                                         "DEFAULT_RAW_SHUTTER_AE_BASELINE_ACCEPTED generation=$sessionGeneration " +
                                             "epoch=${requestSnapshot.identity.controlRequestEpoch} iso=$measuredIso " +
-                                            "exposureNs=$measuredExposureNs aeState=$aeStateForBaseline"
+                                            "exposureNs=$measuredExposureNs aeState=$aeStateForBaseline " +
+                                            "targetLuma=$referenceLuma ${defaultRawAeReferenceGate.summary(sessionGeneration)}"
                                     )
                                 }
                             }
@@ -9534,16 +10206,38 @@ class BnCameraManager(private val context: Context) {
                         }
                     }
 
+                    override fun onCaptureBufferLost(
+                        session: CameraCaptureSession,
+                        request: CaptureRequest,
+                        target: Surface,
+                        frameNumber: Long
+                    ) {
+                        val targetName = sessionSurfaceDiagnosticName(session, target)
+                        val content =
+                            "generation=$sessionGeneration;epoch=$sessionEpoch;frameNumber=$frameNumber;" +
+                                "target=$targetName;targetIdentity=${System.identityHashCode(target)};" +
+                                "selectedViewfinder=${targetViewfinderSource.name};" +
+                                "sessionOutputs=${sessionOutputDiagnostics(session)};" +
+                                rawRingPressureSummary()
+                        recordRawSessionOutputDiagnostic("CAMERA2_CAPTURE_BUFFER_LOST", content)
+                        if (targetName == "CUSTOM_RAW_PREVIEW") {
+                            disableCustomRawPreviewForGeneration(sessionGeneration, "camera2_buffer_lost")
+                        }
+                    }
+
                     override fun onCaptureFailed(
                         session: CameraCaptureSession,
                         request: CaptureRequest,
                         failure: android.hardware.camera2.CaptureFailure
                     ) {
-                        Log.e(
-                            tag,
-                            "captureFailed generation=$sessionGeneration reason=${failure.reason} " +
-                                "sequenceId=${failure.sequenceId} frameNumber=${failure.frameNumber}"
-                        )
+                        val content =
+                            "generation=$sessionGeneration;epoch=$sessionEpoch;reason=${failure.reason};" +
+                                "sequenceId=${failure.sequenceId};frameNumber=${failure.frameNumber};" +
+                                "wasImageCaptured=${failure.wasImageCaptured()};" +
+                                "selectedViewfinder=${targetViewfinderSource.name};" +
+                                "sessionOutputs=${sessionOutputDiagnostics(session)};" +
+                                rawRingPressureSummary()
+                        recordRawSessionOutputDiagnostic("CAMERA2_CAPTURE_FAILED", content)
                     }
 
                     override fun onCaptureSequenceAborted(session: CameraCaptureSession, sequenceId: Int) {
@@ -9553,6 +10247,14 @@ class BnCameraManager(private val context: Context) {
 
                 val stateCallback = object : CameraCaptureSession.StateCallback() {
                     override fun onConfigured(session: CameraCaptureSession) {
+                        registerSessionOutputOwnership(
+                            session = session,
+                            namedSurfaces = sessionNamedSurfaces,
+                            readers = sessionReaders,
+                            generation = sessionGeneration,
+                            epoch = sessionEpoch,
+                            reason = reason
+                        )
                         if (sessionGeneration != pipelineGeneration || sessionEpoch != sessionConfigurationEpoch) {
                             Log.i(
                                 tag,
@@ -9600,6 +10302,7 @@ class BnCameraManager(private val context: Context) {
                             }
                             ringBuffer.recordSessionConfigured(sessionGeneration)
                             startWarmBufferWatchdog(sessionGeneration)
+                            recordRawPreviewValidationEnvironment(reason, sessionGeneration)
                             synchronized(pipelineLock) {
                                 activePipelineIdentity?.selectedLensId
                             }?.let { targetLensId ->
@@ -9626,6 +10329,7 @@ class BnCameraManager(private val context: Context) {
                     }
 
                     override fun onClosed(session: CameraCaptureSession) {
+                        releaseSessionOutputOwnership(session)
                         synchronized(sessionLifecycleLock) {
                             sessionCloseBarriers.remove(session)?.complete(Unit)
                         }
@@ -9643,6 +10347,14 @@ class BnCameraManager(private val context: Context) {
                     }
 
                     override fun onConfigureFailed(session: CameraCaptureSession) {
+                        registerSessionOutputOwnership(
+                            session = session,
+                            namedSurfaces = sessionNamedSurfaces,
+                            readers = sessionReaders,
+                            generation = sessionGeneration,
+                            epoch = sessionEpoch,
+                            reason = "$reason:configure_failed"
+                        )
                         if (sessionGeneration != pipelineGeneration || sessionEpoch != sessionConfigurationEpoch) {
                             session.close()
                             onSessionReady?.invoke(false)
@@ -11504,6 +12216,7 @@ class BnCameraManager(private val context: Context) {
             } else null
             if (defaultRawPlan != null) {
                 if (!defaultRawPlan.ready) {
+                    defaultRawAllocationReady = false
                     updateDefaultRawFrameSelectionExposureConstraint(null, "DEFAULT_RAW_AE_BOOTSTRAP")
                     defaultRawShutterManualFallbackActive = false
                     defaultRawShutterFallbackTargetLuma = null
@@ -11518,18 +12231,49 @@ class BnCameraManager(private val context: Context) {
                     builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, null)
                     builder.set(CaptureRequest.SENSOR_FRAME_DURATION, null)
                     val bootstrapPrioritySupported = supportsExposureTimePriority(characteristics)
-                    val bootstrapPriorityAllowed = bootstrapPrioritySupported &&
-                        defaultRawApi36AuthorityTracker.isAllowed(pipelineGeneration)
+                    val bootstrapPriorityRoute = DefaultRawApi36RoutePolicy.resolve(
+                        priorityModeSupported = bootstrapPrioritySupported,
+                        authorityAllowed = defaultRawApi36AuthorityTracker.isAllowed(pipelineGeneration)
+                    )
                     lastExposurePlanSummary =
                         "defaultRawPriority=true;priorityModeSupported=$bootstrapPrioritySupported;" +
-                            "priorityModeAllowed=$bootstrapPriorityAllowed;" + defaultRawPlan.summary()
+                            "priorityModeAllowed=${bootstrapPriorityRoute.useExposureTimePriority};" +
+                            "priorityRoute=${bootstrapPriorityRoute.reason};" + defaultRawPlan.summary()
+                    lastExposurePlanSummary += ";" + defaultRawConvergenceSummarySuffix()
                     return
                 }
 
                 val priorityModeSupported = supportsExposureTimePriority(characteristics)
-                val priorityModeAllowed = priorityModeSupported &&
-                    defaultRawApi36AuthorityTracker.isAllowed(pipelineGeneration)
+                val api36Route = DefaultRawApi36RoutePolicy.resolve(
+                    priorityModeSupported = priorityModeSupported,
+                    authorityAllowed = defaultRawApi36AuthorityTracker.isAllowed(pipelineGeneration)
+                )
+                val centralPriorityAllocation = run {
+                    val isoRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
+                    val exposureRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
+                    val product = defaultRawPlan.referenceExposureProduct
+                    val safeCeiling = defaultRawPlan.safeExposureCeilingNs
+                    if (isoRange != null && exposureRange != null && product != null && safeCeiling != null) {
+                        DefaultRawExposureAllocator.allocate(
+                            exposureProduct = product,
+                            safeExposureCeilingNs = safeCeiling,
+                            bounds = ExposureBounds(
+                                isoRange.lower, isoRange.upper, exposureRange.lower, exposureRange.upper
+                            ),
+                            flickerConstraint = resolveDefaultRawFlickerConstraint(),
+                            previousExposureNs = null,
+                            preferHeldFlickerShutter = false
+                        )
+                    } else {
+                        null
+                    }
+                }
+                val priorityModeAllowed = api36Route.useExposureTimePriority && centralPriorityAllocation != null
                 if (priorityModeAllowed) {
+                    val priorityAllocation = requireNotNull(centralPriorityAllocation) {
+                        "API36 priority route admitted without a central exposure allocation"
+                    }
+                    defaultRawAllocationReady = true
                     defaultRawShutterManualFallbackActive = false
                     defaultRawShutterFallbackTargetLuma = null
                     defaultRawShutterFallbackPlan = null
@@ -11545,18 +12289,28 @@ class BnCameraManager(private val context: Context) {
                             CaptureRequest.CONTROL_AE_PRIORITY_MODE_SENSOR_EXPOSURE_TIME_PRIORITY
                         )
                     }
-                    builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, defaultRawPlan.targetExposureNs)
+                    latestDefaultRawExposureAllocation = priorityAllocation
+                    builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, priorityAllocation.exposureTimeNs)
                     updateDefaultRawFrameSelectionExposureConstraint(
-                        defaultRawPlan.targetExposureNs,
+                        priorityAllocation.exposureTimeNs,
                         "DEFAULT_RAW_API36_EXPOSURE_TIME_PRIORITY",
-                        isoTarget = defaultRawPlan.expectedIso
+                        isoTarget = priorityAllocation.sensitivityIso
                     )
-                    // AE owns the remaining sensitivity and frame duration in exposure-time priority.
-                    builder.set(CaptureRequest.SENSOR_SENSITIVITY, null)
-                    builder.set(CaptureRequest.SENSOR_FRAME_DURATION, null)
+                    // Android 16 exposure-time priority keeps AE active. The documented contract
+                    // ignores application sensitivity/frame-duration values on this route, so do
+                    // not leave stale manual ownership in the request.
+                    if (api36Route.aeOwnsSensorSensitivity) {
+                        builder.set(CaptureRequest.SENSOR_SENSITIVITY, null)
+                    }
+                    if (api36Route.aeOwnsSensorFrameDuration) {
+                        builder.set(CaptureRequest.SENSOR_FRAME_DURATION, null)
+                    }
                     lastExposurePlanSummary =
                         "defaultRawPriority=true;priorityModeSupported=true;priorityModeAllowed=true;" +
-                            "priorityModeRequested=EXPOSURE_TIME;" + defaultRawPlan.summary()
+                            "priorityModeRequested=EXPOSURE_TIME;priorityRoute=${api36Route.reason};" +
+                            "centralAllocator=true;${priorityAllocation.summary()};" +
+                            defaultRawPlan.summary()
+                    lastExposurePlanSummary += ";" + defaultRawConvergenceSummarySuffix()
                     Log.d(tag, "Camera2 default RAW shutter-priority $lastExposurePlanSummary")
                     return
                 }
@@ -11564,9 +12318,19 @@ class BnCameraManager(private val context: Context) {
                 // AE exposure-time priority is optional. When unavailable, bootstrap one
                 // scene-linear luma anchor under Camera2 AE and then maintain that target with a
                 // bounded manual feedback loop.
+                latestDefaultRawExposureAllocation = null
                 defaultRawShutterManualFallbackActive = true
-                val targetLuma = defaultRawShutterFallbackTargetLuma
-                    ?: latestExposureStatistics?.exposureControllerLuma()?.takeIf { it.isFinite() && it > 0f }
+                val observedForLastResort = latestExposureStatistics
+                    ?.exposureControllerLuma()?.takeIf { it.isFinite() && it > 0f }
+                val targetLuma = DefaultRawTargetContinuity.resolveFallbackTarget(
+                    fallbackTargetLuma = defaultRawShutterFallbackTargetLuma,
+                    photometricTargetLuma = defaultRawPhotometricTargetLuma,
+                    observedLuma = observedForLastResort
+                )
+                if (targetLuma != null) {
+                    if (defaultRawPhotometricTargetLuma == null) defaultRawPhotometricTargetLuma = targetLuma
+                    if (defaultRawShutterFallbackTargetLuma == null) defaultRawShutterFallbackTargetLuma = targetLuma
+                }
                 val isoRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
                 val exposureRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
                 val safeCeiling = defaultRawPlan.safeExposureCeilingNs
@@ -11574,6 +12338,7 @@ class BnCameraManager(private val context: Context) {
                 if (targetLuma == null || isoRange == null || exposureRange == null ||
                     safeCeiling == null || defaultRawPlan.referenceExposureProduct == null
                 ) {
+                    defaultRawAllocationReady = false
                     updateDefaultRawFrameSelectionExposureConstraint(null, "DEFAULT_RAW_FALLBACK_LUMA_ANCHOR_BOOTSTRAP")
                     setAePriorityModeOff(builder)
                     builder.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
@@ -11584,8 +12349,10 @@ class BnCameraManager(private val context: Context) {
                     builder.set(CaptureRequest.SENSOR_FRAME_DURATION, null)
                     lastExposurePlanSummary =
                         "defaultRawPriority=true;priorityModeSupported=$priorityModeSupported;" +
-                            "priorityModeAllowed=$priorityModeAllowed;fallback=AE_LUMA_ANCHOR_BOOTSTRAP;" +
+                            "priorityModeAllowed=$priorityModeAllowed;priorityRoute=${api36Route.reason};" +
+                            "fallback=AE_LUMA_ANCHOR_BOOTSTRAP;" +
                             defaultRawPlan.summary()
+                    lastExposurePlanSummary += ";" + defaultRawConvergenceSummarySuffix()
                     return
                 }
 
@@ -11614,6 +12381,7 @@ class BnCameraManager(private val context: Context) {
                     candidate
                 }
                 if (fallbackPlan == null) {
+                    defaultRawAllocationReady = false
                     updateDefaultRawFrameSelectionExposureConstraint(null, "DEFAULT_RAW_INVALID_FALLBACK_PLAN")
                     setAePriorityModeOff(builder)
                     builder.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
@@ -11623,10 +12391,12 @@ class BnCameraManager(private val context: Context) {
                     builder.set(CaptureRequest.SENSOR_FRAME_DURATION, null)
                     lastExposurePlanSummary =
                         "defaultRawPriority=true;priorityModeSupported=$priorityModeSupported;" +
-                            "priorityModeAllowed=$priorityModeAllowed;fallback=INVALID_FALLBACK_PLAN"
+                            "priorityModeAllowed=$priorityModeAllowed;priorityRoute=${api36Route.reason};fallback=INVALID_FALLBACK_PLAN"
+                    lastExposurePlanSummary += ";" + defaultRawConvergenceSummarySuffix()
                     return
                 }
 
+                defaultRawAllocationReady = true
                 manualExposureAwaitingMetadata = false
                 setAePriorityModeOff(builder)
                 builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
@@ -11642,12 +12412,15 @@ class BnCameraManager(private val context: Context) {
                 builder.set(CaptureRequest.SENSOR_FRAME_DURATION, fallbackPlan.frameDurationNs)
                 lastExposurePlanSummary =
                     "defaultRawPriority=true;priorityModeSupported=$priorityModeSupported;" +
-                        "priorityModeAllowed=$priorityModeAllowed;fallback=MANUAL_LINEAR_LUMA_FEEDBACK;${fallbackPlan.summary()};" +
+                        "priorityModeAllowed=$priorityModeAllowed;priorityRoute=${api36Route.reason};" +
+                        "fallback=MANUAL_LINEAR_LUMA_FEEDBACK;${fallbackPlan.summary()};" +
                         defaultRawPlan.summary()
+                lastExposurePlanSummary += ";" + defaultRawConvergenceSummarySuffix()
                 Log.d(tag, "Camera2 default RAW shutter manual fallback $lastExposurePlanSummary")
                 return
             }
 
+            defaultRawAllocationReady = false
             updateDefaultRawFrameSelectionExposureConstraint(null, "NON_DEFAULT_RAW_EXPOSURE_AUTHORITY")
             val plan = resolveExposurePlan(characteristics)
             if (plan == null || plan.autoExposure || !plan.ready) {
@@ -12298,38 +13071,14 @@ class BnCameraManager(private val context: Context) {
             }
 
             val manualExposureActive = requestedManualIso != null || requestedManualExposureNs != null
-            val selectedMeteringMode = MeteringMode.fromSetting(currentMeteringStyle)
-            val touchAeRegionApplied = !manualExposureActive &&
-                selectedMeteringMode == MeteringMode.AUTO_DEFAULT_AE &&
-                maxAeRegions > 0
-            if (touchAeRegionApplied) {
-                // Auto may temporarily let a focus tap own AE. Explicit metering modes remain
-                // authoritative and use the branch below to restore their configured AE region.
-                if (fallbackPhysicalCameraId != null && physicalAeRegionWritable) {
-                    activeTapAeRegion = mapped.meteringRectangle
-                    activeTapAePhysicalCameraId = fallbackPhysicalCameraId
-                    request.set(CaptureRequest.CONTROL_AE_REGIONS, null)
-                    request.setPhysicalCameraKey(
-                        CaptureRequest.CONTROL_AE_REGIONS,
-                        arrayOf(mapped.meteringRectangle),
-                        fallbackPhysicalCameraId
-                    )
-                } else {
-                    val appliedAeRegion = ownerDomainMeteringRectangle ?: mapped.meteringRectangle
-                    activeTapAeRegion = appliedAeRegion
-                    activeTapAePhysicalCameraId = null
-                    request.set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(appliedAeRegion))
-                }
-                if (restartDefaultRawAeReferenceForMeteringChange("TOUCH_AE_REGION_APPLIED")) {
-                    // Remove the old shutter-priority request before starting tap AE. The new
-                    // touch region must first converge under ordinary Camera2 AE; only that fresh
-                    // repeating epoch may become the next shutter-priority brightness reference.
-                    applyExposurePolicy(request)
-                }
-            } else {
-                clearTouchAeOverride()
-                applyMeteringPolicy(request)
-            }
+
+            // Focus taps own focus only. Global exposure remains owned by the selected metering
+            // policy. This prevents tapping a clipped highlight from darkening the whole frame and
+            // prevents tapping a shadow from globally raising exposure. Explicit metering modes
+            // continue to work through applyMeteringPolicy(); manual exposure remains untouched.
+            val touchAeRegionApplied = false
+            clearTouchAeOverride()
+            applyMeteringPolicy(request)
 
             // Tap-to-focus may use the flash LED only as a temporary AF assist. Do not assume
             // every physical lens has a usable flash route: the shutter-time flash planner remains
@@ -12365,7 +13114,7 @@ class BnCameraManager(private val context: Context) {
 
             if (continuousTapMode || resolvedTapMode == CaptureRequest.CONTROL_AF_MODE_OFF) {
                 // The continuous touch-focus mode is CONTINUOUS_PICTURE. In that mode a touch only
-                // changes the persistent AF/AE region; START is intentionally not fired.
+                // changes the persistent AF region; AE remains owned by the metering policy. START is not fired.
                 request.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_IDLE)
                 request.set(
                     CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER,
@@ -12561,7 +13310,7 @@ class BnCameraManager(private val context: Context) {
             pinned = pinned,
             reason = "tap_acquisition"
         )
-        rawPreviewRenderer.setMlAnalysisRequested(true)
+        refreshRawPreviewCompactAnalysisRequest()
         Log.i(tag, "FOCUS_TRACK_START x=$safeX y=$safeY pinned=$pinned mirrorX=$mirrorX durationMs=$durationMs")
         if (!pinned && durationMs != null) {
             val safeDuration = durationMs.coerceIn(250L, 30_000L)
@@ -12615,7 +13364,7 @@ class BnCameraManager(private val context: Context) {
             pinned = focusTrackingPinned,
             reason = reason
         )
-        rawPreviewRenderer.setMlAnalysisRequested(true)
+        refreshRawPreviewCompactAnalysisRequest()
     }
 
     fun prepareFocusTrackingForLensHandover() {
@@ -12649,10 +13398,7 @@ class BnCameraManager(private val context: Context) {
         _trackedObjectBounds.value = null
         _focusTrackingActive.value = false
         _focusTrackingState.value = FocusTrackingState(reason = reason)
-        rawPreviewRenderer.setMlAnalysisRequested(
-            qrAnalysisEnabled || portraitAnalysisEnabled || objectTrackingAnalysisEnabled ||
-                shouldRequestDefaultRawShutterMotionAnalysis()
-        )
+        refreshRawPreviewCompactAnalysisRequest()
         if (wasActive) {
             Log.i(tag, "FOCUS_TRACK_STOP reason=$reason restoreAf=$restoreConfiguredAf")
         }
@@ -13585,6 +14331,9 @@ class BnCameraManager(private val context: Context) {
         }
         val result = captureAttempts.terminalResult(captureAttemptId, outputProduced)
         captureAttempts.finish(captureAttemptId, result, reason)
+        // Capture ownership changed. Re-evaluate whether QR/tracking/portrait still requires the
+        // compact NV21 side image instead of leaving preview analysis in a stale pre-capture state.
+        refreshRawPreviewCompactAnalysisRequest()
     }
 
     @Synchronized
@@ -14930,6 +15679,9 @@ class BnCameraManager(private val context: Context) {
             _captureContractError.value = "Capture is still being admitted; the duplicate shutter press was ignored."
             return@withContext null
         }
+        // While capture owns the production path, tracking/portrait analysis is suspended. Keep
+        // compact NV21 enabled only for consumers that remain valid during capture (currently QR).
+        refreshRawPreviewCompactAnalysisRequest()
 
         var finalOutputUri: Uri? = null
         var finishReason = "capture did not produce an output"
@@ -15998,7 +16750,28 @@ class BnCameraManager(private val context: Context) {
             "defaultRawRequestedIso" to latestDefaultRawExposureTruth?.requestedIso,
             "defaultRawActualIso" to latestDefaultRawExposureTruth?.actualIso,
             "defaultRawExposureTruthStatus" to latestDefaultRawExposureTruth?.status,
+            "defaultRawAllocationReady" to defaultRawAllocationReady,
+            "defaultRawPhotometricConverged" to
+                (latestDefaultRawPhotometricConvergence?.photometricConverged ?: false),
+            "defaultRawPhotometricConvergence" to latestDefaultRawPhotometricConvergence?.summary(),
+            "defaultRawTargetLuma" to latestDefaultRawPhotometricConvergence?.targetLuma,
+            "defaultRawObservedLuma" to latestDefaultRawPhotometricConvergence?.observedLuma,
+            "defaultRawExposureErrorEv" to latestDefaultRawPhotometricConvergence?.exposureErrorEv,
+            "defaultRawLastFeedbackCorrectionEv" to defaultRawShutterFallbackPlan?.feedbackCorrectionEv,
+            "defaultRawMotionReallocationEv" to defaultRawShutterFallbackPlan?.motionReallocationEv,
+            "defaultRawMeteringFreshness" to latestDefaultRawMetering?.freshness?.name,
+            "defaultRawMeteringAgeNs" to latestDefaultRawMetering?.ageNs,
+            "defaultRawIdealExposureProduct" to latestDefaultRawExposureTarget?.ideal?.idealExposureProduct,
+            "defaultRawFinalExposureProduct" to latestDefaultRawExposureTarget?.finalExposureProduct,
+            "defaultRawHighlightProtectionEv" to latestDefaultRawExposureTarget?.highlightProtectionEv,
+            "defaultRawAllocatedExposureNs" to latestDefaultRawExposureAllocation?.exposureTimeNs,
+            "defaultRawAllocatedIso" to latestDefaultRawExposureAllocation?.sensitivityIso,
+            "defaultRawAllocationLimit" to latestDefaultRawExposureAllocation?.limitingConstraint,
+            "defaultRawFramesSinceExposureRequest" to defaultRawFramesSinceExposureRequest,
+            "defaultRawTimeSinceLastMeaningfulSceneChangeNs" to
+                latestDefaultRawPhotometricConvergence?.timeSinceLastMeaningfulSceneChangeNs,
             "defaultRawApi36PriorityAllowed" to defaultRawApi36AuthorityTracker.isAllowed(pipelineGeneration),
+            "defaultRawApi36PriorityTrusted" to defaultRawApi36AuthorityTracker.isTrusted(pipelineGeneration),
             "defaultRawFrameSelectionExposureConstraint" to
                 ringBuffer.selectionExposureConstraintSnapshot().summary(),
             "resolvedAntibandingMode" to activeResolvedAntibandingMode,

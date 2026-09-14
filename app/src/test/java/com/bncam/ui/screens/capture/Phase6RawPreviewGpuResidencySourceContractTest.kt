@@ -41,14 +41,18 @@ class Phase6RawPreviewGpuResidencySourceContractTest {
         val backend = source("src/main/cpp/vulkan/VulkanRawPreviewBackend.cpp")
         val renderer = source("src/main/java/com/bncam/ui/screens/capture/RawPreviewRenderer.kt")
         val view = source("src/main/java/com/bncam/ui/screens/capture/FocusPeakingView.kt")
+        val fenceBackend = source("src/main/java/com/bncam/ui/screens/capture/RawPreviewFenceBackend.kt")
 
         assertTrue(backend.contains("VK_QUEUE_FAMILY_EXTERNAL"))
-        assertTrue(view.contains("createRawPreviewGlFence"))
-        assertTrue(renderer.contains("pollRawPreviewGlFence"))
+        assertTrue(view.contains("closeAfterGlSampled"))
+        assertTrue(fenceBackend.contains("ImageUtils.createRawPreviewGlFence"))
+        assertTrue(fenceBackend.contains("ImageUtils.pollRawPreviewGlFence"))
+        assertTrue(renderer.contains("fenceBackend.pollFence(handle)"))
         assertTrue(renderer.contains("pendingGpuOutputSlots"))
         assertTrue(renderer.contains("slot.pendingGlFenceHandle"))
-        assertTrue(renderer.contains("slot.quarantined = true"))
-        assertTrue(renderer.contains("gpuResidentOutputDisabled = true"))
+        assertTrue(renderer.contains("slot.quarantineGpuBuffer()"))
+        assertTrue(renderer.contains("RawPreviewGpuInteropStateMachine()"))
+        assertFalse(renderer.contains("gpuResidentOutputDisabled"))
         assertTrue(renderer.contains("closeAfterGlInteropFailure"))
     }
 

@@ -48,6 +48,16 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
         @Volatile var lastSwitchElapsedMs: Long = 0L
         @Volatile var firstRawDrawnLatencyMs: Float = -1f
 
+        fun requestRawDisplayRecovery(
+            generation: Int,
+            reason: String,
+            rebuildRawTexturePool: Boolean
+        ): Boolean = activeInstance?.requestRawDisplayRecoveryInternal(
+            generation = generation,
+            reason = reason,
+            rebuildRawTexturePool = rebuildRawTexturePool
+        ) ?: false
+
         fun getProvenanceSummary(): Map<String, Any?> = mapOf(
             "lastDrawnSource" to lastDrawnSource,
             "lastDrawnSensorTimestampNs" to lastDrawnSensorTimestampNs,
@@ -58,7 +68,11 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
             "firstRawDrawnLatencyMs" to firstRawDrawnLatencyMs,
             "isRawActivelyDrawn" to lastDrawnSource.startsWith("RAW"),
             "displayedSource" to (activeInstance?.displayedSource?.name ?: "UNKNOWN"),
-            "acceptingRawFrames" to (activeInstance?.acceptingRawFrames ?: false)
+            "acceptingRawFrames" to (activeInstance?.acceptingRawFrames ?: false),
+            "eglGeneration" to (activeInstance?.currentEglGeneration ?: -1),
+            "displayReady" to (activeInstance?.displayReady ?: false),
+            "rawTextureGeneration" to (activeInstance?.rawTextureGeneration ?: -1),
+            "displayRefreshRateHz" to (activeInstance?.display?.refreshRate ?: 0f)
         )
     }
 
@@ -237,6 +251,8 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
     private var rawTextureHeight: Int = 1
     private var rawTextureRotationDegrees: Int = 0
     @Volatile private var rawTextureGeneration: Int = -1
+    @Volatile private var currentEglGeneration: Int = -1
+    @Volatile private var lastRawDisplayRecoveryElapsedMs: Long = 0L
     private val pendingRawFrame = AtomicReference<RawPreviewFrame?>(null)
     // GL-thread-owned display pin. A GPU-resident AHardwareBuffer must remain unavailable to
     // Vulkan for as long as it is the texture currently eligible for redraw. Releasing it after
@@ -589,7 +605,8 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
             frame.pipelineGeneration,
             frame.sensorTimestampNs,
             rgbaHandoffBytes = if (frame.gpuResidentOutputUsed) 0L else
-                frame.width.toLong() * frame.height.toLong() * 4L
+                frame.width.toLong() * frame.height.toLong() * 4L,
+            eglGeneration = currentEglGeneration
         )
         RawPreviewFirstActivationTrace.viewAccepted(
             source = frame.source.name,
@@ -635,6 +652,62 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
         oesFrameAvailable = false
     }
 
+    private fun requestRawDisplayRecoveryInternal(
+        generation: Int,
+        reason: String,
+        rebuildRawTexturePool: Boolean
+    ): Boolean {
+        if (detached || displayedSource == ViewfinderEffectiveSource.YUV || displayedGeneration != generation) {
+            return false
+        }
+        val nowMs = SystemClock.elapsedRealtime()
+        if (nowMs - lastRawDisplayRecoveryElapsedMs < 1_000L) return false
+        lastRawDisplayRecoveryElapsedMs = nowMs
+        RawPreviewHealthMonitor.recoveryAttempt(
+            generation,
+            "display:$reason",
+            SystemClock.elapsedRealtimeNanos()
+        )
+        post {
+            if (detached || displayedSource == ViewfinderEffectiveSource.YUV || displayedGeneration != generation) {
+                return@post
+            }
+            if (rebuildRawTexturePool) {
+                runCatching {
+                    queueEvent {
+                        if (detached || displayedGeneration != generation) return@queueEvent
+                        retirePinnedDisplayedGpuFrameOnGlThread()
+                        synchronized(presentationLock) { pendingPresentations.clear() }
+                        if (rawTextureIds.any { it != 0 }) {
+                            GLES20.glDeleteTextures(RAW_GL_TEXTURE_SLOTS, rawTextureIds, 0)
+                        }
+                        rawTextureIds.fill(0)
+                        rawTextureSlotWidths.fill(0)
+                        rawTextureSlotHeights.fill(0)
+                        rawTextureUploadCursor = 0
+                        GLES20.glGenTextures(RAW_GL_TEXTURE_SLOTS, rawTextureIds, 0)
+                        rawTextureIds.forEach { textureId ->
+                            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textureId)
+                            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+                            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+                            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+                            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+                        }
+                        rawTextureId = rawTextureIds[0]
+                        rawTextureGeneration = -1
+                        displayReady = false
+                        Log.w(
+                            "BnCamRawPreview",
+                            "RAW_PREVIEW_DISPLAY_REBIND generation=$generation eglGeneration=$currentEglGeneration reason=$reason"
+                        )
+                    }
+                }
+            }
+            requestRender()
+        }
+        return true
+    }
+
     fun setRawPreviewMirrored(mirrored: Boolean) {
         mirrorRawPreview = mirrored
     }
@@ -671,7 +744,13 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
         // Probe the actual GLES/EGL context plus the already initialized Vulkan runtime. The RAW
         // renderer enables AHardwareBuffer -> Vulkan -> EGLImage only when every required feature
         // (including non-blocking EGL fence sync for slot reuse) is present on this exact context.
-        RawPreviewInteropCapabilities.probeOnGlThread(context)
+        val interopSnapshot = RawPreviewInteropCapabilities.probeOnGlThread(context)
+        currentEglGeneration = interopSnapshot.eglGeneration
+        RawPreviewHealthMonitor.eglContext(displayedGeneration, currentEglGeneration)
+        Log.i(
+            "BnCamRawPreview",
+            "RAW_PREVIEW_EGL_CONTEXT generation=$displayedGeneration eglGeneration=$currentEglGeneration source=${displayedSource.name}"
+        )
         val textures = IntArray(1)
         GLES20.glGenTextures(1, textures, 0)
         oesTextureId = textures[0]
@@ -720,6 +799,7 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
         diagnosticViewportWidth = width
         diagnosticViewportHeight = height
         GLES20.glViewport(0, 0, width, height)
+        RawPreviewHealthMonitor.eglContext(displayedGeneration, currentEglGeneration)
         Log.i(
             "BnCamPreviewDiag",
             "event=GL_VIEWPORT selectedLensId=$diagnosticLensId " +
@@ -798,26 +878,31 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
                         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, uploadTextureId)
                         while (GLES20.glGetError() != GLES20.GL_NO_ERROR) Unit
 
-                        val handoffSucceeded = if (frame.gpuResidentOutputUsed && frame.hardwareBuffer != null) {
-                            // No RGBA host readback and no glTex(Sub)Image2D upload: the exact AHB that
-                            // Vulkan wrote is exposed to this GL texture through EGLImage.
-                            ImageUtils.bindRawPreviewHardwareBufferToCurrentTexture(frame.hardwareBuffer)
-                        } else {
-                            frame.rgba.position(0)
-                            if (rawTextureSlotWidths[uploadSlot] == frame.width &&
-                                rawTextureSlotHeights[uploadSlot] == frame.height
-                            ) {
-                                GLES20.glTexSubImage2D(
-                                    GLES20.GL_TEXTURE_2D, 0, 0, 0, frame.width, frame.height,
-                                    GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, frame.rgba
-                                )
+                        val glHandoffTrace = RawPreviewTrace.beginGlHandoff()
+                        val handoffSucceeded = try {
+                            if (frame.gpuResidentOutputUsed && frame.hardwareBuffer != null) {
+                                // No RGBA host readback and no glTex(Sub)Image2D upload: the exact AHB that
+                                // Vulkan wrote is exposed to this GL texture through EGLImage.
+                                ImageUtils.bindRawPreviewHardwareBufferToCurrentTexture(frame.hardwareBuffer)
                             } else {
-                                GLES20.glTexImage2D(
-                                    GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA, frame.width, frame.height,
-                                    0, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, frame.rgba
-                                )
+                                frame.rgba.position(0)
+                                if (rawTextureSlotWidths[uploadSlot] == frame.width &&
+                                    rawTextureSlotHeights[uploadSlot] == frame.height
+                                ) {
+                                    GLES20.glTexSubImage2D(
+                                        GLES20.GL_TEXTURE_2D, 0, 0, 0, frame.width, frame.height,
+                                        GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, frame.rgba
+                                    )
+                                } else {
+                                    GLES20.glTexImage2D(
+                                        GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA, frame.width, frame.height,
+                                        0, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, frame.rgba
+                                    )
+                                }
+                                GLES20.glGetError() == GLES20.GL_NO_ERROR
                             }
-                            GLES20.glGetError() == GLES20.GL_NO_ERROR
+                        } finally {
+                            RawPreviewTrace.end(glHandoffTrace)
                         }
 
                         val handoffError = GLES20.glGetError()
@@ -825,6 +910,11 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
                             (SystemClock.elapsedRealtimeNanos() - rawHandoffStartedNs) / 1_000_000.0f
                         onRawUploadTiming?.invoke(rawHandoffMs)
                         if (handoffSucceeded && handoffError == GLES20.GL_NO_ERROR) {
+                            RawPreviewFrameLifecycleRegistry.submitted(
+                                frame.pipelineGeneration,
+                                frame.sensorTimestampNs,
+                                SystemClock.elapsedRealtimeNanos()
+                            )
                             rawTextureSlotWidths[uploadSlot] = frame.width
                             rawTextureSlotHeights[uploadSlot] = frame.height
                             rawTextureId = uploadTextureId
@@ -973,7 +1063,12 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
         GLES20.glUniform1f(handles.subjectRoi, if (peakingSubjectRoiActive) 1f else 0f)
         GLES20.glUniform2f(handles.targetCenter, peakingTargetCenterX, peakingTargetCenterY)
         GLES20.glUniform2f(handles.targetRadius, peakingTargetRadiusX, peakingTargetRadiusY)
-        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+        val drawTrace = if (useRaw) RawPreviewTrace.beginDraw() else false
+        try {
+            GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+        } finally {
+            RawPreviewTrace.end(drawTrace)
+        }
 
         if (useRaw) {
             val drawnFrame = uploadedRawFrame ?: lastDrawnRawFrame
@@ -1045,7 +1140,7 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
             // Fence retirement occurs only after a successor texture has been drawn. This preserves
             // the currently displayed AHB across arbitrary redraws without introducing a GL wait.
             // If fence creation fails the backing slot is quarantined rather than reused unsafely.
-            frame.closeAfterGlFence(ImageUtils.createRawPreviewGlFence())
+            frame.closeAfterGlSampled()
         }
 
         uploadedRawFrame?.let { frame ->
@@ -1054,7 +1149,8 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
                 frame.source,
                 frame.pipelineGeneration,
                 frame.sensorTimestampNs,
-                eglFrameId
+                eglFrameId,
+                eglGeneration = currentEglGeneration
             )
             RawPreviewFirstActivationTrace.drawSubmitted(
                 source = frame.source.name,
@@ -1175,7 +1271,7 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
         pinnedDisplayedGpuFrame = null
         // queueEvent executes on the GL owner thread. A fence inserted here is ordered after every
         // previous draw that could have sampled this AHB, while remaining fully non-blocking.
-        frame.closeAfterGlFence(ImageUtils.createRawPreviewGlFence())
+        frame.closeAfterGlSampled()
     }
 
     private fun clearRawSurfaceFrameRate() {
@@ -1215,6 +1311,11 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
                 val pending = iterator.next()
                 val presentTimeNs = ImageUtils.getRawPreviewEglDisplayPresentTime(pending.eglFrameId)
                 if (presentTimeNs > 0L) {
+                    RawPreviewFrameLifecycleRegistry.presented(
+                        pending.generation,
+                        pending.sensorTimestampNs,
+                        presentTimeNs
+                    )
                     RawPreviewCadenceDiagnostics.displayPresented(
                         pending.sensorTimestampNs,
                         pending.eglFrameId,

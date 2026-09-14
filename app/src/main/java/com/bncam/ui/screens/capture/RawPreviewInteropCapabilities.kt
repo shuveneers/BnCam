@@ -5,6 +5,7 @@ import android.content.pm.ApplicationInfo
 import android.opengl.EGL14
 import android.opengl.GLES20
 import android.util.Log
+import java.util.concurrent.atomic.AtomicInteger
 import com.bncam.core.debug.DiagnosticsAggregator
 import com.bncam.core.vulkan.VulkanRuntimeOwner
 
@@ -19,6 +20,7 @@ import com.bncam.core.vulkan.VulkanRuntimeOwner
  * viewfinder context rather than an assumed device capability.
  */
 data class RawPreviewInteropCapabilitySnapshot(
+    val eglGeneration: Int,
     val vulkanAhbExternalMemory: Boolean,
     val vulkanOutputAhbUsage: Long,
     val eglImageBase: Boolean,
@@ -32,6 +34,7 @@ data class RawPreviewInteropCapabilitySnapshot(
 ) {
     fun toReport(): String = buildString {
         appendLine("RAW_PREVIEW_INTEROP_CAPABILITIES")
+        appendLine("eglGeneration=$eglGeneration")
         appendLine("vulkanAhbExternalMemory=$vulkanAhbExternalMemory")
         appendLine("vulkanOutputAhbUsage=0x${vulkanOutputAhbUsage.toString(16)}")
         appendLine("eglImageBase=$eglImageBase")
@@ -47,6 +50,7 @@ data class RawPreviewInteropCapabilitySnapshot(
 }
 
 object RawPreviewInteropCapabilities {
+    private val eglGenerationCounter = AtomicInteger(0)
     @Volatile
     var latest: RawPreviewInteropCapabilitySnapshot? = null
         private set
@@ -60,6 +64,7 @@ object RawPreviewInteropCapabilities {
     }
 
     fun probeOnGlThread(context: Context): RawPreviewInteropCapabilitySnapshot {
+        val eglGeneration = eglGenerationCounter.incrementAndGet()
         fun tokens(value: String?): Set<String> = value.orEmpty()
             .split(' ')
             .asSequence()
@@ -99,6 +104,7 @@ object RawPreviewInteropCapabilities {
             if (!eglFenceSync) add("EGL_KHR_fence_sync")
         }
         val snapshot = RawPreviewInteropCapabilitySnapshot(
+            eglGeneration = eglGeneration,
             vulkanAhbExternalMemory = vulkanAhb,
             vulkanOutputAhbUsage = vulkanOutputAhbUsage,
             eglImageBase = eglImageBase,

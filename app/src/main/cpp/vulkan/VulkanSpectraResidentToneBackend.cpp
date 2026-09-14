@@ -1055,7 +1055,7 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
     if (fllfRequested) {
         const float fllfValues[6] = {
                 std::clamp(request.fllfStrength, 0.0f, 0.92f),
-                std::clamp(request.fllfSceneKey, 0.12f, 0.18f),
+                0.0f, // telemetry[9]: signed positive-EV accumulator; RAW sceneKey is retired.
                 std::clamp(request.fllfMaxLiftEv, 0.0f, 1.80f),
                 std::clamp(request.fllfMaxCompressEv, 0.0f, 1.10f),
                 std::clamp(request.fllfEdgeStopEv, 0.40f, 0.90f),
@@ -1099,9 +1099,9 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
                 edgeAuthority, // standalone signed Edge authority.
                 std::max(1.0f / 255.0f, request.perceptualDetailNoiseSigmaY),
                 antiZipperAuthority, // slot 44: 0..1 zipper detection/reconstruction authority.
-                0.75f,
+                0.0f, // slot 45 reserved for signed FLLF negative-EV telemetry accumulation.
                 std::clamp(request.perceptualDetailHardHaloLimit, 0.0f, 0.14f),
-                1.0f};
+                0.0f}; // slot 47 reserved for signed FLLF positive-sample telemetry.
         std::uint32_t perceptualBits[9]{};
         std::memcpy(perceptualBits, perceptualValues, sizeof(perceptualBits));
         vkCmdUpdateBuffer(commandBuffer_, telemetry_.buffer,
@@ -1662,9 +1662,17 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
     result.fllfAdjustedPixels = telemetry[14];
     result.fllfEdgeProtectedSamples = telemetry[15];
     const std::uint32_t fllfCorrectionSamples = telemetry[18];
-    result.fllfMeanAbsCorrectionEv = fllfCorrectionSamples > 0u
-            ? static_cast<float>(telemetry[16]) / (1024.0f * static_cast<float>(fllfCorrectionSamples))
-            : 0.0f;
+    const float fllfPositiveSumEv = static_cast<float>(telemetry[9]) / 1024.0f;
+    const float fllfNegativeSumEv = static_cast<float>(telemetry[45]) / 1024.0f;
+    const std::uint32_t fllfPositiveSamples = telemetry[47];
+    const std::uint32_t fllfNegativeSamples = telemetry[16];
+    if (fllfCorrectionSamples > 0u) {
+        const float denom = static_cast<float>(fllfCorrectionSamples);
+        result.fllfMeanAbsCorrectionEv = (fllfPositiveSumEv + fllfNegativeSumEv) / denom;
+        result.fllfMeanSignedCorrectionEv = (fllfPositiveSumEv - fllfNegativeSumEv) / denom;
+        result.fllfPositiveCorrectionFraction = static_cast<float>(fllfPositiveSamples) / denom;
+        result.fllfNegativeCorrectionFraction = static_cast<float>(fllfNegativeSamples) / denom;
+    }
     std::uint32_t fllfMaxBits = telemetry[17];
     std::memcpy(&result.fllfMaxAbsCorrectionEv, &fllfMaxBits, sizeof(float));
     result.fllfPhysicalNoiseSigmaY = std::clamp(

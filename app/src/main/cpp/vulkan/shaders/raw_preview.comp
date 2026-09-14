@@ -637,9 +637,10 @@ vec3 resolvePreviewFllfPolicy(
     float strength = 0.30 + 0.24*dynamicRangePressure + 0.10*shadowPressure + 0.08*highlightPressure;
     strength *= 1.0 - (lowLight ? 0.34 : 0.16) * noisePressure;
     strength = clamp(strength, 0.26, 0.70);
-    float lift = 0.34 + 0.44*shadowPressure + 0.15*dynamicRangePressure;
-    lift *= 1.0 - (lowLight ? 0.78 : 0.42) * noisePressure;
-    float maxLiftEv = clamp(lift, 0.12, 0.88);
+    // DELTA 0207: keep display-only shadow placement useful in light-starved RAW preview.
+    float lift = 0.40 + 0.58*shadowPressure + 0.18*dynamicRangePressure;
+    lift *= 1.0 - (lowLight ? 0.42 : 0.24) * noisePressure;
+    float maxLiftEv = clamp(lift, 0.20, 1.10);
     float maxCompressEv = clamp(0.38 + 0.48*highlightPressure + 0.24*dynamicRangePressure, 0.34, 1.10);
 
     statsBuffer[TONE_SCENE_KEY_INDEX] = floatBitsToUint(sceneKey);
@@ -686,9 +687,11 @@ void exposurePass() {
     // Keep normal scenes around a useful linear midtone while being more conservative when
     // exposure time/ISO already say that the sensor is light-starved. The caps mirror the old
     // preview reference policy but remain entirely in the Vulkan display path.
-    float targetMidtone = lowLight ? 0.100 : 0.115;
+    // DELTA 0207: raise only the display-preview placement. Sensor AE/RAW/DNG remain untouched;
+    // the existing p95 and near-clip caps still own highlight protection.
+    float targetMidtone = lowLight ? 0.112 : 0.125;
     bool raw10 = sourceFormat() == RAW10_FORMAT;
-    float maxGain = lowLight ? (raw10 ? 1.95 : 2.15) : (raw10 ? 2.35 : 2.55);
+    float maxGain = lowLight ? (raw10 ? 2.30 : 2.45) : (raw10 ? 2.60 : 2.75);
     float noisePressure = previewPhysicalNoisePressure(max(0.025, midtone));
     maxGain = mix(maxGain, max(1.60, maxGain * 0.84), 0.45 * noisePressure);
 
@@ -1055,7 +1058,7 @@ vec3 applyPreviewFllf(uvec2 gid, vec3 exposedRgb) {
     // deep-black gate and Laplacian edge-stop. RGB receives one scalar exposure factor.
     float sceneKey = clamp(uintBitsToFloat(statsBuffer[TONE_SCENE_KEY_INDEX]), 0.125, 0.178);
     float strength = clamp(uintBitsToFloat(statsBuffer[FLLF_STRENGTH_INDEX]), 0.02, 0.90);
-    float maxLiftEv = clamp(uintBitsToFloat(statsBuffer[FLLF_MAX_LIFT_EV_INDEX]), 0.035, 0.74);
+    float maxLiftEv = clamp(uintBitsToFloat(statsBuffer[FLLF_MAX_LIFT_EV_INDEX]), 0.05, 1.05);
     float maxCompressEv = clamp(uintBitsToFloat(statsBuffer[FLLF_MAX_COMPRESS_EV_INDEX]), 0.08, 0.70);
 
     float centerLuma = max(1.0e-6, dot(exposedRgb, vec3(0.2126, 0.7152, 0.0722)));
@@ -1077,6 +1080,19 @@ vec3 applyPreviewFllf(uvec2 gid, vec3 exposedRgb) {
     float edge = smoothstep(0.62 * edgeStopEv, 1.28 * edgeStopEv, abs(laplacianBand));
     float appliedEv = clamp(requestedCorrection * (1.0 - 0.84 * edge), -maxCompressEv, maxLiftEv);
     return exposedRgb * exp2(appliedEv);
+}
+
+// DELTA 0207: preview companion to capture broad-shadow placement.
+vec3 applyPreviewBroadShadowPlacement(vec3 color) {
+    float maxLiftEv = clamp(uintBitsToFloat(statsBuffer[FLLF_MAX_LIFT_EV_INDEX]), 0.0, 1.10);
+    float strength = clamp(uintBitsToFloat(statsBuffer[FLLF_STRENGTH_INDEX]), 0.0, 0.90);
+    float broadLiftEv = clamp(0.70 * maxLiftEv + 0.15 * strength - 0.05, 0.0, 0.95);
+    if (broadLiftEv <= 1.0e-5) return color;
+    float y = max(0.0, dot(color, vec3(0.2126, 0.7152, 0.0722)));
+    if (y <= 1.0e-8) return color;
+    float blackGuard = smoothstep(0.006, 0.032, y);
+    float shadowWindow = 1.0 - smoothstep(0.105, 0.340, y);
+    return color * exp2(broadLiftEv * blackGuard * shadowWindow);
 }
 
 vec3 applyPreviewProfileNoiseReduction(int x, int y, vec3 sensorRgb) {
@@ -1450,6 +1466,7 @@ void renderPass() {
     // Same semantic order as RAW capture: automatic log-luma FLLF first, then explicit profile
     // Exposure, one neutral display mapper, explicit tonal look, explicit colour and final gamut.
     rgb = applyPreviewFllf(gid, rgb);
+    rgb = applyPreviewBroadShadowPlacement(rgb);
     rgb *= previewProfileExposureMultiplier();
     rgb = pbrNeutralToneMapping(rgb);
     rgb = applyPreviewToneLook(rgb);
