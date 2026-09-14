@@ -1,0 +1,33 @@
+name: Assistant RAW VF Phase1 Inspect
+on:
+  push:
+    branches: [assistant-raw-vf-phase1]
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Collect relevant RAW preview sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/rawvf-src
+          find app/src -type f \( -name '*RawPreview*' -o -name '*FocusPeaking*' \) -print | tee /tmp/rawvf-paths.txt
+          while IFS= read -r f; do
+            [ -f "$f" ] || continue
+            mkdir -p "/tmp/rawvf-src/$(dirname "$f")"
+            cp "$f" "/tmp/rawvf-src/$f"
+          done < /tmp/rawvf-paths.txt
+          grep -RIl --include='*.kt' --include='*.java' -E 'availableOutputSlots|pendingGpuOutputSlots|gpuResidentOutputDisabled|releaseOutputSlot|reclaimCompletedGpuOutputSlots' app/src | while IFS= read -r f; do
+            mkdir -p "/tmp/rawvf-src/$(dirname "$f")"
+            cp "$f" "/tmp/rawvf-src/$f"
+          done
+          if [ -d app/src/test ]; then cp -R app/src/test /tmp/rawvf-src/app/src/ || true; fi
+          cp /tmp/rawvf-paths.txt /tmp/rawvf-src/RAWVF_PATHS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: raw-vf-phase1-sources
+          path: /tmp/rawvf-src
+          retention-days: 1
