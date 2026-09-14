@@ -1,0 +1,25 @@
+name: Assistant Phase1 source bundle
+on:
+  push:
+    branches: [assistant-delta-builder]
+permissions:
+  contents: read
+jobs:
+  bundle:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bundle Phase 1 sources
+        run: |
+          set -euo pipefail
+          mkdir -p phase1-source/app/src/main/java/com/bncam/ui/screens/capture
+          mkdir -p phase1-source/app/src/test/java/com/bncam/ui/screens/capture
+          cp app/src/main/java/com/bncam/ui/screens/capture/RawPreviewRenderer.kt phase1-source/app/src/main/java/com/bncam/ui/screens/capture/
+          cp app/src/main/java/com/bncam/ui/screens/capture/FocusPeakingView.kt phase1-source/app/src/main/java/com/bncam/ui/screens/capture/
+          cp app/src/test/java/com/bncam/ui/screens/capture/Phase6RawPreviewGpuResidencySourceContractTest.kt phase1-source/app/src/test/java/com/bncam/ui/screens/capture/
+          (cd phase1-source && zip -q -r ../phase1-source.zip .)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: phase1-source
+          path: phase1-source.zip
+          retention-days: 1
