@@ -16,7 +16,10 @@ import android.view.PixelCopy
 import android.view.Surface
 import com.bncam.core.debug.RawPreviewFirstActivationTrace
 import com.bncam.core.debug.Phase0PerformanceTrace
+import com.bncam.core.engine.BnCameraManager
 import com.bncam.core.engine.ImageUtils
+import com.bncam.core.runtime.RawPreviewProducerKind
+import com.bncam.core.runtime.ViewfinderStartupGate
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
@@ -39,6 +42,8 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
         const val GUIDANCE_FLOAT_EPSILON = 0.0005f
 
         @Volatile var activeInstance: FocusPeakingView? = null
+        @Volatile private var stagedTargetSourceForNextView: ViewfinderEffectiveSource? = null
+        @Volatile private var stagedTargetGenerationForNextView: Int = -1
         @Volatile var lastDrawnSource: String = "NONE"
         @Volatile var lastDrawnSensorTimestampNs: Long = 0L
         @Volatile var lastDrawnGeneration: Int = -1
@@ -58,6 +63,16 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
             rebuildRawTexturePool = rebuildRawTexturePool
         ) ?: false
 
+        /**
+         * Stages a target without changing committed display authority. The last-known-good texture
+         * remains drawable until a target candidate has actually been submitted and presented.
+         */
+        fun stageViewfinderTarget(source: ViewfinderEffectiveSource, generation: Int) {
+            stagedTargetSourceForNextView = source
+            stagedTargetGenerationForNextView = generation
+            activeInstance?.stageViewfinderTargetInternal(source, generation)
+        }
+
         fun getProvenanceSummary(): Map<String, Any?> = mapOf(
             "lastDrawnSource" to lastDrawnSource,
             "lastDrawnSensorTimestampNs" to lastDrawnSensorTimestampNs,
@@ -68,6 +83,8 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
             "firstRawDrawnLatencyMs" to firstRawDrawnLatencyMs,
             "isRawActivelyDrawn" to lastDrawnSource.startsWith("RAW"),
             "displayedSource" to (activeInstance?.displayedSource?.name ?: "UNKNOWN"),
+            "stagedTargetSource" to (activeInstance?.stagedTargetSource?.name ?: "NONE"),
+            "stagedTargetGeneration" to (activeInstance?.stagedTargetGeneration ?: -1),
             "acceptingRawFrames" to (activeInstance?.acceptingRawFrames ?: false),
             "eglGeneration" to (activeInstance?.currentEglGeneration ?: -1),
             "displayReady" to (activeInstance?.displayReady ?: false),
@@ -262,6 +279,9 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
 
     @Volatile private var displayedSource: ViewfinderEffectiveSource = ViewfinderEffectiveSource.YUV
     @Volatile private var displayedGeneration: Int = -1
+    @Volatile private var stagedTargetSource: ViewfinderEffectiveSource? = null
+    @Volatile private var stagedTargetGeneration: Int = -1
+    @Volatile private var stagedYuvFrameReady: Boolean = false
     @Volatile private var mirrorRawPreview: Boolean = false
     @Volatile private var displayReady: Boolean = false
     @Volatile private var oesFrameAvailable: Boolean = false
@@ -283,8 +303,9 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
         val eglFrameId: Long,
         val queuedElapsedNs: Long,
         val lensId: String,
-        val source: String,
+        val source: ViewfinderEffectiveSource,
         val generation: Int,
+        val producerKind: RawPreviewProducerKind,
         val targetAuthorityAccepted: Boolean
     )
     private val pendingPresentations = ArrayDeque<PendingPresentation>()
@@ -517,15 +538,49 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
         renderMode = RENDERMODE_WHEN_DIRTY
         Matrix.setIdentityM(yuvStMatrix, 0)
         Matrix.setIdentityM(rawStMatrix, 0)
+        val stagedSource = stagedTargetSourceForNextView
+        val stagedGeneration = stagedTargetGenerationForNextView
+        if (stagedSource != null && stagedGeneration >= 0) {
+            stageViewfinderTargetInternal(stagedSource, stagedGeneration)
+        }
+    }
+
+    private fun stageViewfinderTargetInternal(source: ViewfinderEffectiveSource, generation: Int) {
+        if (detached) return
+        stagedTargetSource = source
+        stagedTargetGeneration = generation
+        stagedYuvFrameReady = false
+        phase0PendingDisplayCommit = Phase0PendingDisplayCommit(
+            lensId = diagnosticLensId,
+            source = source.name,
+            generation = generation
+        )
+        if (source != ViewfinderEffectiveSource.YUV) {
+            acceptingRawFrames = true
+        } else {
+            // Keep accepting the currently committed RAW route until a YUV OES candidate is drawn.
+            acceptingRawFrames = displayedSource != ViewfinderEffectiveSource.YUV
+        }
+        pendingRawFrame.getAndSet(null)?.close()
+        lastSwitchElapsedMs = SystemClock.elapsedRealtime()
+        Log.i(
+            "BnCamRawPreview",
+            "VIEWFINDER_TARGET_STAGED_GL source=${source.name} generation=$generation " +
+                "retaining=${displayedSource.name}/$displayedGeneration"
+        )
+        requestRender()
     }
 
     fun setDisplayedSource(source: ViewfinderEffectiveSource, generation: Int) {
+        val committedStagedTarget = stagedTargetSource == source && stagedTargetGeneration == generation
         displayedSource = source
         displayedGeneration = generation
-        // RAW display ownership is validated again by submitRawPreviewFrame(). YUV authority is
-        // accepted only when this callback is synchronously issued while handling an actual OES
-        // frame; an eager callback-registration echo must not satisfy a lens-switch trace.
-        if (source != ViewfinderEffectiveSource.YUV || phase0DispatchingYuvFrame) {
+        if (committedStagedTarget) {
+            stagedTargetSource = null
+            stagedTargetGeneration = -1
+            stagedYuvFrameReady = false
+        } else if (source != ViewfinderEffectiveSource.YUV || phase0DispatchingYuvFrame) {
+            // Compatibility path for an external commit that was not pre-staged by 0217A.
             phase0PendingDisplayCommit = Phase0PendingDisplayCommit(
                 lensId = diagnosticLensId,
                 source = source.name,
@@ -557,6 +612,9 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
 
     fun clearPreviewForCameraTransition() {
         acceptingRawFrames = false
+        stagedTargetSource = null
+        stagedTargetGeneration = -1
+        stagedYuvFrameReady = false
         pendingRawFrame.getAndSet(null)?.close()
         runCatching { queueEvent { retirePinnedDisplayedGpuFrameOnGlThread() } }
         synchronized(presentationLock) { pendingPresentations.clear() }
@@ -570,17 +628,12 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
             frame.close()
             return
         }
-        if (displayedSource != ViewfinderEffectiveSource.YUV && frame.source != ViewfinderEffectiveSource.YUV) {
-            if (frame.pipelineGeneration >= displayedGeneration) {
-                displayedGeneration = frame.pipelineGeneration
-                displayedSource = frame.source
-                acceptingRawFrames = true
-            }
-        }
-        if (!acceptingRawFrames ||
-            displayedSource == ViewfinderEffectiveSource.YUV ||
-            frame.source != displayedSource || frame.pipelineGeneration != displayedGeneration
-        ) {
+        val matchesCommittedRaw = displayedSource != ViewfinderEffectiveSource.YUV &&
+            frame.source == displayedSource && frame.pipelineGeneration == displayedGeneration
+        val stagedSource = stagedTargetSource
+        val matchesStagedRaw = stagedSource != null && stagedSource != ViewfinderEffectiveSource.YUV &&
+            frame.source == stagedSource && frame.pipelineGeneration == stagedTargetGeneration
+        if (!acceptingRawFrames || (!matchesCommittedRaw && !matchesStagedRaw)) {
             frame.close()
             return
         }
@@ -815,24 +868,29 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
             return
         }
         collectPresentedRawFrames()
-        val useRaw = displayedSource != ViewfinderEffectiveSource.YUV
+        val committedUseRaw = displayedSource != ViewfinderEffectiveSource.YUV
         var phase0YuvFrameUpdatedThisDraw = false
-        // Drain the OES producer even while the last-known-good RAW texture is still displayed.
-        // This lets the transition owner validate the exact Camera2 sensor timestamp of the first
-        // YUV frame from a replacement session before switching display ownership to YUV.
+        // Drain OES independently from committed authority. A staged YUV candidate may be drawn
+        // over the retained RAW texture only after updateTexImage() succeeds for the new target.
         if (oesFrameAvailable) {
             try {
                 surfaceTexture?.updateTexImage()
                 surfaceTexture?.getTransformMatrix(yuvStMatrix)
                 val surfaceTimestampNs = surfaceTexture?.timestamp ?: 0L
                 oesFrameAvailable = false
-                if (!useRaw) displayReady = true
+                if (!committedUseRaw) displayReady = true
                 if (surfaceTimestampNs > 0L) {
                     phase0YuvFrameUpdatedThisDraw = true
+                    if (stagedTargetSource == ViewfinderEffectiveSource.YUV && stagedTargetGeneration >= 0) {
+                        stagedYuvFrameReady = true
+                    }
+                    val yuvTraceGeneration = if (
+                        stagedTargetSource == ViewfinderEffectiveSource.YUV && stagedTargetGeneration >= 0
+                    ) stagedTargetGeneration else displayedGeneration
                     Phase0PerformanceTrace.cameraFrameReceived(
                         lensId = diagnosticLensId,
                         source = "YUV",
-                        generation = displayedGeneration,
+                        generation = yuvTraceGeneration,
                         sensorTimestampNs = surfaceTimestampNs
                     )
                     phase0DispatchingYuvFrame = true
@@ -853,20 +911,23 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
                         }
                 }
             } catch (e: Exception) {
-                // Ignore transient update exceptions during surface teardown or stream switch.
+                // Retain the last-known-good texture. A transient OES failure must not blank display.
             }
-        }
-        if (useRaw) {
-            Matrix.setIdentityM(rawStMatrix, 0)
         }
 
         var uploadedRawFrame: RawPreviewFrame? = null
         var gpuFrameToRetireAfterDraw: RawPreviewFrame? = null
-        if (useRaw) {
+        val stagedRawSource = stagedTargetSource?.takeIf { it != ViewfinderEffectiveSource.YUV }
+        val rawCandidateAllowed = committedUseRaw || stagedRawSource != null
+        if (rawCandidateAllowed) {
             pendingRawFrame.getAndSet(null)?.let { frame ->
                 var releaseImmediately = true
+                val matchesCommittedRaw = displayedSource != ViewfinderEffectiveSource.YUV &&
+                    frame.source == displayedSource && frame.pipelineGeneration == displayedGeneration
+                val matchesStagedRaw = stagedRawSource != null &&
+                    frame.source == stagedRawSource && frame.pipelineGeneration == stagedTargetGeneration
                 try {
-                    if (frame.source == displayedSource && frame.pipelineGeneration == displayedGeneration) {
+                    if (matchesCommittedRaw || matchesStagedRaw) {
                         RawPreviewCadenceDiagnostics.glUploadStarted(
                             frame.source,
                             frame.pipelineGeneration,
@@ -881,8 +942,6 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
                         val glHandoffTrace = RawPreviewTrace.beginGlHandoff()
                         val handoffSucceeded = try {
                             if (frame.gpuResidentOutputUsed && frame.hardwareBuffer != null) {
-                                // No RGBA host readback and no glTex(Sub)Image2D upload: the exact AHB that
-                                // Vulkan wrote is exposed to this GL texture through EGLImage.
                                 ImageUtils.bindRawPreviewHardwareBufferToCurrentTexture(frame.hardwareBuffer)
                             } else {
                                 frame.rgba.position(0)
@@ -928,16 +987,12 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
                             uploadedRawFrame = frame
                             val previousPinnedGpuFrame = pinnedDisplayedGpuFrame
                             if (frame.gpuResidentOutputUsed) {
-                                // Keep the newly displayed AHB pinned across redraws. It is retired
-                                // only after a successor has successfully taken display ownership.
                                 pinnedDisplayedGpuFrame = frame
                                 if (previousPinnedGpuFrame != null && previousPinnedGpuFrame !== frame) {
                                     gpuFrameToRetireAfterDraw = previousPinnedGpuFrame
                                 }
                                 releaseImmediately = false
                             } else if (previousPinnedGpuFrame != null) {
-                                // CPU upload owns an independent GL texture copy. Once this draw is
-                                // submitted the former GPU-backed display can be retired safely.
                                 pinnedDisplayedGpuFrame = null
                                 gpuFrameToRetireAfterDraw = previousPinnedGpuFrame
                             }
@@ -954,13 +1009,21 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
                                     "RAW_PREVIEW_GL_HANDOFF source=${frame.source} " +
                                         "generation=${frame.pipelineGeneration} " +
                                         "size=${frame.width}x${frame.height} rotation=${frame.rotationDegrees} " +
-                                        "gpuResident=${frame.gpuResidentOutputUsed}"
+                                        "gpuResident=${frame.gpuResidentOutputUsed} staged=$matchesStagedRaw"
                                 )
                             }
                         } else {
                             if (frame.gpuResidentOutputUsed) {
                                 frame.closeAfterGlInteropFailure()
                                 releaseImmediately = false
+                            }
+                            if (matchesStagedRaw) {
+                                BnCameraManager.activeInstance?.reportViewfinderPresentationFailure(
+                                    frame.source,
+                                    frame.pipelineGeneration,
+                                    frame.sensorTimestampNs,
+                                    "GL_IMPORT_FAILURE"
+                                )
                             }
                             Log.e(
                                 "BnCamRawPreview",
@@ -975,6 +1038,18 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
                 }
             }
         }
+
+        val stagedRawTextureReady = stagedRawSource != null &&
+            stagedTargetGeneration >= 0 && rawTextureGeneration == stagedTargetGeneration &&
+            lastDrawnRawFrame?.source == stagedRawSource
+        val stagedYuvTextureReady = stagedTargetSource == ViewfinderEffectiveSource.YUV &&
+            stagedTargetGeneration >= 0 && stagedYuvFrameReady
+        val useRaw = when {
+            stagedYuvTextureReady -> false
+            stagedRawTextureReady -> true
+            else -> committedUseRaw
+        }
+        if (useRaw) Matrix.setIdentityM(rawStMatrix, 0)
 
         if (!firstFrameDiagnosticsLogged) {
             firstFrameDiagnosticsLogged = true
@@ -1085,7 +1160,9 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
         } else {
             lastDrawnSource = "YUV"
             lastDrawnSensorTimestampNs = surfaceTexture?.timestamp ?: 0L
-            lastDrawnGeneration = displayedGeneration
+            lastDrawnGeneration = if (
+                stagedTargetSource == ViewfinderEffectiveSource.YUV && stagedTargetGeneration >= 0
+            ) stagedTargetGeneration else displayedGeneration
             yuvFramesDrawnCount++
         }
 
@@ -1094,8 +1171,9 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
         val committedGeneration = lastDrawnGeneration
         val committedSensorTimestampNs = lastDrawnSensorTimestampNs
         val phase0PendingCommit = phase0PendingDisplayCommit
+        // Source + generation are display identity. diagnosticLensId is observational and can
+        // legitimately lag one UI update during a serialized lens handover.
         val phase0TargetAuthorityAccepted = phase0PendingCommit != null &&
-            phase0PendingCommit.lensId == committedLensId &&
             phase0PendingCommit.source == committedSource &&
             phase0PendingCommit.generation == committedGeneration
         val phase0NewFrameCommitted = if (useRaw) {
@@ -1111,21 +1189,36 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
                 sensorTimestampNs = committedSensorTimestampNs,
                 targetAuthorityAccepted = phase0TargetAuthorityAccepted
             )
-            if (phase0TargetAuthorityAccepted) phase0PendingDisplayCommit = null
             if (!useRaw) {
+                if (phase0TargetAuthorityAccepted) phase0PendingDisplayCommit = null
                 // GLSurfaceView does not expose a SurfaceFlinger present fence for OES/YUV. Report
                 // the first UI-vsync after GL submit as an explicitly-labelled presentation proxy.
                 postOnAnimation {
+                    val presentationNs = SystemClock.elapsedRealtimeNanos()
                     Phase0PerformanceTrace.viewfinderFramePresented(
                         lensId = committedLensId,
                         source = committedSource,
                         generation = committedGeneration,
                         sensorTimestampNs = committedSensorTimestampNs,
-                        presentationTimestampNs = SystemClock.elapsedRealtimeNanos(),
+                        presentationTimestampNs = presentationNs,
                         presentationSignal = "NEXT_UI_VSYNC_AFTER_GL_SUBMIT_PROXY",
                         targetAuthorityAccepted = phase0TargetAuthorityAccepted
                     )
+                    ViewfinderStartupGate.signalFirstPresentation(
+                        source = committedSource,
+                        generation = committedGeneration,
+                        sensorTimestampNs = committedSensorTimestampNs,
+                        presentationTimestampNs = presentationNs,
+                        signal = "NEXT_UI_VSYNC_AFTER_GL_SUBMIT_PROXY"
+                    )
                     if (phase0TargetAuthorityAccepted) {
+                        BnCameraManager.activeInstance?.reportViewfinderFramePresented(
+                            source = ViewfinderEffectiveSource.YUV,
+                            generation = committedGeneration,
+                            sensorTimestampNs = committedSensorTimestampNs,
+                            presentationTimestampNs = presentationNs,
+                            presentationSignal = "NEXT_UI_VSYNC_AFTER_GL_SUBMIT_PROXY"
+                        )
                         onTargetFramePresented?.invoke(
                             committedLensId,
                             committedSource,
@@ -1165,12 +1258,21 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
                             eglFrameId = eglFrameId,
                             queuedElapsedNs = SystemClock.elapsedRealtimeNanos(),
                             lensId = diagnosticLensId,
-                            source = frame.source.name,
+                            source = frame.source,
                             generation = frame.pipelineGeneration,
+                            producerKind = frame.producerKind,
                             targetAuthorityAccepted = phase0TargetAuthorityAccepted
                         )
                     )
                 }
+                if (phase0TargetAuthorityAccepted) phase0PendingDisplayCommit = null
+            } else if (phase0TargetAuthorityAccepted) {
+                BnCameraManager.activeInstance?.reportViewfinderPresentationFailure(
+                    source = frame.source,
+                    generation = frame.pipelineGeneration,
+                    sensorTimestampNs = frame.sensorTimestampNs,
+                    reason = "EGL_PRESENTATION_ID_UNAVAILABLE"
+                )
             }
         }
 
@@ -1187,7 +1289,8 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
                 val frame = lastDrawnRawFrame
                 Log.i(
                     "BnCamRawPreview",
-                    "RAW_PREVIEW_FRAME_DRAWN source=$displayedSource generation=$displayedGeneration " +
+                    "RAW_PREVIEW_FRAME_DRAWN source=${frame?.source ?: displayedSource} " +
+                        "generation=${frame?.pipelineGeneration ?: displayedGeneration} " +
                         "texture=${rawTextureWidth}x$rawTextureHeight rotation=$rawTextureRotationDegrees " +
                         "rgbMin=${frame?.outputRgbMin ?: -1f} " +
                         "rgbMax=${frame?.outputRgbMax ?: -1f} rgbMean=${frame?.outputRgbMean ?: -1f} " +
@@ -1303,6 +1406,9 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
     }
 
     private fun collectPresentedRawFrames() {
+        data class PresentedEvent(val pending: PendingPresentation, val presentTimeNs: Long)
+        val presented = ArrayList<PresentedEvent>()
+        val timedOut = ArrayList<PendingPresentation>()
         synchronized(presentationLock) {
             if (pendingPresentations.isEmpty()) return
             val now = SystemClock.elapsedRealtimeNanos()
@@ -1311,43 +1417,93 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
                 val pending = iterator.next()
                 val presentTimeNs = ImageUtils.getRawPreviewEglDisplayPresentTime(pending.eglFrameId)
                 if (presentTimeNs > 0L) {
-                    RawPreviewFrameLifecycleRegistry.presented(
-                        pending.generation,
-                        pending.sensorTimestampNs,
-                        presentTimeNs
-                    )
-                    RawPreviewCadenceDiagnostics.displayPresented(
-                        pending.sensorTimestampNs,
-                        pending.eglFrameId,
-                        presentTimeNs
-                    )
-                    RawPreviewFirstActivationTrace.displayPresented(
-                        sensorTimestampNs = pending.sensorTimestampNs,
-                        displayPresentMonotonicNs = presentTimeNs
-                    )
-                    Phase0PerformanceTrace.viewfinderFramePresented(
-                        lensId = pending.lensId,
-                        source = pending.source,
-                        generation = pending.generation,
-                        sensorTimestampNs = pending.sensorTimestampNs,
-                        presentationTimestampNs = presentTimeNs,
-                        presentationSignal = "EGL_DISPLAY_PRESENT_TIME",
-                        targetAuthorityAccepted = pending.targetAuthorityAccepted
-                    )
-                    if (pending.targetAuthorityAccepted) {
-                        post {
-                            onTargetFramePresented?.invoke(
-                                pending.lensId,
-                                pending.source,
-                                pending.generation
-                            )
-                        }
-                    }
                     iterator.remove()
+                    presented += PresentedEvent(pending, presentTimeNs)
                 } else if (now - pending.queuedElapsedNs > PRESENTATION_QUERY_TIMEOUT_NS) {
                     iterator.remove()
+                    timedOut += pending
                 }
             }
+        }
+
+        presented.forEach { event ->
+            val pending = event.pending
+            val presentTimeNs = event.presentTimeNs
+            RawPreviewFrameLifecycleRegistry.presented(
+                pending.generation,
+                pending.sensorTimestampNs,
+                presentTimeNs
+            )
+            RawPreviewCadenceDiagnostics.displayPresented(
+                pending.sensorTimestampNs,
+                pending.eglFrameId,
+                presentTimeNs
+            )
+            RawPreviewFirstActivationTrace.displayPresented(
+                sensorTimestampNs = pending.sensorTimestampNs,
+                displayPresentMonotonicNs = presentTimeNs
+            )
+            Phase0PerformanceTrace.viewfinderFramePresented(
+                lensId = pending.lensId,
+                source = pending.source.name,
+                generation = pending.generation,
+                sensorTimestampNs = pending.sensorTimestampNs,
+                presentationTimestampNs = presentTimeNs,
+                presentationSignal = "EGL_DISPLAY_PRESENT_TIME",
+                targetAuthorityAccepted = pending.targetAuthorityAccepted
+            )
+            ViewfinderStartupGate.signalFirstPresentation(
+                source = pending.source.name,
+                generation = pending.generation,
+                sensorTimestampNs = pending.sensorTimestampNs,
+                presentationTimestampNs = presentTimeNs,
+                signal = "EGL_DISPLAY_PRESENT_TIME"
+            )
+            // Every presented RAW frame reports producer provenance so a custom producer can earn
+            // takeover authority even when the route itself was first proven by the canonical ring.
+            BnCameraManager.activeInstance?.reportViewfinderFramePresented(
+                source = pending.source,
+                generation = pending.generation,
+                sensorTimestampNs = pending.sensorTimestampNs,
+                presentationTimestampNs = presentTimeNs,
+                presentationSignal = "EGL_DISPLAY_PRESENT_TIME",
+                producerKind = pending.producerKind
+            )
+            if (pending.targetAuthorityAccepted) {
+                post {
+                    onTargetFramePresented?.invoke(
+                        pending.lensId,
+                        pending.source.name,
+                        pending.generation
+                    )
+                }
+            }
+        }
+
+        timedOut.forEach { pending ->
+            if (pending.targetAuthorityAccepted) {
+                BnCameraManager.activeInstance?.reportViewfinderPresentationFailure(
+                    source = pending.source,
+                    generation = pending.generation,
+                    sensorTimestampNs = pending.sensorTimestampNs,
+                    reason = "PRESENTATION_TIMEOUT"
+                )
+                // Presentation was not proven, so re-arm the exact staged target for the next fresh
+                // RAW frame instead of leaving the transition permanently stuck after one timeout.
+                if (stagedTargetSource == pending.source && stagedTargetGeneration == pending.generation) {
+                    phase0PendingDisplayCommit = Phase0PendingDisplayCommit(
+                        lensId = pending.lensId,
+                        source = pending.source.name,
+                        generation = pending.generation
+                    )
+                }
+            }
+            Log.w(
+                "BnCamRawPreview",
+                "RAW_PREVIEW_PRESENTATION_TIMEOUT source=${pending.source.name} " +
+                    "generation=${pending.generation} timestampNs=${pending.sensorTimestampNs} " +
+                    "eglFrameId=${pending.eglFrameId}"
+            )
         }
     }
 

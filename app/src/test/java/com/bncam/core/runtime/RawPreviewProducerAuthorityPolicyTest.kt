@@ -13,18 +13,27 @@ class RawPreviewProducerAuthorityPolicyTest {
     }
 
     @Test
-    fun `renderer publication grants custom producer authority`() {
+    fun `renderer publication alone never grants custom producer authority`() {
         val tracker = RawPreviewProducerAuthorityTracker()
         tracker.reset(7)
         tracker.customRendererPublished(7)
+        assertFalse(tracker.maySuppressCanonical(7, customInputFresh = true))
+    }
+
+    @Test
+    fun `egl presentation grants custom producer authority`() {
+        val tracker = RawPreviewProducerAuthorityTracker()
+        tracker.reset(7)
+        tracker.customRendererPublished(7)
+        tracker.customFramePresented(7)
         assertTrue(tracker.maySuppressCanonical(7, customInputFresh = true))
     }
 
     @Test
-    fun `stale custom input never suppresses canonical even after publication`() {
+    fun `stale custom input never suppresses canonical even after presentation`() {
         val tracker = RawPreviewProducerAuthorityTracker()
         tracker.reset(7)
-        tracker.customRendererPublished(7)
+        tracker.customFramePresented(7)
         assertFalse(tracker.maySuppressCanonical(7, customInputFresh = false))
     }
 
@@ -32,7 +41,7 @@ class RawPreviewProducerAuthorityPolicyTest {
     fun `new generation revokes prior custom authority`() {
         val tracker = RawPreviewProducerAuthorityTracker()
         tracker.reset(7)
-        tracker.customRendererPublished(7)
+        tracker.customFramePresented(7)
         assertTrue(tracker.maySuppressCanonical(7, customInputFresh = true))
         assertFalse(tracker.maySuppressCanonical(8, customInputFresh = true))
     }

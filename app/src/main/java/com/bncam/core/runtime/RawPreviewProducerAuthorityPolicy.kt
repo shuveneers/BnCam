@@ -9,40 +9,51 @@ enum class RawPreviewProducerKind {
 /**
  * Generation-scoped authority gate for the optional custom RAW preview producer.
  *
- * A custom ImageReader receiving a HardwareBuffer is not proof that the buffer can be imported,
- * rendered and published by the RAW preview renderer. Canonical warm-ring preview must therefore
- * remain authoritative until one custom frame has actually completed renderer publication.
+ * DELTA 0217A ownership rule:
+ * receiving, rendering or publishing a custom RAW frame is not display proof. Canonical warm-ring
+ * preview remains authoritative until the exact custom generation has been presented by EGL.
  */
 class RawPreviewProducerAuthorityTracker {
     private var generation: Int = -1
-    private var customPublicationProven: Boolean = false
+    private var customPresentationProven: Boolean = false
     private var customPublishedFrames: Long = 0L
+    private var customPresentedFrames: Long = 0L
 
     @Synchronized
     fun reset(currentGeneration: Int) {
         generation = currentGeneration
-        customPublicationProven = false
+        customPresentationProven = false
         customPublishedFrames = 0L
+        customPresentedFrames = 0L
     }
 
+    /** Observational only. Renderer publication must never suppress the canonical producer. */
     @Synchronized
-    fun customRendererPublished(currentGeneration: Int): Boolean {
+    fun customRendererPublished(currentGeneration: Int) {
         ensureGeneration(currentGeneration)
-        customPublicationProven = true
         customPublishedFrames++
+    }
+
+    /** Grants takeover authority only after EGL presentation of the exact custom generation. */
+    @Synchronized
+    fun customFramePresented(currentGeneration: Int): Boolean {
+        ensureGeneration(currentGeneration)
+        customPresentationProven = true
+        customPresentedFrames++
         return true
     }
 
     @Synchronized
     fun maySuppressCanonical(currentGeneration: Int, customInputFresh: Boolean): Boolean {
         ensureGeneration(currentGeneration)
-        return customPublicationProven && customInputFresh
+        return customPresentationProven && customInputFresh
     }
 
     @Synchronized
     fun summary(currentGeneration: Int): String {
         ensureGeneration(currentGeneration)
-        return "customPublicationProven=$customPublicationProven;customPublishedFrames=$customPublishedFrames"
+        return "customPresentationProven=$customPresentationProven;" +
+            "customPublishedFrames=$customPublishedFrames;customPresentedFrames=$customPresentedFrames"
     }
 
     private fun ensureGeneration(currentGeneration: Int) {

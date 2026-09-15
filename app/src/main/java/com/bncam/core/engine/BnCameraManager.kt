@@ -590,10 +590,10 @@ class BnCameraManager(private val context: Context) {
     private var customRawPreviewReader: ImageReader? = null
     @Volatile private var customRawPreviewBinding: CustomRawPreviewBinding? = null
     @Volatile private var customRawPreviewDisabledGeneration: Int = -1
-    // A custom/vendor RAW preview output is preferred only after it has actually produced a
-    // renderable frame for the active generation. Until then the canonical warm RAW ring remains
-    // the live-preview source so the first Selected-buffer activation can never wait on shutter.
-    @Volatile private var customRawPreviewPublicationReadyGeneration: Int = -1
+    // DELTA 0217A: a custom/vendor RAW preview output is preferred only after an exact frame from
+    // the active generation has been PRESENTED by EGL. Renderer publication alone is not display
+    // truth. Until presentation is proven the canonical warm RAW ring remains authoritative.
+    @Volatile private var customRawPreviewPresentedReadyGeneration: Int = -1
     private val rawPreviewProducerAuthorityTracker = RawPreviewProducerAuthorityTracker()
     @Volatile private var customRawPreviewLastFrameElapsedNs: Long = 0L
     @Volatile private var customRawPreviewLastSensorTimestampNs: Long = 0L
@@ -782,11 +782,12 @@ class BnCameraManager(private val context: Context) {
             if (binding != null && binding.generation == frame.pipelineGeneration && binding.source == frame.source &&
                 frame.source == targetViewfinderSource && customRawPreviewDisabledGeneration != frame.pipelineGeneration
             ) {
+                // Publication is useful diagnostics, but it no longer grants producer authority.
+                // The exact custom frame must first reach EGL PRESENTED state in FocusPeakingView.
                 rawPreviewProducerAuthorityTracker.customRendererPublished(frame.pipelineGeneration)
-                customRawPreviewPublicationReadyGeneration = frame.pipelineGeneration
                 Log.i(
                     tag,
-                    "CUSTOM_RAW_PREVIEW_PUBLICATION_PROVEN source=${frame.source.name} " +
+                    "CUSTOM_RAW_PREVIEW_PUBLICATION_OBSERVED source=${frame.source.name} " +
                         "generation=${frame.pipelineGeneration} timestampNs=${frame.sensorTimestampNs}"
                 )
             }
@@ -806,13 +807,8 @@ class BnCameraManager(private val context: Context) {
         // Never let that completion overwrite the last-known-good texture during a display handoff.
         // The target route owns viewfinder publication; non-viewfinder frames are closed after analysis.
         if (frame.source == targetViewfinderSource) {
-            // A RAW route becomes visible only after Vulkan has produced a valid frame for the exact
-            // target generation. Until this point FocusPeakingView keeps drawing the previous texture.
-            commitRawViewfinderFrameIfReady(
-                frame.source,
-                frame.pipelineGeneration,
-                frame.sensorTimestampNs
-            )
+            // Renderer completion is deliberately NOT a display commit. FocusPeakingView stages the
+            // candidate, imports/draws it, and reports the exact frame back only after presentation.
             rawPreviewFrameListener?.invoke(frame) ?: frame.close()
         } else {
             frame.close()
@@ -1841,7 +1837,6 @@ class BnCameraManager(private val context: Context) {
                 producerFrameReady = !requiresProducerFrame
             )
         }
-
         // RuntimeProfileFactory already resolves CameraCharacteristics/stream timing on the
         // serialized camera worker. Do not issue a CameraService Binder query from a Compose
         // callback merely to populate diagnostics.
@@ -1866,6 +1861,10 @@ class BnCameraManager(private val context: Context) {
             )
             return
         }
+
+        // Stage display intent separately from committed display authority. This lets the GL view
+        // attempt the exact target frame while retaining the last-known-good texture as fallback.
+        com.bncam.ui.screens.capture.FocusPeakingView.stageViewfinderTarget(source, generation)
 
         Log.i(
             tag,
@@ -1999,69 +1998,112 @@ class BnCameraManager(private val context: Context) {
         return true
     }
 
-    private fun commitRawViewfinderFrameIfReady(
+    /**
+     * Final viewfinder authority is granted only from presentation truth.
+     *
+     * RAW uses EGL display-present-time. YUV uses the first UI-vsync after a successful OES GL
+     * submit because GLSurfaceView does not expose a SurfaceFlinger present fence for that path.
+     * Renderer publication / SurfaceTexture arrival alone must never commit a display transition.
+     */
+    fun reportViewfinderFramePresented(
         source: ViewfinderEffectiveSource,
         generation: Int,
-        sensorTimestampNs: Long
+        sensorTimestampNs: Long,
+        presentationTimestampNs: Long,
+        presentationSignal: String,
+        producerKind: RawPreviewProducerKind? = null
     ) {
-        if (source == ViewfinderEffectiveSource.YUV) return
+        if (generation != pipelineGeneration || generation != targetViewfinderGeneration ||
+            source != targetViewfinderSource
+        ) {
+            Log.i(
+                tag,
+                "VIEWFINDER_PRESENTATION_STALE source=${source.name} generation=$generation " +
+                    "target=${targetViewfinderSource.name}/$targetViewfinderGeneration " +
+                    "activeGeneration=$pipelineGeneration signal=$presentationSignal"
+            )
+            return
+        }
+
         markViewfinderProducerFrameReady(source, generation, sensorTimestampNs)
-        if (commitViewfinderDisplayTransition(source, generation, "FIRST_VALID_RAW_VULKAN_FRAME")) {
-            com.bncam.core.debug.RawPreviewFirstActivationTrace.displayTransitionCommitted(
-                source = source.name,
-                generation = generation,
-                sensorTimestampNs = sensorTimestampNs
+
+        if (source != ViewfinderEffectiveSource.YUV &&
+            producerKind == RawPreviewProducerKind.CUSTOM_IMAGE_READER
+        ) {
+            val binding = customRawPreviewBinding
+            if (binding != null && binding.generation == generation && binding.source == source &&
+                customRawPreviewDisabledGeneration != generation
+            ) {
+                rawPreviewProducerAuthorityTracker.customFramePresented(generation)
+                customRawPreviewPresentedReadyGeneration = generation
+                Log.i(
+                    tag,
+                    "CUSTOM_RAW_PREVIEW_PRESENTATION_PROVEN source=${source.name} generation=$generation " +
+                        "timestampNs=$sensorTimestampNs signal=$presentationSignal"
+                )
+            }
+        }
+
+        val reason = if (source == ViewfinderEffectiveSource.YUV) {
+            "FIRST_PRESENTED_YUV_FRAME"
+        } else {
+            "FIRST_PRESENTED_RAW_FRAME"
+        }
+        if (commitViewfinderDisplayTransition(source, generation, reason)) {
+            if (source != ViewfinderEffectiveSource.YUV) {
+                com.bncam.core.debug.RawPreviewFirstActivationTrace.displayTransitionCommitted(
+                    source = source.name,
+                    generation = generation,
+                    sensorTimestampNs = sensorTimestampNs
+                )
+            }
+            com.bncam.core.debug.DiagnosticsAggregator.record(
+                stream = com.bncam.core.debug.DiagnosticsAggregator.Stream.PERFORMANCE,
+                scope = "VIEWFINDER",
+                section = "DISPLAY AUTHORITY COMMITTED",
+                content = "source=${source.name};generation=$generation;" +
+                    "sensorTimestampNs=$sensorTimestampNs;presentationTimestampNs=$presentationTimestampNs;" +
+                    "signal=$presentationSignal;producer=${producerKind?.name ?: "YUV_OES"}"
             )
         }
     }
 
+    /** Local presentation failure is diagnostic only; it must not tear down Camera2 or capture. */
+    fun reportViewfinderPresentationFailure(
+        source: ViewfinderEffectiveSource,
+        generation: Int,
+        sensorTimestampNs: Long,
+        reason: String
+    ) {
+        if (generation != targetViewfinderGeneration || source != targetViewfinderSource) return
+        Log.w(
+            tag,
+            "VIEWFINDER_PRESENTATION_NOT_PROVEN source=${source.name} generation=$generation " +
+                "timestampNs=$sensorTimestampNs reason=$reason retaining=${effectiveViewfinderSource.name}/$effectiveViewfinderGeneration"
+        )
+        com.bncam.core.debug.DiagnosticsAggregator.record(
+            stream = com.bncam.core.debug.DiagnosticsAggregator.Stream.PERFORMANCE,
+            scope = "VIEWFINDER",
+            section = "DISPLAY PRESENTATION FAILURE",
+            content = "source=${source.name};generation=$generation;sensorTimestampNs=$sensorTimestampNs;" +
+                "reason=$reason;retained=${effectiveViewfinderSource.name}/$effectiveViewfinderGeneration"
+        )
+    }
+
     /**
-     * SurfaceTexture reports a valid OES frame independently from the authoritative ZSL format.
-     * For a producer-generation change, require an acquired frame from that generation first; this
-     * prevents a late frame from the retiring CameraCaptureSession from committing the new route.
+     * SurfaceTexture arrival proves only that the YUV producer is alive. The actual route commit is
+     * deferred until FocusPeakingView has submitted that OES texture and reached the next UI-vsync.
      */
     fun reportYuvViewfinderFrameAvailable(surfaceTimestampNs: Long) {
-        // The OES SurfaceTexture is the actual YUV display producer. A RAW ImageReader frame must
-        // never satisfy this transition merely because both outputs share one session generation.
         val stagedGeneration = synchronized(pipelineLock) {
             pendingViewfinderDisplayTransition
                 ?.takeIf { it.source == ViewfinderEffectiveSource.YUV }
                 ?.generation
-        }
-        if (stagedGeneration != null) {
-            markViewfinderProducerFrameReady(
-                ViewfinderEffectiveSource.YUV,
-                stagedGeneration,
-                surfaceTimestampNs
-            )
-        }
-        data class YuvCommitSnapshot(
-            val generation: Int,
-            val requiresProducerFrame: Boolean,
-            val producerFrameReady: Boolean,
-            val firstProducerTimestampNs: Long
-        )
-        val pending = synchronized(pipelineLock) {
-            val state = pendingViewfinderDisplayTransition ?: return
-            if (state.source != ViewfinderEffectiveSource.YUV) return
-            YuvCommitSnapshot(
-                generation = state.generation,
-                requiresProducerFrame = state.requiresProducerFrame,
-                producerFrameReady = state.producerFrameReady,
-                firstProducerTimestampNs = state.firstProducerTimestampNs
-            )
-        }
-        if (sessionConfiguredGeneration != pending.generation || captureSession == null) return
-        if (pending.requiresProducerFrame &&
-            (!pending.producerFrameReady || pending.firstProducerTimestampNs <= 0L ||
-                surfaceTimestampNs < pending.firstProducerTimestampNs)
-        ) {
-            return
-        }
-        commitViewfinderDisplayTransition(
+        } ?: return
+        markViewfinderProducerFrameReady(
             ViewfinderEffectiveSource.YUV,
-            pending.generation,
-            "FIRST_VALID_YUV_SURFACE_FRAME"
+            stagedGeneration,
+            surfaceTimestampNs
         )
     }
 
@@ -2084,7 +2126,7 @@ class BnCameraManager(private val context: Context) {
     ): Boolean {
         if (customRawPreviewDisabledGeneration == generation) return false
         if (customRawPreviewBinding?.generation != generation || customRawPreviewReader == null ||
-            customRawPreviewPublicationReadyGeneration != generation
+            customRawPreviewPresentedReadyGeneration != generation
         ) return false
         val last = customRawPreviewLastFrameElapsedNs
         if (last <= 0L) return false
@@ -2094,9 +2136,9 @@ class BnCameraManager(private val context: Context) {
 
     private fun disableCustomRawPreviewForGeneration(generation: Int, reason: String) {
         if (generation != pipelineGeneration || customRawPreviewBinding?.generation != generation) return
-        if (customRawPreviewDisabledGeneration == generation && customRawPreviewPublicationReadyGeneration != generation) return
+        if (customRawPreviewDisabledGeneration == generation && customRawPreviewPresentedReadyGeneration != generation) return
         customRawPreviewDisabledGeneration = generation
-        customRawPreviewPublicationReadyGeneration = -1
+        customRawPreviewPresentedReadyGeneration = -1
         rawPreviewProducerAuthorityTracker.reset(generation)
         recordRawSessionOutputDiagnostic(
             section = "CUSTOM_RAW_PREVIEW_FALLBACK_CANONICAL",
@@ -7249,7 +7291,7 @@ class BnCameraManager(private val context: Context) {
                                 )
                             com.bncam.ui.screens.capture.RawPreviewHealthStage.RAW_IMAGE_READER -> {
                                 if (customRawPreviewBinding?.generation == sessionGeneration &&
-                                    customRawPreviewPublicationReadyGeneration == sessionGeneration
+                                    customRawPreviewPresentedReadyGeneration == sessionGeneration
                                 ) {
                                     disableCustomRawPreviewForGeneration(
                                         sessionGeneration,
@@ -7283,7 +7325,7 @@ class BnCameraManager(private val context: Context) {
                     freshnessWindowMs = streamHealthRequirement.streamHealthFreshnessWindowMs
                 )
                 if (customRawPreviewBinding?.generation == sessionGeneration &&
-                    customRawPreviewPublicationReadyGeneration == sessionGeneration &&
+                    customRawPreviewPresentedReadyGeneration == sessionGeneration &&
                     !isCustomRawPreviewFresh(sessionGeneration, watchdogNowNs)
                 ) {
                     disableCustomRawPreviewForGeneration(
@@ -7512,7 +7554,7 @@ class BnCameraManager(private val context: Context) {
             appendLine("raw10Sizes=${sizes(ImageFormat.RAW10)}")
             appendLine("aeTargetFpsRanges=$fpsRanges timestampSource=$timestampSource")
             appendLine("customRawPreviewFormatCode=${identity.rawPreviewFormatCode ?: "none"} customBinding=${customRawPreviewBinding ?: "none"} " +
-                "customPublicationReadyGeneration=$customRawPreviewPublicationReadyGeneration " +
+                "customPresentedReadyGeneration=$customRawPreviewPresentedReadyGeneration " +
                 rawPreviewProducerAuthorityTracker.summary(pipelineGeneration))
             appendLine("interopEglGeneration=${interop?.eglGeneration ?: -1} interopReady=${interop?.readyForAhbEglImageInterop ?: false} interopBlockers=${interop?.blockers?.joinToString() ?: "unprobed"} vulkanAhbUsage=0x${(interop?.vulkanOutputAhbUsage ?: 0L).toString(16)}")
             appendLine("displayProvenance=$display")
@@ -7600,7 +7642,7 @@ class BnCameraManager(private val context: Context) {
         }
         customRawPreviewReader = null
         customRawPreviewBinding = null
-        customRawPreviewPublicationReadyGeneration = -1
+        customRawPreviewPresentedReadyGeneration = -1
         rawPreviewProducerAuthorityTracker.reset(pipelineGeneration)
         customRawPreviewLastFrameElapsedNs = 0L
         customRawPreviewLastSensorTimestampNs = 0L
@@ -7620,7 +7662,7 @@ class BnCameraManager(private val context: Context) {
         }
         customRawPreviewReader = null
         customRawPreviewBinding = null
-        customRawPreviewPublicationReadyGeneration = -1
+        customRawPreviewPresentedReadyGeneration = -1
         rawPreviewProducerAuthorityTracker.reset(pipelineGeneration)
         customRawPreviewLastFrameElapsedNs = 0L
         customRawPreviewLastSensorTimestampNs = 0L
@@ -7746,7 +7788,7 @@ class BnCameraManager(private val context: Context) {
         val binding = CustomRawPreviewBinding(source, requestedCode, size.width, size.height, generation, advertised)
         customRawPreviewReader = reader
         customRawPreviewBinding = binding
-        customRawPreviewPublicationReadyGeneration = -1
+        customRawPreviewPresentedReadyGeneration = -1
         rawPreviewProducerAuthorityTracker.reset(generation)
         customRawPreviewLastFrameElapsedNs = 0L
         customRawPreviewLastSensorTimestampNs = 0L
@@ -7777,8 +7819,8 @@ class BnCameraManager(private val context: Context) {
                 }
                 val hardwareBuffer = runCatching { image.hardwareBuffer }.getOrNull()
                 if (hardwareBuffer != null && rawPreviewConfiguredGeneration == generation) {
-                    // Input arrival alone is not renderer proof. Keep the canonical warm RAW ring
-                    // authoritative until a custom frame has actually completed renderer publication.
+                    // Input arrival and renderer publication are not display proof. Keep the
+                    // canonical warm RAW ring authoritative until this custom frame is EGL PRESENTED.
                     val ringHandoffTrace = com.bncam.ui.screens.capture.RawPreviewTrace.beginRingHandoff()
                     try {
                         rawPreviewRenderer.offerBorrowedHardwareBuffer(
