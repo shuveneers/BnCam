@@ -91,6 +91,8 @@ import com.bncam.core.capture.ReadinessState
 import com.bncam.core.capture.WarmBufferReadinessPolicy
 import com.bncam.core.capture.WarmBufferReadinessRequirement
 import com.bncam.core.capture.NearZslAnchorAdmissionPolicy
+import com.bncam.core.capture.ZslCaptureCandidateEvidence
+import com.bncam.core.capture.ZslCaptureCandidateRolePolicy
 import com.bncam.core.capture.CaptureCapabilities
 import com.bncam.core.capture.CaptureMode
 import com.bncam.core.capture.NightCapturePlan
@@ -3246,6 +3248,43 @@ class BnCameraManager(private val context: Context) {
         }
     }
 
+    private fun zslCaptureCandidateEvidence(
+        candidate: FrameRingBuffer.LeasedCandidate,
+        physicalAgeMs: Double
+    ): ZslCaptureCandidateEvidence {
+        val frame = candidate.frame
+        val afState = frame.afState
+        val afTransitioning =
+            afState == CaptureResult.CONTROL_AF_STATE_PASSIVE_SCAN ||
+                afState == CaptureResult.CONTROL_AF_STATE_ACTIVE_SCAN
+        val afExplicitlyUnfocused =
+            afState == CaptureResult.CONTROL_AF_STATE_PASSIVE_UNFOCUSED ||
+                afState == CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED
+        val lensMoving = frame.lensState == CaptureResult.LENS_STATE_MOVING
+        val aeState = try {
+            frame.metadata?.get(CaptureResult.CONTROL_AE_STATE)
+        } catch (_: Throwable) {
+            null
+        }
+        val awbState = try {
+            frame.metadata?.get(CaptureResult.CONTROL_AWB_STATE)
+        } catch (_: Throwable) {
+            null
+        }
+        return ZslCaptureCandidateEvidence(
+            frameVersion = frame.frameVersion,
+            physicalAgeMs = physicalAgeMs,
+            afTransitioning = afTransitioning,
+            afExplicitlyUnfocused = afExplicitlyUnfocused,
+            lensMoving = lensMoving,
+            aeTransitioning =
+                aeState == CaptureResult.CONTROL_AE_STATE_SEARCHING ||
+                    aeState == CaptureResult.CONTROL_AE_STATE_PRECAPTURE,
+            awbTransitioning =
+                awbState == CaptureResult.CONTROL_AWB_STATE_SEARCHING
+        )
+    }
+
     private fun leasePreShutterAnchor(
         userShutterTimestampNs: Long,
         expectedGeneration: Int,
@@ -3257,9 +3296,10 @@ class BnCameraManager(private val context: Context) {
             return null
         }
         // This is the shutter-time atomic ownership operation. Lease every currently eligible pair
-        // for the few microseconds needed to choose the newest valid anchor, then immediately release
-        // all non-winners. With the production caps (<=35) this avoids a query->overwrite->lease race
-        // without materially reducing ImageReader headroom.
+        // for the few microseconds needed to choose one capture candidate, then immediately release
+        // all non-winners. The capture-candidate role is intentionally independent from viewfinder
+        // publication and live metering freshness: only the exact warm frame's own state is allowed
+        // to demote a transitional candidate. Candidate quality never blocks the shutter.
         val leased = ringBuffer.queryAndLeaseCandidates(
             userShutterTimestampNs = userShutterTimestampNs,
             maxCount = ringBuffer.currentCapacity().coerceAtLeast(1),
@@ -3268,22 +3308,44 @@ class BnCameraManager(private val context: Context) {
         )
         if (leased.isEmpty()) return null
 
-        val chosen = leased
+        val eligible = leased
             .asSequence()
             .filter { candidate ->
                 candidate.frame.generationId == expectedGeneration &&
                     candidate.frame.format == expectedFormat
             }
-            .map { candidate -> candidate to nearZslPhysicalAgeAtShutterMs(candidate, userShutterTimestampNs) }
-            .filter { (_, ageMs) ->
-                if (genuineOnly) {
+            .mapNotNull { candidate ->
+                val ageMs = nearZslPhysicalAgeAtShutterMs(candidate, userShutterTimestampNs)
+                    ?: return@mapNotNull null
+                val ageAccepted = if (genuineOnly) {
                     NearZslAnchorAdmissionPolicy.isGenuinePreShutterAge(ageMs)
                 } else {
                     NearZslAnchorAdmissionPolicy.isUsableDegradedPreShutterAge(ageMs, maximumAgeMs)
                 }
+                if (!ageAccepted) {
+                    return@mapNotNull null
+                }
+                candidate to zslCaptureCandidateEvidence(candidate, ageMs)
             }
-            .minByOrNull { (_, ageMs) -> ageMs ?: Double.MAX_VALUE }
-            ?.first
+            .toList()
+        val selectedEvidence =
+            ZslCaptureCandidateRolePolicy.selectBest(eligible.map { (_, evidence) -> evidence })
+        val chosen = selectedEvidence?.let { selected ->
+            eligible.firstOrNull { (_, evidence) ->
+                evidence.frameVersion == selected.frameVersion
+            }?.first
+        }
+
+        if (selectedEvidence != null) {
+            traceCaptureRuntime(
+                "CAPTURE_CANDIDATE_ROLE_SELECTED " +
+                    "frameVersion=${selectedEvidence.frameVersion} " +
+                    "physicalAgeMs=${selectedEvidence.physicalAgeMs} " +
+                    "state=${selectedEvidence.state.name} " +
+                    "reason=${selectedEvidence.reason()} " +
+                    "genuineOnly=$genuineOnly"
+            )
+        }
 
         leased.forEach { candidate ->
             if (candidate !== chosen) candidate.lease.release()
