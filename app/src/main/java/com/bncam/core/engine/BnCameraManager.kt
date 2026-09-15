@@ -117,9 +117,12 @@ import com.bncam.core.capture.HdrExposureBracketPlanner
 import com.bncam.core.capture.HdrExposureControlMode
 import com.bncam.core.capture.HdrManualSensorBounds
 import com.bncam.core.debug.ShotLogger
+import com.bncam.core.debug.RuntimeDiagnosticDomain
+import com.bncam.core.debug.UnifiedRuntimeDiagnosticsSnapshot
 import com.bncam.core.quality.RenderQualityConfig
 import com.bncam.core.quality.PhysicalSensorProfileRegistry
 import com.bncam.core.quality.FrameSensorMetadataSnapshot
+import com.bncam.core.quality.RawCalibrationRole
 import com.bncam.core.quality.SizeSnapshot
 import com.bncam.core.isp.raw10.RawCameraColorProfileRepository
 import com.bncam.core.quality.RawColorTransformEngine
@@ -440,6 +443,157 @@ class BnCameraManager(private val context: Context) {
                     "generation=$expectedGeneration;frame=${result.frameNumber};sequence=${result.sequenceId}"
             )
         }.getOrNull()
+    }
+
+    /**
+     * Freezes a compact, read-only cross-owner diagnostic view at shutter time. None of the
+     * sources below is allowed to submit a request, recover a renderer, change calibration or
+     * mutate capture policy. Missing evidence remains explicit instead of being synthesized.
+     */
+    private fun buildUnifiedRuntimeDiagnosticsSnapshot(
+        capturePlan: CaptureRequestPlan,
+        capabilities: CaptureCapabilities,
+        sensorMetadata: FrameSensorMetadataSnapshot?
+    ): UnifiedRuntimeDiagnosticsSnapshot {
+        val rawCapture = capturePlan.frameOrigin != FrameOrigin.YUV
+
+        val aeDomain = if (!rawCapture) {
+            RuntimeDiagnosticDomain.of(
+                "CAMERA2_HAL_OWNED",
+                "owner" to "CAMERA2_HAL",
+                "cameraAeState" to (lastAeState ?: "unavailable"),
+                "rawControllerActive" to false,
+                "policy" to "STANDARD_CAMERA2_AE_NO_BNCAM_RAW_FEEDBACK"
+            )
+        } else {
+            val convergence = latestDefaultRawPhotometricConvergence
+                ?.takeIf { it.generation == pipelineGeneration }
+            val status = when {
+                convergence == null -> "RAW_CONVERGENCE_UNAVAILABLE"
+                convergence.photometricConverged -> "PHOTOMETRIC_CONVERGED"
+                convergence.allocationReady -> "ALLOCATED_SETTLING"
+                else -> "ALLOCATION_NOT_READY"
+            }
+            RuntimeDiagnosticDomain.of(
+                status,
+                "owner" to "BNCAM_RAW_EXPOSURE_POLICY",
+                "route" to (convergence?.route ?: "unavailable"),
+                "allocationReady" to (convergence?.allocationReady ?: defaultRawAllocationReady),
+                "photometricConverged" to (convergence?.photometricConverged ?: false),
+                "targetLuma" to convergence?.targetLuma,
+                "observedLuma" to convergence?.observedLuma,
+                "exposureErrorEv" to convergence?.exposureErrorEv,
+                "realizationStatus" to convergence?.realizationStatus,
+                "aeStable" to convergence?.aeStable,
+                "reason" to (convergence?.reason ?: "no_generation_matched_convergence"),
+                "framesSinceExposureRequest" to defaultRawFramesSinceExposureRequest
+            )
+        }
+
+        val rawPreviewDomain = if (!rawCapture) {
+            RuntimeDiagnosticDomain.of(
+                "NOT_APPLICABLE_YUV",
+                "owner" to "CAMERA2_YUV_PREVIEW",
+                "captureOrigin" to capturePlan.frameOrigin
+            )
+        } else {
+            val nowNs = android.os.SystemClock.elapsedRealtimeNanos()
+            val health = com.bncam.ui.screens.capture.RawPreviewHealthMonitor.snapshot(nowNs)
+            RuntimeDiagnosticDomain.of(
+                health.stage.name,
+                "source" to health.source,
+                "healthGeneration" to health.pipelineGeneration,
+                "eglGeneration" to health.eglGeneration,
+                "expectedIntervalNs" to health.expectedIntervalNs,
+                "stallThresholdNs" to health.stallThresholdNs,
+                "actualPresentationObserved" to health.actualPresentationObserved,
+                "rgbMean" to health.outputRgbMean,
+                "lastRecoveryReason" to health.lastRecoveryReason,
+                "producerAuthority" to
+                    rawPreviewProducerAuthorityTracker.diagnosticSummary(pipelineGeneration),
+                "renderer" to rawPreviewRenderer.runtimeDiagnosticsSummary()
+            )
+        }
+
+        val calibrationDomain = if (!rawCapture) {
+            RuntimeDiagnosticDomain.of(
+                "NOT_APPLICABLE_YUV",
+                "reason" to "RAW_SENSOR_CALIBRATION_NOT_USED_BY_YUV_ROUTE"
+            )
+        } else if (sensorMetadata == null) {
+            RuntimeDiagnosticDomain.unavailable("EXACT_CAPTURE_FRAME_SENSOR_METADATA_NOT_FROZEN_YET")
+        } else {
+            val ownership = sensorMetadata.calibrationOwnership
+            val status = when {
+                !ownership.sourceAuthorityCoherent -> "SENSOR_AUTHORITY_REJECTED"
+                ownership.mandatoryRawNormalizationReady && ownership.calibratedColorReady ->
+                    "RAW_AND_COLOR_CALIBRATED"
+                ownership.mandatoryRawNormalizationReady -> "RAW_NORMALIZATION_READY"
+                else -> "RAW_NORMALIZATION_REJECTED"
+            }
+            RuntimeDiagnosticDomain.of(
+                status,
+                "sensorAuthorityId" to ownership.sensorAuthorityId,
+                "sourceAuthorityCoherent" to ownership.sourceAuthorityCoherent,
+                "sourceAuthorityReason" to ownership.sourceAuthorityReason,
+                "mandatoryRawReady" to ownership.mandatoryRawNormalizationReady,
+                "mandatoryRejectionReason" to ownership.mandatoryRejectionReason,
+                "calibratedColorReady" to ownership.calibratedColorReady,
+                "cfaAuthority" to ownership.role(RawCalibrationRole.CFA).authority.name,
+                "blackAuthority" to ownership.role(RawCalibrationRole.BLACK_LEVEL).authority.name,
+                "whiteAuthority" to ownership.role(RawCalibrationRole.WHITE_LEVEL).authority.name,
+                "shadingAuthority" to ownership.role(RawCalibrationRole.LENS_SHADING).authority.name,
+                "wbAuthority" to ownership.role(RawCalibrationRole.WHITE_BALANCE).authority.name,
+                "colorAuthority" to ownership.role(RawCalibrationRole.COLOR_TRANSFORM).authority.name,
+                "coreRawMetadataStatus" to sensorMetadata.coreRawMetadataStatus,
+                "logicalFallbackUsed" to sensorMetadata.logicalMetadataFallbackUsed,
+                "foreignMetadataUsed" to sensorMetadata.foreignSensorMetadataUsed
+            )
+        }
+
+        val noiseDomain = if (!rawCapture) {
+            RuntimeDiagnosticDomain.of(
+                "NOT_APPLICABLE_YUV",
+                "reason" to "RAW_PHYSICAL_NOISE_MODEL_NOT_USED_BY_YUV_ROUTE"
+            )
+        } else if (sensorMetadata == null) {
+            RuntimeDiagnosticDomain.unavailable("EXACT_CAPTURE_FRAME_NOISE_METADATA_NOT_FROZEN_YET")
+        } else {
+            RuntimeDiagnosticDomain.of(
+                if (sensorMetadata.hasPhysicalNoiseModel) "PHYSICAL_SO_AVAILABLE" else "PHYSICAL_SO_UNAVAILABLE",
+                "authorityContract" to "PHYSICAL_SO_PRIMARY_ISO_FALLBACK_NO_LENS_ID_STRENGTH_SHORTCUT",
+                "physicalSoAvailable" to sensorMetadata.hasPhysicalNoiseModel,
+                "soSource" to sensorMetadata.noiseProfileSoField.source,
+                "soValidity" to sensorMetadata.noiseProfileSoField.validity.name,
+                "iso" to sensorMetadata.sensitivityIso,
+                "exposureTimeNs" to sensorMetadata.exposureTimeNs,
+                "postRawSensitivityBoost" to sensorMetadata.postRawSensitivityBoost,
+                "postRawBoostAffectsRawNoiseEvidence" to false,
+                "processingConfidence" to "CONFIRMED_LATER_IN_NOISE_MODEL_TRACE"
+            )
+        }
+
+        val capabilityDomain = RuntimeDiagnosticDomain.of(
+            if (capabilities.supports(capturePlan.frameOrigin)) "ROUTE_SUPPORTED" else "ROUTE_UNSUPPORTED",
+            "yuv" to capabilities.yuv,
+            "raw10" to capabilities.raw10,
+            "rawSensor" to capabilities.rawSensor,
+            "camera2RawCapability" to capabilities.camera2RawCapability,
+            "selectedOrigin" to capturePlan.frameOrigin,
+            "resolvedRoute" to capturePlan.route.id,
+            "captureImplementation" to "CaptureRoutePlanner",
+            "tuningAuthority" to "NONE_FROM_CAPABILITY_FACTS"
+        )
+
+        return UnifiedRuntimeDiagnosticsSnapshot(
+            generation = pipelineGeneration,
+            captureRoute = capturePlan.route.id,
+            ae = aeDomain,
+            rawPreview = rawPreviewDomain,
+            calibration = calibrationDomain,
+            noise = noiseDomain,
+            capability = capabilityDomain
+        )
     }
 
     /**
@@ -16496,6 +16650,21 @@ class BnCameraManager(private val context: Context) {
                 } else {
                     userShutterTimestampNs
                 }
+            val diagnosticsSensorMetadata = if (capturePlan.frameOrigin == FrameOrigin.YUV) {
+                null
+            } else {
+                hdrBracket?.anchor?.lease?.pair?.sensorMetadataSnapshot
+                    ?: preleasedSingleAnchor?.lease?.pair?.sensorMetadataSnapshot
+                    ?: preleasedNormalMultiAnchor?.lease?.pair?.sensorMetadataSnapshot
+            }
+            val unifiedRuntimeDiagnostics = buildUnifiedRuntimeDiagnosticsSnapshot(
+                capturePlan = capturePlan,
+                capabilities = capabilities,
+                sensorMetadata = diagnosticsSensorMetadata
+            ).compactText()
+            val unifiedRuntimeDiagnosticsSuffix =
+                ";unifiedRuntimeDiagnostics=$unifiedRuntimeDiagnostics"
+
             val singleRunnerExposurePolicySummary =
                 lastExposurePlanSummary +
                     ";nearZslPhysicalUserShutterTimestampNs=$userShutterTimestampNs" +
@@ -16504,7 +16673,8 @@ class BnCameraManager(private val context: Context) {
                     ";nearZslAnchorIsGenuinePreShutter=${
                         singleAnchorTemporalClass.startsWith("GENUINE_PRE_SHUTTER")
                     }" +
-                    ";nearZslNoDedicatedStillFallback=${!dedicatedFlashStill}"
+                    ";nearZslNoDedicatedStillFallback=${!dedicatedFlashStill}" +
+                    unifiedRuntimeDiagnosticsSuffix
 
             val submissionResult = try {
                 withTimeout(60_000L) {
@@ -16571,7 +16741,7 @@ class BnCameraManager(private val context: Context) {
                                     currentSubmittedControlRequestEpochAtShutter,
                                 aeStateBeforeCapture = lastAeState,
                                 meteringPolicySummary = lastMeteringPlanSummary,
-                                exposurePolicySummary = lastExposurePlanSummary,
+                                exposurePolicySummary = lastExposurePlanSummary + unifiedRuntimeDiagnosticsSuffix,
                                 postShutterStillCaptureUsed = postShutterStillCaptureUsed,
                                 stableAutoWhiteBalance = stableAutoWhiteBalanceAtShutter,
                                 hdrBracket = hdrBracket,
@@ -16616,7 +16786,7 @@ class BnCameraManager(private val context: Context) {
                                 currentSubmittedControlRequestEpochAtShutter = currentSubmittedControlRequestEpochAtShutter,
                                 aeStateBeforeCapture = lastAeState,
                                 meteringPolicySummary = lastMeteringPlanSummary,
-                                exposurePolicySummary = lastExposurePlanSummary,
+                                exposurePolicySummary = lastExposurePlanSummary + unifiedRuntimeDiagnosticsSuffix,
                                 postShutterStillCaptureUsed = postShutterStillCaptureUsed,
                                 stableAutoWhiteBalance = stableAutoWhiteBalanceAtShutter,
                                 captureStageListener = captureAttempts.listenerFor(attemptId),

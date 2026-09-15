@@ -447,6 +447,24 @@ class RawPreviewRenderer(
     fun healthSummary(): String = outputSlotHealth()
 
     /**
+     * Read-only compact runtime evidence for per-shot diagnostics. This does not probe, recover,
+     * reconfigure or otherwise influence preview authority.
+     */
+    fun runtimeDiagnosticsSummary(): String =
+        "fastPath=${lastFastPathKind ?: "UNPROVEN"};" +
+            "directAhbFrames=$directAhbGpuFastFrames;" +
+            "hostInputFrames=$hostInputGpuResidentFrames;" +
+            "gpuCompatFrames=$gpuResidentCompatibilityFrames;" +
+            "cpuFallbackFrames=$cpuVisibleFallbackFrames;" +
+            "compactNv21Requested=$mlAnalysisRequested;compactNv21Frames=$compactAnalysisFrames;" +
+            "slotHealth={${outputSlotHealth()}};" +
+            "dropReasons={${dropCountsSummary()}};" +
+            "frameLifecycle={${RawPreviewFrameLifecycleRegistry.latest()?.summary() ?: "unavailable"}};" +
+            "activeLifecycleFrames=${RawPreviewFrameLifecycleRegistry.activeCount()};" +
+            "retainFailures=$retainFailures;renderFailures=$renderFailures;" +
+            "generation=${activeConfig?.pipelineGeneration ?: -1}"
+
+    /**
      * Stage-aware watchdog recovery. This only retires GPU presentation authority for the active
      * camera/EGL boundary; it never restarts Camera2 and never recycles an AHB whose GL completion
      * is unknown. Available CPU-capable slots continue servicing newest-frame-wins requests.

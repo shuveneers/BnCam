@@ -45,4 +45,26 @@ class RawPreviewProducerAuthorityPolicyTest {
         assertTrue(tracker.maySuppressCanonical(7, customInputFresh = true))
         assertFalse(tracker.maySuppressCanonical(8, customInputFresh = true))
     }
+
+    @Test
+    fun `diagnostic read reports presentation truth without granting authority`() {
+        val tracker = RawPreviewProducerAuthorityTracker()
+        tracker.reset(7)
+        tracker.customRendererPublished(7)
+        val summary = tracker.diagnosticSummary(7)
+        assertTrue(summary.contains("customPresentationProven=false"))
+        assertTrue(summary.contains("customPublishedFrames=1"))
+        assertFalse(tracker.maySuppressCanonical(7, customInputFresh = true))
+    }
+
+    @Test
+    fun `stale diagnostic read does not reset current generation authority`() {
+        val tracker = RawPreviewProducerAuthorityTracker()
+        tracker.reset(7)
+        tracker.customFramePresented(7)
+        val summary = tracker.diagnosticSummary(8)
+        assertTrue(summary.contains("generationMatch=false"))
+        assertTrue(summary.contains("STALE_GENERATION"))
+        assertTrue(tracker.maySuppressCanonical(7, customInputFresh = true))
+    }
 }

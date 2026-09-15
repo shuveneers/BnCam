@@ -56,6 +56,19 @@ class RawPreviewProducerAuthorityTracker {
             "customPublishedFrames=$customPublishedFrames;customPresentedFrames=$customPresentedFrames"
     }
 
+    /** Read-only diagnostic view. This must never reset or grant producer authority. */
+    @Synchronized
+    fun diagnosticSummary(currentGeneration: Int): String =
+        if (generation == currentGeneration) {
+            "trackerGeneration=$generation;generationMatch=true;" +
+                "customPresentationProven=$customPresentationProven;" +
+                "customPublishedFrames=$customPublishedFrames;customPresentedFrames=$customPresentedFrames"
+        } else {
+            "trackerGeneration=$generation;requestedGeneration=$currentGeneration;generationMatch=false;" +
+                "customPresentationProven=false;customPublishedFrames=0;customPresentedFrames=0;" +
+                "status=STALE_GENERATION"
+        }
+
     private fun ensureGeneration(currentGeneration: Int) {
         if (generation != currentGeneration) reset(currentGeneration)
     }
