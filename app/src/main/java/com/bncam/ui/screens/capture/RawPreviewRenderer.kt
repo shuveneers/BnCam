@@ -1304,7 +1304,9 @@ class RawPreviewRenderer(
                 rgbMax = frame.outputRgbMax,
                 rgbMean = frame.outputRgbMean,
                 slotHealth = outputSlotHealth(),
-                publicationElapsedNs = publicationNs
+                publicationElapsedNs = publicationNs,
+                normalizedRawMax = frame.normalizedRawMax,
+                sceneP50 = frame.spatialExposureSceneP50
             )
             onFrame(frame)
             delivered = true
