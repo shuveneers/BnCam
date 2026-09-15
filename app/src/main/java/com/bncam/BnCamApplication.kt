@@ -48,8 +48,9 @@ class BnCamApplication : Application() {
         SpectraNeuralModelInstaller.loadBundled(applicationContext)
         Phase0PerformanceTrace.markStartup("neural_model_prepare_end")
 
-        // RAW preview backend preparation is deliberately NOT part of Application.onCreate().
-        // BnCameraManager prepares it when RAW10/RAW_SENSOR is actually requested.
+        // RAW preview pipeline creation stays out of Application.onCreate()/first-frame startup.
+        // DELTA 0226 prepares it immediately after the first proven viewfinder presentation so
+        // the expensive cold Vulkan setup is no longer charged to the first YUV -> RAW switch.
 
         com.bncam.core.debug.RawRecoveryTrace.init(applicationContext)
         Phase0PerformanceTrace.markStartup("recovery_initialize_start")
@@ -72,6 +73,23 @@ class BnCamApplication : Application() {
                     "source=${firstPresentation?.source ?: "unknown"};" +
                         "generation=${firstPresentation?.generation ?: -1};" +
                         "signal=${firstPresentation?.signal ?: "unknown"}"
+                )
+
+                // DELTA 0226: RAW preview is the latency-critical backend. Prepare it before
+                // the first interactive YUV -> RAW transition, but only after 0217A has proven a
+                // real viewfinder presentation. This keeps cold VkPipeline creation out of the
+                // format-switch path without competing with the first SurfaceTexture/EGL attach.
+                val rawPreviewStartNs = SystemClock.elapsedRealtimeNanos()
+                val rawPreviewPrepared = VulkanRuntimeOwner.prepareRawPreviewBackend()
+                val rawPreviewWallMs =
+                    (SystemClock.elapsedRealtimeNanos() - rawPreviewStartNs) / 1_000_000.0
+                com.bncam.core.debug.DiagnosticsAggregator.record(
+                    com.bncam.core.debug.DiagnosticsAggregator.Stream.PERFORMANCE,
+                    "APPLICATION",
+                    "RAW PREVIEW PREWARM",
+                    "prepared=$rawPreviewPrepared;wallMs=${
+                        String.format(java.util.Locale.US, "%.3f", rawPreviewWallMs)
+                    };trigger=FIRST_PRESENTED_VIEWFINDER"
                 )
 
                 val startNs = SystemClock.elapsedRealtimeNanos()

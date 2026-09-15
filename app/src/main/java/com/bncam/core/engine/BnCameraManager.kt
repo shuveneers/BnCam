@@ -8615,6 +8615,9 @@ class BnCameraManager(private val context: Context) {
         }
 
         private suspend fun performSoftResetPipeline(request: PendingPipelineResetRequest): Boolean {
+            val transitionStartedNs = android.os.SystemClock.elapsedRealtimeNanos()
+            fun transitionElapsedMs(): Double =
+                (android.os.SystemClock.elapsedRealtimeNanos() - transitionStartedNs) / 1_000_000.0
             val previewSurface = request.previewSurface
             val newFormat = request.newFormat
             val profileId = request.profileId
@@ -8634,6 +8637,7 @@ class BnCameraManager(private val context: Context) {
 
             pushHardwareConfigToNative(cameraId)
 
+            val identityStartedNs = android.os.SystemClock.elapsedRealtimeNanos()
             val requestedIdentity = try {
                 buildPipelineIdentity(cameraId, profileId, newFormat)
             } catch (e: Exception) {
@@ -8644,6 +8648,8 @@ class BnCameraManager(private val context: Context) {
                 )
                 null
             }
+            val identityWallMs =
+                (android.os.SystemClock.elapsedRealtimeNanos() - identityStartedNs) / 1_000_000.0
 
             if (requestedIdentity == null) {
                 Log.e(
@@ -9017,11 +9023,14 @@ class BnCameraManager(private val context: Context) {
                     }
                 }, backgroundHandler)
 
+                val sessionHandshakeStartedNs = android.os.SystemClock.elapsedRealtimeNanos()
                 val configured = awaitCaptureSessionConfiguration(
                     camera = camera,
                     previewSurface = previewSurface,
                     reason = "PIPELINE_PRODUCER_RESET:${decision.reasons.joinToString("+")}"
                 )
+                val sessionHandshakeWallMs =
+                    (android.os.SystemClock.elapsedRealtimeNanos() - sessionHandshakeStartedNs) / 1_000_000.0
 
                 val oldSessionClosed = oldSessionCloseTicket?.closeBarrier?.isCompleted ?: true
                 if (oldSessionClosed) {
@@ -9045,6 +9054,14 @@ class BnCameraManager(private val context: Context) {
                         "PIPELINE_RESET_SESSION_NOT_READY generation=$resetGeneration " +
                             "configured=false previousSessionClosed=$oldSessionClosed"
                     )
+                    recordPipelineResetLatency(
+                        requestedFormat = newFormat,
+                        reason = reason,
+                        identityWallMs = identityWallMs,
+                        sessionHandshakeWallMs = sessionHandshakeWallMs,
+                        totalWallMs = transitionElapsedMs(),
+                        outcome = "PRODUCER_SESSION_FAILED"
+                    )
                     return false
                 }
 
@@ -9060,6 +9077,14 @@ class BnCameraManager(private val context: Context) {
                     tag,
                     "PIPELINE_RESET_END generation=$resetGeneration configured=true " +
                         "previousSessionClosed=$oldSessionClosed retirement=${if (oldSessionClosed) "complete" else "deferred"}"
+                )
+                recordPipelineResetLatency(
+                    requestedFormat = newFormat,
+                    reason = reason,
+                    identityWallMs = identityWallMs,
+                    sessionHandshakeWallMs = sessionHandshakeWallMs,
+                    totalWallMs = transitionElapsedMs(),
+                    outcome = "PRODUCER_SESSION_READY"
                 )
                 return true
             } catch (e: Exception) {
@@ -10889,22 +10914,50 @@ class BnCameraManager(private val context: Context) {
         return closed
     }
 
+    private fun recordPipelineResetLatency(
+        requestedFormat: String,
+        reason: String,
+        identityWallMs: Double,
+        sessionHandshakeWallMs: Double,
+        totalWallMs: Double,
+        outcome: String
+    ) {
+        val content =
+            "requestedFormat=$requestedFormat;reason=$reason;outcome=$outcome;" +
+                "identityWallMs=${String.format(Locale.US, "%.3f", identityWallMs)};" +
+                "sessionHandshakeWallMs=${String.format(Locale.US, "%.3f", sessionHandshakeWallMs)};" +
+                "totalWallMs=${String.format(Locale.US, "%.3f", totalWallMs)};" +
+                "generation=$pipelineGeneration;activeFormat=${formatName(activeZslFormat)}"
+        com.bncam.core.debug.DiagnosticsAggregator.record(
+            stream = com.bncam.core.debug.DiagnosticsAggregator.Stream.PERFORMANCE,
+            scope = "CAMERA PIPELINE",
+            section = "PIPELINE RESET LATENCY",
+            content = content
+        )
+        Log.i(previewDiagnosticsTag, "event=PIPELINE_RESET_LATENCY $content")
+    }
+
     private suspend fun awaitCaptureSessionConfiguration(
         camera: CameraDevice,
         previewSurface: Surface?,
         reason: String,
         timeoutMs: Long = SESSION_TRANSITION_TIMEOUT_MS
     ): Boolean {
+        val handshakeStartedNs = android.os.SystemClock.elapsedRealtimeNanos()
         val completion = CompletableDeferred<Boolean>()
         val settingsLensId = synchronized(pipelineLock) {
             activePipelineIdentity?.selectedLensId
         } ?: camera.id
+        val sessionSettingsStartedNs = android.os.SystemClock.elapsedRealtimeNanos()
         val sessionSettings = runCatching {
             loadSessionRequestSettings(settingsLensId)
         }.getOrElse { error ->
             Log.e(tag, "Camera2 session settings load failed reason=$reason camera=${camera.id}", error)
             return false
         }
+        val sessionSettingsWallMs =
+            (android.os.SystemClock.elapsedRealtimeNanos() - sessionSettingsStartedNs) / 1_000_000.0
+        val camera2ConfigureStartedNs = android.os.SystemClock.elapsedRealtimeNanos()
         createCaptureSession(
             camera = camera,
             previewSurface = previewSurface,
@@ -10913,6 +10966,23 @@ class BnCameraManager(private val context: Context) {
             onSessionReady = { success -> if (!completion.isCompleted) completion.complete(success) }
         )
         val configured = withTimeoutOrNull(timeoutMs) { completion.await() }
+        val camera2ConfigureWallMs =
+            (android.os.SystemClock.elapsedRealtimeNanos() - camera2ConfigureStartedNs) / 1_000_000.0
+        val handshakeWallMs =
+            (android.os.SystemClock.elapsedRealtimeNanos() - handshakeStartedNs) / 1_000_000.0
+        val handshakeContent =
+            "reason=$reason;camera=${camera.id};settingsLensId=$settingsLensId;" +
+                "settingsWallMs=${String.format(Locale.US, "%.3f", sessionSettingsWallMs)};" +
+                "camera2ConfigureWallMs=${String.format(Locale.US, "%.3f", camera2ConfigureWallMs)};" +
+                "handshakeWallMs=${String.format(Locale.US, "%.3f", handshakeWallMs)};" +
+                "configured=${configured ?: false};timeoutMs=$timeoutMs;generation=$pipelineGeneration"
+        com.bncam.core.debug.DiagnosticsAggregator.record(
+            stream = com.bncam.core.debug.DiagnosticsAggregator.Stream.PERFORMANCE,
+            scope = "CAMERA PIPELINE",
+            section = "SESSION CONFIGURATION LATENCY",
+            content = handshakeContent
+        )
+        Log.i(previewDiagnosticsTag, "event=SESSION_CONFIGURATION_LATENCY $handshakeContent")
         if (configured == null) {
             synchronized(pipelineLock) {
                 // Invalidate the pending callback. The caller will hard-close/restart; a late
