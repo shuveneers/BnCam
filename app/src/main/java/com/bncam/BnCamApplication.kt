@@ -75,10 +75,26 @@ class BnCamApplication : Application() {
                         "signal=${firstPresentation?.signal ?: "unknown"}"
                 )
 
-                // DELTA 0226: RAW preview is the latency-critical backend. Prepare it before
-                // the first interactive YUV -> RAW transition, but only after 0217A has proven a
-                // real viewfinder presentation. This keeps cold VkPipeline creation out of the
-                // format-switch path without competing with the first SurfaceTexture/EGL attach.
+                // DELTA 0229R: still capture wins cold-start priority after the first proven
+                // viewfinder presentation. The previous 0226 order compiled RAW preview first;
+                // on a fresh install that could postpone YUV still-pipeline preparation by several
+                // seconds and let an otherwise-ready first YUV shutter pay VkPipeline creation.
+                val yuvStillStartNs = SystemClock.elapsedRealtimeNanos()
+                val yuvStillPrepared = VulkanRuntimeOwner.prepareYuvSingleFrameBackend()
+                val yuvStillWallMs =
+                    (SystemClock.elapsedRealtimeNanos() - yuvStillStartNs) / 1_000_000.0
+                com.bncam.core.debug.DiagnosticsAggregator.record(
+                    com.bncam.core.debug.DiagnosticsAggregator.Stream.PERFORMANCE,
+                    "APPLICATION",
+                    "YUV SINGLE FRAME PREWARM",
+                    "prepared=$yuvStillPrepared;wallMs=${
+                        String.format(java.util.Locale.US, "%.3f", yuvStillWallMs)
+                    };priority=STILL_BEFORE_RAW_PREVIEW"
+                )
+
+                // RAW preview stays post-first-presentation so it cannot regress app/viewfinder
+                // startup. It now runs second because a visible YUV viewfinder is already capture
+                // ready and the still backend is latency-critical at that point.
                 val rawPreviewStartNs = SystemClock.elapsedRealtimeNanos()
                 val rawPreviewPrepared = VulkanRuntimeOwner.prepareRawPreviewBackend()
                 val rawPreviewWallMs =
@@ -89,17 +105,7 @@ class BnCamApplication : Application() {
                     "RAW PREVIEW PREWARM",
                     "prepared=$rawPreviewPrepared;wallMs=${
                         String.format(java.util.Locale.US, "%.3f", rawPreviewWallMs)
-                    };trigger=FIRST_PRESENTED_VIEWFINDER"
-                )
-
-                val startNs = SystemClock.elapsedRealtimeNanos()
-                val prepared = VulkanRuntimeOwner.prepareYuvSingleFrameBackend()
-                val wallMs = (SystemClock.elapsedRealtimeNanos() - startNs) / 1_000_000.0
-                com.bncam.core.debug.DiagnosticsAggregator.record(
-                    com.bncam.core.debug.DiagnosticsAggregator.Stream.PERFORMANCE,
-                    "APPLICATION",
-                    "YUV SINGLE FRAME PREWARM",
-                    "prepared=$prepared;wallMs=${String.format(java.util.Locale.US, "%.3f", wallMs)}"
+                    };trigger=FIRST_PRESENTED_VIEWFINDER;priority=AFTER_YUV_STILL"
                 )
 
                 val diagnosticsStartNs = SystemClock.elapsedRealtimeNanos()

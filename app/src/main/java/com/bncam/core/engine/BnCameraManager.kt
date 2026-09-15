@@ -1936,6 +1936,34 @@ class BnCameraManager(private val context: Context) {
         }
     }
 
+    /**
+     * Start full-resolution RAW still resource preparation as soon as the pipeline identity is
+     * known. Waiting for the first ImageReader RAW frame made the old prewarm race the user's first
+     * shutter and could occupy the shared capture-domain Vulkan lock for several seconds.
+     *
+     * The worker remains asynchronous; Camera2/session construction never waits here. The
+     * FrameRingBuffer first-frame request is intentionally kept as a fallback/retry path.
+     */
+    private fun prewarmRawStillWorkingSetAsync(
+        identity: PipelineIdentity,
+        generation: Int,
+        reason: String
+    ) {
+        if (identity.bufferFormat != ImageFormat.RAW10 &&
+            identity.bufferFormat != ImageFormat.RAW_SENSOR
+        ) return
+        com.bncam.core.vulkan.RawStillWorkingSetPrewarmer.request(
+            width = identity.width,
+            height = identity.height,
+            generation = generation
+        )
+        traceCaptureRuntime(
+            "RAW_STILL_PREWARM_EARLY_REQUEST generation=$generation " +
+                "format=${formatName(identity.bufferFormat)} size=${identity.width}x${identity.height} " +
+                "reason=$reason"
+        )
+    }
+
     private fun refreshEffectiveViewfinderSource(
         expectedCallbackRegistrationId: Long? = null,
         preserveResidentRawConfig: Boolean = false
@@ -8176,6 +8204,11 @@ class BnCameraManager(private val context: Context) {
                 extra = "previousSelectedLensId=${previousLensId ?: "none"} requestedFrameSource=$preferredFormat"
             )
             val startGeneration = pipelineGeneration
+            prewarmRawStillWorkingSetAsync(
+                identity = requestedIdentity,
+                generation = startGeneration,
+                reason = "HARD_START_IDENTITY_READY"
+            )
             ringBuffer.activateGeneration(startGeneration)
             ringBuffer.predictiveAfTracker = predictiveAfTracker
             _focusPeakingGuidance.value = FocusPeakingGuidance()
@@ -8799,6 +8832,11 @@ class BnCameraManager(private val context: Context) {
             }
 
             val resetGeneration = pipelineGeneration
+            prewarmRawStillWorkingSetAsync(
+                identity = requestedIdentity,
+                generation = resetGeneration,
+                reason = "SOFT_RESET_IDENTITY_READY"
+            )
             if (ViewfinderRebuildVisualPolicy.requiresBlackTransition(
                     decisionReasons = decision.reasons,
                     requestReason = reason
