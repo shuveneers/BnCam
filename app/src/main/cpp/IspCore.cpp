@@ -27,6 +27,7 @@
 #include "PerceptualDetailPolicy.h"
 #include "SpectraCfaChromaConfidence.h"
 #include "SpectraNeuralProductionPolicy.h"
+#include "SpectraNoiseAuthorityPolicy.h"
 #include "vulkan/VulkanRuntime.h"
 #include "vulkan/NativeStageHeartbeat.h"
 #include <algorithm>
@@ -2981,9 +2982,9 @@ SpectraIsoAdaptiveState IspCore::resolveSpectraIsoAdaptiveState(
             ? meta.calibration.postRawSensitivityBoost
             : 100;
     state.postRawSensitivityBoost = std::clamp(metadataPostRawBoost, 50, 800);
-    state.effectiveIso = static_cast<float>(state.captureIso) *
-            static_cast<float>(state.postRawSensitivityBoost) / 100.0f;
-    state.effectiveIso = std::clamp(state.effectiveIso, 25.0f, 102400.0f);
+    // Phase 0220: RAW noise evidence uses SENSOR_SENSITIVITY only. Post-RAW sensitivity boost
+    // belongs to processed YUV/JPEG and must not amplify the pre-demosaic RAW noise proxy.
+    state.effectiveIso = bncam::spectra::rawNoiseEvidenceIso(state.captureIso);
     state.isoEvAbove100 = std::log2(std::max(0.25f, state.effectiveIso / 100.0f));
 
     // Continuous ISO pressure. Regime names are diagnostic only; the processing
@@ -3010,12 +3011,18 @@ SpectraIsoAdaptiveState IspCore::resolveSpectraIsoAdaptiveState(
     state.modelNoisePressure = smoothstepIsp(-16.5f, -8.5f, logVariance);
 
     const float confidence = std::clamp(meta.calibration.signalModelConfidence, 0.0f, 1.0f);
-    const float modelWeight = 0.25f + 0.50f * confidence;
-    state.combinedNoisePressure = std::clamp(
-            (1.0f - modelWeight) * state.isoPressure + modelWeight * state.modelNoisePressure,
-            0.0f,
-            1.0f
-    );
+    // Phase 0220: the physical S/O model is the primary evidence. ISO is a fallback context only
+    // for unavailable or lower-confidence models; a fully trusted model receives 100% authority.
+    // No lens id or lens role participates in this decision.
+    const auto noiseAuthority = bncam::spectra::resolveSpectraNoiseAuthority(
+            state.modelNoisePressure,
+            state.isoPressure,
+            confidence,
+            meta.calibration.noiseProfileApplied,
+            meta.calibration.normalizationCalibrationValid,
+            meta.calibration.cfaSupportedForBayerNoiseModel,
+            validChannels);
+    state.combinedNoisePressure = noiseAuthority.combinedNoisePressure;
 
     // Read-only SPECTRA observer telemetry retains its historical lens/component shaping.
     // Phase-6 neural master authority must NOT distort the physical evidence snapshot; before
