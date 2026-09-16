@@ -1,12 +1,16 @@
 package com.bncam.core.quality
 
 /**
- * Resolves two deliberately separate contracts:
- *  - physicalNoiseMode controls availability of the sensor S/O variance model;
- *  - spectraProcessingMode controls SPECTRA Context Fusion pixel processing.
+ * Transitional compatibility policy while FinalSensorCalibration still has retired
+ * Off/Auto/Manual fields.
  *
- * A valid Camera2 profile is useful to the conventional RAW baseline even when SPECTRA is Off.
- * SPECTRA therefore never owns or erases physical sensor calibration.
+ * Production physical authority is no longer selected here. OEM/System/Manual/Preset is resolved
+ * later by PhysicalNoiseState. This compatibility lane may expose Camera2/OEM S/O as a temporary
+ * baseline only; legacy Manual S/O is deliberately unreachable so single-anchor scaling cannot
+ * become capture authority again.
+ *
+ * [spectraProcessingMode] carries only the profile SPECTRA request intent. Effective SPECTRA
+ * execution is decided later by [withSpectraNoiseAdapter] from the resolved physical state.
  */
 data class NoiseModelAuthorityDecision(
     val physicalNoiseMode: String,
@@ -15,8 +19,8 @@ data class NoiseModelAuthorityDecision(
 
 object NoiseModelAuthorityPolicy {
     private const val OFF = "Off"
+    private const val ON = "On"
     private const val AUTO = "Auto"
-    private const val MANUAL = "Manual"
 
     fun resolve(
         lensNoiseMode: String,
@@ -24,28 +28,15 @@ object NoiseModelAuthorityPolicy {
         cameraNoiseProfileAvailable: Boolean,
         manualNoiseProfileAvailable: Boolean
     ): NoiseModelAuthorityDecision {
-        val requestedLensMode = when {
-            lensNoiseMode.equals(MANUAL, ignoreCase = true) -> MANUAL
-            lensNoiseMode.equals(AUTO, ignoreCase = true) -> AUTO
-            else -> OFF
-        }
+        // The old user-selected Off/Auto/Manual mode no longer has production authority. Keep only
+        // Camera2/OEM as an interim baseline for legacy FinalSensorCalibration construction; the
+        // PhysicalNoiseState bridge replaces it before RAW merge/render.
+        val physicalMode = if (cameraNoiseProfileAvailable) AUTO else OFF
+        val spectraMode = if (spectraRequested) ON else OFF
 
-        // An explicit Manual request must never silently substitute Camera2 Auto. If its profile is
-        // missing/invalid, the existing validation path reports that failure. Otherwise a valid
-        // Camera2 model is the physical baseline regardless of the SPECTRA profile toggle.
-        val physicalMode = when {
-            requestedLensMode == MANUAL -> MANUAL
-            requestedLensMode == AUTO -> AUTO
-            cameraNoiseProfileAvailable -> AUTO
-            else -> OFF
-        }
+        @Suppress("UNUSED_VARIABLE")
+        val retiredLegacyInputs = lensNoiseMode to manualNoiseProfileAvailable
 
-        val physicalModelAvailable = when (physicalMode) {
-            MANUAL -> manualNoiseProfileAvailable
-            AUTO -> cameraNoiseProfileAvailable
-            else -> false
-        }
-        val spectraMode = if (spectraRequested && physicalModelAvailable) physicalMode else OFF
         return NoiseModelAuthorityDecision(
             physicalNoiseMode = physicalMode,
             spectraProcessingMode = spectraMode

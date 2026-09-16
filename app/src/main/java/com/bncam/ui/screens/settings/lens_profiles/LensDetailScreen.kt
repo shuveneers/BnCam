@@ -16,24 +16,27 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.setValue
-import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -43,12 +46,14 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.bncam.data.settings.LensNoiseModelSettings
-import com.bncam.data.settings.LensBlackLevelSettings
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.bncam.data.settings.BlackLevelSettingsStore
+import com.bncam.data.settings.LensBlackLevelControlSettings
+import com.bncam.data.settings.LensPhysicalNoiseModelSettings
+import com.bncam.data.settings.PhysicalNoiseModelSettingsStore
+import com.bncam.data.settings.PhysicalNoiseModelUiPolicy
 import com.bncam.data.settings.SettingsRepository
-import com.bncam.data.settings.parseCameraFormatCode
-import com.bncam.data.settings.StableLensKey
-import com.bncam.core.quality.LensCalibrationTelemetry
+import com.bncam.ui.components.AccentPistachio
 import com.bncam.ui.components.SettingValueRow
 import com.bncam.ui.screens.settings.SettingsCard
 import kotlinx.coroutines.Dispatchers
@@ -64,15 +69,17 @@ fun LensDetailScreen(
     onNavigateToNoiseModel: () -> Unit = {},
     onNavigateToBlackLevel: () -> Unit = {},
     onNavigateToColorMatrix: () -> Unit = {},
-    onNavigateToRawStreamBinding: () -> Unit = {},
+    @Suppress("UNUSED_PARAMETER") onNavigateToRawStreamBinding: () -> Unit = {},
     onNavigateBack: () -> Unit
 ) {
     val scrollState = rememberScrollState()
     val context = LocalContext.current
     val settingsRepo = remember(context) { SettingsRepository(context) }
+    val physicalNoiseStore = remember(context) { PhysicalNoiseModelSettingsStore(context) }
+    val blackLevelStore = remember(context) { BlackLevelSettingsStore(context) }
     val coroutineScope = rememberCoroutineScope()
     val hardwareSummary by produceState(
-        initialValue = unavailableLensHardwareSummary(lensId),
+        initialValue = unavailableLensHardwareSummary(),
         context,
         lensId
     ) {
@@ -80,44 +87,31 @@ fun LensDetailScreen(
     }
 
     var showAmountDialog by remember { mutableStateOf(false) }
-    var showOrientationDialog by remember { mutableStateOf(false) }
+    var showResetConfirm by remember { mutableStateOf(false) }
+
+    // Preview orientation is no longer a user calibration. Retire any previously persisted
+    // per-lens rotation as soon as this hardware page is opened. At the same time materialize
+    // the current v2 Noise Model / Black Level state so this overview never reports legacy UI state.
+    LaunchedEffect(lensId, physicalNoiseStore, blackLevelStore) {
+        settingsRepo.setLensPreviewOrientationCorrection(lensId, "Auto")
+        physicalNoiseStore.ensureMigrated(lensId)
+        blackLevelStore.ensureMigrated(lensId)
+    }
 
     // Use the same authoritative profile-count value as the viewfinder and ProfileManager.
-    // The temporary hardware_lens_*_profile_amount key is intentionally no longer used here.
     val profileAmountValue by settingsRepo.getProfileCountFlow(lensId).collectAsStateWithLifecycle(
         initialValue = initialProfileAmount.toIntOrNull()?.coerceIn(1, 12) ?: 6
     )
     val profileAmount = profileAmountValue.toString()
-
     var profileAmountDraft by remember(profileAmount) { mutableStateOf(profileAmount) }
 
+    val noiseModelSettings by physicalNoiseStore.settingsFlow(lensId)
+        .collectAsStateWithLifecycle(initialValue = LensPhysicalNoiseModelSettings())
+    val blackLevelSettings by blackLevelStore.settingsFlow(lensId)
+        .collectAsStateWithLifecycle(initialValue = LensBlackLevelControlSettings())
 
-    val noiseModelSettings by settingsRepo.getLensNoiseModelSettingsFlow(lensId)
-        .collectAsStateWithLifecycle(initialValue = LensNoiseModelSettings())
-    val blackLevelSettings by settingsRepo.getLensBlackLevelSettingsFlow(lensId)
-        .collectAsStateWithLifecycle(initialValue = LensBlackLevelSettings())
-    val calibrationTelemetry by LensCalibrationTelemetry.flow(lensId).collectAsStateWithLifecycle()
-    val conciseNoiseSource = when {
-        calibrationTelemetry?.noiseSource?.contains("SENSOR_NOISE_PROFILE") == true -> "Camera2 metadata"
-        calibrationTelemetry?.noiseSource?.contains("manual", ignoreCase = true) == true -> "Lens manual"
-        calibrationTelemetry == null -> null
-        else -> "Fallback"
-    }
-    val conciseBlackSource = when {
-        calibrationTelemetry?.blackLevelSource?.contains("DYNAMIC_BLACK_LEVEL") == true -> "Dynamic metadata"
-        calibrationTelemetry?.blackLevelSource?.contains("BLACK_LEVEL_PATTERN") == true -> "Static pattern"
-        calibrationTelemetry?.blackLevelSource?.contains("manual", ignoreCase = true) == true -> "Lens manual"
-        calibrationTelemetry == null -> null
-        else -> "Fallback"
-    }
-
-    val colorMatrixMode by settingsRepo.getColorMatrixModeFlow(lensId).collectAsStateWithLifecycle(initialValue = "System")
-    val raw10PreviewBinding by settingsRepo.getRawPreviewFormatCodeFlow(lensId, "RAW10")
-        .collectAsStateWithLifecycle(initialValue = "AUTO")
-    val rawSensorPreviewBinding by settingsRepo.getRawPreviewFormatCodeFlow(lensId, "RAW_SENSOR")
-        .collectAsStateWithLifecycle(initialValue = "AUTO")
-    val previewOrientationCorrection by settingsRepo.getLensPreviewOrientationCorrectionFlow(lensId)
-        .collectAsStateWithLifecycle(initialValue = "Auto")
+    val colorMatrixMode by settingsRepo.getColorMatrixModeFlow(lensId)
+        .collectAsStateWithLifecycle(initialValue = "System")
 
     Column(
         modifier = Modifier
@@ -147,8 +141,10 @@ fun LensDetailScreen(
                 .padding(bottom = 32.dp)
         )
 
-        SettingsCard(title = "Lens ID specifications", description = "Camera2-reported hardware details for this lens.") {
-            SpecRow("Stable lens key", hardwareSummary.stableLensKey)
+        SettingsCard(
+            title = "Lens ID specifications",
+            description = "Camera2-reported hardware details for this lens."
+        ) {
             SpecRow("Hardware ID", lensId)
             hardwareSummary.logicalParentId?.let { parentId ->
                 SpecRow("Logical parent", parentId)
@@ -176,97 +172,40 @@ fun LensDetailScreen(
 
         SettingsCard(
             title = "Lens hardware settings",
-            description = "Sensor calibration and RAW viewfinder routing for this Lens ID."
+            description = "Per-lens sensor calibration and color transform settings."
         ) {
             SettingValueRow(
-                title = "Reset lens hardware settings",
-                description = "Return this Lens ID to neutral system/auto behavior.",
-                value = "Reset",
-                onClick = {
-                    coroutineScope.launch { settingsRepo.resetLensHardwareSettings(lensId) }
-                }
-            )
-
-            SettingValueRow(
-                title = "Preview orientation correction",
-                description = "Additional per-lens display rotation. Keep Auto unless a vendor/hidden Lens ID is physically shown rotated.",
-                value = previewOrientationCorrection,
-                onClick = { showOrientationDialog = true }
-            )
-
-            CalibrationGroupLabel("Noise Model Calibration")
-            SettingValueRow(
-                title = "SPECTRA noise model",
-                description = "Per-lens sensor noise calibration and manual S/O values.",
-                value = noiseModelSettings.summary("Sensor CFA", conciseNoiseSource),
+                title = "Noise model",
+                description = "Per-lens physical sensor noise model, presets and manual S/O values.",
+                value = PhysicalNoiseModelUiPolicy.summary(noiseModelSettings),
                 onClick = onNavigateToNoiseModel
             )
 
-            CalibrationGroupLabel("Black Level Calibration")
             SettingValueRow(
                 title = "Black level",
                 description = "Floating-point developed-RAW black offsets. DNG metadata remains sensor truthful.",
-                value = blackLevelSettings.summary(conciseBlackSource),
+                value = blackLevelSettings.summary(),
                 onClick = onNavigateToBlackLevel
             )
 
-            CalibrationGroupLabel("Color Transform Scheme")
             SettingValueRow(
                 title = "Color matrix",
                 description = "Sensor-to-RGB color transformation for this Lens ID.",
                 value = colorMatrixMode,
                 onClick = onNavigateToColorMatrix
             )
-
-
-            CalibrationGroupLabel("RAW Viewfinder Stream Calibration")
-            SettingValueRow(
-                title = "RAW stream binding",
-                description = "Inspect Camera2 stream codes and bind a reported or manual code to RAW10 / RAW_SENSOR live preview.",
-                value = rawStreamBindingSummary(raw10PreviewBinding, rawSensorPreviewBinding),
-                onClick = onNavigateToRawStreamBinding
-            )
         }
 
-    }
-
-    if (showOrientationDialog) {
-        AlertDialog(
-            onDismissRequest = { showOrientationDialog = false },
-            title = { Text("Preview orientation correction") },
-            text = {
-                Column {
-                    listOf("Auto", "+90°", "+180°", "+270°").forEach { option ->
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable {
-                                    coroutineScope.launch {
-                                        settingsRepo.setLensPreviewOrientationCorrection(lensId, option)
-                                    }
-                                    showOrientationDialog = false
-                                }
-                                .padding(vertical = 12.dp),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(option)
-                            if (option == previewOrientationCorrection) {
-                                Text("Selected", color = Color(0xFFC5E1A5), fontSize = 12.sp)
-                            }
-                        }
-                    }
-                }
-            },
-            confirmButton = {
-                OutlinedButton(onClick = { showOrientationDialog = false }) { Text("Cancel") }
-            }
+        Spacer(Modifier.height(12.dp))
+        LensHardwareResetButton(
+            text = "Reset lens hardware settings",
+            onClick = { showResetConfirm = true }
         )
+        Spacer(Modifier.height(20.dp))
     }
 
     if (showAmountDialog) {
-        SimpleTextDialog(
-            title = "Amount of profiles",
+        ProfileAmountDialog(
             value = profileAmountDraft,
             onValueChange = { profileAmountDraft = it },
             onDismiss = {
@@ -274,31 +213,52 @@ fun LensDetailScreen(
                 showAmountDialog = false
             },
             onConfirm = {
-                val sanitized = profileAmountDraft.trim().toIntOrNull()?.coerceIn(1, 12)?.toString() ?: profileAmount
-                // AppNavigation persists this through SettingsRepository.setProfileCount(...),
-                // which is also read by the viewfinder and the restored profile list.
+                val sanitized = profileAmountDraft.trim().toIntOrNull()
+                    ?.coerceIn(1, 12)
+                    ?.toString()
+                    ?: profileAmount
                 onProfileAmountChanged(sanitized)
                 showAmountDialog = false
             }
         )
     }
 
+    if (showResetConfirm) {
+        AlertDialog(
+            onDismissRequest = { showResetConfirm = false },
+            containerColor = Color(0xFF1E1E1E),
+            title = { Text("Reset lens hardware settings?", color = Color.White) },
+            text = {
+                Text(
+                    text = "Noise model, Black Level and other per-lens hardware calibration settings will return to their defaults. Future White Level and Stream Configuration settings use this same reset scope.",
+                    color = Color.Gray,
+                    lineHeight = 18.sp
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        coroutineScope.launch {
+                            settingsRepo.resetLensHardwareSettings(lensId)
+                            settingsRepo.setLensPreviewOrientationCorrection(lensId, "Auto")
+                        }
+                        showResetConfirm = false
+                    }
+                ) {
+                    Text("Reset", color = Color(0xFFFF6B6B), fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showResetConfirm = false }) {
+                    Text("Cancel", color = Color.Gray)
+                }
+            }
+        )
+    }
 }
 
 @Composable
-private fun CalibrationGroupLabel(title: String) {
-    Text(
-        text = title,
-        color = Color(0xFFC5E1A5),
-        fontSize = 13.sp,
-        fontWeight = FontWeight.Medium,
-        modifier = Modifier.padding(start = 16.dp, top = 10.dp)
-    )
-}
-
-@Composable
-private fun SimpleTextDialog(
-    title: String,
+private fun ProfileAmountDialog(
     value: String,
     onValueChange: (String) -> Unit,
     onDismiss: () -> Unit,
@@ -306,31 +266,53 @@ private fun SimpleTextDialog(
 ) {
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text(title) },
+        containerColor = Color(0xFF1E1E1E),
+        title = { Text("Amount of profiles", color = Color.White) },
         text = {
             OutlinedTextField(
                 value = value,
                 onValueChange = onValueChange,
+                modifier = Modifier.fillMaxWidth(),
                 singleLine = true,
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedTextColor = Color.White,
+                    unfocusedTextColor = Color.White,
+                    cursorColor = AccentPistachio,
+                    focusedBorderColor = AccentPistachio,
+                    unfocusedBorderColor = Color(0xFF555555)
+                )
             )
         },
         confirmButton = {
-            Button(onClick = onConfirm) { Text("OK") }
+            TextButton(onClick = onConfirm) {
+                Text("Save", color = AccentPistachio, fontWeight = FontWeight.Bold)
+            }
         },
         dismissButton = {
-            OutlinedButton(onClick = onDismiss) { Text("Cancel") }
+            TextButton(onClick = onDismiss) {
+                Text("Cancel", color = Color.Gray)
+            }
         }
     )
 }
 
-private fun rawStreamBindingSummary(raw10: String, rawSensor: String): String {
-    fun label(encoded: String): String = parseCameraFormatCode(encoded)?.toString() ?: "Auto"
-    return "RAW10 ${label(raw10)}\nRAW_SENSOR ${label(rawSensor)}"
+@Composable
+private fun LensHardwareResetButton(text: String, onClick: () -> Unit) {
+    Button(
+        onClick = onClick,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp)
+            .height(54.dp),
+        shape = RoundedCornerShape(28.dp),
+        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF8B1A1A))
+    ) {
+        Text(text, color = Color.White, fontWeight = FontWeight.Bold)
+    }
 }
 
 private data class LensHardwareSummary(
-    val stableLensKey: String,
     val logicalParentId: String?,
     val focalLengths: String,
     val sensorSize: String,
@@ -344,8 +326,7 @@ private data class ResolvedLensCharacteristics(
     val characteristics: CameraCharacteristics
 )
 
-private fun unavailableLensHardwareSummary(lensId: String) = LensHardwareSummary(
-    stableLensKey = StableLensKey.fromString(lensId).value,
+private fun unavailableLensHardwareSummary() = LensHardwareSummary(
     logicalParentId = null,
     focalLengths = "Unavailable",
     sensorSize = "Unavailable",
@@ -356,9 +337,7 @@ private fun unavailableLensHardwareSummary(lensId: String) = LensHardwareSummary
 private fun resolveLensHardwareSummary(context: Context, lensId: String): LensHardwareSummary {
     val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
     val resolved = resolveLensCharacteristics(cameraManager, lensId)
-    if (resolved == null) {
-        return unavailableLensHardwareSummary(lensId)
-    }
+        ?: return unavailableLensHardwareSummary()
 
     val chars = resolved.characteristics
     val focalLengths = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
@@ -378,17 +357,16 @@ private fun resolveLensHardwareSummary(context: Context, lensId: String): LensHa
     val maxOutput = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)?.let { map ->
         map.outputFormats
             .asSequence()
-            .flatMap { format -> runCatching { map.getOutputSizes(format)?.asSequence() ?: emptySequence() }.getOrDefault(emptySequence()) }
+            .flatMap { format ->
+                runCatching { map.getOutputSizes(format)?.asSequence() ?: emptySequence() }
+                    .getOrDefault(emptySequence())
+            }
             .filter { it.width > 0 && it.height > 0 }
             .maxByOrNull { it.width.toLong() * it.height.toLong() }
             ?.let { "${it.width} × ${it.height}" }
     } ?: "Unavailable"
 
     return LensHardwareSummary(
-        stableLensKey = StableLensKey.fromRawPhysicalId(
-            resolved.logicalCameraId,
-            resolved.physicalCameraId
-        ).value,
         logicalParentId = resolved.physicalCameraId?.let { resolved.logicalCameraId },
         focalLengths = focalLengths,
         sensorSize = sensorSize,
@@ -412,8 +390,6 @@ private fun resolveLensCharacteristics(
                             cameraManager.getCameraCharacteristics(lensId)
                         }.getOrElse {
                             // Some HALs expose a physical ID only through its logical parent.
-                            // In that case keep the page usable and report the parent characteristics
-                            // rather than inventing hardware specifications.
                             logicalChars
                         }
                         ResolvedLensCharacteristics(logicalId, lensId, physicalChars)
@@ -445,19 +421,14 @@ private fun SpecRow(label: String, value: String) {
     ) {
         Text(
             text = label,
-            color = Color.Gray,
-            fontSize = 14.sp,
-            modifier = Modifier
-                .weight(0.38f)
-                .padding(end = 12.dp)
+            color = Color(0xFF777777),
+            fontSize = 14.sp
         )
         Text(
             text = value,
-            color = Color.White,
+            color = Color(0xFFD8D8D8),
             fontSize = 14.sp,
-            fontWeight = FontWeight.Medium,
-            textAlign = TextAlign.End,
-            modifier = Modifier.weight(0.62f)
+            textAlign = TextAlign.End
         )
     }
 }

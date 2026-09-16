@@ -565,10 +565,6 @@ void sampleNoiseModelFromProductionRaw(
 
     g_spatialNoiseMap = SpatialNoiseMap();
 
-    if (meta.calibration.noiseModelMode == 0) {
-        stats.noiseModelReason = "off";
-        return;
-    }
     if (!meta.calibration.hasNoiseProfile || !meta.calibration.noiseProfileApplied ||
         meta.calibration.noiseProfilePairCount <= 0) {
         stats.noiseModelReason = "missing_or_invalid_effective_so";
@@ -702,11 +698,6 @@ bool sampleNoiseModelFromResidentRaw(
         return false;
     };
 
-    if (meta.calibration.noiseModelMode == 0) {
-        stats.noiseModelReason = "off";
-        if (failureReason != nullptr) failureReason->clear();
-        return true;
-    }
     if (!meta.calibration.hasNoiseProfile || !meta.calibration.noiseProfileApplied ||
         meta.calibration.noiseProfilePairCount <= 0) {
         stats.noiseModelReason = "missing_or_invalid_effective_so";
@@ -841,12 +832,8 @@ bool sampleNoiseModelFromResidentRaw(
 // Physical S/O remains measurement-only here. Filter authority is intentionally absent;
 // future SPECTRA Neural conditioning consumes the measured noise state explicitly.
 
-const char* noiseModelModeName(int mode) {
-    switch (mode) {
-        case 1: return "Auto";
-        case 2: return "Manual";
-        default: return "Off";
-    }
+const char* spectraProcessingModeName(int mode) {
+    return mode != 0 ? "On" : "Off";
 }
 
 void rotateMatForOutput(cv::Mat& mat, int rotationDegrees) {
@@ -2195,8 +2182,8 @@ std::string computeRawShadowDiagnostics(
          << ";effectiveO=[" << meta.calibration.effectiveO[0] << "," << meta.calibration.effectiveO[1] << "," << meta.calibration.effectiveO[2] << "," << meta.calibration.effectiveO[3] << "]"
          << ";spectraSnapshotHash=0x" << std::hex << spectraSnapshotHash << std::dec
          << ";spectraEffectiveSigmaAtReferenceSignal=" << spectraEffectiveSigmaAtReferenceSignal
-         << ";physicalNoiseModelMode=" << noiseModelModeName(meta.calibration.noiseModelMode)
-         << ";spectraProcessingMode=" << noiseModelModeName(meta.calibration.spectraProcessingMode)
+         << ";physicalNoiseModelAvailable=" << (meta.calibration.physicalNoiseModelAvailable() ? "true" : "false")
+         << ";spectraProcessingMode=" << spectraProcessingModeName(meta.calibration.spectraProcessingMode)
          << ";spectraSignalModelConfidence=" << meta.calibration.signalModelConfidence
          << "}";
 
@@ -2320,8 +2307,7 @@ DefectCorrectionDebug applyDefectCorrectionToJpegRaw(LinearFloatRaw& raw, const 
     }
 
     const float baseThreshold = meta.isRaw10 ? 0.070f : 0.050f;
-    const bool noiseModelValid = meta.calibration.noiseProfileApplied &&
-            meta.calibration.normalizationCalibrationValid &&
+    const bool noiseModelValid = meta.calibration.physicalNoiseModelAvailable() &&
             meta.calibration.signalModelConfidence > 0.0f;
 
     const auto preScanStart = IspClock::now();
@@ -2552,12 +2538,7 @@ std::string IspCore::describeResolvedConfig(const NativeRenderQualityConfig& uiC
     oss << "ispCoreCentralized=true"
         << ";pipeline=" << (isYuv ? "YUV" : (isRaw10 ? "JPEG_WORKING_LINEAR_RAW_FROM_RAW10_MASTER" : "JPEG_WORKING_LINEAR_RAW_FROM_RAW_SENSOR_MASTER"))
         << ";jpegQuality=" << cfg.jpegQuality
-        << ";lensIsoNrMode=" << cfg.lensIsoNrMode
-        << ";lensDynamicIsoCoeff=" << fmtDouble(cfg.lensDynamicIsoCoeff, 4)
-        << ";lensManualIsoValue=" << fmtDouble(cfg.lensManualIsoValue, 2)
-        << ";captureSensitivityIso=" << (cfg.captureSensitivityIso > 0 ? std::to_string(cfg.captureSensitivityIso) : "unknown")
-        << ";yuvLensIsoNrApplied=" << (cfg.yuvLensIsoNrApplied ? "true" : "false")
-        << ";yuvLensIsoNoiseReductionBoost=" << fmtDouble(cfg.yuvLensIsoNoiseReductionBoost, 4);
+        << ";captureSensitivityIso=" << (cfg.captureSensitivityIso > 0 ? std::to_string(cfg.captureSensitivityIso) : "unknown");
     return oss.str();
 }
 
@@ -2565,7 +2546,7 @@ std::string SpectraPass0State::formatDebugString() const {
     std::ostringstream out;
     out << std::fixed << std::setprecision(4);
     out << "spectraPass0Observer={"
-        << "mode=" << (spectraMode == 1 ? "auto" : (spectraMode == 2 ? "manual" : "off"))
+        << "mode=" << spectraProcessingModeName(spectraMode)
         << ";sourceFormat=" << sourceFormat
         << ";lensKey=" << lensKey
         << ";acceptedTiles=" << acceptedTileCount << "/" << totalTileCount
@@ -2963,8 +2944,8 @@ std::string computeRawShadowDiagnosticsCompact(
          << ";effectiveO=[" << meta.calibration.effectiveO[0] << "," << meta.calibration.effectiveO[1] << "," << meta.calibration.effectiveO[2] << "," << meta.calibration.effectiveO[3] << "]"
          << ";spectraSnapshotHash=0x" << std::hex << spectraSnapshotHash << std::dec
          << ";spectraEffectiveSigmaAtReferenceSignal=" << spectraEffectiveSigmaAtReferenceSignal
-         << ";physicalNoiseModelMode=" << noiseModelModeName(meta.calibration.noiseModelMode)
-         << ";spectraProcessingMode=" << noiseModelModeName(meta.calibration.spectraProcessingMode)
+         << ";physicalNoiseModelAvailable=" << (meta.calibration.physicalNoiseModelAvailable() ? "true" : "false")
+         << ";spectraProcessingMode=" << spectraProcessingModeName(meta.calibration.spectraProcessingMode)
          << ";spectraSignalModelConfidence=" << meta.calibration.signalModelConfidence
          << "}";
     return diag.str();
@@ -3011,32 +2992,27 @@ SpectraIsoAdaptiveState IspCore::resolveSpectraIsoAdaptiveState(
     state.modelNoisePressure = smoothstepIsp(-16.5f, -8.5f, logVariance);
 
     const float confidence = std::clamp(meta.calibration.signalModelConfidence, 0.0f, 1.0f);
-    // Phase 0220: the physical S/O model is the primary evidence. ISO is a fallback context only
-    // for unavailable or lower-confidence models; a fully trusted model receives 100% authority.
+    // The already-resolved physical S/O model is the only noise evidence authority here. ISO is
+    // context/telemetry only and cannot create a fallback model. Kotlin has already validated RAW
+    // normalization/CFA before marking the profile applied; native revalidates the frozen S/O once.
     // No lens id or lens role participates in this decision.
     const auto noiseAuthority = bncam::spectra::resolveSpectraNoiseAuthority(
             state.modelNoisePressure,
             state.isoPressure,
             confidence,
-            meta.calibration.noiseProfileApplied,
-            meta.calibration.normalizationCalibrationValid,
-            meta.calibration.cfaSupportedForBayerNoiseModel,
-            validChannels);
+            meta.calibration.physicalNoiseModelAvailable() && validChannels == 4);
     state.combinedNoisePressure = noiseAuthority.combinedNoisePressure;
 
-    // Read-only SPECTRA observer telemetry retains its historical lens/component shaping.
-    // Phase-6 neural master authority must NOT distort the physical evidence snapshot; before
-    // Phase 6 this profile master was always runtime-neutral here, so keep exact 1.0 behavior.
-    const float dynamicUserGain = 1.0f + std::clamp(uiConfig.lensDynamicIsoCoeff, 0.0f, 1.0f) *
-            smoothstepIsp(0.0f, 6.0f, state.isoEvAbove100);
+    // SPECTRA consumes the already-resolved physical noise evidence. Physical Dynamic ISO is
+    // not re-applied here; only explicit SPECTRA profile controls may shape SPECTRA authority.
     const float profileOverall = 1.0f;
     const float profileLuma = std::exp2(std::clamp(uiConfig.profileSpectraLuma, -1.0f, 1.0f) * 0.75f);
     const float profileChroma = std::exp2(std::clamp(uiConfig.profileSpectraChroma, -1.0f, 1.0f) * 0.75f);
     const float profileLowFrequency = std::exp2(std::clamp(uiConfig.profileSpectraLowFrequency, -1.0f, 1.0f) * 0.75f);
-    const float lumaUser = std::sqrt(std::clamp(uiConfig.lumaUserScale, 0.25f, 2.0f)) * profileOverall * profileLuma;
-    const float chromaUser = std::sqrt(std::clamp(uiConfig.chromaUserScale, 0.25f, 2.5f)) * profileOverall * profileChroma;
+    const float lumaUser = profileOverall * profileLuma;
+    const float chromaUser = profileOverall * profileChroma;
     state.lumaAuthority = std::clamp(
-            (0.20f + 0.95f * state.combinedNoisePressure) * lumaUser * dynamicUserGain,
+            (0.20f + 0.95f * state.combinedNoisePressure) * lumaUser,
             0.10f,
             1.65f
     );
@@ -3044,7 +3020,7 @@ SpectraIsoAdaptiveState IspCore::resolveSpectraIsoAdaptiveState(
     // now measures structure relative to the predicted CFA noise floor instead
     // of treating dark sensor noise as protected detail.
     state.chromaAuthority = std::clamp(
-            (0.28f + 1.08f * state.combinedNoisePressure) * chromaUser * dynamicUserGain,
+            (0.28f + 1.08f * state.combinedNoisePressure) * chromaUser,
             0.18f,
             1.50f
     );
@@ -4175,7 +4151,7 @@ std::string SpectraPass1State::formatDebugString() const {
     std::ostringstream out;
     out << std::fixed << std::setprecision(4);
     out << "spectraNoiseObserver={"
-        << "mode=" << (spectraMode == 1 ? "auto" : (spectraMode == 2 ? "manual" : "off"))
+        << "mode=" << spectraProcessingModeName(spectraMode)
         << ";modelConfidence=" << modelConfidence
         << ";isoEvidenceAuthority=" << isoAuthority
         << ";combinedNoisePressure=" << combinedNoisePressure
@@ -4256,7 +4232,7 @@ std::string SpectraPass2State::formatDebugString() const {
     std::ostringstream out;
     out << std::fixed << std::setprecision(4);
     out << "spectraCfaBandObserver={"
-        << "mode=" << (spectraMode == 1 ? "auto" : (spectraMode == 2 ? "manual" : "off"))
+        << "mode=" << spectraProcessingModeName(spectraMode)
         << ";status=" << observerStatus
         << ";modelConfidence=" << modelConfidence
         << ";bandEnergyStatus=" << bandEnergyStatus
@@ -4784,7 +4760,7 @@ std::string SpectraBudgetState::formatDebugString() const {
     std::ostringstream out;
     out << std::fixed << std::setprecision(6);
     out << "spectraBudget={"
-        << "mode=" << (spectraMode == 1 ? "auto" : (spectraMode == 2 ? "manual" : "legacy"))
+        << "mode=" << spectraProcessingModeName(spectraMode)
         << ";applied=" << (applied ? "true" : "false")
         << ";targetFloor=" << predictedNoiseFloor
         << ";initialEnergy=" << initialResidualEnergy
@@ -4933,9 +4909,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             : computeRawShadowDiagnostics(workingRaw, workingMeta, uiConfig);
     const SpectraIsoAdaptiveState isoState = IspCore::resolveSpectraIsoAdaptiveState(workingMeta, uiConfig);
     const bool preDemosaicPhysicalNoiseModelAvailable =
-            workingMeta.calibration.noiseModelMode != 0 &&
-            workingMeta.calibration.hasNoiseProfile &&
-            workingMeta.calibration.noiseProfileApplied &&
+            workingMeta.calibration.physicalNoiseModelAvailable() &&
             workingMeta.calibration.signalModelConfidence >= 0.25f;
     SpectraIsoAdaptiveState preDemosaicAuthorityState = isoState;
     // Phase N006A: SPECTRA Core is measurement/conditioning only. The classical RAW
@@ -5594,8 +5568,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         request.cfaOffsetY = jpegRaw.info.cfaOffsetY;
         request.isRaw10 = meta.isRaw10;
         request.adaptiveExposureEnabled = false;
-        request.noiseModelValid = meta.calibration.noiseProfileApplied &&
-                meta.calibration.normalizationCalibrationValid &&
+        request.noiseModelValid = meta.calibration.physicalNoiseModelAvailable() &&
                 meta.calibration.signalModelConfidence > 0.0f;
         for (int ch = 0; ch < 4; ++ch) {
             request.effectiveS[static_cast<std::size_t>(ch)] =
@@ -6756,9 +6729,8 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     // N004: automatic Phase-11 physical detail recovery is retired. S/O remains read-only
     // sensor/noise evidence for explicit profile-owned detail, but it may not activate or scale
     // a separate capture-detail pixel owner. Keep the residual state as an exact identity edge.
-    const bool perceptualDetailPhysicalNoiseAvailable = meta.calibration.noiseModelMode != 0 &&
-            meta.calibration.hasNoiseProfile && meta.calibration.noiseProfileApplied &&
-            meta.calibration.noiseProfilePairCount > 0;
+    const bool perceptualDetailPhysicalNoiseAvailable =
+            meta.calibration.physicalNoiseModelAvailable();
     residualNoiseState.postLinearDetail = residualNoiseState.postColourTransform;
     residualNoiseState.linearDetailPropagationMs = 0.0f;
 
@@ -8148,8 +8120,8 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     // === PHASE N003: NEUTRAL POST-TONE PATH ===
     // Sensor S/O and propagated covariance remain measurement-only. None of the values below
     // grants post-demosaic pixel authority; the future SPECTRA Neural owner will consume them.
-    const bool physicalNoiseModelAvailable = meta.calibration.noiseModelMode != 0 &&
-            meta.calibration.hasNoiseProfile && meta.calibration.noiseProfileApplied;
+    const bool physicalNoiseModelAvailable =
+            meta.calibration.physicalNoiseModelAvailable();
 
     std::ostringstream nativeNoiseSo;
     nativeNoiseSo << std::setprecision(17) << "[";
@@ -9052,8 +9024,8 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; meanNormalizedNoiseSignal=" << g_threadLocalIspStats.meanNormalizedNoiseSignal
             << "; minNormalizedNoiseSignal=" << g_threadLocalIspStats.minNormalizedNoiseSignal
             << "; maxNormalizedNoiseSignal=" << g_threadLocalIspStats.maxNormalizedNoiseSignal
-            << "; noiseModelMode=" << noiseModelModeName(meta.calibration.noiseModelMode)
-            << "; spectraProcessingMode=" << noiseModelModeName(meta.calibration.spectraProcessingMode)
+            << "; physicalNoiseModelAvailable=" << (meta.calibration.physicalNoiseModelAvailable() ? "true" : "false")
+            << "; spectraProcessingMode=" << spectraProcessingModeName(meta.calibration.spectraProcessingMode)
             << "; physicalChromaNoiseRequested=" << (physicalChromaNoiseRequested ? "true" : "false")
             << "; noiseModelSoReceivedByCpp=" << nativeNoiseSo.str()
             << "; noiseModelApplied=" << (g_threadLocalIspStats.noiseModelApplied ? "yes" : "no")
@@ -9434,7 +9406,6 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; spatialExposureNoiseScaleRms=" << spatialExposureNoiseScale
             << "; spatialExposureMeanGainSquared=" << spatialExposureMeanGainSquared
             << "; noiseMapCoordinateSpace=" << g_spatialNoiseMap.rawWidth << "x" << g_spatialNoiseMap.rawHeight
-            << "; lensIsoNrMode=" << uiConfig.lensIsoNrMode
             << "; frameIso=" << actualIso
             << "; absoluteMeanLumaSigma=" << g_threadLocalIspStats.absoluteMeanLumaSigma
             << "; absoluteMeanChromaSigma=" << g_threadLocalIspStats.absoluteMeanChromaSigma
@@ -10337,13 +10308,14 @@ std::string IspCore::validateNoiseModelImplementation(
     auto metadataFor = [](int mode, const std::array<double, 8>& values) {
         IspFrameMetadata meta{};
         meta.cfaPattern = CFA_BGGR;
-        meta.calibration.noiseModelMode = mode;
-        meta.calibration.hasNoiseProfile = true;
-        meta.calibration.noiseProfileApplied = true;
-        meta.calibration.noiseProfilePairCount = 4;
-        meta.calibration.noiseProfileChannelCount = 4;
-        meta.calibration.spectraSnapshotPresent = mode != 0;
-        meta.calibration.signalModelConfidence = mode != 0 ? 1.0f : 0.0f;
+        const bool physicalAvailable = mode != 0;
+        meta.calibration.hasNoiseProfile = physicalAvailable;
+        meta.calibration.noiseProfileApplied = physicalAvailable;
+        meta.calibration.noiseProfileValid = physicalAvailable;
+        meta.calibration.noiseProfilePairCount = physicalAvailable ? 4 : 0;
+        meta.calibration.noiseProfileChannelCount = physicalAvailable ? 4 : 0;
+        meta.calibration.spectraSnapshotPresent = physicalAvailable;
+        meta.calibration.signalModelConfidence = physicalAvailable ? 1.0f : 0.0f;
         meta.calibration.postRawSensitivityBoost = 100;
         for (int i = 0; i < 8; ++i) {
             meta.calibration.effectiveNoiseProfile[i] = values[static_cast<size_t>(i)];
@@ -10368,9 +10340,6 @@ std::string IspCore::validateNoiseModelImplementation(
     const ThreadLocalIspStats highStats = g_threadLocalIspStats;
 
     NativeRenderQualityConfig spectraConfig{};
-    spectraConfig.lumaUserScale = 1.0f;
-    spectraConfig.chromaUserScale = 1.0f;
-    spectraConfig.lensDynamicIsoCoeff = 0.5f;
     IspFrameMetadata isoLowMeta = metadataFor(1, highNoiseSo);
     IspFrameMetadata isoMidMeta = metadataFor(1, highNoiseSo);
     IspFrameMetadata isoHighMeta = metadataFor(1, highNoiseSo);

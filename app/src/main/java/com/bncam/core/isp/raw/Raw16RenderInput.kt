@@ -9,7 +9,10 @@ import com.bncam.core.isp.raw10.DngWriter
 import com.bncam.core.isp.raw10.RawCameraColorProfileRepository
 import com.bncam.core.quality.FinalSensorCalibration
 import com.bncam.core.quality.FocusConfidenceState
-import com.bncam.core.quality.withSpectraMergeStats
+import com.bncam.core.quality.withPhysicalCaptureIdentity
+import com.bncam.core.quality.withPhysicalNoiseAuthority
+import com.bncam.core.quality.withPhysicalMergeStats
+import com.bncam.core.quality.withSpectraNoiseAdapter
 import com.bncam.core.quality.RenderQualityConfig
 
 data class DemosaicAfHints(
@@ -162,6 +165,14 @@ object SingleRaw16FrameBuilder {
         } else {
             arrayOf(buffer)
         }
+        val shutterCalibration = qualityConfig.finalCalibration?.withPhysicalCaptureIdentity(
+            sourceFormat = RenderQualityConfig.formatLabel(sourceFormat),
+            captureIso = captureResult?.get(CaptureResult.SENSOR_SENSITIVITY) ?: 0,
+            exposureTimeNs = captureResult?.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 0L,
+            postRawSensitivityBoost = captureResult?.get(CaptureResult.CONTROL_POST_RAW_SENSITIVITY_BOOST),
+            cfaPattern = qualityConfig.cfaPattern
+        )?.withPhysicalNoiseAuthority()
+            ?.withSpectraNoiseAdapter()
         val nativeRaw16Buffer = when (sourceFormat) {
             ImageFormat.RAW10 -> ImageUtils.mergeRaw10NativeRaw16Safe(
                 lensId = lensId,
@@ -172,7 +183,7 @@ object SingleRaw16FrameBuilder {
                 maxFramesCap = sourceBuffers.size,
                 maxShiftPixels = if (sourceBuffers.size > 1) 32 else 0,
                 alignmentStrictness = 0.9f,
-                finalCalibration = qualityConfig.finalCalibration,
+                finalCalibration = shutterCalibration,
                 fuseSupportFrames = false
             )
             ImageFormat.RAW_SENSOR -> ImageUtils.mergeRawSensorNativeRaw16Safe(
@@ -184,7 +195,7 @@ object SingleRaw16FrameBuilder {
                 maxFramesCap = sourceBuffers.size,
                 maxShiftPixels = if (sourceBuffers.size > 1) 32 else 0,
                 alignmentStrictness = 0.9f,
-                finalCalibration = qualityConfig.finalCalibration,
+                finalCalibration = shutterCalibration,
                 fuseSupportFrames = false
             )
             else -> null
@@ -200,7 +211,8 @@ object SingleRaw16FrameBuilder {
         }
         return try {
             val stats = ImageUtils.lastDngMergeStats()
-            val spectraCalibration = qualityConfig.finalCalibration?.withSpectraMergeStats(stats)
+            val physicalNoiseCalibration = shutterCalibration
+                ?.withPhysicalMergeStats(stats)
             val finalContract = RawDomainContractResolver.resolve(
                 lensId = lensId,
                 sourceFormat = sourceFormat,
@@ -230,7 +242,7 @@ object SingleRaw16FrameBuilder {
                 sourceFormat = sourceFormat,
                 captureResult = captureResult,
                 characteristics = characteristics,
-                calibration = spectraCalibration
+                calibration = physicalNoiseCalibration
             )
             SingleRaw16Frame(
                 lensId = lensId,
@@ -243,7 +255,7 @@ object SingleRaw16FrameBuilder {
                 cfaPattern = qualityConfig.cfaPattern,
                 orientationDegrees = orientationDegrees,
                 dngMergeStats = stats,
-                finalCalibration = spectraCalibration,
+                finalCalibration = physicalNoiseCalibration,
                 rawFrameInfo = finalContract,
                 knownHotPixelMap = hotPixelMap,
                 demosaicAfHints = demosaicAfHints,

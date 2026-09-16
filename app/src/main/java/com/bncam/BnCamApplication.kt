@@ -9,12 +9,19 @@ import com.bncam.core.runtime.ViewfinderStartupGate
 import com.bncam.core.vulkan.VulkanRuntimeConfig
 import com.bncam.core.vulkan.VulkanRuntimeOwner
 import com.bncam.core.vulkan.SpectraNeuralModelInstaller
+import com.bncam.data.settings.PhysicalNoiseModelRuntimeRegistry
 import org.lsposed.hiddenapibypass.HiddenApiBypass
 
 class BnCamApplication : Application() {
     override fun onCreate() {
         val applicationOnCreateStartNs = SystemClock.elapsedRealtimeNanos()
         super.onCreate()
+
+        // Process context only; no DataStore read or noise-model parsing is performed at startup.
+        // The capture registry lazily resolves the first shutter-time snapshot and then caches it.
+        BnCamProcessContext.initialize(applicationContext)
+        PhysicalNoiseModelRuntimeRegistry.initialize(applicationContext)
+
         Phase0PerformanceTrace.applicationOnCreateStarted(this, applicationOnCreateStartNs)
 
         // Preserve the existing startup prerequisite before any native engine work begins.

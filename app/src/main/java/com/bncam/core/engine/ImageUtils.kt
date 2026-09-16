@@ -448,9 +448,6 @@ object ImageUtils {
                 buffers = buffers,
                 lensId = lensId,
                 jpegQuality = post?.jpegQuality ?: 98,
-                lensIsoNrMode = qualityConfig?.lensHardwareSettings?.isoNrNativeMode ?: 0,
-                lensDynamicIsoCoeff = qualityConfig?.lensHardwareSettings?.dynamicIsoCoeff ?: 0.0f,
-                lensManualIsoValue = qualityConfig?.lensHardwareSettings?.manualIsoValue ?: 0.0f,
                 captureSensitivityIso = captureSensitivityIso,
                 rotationDegrees = rotationDegrees,
                 profileYuvWbRed = yuvAwbCompensation[0],
@@ -669,11 +666,6 @@ object ImageUtils {
         val spectraCameraO = spectraSnapshot?.cameraO ?: DoubleArray(0)
         val spectraEffectiveS = spectraSnapshot?.effectiveS ?: DoubleArray(0)
         val spectraEffectiveO = spectraSnapshot?.effectiveO ?: DoubleArray(0)
-        val lensIsoNrMode = qualityConfig?.lensHardwareSettings?.isoNrNativeMode ?: 0
-        // Lens Dynamic ISO remains a hardware/observer policy. Phase-6 neural Adaptive Response
-        // is an independent profile control and must never be folded into this coefficient.
-        val lensDynamicIsoCoeff = qualityConfig?.lensHardwareSettings?.dynamicIsoCoeff ?: 0.0f
-        val lensManualIsoValue = qualityConfig?.lensHardwareSettings?.manualIsoValue ?: 0.0f
         val lensShadingMap = captureResult.toNativeLensShadingMap()
         val curves = qualityConfig?.curves
         val routeLabel = if (masterFrame.frameCount == 1) {
@@ -776,11 +768,6 @@ object ImageUtils {
                 colorMatrixFromMetadata = finalCal?.effectiveColorMatrixSource?.let { source ->
                     source.contains("CaptureResult", ignoreCase = true) || source.contains("CameraCharacteristics", ignoreCase = true)
                 } ?: (colorMatrix?.fromMetadata ?: false),
-                sensorNoiseModelMode = when (finalCal?.noiseModelMode) {
-                    "Auto" -> 1
-                    "Manual" -> 2
-                    else -> 0
-                },
                 spectraProcessingEnabled = finalCal?.spectraProcessingEnabled == true,
                 sensorNoiseProfile = nativeNoiseProfile,
                 sensorNoiseProfilePresent = finalCal?.effectiveNoiseProfile != null,
@@ -795,15 +782,6 @@ object ImageUtils {
                 spectraEffectiveO = spectraEffectiveO,
                 spectraSignalModelConfidence = spectraSnapshot?.signalModelConfidence ?: 0.0f,
                 spectraPostRawSensitivityBoost = capturePostRawSensitivityBoost,
-                lensIsoNrMode = lensIsoNrMode,
-                lensDynamicIsoCoeff = lensDynamicIsoCoeff,
-                lensManualIsoValue = lensManualIsoValue,
-                noiseModelCalibrationAdjustment = qualityConfig?.lensHardwareSettings?.noiseModelCalibrationAdjustment ?: 0.0f,
-                dynamicChromaAuthorityAdjustment = qualityConfig?.lensHardwareSettings?.dynamicChromaAuthorityAdjustment ?: 0.0f,
-                dynamicLumaAuthorityAdjustment = qualityConfig?.lensHardwareSettings?.dynamicLumaAuthorityAdjustment ?: 0.0f,
-                noiseModelCalibrationFactor = qualityConfig?.lensHardwareSettings?.noiseModelCalibrationFactor ?: 1.0f,
-                effectiveChromaAuthorityStops = qualityConfig?.lensHardwareSettings?.effectiveChromaAuthorityStops ?: 4.0f,
-                effectiveLumaAuthorityStops = qualityConfig?.lensHardwareSettings?.effectiveLumaAuthorityStops ?: 2.25f,
                 profileSpectraStrength = qualityConfig?.profileNoiseTuning?.neuralDenoiseStrength
                     ?: SpectraProfileDefaults.MASTER_STRENGTH,
                 profileSpectraLuma = qualityConfig?.profileNoiseTuning?.spectraLuma ?: 0.0f,
@@ -1345,9 +1323,6 @@ object ImageUtils {
         buffers: Array<HardwareBuffer>,
         lensId: String,
         jpegQuality: Int,
-        lensIsoNrMode: Int,
-        lensDynamicIsoCoeff: Float,
-        lensManualIsoValue: Float,
         captureSensitivityIso: Int,
         rotationDegrees: Int,
         profileYuvWbRed: Float,
@@ -1581,7 +1556,6 @@ object ImageUtils {
         wbFromMetadata: Boolean,
         colorMatrix: FloatArray,
         colorMatrixFromMetadata: Boolean,
-        sensorNoiseModelMode: Int,
         spectraProcessingEnabled: Boolean,
         sensorNoiseProfile: DoubleArray,
         sensorNoiseProfilePresent: Boolean,
@@ -1596,15 +1570,6 @@ object ImageUtils {
         spectraEffectiveO: DoubleArray,
         spectraSignalModelConfidence: Float,
         spectraPostRawSensitivityBoost: Int,
-        lensIsoNrMode: Int,
-        lensDynamicIsoCoeff: Float,
-        lensManualIsoValue: Float,
-        noiseModelCalibrationAdjustment: Float,
-        dynamicChromaAuthorityAdjustment: Float,
-        dynamicLumaAuthorityAdjustment: Float,
-        noiseModelCalibrationFactor: Float,
-        effectiveChromaAuthorityStops: Float,
-        effectiveLumaAuthorityStops: Float,
         profileSpectraStrength: Float,
         profileSpectraLuma: Float,
         profileSpectraChroma: Float,
@@ -1685,15 +1650,6 @@ object ImageUtils {
         return try {
             updateHardwareConfigNative(
                 lensId = settings.lensId,
-                noiseModelType = settings.noiseModelNativeMode,
-                noiseA = settings.nativeNoiseA(),
-                noiseB = settings.nativeNoiseB(),
-                noiseC = settings.nativeNoiseC(),
-                noiseD = settings.nativeNoiseD(),
-                isoStep = settings.isoStep,
-                isoNrStyle = settings.isoNrNativeMode,
-                dynamicIsoCoeff = settings.dynamicIsoCoeff,
-                manualIsoValue = settings.manualIsoValue,
                 blMode = settings.blackLevelNativeMode,
                 dynamicBl = settings.dynamicBlackLevelPercent,
                 manualBl = settings.nativeManualBlackLevels(),
@@ -1714,8 +1670,6 @@ object ImageUtils {
     @JvmStatic
     external fun updateHardwareConfigNative(
         lensId: String,
-        noiseModelType: Int, noiseA: FloatArray?, noiseB: FloatArray?, noiseC: FloatArray?, noiseD: FloatArray?, isoStep: Float,
-        isoNrStyle: Int, dynamicIsoCoeff: Float, manualIsoValue: Float,
         blMode: Int, dynamicBl: Float, manualBl: FloatArray?,
         cmMode: Int, manualCm: FloatArray?,
         awbMode: Int, awbRatio: Float, awbTemp: Float, awbIntensity: Float

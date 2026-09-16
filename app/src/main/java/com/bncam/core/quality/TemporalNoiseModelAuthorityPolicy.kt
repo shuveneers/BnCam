@@ -23,14 +23,15 @@ internal data class TemporalNoiseModelDecision(
 }
 
 /**
- * Separates physical Camera2 S/O availability from optional SPECTRA adaptation.
+ * Final temporal/native consumer policy after physical-noise authority migration.
  *
- * The physical baseline is valid when the camera supplied a usable SENSOR_NOISE_PROFILE
- * and the resolved calibration confirms that the model is valid in the normalized Bayer
- * domain. SPECTRA Off therefore does not mean "no physical noise model".
+ * Production authority is exclusively the immutable shutter-time physical snapshot. Legacy
+ * FinalSensorCalibration S/O, Camera2-validity flags and retired Off/Auto/Manual mode strings are
+ * accepted in the call signature only until the JNI transport is simplified; they can no longer
+ * create, replace or rescue physical authority.
  *
- * Adaptive S/O re-fitting remains SPECTRA-owned. In the physical baseline the native
- * temporal observer receives fixed adaptation bounds [1,1].
+ * SPECTRA is a downstream add-on. Its effective on/off decision changes only SPECTRA processing;
+ * it never changes the physical S/O vectors or their confidence.
  */
 internal object TemporalNoiseModelAuthorityPolicy {
     fun resolve(
@@ -46,59 +47,42 @@ internal object TemporalNoiseModelAuthorityPolicy {
         normalizationCalibrationValid: Boolean,
         cfaSupportedForBayerNoiseModel: Boolean
     ): TemporalNoiseModelDecision {
-        val adaptive = spectraProcessingEnabled &&
-            !spectraModeName.isNullOrBlank() &&
-            !spectraModeName.equals("Legacy", ignoreCase = true) &&
-            !spectraModeName.equals("Off", ignoreCase = true)
-
-        val physicalCameraModelValid =
-            cameraNoiseProfilePresent &&
-            cameraNoiseProfileValid &&
-            effectiveNoiseProfileApplied &&
-            normalizationCalibrationValid &&
-            cfaSupportedForBayerNoiseModel
-
-        // Preserve the established Manual/Auto SPECTRA path even when it is not sourced
-        // from Camera2. The new physical path is stricter and requires Camera2 authority.
-        if (!adaptive && !physicalCameraModelValid) {
-            return TemporalNoiseModelDecision.disabled("NO_VALID_CAMERA2_PHYSICAL_SO")
-        }
-
         val snapshotS = snapshotEffectiveS?.takeIf(::validFour)
         val snapshotO = snapshotEffectiveO?.takeIf(::validFour)
-        val profile = effectiveNoiseProfile?.takeIf { values ->
-            values.size >= 8 && values.take(8).all { it.isFinite() && it >= 0.0 }
-        }
-        val profileS = profile?.let { DoubleArray(4) { ch -> it[ch * 2] } }
-        val profileO = profile?.let { DoubleArray(4) { ch -> it[ch * 2 + 1] } }
-
-        val s = snapshotS ?: profileS
-        val o = snapshotO ?: profileO
-        if (s == null || o == null || !hasEnergy(s, o)) {
-            return TemporalNoiseModelDecision.disabled("VALIDITY_FLAGS_WITHOUT_USABLE_SO")
+        if (snapshotS == null || snapshotO == null || !hasEnergy(snapshotS, snapshotO)) {
+            return TemporalNoiseModelDecision.disabled("PHYSICAL_SHUTTER_SNAPSHOT_REQUIRED")
         }
 
-        val mode = if (adaptive) {
-            if (spectraModeName.equals("Manual", ignoreCase = true)) 2 else 1
-        } else {
-            0
-        }
-        val confidence = (snapshotConfidence ?: 1.0f)
-            .takeIf { it.isFinite() }
-            ?.coerceIn(0.0f, 1.0f)
-            ?: 1.0f
+        // The frozen physical snapshot is deterministic capture authority. SPECTRA fit/observer
+        // confidence is a separate processing metric and must never reduce physical confidence.
+        val physicalConfidence = 1.0f
+        val spectraEnabled = spectraProcessingEnabled
+
+        // Keep compatibility parameters referenced while old call sites/JNI fields still exist.
+        // None of them is allowed to participate in the authority decision anymore.
+        @Suppress("UNUSED_VARIABLE")
+        val retiredCompatibilityInputs = listOf(
+            spectraModeName,
+            snapshotConfidence,
+            effectiveNoiseProfile?.size,
+            effectiveNoiseProfileApplied,
+            cameraNoiseProfilePresent,
+            cameraNoiseProfileValid,
+            normalizationCalibrationValid,
+            cfaSupportedForBayerNoiseModel
+        )
 
         return TemporalNoiseModelDecision(
             enabled = true,
-            adaptiveSpectraCalibration = adaptive,
-            spectraMode = mode,
-            effectiveS = s.copyOf(4),
-            effectiveO = o.copyOf(4),
-            confidence = confidence,
-            authoritySource = if (adaptive) {
-                "SPECTRA_ADAPTIVE_SO"
+            adaptiveSpectraCalibration = spectraEnabled,
+            spectraMode = if (spectraEnabled) 1 else 0,
+            effectiveS = snapshotS.copyOf(4),
+            effectiveO = snapshotO.copyOf(4),
+            confidence = physicalConfidence,
+            authoritySource = if (spectraEnabled) {
+                "SPECTRA_ADDON_CONSUMES_PHYSICAL_SHUTTER_SO"
             } else {
-                "PHYSICAL_CAMERA2_FIXED_SO"
+                "PHYSICAL_SHUTTER_SNAPSHOT_FIXED_SO"
             }
         )
     }

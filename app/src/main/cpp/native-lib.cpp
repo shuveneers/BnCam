@@ -381,15 +381,6 @@ NativeRenderQualityConfig makeQualityConfig(
         jfloatArray colorMatrixArray,
         jboolean colorMatrixFromMetadata,
         jint jpegQuality,
-        jint lensIsoNrMode,
-        jfloat lensDynamicIsoCoeff,
-        jfloat lensManualIsoValue,
-        jfloat noiseModelCalibrationAdjustment,
-        jfloat dynamicChromaAuthorityAdjustment,
-        jfloat dynamicLumaAuthorityAdjustment,
-        jfloat noiseModelCalibrationFactor,
-        jfloat effectiveChromaAuthorityStops,
-        jfloat effectiveLumaAuthorityStops,
         jfloat profileSpectraStrength,
         jfloat profileSpectraLuma,
         jfloat profileSpectraChroma,
@@ -424,9 +415,6 @@ NativeRenderQualityConfig makeQualityConfig(
     cfg.wbFromMetadata = wbFromMetadata == JNI_TRUE;
     cfg.colorMatrixFromMetadata = colorMatrixFromMetadata == JNI_TRUE;
 
-    cfg.lensIsoNrMode = std::clamp(static_cast<int>(lensIsoNrMode), 0, 2);
-    cfg.lensDynamicIsoCoeff = std::isfinite(lensDynamicIsoCoeff) ? std::clamp(lensDynamicIsoCoeff, 0.0f, 1.0f) : 0.0f;
-    cfg.lensManualIsoValue = std::isfinite(lensManualIsoValue) ? std::max(0.0f, lensManualIsoValue) : 0.0f;
     // Phase 6 neural RAW controls. Master is direct unit authority; existing component
     // values retain their signed profile storage and are projected in the production policy.
     cfg.profileSpectraStrength = std::isfinite(profileSpectraStrength)
@@ -463,24 +451,6 @@ NativeRenderQualityConfig makeQualityConfig(
     cfg.profileDetailRadius = bncam::profile_defaults::kDetailMinRadius;
     cfg.profileDetailDetail = bncam::profile_microdetail_transport::encodePair(profileDetailDetail, profileLegibility);
     cfg.profileDetailMasking = std::isfinite(profileDetailMasking) ? std::clamp(profileDetailMasking, -1.0f, 1.0f) : bncam::profile_defaults::kDetailMasking;
-
-    cfg.noiseModelCalibrationAdjustment = std::isfinite(noiseModelCalibrationAdjustment)
-            ? std::clamp(noiseModelCalibrationAdjustment, -1.0f, 1.0f) : 0.0f;
-    cfg.dynamicChromaAuthorityAdjustment = std::isfinite(dynamicChromaAuthorityAdjustment)
-            ? std::clamp(dynamicChromaAuthorityAdjustment, -1.0f, 1.0f) : 0.0f;
-    cfg.dynamicLumaAuthorityAdjustment = std::isfinite(dynamicLumaAuthorityAdjustment)
-            ? std::clamp(dynamicLumaAuthorityAdjustment, -1.0f, 1.0f) : 0.0f;
-    cfg.noiseModelCalibrationFactor = std::isfinite(noiseModelCalibrationFactor)
-            ? std::clamp(noiseModelCalibrationFactor, 0.25f, 4.0f) : 1.0f;
-    cfg.effectiveChromaAuthorityStops = std::isfinite(effectiveChromaAuthorityStops)
-            ? std::clamp(effectiveChromaAuthorityStops, 0.0f, 5.0f) : 4.0f;
-    cfg.effectiveLumaAuthorityStops = std::isfinite(effectiveLumaAuthorityStops)
-            ? std::clamp(effectiveLumaAuthorityStops, 0.0f, 3.5f) : 2.25f;
-    cfg.chromaUserScale = std::pow(2.0f, cfg.lensDynamicIsoCoeff * cfg.effectiveChromaAuthorityStops);
-    cfg.lumaUserScale = std::pow(2.0f, cfg.lensDynamicIsoCoeff * cfg.effectiveLumaAuthorityStops);
-    cfg.outerRingAuthority = (cfg.lensDynamicIsoCoeff > 0.0f && cfg.effectiveChromaAuthorityStops > 0.0f)
-            ? smoothstepIsp(0.35f, 0.85f, cfg.lensDynamicIsoCoeff * std::clamp(cfg.effectiveChromaAuthorityStops / 5.0f, 0.0f, 1.0f))
-            : 0.0f;
 
     cfg.toneCurve = extractCurveVector(env, toneCurveArray, 2, 64);
     cfg.gammaCurve = extractCurveVector(env, gammaCurveArray, 2, 64);
@@ -2321,9 +2291,6 @@ Java_com_bncam_core_engine_ImageUtils_processNativeYuv(
         jobjectArray buffersArray,
         jstring lensIdStr,
         jint jpegQuality,
-        jint lensIsoNrMode,
-        jfloat lensDynamicIsoCoeff,
-        jfloat lensManualIsoValue,
         jint captureSensitivityIso,
         jint rotationDegrees,
         jfloat profileYuvWbRed,
@@ -2379,9 +2346,6 @@ Java_com_bncam_core_engine_ImageUtils_processNativeYuv(
 
     NativeRenderQualityConfig yuvQuality{};
     yuvQuality.jpegQuality = jpegQuality;
-    yuvQuality.lensIsoNrMode = std::clamp(static_cast<int>(lensIsoNrMode), 0, 2);
-    yuvQuality.lensDynamicIsoCoeff = std::isfinite(lensDynamicIsoCoeff) ? std::clamp(lensDynamicIsoCoeff, 0.0f, 1.0f) : 0.0f;
-    yuvQuality.lensManualIsoValue = std::isfinite(lensManualIsoValue) ? std::max(0.0f, lensManualIsoValue) : 0.0f;
     yuvQuality.captureSensitivityIso = std::max(0, static_cast<int>(captureSensitivityIso));
     yuvQuality.profileYuvWbRed = std::isfinite(profileYuvWbRed) ? std::clamp(profileYuvWbRed, 0.50f, 2.00f) : 1.0f;
     yuvQuality.profileYuvWbGreen = std::isfinite(profileYuvWbGreen) ? std::clamp(profileYuvWbGreen, 0.50f, 2.00f) : 1.0f;
@@ -2427,11 +2391,6 @@ Java_com_bncam_core_engine_ImageUtils_processNativeYuv(
     yuvQuality.toneCurve = extractCurveVector(env, toneCurveArray, 2, 64);
     yuvQuality.gammaCurve = extractCurveVector(env, gammaCurveArray, 2, 64);
     yuvQuality.sectionCurve = extractCurveVector(env, sectionCurveArray, 2, 64);
-    // FASE 13: retire ISO-derived YUV "physical NR". Camera2 YUV has already passed
-    // through the vendor ISP; only the measured residual frame can establish baseline NR.
-    yuvQuality.yuvLensIsoNoiseReductionBoost = 0.0f;
-    yuvQuality.yuvLensIsoNrApplied = false;
-
     LOGI("NATIVE BRIDGE: YUV engine started with %zu frame(s), lens=%s, jpegQuality=%d", hwBuffers.size(), lensId.c_str(), yuvQuality.jpegQuality);
 
     AHardwareBuffer* anchor = hwBuffers.back();
@@ -2954,8 +2913,6 @@ Java_com_bncam_core_engine_ImageUtils_processNativeYuv(
           << ";yuvResolvedGpuLumaNrProtection=" << nativeFmtMs(encodeTiming.yuvResolvedGpuLumaNrProtection)
           << ";yuvResolvedGpuChromaNrProtection=" << nativeFmtMs(encodeTiming.yuvResolvedGpuChromaNrProtection)
           << ";captureSensitivityIso=" << yuvQuality.captureSensitivityIso
-          << ";yuvLensIsoNrApplied=" << (yuvQuality.yuvLensIsoNrApplied ? "true" : "false")
-          << ";yuvLensIsoNoiseReductionBoost=" << nativeFmtMs(yuvQuality.yuvLensIsoNoiseReductionBoost)
           << ";hwBufferExtractMs=" << nativeFmtMs(hwBufferExtractMs)
           << ";hwBufferDescribeMs=" << nativeFmtMs(hwBufferDescribeMs)
           << ";hwBufferLockMs=" << nativeFmtMs(hwBufferLockMs)
@@ -3398,7 +3355,6 @@ Java_com_bncam_core_engine_ImageUtils_renderJpegFromMasterNative(
         jboolean wbFromMetadata,
         jfloatArray colorMatrixArray,
         jboolean colorMatrixFromMetadata,
-        jint sensorNoiseModelMode,
         jboolean spectraProcessingEnabled,
         jdoubleArray sensorNoiseProfileArray,
         jboolean sensorNoiseProfilePresent,
@@ -3413,15 +3369,6 @@ Java_com_bncam_core_engine_ImageUtils_renderJpegFromMasterNative(
         jdoubleArray spectraEffectiveOArray,
         jfloat spectraSignalModelConfidence,
         jint spectraPostRawSensitivityBoost,
-        jint lensIsoNrMode,
-        jfloat lensDynamicIsoCoeff,
-        jfloat lensManualIsoValue,
-        jfloat noiseModelCalibrationAdjustment,
-        jfloat dynamicChromaAuthorityAdjustment,
-        jfloat dynamicLumaAuthorityAdjustment,
-        jfloat noiseModelCalibrationFactor,
-        jfloat effectiveChromaAuthorityStops,
-        jfloat effectiveLumaAuthorityStops,
         jfloat profileSpectraStrength,
         jfloat profileSpectraLuma,
         jfloat profileSpectraChroma,
@@ -3538,10 +3485,7 @@ Java_com_bncam_core_engine_ImageUtils_renderJpegFromMasterNative(
 
     NativeRenderQualityConfig qualityConfig = makeQualityConfig(
             env, wbGainsArray, wbFromMetadata, colorMatrixArray, colorMatrixFromMetadata,
-            jpegQuality, lensIsoNrMode, lensDynamicIsoCoeff, lensManualIsoValue,
-            noiseModelCalibrationAdjustment, dynamicChromaAuthorityAdjustment,
-            dynamicLumaAuthorityAdjustment, noiseModelCalibrationFactor,
-            effectiveChromaAuthorityStops, effectiveLumaAuthorityStops,
+            jpegQuality,
             profileSpectraStrength, profileSpectraLuma, profileSpectraChroma,
             profileSpectraDetailProtection, profileSpectraLowFrequency,
             profileNrLuminance, profileNrLuminanceDetail, profileNrLuminanceContrast,
@@ -3684,11 +3628,10 @@ Java_com_bncam_core_engine_ImageUtils_renderJpegFromMasterNative(
     }
     meta.calibration.hasColorMatrix = validColorMatrix && nonZeroColorMatrix;
 
-    meta.calibration.noiseModelMode = std::clamp(static_cast<int>(sensorNoiseModelMode), 0, 2);
-    meta.calibration.spectraProcessingMode = spectraProcessingEnabled == JNI_TRUE
-            ? meta.calibration.noiseModelMode
-            : 0;
-    meta.calibration.spectraMode = meta.calibration.spectraProcessingMode;
+    // Physical source identity never crosses JNI. Native receives only the validated frozen S/O.
+    // SPECTRA request intent is a separate boolean and becomes effective only after S/O validates.
+    meta.calibration.spectraProcessingMode = 0;
+    meta.calibration.spectraMode = 0;
     meta.calibration.lensId = lensId;
     const int requestedNoisePairs = std::clamp(static_cast<int>(sensorNoiseProfilePairCount), 0, 8);
     const int requestedNoiseFloats = requestedNoisePairs * 2;
@@ -3721,12 +3664,12 @@ Java_com_bncam_core_engine_ImageUtils_renderJpegFromMasterNative(
         meta.calibration.noiseProfileChannelCount = 0;
         meta.calibration.calibrationWarnings = "SENSOR_NOISE_PROFILE missing or not applied";
     }
-    if (meta.calibration.noiseModelMode == 0) {
-        meta.calibration.hasNoiseProfile = false;
-        meta.calibration.noiseProfileApplied = false;
-        meta.calibration.noiseProfilePairCount = 0;
-        meta.calibration.noiseProfileChannelCount = 0;
-        meta.calibration.calibrationWarnings = "Noise Model Off";
+    const bool physicalNoiseReady = meta.calibration.physicalNoiseModelAvailable();
+    meta.calibration.spectraProcessingMode =
+            spectraProcessingEnabled == JNI_TRUE && physicalNoiseReady ? 1 : 0;
+    meta.calibration.spectraMode = meta.calibration.spectraProcessingMode;
+    if (spectraProcessingEnabled == JNI_TRUE && !physicalNoiseReady) {
+        meta.calibration.calibrationWarnings += "; SPECTRA disabled: physical S/O unavailable";
     }
 
     // SPECTRA receives one immutable shutter-time snapshot. Do not reconstruct these
@@ -4478,15 +4421,6 @@ Java_com_bncam_core_engine_ImageUtils_updateHardwareConfigNative(
         JNIEnv *env,
         jclass clazz,
         jstring lensIdStr,
-        jint noiseModelType,
-        jfloatArray noiseA,
-        jfloatArray noiseB,
-        jfloatArray noiseC,
-        jfloatArray noiseD,
-        jfloat isoStep,
-        jint isoNrStyle,
-        jfloat dynamicIsoCoeff,
-        jfloat manualIsoValue,
         jint blMode,
         jfloat dynamicBl,
         jfloatArray manualBl,

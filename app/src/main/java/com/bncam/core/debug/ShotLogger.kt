@@ -1478,7 +1478,6 @@ class ShotLogger(
         kv("Neighbour delta semantics", stat("yuvInputNeighbourDeltaSemantics"))
         kv("Input Y p0.1 / p50 / p99.9", "${stat("yuvInputNativeYP0_1")} / ${stat("yuvInputNativeYP50")} / ${stat("yuvInputNativeYP99_9")}")
         kv("Input black / white clipped", "${stat("yuvInputBlackClippedFraction")} / ${stat("yuvInputWhiteClippedFraction")}")
-        kv("Physical ISO NR authority", stat("yuvLensIsoNoiseReductionBoost"))
         kv("Resolved Vulkan luma NR blend", stat("yuvResolvedGpuLumaNrBlend"))
         kv("Resolved Vulkan chroma NR blend", stat("yuvResolvedGpuChromaNrBlend"))
         kv("Resolved Vulkan luma/chroma protection", "${stat("yuvResolvedGpuLumaNrProtection")} / ${stat("yuvResolvedGpuChromaNrProtection")}")

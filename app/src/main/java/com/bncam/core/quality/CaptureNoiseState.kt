@@ -1,11 +1,11 @@
 package com.bncam.core.quality
 
 /**
- * Immutable shutter-time source of truth for SPECTRA 2 observability.
+ * Immutable SPECTRA observability/input state derived from the physical shutter model.
  *
- * This contract deliberately keeps Camera2 black levels in mosaic order while S/O arrays use
- * canonical R, G1, G2, B order. It is derived from the existing [NoiseModelSnapshotV3] so the
- * proven capture path remains unchanged during Milestone 1.
+ * This class is not a physical-noise authority. [PhysicalNoiseState] owns the resolved
+ * OEM/System/Manual/Preset S/O. This state only exposes a read-only copy to the optional SPECTRA
+ * add-on together with SPECTRA-specific profile and lens-shading context.
  */
 class CaptureNoiseState(
     val lensKey: String,
@@ -31,9 +31,19 @@ class CaptureNoiseState(
     val lensShadingGainP90: Float?,
     val profileSpectraSettings: ProfileNoiseTuning,
     val modelSourceFlags: Long,
-    /** Physical/effective sensor-model confidence. It does not become zero merely because SPECTRA is Off. */
+    /** Confidence of the physical input model, not SPECTRA fit/adaptation confidence. */
     val modelConfidence: Float,
-    val timestampNs: Long
+    val timestampNs: Long,
+    val physicalNoiseRequestedSource: String = "LEGACY",
+    val physicalNoiseEffectiveSource: String = "LEGACY",
+    val physicalNoiseProvenance: String = "legacy capture noise state",
+    val physicalNoiseFallbackReason: String? = null,
+    val physicalNoiseEffectiveModelIso: Double? = null,
+    val physicalNoiseDynamicIsoEnabled: Boolean = false,
+    val physicalNoiseDynamicIsoCoefficient: Double? = null,
+    val physicalNoiseIsoStep: Double? = null,
+    val physicalNoisePresetName: String? = null,
+    val physicalNoiseSettingsReady: Boolean = true
 ) {
     private val blackLevels = blackLevelMosaicOrder.clone()
     private val cameraSValues = cameraSCanonical.clone()
@@ -47,31 +57,42 @@ class CaptureNoiseState(
     val effectiveSCanonical: DoubleArray get() = effectiveSValues.clone()
     val effectiveOCanonical: DoubleArray get() = effectiveOValues.clone()
 
-    /** Camera2 physical S/O availability; independent from whether SPECTRA mutates pixels. */
-    val physicalNoiseModelAvailable: Boolean
+    /** OEM/Camera2 S/O evidence only. It is not the selected physical-authority test. */
+    val oemNoiseEvidenceAvailable: Boolean
         get() = validSoModel(cameraSValues, cameraOValues)
 
-    /** Effective S/O availability after an explicit manual/fusion authority may have replaced Camera2. */
-    val effectiveNoiseModelAvailable: Boolean
+    /** Selected physical S/O availability after OEM/System/Manual/Preset resolution. */
+    val physicalNoiseModelAvailable: Boolean
         get() = validSoModel(effectiveSValues, effectiveOValues)
 
-    /** Pixel-mutation authority remains separate from sensor-model measurement authority. */
-    val spectraProcessingEnabled: Boolean
-        get() = profileSpectraSettings.spectraEnabled && modelConfidence > 0f
+    /**
+     * Deprecated source-compatibility alias. New code must use [physicalNoiseModelAvailable].
+     * It is intentionally omitted from the V2 trace schema.
+     */
+    @Deprecated("Use physicalNoiseModelAvailable")
+    val effectiveNoiseModelAvailable: Boolean
+        get() = physicalNoiseModelAvailable
 
-    /** Processing confidence is zero when mutation is disabled; physical model confidence is retained above. */
+    /** Pixel-mutation authority remains separate from physical-model availability. */
+    val spectraProcessingEnabled: Boolean
+        get() = profileSpectraSettings.spectraEnabled && physicalNoiseModelAvailable && modelConfidence > 0f
+
+    /** Processing confidence is zero when the optional add-on is disabled. */
     val spectraProcessingConfidence: Float
         get() = if (spectraProcessingEnabled) modelConfidence.coerceIn(0f, 1f) else 0f
 
     init {
         require(lensKey.isNotBlank()) { "lensKey cannot be blank" }
         require(whiteLevel > 0) { "whiteLevel must be > 0" }
-        require(blackLevels.size == 4) { "black levels must contain four mosaic-order values" }
+        require(blackLevels.size == 4) { "black levels must contain four values" }
         require(cameraSValues.size == 4 && cameraOValues.size == 4) {
-            "camera S/O must use canonical R,G1,G2,B order"
+            "camera S/O must use canonical R,Gr,Gb,B order"
         }
         require(effectiveSValues.size == 4 && effectiveOValues.size == 4) {
-            "effective S/O must use canonical R,G1,G2,B order"
+            "effective S/O must use canonical R,Gr,Gb,B order"
+        }
+        require(modelConfidence.isFinite() && modelConfidence in 0f..1f) {
+            "modelConfidence must be finite in [0,1]"
         }
     }
 
@@ -80,15 +101,13 @@ class CaptureNoiseState(
         "sourceFormat" to sourceFormat,
         "sensorPixelMode" to sensorPixelMode,
         "captureIso" to captureIso,
-        // SENSOR_SENSITIVITY is the RAW-domain sensitivity observation. Post-RAW boost is retained
-        // as metadata/telemetry, but 0220 forbids folding it into pre-demosaic RAW noise evidence.
         "rawNoiseEvidenceIso" to captureIso,
         "exposureTimeNs" to exposureTimeNs,
         "postRawSensitivityBoost" to postRawSensitivityBoost,
         "postRawBoostAffectsRawNoiseEvidence" to false,
         "cfaPattern" to cfaPattern,
         "cfaName" to cfaName,
-        "canonicalSoOrder" to "R,G1,G2,B",
+        "canonicalSoOrder" to "R,Gr,Gb,B",
         "blackLevelOrder" to "camera2_2x2_mosaic_order",
         "whiteLevel" to whiteLevel,
         "blackLevelMosaicOrder" to blackLevels.toList(),
@@ -96,8 +115,24 @@ class CaptureNoiseState(
         "cameraOCanonical" to cameraOValues.toList(),
         "effectiveSCanonical" to effectiveSValues.toList(),
         "effectiveOCanonical" to effectiveOValues.toList(),
+        "oemNoiseEvidenceAvailable" to oemNoiseEvidenceAvailable,
         "physicalNoiseModelAvailable" to physicalNoiseModelAvailable,
-        "effectiveNoiseModelAvailable" to effectiveNoiseModelAvailable,
+        "physicalNoiseRequestedSource" to physicalNoiseRequestedSource,
+        "physicalNoiseEffectiveSource" to physicalNoiseEffectiveSource,
+        "physicalNoiseProvenance" to physicalNoiseProvenance,
+        "physicalNoiseFallbackReason" to physicalNoiseFallbackReason,
+        "physicalNoiseEffectiveModelIso" to physicalNoiseEffectiveModelIso,
+        "physicalNoiseDynamicIsoEnabled" to physicalNoiseDynamicIsoEnabled,
+        "physicalNoiseDynamicIsoCoefficient" to physicalNoiseDynamicIsoCoefficient,
+        "physicalNoiseDynamicIsoCoefficientRange" to "0.00..2.00",
+        "physicalNoiseDynamicIsoFormula" to "ISO_NM=trunc(50+k*(ISO_capture-50))",
+        "physicalNoiseIsoStep" to physicalNoiseIsoStep,
+        "physicalNoisePresetName" to physicalNoisePresetName,
+        "physicalNoiseSettingsReady" to physicalNoiseSettingsReady,
+        "physicalNoiseTransportContract" to "V2_EXPLICIT_PHYSICAL_SO",
+        "physicalNoiseSourceIdentityTransport" to "SNAPSHOT_METADATA_ONLY",
+        "spectraIsoFallbackAuthority" to false,
+        "spectraMaySynthesizePhysicalModel" to false,
         "lensShadingAlreadyApplied" to lensShadingAlreadyApplied,
         "lensShadingMapFromMetadata" to lensShadingMapFromMetadata,
         "lensShadingMapColumns" to lensShadingMapColumns,
@@ -111,7 +146,8 @@ class CaptureNoiseState(
         "modelConfidence" to modelConfidence,
         "spectraProcessingEnabled" to spectraProcessingEnabled,
         "spectraProcessingConfidence" to spectraProcessingConfidence,
-        "noiseAuthorityContract" to "PHYSICAL_SO_PRIMARY_ISO_FALLBACK_NO_LENS_ID_STRENGTH_SHORTCUT",
+        "noiseAuthorityContract" to "PHYSICAL_NOISE_STATE_OWNER_SPECTRA_READ_ONLY_CONSUMER",
+        "spectraMayMutatePhysicalSo" to false,
         "timestampNs" to timestampNs
     )
 
@@ -134,11 +170,7 @@ class CaptureNoiseState(
             lensShadingGainP90: Float? = null,
             sensorPixelMode: String = "UNAVAILABLE_IN_V3_SNAPSHOT"
         ): CaptureNoiseState {
-            val cameraS = snapshot.cameraS
-            val cameraO = snapshot.cameraO
-            val effectiveS = snapshot.effectiveS
-            val effectiveO = snapshot.effectiveO
-            val effectiveModelValid = validSoModel(effectiveS, effectiveO)
+            val physical = snapshot.physicalNoiseState()
             return CaptureNoiseState(
                 lensKey = snapshot.lensKey,
                 sourceFormat = snapshot.sourceFormat,
@@ -150,10 +182,10 @@ class CaptureNoiseState(
                 cfaName = snapshot.cfaName,
                 whiteLevel = snapshot.whiteLevel,
                 blackLevelMosaicOrder = snapshot.blackLevel,
-                cameraSCanonical = cameraS,
-                cameraOCanonical = cameraO,
-                effectiveSCanonical = effectiveS,
-                effectiveOCanonical = effectiveO,
+                cameraSCanonical = physical.cameraS,
+                cameraOCanonical = physical.cameraO,
+                effectiveSCanonical = physical.effectiveS,
+                effectiveOCanonical = physical.effectiveO,
                 lensShadingAlreadyApplied = lensShadingAlreadyApplied,
                 lensShadingMapFromMetadata = lensShadingMapFromMetadata,
                 lensShadingMapColumns = lensShadingMapColumns,
@@ -163,12 +195,18 @@ class CaptureNoiseState(
                 lensShadingGainP90 = lensShadingGainP90,
                 profileSpectraSettings = profileNoiseTuning.sanitized(),
                 modelSourceFlags = snapshot.sourceFlags,
-                modelConfidence = if (effectiveModelValid) {
-                    snapshot.signalModelConfidence.coerceIn(0f, 1f)
-                } else {
-                    0f
-                },
-                timestampNs = snapshot.timestampNs
+                modelConfidence = physical.confidence,
+                timestampNs = snapshot.timestampNs,
+                physicalNoiseRequestedSource = physical.requestedSource,
+                physicalNoiseEffectiveSource = physical.effectiveSource,
+                physicalNoiseProvenance = physical.provenance,
+                physicalNoiseFallbackReason = physical.fallbackReason,
+                physicalNoiseEffectiveModelIso = physical.effectiveModelIso,
+                physicalNoiseDynamicIsoEnabled = physical.dynamicIsoEnabled,
+                physicalNoiseDynamicIsoCoefficient = physical.dynamicIsoCoefficient,
+                physicalNoiseIsoStep = physical.isoStep,
+                physicalNoisePresetName = physical.presetName,
+                physicalNoiseSettingsReady = physical.settingsReady
             )
         }
     }

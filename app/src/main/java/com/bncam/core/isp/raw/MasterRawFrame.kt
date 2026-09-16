@@ -6,7 +6,10 @@ import android.hardware.camera2.CaptureResult
 import com.bncam.core.engine.ImageUtils
 import com.bncam.core.quality.RenderQualityConfig
 import com.bncam.core.quality.FinalSensorCalibration
-import com.bncam.core.quality.withSpectraMergeStats
+import com.bncam.core.quality.withPhysicalCaptureIdentity
+import com.bncam.core.quality.withPhysicalNoiseAuthority
+import com.bncam.core.quality.withPhysicalMergeStats
+import com.bncam.core.quality.withSpectraNoiseAdapter
 
 class MasterRawFrame(
     override val lensId: String,
@@ -172,6 +175,9 @@ class MasterRawFrame(
             finalCalibration.debugPairs().forEach { (key, value) ->
                 pairs.add("[CAL] $key" to value)
             }
+            finalCalibration.noiseSnapshot?.physicalNoiseState()?.tracePairs()?.forEach { (key, value) ->
+                pairs.add("[PHYSICAL NOISE] $key" to value)
+            }
 
             // Keep a few legacy keys for existing summary readers, but source them from the central resolver.
             pairs.add("[BASE] Hardware White Level" to "${finalCalibration.base.baseWhiteLevel} (${finalCalibration.base.baseWhiteLevelSource})")
@@ -232,6 +238,14 @@ object RawMasterBuilder {
         colorSensorContributionWeight: Float = 0.0f
     ): MasterRawFrame? {
         val selectedCap = maxFramesCap.coerceAtLeast(1)
+        val shutterCalibration = qualityConfig.finalCalibration?.withPhysicalCaptureIdentity(
+            sourceFormat = RenderQualityConfig.formatLabel(sourceFormat),
+            captureIso = captureResult?.get(CaptureResult.SENSOR_SENSITIVITY) ?: 0,
+            exposureTimeNs = captureResult?.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 0L,
+            postRawSensitivityBoost = captureResult?.get(CaptureResult.CONTROL_POST_RAW_SENSITIVITY_BOOST),
+            cfaPattern = qualityConfig.cfaPattern
+        )?.withPhysicalNoiseAuthority()
+            ?.withSpectraNoiseAdapter()
         val initialContract = RawDomainContractResolver.resolve(
             lensId = lensId,
             sourceFormat = sourceFormat,
@@ -251,7 +265,7 @@ object RawMasterBuilder {
                 maxFramesCap = selectedCap,
                 maxShiftPixels = maxShiftPixels,
                 alignmentStrictness = alignmentStrictness,
-                finalCalibration = qualityConfig.finalCalibration,
+                finalCalibration = shutterCalibration,
                 exposureScaleToAnchor = exposureScaleToAnchor,
                 computationalHdr = computationalHdr
             )
@@ -264,7 +278,7 @@ object RawMasterBuilder {
                 maxFramesCap = selectedCap,
                 maxShiftPixels = maxShiftPixels,
                 alignmentStrictness = alignmentStrictness,
-                finalCalibration = qualityConfig.finalCalibration,
+                finalCalibration = shutterCalibration,
                 exposureScaleToAnchor = exposureScaleToAnchor,
                 computationalHdr = computationalHdr
             )
@@ -282,7 +296,8 @@ object RawMasterBuilder {
 
         return try {
             val dngMergeStats = ImageUtils.lastDngMergeStats()
-            val spectraCalibration = qualityConfig.finalCalibration?.withSpectraMergeStats(dngMergeStats)
+            val physicalNoiseCalibration = shutterCalibration
+                ?.withPhysicalMergeStats(dngMergeStats)
 
             val source = when (sourceFormat) {
                 ImageFormat.RAW10 -> RawInputSource.RAW10
@@ -339,7 +354,7 @@ object RawMasterBuilder {
                 orientationDegrees = orientationDegrees,
                 dngExportRequested = dngExportRequested,
                 dngMergeStats = dngMergeStats,
-                finalCalibration = spectraCalibration,
+                finalCalibration = physicalNoiseCalibration,
                 rawFrameInfo = rawDomainContract,
                 knownHotPixelMap = hotPixelMap,
                 demosaicAfHints = demosaicAfHints,
