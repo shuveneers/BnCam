@@ -4,17 +4,17 @@ namespace bncam::raw_black {
 
 struct SceneBlackAuthorityDecision {
     bool metadataAuthoritative = false;
-    bool imageDerivedMutationAllowed = true;
-    const char* mode = "IMAGE_DERIVED_FALLBACK_PLUS_RESIDUAL";
+    bool imageDerivedMutationAllowed = false;
+    const char* mode = "IMAGE_DERIVED_OBSERVER_ONLY";
 };
 
 /**
- * Camera2 dynamic/static black metadata owns the electronic black-level baseline.
+ * Black Level v2 / RawDomainInfo owns the developed RAW zero point before SPECTRA.
  *
- * A scene-derived estimate is never allowed to replace that baseline. It may,
- * however, remove a *residual* CFA pedestal measured after metadata subtraction.
- * Treating metadata as a ban on residual correction left a measured common-green
- * offset in the normalised RAW data and propagated it through WB/CCM/tone.
+ * The current pre-neural scene-black stage is diagnostic only: it may measure residual CFA/green
+ * pedestal evidence, but it must not mutate pixels or replace the resolved System/Dynamic/Manual
+ * baseline. This also guarantees that Manual remains an exact user override rather than being
+ * silently shifted by a later image-derived pedestal correction.
  */
 constexpr SceneBlackAuthorityDecision resolveSceneBlackAuthority(
         bool dynamicBlackLevelUsed,
@@ -22,10 +22,8 @@ constexpr SceneBlackAuthorityDecision resolveSceneBlackAuthority(
     const bool metadata = dynamicBlackLevelUsed || staticBlackLevelUsed;
     return {
         metadata,
-        true,
-        metadata
-            ? "METADATA_BASELINE_PLUS_CONFIDENCE_GATED_RESIDUAL"
-            : "IMAGE_DERIVED_FALLBACK_PLUS_RESIDUAL"
+        false,
+        metadata ? "METADATA_BASELINE_OBSERVER_ONLY" : "IMAGE_DERIVED_OBSERVER_ONLY"
     };
 }
 

@@ -6,7 +6,6 @@ import kotlin.math.abs
 private fun Float.format3(): String = String.format(Locale.US, "%.3f", this)
 private fun Float.format5(): String = String.format(Locale.US, "%.5f", this)
 private fun List<Float>.formatList(): String = joinToString(prefix = "[", postfix = "]") { it.format5() }
-private fun List<Int>.formatIntList(): String = joinToString(prefix = "[", postfix = "]")
 
 object LensHardwareModes {
     // Legacy noise choices are retained only so old DataStore snapshots can still be decoded.
@@ -16,6 +15,9 @@ object LensHardwareModes {
     const val NOISE_DEFAULT = NOISE_OFF
     const val NOISE_MANUAL = "Manual"
 
+    // Legacy Black Level values are decode/import aliases only. Production authority is
+    // BlackLevelSettingsStore -> RawBlackAuthorityPolicy.
+    const val BLACK_SYSTEM = "System"
     const val BLACK_AUTO = "Auto"
     const val BLACK_DYNAMIC = "Dynamic"
     const val BLACK_MANUAL = "Manual"
@@ -91,29 +93,27 @@ data class ResolvedLensHardwareSettings(
     val nativeHardwareConfigPushedExpected: Boolean = true
 
     val anyManualEffectActive: Boolean =
-        blackLevelNativeMode != 0 ||
-            colorMatrixNativeMode != 0 ||
+        colorMatrixNativeMode != 0 ||
             awbNativeMode != 0
 
+    /**
+     * Legacy compatibility projection only. Black Level v2 owns developed RAW.
+     *
+     * This ABI must never scale, replace or otherwise mutate the Camera2 baseline. Keeping the
+     * method as an identity projection lets older callers compile while preventing a second
+     * black-level owner from reappearing.
+     */
     fun effectiveBlackLevels(defaultLevels: List<Int>, whiteLevel: Int): List<Int> {
         val safeWhite = whiteLevel.coerceAtLeast(2)
         val base = if (defaultLevels.size >= 4) defaultLevels.take(4) else listOf(64, 64, 64, 64)
-        return when (blackLevelNativeMode) {
-            1 -> {
-                val factor = (dynamicBlackLevelPercent / 100.0f).coerceIn(0.0f, 2.0f)
-                base.map { (it.toFloat() * factor).toInt().coerceIn(0, safeWhite - 1) }
-            }
-            2 -> manualBlackLevels.take(4).map { it.toInt().coerceIn(0, safeWhite - 1) }
-            else -> base.map { it.coerceIn(0, safeWhite - 1) }
-        }
+        return base.map { it.coerceIn(0, safeWhite - 1) }
     }
 
-    fun blackLevelSource(defaultSource: String, defaultLevels: List<Int>, whiteLevel: Int): String =
-        when (blackLevelNativeMode) {
-            1 -> "Lens ID Dynamic black level override ${dynamicBlackLevelPercent.format3()}% of base ${defaultLevels.formatIntList()} from $defaultSource"
-            2 -> "Lens ID Manual black level override ${effectiveBlackLevels(defaultLevels, whiteLevel).formatIntList()}"
-            else -> defaultSource
-        }
+    fun blackLevelSource(defaultSource: String, defaultLevels: List<Int>, whiteLevel: Int): String {
+        @Suppress("UNUSED_VARIABLE")
+        val compatibilityOnly = defaultLevels.size + whiteLevel
+        return defaultSource
+    }
 
     fun effectiveWhiteBalance(
         defaultRed: Float,
@@ -172,8 +172,8 @@ data class ResolvedLensHardwareSettings(
     fun nativeNoiseD(): FloatArray? = null
     fun nativeManualNoiseProfile(): DoubleArray? = null
 
-    fun nativeManualBlackLevels(): FloatArray? =
-        manualBlackLevels.takeIf { blackLevelNativeMode == 2 && it.size == 4 }?.toFloatArray()
+    // Production cutoff: native/manual Black Level transport is retired.
+    fun nativeManualBlackLevels(): FloatArray? = null
 
     fun nativeManualColorMatrix(): FloatArray? =
         manualColorMatrix.takeIf { colorMatrixNativeMode == 1 && it.size == 9 }?.toFloatArray()
@@ -183,9 +183,9 @@ data class ResolvedLensHardwareSettings(
         val yuvRoute = routeLabel.contains("YUV", ignoreCase = true)
         return listOf(
             "Black Level Applied To" to when {
-                rawRoute && blackLevelNativeMode != 0 -> "RAW_MASTER, RAW_JPEG, DNG_DESCRIPTION_ONLY"
-                yuvRoute && blackLevelNativeMode != 0 -> "NOT_APPLICABLE_RAW_ONLY"
-                else -> "NOT_APPLICABLE_OR_AUTO"
+                rawRoute -> "BLACK_LEVEL_V2_RAW_AUTHORITY; LEGACY_LENS_HARDWARE_TRANSPORT_NOT_APPLIED"
+                yuvRoute -> "NOT_APPLICABLE_RAW_ONLY"
+                else -> "NOT_APPLICABLE"
             },
             "Legacy Lens Hardware Noise Applied To" to "NOT_APPLIED_RETIRED_USE_PHYSICAL_NOISE_MODEL",
             "Color Matrix Applied To" to when {
@@ -204,11 +204,8 @@ data class ResolvedLensHardwareSettings(
     }
 
     fun debugPairs(routeLabel: String = "UNKNOWN"): List<Pair<String, String>> {
-        val effectiveBlackText = when (blackLevelNativeMode) {
-            1 -> "dynamic ${dynamicBlackLevelPercent.format3()}% of metadata baseline"
-            2 -> manualBlackLevels.formatList()
-            else -> "resolved from SensorCalibrationResolver metadata baseline"
-        }
+        val effectiveBlackText =
+            "legacy transport retired; developed RAW authority=BlackLevelSettingsStore/RawBlackAuthorityPolicy"
         return listOf(
             "Lens Hardware Settings Enabled/Resolved" to settingsResolved.toString(),
             "Lens Hardware Lens ID" to lensId,
@@ -216,7 +213,7 @@ data class ResolvedLensHardwareSettings(
             "Native Hardware Config Pushed" to nativeHardwareConfigPushedExpected.toString(),
             "Native Hardware Config Lens ID" to lensId,
             "Native Hardware Config Version/Fingerprint" to fingerprint(),
-            "Black Level Mode" to blackLevelMode,
+            "Black Level Mode" to "$blackLevelMode (legacy compatibility transport retired)",
             "Effective Black Levels" to effectiveBlackText,
             "Legacy Noise Model Transport" to "RETIRED_NEUTRAL; physical authority=PhysicalNoiseModelSettingsStore",
             "Legacy Noise Native Mode" to noiseModelNativeMode.toString(),
@@ -239,8 +236,8 @@ data class ResolvedLensHardwareSettings(
     fun dngDescription(): String = listOf(
         "lensId=$lensId",
         "source=$snapshotSource",
-        "blackMode=$blackLevelMode",
-        "blackManual=${if (blackLevelNativeMode == 2) manualBlackLevels.formatList() else "system/auto"}",
+        "blackMode=legacy_transport_retired",
+        "blackManual=not_applied_use_black_level_v2",
         "legacyNoiseTransport=retired-neutral",
         "physicalNoiseAuthority=separate-processing-snapshot",
         "colorMode=$colorMatrixMode",
@@ -340,15 +337,21 @@ object LensHardwareSettingsResolver {
                 abs(lumaAuthorityAdj) > 1.0e-7f
         if (legacyNoiseRequested) warn(RETIRED_NOISE_WARNING)
 
+        // Parse legacy Black Level fields only as migration evidence. They must never enter the
+        // SensorCalibration pixel-authority layer after BL6; Black Level v2 is applied later at the
+        // resolved RAW-domain boundary.
         val safeBlackMode = normalizeChoice(blackLevelMode, LensHardwareModes.BLACK_AUTO)
         val manualBl = parseFloatList(manualBlackLevelsString, 4, "Manual Black Levels", ::warn)
-        val blackNativeMode = when (safeBlackMode) {
-            LensHardwareModes.BLACK_DYNAMIC -> 1
-            LensHardwareModes.BLACK_MANUAL -> if (manualBl.size == 4) 2 else {
-                warn("Manual black level selected but four valid values were not provided. Native black level override disabled.")
-                0
-            }
-            else -> 0
+        val legacyBlackTransportRequested =
+            safeBlackMode.equals(LensHardwareModes.BLACK_DYNAMIC, ignoreCase = true) ||
+                safeBlackMode.equals(LensHardwareModes.BLACK_MANUAL, ignoreCase = true) ||
+                manualBlackLevelsString.isNotBlank() ||
+                kotlin.math.abs(dynamicBlackLevel - 100.0f) > 1.0e-4f
+        if (legacyBlackTransportRequested && kotlin.math.abs(dynamicBlackLevel - 100.0f) > 1.0e-4f) {
+            warn(
+                "Legacy Dynamic Black Level percentage=${dynamicBlackLevel.format3()}% is migration-only; " +
+                    "production Black Level authority is BlackLevelSettingsStore/RawBlackAuthorityPolicy."
+            )
         }
 
         val safeColorMode = normalizeChoice(colorMatrixMode, LensHardwareModes.COLOR_SYSTEM)
@@ -388,7 +391,7 @@ object LensHardwareSettingsResolver {
 
         return ResolvedLensHardwareSettings(
             lensId = lensId,
-            snapshotSource = "DataStore lens hardware settings; legacy noise transport retired",
+            snapshotSource = "DataStore lens hardware settings; legacy noise/black transport retired",
             warnings = warnings,
 
             // Production cutoff. Do not reintroduce legacy Lens Hardware noise authority here.
@@ -405,10 +408,13 @@ object LensHardwareSettingsResolver {
             dynamicIsoCoeff = 0.0f,
             manualIsoValue = 0.0f,
 
-            blackLevelMode = safeBlackMode,
-            blackLevelNativeMode = blackNativeMode,
-            dynamicBlackLevelPercent = dynamicBlackLevel.coerceIn(0.0f, 100.0f),
-            manualBlackLevels = if (manualBl.size == 4) manualBl else listOf(0f, 0f, 0f, 0f),
+            // Hard ABI cutoff. SensorCalibration still carries legacy fields in its data shape,
+            // but it can now observe only neutral System values. System/Dynamic/Manual production
+            // ownership lives exclusively in Black Level v2 at RawBlackDomainBinding.
+            blackLevelMode = LensHardwareModes.BLACK_SYSTEM,
+            blackLevelNativeMode = 0,
+            dynamicBlackLevelPercent = 100.0f,
+            manualBlackLevels = listOf(0f, 0f, 0f, 0f),
 
             colorMatrixMode = safeColorMode,
             colorMatrixNativeMode = colorNativeMode,

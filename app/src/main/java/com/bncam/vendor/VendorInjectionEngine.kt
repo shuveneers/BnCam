@@ -3,12 +3,14 @@
 package com.bncam.vendor
 
 import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.TotalCaptureResult
 import android.util.Log
+import com.bncam.core.capture.BlackLevelLockController
+import com.bncam.core.capture.BlackLevelLockRequestStage
 import com.bncam.data.settings.SettingsRepository
 import com.bncam.data.settings.VendorTagConfig
 import com.bncam.data.settings.VendorTagTarget
 import java.util.concurrent.ConcurrentHashMap
-import android.hardware.camera2.TotalCaptureResult
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
@@ -70,7 +72,6 @@ object VendorInjectionEngine {
 
     private val attemptsByLens = ConcurrentHashMap<String, MutableList<VendorInjectionAttempt>>()
 
-    // NIEUW: Echo tracker
     private val _echoStatuses = MutableStateFlow<Map<String, Boolean>>(emptyMap())
     val echoStatuses = _echoStatuses.asStateFlow()
 
@@ -83,13 +84,16 @@ object VendorInjectionEngine {
     }
 
     fun verifyEchoes(lensId: String, result: TotalCaptureResult) {
+        // Standard Camera2 truth must be observed even when this lens has zero vendor tags.
+        // Keeping this before the legacy early-return prevents BLACK_LEVEL_LOCK telemetry from
+        // accidentally depending on vendor-tag configuration.
+        BlackLevelLockController.observeResult(lensId, result)
+
         val activeAttempts = attemptsByLens[lensId] ?: return
         val resultKeys = result.keys.map { it.name }.toSet()
-
         val updates = activeAttempts.associate { attempt ->
             attempt.keyName to resultKeys.contains(attempt.keyName)
         }
-
         _echoStatuses.value = _echoStatuses.value + updates
     }
 
@@ -120,7 +124,6 @@ object VendorInjectionEngine {
     ): List<VendorInjectionAttempt> {
         val stageTags = activeTags.filter { it.shouldApplyForStage(stage) }
         val registryByName = registry.associateBy { it.name }
-
         val attempts = stageTags.map { config ->
             applyOne(
                 lensId = lensId,
@@ -130,7 +133,6 @@ object VendorInjectionEngine {
                 descriptor = registryByName[config.keyName]
             )
         }
-
         if (attempts.isNotEmpty()) {
             attemptsByLens.compute(lensId) { _, current ->
                 val list = current ?: mutableListOf()
@@ -139,16 +141,22 @@ object VendorInjectionEngine {
             }
         }
 
+        // This is only a shared builder hook. BLACK_LEVEL_LOCK is a standard Camera2 control and
+        // remains owned by BlackLevelLockController, not by the vendor-tag registry. Apply it last
+        // so an arbitrary vendor-tag entry can never silently override the standard authority.
+        BlackLevelLockController.applyToBuilder(
+            lensId,
+            builder,
+            BlackLevelLockRequestStage.valueOf(stage.name)
+        )
         return attempts
     }
 
-    fun consumeAttempts(lensId: String): List<VendorInjectionAttempt> {
-        return attemptsByLens.remove(lensId)?.toList().orEmpty()
-    }
+    fun consumeAttempts(lensId: String): List<VendorInjectionAttempt> =
+        attemptsByLens.remove(lensId)?.toList().orEmpty()
 
-    fun peekAttempts(lensId: String): List<VendorInjectionAttempt> {
-        return attemptsByLens[lensId]?.toList().orEmpty()
-    }
+    fun peekAttempts(lensId: String): List<VendorInjectionAttempt> =
+        attemptsByLens[lensId]?.toList().orEmpty()
 
     fun clearAttempts(lensId: String) {
         attemptsByLens.remove(lensId)
@@ -167,51 +175,47 @@ object VendorInjectionEngine {
     ): VendorInjectionAttempt {
         if (!config.enabled) {
             return skipped(
-                lensId = lensId,
-                config = config,
-                stage = stage,
-                status = VendorInjectionStatus.SKIPPED_DISABLED,
-                reason = "Vendor tag is disabled."
+                lensId,
+                config,
+                stage,
+                VendorInjectionStatus.SKIPPED_DISABLED,
+                "Vendor tag is disabled."
             )
         }
-
         if (!config.shouldApplyForStage(stage)) {
             return skipped(
-                lensId = lensId,
-                config = config,
-                stage = stage,
-                status = VendorInjectionStatus.SKIPPED_STAGE_MISMATCH,
-                reason = "target=${config.target}, stage=$stage"
+                lensId,
+                config,
+                stage,
+                VendorInjectionStatus.SKIPPED_STAGE_MISMATCH,
+                "target=${config.target}, stage=$stage"
             )
         }
-
         if (config.target == VendorTagTarget.RESULT_ONLY) {
             return skipped(
-                lensId = lensId,
-                config = config,
-                stage = stage,
-                status = VendorInjectionStatus.SKIPPED_RESULT_ONLY,
-                reason = "Result-only key cannot be injected into CaptureRequest.Builder."
+                lensId,
+                config,
+                stage,
+                VendorInjectionStatus.SKIPPED_RESULT_ONLY,
+                "Result-only key cannot be injected into CaptureRequest.Builder."
             )
         }
-
         if (config.target == VendorTagTarget.CHARACTERISTIC_ONLY) {
             return skipped(
-                lensId = lensId,
-                config = config,
-                stage = stage,
-                status = VendorInjectionStatus.SKIPPED_CHARACTERISTIC_ONLY,
-                reason = "Characteristic-only key cannot be injected into CaptureRequest.Builder."
+                lensId,
+                config,
+                stage,
+                VendorInjectionStatus.SKIPPED_CHARACTERISTIC_ONLY,
+                "Characteristic-only key cannot be injected into CaptureRequest.Builder."
             )
         }
-
         if (descriptor != null && !descriptor.injectable) {
             return skipped(
-                lensId = lensId,
-                config = config,
-                stage = stage,
-                status = VendorInjectionStatus.SKIPPED_NOT_INJECTABLE,
-                reason = descriptor.notes.ifBlank { "Registry marks this key as not injectable." }
+                lensId,
+                config,
+                stage,
+                VendorInjectionStatus.SKIPPED_NOT_INJECTABLE,
+                descriptor.notes.ifBlank { "Registry marks this key as not injectable." }
             )
         }
 
@@ -220,7 +224,6 @@ object VendorInjectionEngine {
             fallback = descriptor?.typeName,
             rawValue = config.value
         )
-
         val parsedValue = try {
             parseValue(config.value, valueType)
         } catch (e: Exception) {
@@ -247,7 +250,6 @@ object VendorInjectionEngine {
             valueType = valueType,
             parsedValue = parsedValue
         )
-
         return if (applyResult.success) {
             VendorInjectionAttempt(
                 lensId = lensId,
@@ -265,7 +267,6 @@ object VendorInjectionEngine {
             )
         } else {
             Log.w(TAG, "Apply failed for ${config.keyName}: ${applyResult.error}")
-
             VendorInjectionAttempt(
                 lensId = lensId,
                 keyName = config.keyName,
@@ -296,12 +297,7 @@ object VendorInjectionEngine {
         parsedValue: Any
     ): ApplyResult {
         val errors = mutableListOf<String>()
-
-        val candidateClasses = requestKeyClassesFor(
-            type = valueType,
-            parsedValue = parsedValue
-        )
-
+        val candidateClasses = requestKeyClassesFor(valueType, parsedValue)
         candidateClasses.forEach { typeClass ->
             try {
                 val key = createRequestKey(keyName, typeClass) as CaptureRequest.Key<Any>
@@ -311,7 +307,6 @@ object VendorInjectionEngine {
                 errors.add("${typeClass.name}: ${e.message ?: e.javaClass.simpleName}")
             }
         }
-
         return ApplyResult(
             success = false,
             error = errors.joinToString(" | ").ifBlank { "No key class candidate worked." }
@@ -324,89 +319,58 @@ object VendorInjectionEngine {
         stage: VendorRequestStage,
         status: VendorInjectionStatus,
         reason: String
-    ): VendorInjectionAttempt {
-        return VendorInjectionAttempt(
-            lensId = lensId,
-            keyName = config.keyName,
-            requestedValue = config.value,
-            parsedValuePreview = "",
-            valueType = normalizeType(config.type, null, config.value),
-            target = config.target,
-            attempted = false,
-            appliedToBuilder = false,
-            builderStage = stage,
-            applyError = reason,
-            finalStatus = status,
-            source = config.source.name,
-            notes = config.notes
-        )
-    }
+    ): VendorInjectionAttempt = VendorInjectionAttempt(
+        lensId = lensId,
+        keyName = config.keyName,
+        requestedValue = config.value,
+        parsedValuePreview = "",
+        valueType = normalizeType(config.type, null, config.value),
+        target = config.target,
+        attempted = false,
+        appliedToBuilder = false,
+        builderStage = stage,
+        applyError = reason,
+        finalStatus = status,
+        source = config.source.name,
+        notes = config.notes
+    )
 
-    private fun VendorTagConfig.shouldApplyForStage(stage: VendorRequestStage): Boolean {
-        return when (target) {
+    private fun VendorTagConfig.shouldApplyForStage(stage: VendorRequestStage): Boolean =
+        when (target) {
             VendorTagTarget.SESSION -> stage == VendorRequestStage.SESSION
             VendorTagTarget.REPEATING_REQUEST -> stage == VendorRequestStage.REPEATING_REQUEST
             VendorTagTarget.STILL_CAPTURE -> stage == VendorRequestStage.STILL_CAPTURE
-            VendorTagTarget.REQUEST_BOTH -> {
-                stage == VendorRequestStage.REPEATING_REQUEST ||
-                        stage == VendorRequestStage.STILL_CAPTURE
-            }
-            VendorTagTarget.RESULT_ONLY -> false
-            VendorTagTarget.CHARACTERISTIC_ONLY -> false
+            VendorTagTarget.REQUEST_BOTH ->
+                stage == VendorRequestStage.REPEATING_REQUEST || stage == VendorRequestStage.STILL_CAPTURE
+            VendorTagTarget.RESULT_ONLY,
+            VendorTagTarget.CHARACTERISTIC_ONLY,
             VendorTagTarget.UNKNOWN -> false
         }
-    }
 
-    private fun createRequestKey(
-        name: String,
-        typeClass: Class<*>
-    ): CaptureRequest.Key<*> {
+    private fun createRequestKey(name: String, typeClass: Class<*>): CaptureRequest.Key<*> {
         val constructor = runCatching {
-            CaptureRequest.Key::class.java.getConstructor(
-                String::class.java,
-                Class::class.java
-            )
+            CaptureRequest.Key::class.java.getConstructor(String::class.java, Class::class.java)
         }.getOrElse {
-            CaptureRequest.Key::class.java.getDeclaredConstructor(
-                String::class.java,
-                Class::class.java
-            )
+            CaptureRequest.Key::class.java.getDeclaredConstructor(String::class.java, Class::class.java)
         }
-
         constructor.isAccessible = true
         return constructor.newInstance(name, typeClass) as CaptureRequest.Key<*>
     }
 
-    private fun normalizeType(
-        raw: String,
-        fallback: String?,
-        rawValue: String
-    ): VendorValueType {
+    private fun normalizeType(raw: String, fallback: String?, rawValue: String): VendorValueType {
         val fromRaw = normalizeTypeName(raw)
-
-        if (fromRaw != VendorValueType.UNKNOWN) {
-            return fromRaw
-        }
-
+        if (fromRaw != VendorValueType.UNKNOWN) return fromRaw
         val fromFallback = if (!fallback.isNullOrBlank() && !fallback.equals(raw, ignoreCase = true)) {
             normalizeTypeName(fallback)
         } else {
             VendorValueType.UNKNOWN
         }
-
-        if (fromFallback != VendorValueType.UNKNOWN) {
-            return fromFallback
-        }
-
+        if (fromFallback != VendorValueType.UNKNOWN) return fromFallback
         return inferTypeFromValue(rawValue)
     }
 
     private fun normalizeTypeName(raw: String): VendorValueType {
-        val compact = raw.trim()
-            .replace("-", "_")
-            .replace(" ", "_")
-            .lowercase()
-
+        val compact = raw.trim().replace("-", "_").replace(" ", "_").lowercase()
         return when (compact) {
             "byte", "byte_(u8)", "u8", "java.lang.byte" -> VendorValueType.BYTE
             "short", "int16", "i16", "java.lang.short" -> VendorValueType.SHORT
@@ -416,7 +380,6 @@ object VendorInjectionEngine {
             "double", "float64", "f64", "java.lang.double" -> VendorValueType.DOUBLE
             "boolean", "bool", "java.lang.boolean" -> VendorValueType.BOOLEAN
             "string", "java.lang.string" -> VendorValueType.STRING
-
             "byte_array", "byte[]", "bytearray", "byte_array_(byte[])" -> VendorValueType.BYTE_ARRAY
             "short_array", "short[]", "shortarray" -> VendorValueType.SHORT_ARRAY
             "int_array", "integer_array", "int[]", "integer[]", "intarray" -> VendorValueType.INT_ARRAY
@@ -424,22 +387,14 @@ object VendorInjectionEngine {
             "float_array", "float[]", "floatarray", "float_array_(float[])" -> VendorValueType.FLOAT_ARRAY
             "double_array", "double[]", "doublearray" -> VendorValueType.DOUBLE_ARRAY
             "boolean_array", "bool_array", "boolean[]", "bool[]", "booleanarray" -> VendorValueType.BOOLEAN_ARRAY
-
             else -> VendorValueType.UNKNOWN
         }
     }
 
     private fun inferTypeFromValue(raw: String): VendorValueType {
-        val cleaned = raw.trim()
-            .removePrefix("[")
-            .removeSuffix("]")
-
-        if (cleaned.isBlank()) {
-            return VendorValueType.STRING
-        }
-
+        val cleaned = raw.trim().removePrefix("[").removeSuffix("]")
+        if (cleaned.isBlank()) return VendorValueType.STRING
         val tokens = splitValues(raw)
-
         if (tokens.size > 1) {
             return when {
                 tokens.all { it.isBooleanLiteral() } -> VendorValueType.BOOLEAN_ARRAY
@@ -450,9 +405,7 @@ object VendorInjectionEngine {
                 else -> VendorValueType.STRING
             }
         }
-
         val single = tokens.firstOrNull() ?: cleaned
-
         return when {
             single.isBooleanLiteral() -> VendorValueType.BOOLEAN
             single.toIntOrNull() != null -> VendorValueType.INT
@@ -463,12 +416,8 @@ object VendorInjectionEngine {
         }
     }
 
-    private fun parseValue(
-        raw: String,
-        type: VendorValueType
-    ): Any {
+    private fun parseValue(raw: String, type: VendorValueType): Any {
         val trimmed = raw.trim()
-
         return when (type) {
             VendorValueType.BYTE -> trimmed.toByte()
             VendorValueType.SHORT -> trimmed.toShort()
@@ -478,7 +427,6 @@ object VendorInjectionEngine {
             VendorValueType.DOUBLE -> trimmed.toDouble()
             VendorValueType.BOOLEAN -> parseBoolean(trimmed)
             VendorValueType.STRING -> raw
-
             VendorValueType.BYTE_ARRAY -> splitValues(raw).map { it.toByte() }.toByteArray()
             VendorValueType.SHORT_ARRAY -> splitValues(raw).map { it.toShort() }.toShortArray()
             VendorValueType.INT_ARRAY -> splitValues(raw).map { it.toInt() }.toIntArray()
@@ -486,19 +434,13 @@ object VendorInjectionEngine {
             VendorValueType.FLOAT_ARRAY -> splitValues(raw).map { it.toFloat() }.toFloatArray()
             VendorValueType.DOUBLE_ARRAY -> splitValues(raw).map { it.toDouble() }.toDoubleArray()
             VendorValueType.BOOLEAN_ARRAY -> splitValues(raw).map { parseBoolean(it) }.toBooleanArray()
-
             VendorValueType.UNKNOWN -> throw IllegalArgumentException("Unsupported or unknown vendor value type.")
         }
     }
 
-    private fun requestKeyClassesFor(
-        type: VendorValueType,
-        parsedValue: Any
-    ): List<Class<*>> {
+    private fun requestKeyClassesFor(type: VendorValueType, parsedValue: Any): List<Class<*>> {
         val classes = mutableListOf<Class<*>>()
-
         classes.add(parsedValue.javaClass)
-
         when (type) {
             VendorValueType.BYTE -> {
                 classes.add(Byte::class.javaObjectType)
@@ -529,7 +471,6 @@ object VendorInjectionEngine {
                 Boolean::class.javaPrimitiveType?.let { classes.add(it) }
             }
             VendorValueType.STRING -> classes.add(String::class.java)
-
             VendorValueType.BYTE_ARRAY -> classes.add(ByteArray::class.java)
             VendorValueType.SHORT_ARRAY -> classes.add(ShortArray::class.java)
             VendorValueType.INT_ARRAY -> classes.add(IntArray::class.java)
@@ -537,73 +478,65 @@ object VendorInjectionEngine {
             VendorValueType.FLOAT_ARRAY -> classes.add(FloatArray::class.java)
             VendorValueType.DOUBLE_ARRAY -> classes.add(DoubleArray::class.java)
             VendorValueType.BOOLEAN_ARRAY -> classes.add(BooleanArray::class.java)
-
             VendorValueType.UNKNOWN -> classes.add(parsedValue.javaClass)
         }
-
         return classes.distinct()
     }
 
-    private fun parseBoolean(value: String): Boolean {
-        return value.equals("true", ignoreCase = true) ||
-                value == "1" ||
-                value.equals("yes", ignoreCase = true) ||
-                value.equals("on", ignoreCase = true)
-    }
+    private fun parseBoolean(value: String): Boolean =
+        value.equals("true", ignoreCase = true) ||
+            value == "1" ||
+            value.equals("yes", ignoreCase = true) ||
+            value.equals("on", ignoreCase = true)
 
-    private fun String.isBooleanLiteral(): Boolean {
-        return equals("true", ignoreCase = true) ||
-                equals("false", ignoreCase = true) ||
-                this == "1" ||
-                this == "0" ||
-                equals("yes", ignoreCase = true) ||
-                equals("no", ignoreCase = true) ||
-                equals("on", ignoreCase = true) ||
-                equals("off", ignoreCase = true)
-    }
+    private fun String.isBooleanLiteral(): Boolean =
+        equals("true", ignoreCase = true) ||
+            equals("false", ignoreCase = true) ||
+            this == "1" ||
+            this == "0" ||
+            equals("yes", ignoreCase = true) ||
+            equals("no", ignoreCase = true) ||
+            equals("on", ignoreCase = true) ||
+            equals("off", ignoreCase = true)
 
-    private fun splitValues(raw: String): List<String> {
-        return raw
-            .trim()
-            .removePrefix("[")
-            .removeSuffix("]")
-            .split(',', ';', ' ')
-            .map { it.trim() }
-            .filter { it.isNotEmpty() }
-    }
+    private fun splitValues(raw: String): List<String> = raw
+        .trim()
+        .removePrefix("[")
+        .removeSuffix("]")
+        .split(',', ';', ' ')
+        .map { it.trim() }
+        .filter { it.isNotEmpty() }
 
-    fun previewValue(value: Any?): String {
-        return when (value) {
-            null -> "null"
-            is ByteArray -> value.take(20).joinToString(
-                prefix = "[",
-                postfix = if (value.size > 20) ", ...] (${value.size})" else "]"
-            )
-            is ShortArray -> value.take(20).joinToString(
-                prefix = "[",
-                postfix = if (value.size > 20) ", ...] (${value.size})" else "]"
-            )
-            is IntArray -> value.take(20).joinToString(
-                prefix = "[",
-                postfix = if (value.size > 20) ", ...] (${value.size})" else "]"
-            )
-            is LongArray -> value.take(20).joinToString(
-                prefix = "[",
-                postfix = if (value.size > 20) ", ...] (${value.size})" else "]"
-            )
-            is FloatArray -> value.take(20).joinToString(
-                prefix = "[",
-                postfix = if (value.size > 20) ", ...] (${value.size})" else "]"
-            )
-            is DoubleArray -> value.take(20).joinToString(
-                prefix = "[",
-                postfix = if (value.size > 20) ", ...] (${value.size})" else "]"
-            )
-            is BooleanArray -> value.take(20).joinToString(
-                prefix = "[",
-                postfix = if (value.size > 20) ", ...] (${value.size})" else "]"
-            )
-            else -> value.toString().take(240)
-        }
+    fun previewValue(value: Any?): String = when (value) {
+        null -> "null"
+        is ByteArray -> value.take(20).joinToString(
+            prefix = "[",
+            postfix = if (value.size > 20) ", ...] (${value.size})" else "]"
+        )
+        is ShortArray -> value.take(20).joinToString(
+            prefix = "[",
+            postfix = if (value.size > 20) ", ...] (${value.size})" else "]"
+        )
+        is IntArray -> value.take(20).joinToString(
+            prefix = "[",
+            postfix = if (value.size > 20) ", ...] (${value.size})" else "]"
+        )
+        is LongArray -> value.take(20).joinToString(
+            prefix = "[",
+            postfix = if (value.size > 20) ", ...] (${value.size})" else "]"
+        )
+        is FloatArray -> value.take(20).joinToString(
+            prefix = "[",
+            postfix = if (value.size > 20) ", ...] (${value.size})" else "]"
+        )
+        is DoubleArray -> value.take(20).joinToString(
+            prefix = "[",
+            postfix = if (value.size > 20) ", ...] (${value.size})" else "]"
+        )
+        is BooleanArray -> value.take(20).joinToString(
+            prefix = "[",
+            postfix = if (value.size > 20) ", ...] (${value.size})" else "]"
+        )
+        else -> value.toString().take(240)
     }
 }

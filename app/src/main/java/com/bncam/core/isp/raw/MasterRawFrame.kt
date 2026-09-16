@@ -3,6 +3,8 @@ package com.bncam.core.isp.raw
 import android.graphics.ImageFormat
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CaptureResult
+import android.hardware.camera2.TotalCaptureResult
+import com.bncam.core.capture.BlackLevelLockController
 import com.bncam.core.engine.ImageUtils
 import com.bncam.core.quality.RenderQualityConfig
 import com.bncam.core.quality.FinalSensorCalibration
@@ -183,8 +185,11 @@ class MasterRawFrame(
             pairs.add("[BASE] Hardware White Level" to "${finalCalibration.base.baseWhiteLevel} (${finalCalibration.base.baseWhiteLevelSource})")
             pairs.add("[BASE] Hardware Black Levels" to finalCalibration.base.baseBlackLevels.joinToString(", "))
             pairs.add("[BASE] Raw Input Domain" to finalCalibration.rawInputDomain.name)
-            pairs.add("[OVERRIDE] UI Black Level Mode" to finalCalibration.override.blackLevelMode)
-            pairs.add("[OVERRIDE] UI Manual Black Levels" to (finalCalibration.override.manualBlackLevels?.joinToString(", ") ?: "none"))
+            pairs.add("[BLACK V2] Developed Black Source" to rawFrameInfo.developedRawBlackLevelSource)
+            pairs.add("[BLACK V2] Developed Black Canonical R/Gr/Gb/B" to rawFrameInfo.developedRawBlackLevels.joinToString(", "))
+            pairs.add("[BLACK V2] Manual Override Used" to rawFrameInfo.manualOverrideUsed.toString())
+            pairs.add("[LEGACY COMPAT] SensorCalibration Black Layer" to
+                "${finalCalibration.override.blackLevelMode} (transport retired; no pixel authority)")
             pairs.add("[OVERRIDE] UI Color Matrix Mode" to finalCalibration.override.colorMode)
             pairs.add("[FINAL] ISP Contract White Level" to finalCalibration.effectiveWhiteLevel.toString())
             pairs.add("[FINAL] ISP Contract Black Levels" to finalCalibration.effectiveBlackLevels.joinToString(", "))
@@ -237,6 +242,11 @@ object RawMasterBuilder {
         colorSensorReading: com.bncam.core.model.ColorSensorReading = com.bncam.core.model.ColorSensorReading(),
         colorSensorContributionWeight: Float = 0.0f
     ): MasterRawFrame? {
+        // This captureResult is the selected/anchor frame authority for the Master RAW. Do not
+        // infer that every support frame was locked; each frame retains its own Camera2 result truth.
+        (captureResult as? TotalCaptureResult)?.let {
+            BlackLevelLockController.observeResult(lensId, it)
+        }
         val selectedCap = maxFramesCap.coerceAtLeast(1)
         val shutterCalibration = qualityConfig.finalCalibration?.withPhysicalCaptureIdentity(
             sourceFormat = RenderQualityConfig.formatLabel(sourceFormat),
@@ -246,13 +256,16 @@ object RawMasterBuilder {
             cfaPattern = qualityConfig.cfaPattern
         )?.withPhysicalNoiseAuthority()
             ?.withSpectraNoiseAdapter()
-        val initialContract = RawDomainContractResolver.resolve(
-            lensId = lensId,
-            sourceFormat = sourceFormat,
-            width = width,
-            height = height,
-            characteristics = characteristics,
-            captureResult = captureResult,
+        val initialContract = RawBlackDomainBinding.bindForQualityConfig(
+            contract = RawDomainContractResolver.resolve(
+                lensId = lensId,
+                sourceFormat = sourceFormat,
+                width = width,
+                height = height,
+                characteristics = characteristics,
+                captureResult = captureResult,
+                qualityConfig = qualityConfig
+            ),
             qualityConfig = qualityConfig
         )
         val nativeRaw16Buffer = when (sourceFormat) {
@@ -305,15 +318,18 @@ object RawMasterBuilder {
                 else -> error("RawMasterBuilder only accepts RAW10 or RAW_SENSOR")
             }
 
-            val rawDomainContract = RawDomainContractResolver.resolve(
-                lensId = lensId,
-                sourceFormat = sourceFormat,
-                width = outputWidth,
-                height = outputHeight,
-                characteristics = characteristics,
-                captureResult = captureResult,
-                qualityConfig = qualityConfig,
-                dngMergeStats = dngMergeStats
+            val rawDomainContract = RawBlackDomainBinding.bindForQualityConfig(
+                contract = RawDomainContractResolver.resolve(
+                    lensId = lensId,
+                    sourceFormat = sourceFormat,
+                    width = outputWidth,
+                    height = outputHeight,
+                    characteristics = characteristics,
+                    captureResult = captureResult,
+                    qualityConfig = qualityConfig,
+                    dngMergeStats = dngMergeStats
+                ),
+                qualityConfig = qualityConfig
             )
             val payloadBlackLevels = rawDomainContract.payloadBlackLevelsIntArray()
             val hotPixelMap = RawHotPixelMapMapper.fromCamera2(

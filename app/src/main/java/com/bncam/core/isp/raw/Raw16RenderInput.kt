@@ -4,6 +4,8 @@ import android.graphics.ImageFormat
 import android.hardware.HardwareBuffer
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CaptureResult
+import android.hardware.camera2.TotalCaptureResult
+import com.bncam.core.capture.BlackLevelLockController
 import com.bncam.core.engine.ImageUtils
 import com.bncam.core.isp.raw10.DngWriter
 import com.bncam.core.isp.raw10.RawCameraColorProfileRepository
@@ -151,13 +153,21 @@ object SingleRaw16FrameBuilder {
         require(sourceFormat == ImageFormat.RAW10 || sourceFormat == ImageFormat.RAW_SENSOR) {
             "SingleRaw16Frame only accepts RAW10 or RAW_SENSOR."
         }
-        val initialContract = RawDomainContractResolver.resolve(
-            lensId = lensId,
-            sourceFormat = sourceFormat,
-            width = width,
-            height = height,
-            characteristics = characteristics,
-            captureResult = captureResult,
+        // Observe the exact selected frame. This is intentionally per-result truth: a pre-shutter
+        // warm frame is covered only when its own original request requested the lock.
+        (captureResult as? TotalCaptureResult)?.let {
+            BlackLevelLockController.observeResult(lensId, it)
+        }
+        val initialContract = RawBlackDomainBinding.bindForQualityConfig(
+            contract = RawDomainContractResolver.resolve(
+                lensId = lensId,
+                sourceFormat = sourceFormat,
+                width = width,
+                height = height,
+                characteristics = characteristics,
+                captureResult = captureResult,
+                qualityConfig = qualityConfig
+            ),
             qualityConfig = qualityConfig
         )
         val sourceBuffers = if (observerBuffer != null && observerBuffer !== buffer) {
@@ -213,15 +223,18 @@ object SingleRaw16FrameBuilder {
             val stats = ImageUtils.lastDngMergeStats()
             val physicalNoiseCalibration = shutterCalibration
                 ?.withPhysicalMergeStats(stats)
-            val finalContract = RawDomainContractResolver.resolve(
-                lensId = lensId,
-                sourceFormat = sourceFormat,
-                width = outputWidth,
-                height = outputHeight,
-                characteristics = characteristics,
-                captureResult = captureResult,
-                qualityConfig = qualityConfig,
-                dngMergeStats = stats
+            val finalContract = RawBlackDomainBinding.bindForQualityConfig(
+                contract = RawDomainContractResolver.resolve(
+                    lensId = lensId,
+                    sourceFormat = sourceFormat,
+                    width = outputWidth,
+                    height = outputHeight,
+                    characteristics = characteristics,
+                    captureResult = captureResult,
+                    qualityConfig = qualityConfig,
+                    dngMergeStats = stats
+                ),
+                qualityConfig = qualityConfig
             )
             val hotPixelMap = RawHotPixelMapMapper.fromCamera2(
                 points = runCatching {
