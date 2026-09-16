@@ -574,7 +574,6 @@ object ImageUtils {
             domainInfo.developedRawBlackLevelsCanonicalInMasterUnits.getOrElse(index) { 0f }
         }
         val nativeWhiteLevel = domainInfo.effectiveWhiteLevelInMasterUnits.roundToInt().coerceAtLeast(1)
-        val nativeNoiseProfile = finalCal?.effectiveNoiseProfile ?: DoubleArray(0)
         val captureSensitivityIso = captureResult?.get(CaptureResult.SENSOR_SENSITIVITY) ?: 0
         val captureExposureTimeNs = captureResult?.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 0L
         val demosaicAfHints = masterFrame.demosaicAfHints
@@ -666,6 +665,28 @@ object ImageUtils {
         val spectraCameraO = spectraSnapshot?.cameraO ?: DoubleArray(0)
         val spectraEffectiveS = spectraSnapshot?.effectiveS ?: DoubleArray(0)
         val spectraEffectiveO = spectraSnapshot?.effectiveO ?: DoubleArray(0)
+
+        // PhysicalNoiseState is the sole native physical S/O authority. The previous JPEG
+        // handoff still populated this carrier from FinalSensorCalibration.effectiveNoiseProfile,
+        // which is a legacy Camera2/compatibility mirror and can disagree with the frozen
+        // OEM/System/Manual/Preset shutter snapshot. In particular, PRESET + Dynamic ISO could
+        // resolve correctly in spectraEffectiveS/O while C++ received an empty/old S/O carrier.
+        //
+        // Rebuild the JNI carrier from the exact render-time snapshot so generic native noise
+        // consumers and optional SPECTRA observe the same physical model. Do not fall back to
+        // the legacy effectiveNoiseProfile: an unavailable V2 physical model must remain
+        // unavailable instead of silently resurrecting legacy authority.
+        val physicalNoiseState = spectraSnapshot?.physicalNoiseState()
+        val nativeNoiseProfile = physicalNoiseState?.toInterleavedProfileOrNull() ?: DoubleArray(0)
+        val nativeNoiseProfilePresent = nativeNoiseProfile.size == 8
+        val nativeNoiseProfileApplied = nativeNoiseProfilePresent &&
+            finalCal?.let { calibration ->
+                calibration.normalizationCalibrationValid &&
+                    calibration.cfaSupportedForBayerNoiseModel
+            } == true
+        val nativeNoiseProfilePairCount = if (nativeNoiseProfilePresent) 4 else 0
+        val nativeNoiseProfileChannelCount = if (nativeNoiseProfilePresent) 4 else 0
+
         val lensShadingMap = captureResult.toNativeLensShadingMap()
         val curves = qualityConfig?.curves
         val routeLabel = if (masterFrame.frameCount == 1) {
@@ -770,10 +791,10 @@ object ImageUtils {
                 } ?: (colorMatrix?.fromMetadata ?: false),
                 spectraProcessingEnabled = finalCal?.spectraProcessingEnabled == true,
                 sensorNoiseProfile = nativeNoiseProfile,
-                sensorNoiseProfilePresent = finalCal?.effectiveNoiseProfile != null,
-                sensorNoiseProfileApplied = finalCal?.effectiveNoiseProfileApplied == true,
-                sensorNoiseProfilePairCount = finalCal?.effectiveNoiseProfilePairCount ?: 0,
-                sensorNoiseProfileChannelCount = finalCal?.effectiveNoiseProfileChannelCount ?: 0,
+                sensorNoiseProfilePresent = nativeNoiseProfilePresent,
+                sensorNoiseProfileApplied = nativeNoiseProfileApplied,
+                sensorNoiseProfilePairCount = nativeNoiseProfilePairCount,
+                sensorNoiseProfileChannelCount = nativeNoiseProfileChannelCount,
                 spectraSnapshotPresent = spectraSnapshot != null,
                 spectraLensKey = spectraSnapshot?.stableLensKey?.value ?: masterFrame.lensId,
                 spectraCameraS = spectraCameraS,
