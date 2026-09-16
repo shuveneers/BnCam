@@ -28,6 +28,11 @@ class Phase6APhysicalNoiseSeparationSourceContractTest {
         assertFalse(bridge.contains("spectraProcessingEnabled ="))
         assertTrue(bridge.contains("manualNoiseSingleAnchorScaled = false"))
         assertTrue(bridge.contains("SPECTRA fit coefficients ignored"))
+        assertTrue(bridge.contains("frozenPhysicalSoUnchanged=true"))
+        val mergeFunction = bridge.substringAfter("fun FinalSensorCalibration.withPhysicalMergeStats")
+            .substringBefore("fun FinalSensorCalibration.withPhysicalCaptureIdentity")
+        assertFalse(mergeFunction.contains("noiseSnapshot ="))
+        assertFalse(mergeFunction.contains("effectiveNoiseProfile ="))
     }
 
     @Test

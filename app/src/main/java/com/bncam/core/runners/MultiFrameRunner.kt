@@ -2365,7 +2365,6 @@ class MultiFrameRunner(
                     jniCalibration = renderQualityConfig.finalCalibration,
                     nativeStats = if (isRawEnabled) masterIspStats else yuvNativeStats,
                     fusionStats = if (isRawEnabled) jpegMergeStats else "",
-                    dynamicIsoCoefficient = lensHardwareSettings.dynamicIsoCoeff,
                     captureAttemptId = attemptId,
                     recipe = recipe,
                     runnerPerformance = performanceTracker.traceSnapshot(),

@@ -252,4 +252,35 @@ class PhysicalNoiseModelTest {
         external[0] = 999.0
         assertEquals(1.0, resolved.effectiveS[0], 0.0)
     }
+    @Test
+    fun dynamicIsoKnownPresetValidationCaseResolvesExactlyOnce() {
+        assertEquals(186.0, NoiseModelResolver.effectiveNoiseModelIso(557, 0.27), 0.0)
+
+        val model = ParametricNoiseModel(
+            a = doubleArrayOf(1.0e-6, 1.0e-6, 1.0e-6, 1.0e-6),
+            b = doubleArrayOf(0.0, 0.0, 0.0, 0.0),
+            c = doubleArrayOf(1.0e-10, 1.0e-10, 1.0e-10, 1.0e-10),
+            d = doubleArrayOf(0.0, 0.0, 0.0, 0.0),
+            isoStep = 100.0
+        )
+        val resolved = NoiseModelResolver.resolve(
+            NoiseModelResolver.Request.Parametric(
+                lensId = "phase2_known_case",
+                captureIso = 557,
+                cfaPattern = NoiseModelCfaPattern.RGGB,
+                source = NoiseModelSource.PRESET,
+                model = model,
+                dynamicIsoEnabled = true,
+                dynamicIsoCoefficient = 0.27,
+                provenance = "phase2 contract test"
+            )
+        )
+
+        assertEquals(186.0, resolved.effectiveNoiseModelIso!!, 0.0)
+        assertTrue(resolved.dynamicIsoCoefficientApplied)
+        assertEquals(0.27, resolved.dynamicIsoCoefficient!!, 0.0)
+        // S is evaluated at ISO_NM=186. Re-applying k downstream would produce a different value.
+        assertEquals(186.0e-6, resolved.effectiveS[0], 1.0e-15)
+    }
+
 }

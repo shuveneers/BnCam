@@ -5568,14 +5568,15 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         request.cfaOffsetY = jpegRaw.info.cfaOffsetY;
         request.isRaw10 = meta.isRaw10;
         request.adaptiveExposureEnabled = false;
-        request.noiseModelValid = meta.calibration.physicalNoiseModelAvailable() &&
-                meta.calibration.signalModelConfidence > 0.0f;
-        for (int ch = 0; ch < 4; ++ch) {
-            request.effectiveS[static_cast<std::size_t>(ch)] =
-                    static_cast<float>(std::max(0.0, meta.calibration.effectiveS[ch]));
-            request.effectiveO[static_cast<std::size_t>(ch)] =
-                    static_cast<float>(std::max(0.0, meta.calibration.effectiveO[ch]));
-        }
+
+        // Phase 3: freeze one native physical-noise export for every downstream RAW consumer in
+        // this finalize invocation. Neural conditioning must consume this exact object; it must
+        // never re-read Camera2 noise evidence, re-resolve ISO, clamp coefficients, or synthesize
+        // missing channels. Invalid physical S/O stays unavailable and all-zero by contract.
+        const auto frozenPhysicalNoise = meta.calibration.frozenPhysicalNoiseModel();
+        request.noiseModelValid = frozenPhysicalNoise.available;
+        request.effectiveS = frozenPhysicalNoise.shotS;
+        request.effectiveO = frozenPhysicalNoise.readO;
         if (lensShadingMapValid(meta)) {
             request.lensShadingMap = meta.lensShadingMap.data();
             request.lensShadingColumns = static_cast<std::uint32_t>(meta.lensShadingColumns);
@@ -5612,13 +5613,12 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                 neuralEvidence.rawLevelsValid = neuralEvidence.rawLevelsValid &&
                         std::isfinite(neuralEvidence.blackLevelRaw[ch]) &&
                         neuralEvidence.whiteLevelRaw[ch] > neuralEvidence.blackLevelRaw[ch];
-                neuralEvidence.effectiveS[ch] = static_cast<float>(
-                        std::max(0.0, meta.calibration.effectiveS[ch]));
-                neuralEvidence.effectiveO[ch] = static_cast<float>(
-                        std::max(0.0, meta.calibration.effectiveO[ch]));
             }
-            neuralEvidence.noiseModelTrust = request.noiseModelValid
-                    ? std::clamp(meta.calibration.signalModelConfidence, 0.0f, 1.0f) : 0.0f;
+            // Exact Phase-3 bridge: shot/read conditioning is copied from the one frozen native
+            // physical-noise export above. No second lookup, fallback or coefficient transform.
+            neuralEvidence.effectiveS = frozenPhysicalNoise.shotS;
+            neuralEvidence.effectiveO = frozenPhysicalNoise.readO;
+            neuralEvidence.noiseModelTrust = frozenPhysicalNoise.available ? 1.0f : 0.0f;
 
             neuralEvidence.metadataTrust.noiseProfile = neuralEvidence.noiseModelTrust;
             neuralEvidence.metadataTrust.blackLevel = meta.calibration.hasBlackLevel ? 1.0f : 0.0f;

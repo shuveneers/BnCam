@@ -16,9 +16,12 @@ class SensorCalibrationFusionNoiseTest {
         assertEquals(1.0, fused.effectiveNoiseProfile!![0], 0.000001)
         assertEquals(1.5, fused.effectiveNoiseProfile!![1], 0.000001)
         assertEquals(1.0, fused.noiseSnapshot!!.effectiveS[0], 0.000001)
-        assertEquals(1.5, fused.noiseSnapshot!!.effectiveO[0], 0.000001)
+        assertEquals(2.0, fused.noiseSnapshot!!.effectiveO[0], 0.000001)
         assertTrue(fused.effectiveNoiseProfileSource.contains("2 frames"))
-        assertTrue(fused.pipelineWarnings.any { it.contains("anchor metadata was not reused") })
+        assertTrue(fused.pipelineWarnings.any {
+            it.contains("frozen PhysicalNoiseState remains unchanged") &&
+                it.contains("anchor metadata was not reused")
+        })
     }
 
     @Test
@@ -52,6 +55,32 @@ class SensorCalibrationFusionNoiseTest {
         assertEquals((2.0 + 3.0 * beta + 4.0) / 4.0, fused.effectiveNoiseProfile!![1], 1.0e-12)
     }
 
+
+    @Test
+    fun `physical merge stats keep shutter S O immutable and record residual propagation separately`() {
+        val base = calibration(
+            doubleArrayOf(4.0, 8.0, 4.0, 8.0, 4.0, 8.0, 4.0, 8.0),
+            "frame"
+        ).withPhysicalNoiseAuthority()
+        val beforeS = base.noiseSnapshot!!.effectiveS
+        val beforeO = base.noiseSnapshot!!.effectiveO
+        val beforeProfile = base.effectiveNoiseProfile!!.copyOf()
+
+        val propagated = base.withPhysicalMergeStats(
+            "physicalFusionVarianceScale=0.25;physicalEffectiveFrameCount=4.0;" +
+                "spectraSScale0=1.25;spectraOScale0=0.75"
+        )
+
+        assertTrue(propagated.noiseSnapshot!!.effectiveS.contentEquals(beforeS))
+        assertTrue(propagated.noiseSnapshot!!.effectiveO.contentEquals(beforeO))
+        assertTrue(propagated.effectiveNoiseProfile!!.contentEquals(beforeProfile))
+        assertEquals(0.25, propagated.physicalFusionVarianceScale, 1.0e-12)
+        assertEquals(4.0, propagated.physicalEffectiveFrameCount, 1.0e-12)
+        assertTrue(propagated.pipelineWarnings.any {
+            it.contains("frozenPhysicalSoUnchanged=true") &&
+                it.contains("SPECTRA fit coefficients ignored")
+        })
+    }
 
     @Test
     fun `spectra observer-only stats adapt shutter snapshot within bounded authority`() {

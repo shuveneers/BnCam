@@ -6,73 +6,75 @@ import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class Phase4SingleFrameRawDenoiseSourceContractTest {
+    private fun source(path: String): String = File(path).readText()
+
     @Test
-    fun physicalPreDemosaicPolicyIsLumaOnlyAndSensorVarianceDriven() {
-        val policy = File("src/main/cpp/SingleFrameRawDenoisePolicy.h").readText()
-        assertTrue(policy.contains("meanSensorNoiseVariance"))
-        assertTrue(policy.contains("lumaAuthority"))
-        assertFalse(policy.contains("chromaAuthority"))
-        assertFalse(policy.contains("lowFrequencyChromaAuthority"))
-        assertFalse(policy.contains("captureIso"))
-        assertFalse(policy.contains("effectiveIso"))
-        assertFalse(policy.contains("isRaw10"))
+    fun `neural is sole stochastic RAW noise pixel owner`() {
+        val demosaicShader = source("src/main/cpp/vulkan/shaders/spectra_demosaic_resident.comp")
+        val toneShader = source("src/main/cpp/vulkan/shaders/spectra_tone_resident.comp")
+        val demosaicBackend = source("src/main/cpp/vulkan/VulkanSpectraResidentDemosaicBackend.cpp")
+        val pipelineHeader = source("src/main/cpp/vulkan/VulkanComputePipelineManager.h")
+        val pipelineSource = source("src/main/cpp/vulkan/VulkanComputePipelineManager.cpp")
+
+        assertFalse(demosaicShader.contains("phase6ClassifyAndStore"))
+        assertFalse(demosaicShader.contains("phase6ApplyCorrection"))
+        assertFalse(demosaicShader.contains("preWbOpponentStabilize"))
+        assertFalse(demosaicShader.contains("preWbCloudCorrect"))
+        assertFalse(demosaicShader.contains("neuralJddAt"))
+        assertFalse(demosaicShader.contains("JDD_W1"))
+
+        assertFalse(toneShader.contains("preToneChroma444FromInput"))
+        assertFalse(toneShader.contains("preToneFirmResidualKeep"))
+        assertFalse(toneShader.contains("GALOSH-style residual cleanup"))
+
+        assertFalse(demosaicBackend.contains("push.mode = 9u"))
+        assertFalse(demosaicBackend.contains("push.mode = 10u"))
+        assertTrue(demosaicBackend.contains("result.phase6ResidualChromaUsedForOutput = false"))
+
+        assertFalse(pipelineHeader.contains("executeIspLumaDenoise"))
+        assertFalse(pipelineHeader.contains("executeIspChromaDenoise"))
+        assertFalse(pipelineSource.contains("getIspLumaDenoiseSpirv"))
+        assertFalse(pipelineSource.contains("getIspChromaDenoiseSpirv"))
     }
 
     @Test
-    fun physicalCfaLumaUsesUnbiasedGeneralizedAnscombeInverseApproximation() {
-        val shader = File("src/main/cpp/vulkan/shaders/spectra_pass1_resident.comp").readText()
-        assertTrue(shader.contains("inverseVstUnbiasedApprox"))
-        assertTrue(shader.contains("Mäkitalo-Foi"))
-        assertFalse(shader.contains("float inverseVst(float y"))
-        assertTrue(shader.contains("pc.physicalBaselineMode == 0u && midRing.valid"))
-        assertTrue(shader.contains("pc.physicalBaselineMode != 0u\n            ? 1.0"))
+    fun `retired JDD cannot regain denoise pixel authority`() {
+        val shader = source("src/main/cpp/vulkan/shaders/spectra_demosaic_resident.comp")
+        val backend = source("src/main/cpp/vulkan/VulkanSpectraResidentDemosaicBackend.cpp")
+
+        assertTrue(shader.contains("pc.mode == 0u ? bilinearAt(x, y) : malvarAt(x, y)"))
+        assertFalse(shader.contains("neuralJddResidualAt"))
+        assertTrue(backend.contains("legacy direct requests cannot regain denoise pixel authority"))
+        assertTrue(backend.contains("case SpectraGpuDemosaicAlgorithm::NEURAL_JDD:"))
+        assertTrue(backend.contains("push.mode = 1u"))
     }
 
     @Test
-    fun lateLumaUsesPropagatedResidualAndNoIsoOrRenderGainHeuristic() {
-        val shader = File("src/main/cpp/vulkan/shaders/spectra_post_demosaic_resident.comp").readText()
-        val backend = File("src/main/cpp/vulkan/VulkanSpectraResidentPostDemosaicBackend.h").readText()
-        val isp = File("src/main/cpp/IspCore.cpp").readText()
+    fun `observer stages remain read only while classical authorities are neutral`() {
+        val isp = source("src/main/cpp/IspCore.cpp")
+        val planner = source("src/main/cpp/vulkan/shaders/spectra_pass3_planner.comp")
 
-        assertTrue(shader.contains("inputResidualLumaSigma"))
-        assertTrue(shader.contains("predictedResidualVariance"))
-        assertTrue(shader.contains("estimatedSignalVariance"))
-        assertTrue(shader.contains("noiseDominance"))
-        assertTrue(shader.contains("correctionFraction"))
-        assertTrue(shader.contains("microDetailConfidence"))
-        assertFalse(shader.contains("lumaUserBoost"))
-        assertFalse(shader.contains("noiseModelMultiplier"))
-        assertFalse(shader.contains("configuredDynamicIsoCoeff"))
-
-        assertTrue(backend.contains("inputResidualLumaSigma"))
-        assertFalse(backend.contains("noiseModelMultiplier"))
-        assertFalse(backend.contains("configuredDynamicIsoCoeff"))
-        assertTrue(isp.contains("spectraResidualNr.inputLumaSigma"))
-        assertTrue(isp.contains("postToneResidualLumaSigma"))
+        assertTrue(isp.contains("preDemosaicAuthorityState.lumaAuthority = 0.0f"))
+        assertTrue(isp.contains("preDemosaicAuthorityState.chromaAuthority = 0.0f"))
+        assertTrue(isp.contains("preDemosaicAuthorityState.lowFrequencyAuthority = 0.0f"))
+        assertTrue(isp.contains("budgetState.applied = false"))
+        assertTrue(planner.contains("This shader has no pixel output and cannot perform denoise or correction"))
     }
 
     @Test
-    fun deadPhysicalLumaOwnersAreRemovedRatherThanDisabled() {
-        val isp = File("src/main/cpp/IspCore.cpp").readText()
-        val physical = File("src/main/cpp/SpectraPhysicalBaselineNr.h").readText()
-        assertFalse(physical.contains("PhysicalBaselineNrPlan"))
-        assertFalse(physical.contains("resolvePhysicalBaselineNr"))
-        assertFalse(physical.contains("resolvePhysicalPreToneLumaAuthority"))
-        assertFalse(physical.contains("renderGainPressure"))
-        assertFalse(physical.contains("captureIsoPressure"))
-        assertFalse(isp.contains("galoshPreToneLumaBaselineAuthority"))
-        assertFalse(isp.contains("residualLumaStrengthScale"))
+    fun `post demosaic pre WB path is exact pass through`() {
+        val shader = source("src/main/cpp/vulkan/shaders/spectra_demosaic_resident.comp")
+        assertTrue(shader.contains("vec3 rawForWb = rawInput;"))
+        assertTrue(shader.contains("cloudAppliedOpponent = vec2(0.0);"))
     }
 
     @Test
-    fun separatePhysicalChromaOwnersRemainConnected() {
-        val isp = File("src/main/cpp/IspCore.cpp").readText()
-        val physical = File("src/main/cpp/SpectraPhysicalBaselineNr.h").readText()
-        assertTrue(physical.contains("resolvePhysicalChromaBaseStrength"))
-        assertTrue(physical.contains("resolvePhysicalPreToneChroma"))
-        assertTrue(isp.contains("PHYSICAL_SINGLE_FRAME_LOW_FREQUENCY_CHROMA_READY"))
-        assertTrue(isp.contains("pass3State.applyRowBanding = false"))
-        assertTrue(isp.contains("pass3State.applyColBanding = false"))
-        assertTrue(isp.contains("state.bandingAuthority = 0.0f"))
+    fun `tone mode zero is identity preparation not classical denoise`() {
+        val shader = source("src/main/cpp/vulkan/shaders/spectra_tone_resident.comp")
+        val backend = source("src/main/cpp/vulkan/VulkanSpectraResidentToneBackend.cpp")
+
+        assertTrue(shader.contains("writeWorking(gid, inputAt(int(gid.x), int(gid.y)));"))
+        assertTrue(backend.contains("constexpr bool preToneChroma444Requested = false"))
+        assertTrue(backend.contains("constexpr bool preToneChromaCovarianceWhiteningRequested = false"))
     }
 }

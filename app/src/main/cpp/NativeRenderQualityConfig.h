@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <array>
 #include <cmath>
 
 // Enum matching Kotlin RawDomain
@@ -17,13 +18,21 @@ enum class NativeRawDomain {
 
 // Capture-local calibration transport. Physical sensor-noise source identity lives in the
 // Kotlin PhysicalNoiseState snapshot; native only receives frozen physical S/O plus availability.
+struct FrozenPhysicalNoiseModelNative {
+    std::array<float, 4> shotS{{0.0f, 0.0f, 0.0f, 0.0f}};
+    std::array<float, 4> readO{{0.0f, 0.0f, 0.0f, 0.0f}};
+    bool available = false;
+};
+
 struct FinalSensorCalibrationNative {
     int effectiveWhiteLevel = 65535;
     float effectiveBlackLevels[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     float blackLevelScaleFactor = 1.0f;
 
-    // Physical shutter S/O flattened as S0,O0,S1,O1... in canonical R,Gr,Gb,B order.
-    // Values arrive as Java/Kotlin Double and stay double in native evaluation.
+    // Compatibility JNI ingress for physical shutter S/O flattened as
+    // S0,O0,S1,O1... in canonical R,Gr,Gb,B order. Native consumers must not treat this
+    // array as an independent authority: native-lib validates it once and copies it into
+    // effectiveS/effectiveO below, which are the sole native physical S/O truth.
     double effectiveNoiseProfile[16] = {0.0};
 
     // Physical model availability is derived from the validated frozen S/O payload below.
@@ -56,7 +65,9 @@ struct FinalSensorCalibrationNative {
     NativeRawDomain rawInputDomain = NativeRawDomain::UNKNOWN;
     NativeRawDomain ispWorkingDomain = NativeRawDomain::MASTER_RAW16_NORMALIZED;
 
-    // Optional SPECTRA-consumer snapshot. Physical authority is already frozen upstream.
+    // Optional SPECTRA-consumer metadata. cameraS/cameraO are OEM evidence/telemetry only.
+    // effectiveS/effectiveO are populated exclusively from the validated PhysicalNoiseState
+    // JNI payload and are the sole native physical shutter-noise authority.
     bool spectraSnapshotPresent = false;
     std::string spectraLensKey = "unknown";
     int spectraMode = 0;
@@ -69,10 +80,42 @@ struct FinalSensorCalibrationNative {
     std::string lensId = "unknown";
 
     bool physicalNoiseModelAvailable() const noexcept {
-        return hasNoiseProfile && noiseProfileApplied && noiseProfileValid &&
-               noiseProfilePairCount == 4 && noiseProfileChannelCount == 4;
+        if (!(hasNoiseProfile && noiseProfileApplied && noiseProfileValid &&
+              noiseProfilePairCount == 4 && noiseProfileChannelCount == 4)) {
+            return false;
+        }
+        bool hasEnergy = false;
+        for (int ch = 0; ch < 4; ++ch) {
+            if (!std::isfinite(effectiveS[ch]) || !std::isfinite(effectiveO[ch]) ||
+                effectiveS[ch] < 0.0 || effectiveO[ch] < 0.0) {
+                return false;
+            }
+            hasEnergy = hasEnergy || effectiveS[ch] > 0.0 || effectiveO[ch] > 0.0;
+        }
+        return hasEnergy;
+    }
+
+    // Phase 3: the only native export into Neural conditioning. This is deliberately all-or-none:
+    // no Camera2/OEM fallback, no ISO synthesis, no clamping and no partial-channel recovery.
+    // The float cast is the sole representation change between frozen JNI physical S/O and the
+    // Vulkan/Neural conditioning contract. Invalid physical state exports a zero unavailable model.
+    FrozenPhysicalNoiseModelNative frozenPhysicalNoiseModel() const noexcept {
+        FrozenPhysicalNoiseModelNative out{};
+        if (!physicalNoiseModelAvailable()) return out;
+        for (std::size_t ch = 0; ch < out.shotS.size(); ++ch) {
+            out.shotS[ch] = static_cast<float>(effectiveS[ch]);
+            out.readO[ch] = static_cast<float>(effectiveO[ch]);
+        }
+        out.available = true;
+        return out;
     }
 };
+
+inline int resolveSpectraProcessingMode(
+        bool spectraRequested,
+        const FinalSensorCalibrationNative& calibration) noexcept {
+    return spectraRequested && calibration.physicalNoiseModelAvailable() ? 1 : 0;
+}
 
 namespace bncam::profile_defaults {
 inline constexpr float kDetailAmount = 0.00f;

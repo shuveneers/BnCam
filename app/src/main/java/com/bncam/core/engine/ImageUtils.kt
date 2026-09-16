@@ -721,6 +721,12 @@ object ImageUtils {
         val profileDetailTuning = qualityConfig?.profileDetailTuning?.sanitized()
             ?: com.bncam.core.quality.ProfileDetailTuning()
 
+        // Profile/UI owns only the SPECTRA request intent. The capture-local FinalSensorCalibration
+        // may carry an effective downstream state after physical adaptation, so it must not be used
+        // as the JNI request source. Native combines this immutable profile request with the frozen
+        // PhysicalNoiseState S/O and disables Neural production when that physical model is invalid.
+        val spectraRequestedByProfile = qualityConfig?.profileNoiseTuning?.spectraEnabled == true
+
         return masterFrame.nativeRaw16Buffer.withDirectBuffer { raw16DirectBuffer ->
             // Full-payload CRC verification scans the complete RAW16 array twice. Keep it available
             // for explicit developer dump/integrity sessions, but not on every debug shot.
@@ -789,7 +795,7 @@ object ImageUtils {
                 colorMatrixFromMetadata = finalCal?.effectiveColorMatrixSource?.let { source ->
                     source.contains("CaptureResult", ignoreCase = true) || source.contains("CameraCharacteristics", ignoreCase = true)
                 } ?: (colorMatrix?.fromMetadata ?: false),
-                spectraProcessingEnabled = finalCal?.spectraProcessingEnabled == true,
+                spectraProcessingEnabled = spectraRequestedByProfile,
                 sensorNoiseProfile = nativeNoiseProfile,
                 sensorNoiseProfilePresent = nativeNoiseProfilePresent,
                 sensorNoiseProfileApplied = nativeNoiseProfileApplied,

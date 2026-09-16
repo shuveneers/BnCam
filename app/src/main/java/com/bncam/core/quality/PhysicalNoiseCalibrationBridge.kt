@@ -79,20 +79,17 @@ fun FinalSensorCalibration.withPhysicalNoiseAuthority(): FinalSensorCalibration 
     )
 }
 
-private const val PHYSICAL_NOISE_TEMPORAL_FUSION_SOURCE_FLAG: Long = 1L shl 9
-
 /**
- * Propagates only the generic multi-frame variance reduction into the physical residual model.
+ * Records generic multi-frame residual-variance propagation without mutating the physical
+ * shutter-time model. PhysicalNoiseState.effectiveS/O is immutable capture truth; a fused RAW
+ * product may have lower residual variance, represented separately by these scalar fields.
  *
- * The canonical transport names are `physicalFusionVarianceScale` and
- * `physicalEffectiveFrameCount`. Historical native `spectra*` names are accepted only as read-only
- * compatibility aliases until the native merge telemetry is renamed. No SPECTRA fit/observer
- * coefficient is consumed here.
+ * Historical native `spectra*` telemetry names remain read-only compatibility aliases until the
+ * native merge telemetry is renamed. No SPECTRA fit/observer coefficient is consumed here.
  */
 fun FinalSensorCalibration.withPhysicalMergeStats(stats: String): FinalSensorCalibration {
     if (stats.isBlank()) return this
-    val snapshot = noiseSnapshot ?: return this
-    val physical = snapshot.physicalNoiseState()
+    val physical = noiseSnapshot?.physicalNoiseState() ?: return this
     if (!physical.modelAvailable) return this
 
     val values = stats.split(';')
@@ -107,46 +104,21 @@ fun FinalSensorCalibration.withPhysicalMergeStats(stats: String): FinalSensorCal
         ?.takeIf { it.isFinite() }
         ?.coerceIn(0.04, 1.0)
         ?: 1.0
-    if (kotlin.math.abs(fusionVarianceScale - 1.0) < 1.0e-9) return this
-
-    val oldS = snapshot.effectiveS
-    val oldO = snapshot.effectiveO
-    if (oldS.size < 4 || oldO.size < 4) return this
-    val propagatedS = DoubleArray(4) { channel ->
-        (oldS[channel] * fusionVarianceScale).coerceAtLeast(0.0)
-    }
-    val propagatedO = DoubleArray(4) { channel ->
-        (oldO[channel] * fusionVarianceScale).coerceAtLeast(0.0)
-    }
-    if (propagatedS.any { !it.isFinite() } || propagatedO.any { !it.isFinite() }) return this
-
-    val propagatedSnapshot = snapshot.copy(
-        effectiveS = propagatedS,
-        effectiveO = propagatedO,
-        sourceFlags = snapshot.sourceFlags or PHYSICAL_NOISE_TEMPORAL_FUSION_SOURCE_FLAG
-    )
-    val propagatedProfile = DoubleArray(8) { index ->
-        val channel = index / 2
-        if (index % 2 == 0) propagatedS[channel] else propagatedO[channel]
-    }
     val effectiveFrames = (values["physicalEffectiveFrameCount"]
         ?: values["spectraEffectiveFrameCount"])
         ?.toDoubleOrNull()
         ?.takeIf { it.isFinite() && it >= 1.0 }
         ?: 1.0
-    val warning = "PhysicalNoisePropagation: fusionVarianceScale=$fusionVarianceScale; " +
-        "effectiveFrames=$effectiveFrames; SPECTRA fit coefficients ignored"
-    val physicalProfileWasApplied = effectiveNoiseProfileApplied
+
+    val warning = "PhysicalNoiseResidualPropagation: fusionVarianceScale=$fusionVarianceScale; " +
+        "effectiveFrames=$effectiveFrames; frozenPhysicalSoUnchanged=true; SPECTRA fit coefficients ignored"
 
     return copy(
-        effectiveNoiseProfile = propagatedProfile,
-        effectiveNoiseProfileSource = "$effectiveNoiseProfileSource + PHYSICAL_TEMPORAL_FUSION",
-        effectiveNoiseProfileApplied = physicalProfileWasApplied,
-        effectiveNoiseProfilePairCount = 4,
-        effectiveNoiseProfileChannelCount = 4,
-        noiseSnapshot = propagatedSnapshot,
+        physicalFusionVarianceScale = fusionVarianceScale,
+        physicalEffectiveFrameCount = effectiveFrames,
         pipelineWarnings = pipelineWarnings
-            .filterNot { it.startsWith("PhysicalNoisePropagation:") }
+            .filterNot { it.startsWith("PhysicalNoisePropagation:") ||
+                it.startsWith("PhysicalNoiseResidualPropagation:") }
             .plus(warning)
     )
 }

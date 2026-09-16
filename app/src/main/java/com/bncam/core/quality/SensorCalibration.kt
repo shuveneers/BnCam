@@ -181,7 +181,12 @@ data class FinalSensorCalibration(
     val applicability: List<Pair<String, String>>,
     val calibrationApplied: Boolean,
     val pipelineWarnings: List<String>,
-    val noiseSnapshot: NoiseModelSnapshotV3? = null
+    val noiseSnapshot: NoiseModelSnapshotV3? = null,
+
+    // Residual-noise propagation after temporal fusion. These values describe the fused RAW
+    // product only; they never rewrite the immutable shutter-time PhysicalNoiseState S/O.
+    val physicalFusionVarianceScale: Double = 1.0,
+    val physicalEffectiveFrameCount: Double = 1.0
 ) {
     fun debugPairs(): List<Pair<String, String>> {
         val pairs = mutableListOf<Pair<String, String>>()
@@ -275,6 +280,8 @@ data class FinalSensorCalibration(
         pairs.add("Sensor Noise Profile CFA/Channel Mapping" to effectiveNoiseProfileChannelMap)
         pairs.add("Sensor Noise Profile Values S/O" to (effectiveNoiseProfile?.formatDoubleArray() ?: "missing"))
         pairs.add("Sensor Noise Profile Applied To" to if (effectiveNoiseProfileApplied) "RAW_DOMAIN_NATIVE_ISP_DENOISE_SCALING" else "NOT_APPLIED")
+        pairs.add("Physical Fusion Variance Scale" to physicalFusionVarianceScale.toString())
+        pairs.add("Physical Effective Frame Count" to physicalEffectiveFrameCount.toString())
 
         pairs.add("Native Calibration Applied" to calibrationApplied.toString())
         applicability.forEach { (key, value) -> pairs.add(key to value) }
@@ -493,9 +500,11 @@ object SensorCalibrationResolver {
     }
 
     /**
-     * Produces the denoise model for an averaged/fused master from each selected frame's exact
-     * calibration. Independent-frame mean variance is sum(variance_i) / n², so the resulting
-     * S/O coefficients are summed and divided by n² rather than copied from the anchor.
+     * Produces a compatibility residual-noise estimate for an averaged/fused master from each
+     * selected frame's exact calibration. Independent-frame mean variance is sum(variance_i) / n².
+     *
+     * Crucially, this estimate is NOT physical sensor calibration: the capture-local
+     * NoiseModelSnapshotV3/PhysicalNoiseState remains the immutable shutter-time authority.
      */
     fun combineNoiseForFusion(
         anchor: FinalSensorCalibration,
@@ -554,15 +563,6 @@ object SensorCalibrationResolver {
             combined[channel * 2] = weightedSlopeSum.coerceAtLeast(0.0)
             combined[channel * 2 + 1] = weightedOffsetSum.coerceAtLeast(0.0)
         }
-        val fusedS = DoubleArray(4) { channel -> combined.getOrNull(channel * 2) ?: 0.0 }
-        val fusedO = DoubleArray(4) { channel -> combined.getOrNull(channel * 2 + 1) ?: 0.0 }
-        val anchorSnapshot = anchor.noiseSnapshot
-        val fusedSnapshot = anchorSnapshot?.copy(
-            effectiveS = fusedS,
-            effectiveO = fusedO,
-            sourceFlags = anchorSnapshot.sourceFlags or 0x1L
-        )
-
         return anchor.copy(
             effectiveNoiseProfile = combined,
             effectiveNoiseProfileSource = "Fused per-frame exact Camera2/manual S/O ($frameCount frames, $fallbackCount explicit zero fallbacks)",
@@ -570,9 +570,8 @@ object SensorCalibrationResolver {
             effectiveNoiseProfileApplied = true,
             effectiveNoiseProfilePairCount = coefficientCount / 2,
             effectiveNoiseProfileChannelCount = coefficientCount / 2,
-            noiseSnapshot = fusedSnapshot,
             pipelineWarnings = anchor.pipelineWarnings + (
-                "Fused denoise S/O derived from $frameCount selected frames using per-frame radiometric weights w_i and exact black/white normalization; anchor metadata was not reused for support frames" +
+                "Fused residual-noise estimate derived from $frameCount selected frames using per-frame radiometric weights w_i and exact black/white normalization; frozen PhysicalNoiseState remains unchanged; anchor metadata was not reused for support frames" +
                     if (fallbackCount > 0) "; $fallbackCount frame(s) had no S/O and used explicit zero fallback" else ""
                 )
         ).also(LensCalibrationTelemetry::record)

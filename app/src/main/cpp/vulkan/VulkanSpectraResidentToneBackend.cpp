@@ -489,21 +489,11 @@ SpectraResidentSceneObserverResult VulkanSpectraResidentToneBackend::executeScen
     }
     const std::uint64_t pixels = static_cast<std::uint64_t>(request.frameWidth) * request.frameHeight;
     const std::uint64_t rgbBytes = pixels * 3u * sizeof(float);
-    const float preToneChroma444Strength = std::clamp(request.preToneChroma444Strength, 0.0f, 0.94f);
-    const bool preToneChroma444Requested = request.preToneChroma444Enabled &&
-            preToneChroma444Strength > 1.0e-4f;
-    const bool preToneChromaCovarianceWhiteningRequested = preToneChroma444Requested &&
-            request.preToneChromaCovarianceWhiteningEnabled &&
-            std::isfinite(request.preToneChromaVarianceY) && request.preToneChromaVarianceY > 1.0e-14f &&
-            std::isfinite(request.preToneChromaVarianceC1) && request.preToneChromaVarianceC1 > 1.0e-14f &&
-            std::isfinite(request.preToneChromaVarianceC2) && request.preToneChromaVarianceC2 > 1.0e-14f &&
-            std::isfinite(request.preToneChromaCovarianceC1C2) &&
-            std::isfinite(request.preToneChromaReferenceSignal) && request.preToneChromaReferenceSignal > 0.0f &&
-            std::isfinite(request.preToneChromaShotNoiseFraction) &&
-            std::isfinite(request.preToneChromaModelConfidence) && request.preToneChromaModelConfidence >= 0.10f &&
-            std::isfinite(request.preToneChromaFullShrinkSigma) &&
-            std::isfinite(request.preToneChromaPreserveSigma) &&
-            request.preToneChromaPreserveSigma > request.preToneChromaFullShrinkSigma;
+    // Phase 4: compatibility fields remain in the ABI until the dedicated ABI cleanup phase,
+    // but classical pre-tone denoise has no runtime authority even if a stale caller sets them.
+    constexpr float preToneChroma444Strength = 0.0f;
+    constexpr bool preToneChroma444Requested = false;
+    constexpr bool preToneChromaCovarianceWhiteningRequested = false;
     if (residentInputBytes < rgbBytes) {
         result.status = "GPU_SCENE_OBSERVER_RESIDENT_INPUT_TOO_SMALL";
         result.failureReason = "RESIDENT_RGB_BYTES_BELOW_FRAME_REQUIREMENT";
@@ -545,25 +535,22 @@ SpectraResidentSceneObserverResult VulkanSpectraResidentToneBackend::executeScen
     push.sampleStep = result.sampleStep;
     push.sampleCount = result.sampleCount;
     push.displayOffsetFloats = result.sampleCount * 3u;
-    push.presenceReserved0 = preToneChroma444Requested ? 1u : 0u;
-    push.presenceReserved1 = preToneChroma444Strength;
-    // Mode-0-only aliases. Keep the push block at the portable 128-byte Vulkan minimum while
-    // supplying the exact propagated physical covariance needed for whitened chroma shrinkage.
-    push.portraitEnabled = preToneChromaCovarianceWhiteningRequested ? 1u : 0u;
-    push.exposureGain = std::max(0.0f, request.preToneChromaVarianceY);
-    push.rawJpegBaseVibrance = std::max(0.0f, request.preToneChromaVarianceC1);
-    push.profileSaturation = std::max(0.0f, request.preToneChromaVarianceC2);
-    push.profileContrast = request.preToneChromaCovarianceC1C2;
-    push.profileVibrance = std::clamp(request.preToneChromaReferenceSignal, 1.0e-4f, 2.0f);
-    push.portraitTargetLeft = std::clamp(request.preToneChromaShotNoiseFraction, 0.0f, 1.0f);
-    push.portraitTargetTop = std::clamp(request.preToneChromaModelConfidence, 0.0f, 1.0f);
-    push.portraitTargetRight = std::max(0.50f, request.preToneChromaFullShrinkSigma);
-    push.portraitTargetBottom = std::max(push.portraitTargetRight + 0.25f, request.preToneChromaPreserveSigma);
-    // Mode 0 owns no tone shoulder. Reuse these two existing push slots only for
-    // measured physical-noise and WB+CCM amplification evidence. Delta 0066 removes
-    // all demosaic-family / RAW-format authority heuristics from Phase 9.
-    push.shoulderStart = std::clamp(request.preToneChromaNoisePressure, 0.0f, 1.0f);
-    push.shoulderStrength = std::clamp(request.preToneChromaWbCcmPressure, 0.0f, 1.0f);
+    push.presenceReserved0 = 0u;
+    push.presenceReserved1 = 0.0f;
+    // Compatibility-only mode-0 aliases stay neutral. Physical covariance remains available to
+    // read-only observers/telemetry elsewhere, never to a second pixel denoiser.
+    push.portraitEnabled = 0u;
+    push.exposureGain = 0.0f;
+    push.rawJpegBaseVibrance = 0.0f;
+    push.profileSaturation = 0.0f;
+    push.profileContrast = 0.0f;
+    push.profileVibrance = 0.0f;
+    push.portraitTargetLeft = 0.0f;
+    push.portraitTargetTop = 0.0f;
+    push.portraitTargetRight = 0.0f;
+    push.portraitTargetBottom = 0.0f;
+    push.shoulderStart = 0.0f;
+    push.shoulderStrength = 0.0f;
 
     double timestampToMs = 0.0;
     if (queryPool_ != VK_NULL_HANDLE) {

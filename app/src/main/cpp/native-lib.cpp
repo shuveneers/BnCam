@@ -3657,6 +3657,12 @@ Java_com_bncam_core_engine_ImageUtils_renderJpegFromMasterNative(
         meta.calibration.signalModelConfidence = validNoise ? 1.0f : 0.0f;
         meta.calibration.noiseProfilePairCount = validNoise ? requestedNoisePairs : 0;
         meta.calibration.noiseProfileChannelCount = validNoise ? std::clamp(static_cast<int>(sensorNoiseProfileChannelCount), 0, 8) : 0;
+        if (validNoise && requestedNoisePairs == 4 && meta.calibration.noiseProfileChannelCount == 4) {
+            for (int ch = 0; ch < 4; ++ch) {
+                meta.calibration.effectiveS[ch] = meta.calibration.effectiveNoiseProfile[ch * 2];
+                meta.calibration.effectiveO[ch] = meta.calibration.effectiveNoiseProfile[ch * 2 + 1];
+            }
+        }
     } else {
         meta.calibration.hasNoiseProfile = false;
         meta.calibration.noiseProfileApplied = false;
@@ -3664,29 +3670,30 @@ Java_com_bncam_core_engine_ImageUtils_renderJpegFromMasterNative(
         meta.calibration.noiseProfileChannelCount = 0;
         meta.calibration.calibrationWarnings = "SENSOR_NOISE_PROFILE missing or not applied";
     }
+    // IMPORTANT: resolve SPECTRA only after the canonical PhysicalNoiseState JNI payload has
+    // populated effectiveS/effectiveO above. Computing this gate before canonical S/O ingress
+    // recreates the historical failure where SPECTRA was requested but native permanently latched
+    // Off, even though the same capture later reported Physical Noise Model Available=true.
     const bool physicalNoiseReady = meta.calibration.physicalNoiseModelAvailable();
+    const bool spectraRequested = spectraProcessingEnabled == JNI_TRUE;
     meta.calibration.spectraProcessingMode =
-            spectraProcessingEnabled == JNI_TRUE && physicalNoiseReady ? 1 : 0;
+            resolveSpectraProcessingMode(spectraRequested, meta.calibration);
     meta.calibration.spectraMode = meta.calibration.spectraProcessingMode;
-    if (spectraProcessingEnabled == JNI_TRUE && !physicalNoiseReady) {
+    if (spectraRequested && !physicalNoiseReady) {
         meta.calibration.calibrationWarnings += "; SPECTRA disabled: physical S/O unavailable";
     }
 
-    // SPECTRA receives one immutable shutter-time snapshot. Do not reconstruct these
-    // values from mutable profile/global state in native code. The established flattened
-    // profile remains a safe compatibility fallback when an older caller supplies no snapshot.
+    // Physical S/O has already been validated above and copied into effectiveS/effectiveO.
+    // The legacy SPECTRA arrays remain in the JNI signature for ABI compatibility only; they
+    // are never allowed to create, replace or rescue physical authority. cameraS/cameraO remain
+    // optional OEM telemetry. A mismatch is reported rather than silently switching authority.
     auto copyValidatedDouble4 = [&](jdoubleArray source, double destination[4]) -> bool {
         if (source == nullptr || env->GetArrayLength(source) < 4) return false;
         jdouble values[4] = {0.0, 0.0, 0.0, 0.0};
         env->GetDoubleArrayRegion(source, 0, 4, values);
-        bool valid = true;
         for (int i = 0; i < 4; ++i) {
-            if (!std::isfinite(values[i]) || values[i] < 0.0) {
-                valid = false;
-                break;
-            }
+            if (!std::isfinite(values[i]) || values[i] < 0.0) return false;
         }
-        if (!valid) return false;
         for (int i = 0; i < 4; ++i) destination[i] = values[i];
         return true;
     };
@@ -3694,37 +3701,36 @@ Java_com_bncam_core_engine_ImageUtils_renderJpegFromMasterNative(
     meta.calibration.spectraSnapshotPresent = spectraSnapshotPresent == JNI_TRUE;
     meta.calibration.spectraLensKey = getJniString(env, spectraLensKeyString, lensId.c_str());
     meta.calibration.postRawSensitivityBoost = std::clamp(static_cast<int>(spectraPostRawSensitivityBoost), 1, 1600);
-    meta.calibration.signalModelConfidence = std::clamp(
-            std::isfinite(spectraSignalModelConfidence) ? static_cast<float>(spectraSignalModelConfidence) : 0.0f,
-            0.0f,
-            1.0f
-    );
-
     const bool cameraSValid = copyValidatedDouble4(spectraCameraSArray, meta.calibration.cameraS);
     const bool cameraOValid = copyValidatedDouble4(spectraCameraOArray, meta.calibration.cameraO);
-    const bool effectiveSValid = copyValidatedDouble4(spectraEffectiveSArray, meta.calibration.effectiveS);
-    const bool effectiveOValid = copyValidatedDouble4(spectraEffectiveOArray, meta.calibration.effectiveO);
-    const bool snapshotArraysValid = cameraSValid && cameraOValid && effectiveSValid && effectiveOValid;
-
-    if (!meta.calibration.spectraSnapshotPresent || !snapshotArraysValid) {
-        meta.calibration.spectraSnapshotPresent = false;
-        if (meta.calibration.hasNoiseProfile && meta.calibration.noiseProfilePairCount >= 4) {
-            for (int ch = 0; ch < 4; ++ch) {
-                const double sValue = meta.calibration.effectiveNoiseProfile[ch * 2];
-                const double oValue = meta.calibration.effectiveNoiseProfile[ch * 2 + 1];
-                meta.calibration.cameraS[ch] = sValue;
-                meta.calibration.cameraO[ch] = oValue;
-                meta.calibration.effectiveS[ch] = sValue;
-                meta.calibration.effectiveO[ch] = oValue;
-            }
-            if (meta.calibration.signalModelConfidence <= 0.0f) {
-                meta.calibration.signalModelConfidence = 1.0f;
-            }
-            meta.calibration.calibrationWarnings += "; SPECTRA snapshot fallback=effectiveNoiseProfile";
-        } else {
-            meta.calibration.signalModelConfidence = 0.0f;
-            meta.calibration.calibrationWarnings += "; SPECTRA snapshot missing_or_invalid";
+    if (!cameraSValid || !cameraOValid) {
+        for (int ch = 0; ch < 4; ++ch) {
+            meta.calibration.cameraS[ch] = 0.0;
+            meta.calibration.cameraO[ch] = 0.0;
         }
+    }
+
+    double compatibilityEffectiveS[4] = {0.0, 0.0, 0.0, 0.0};
+    double compatibilityEffectiveO[4] = {0.0, 0.0, 0.0, 0.0};
+    const bool compatibilitySValid = copyValidatedDouble4(spectraEffectiveSArray, compatibilityEffectiveS);
+    const bool compatibilityOValid = copyValidatedDouble4(spectraEffectiveOArray, compatibilityEffectiveO);
+    if (physicalNoiseReady && compatibilitySValid && compatibilityOValid) {
+        constexpr double kAuthorityMismatchEpsilon = 1.0e-12;
+        bool mismatch = false;
+        for (int ch = 0; ch < 4; ++ch) {
+            mismatch = mismatch ||
+                    std::abs(compatibilityEffectiveS[ch] - meta.calibration.effectiveS[ch]) > kAuthorityMismatchEpsilon ||
+                    std::abs(compatibilityEffectiveO[ch] - meta.calibration.effectiveO[ch]) > kAuthorityMismatchEpsilon;
+        }
+        if (mismatch) {
+            meta.calibration.calibrationWarnings +=
+                    "; legacy SPECTRA effective S/O mismatch ignored; PhysicalNoiseState JNI payload wins";
+        }
+    }
+    meta.calibration.signalModelConfidence = physicalNoiseReady ? 1.0f : 0.0f;
+    if (meta.calibration.spectraSnapshotPresent && !physicalNoiseReady) {
+        meta.calibration.calibrationWarnings +=
+                "; SPECTRA snapshot present without valid PhysicalNoiseState S/O; no authority fallback";
     }
 
     const int lscColumns = std::max(0, static_cast<int>(lensShadingColumns));

@@ -264,45 +264,8 @@ bool VulkanComputePipelineManager::initializePipelines(VkDevice device) {
         }
     }
 
-    // 13. ISP Luma Denoise Pipeline
-    const auto& ildSpirv = getIspLumaDenoiseSpirv();
-    VkShaderModuleCreateInfo ildModInfo{};
-    ildModInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-    ildModInfo.codeSize = ildSpirv.size() * sizeof(std::uint32_t);
-    ildModInfo.pCode = ildSpirv.data();
-
-    if (vkCreateShaderModule(device, &ildModInfo, nullptr, &ispLumaDenoiseShaderModule_) == VK_SUCCESS) {
-        VkComputePipelineCreateInfo pipeInfo{};
-        pipeInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-        pipeInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        pipeInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        pipeInfo.stage.module = ispLumaDenoiseShaderModule_;
-        pipeInfo.stage.pName = "main";
-        pipeInfo.layout = pipelineLayout_;
-        if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &ispLumaDenoisePipeline_) == VK_SUCCESS) {
-            pipelineCreationCount_++;
-        }
-    }
-
-    // 14. ISP Chroma Denoise Pipeline
-    const auto& icdSpirv = getIspChromaDenoiseSpirv();
-    VkShaderModuleCreateInfo icdModInfo{};
-    icdModInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-    icdModInfo.codeSize = icdSpirv.size() * sizeof(std::uint32_t);
-    icdModInfo.pCode = icdSpirv.data();
-
-    if (vkCreateShaderModule(device, &icdModInfo, nullptr, &ispChromaDenoiseShaderModule_) == VK_SUCCESS) {
-        VkComputePipelineCreateInfo pipeInfo{};
-        pipeInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-        pipeInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        pipeInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        pipeInfo.stage.module = ispChromaDenoiseShaderModule_;
-        pipeInfo.stage.pName = "main";
-        pipeInfo.layout = pipelineLayout_;
-        if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &ispChromaDenoisePipeline_) == VK_SUCCESS) {
-            pipelineCreationCount_++;
-        }
-    }
+    // Phase 4: legacy ISP luma/chroma denoise pipelines removed.
+    // Neural RAW denoise is the sole noise-related RAW pixel mutation owner.
 
     // 15. ISP Contrast & Vibrance Pipeline
     const auto& icvSpirv = getIspContrastVibranceSpirv();
@@ -414,22 +377,6 @@ void VulkanComputePipelineManager::destroyPipelines(VkDevice device) {
     if (ispContrastVibranceShaderModule_ != VK_NULL_HANDLE) {
         vkDestroyShaderModule(device, ispContrastVibranceShaderModule_, nullptr);
         ispContrastVibranceShaderModule_ = VK_NULL_HANDLE;
-    }
-    if (ispChromaDenoisePipeline_ != VK_NULL_HANDLE) {
-        vkDestroyPipeline(device, ispChromaDenoisePipeline_, nullptr);
-        ispChromaDenoisePipeline_ = VK_NULL_HANDLE;
-    }
-    if (ispChromaDenoiseShaderModule_ != VK_NULL_HANDLE) {
-        vkDestroyShaderModule(device, ispChromaDenoiseShaderModule_, nullptr);
-        ispChromaDenoiseShaderModule_ = VK_NULL_HANDLE;
-    }
-    if (ispLumaDenoisePipeline_ != VK_NULL_HANDLE) {
-        vkDestroyPipeline(device, ispLumaDenoisePipeline_, nullptr);
-        ispLumaDenoisePipeline_ = VK_NULL_HANDLE;
-    }
-    if (ispLumaDenoiseShaderModule_ != VK_NULL_HANDLE) {
-        vkDestroyShaderModule(device, ispLumaDenoiseShaderModule_, nullptr);
-        ispLumaDenoiseShaderModule_ = VK_NULL_HANDLE;
     }
     if (yuvWeightedAverageFusionPipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(device, yuvWeightedAverageFusionPipeline_, nullptr);
@@ -1463,85 +1410,6 @@ ComputeExecutionResult VulkanComputePipelineManager::executeYuvWeightedAverageFu
 
     if (!initialized_ || device == VK_NULL_HANDLE || anchorYuvBuffer == VK_NULL_HANDLE || supportYuvBuffer == VK_NULL_HANDLE) {
         result.failureReason = "Compute pipeline manager uninitialized or invalid handles for YUV weighted average fusion.";
-        result.diagnostics.failureReason = result.failureReason;
-        return result;
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        pipelineReuseCount_++;
-    }
-
-    result.success = true;
-    result.diagnostics.success = true;
-    return result;
-}
-
-ComputeExecutionResult VulkanComputePipelineManager::executeIspLumaDenoise(
-    VkDevice device,
-    VulkanAllocatorOwner& allocatorOwner,
-    VkQueue computeQueue,
-    VkCommandPool commandPool,
-    VkBuffer inputRgbBuffer,
-    std::uint32_t width,
-    std::uint32_t height,
-    float lumaSigmaS,
-    float lumaSigmaR,
-    std::uint64_t generationId
-) {
-    ComputeExecutionResult result{};
-    result.diagnostics.stageId = "LUMA_DENOISE";
-    result.diagnostics.shaderVersion = "SPIR-V 1.0 (GLSL 450)";
-    result.diagnostics.pipelineIdentity = "vulkan-isp-luma-denoise-pipeline";
-    result.diagnostics.inputResourceIdentity = "rgba32f-input-" + std::to_string(generationId);
-    result.diagnostics.outputResourceIdentity = "luma-denoised-rgba32f-" + std::to_string(generationId);
-    result.diagnostics.inputBytes = static_cast<std::uint64_t>(width) * height * 16u;
-    result.diagnostics.outputBytes = static_cast<std::uint64_t>(width) * height * 16u;
-    result.diagnostics.readbackBytes = 0u;
-    result.diagnostics.dispatchDimensions = "(" + std::to_string((width + 15) / 16) + ", " + std::to_string((height + 15) / 16) + ", 1)";
-    result.diagnostics.fallback = false;
-
-    if (!initialized_ || device == VK_NULL_HANDLE || inputRgbBuffer == VK_NULL_HANDLE) {
-        result.failureReason = "Compute pipeline manager uninitialized or invalid handles for luma denoise.";
-        result.diagnostics.failureReason = result.failureReason;
-        return result;
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        pipelineReuseCount_++;
-    }
-
-    result.success = true;
-    result.diagnostics.success = true;
-    return result;
-}
-
-ComputeExecutionResult VulkanComputePipelineManager::executeIspChromaDenoise(
-    VkDevice device,
-    VulkanAllocatorOwner& allocatorOwner,
-    VkQueue computeQueue,
-    VkCommandPool commandPool,
-    VkBuffer inputRgbBuffer,
-    std::uint32_t width,
-    std::uint32_t height,
-    float chromaStrength,
-    std::uint64_t generationId
-) {
-    ComputeExecutionResult result{};
-    result.diagnostics.stageId = "CHROMA_DENOISE";
-    result.diagnostics.shaderVersion = "SPIR-V 1.0 (GLSL 450)";
-    result.diagnostics.pipelineIdentity = "vulkan-isp-chroma-denoise-pipeline";
-    result.diagnostics.inputResourceIdentity = "rgba32f-input-" + std::to_string(generationId);
-    result.diagnostics.outputResourceIdentity = "chroma-denoised-rgba32f-" + std::to_string(generationId);
-    result.diagnostics.inputBytes = static_cast<std::uint64_t>(width) * height * 16u;
-    result.diagnostics.outputBytes = static_cast<std::uint64_t>(width) * height * 16u;
-    result.diagnostics.readbackBytes = 0u;
-    result.diagnostics.dispatchDimensions = "(" + std::to_string((width + 15) / 16) + ", " + std::to_string((height + 15) / 16) + ", 1)";
-    result.diagnostics.fallback = false;
-
-    if (!initialized_ || device == VK_NULL_HANDLE || inputRgbBuffer == VK_NULL_HANDLE) {
-        result.failureReason = "Compute pipeline manager uninitialized or invalid handles for chroma denoise.";
         result.diagnostics.failureReason = result.failureReason;
         return result;
     }

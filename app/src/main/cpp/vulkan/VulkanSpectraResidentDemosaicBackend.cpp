@@ -477,7 +477,14 @@ SpectraResidentDemosaicResult VulkanSpectraResidentDemosaicBackend::executeInter
     SpectraResidentDemosaicResult result{};
     result.attempted = true;
     const auto totalStart = Clock::now();
-    if (request.algorithm == SpectraGpuDemosaicAlgorithm::MENON_2007) {
+    // Phase 3 hard boundary: legacy Neural-JDD/RCD is a retired denoiser. Even a stale/direct
+    // backend caller cannot re-enable it; slot 3 is reconstructed with deterministic Malvar.
+    const bool retiredNeuralJddRequested =
+            request.algorithm == SpectraGpuDemosaicAlgorithm::NEURAL_JDD;
+    const SpectraGpuDemosaicAlgorithm effectiveAlgorithm = retiredNeuralJddRequested
+            ? SpectraGpuDemosaicAlgorithm::MALVAR_2004
+            : request.algorithm;
+    if (effectiveAlgorithm == SpectraGpuDemosaicAlgorithm::MENON_2007) {
         result.cpuFallbackRequired = true;
         result.status = "GPU_DEMOSAIC_MENON_TYPED_FALLBACK_LEGACY_REFERENCE_ONLY";
         result.failureReason = "MENON_2007_NOT_PORTED_LONG_TERM_ALGORITHM_REPLACEMENT_PLANNED";
@@ -544,16 +551,14 @@ SpectraResidentDemosaicResult VulkanSpectraResidentDemosaicBackend::executeInter
             static_cast<std::uint64_t>((request.frameHeight + 15u) / 16u);
     const std::uint64_t statisticsBytes = std::max<std::uint64_t>(36u, groupCount * 9u * sizeof(float));
     const ResidualSampling residualSampling = residualSamplingFor(request.frameWidth, request.frameHeight);
-    const bool phase6ResidualChromaRequested = request.phase6ResidualChromaEnabled &&
-            std::isfinite(request.noiseSigmaChroma) && request.noiseSigmaChroma > 1.0e-7f;
-    const std::uint64_t phase6ScratchBytes = pixelCount * 2u * sizeof(float);
+    // Phase 4: classical residual-chroma pixel correction was physically removed.
+    // Keep the result bit false until the later ABI cleanup phase removes legacy telemetry fields.
     const bool reconstructionScratchRequired =
-            request.algorithm == SpectraGpuDemosaicAlgorithm::AMAZE ||
-            request.algorithm == SpectraGpuDemosaicAlgorithm::AUTO_HYBRID;
-    const std::uint64_t requiredScratchBytes = std::max(
-            reconstructionScratchRequired ? outputBytes : 0u,
-            phase6ResidualChromaRequested ? phase6ScratchBytes : 0u);
-    result.phase6ResidualChromaRequested = phase6ResidualChromaRequested;
+            effectiveAlgorithm == SpectraGpuDemosaicAlgorithm::AMAZE ||
+            effectiveAlgorithm == SpectraGpuDemosaicAlgorithm::AUTO_HYBRID;
+    const std::uint64_t requiredScratchBytes =
+            reconstructionScratchRequired ? outputBytes : 0u;
+    result.phase6ResidualChromaRequested = false;
     result.residualSampleStride = residualSampling.stride;
     result.residualSampleColumns = residualSampling.columns;
     result.residualSampleRows = residualSampling.rows;
@@ -593,9 +598,8 @@ SpectraResidentDemosaicResult VulkanSpectraResidentDemosaicBackend::executeInter
     // Rebind every demosaic submission because binding 0 may alternate between an internal
     // upload buffer and an opaque resident Pass-3 buffer. AMaZE and Auto Hybrid bind the same
     // dedicated resident guide scratch at binding 2; other algorithms retain the color alias.
-    const bool usesGuideScratch = request.algorithm == SpectraGpuDemosaicAlgorithm::AMAZE ||
-            request.algorithm == SpectraGpuDemosaicAlgorithm::AUTO_HYBRID ||
-            phase6ResidualChromaRequested;
+    const bool usesGuideScratch = effectiveAlgorithm == SpectraGpuDemosaicAlgorithm::AMAZE ||
+            effectiveAlgorithm == SpectraGpuDemosaicAlgorithm::AUTO_HYBRID;
     updateDescriptorSetLocked(
             device,
             residentInput ? residentInputBuffer : VK_NULL_HANDLE,
@@ -703,34 +707,32 @@ SpectraResidentDemosaicResult VulkanSpectraResidentDemosaicBackend::executeInter
     push.ccm[9] = std::max(0.0f, std::isfinite(request.noiseSigmaY) ? request.noiseSigmaY : 0.0f);
     push.ccm[10] = std::max(0.0f, std::isfinite(request.noiseSigmaChroma) ? request.noiseSigmaChroma : 0.0f);
     push.ccm[11] = std::clamp(std::isfinite(request.noisePressure) ? request.noisePressure : 0.0f, 0.0f, 1.0f);
-    // ccm[3..4] are unused by reconstruction modes and transport Phase-6 bounded authority.
-    push.ccm[3] = std::clamp(std::isfinite(request.phase6MaximumBlend)
-            ? request.phase6MaximumBlend : 0.0f, 0.0f, 0.95f);
-    push.ccm[4] = std::clamp(std::isfinite(request.phase6MaximumCorrection)
-            ? request.phase6MaximumCorrection : 0.0f, 0.0f, 0.15f);
-    if (request.algorithm == SpectraGpuDemosaicAlgorithm::AUTO_HYBRID) {
+    // ccm[3..4] were Phase-6 mutation controls. Keep them zero until ABI cleanup.
+    push.ccm[3] = 0.0f;
+    push.ccm[4] = 0.0f;
+    if (effectiveAlgorithm == SpectraGpuDemosaicAlgorithm::AUTO_HYBRID) {
         float malvarPrior = std::clamp(std::isfinite(request.autoMalvarPrior) ? request.autoMalvarPrior : 0.0f, 0.0f, 1.0f);
-        float neuralPrior = std::clamp(std::isfinite(request.autoNeuralJddPrior) ? request.autoNeuralJddPrior : 0.0f, 0.0f, 1.0f);
         float amazePrior = std::clamp(std::isfinite(request.autoAmazePrior) ? request.autoAmazePrior : 0.0f, 0.0f, 1.0f);
-        const float priorSum = malvarPrior + neuralPrior + amazePrior;
+        const float priorSum = malvarPrior + amazePrior;
         if (priorSum > 1.0e-6f) {
             malvarPrior /= priorSum;
-            neuralPrior /= priorSum;
             amazePrior /= priorSum;
         } else {
-            malvarPrior = neuralPrior = amazePrior = 1.0f / 3.0f;
+            malvarPrior = amazePrior = 0.5f;
         }
         // ccm[0..2] are unused by demosaic modes and map to GLSL ccm0..ccm2.
+        // Slot 1 is intentionally zero: retired Neural JDD has no Auto-Hybrid authority.
         push.ccm[0] = malvarPrior;
-        push.ccm[1] = neuralPrior;
+        push.ccm[1] = 0.0f;
         push.ccm[2] = amazePrior;
     }
-    switch (request.algorithm) {
+    switch (effectiveAlgorithm) {
         case SpectraGpuDemosaicAlgorithm::BILINEAR:
             push.mode = 0u;
             break;
         case SpectraGpuDemosaicAlgorithm::NEURAL_JDD:
-            push.mode = 2u;
+            // Phase 4 safety: legacy direct requests cannot regain denoise pixel authority.
+            push.mode = 1u;
             break;
         case SpectraGpuDemosaicAlgorithm::AMAZE:
             push.mode = 5u;
@@ -746,12 +748,12 @@ SpectraResidentDemosaicResult VulkanSpectraResidentDemosaicBackend::executeInter
     vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0u, sizeof(push), &push);
     vkCmdDispatch(commandBuffer_, (request.frameWidth + 15u) / 16u, (request.frameHeight + 15u) / 16u, 1u);
     if (queryPool_ != VK_NULL_HANDLE) {
-        // Slot 1 always marks the end of the first primary pass. For Malvar/Neural JDD this is
+        // Slot 1 always marks the end of the first primary pass. For Malvar this is
         // the complete reconstruction; for AMaZE/Auto Hybrid it is the end of the resident guide pass.
         vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 1u);
     }
-    if (request.algorithm == SpectraGpuDemosaicAlgorithm::AMAZE ||
-        request.algorithm == SpectraGpuDemosaicAlgorithm::AUTO_HYBRID) {
+    if (effectiveAlgorithm == SpectraGpuDemosaicAlgorithm::AMAZE ||
+        effectiveAlgorithm == SpectraGpuDemosaicAlgorithm::AUTO_HYBRID) {
         VkBufferMemoryBarrier guideBarrier{};
         guideBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
         guideBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -763,7 +765,7 @@ SpectraResidentDemosaicResult VulkanSpectraResidentDemosaicBackend::executeInter
         vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr,
                              1u, &guideBarrier, 0u, nullptr);
-        push.mode = request.algorithm == SpectraGpuDemosaicAlgorithm::AMAZE ? 6u : 8u;
+        push.mode = effectiveAlgorithm == SpectraGpuDemosaicAlgorithm::AMAZE ? 6u : 8u;
         vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0u, sizeof(push), &push);
         vkCmdDispatch(commandBuffer_, (request.frameWidth + 15u) / 16u,
                       (request.frameHeight + 15u) / 16u, 1u);
@@ -773,53 +775,9 @@ SpectraResidentDemosaicResult VulkanSpectraResidentDemosaicBackend::executeInter
     } else if (queryPool_ != VK_NULL_HANDLE) {
         vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 2u);
     }
-    // Phase 6: two-pass, no-feedback residual chroma artifact correction. Pass 9 classifies
-    // physically significant opponent outliers into the vec4 scratch. Pass 10 applies only
-    // those precomputed corrections to R/B while preserving G exactly.
-    if (phase6ResidualChromaRequested) {
-        VkBufferMemoryBarrier phase6InputReady{};
-        phase6InputReady.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-        phase6InputReady.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        phase6InputReady.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        phase6InputReady.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        phase6InputReady.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        phase6InputReady.buffer = deviceOutput_.buffer;
-        phase6InputReady.size = VK_WHOLE_SIZE;
-        vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr,
-                             1u, &phase6InputReady, 0u, nullptr);
-        if (queryPool_ != VK_NULL_HANDLE) {
-            vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 3u);
-        }
-        push.mode = 9u;
-        vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
-                           0u, sizeof(push), &push);
-        vkCmdDispatch(commandBuffer_, (request.frameWidth + 15u) / 16u,
-                      (request.frameHeight + 15u) / 16u, 1u);
-        if (queryPool_ != VK_NULL_HANDLE) {
-            vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 4u);
-        }
-        VkBufferMemoryBarrier phase6GuideReady{};
-        phase6GuideReady.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-        phase6GuideReady.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        phase6GuideReady.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        phase6GuideReady.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        phase6GuideReady.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        phase6GuideReady.buffer = rgbUpload_.buffer;
-        phase6GuideReady.size = VK_WHOLE_SIZE;
-        vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr,
-                             1u, &phase6GuideReady, 0u, nullptr);
-        push.mode = 10u;
-        vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
-                           0u, sizeof(push), &push);
-        vkCmdDispatch(commandBuffer_, (request.frameWidth + 15u) / 16u,
-                      (request.frameHeight + 15u) / 16u, 1u);
-        if (queryPool_ != VK_NULL_HANDLE) {
-            vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 5u);
-        }
-    } else if (queryPool_ != VK_NULL_HANDLE) {
-        // Keep timestamp ordering monotonic when Phase 6 is intentionally disabled.
+    // Phase 4: retired residual-chroma modes 9/10 no longer exist in the shader.
+    // Preserve timestamp slot ordering for the existing telemetry ABI.
+    if (queryPool_ != VK_NULL_HANDLE) {
         vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 3u);
         vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 4u);
         vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 5u);
@@ -860,19 +818,6 @@ SpectraResidentDemosaicResult VulkanSpectraResidentDemosaicBackend::executeInter
     residualBarrier.size = VK_WHOLE_SIZE;
     vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          VK_PIPELINE_STAGE_HOST_BIT, 0u, 0u, nullptr, 1u, &residualBarrier, 0u, nullptr);
-    if (phase6ResidualChromaRequested) {
-        VkBufferMemoryBarrier phase6StatsBarrier{};
-        phase6StatsBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-        phase6StatsBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        phase6StatsBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-        phase6StatsBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        phase6StatsBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        phase6StatsBarrier.buffer = colorStatistics_.buffer;
-        phase6StatsBarrier.size = VK_WHOLE_SIZE;
-        vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                             VK_PIPELINE_STAGE_HOST_BIT, 0u, 0u, nullptr,
-                             1u, &phase6StatsBarrier, 0u, nullptr);
-    }
     if (vkEndCommandBuffer(commandBuffer_) != VK_SUCCESS) {
         result.cpuFallbackRequired = true;
         result.status = "GPU_DEMOSAIC_COMMAND_END_FAILED";
@@ -906,14 +851,14 @@ SpectraResidentDemosaicResult VulkanSpectraResidentDemosaicBackend::executeInter
             VkPhysicalDeviceProperties properties{};
             vkGetPhysicalDeviceProperties(physicalDevice, &properties);
             const double timestampMs = static_cast<double>(properties.limits.timestampPeriod) / 1.0e6;
-            if ((request.algorithm == SpectraGpuDemosaicAlgorithm::AMAZE ||
-                 request.algorithm == SpectraGpuDemosaicAlgorithm::AUTO_HYBRID) &&
+            if ((effectiveAlgorithm == SpectraGpuDemosaicAlgorithm::AMAZE ||
+                 effectiveAlgorithm == SpectraGpuDemosaicAlgorithm::AUTO_HYBRID) &&
                 timestamps[1] >= timestamps[0] && timestamps[2] >= timestamps[1]) {
                 const float guideMs = static_cast<float>(
                         static_cast<double>(timestamps[1] - timestamps[0]) * timestampMs);
                 const float secondPassMs = static_cast<float>(
                         static_cast<double>(timestamps[2] - timestamps[1]) * timestampMs);
-                if (request.algorithm == SpectraGpuDemosaicAlgorithm::AMAZE) {
+                if (effectiveAlgorithm == SpectraGpuDemosaicAlgorithm::AMAZE) {
                     result.amazeGreenPassMs = guideMs;
                     result.amazeReconstructPassMs = secondPassMs;
                 } else {
@@ -924,13 +869,6 @@ SpectraResidentDemosaicResult VulkanSpectraResidentDemosaicBackend::executeInter
             } else if (timestamps[1] >= timestamps[0]) {
                 result.kernelMs = static_cast<float>(
                         static_cast<double>(timestamps[1] - timestamps[0]) * timestampMs);
-            }
-            if (phase6ResidualChromaRequested && timestamps[4] >= timestamps[3] &&
-                timestamps[5] >= timestamps[4]) {
-                result.phase6ClassifyPassMs = static_cast<float>(
-                        static_cast<double>(timestamps[4] - timestamps[3]) * timestampMs);
-                result.phase6CorrectPassMs = static_cast<float>(
-                        static_cast<double>(timestamps[5] - timestamps[4]) * timestampMs);
             }
             if (timestamps[7] >= timestamps[6]) {
                 result.residualKernelMs = static_cast<float>(
@@ -946,43 +884,6 @@ SpectraResidentDemosaicResult VulkanSpectraResidentDemosaicBackend::executeInter
         std::memcpy(result.residualCandidates.data(), residualCandidates_.mapped,
                     static_cast<std::size_t>(residualSampling.bytes));
     }
-    if (phase6ResidualChromaRequested && statisticsBytes > 0u) {
-        vmaInvalidateAllocation(allocator, colorStatistics_.allocation, 0u,
-                                static_cast<VkDeviceSize>(statisticsBytes));
-        const float* stats = static_cast<const float*>(colorStatistics_.mapped);
-        double processed = 0.0;
-        double candidates = 0.0;
-        double isolated = 0.0;
-        double zipper = 0.0;
-        double edgeProtected = 0.0;
-        double saturatedProtected = 0.0;
-        double sumAbsRg = 0.0;
-        double sumAbsBg = 0.0;
-        float maxCorrection = 0.0f;
-        for (std::uint64_t group = 0u; group < groupCount; ++group) {
-            const std::size_t base = static_cast<std::size_t>(group * 9u);
-            processed += std::max(0.0f, stats[base + 0u]);
-            candidates += std::max(0.0f, stats[base + 1u]);
-            isolated += std::max(0.0f, stats[base + 2u]);
-            zipper += std::max(0.0f, stats[base + 3u]);
-            edgeProtected += std::max(0.0f, stats[base + 4u]);
-            saturatedProtected += std::max(0.0f, stats[base + 5u]);
-            sumAbsRg += std::max(0.0f, stats[base + 6u]);
-            sumAbsBg += std::max(0.0f, stats[base + 7u]);
-            maxCorrection = std::max(maxCorrection, std::max(0.0f, stats[base + 8u]));
-        }
-        result.phase6ProcessedPixels = static_cast<std::uint64_t>(std::llround(processed));
-        result.phase6CandidatePixels = static_cast<std::uint64_t>(std::llround(candidates));
-        result.phase6IsolatedOutlierPixels = static_cast<std::uint64_t>(std::llround(isolated));
-        result.phase6ZipperPixels = static_cast<std::uint64_t>(std::llround(zipper));
-        result.phase6EdgeProtectedPixels = static_cast<std::uint64_t>(std::llround(edgeProtected));
-        result.phase6SaturatedDetailProtectedPixels =
-                static_cast<std::uint64_t>(std::llround(saturatedProtected));
-        const double denominator = std::max(1.0, candidates);
-        result.phase6MeanAbsCorrectionRG = sumAbsRg / denominator;
-        result.phase6MeanAbsCorrectionBG = sumAbsBg / denominator;
-        result.phase6MaximumAbsoluteCorrection = maxCorrection;
-    }
     result.readbackMs = elapsedMs(readStart);
     // uploadMs is intentionally the non-kernel, non-readback submission share. Exact transfer GPU
     // timestamps can be added when the graph becomes fully resident and copies disappear entirely.
@@ -990,7 +891,7 @@ SpectraResidentDemosaicResult VulkanSpectraResidentDemosaicBackend::executeInter
             result.phase6ClassifyPassMs - result.phase6CorrectPassMs - result.residualKernelMs);
     result.success = true;
     result.gpuUsedForOutput = true;
-    result.phase6ResidualChromaUsedForOutput = phase6ResidualChromaRequested;
+    result.phase6ResidualChromaUsedForOutput = false;
     result.cpuFallbackRequired = false;
     result.fullReadbackDeferred = true;
     residentDemosaicGeneration_++;
@@ -1002,18 +903,22 @@ SpectraResidentDemosaicResult VulkanSpectraResidentDemosaicBackend::executeInter
     sourceClipConfidenceWidth_ = sourceClipMapAppended ? sourceClipWidth : 0u;
     sourceClipConfidenceHeight_ = sourceClipMapAppended ? sourceClipHeight : 0u;
     result.residentDemosaicGeneration = residentDemosaicGeneration_;
-    const char* algorithmStatus = request.algorithm == SpectraGpuDemosaicAlgorithm::BILINEAR
+    const char* algorithmStatus = effectiveAlgorithm == SpectraGpuDemosaicAlgorithm::BILINEAR
             ? "BILINEAR"
-            : (request.algorithm == SpectraGpuDemosaicAlgorithm::NEURAL_JDD
+            : (effectiveAlgorithm == SpectraGpuDemosaicAlgorithm::NEURAL_JDD
                     ? "NEURAL_JDD"
-                    : (request.algorithm == SpectraGpuDemosaicAlgorithm::AMAZE
+                    : (effectiveAlgorithm == SpectraGpuDemosaicAlgorithm::AMAZE
                             ? "AMAZE"
-                            : (request.algorithm == SpectraGpuDemosaicAlgorithm::AUTO_HYBRID
+                            : (effectiveAlgorithm == SpectraGpuDemosaicAlgorithm::AUTO_HYBRID
                                     ? "AUTO_HYBRID"
                                     : "MALVAR_2004")));
-    result.status = std::string(residentInput ? "GPU_RESIDENT_INPUT_PRIMARY_" : "GPU_PRIMARY_") +
-            algorithmStatus;
-    result.failureReason = "none";
+    result.status = retiredNeuralJddRequested
+            ? "GPU_PRIMARY_MALVAR_2004_LEGACY_NEURAL_JDD_RETIRED"
+            : std::string(residentInput ? "GPU_RESIDENT_INPUT_PRIMARY_" : "GPU_PRIMARY_") +
+                    algorithmStatus;
+    result.failureReason = retiredNeuralJddRequested
+            ? "NEURAL_JDD_RETIRED_NEURAL_DENOISE_IS_SOLE_NOISE_PIXEL_OWNER"
+            : "none";
     result.totalMs = elapsedMs(totalStart);
     return result;
 #endif
@@ -1069,12 +974,9 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
             static_cast<std::uint64_t>((request.frameHeight + 15u) / 16u);
     const std::uint64_t statisticsBytes = std::max<std::uint64_t>(48u, groupCount * 12u * sizeof(float));
     const ResidualSampling residualSampling = residualSamplingFor(request.frameWidth, request.frameHeight);
-    const bool cloudMapContractValid = request.preWbCloudCorrectionReady &&
-            request.preWbCloudCorrectionRG != nullptr &&
-            request.preWbCloudCorrectionBG != nullptr &&
-            request.preWbCloudCorrectionValid != nullptr &&
-            request.preWbCloudGridColumns == 16u && request.preWbCloudGridRows == 12u &&
-            request.preWbCloudValidTileCount >= 6u;
+    // Phase 3: historical pre-WB opponent/cloud cleanup is a retired classical denoiser.
+    // The transport fields remain compatibility-only; the backend cannot grant pixel authority.
+    constexpr bool cloudMapContractValid = false;
     const std::uint64_t cloudMapRecordCount = cloudMapContractValid ? 192u : 1u;
     const std::uint64_t cloudMapBytes = cloudMapRecordCount * 4u * sizeof(float);
     const bool hueSatData1Valid = request.calibratedHueSatMapEnabled &&
@@ -1318,8 +1220,8 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
     // The 128-byte push layout is already at Vulkan's minimum guaranteed limit. During mode 3
     // the demosaic evidence slots are no longer needed, so reuse two of them for the pre-WB
     // opponent cleanup maxima rather than growing the push-constant block.
-    push.cfaEvidence0[0] = std::clamp(request.preWbOpponentCleanupBlend[0], 0.0f, 0.12f);
-    push.cfaEvidence0[1] = std::clamp(request.preWbOpponentCleanupBlend[1], 0.0f, 0.12f);
+    push.cfaEvidence0[0] = 0.0f; // retired classical pre-WB chroma cleanup
+    push.cfaEvidence0[1] = 0.0f; // retired classical pre-WB chroma cleanup
     push.cfaEvidence0[2] = cloudMapContractValid ? 1.0f : 0.0f;
     push.cfaEvidence0[3] = cloudMapContractValid
             ? std::clamp(request.preWbCloudMaxAbsoluteCorrection, 0.0f, 0.010f)

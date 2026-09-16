@@ -3753,7 +3753,6 @@ class SingleFrameRunner(
                         jniCalibration = renderQualityConfig.finalCalibration,
                         nativeStats = if (isRawFrameSource) masterIspStats else yuvNativeStats,
                         fusionStats = if (isRawFrameSource) dngMergeStats else "",
-                        dynamicIsoCoefficient = lensHardwareSettings.dynamicIsoCoeff,
                         captureAttemptId = attemptId,
                         recipe = recipe,
                         runnerPerformance = performanceTracker.traceSnapshot(),

@@ -79,7 +79,6 @@ object NoiseModelTrace {
         jniCalibration: FinalSensorCalibration?,
         nativeStats: String,
         fusionStats: String = "",
-        dynamicIsoCoefficient: Float,
         captureAttemptId: String? = null,
         recipe: CaptureRecipe? = null,
         runnerPerformance: CapturePerformanceTraceSnapshot? = null,
@@ -130,7 +129,7 @@ object NoiseModelTrace {
                 "formula" to "variance = S * x + O",
                 "canonicalSoOrder" to "R,G1,G2,B",
                 "captureIdentity" to captureIdentity(captureAttemptId, recipe, frames),
-                "profileSettings" to profileSettings(recipe, dynamicIsoCoefficient),
+                "profileSettings" to profileSettings(recipe),
                 "frames" to frames.map(::frameMap),
                 "captureNoiseState" to captureNoiseState?.toTraceMap(),
                 "sensorState" to sensorState(anchor, jniCalibration, stats),
@@ -186,7 +185,7 @@ object NoiseModelTrace {
                         null
                     }
                 ),
-                "finalRenderOutput" to legacyFinalOutput(anchor, jniCalibration, stats, dynamicIsoCoefficient)
+                "finalRenderOutput" to legacyFinalOutput(anchor, jniCalibration, stats)
             )
         )
     }
@@ -208,15 +207,13 @@ object NoiseModelTrace {
     )
 
     private fun profileSettings(
-        recipe: CaptureRecipe?,
-        dynamicIsoCoefficient: Float
+        recipe: CaptureRecipe?
     ): Map<String, Any?> {
         val render = recipe?.executionSettings?.renderPreferences
         val noise = render?.noiseTuning ?: ProfileNoiseTuning()
         val nr = render?.noiseReductionTuning ?: ProfileNoiseReductionTuning()
         return linkedMapOf(
             "spectraMode" to (if (noise.spectraEnabled) "Auto" else "Off"),
-            "dynamicIso" to dynamicIsoCoefficient.coerceIn(-1f, 1f),
             "profileSpectraStrength" to noise.spectraStrength,
             "profileSpectraLuma" to noise.spectraLuma,
             "profileSpectraChroma" to noise.spectraChroma,
@@ -270,9 +267,16 @@ object NoiseModelTrace {
         return linkedMapOf(
             "captureIso" to (snapshot?.iso ?: stats.number("actualIso")),
             "postRawSensitivityBoost" to snapshot?.postRawSensitivityBoost,
-            "effectiveIso" to (
+            // Physical Dynamic ISO is already resolved in Kotlin before JNI. Native `effectiveIso`
+            // is only capture-ISO context for legacy SPECTRA telemetry and must never be confused
+            // with the physical noise-model ISO below.
+            "captureContextIsoNativeTelemetry" to (
                 stats.number("spectraResidualEffectiveIso") ?: stats.number("effectiveIso")
             ),
+            "physicalNoiseEffectiveModelIso" to snapshot?.physicalNoiseEffectiveModelIso,
+            "physicalNoiseDynamicIsoEnabled" to snapshot?.physicalNoiseDynamicIsoEnabled,
+            "physicalNoiseDynamicIsoCoefficient" to snapshot?.physicalNoiseDynamicIsoCoefficient,
+            "physicalNoiseDynamicIsoOwnership" to "NoiseModelResolver_ONLY",
             "exposureTimeNs" to snapshot?.exposureTimeNs,
             "cfaPattern" to snapshot?.cfaPattern,
             "cfaName" to snapshot?.cfaName,
@@ -819,8 +823,7 @@ object NoiseModelTrace {
     private fun legacyFinalOutput(
         anchorFrame: NoiseModelTraceFrame?,
         jniCalibration: FinalSensorCalibration?,
-        stats: Map<String, String>,
-        dynamicIsoCoefficient: Float
+        stats: Map<String, String>
     ): Map<String, Any?> {
         val calibration = anchorFrame?.calibration
         val sampleCount = stats["sensorNoiseVarianceSamples"]?.toLongOrNull() ?: 0L
@@ -828,7 +831,9 @@ object NoiseModelTrace {
         val applied = nativeApplied && sampleCount > 0L && calibration?.noiseModelMode != "Off"
         return linkedMapOf(
             "appliedNoiseModelMode" to (calibration?.noiseModelMode ?: "Off"),
-            "dynamicIsoCoefficient" to dynamicIsoCoefficient.coerceIn(-1f, 1f),
+            "physicalNoiseEffectiveModelIso" to calibration?.noiseSnapshot?.physicalNoiseEffectiveModelIso,
+            "physicalNoiseDynamicIsoEnabled" to calibration?.noiseSnapshot?.physicalNoiseDynamicIsoEnabled,
+            "physicalNoiseDynamicIsoCoefficient" to calibration?.noiseSnapshot?.physicalNoiseDynamicIsoCoefficient,
             "soValuesSentToJni" to jniCalibration?.effectiveNoiseProfile?.toList().orEmpty(),
             "soValuesReceivedByCpp" to parseNumberArray(stats["noiseModelSoReceivedByCpp"]),
             "normalizedSignalSampleCount" to sampleCount,

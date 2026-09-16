@@ -123,19 +123,6 @@ struct YuvWeightedAverageFusionPushConstants {
     std::uint32_t isFirstSupport;
 };
 
-struct IspLumaDenoisePushConstants {
-    std::uint32_t width;
-    std::uint32_t height;
-    float lumaSigmaS;
-    float lumaSigmaR;
-};
-
-struct IspChromaDenoisePushConstants {
-    std::uint32_t width;
-    std::uint32_t height;
-    float chromaStrength;
-};
-
 struct IspContrastVibrancePushConstants {
     std::uint32_t width;
     std::uint32_t height;
@@ -291,31 +278,6 @@ public:
         std::uint64_t generationId
     );
 
-    ComputeExecutionResult executeIspLumaDenoise(
-        VkDevice device,
-        VulkanAllocatorOwner& allocatorOwner,
-        VkQueue computeQueue,
-        VkCommandPool commandPool,
-        VkBuffer inputRgbBuffer,
-        std::uint32_t width,
-        std::uint32_t height,
-        float lumaSigmaS,
-        float lumaSigmaR,
-        std::uint64_t generationId
-    );
-
-    ComputeExecutionResult executeIspChromaDenoise(
-        VkDevice device,
-        VulkanAllocatorOwner& allocatorOwner,
-        VkQueue computeQueue,
-        VkCommandPool commandPool,
-        VkBuffer inputRgbBuffer,
-        std::uint32_t width,
-        std::uint32_t height,
-        float chromaStrength,
-        std::uint64_t generationId
-    );
-
     ComputeExecutionResult executeIspContrastVibrance(
         VkDevice device,
         VulkanAllocatorOwner& allocatorOwner,
@@ -406,12 +368,6 @@ private:
 
     VkShaderModule yuvWeightedAverageFusionShaderModule_ = VK_NULL_HANDLE;
     VkPipeline yuvWeightedAverageFusionPipeline_ = VK_NULL_HANDLE;
-
-    VkShaderModule ispLumaDenoiseShaderModule_ = VK_NULL_HANDLE;
-    VkPipeline ispLumaDenoisePipeline_ = VK_NULL_HANDLE;
-
-    VkShaderModule ispChromaDenoiseShaderModule_ = VK_NULL_HANDLE;
-    VkPipeline ispChromaDenoisePipeline_ = VK_NULL_HANDLE;
 
     VkShaderModule ispContrastVibranceShaderModule_ = VK_NULL_HANDLE;
     VkPipeline ispContrastVibrancePipeline_ = VK_NULL_HANDLE;
