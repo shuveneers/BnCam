@@ -99,11 +99,14 @@ float noiseS(int ch) {
 float noiseO(int ch) {
     return ch == 0 ? pc.o0 : (ch == 1 ? pc.o1 : (ch == 2 ? pc.o2 : pc.o3));
 }
-float predictedNoiseSigma(float signal, int ch) {
+float predictedNoiseVariance(float signal, int ch) {
     if (pc.noiseModelEnabled == 0u) return 0.0;
     float s = max(0.0, noiseS(ch));
     float o = max(0.0, noiseO(ch));
-    return sqrt(max(0.0, s * clamp(signal, 0.0, 1.0) + o));
+    return max(0.0, s * clamp(signal, 0.0, 1.0) + o);
+}
+float predictedNoiseSigma(float signal, int ch) {
+    return sqrt(predictedNoiseVariance(signal, ch));
 }
 
 float sourceAt(int x, int y) {
@@ -174,6 +177,64 @@ float defectCorrectedAt(int x, int y, float center, out bool corrected) {
         return median;
     }
     return center;
+}
+
+// Baseline SPECTRA denoise is a physical-model owner, not a Neural feature.
+// It operates on one Bayer plane at a time (all offsets are even), so R/Gr/Gb/B are never
+// mixed. Dynamic ISO has already been folded into the effective S/O supplied here; this pass
+// must not apply the coefficient again. Neural, when enabled, receives this denoised mosaic
+// and is therefore only a residual/add-on refinement of the physical baseline.
+float baselineNoiseReducedAt(int x, int y, float center) {
+    if (pc.noiseModelEnabled == 0u || !finite1(center)) return center;
+    if (x < 2 || y < 2 || x >= int(pc.frameWidth) - 2 || y >= int(pc.frameHeight) - 2) {
+        return center;
+    }
+
+    int channel = noiseChannel4(pc.effectiveCfaPattern, x, y);
+    float centerNoiseVariance = predictedNoiseVariance(center, channel);
+    if (!(centerNoiseVariance > 1.0e-12) || !finite1(centerNoiseVariance)) return center;
+
+    const ivec2 offsets[8] = ivec2[8](
+        ivec2(-2,  0), ivec2( 2,  0), ivec2( 0, -2), ivec2( 0,  2),
+        ivec2(-2, -2), ivec2( 2, -2), ivec2(-2,  2), ivec2( 2,  2));
+    float samples[8];
+    float weights[8];
+
+    // A noise-scaled rational range kernel keeps coherent edges/detail out of the local
+    // estimator. As effective S/O rises, genuinely noise-like deviations are admitted while
+    // large structure remains down-weighted.
+    float rangeVariance = max(4.0 * centerNoiseVariance, 1.0e-12);
+    float weightSum = 1.0;
+    float weightedSum = center;
+    for (int i = 0; i < 8; ++i) {
+        float sampleValue = sourceAt(x + offsets[i].x, y + offsets[i].y);
+        samples[i] = sampleValue;
+        float delta = finite1(sampleValue) ? sampleValue - center : 0.0;
+        float w = finite1(sampleValue)
+            ? 1.0 / (1.0 + (delta * delta) / rangeVariance)
+            : 0.0;
+        weights[i] = w;
+        weightSum += w;
+        weightedSum += w * sampleValue;
+    }
+
+    float localMean = weightedSum / max(weightSum, 1.0e-12);
+    float localVarianceSum = (center - localMean) * (center - localMean);
+    for (int i = 0; i < 8; ++i) {
+        float delta = samples[i] - localMean;
+        localVarianceSum += weights[i] * delta * delta;
+    }
+    float localVariance = localVarianceSum / max(weightSum, 1.0e-12);
+
+    // Local Wiener shrinkage: variance explained by S/O is suppressed; variance in excess
+    // of the physical prediction is treated as scene structure and retained. This makes the
+    // Dynamic-ISO-driven effective S/O directly control baseline pixel denoise even when
+    // Neural is disabled, without inventing a second independent strength coefficient.
+    float noiseVariance = predictedNoiseVariance(localMean, channel);
+    float signalVariance = max(localVariance - noiseVariance, 0.0);
+    float detailGain = signalVariance / max(signalVariance + noiseVariance, 1.0e-12);
+    float filtered = localMean + detailGain * (center - localMean);
+    return finite1(filtered) ? sceneClamp(filtered) : center;
 }
 
 float safeLensGain(float value) {
@@ -674,6 +735,11 @@ void finalizePixel() {
         bool defectCorrected = false;
         float value = defectCorrectedAt(x, y, original, defectCorrected);
         if (defectCorrected) localCounts.y = 1u;
+
+        // Physical baseline NR owns first-pass noise removal. It consumes the already-resolved
+        // effective per-channel S/O and therefore remains active with Neural OFF. Neural ON is
+        // downstream and receives this result; it never replaces this stage.
+        value = baselineNoiseReducedAt(x, y, value);
 
         int effectiveChannel = cfaChannel4(pc.effectiveCfaPattern, x, y);
         if (effectiveChannel == 1) value = sceneClamp(value * pc.greenEvenScale);
