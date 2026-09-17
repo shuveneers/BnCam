@@ -101,9 +101,11 @@ float noiseO(int ch) {
 }
 float predictedNoiseVariance(float signal, int ch) {
     if (pc.noiseModelEnabled == 0u) return 0.0;
-    float s = max(0.0, noiseS(ch));
-    float o = max(0.0, noiseO(ch));
-    return max(0.0, s * clamp(signal, 0.0, 1.0) + o);
+    float s = noiseS(ch);
+    float o = noiseO(ch);
+    if (!finite1(s) || !finite1(o)) return 0.0;
+    float safeSignal = finite1(signal) ? clamp(signal, 0.0, 1.0) : 0.0;
+    return max(0.0, max(0.0, s) * safeSignal + max(0.0, o));
 }
 float predictedNoiseSigma(float signal, int ch) {
     return sqrt(predictedNoiseVariance(signal, ch));
@@ -207,33 +209,44 @@ float baselineNoiseReducedAt(int x, int y, float center) {
     float weightSum = 1.0;
     float weightedSum = center;
     for (int i = 0; i < 8; ++i) {
-        float sampleValue = sourceAt(x + offsets[i].x, y + offsets[i].y);
+        float rawSample = sourceAt(x + offsets[i].x, y + offsets[i].y);
+        bool sampleFinite = finite1(rawSample);
+        float sampleValue = sampleFinite ? rawSample : center;
         samples[i] = sampleValue;
-        float delta = finite1(sampleValue) ? sampleValue - center : 0.0;
-        float w = finite1(sampleValue)
-            ? 1.0 / (1.0 + (delta * delta) / rangeVariance)
+        float delta = sampleValue - center;
+        float normalizedDistance = (delta * delta) / rangeVariance;
+        float w = sampleFinite && finite1(normalizedDistance)
+            ? 1.0 / (1.0 + max(normalizedDistance, 0.0))
             : 0.0;
+        if (!finite1(w) || w < 0.0) w = 0.0;
         weights[i] = w;
         weightSum += w;
         weightedSum += w * sampleValue;
     }
+    if (!finite1(weightSum) || !finite1(weightedSum) || !(weightSum > 1.0e-12)) return center;
 
-    float localMean = weightedSum / max(weightSum, 1.0e-12);
+    float localMean = weightedSum / weightSum;
+    if (!finite1(localMean)) return center;
     float localVarianceSum = (center - localMean) * (center - localMean);
     for (int i = 0; i < 8; ++i) {
         float delta = samples[i] - localMean;
         localVarianceSum += weights[i] * delta * delta;
     }
-    float localVariance = localVarianceSum / max(weightSum, 1.0e-12);
+    if (!finite1(localVarianceSum)) return center;
+    float localVariance = localVarianceSum / weightSum;
+    if (!finite1(localVariance) || localVariance < 0.0) return center;
 
     // Local Wiener shrinkage: variance explained by S/O is suppressed; variance in excess
     // of the physical prediction is treated as scene structure and retained. This makes the
     // Dynamic-ISO-driven effective S/O directly control baseline pixel denoise even when
     // Neural is disabled, without inventing a second independent strength coefficient.
     float noiseVariance = predictedNoiseVariance(localMean, channel);
+    if (!finite1(noiseVariance) || noiseVariance < 0.0) return center;
     float signalVariance = max(localVariance - noiseVariance, 0.0);
-    float detailGain = signalVariance / max(signalVariance + noiseVariance, 1.0e-12);
-    float filtered = localMean + detailGain * (center - localMean);
+    float denominator = signalVariance + noiseVariance;
+    float detailGain = denominator > 1.0e-12 ? signalVariance / denominator : 1.0;
+    if (!finite1(detailGain)) return center;
+    float filtered = localMean + clamp(detailGain, 0.0, 1.0) * (center - localMean);
     return finite1(filtered) ? sceneClamp(filtered) : center;
 }
 
@@ -284,7 +297,6 @@ void sampleGreen() {
     greenSamples[sampleIndex] = vec4(g1, g2, v1, v2);
 }
 
-
 float outputAt(int x, int y) {
     x = clamp(x, 0, int(pc.frameWidth) - 1);
     y = clamp(y, 0, int(pc.frameHeight) - 1);
@@ -323,7 +335,6 @@ void sampleAutoScene() {
     greenSamples[sampleIndex] = vec4(center, gradient, isCoherent ? 1.0 : 0.0,
                                      center < 0.060 ? 1.0 : 0.0);
 }
-
 
 // Phase-5 compact exposure ABI inside TelemetryBuffer. Words 0..4 remain the legacy
 // raw-finalize counters. Histograms are GPU-only scratch; summary words are read back after the
