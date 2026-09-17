@@ -621,6 +621,17 @@ class ShotLogger(
         val nativeAvailable = stats["physicalNoiseModelAvailable"] ?: "not recorded"
         val usedForNeural = stats["physicalNoiseUsedForNeuralConditioning"] ?: "not recorded"
 
+        // The pre-JNI snapshot trace is useful diagnostics, but end-to-end Model Valid must report
+        // the final native authority actually used by RAW processing. Native Available is computed
+        // only after canonical S/O/JNI validation, so it is the authoritative validity bit here.
+        eventValue("Physical Noise Model", "Model Valid")?.let { snapshotValid ->
+            recordPipelineEvent("Physical Noise Model", "Snapshot Model Valid", snapshotValid)
+        }
+        if (nativeAvailable.equals("true", ignoreCase = true) ||
+            nativeAvailable.equals("false", ignoreCase = true)
+        ) {
+            recordPipelineEvent("Physical Noise Model", "Model Valid", nativeAvailable.lowercase())
+        }
         recordPipelineEvent("Physical Noise Model", "JNI Received", jniReceived)
         recordPipelineEvent("Physical Noise Model", "Native Available", nativeAvailable)
         recordPipelineEvent("Physical Noise Model", "Used For Neural Conditioning", usedForNeural)

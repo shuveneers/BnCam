@@ -95,10 +95,10 @@ void main(){
     vec4 controlled=componentControlled(fine,clamp(pc.lumaAuthority,0.0,1.0),clamp(pc.chromaAuthority,0.0,1.0));
     controlled+=clamp(pc.lowFrequencyCleanup,0.0,1.0)*componentControlled(coarse,clamp(pc.lumaAuthority,0.0,1.0),clamp(pc.chromaAuthority,0.0,1.0));
 
-    // Physical noise evidence, never sensor/lens identity, owns the clean-frame gate.
-    // Use this SNR envelope exactly once.  The retired Phase-6 sqrt(inverse-SNR) multiplier
-    // described the same physics a second time and collapsed real Neural corrections toward
-    // identity.  SNR >= identity threshold remains exact identity for texture protection.
+    // Neural is downstream of the physical baseline. The conditioning sigma is measured remaining
+    // post-physical noise, so this residual-SNR envelope may only gate the ONE Student residual.
+    // Dynamic ISO is deliberately absent here: it has already changed effective S/O and therefore
+    // the physical baseline. Detail confidence/posterior risk below remains the texture-protection gate.
     vec4 snr=abs(x)/max(sigma,vec4(1.0e-8));
     vec4 noiseEvidence=vec4(1.0)-smoothstep(
         vec4(pc.adaptiveFullEvidenceSnr),vec4(pc.adaptiveIdentitySnr),snr);

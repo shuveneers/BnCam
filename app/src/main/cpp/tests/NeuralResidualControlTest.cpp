@@ -11,6 +11,9 @@ static bool near(float a, float b, float eps = 2.0e-6f) {
 }
 
 int main() {
+    static_assert(kNeuralAdaptiveFullEvidenceSnr == 4.0f);
+    static_assert(kNeuralAdaptiveIdentitySnr == 48.0f);
+
     const std::array<std::array<float,4>,5> vectors{{
         {{0.10f,-0.20f,0.30f,-0.40f}},
         {{1.0f,0.0f,0.0f,0.0f}},
@@ -54,32 +57,32 @@ int main() {
     assert(texture.detailProtection > natural.detailProtection);
     assert(night.lowFrequencyCleanup > natural.lowFrequencyCleanup);
 
-    // Phase 9 cross-sensor behavior is driven only by local physical SNR. The same
-    // signal/noise pair must resolve identically regardless of sensor provenance.
+    // Post-physical Neural evidence is driven only by remaining local SNR. The same
+    // signal/noise pair resolves identically regardless of sensor provenance.
     assert(near(neuralAdaptiveNoiseEvidenceFromSnr(1.0f), 1.0f));
     assert(near(neuralAdaptiveNoiseEvidenceFromSnr(kNeuralAdaptiveFullEvidenceSnr), 1.0f));
     assert(near(neuralAdaptiveNoiseEvidenceFromSnr(kNeuralAdaptiveIdentitySnr), 0.0f));
-    assert(near(neuralAdaptiveNoiseEvidenceFromSnr(16.0f), 0.0f));
+    assert(neuralAdaptiveNoiseEvidenceFromSnr(16.0f) > 0.0f);
+    assert(neuralAdaptiveNoiseEvidenceFromSnr(16.0f) < 1.0f);
 
-    const float noisy = neuralAdaptiveAuthorityScale(0.02f, 0.02f, natural.adaptiveResponse);
-    const float medium = neuralAdaptiveAuthorityScale(0.08f, 0.02f, natural.adaptiveResponse);
-    const float cleanAuthority = neuralAdaptiveAuthorityScale(0.32f, 0.02f, natural.adaptiveResponse);
+    const float noisy = neuralAdaptiveAuthorityScale(0.02f, 0.02f, natural.adaptiveResponse);       // SNR 1
+    const float medium = neuralAdaptiveAuthorityScale(0.32f, 0.02f, natural.adaptiveResponse);      // SNR 16
+    const float cleanAuthority = neuralAdaptiveAuthorityScale(0.96f, 0.02f, natural.adaptiveResponse); // SNR 48
     assert(noisy > medium);
     assert(medium > cleanAuthority);
     assert(near(cleanAuthority, 0.0f));
 
-    // At the same RAW signal, stronger measured sigma must never produce less
-    // authority. This is the cross-sensor rule without any sensor identity input.
-    const float lowNoise = neuralAdaptiveAuthorityScale(0.08f, 0.005f, natural.adaptiveResponse);
-    const float mediumNoise = neuralAdaptiveAuthorityScale(0.08f, 0.02f, natural.adaptiveResponse);
-    const float highNoise = neuralAdaptiveAuthorityScale(0.08f, 0.08f, natural.adaptiveResponse);
+    // At the same RAW signal, stronger measured residual sigma must never produce less authority.
+    const float lowNoise = neuralAdaptiveAuthorityScale(0.08f, 0.0010f, natural.adaptiveResponse);  // SNR 80
+    const float mediumNoise = neuralAdaptiveAuthorityScale(0.08f, 0.0050f, natural.adaptiveResponse); // SNR 16
+    const float highNoise = neuralAdaptiveAuthorityScale(0.08f, 0.0200f, natural.adaptiveResponse); // SNR 4
     assert(highNoise > mediumNoise);
     assert(mediumNoise > lowNoise);
     assert(near(lowNoise, 0.0f));
     assert(highNoise <= 1.0f);
 
     float previousEvidence = 1.0f;
-    for (int step = 0; step <= 200; ++step) {
+    for (int step = 0; step <= 600; ++step) {
         const float snr = 0.1f * static_cast<float>(step);
         const float evidence = neuralAdaptiveNoiseEvidenceFromSnr(snr);
         assert(evidence >= 0.0f && evidence <= 1.0f);
@@ -87,26 +90,22 @@ int main() {
         previousEvidence = evidence;
     }
 
-    // Corrective contract: SNR may attenuate writeback exactly once.  Adaptive Response is
-    // production-fixed and therefore cannot add a second inverse-SNR attenuation.  A representative
-    // SNR=4 sample must retain the physical evidence envelope (~0.741), rather than the retired
-    // double-gated value (~0.331).
-    const float evidenceMid = neuralAdaptiveNoiseEvidence(0.08f, 0.02f);
-    assert(evidenceMid > 0.70f);
+    // Adaptive Response is compatibility-only. Residual SNR may attenuate writeback exactly once.
+    const float evidenceFull = neuralAdaptiveNoiseEvidence(0.08f, 0.02f); // SNR 4
+    assert(near(evidenceFull, 1.0f));
     for (float response : {0.0f, 0.5f, 1.0f}) {
         const float authority = neuralAdaptiveAuthorityScale(0.08f, 0.02f, response);
-        assert(near(authority, evidenceMid));
+        assert(near(authority, evidenceFull));
     }
 
-    // High-SNR identity remains an invariant independent of the retained compatibility parameter.
-    assert(near(neuralAdaptiveAuthorityScale(0.32f, 0.02f, 0.0f), 0.0f));
-    assert(near(neuralAdaptiveAuthorityScale(0.32f, 0.02f, 1.0f), 0.0f));
+    // Exact high-SNR identity remains invariant at the new post-physical residual threshold.
+    assert(near(neuralAdaptiveAuthorityScale(0.96f, 0.02f, 0.0f), 0.0f));
+    assert(near(neuralAdaptiveAuthorityScale(0.96f, 0.02f, 1.0f), 0.0f));
 
     SpectraCoreSnapshot snapshot{};
     NeuralRuntimeReadiness readiness{};
     NeuralDenoiseControls zero = natural;
     zero.noiseReduction = 0.0f;
-    // Exact zero authority is decided before any model/backend readiness checks.
     const auto decision = decideNeuralInvocation(snapshot, zero, readiness);
     assert(!decision.runInference);
     assert(decision.bypassReason == NeuralBypassReason::ZeroAuthority);

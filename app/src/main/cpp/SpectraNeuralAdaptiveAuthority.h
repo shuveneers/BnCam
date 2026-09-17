@@ -5,14 +5,17 @@
 
 namespace bncam::spectra::neural {
 
-// Phase 9 cross-sensor authority contract.
+// Post-physical Neural authority contract.
 //
-// These thresholds operate only on dimensionless local sensor-domain SNR. They do not encode
-// sensor/lens identity. Phase 9 preserves the existing Phase-6 adaptive-response authority and
-// can only attenuate it further. The Student still receives the full physical conditioning vector;
-// this gate protects high-SNR texture without introducing a new strength boost.
-constexpr float kNeuralAdaptiveFullEvidenceSnr = 2.0f;
-constexpr float kNeuralAdaptiveIdentitySnr = 8.0f;
+// Neural receives an already denoised Bayer image. Its sigma is therefore the measured remaining
+// post-physical noise budget, not the original sensor noise prediction. The former 2..8 SNR
+// envelope classified almost every normal post-physical sample as exact identity (device telemetry
+// showed ~98% at SNR>=8), so the add-on could not materially clean residual shadow/chroma noise.
+// Keep the gate sensor-independent and dimensionless, but move it to the residual-noise regime:
+// full authority through SNR 4, smooth attenuation to exact identity at SNR 48. Student residual,
+// confidence/posterior protection and user Luma/Chroma/Detail controls remain independent gates.
+constexpr float kNeuralAdaptiveFullEvidenceSnr = 4.0f;
+constexpr float kNeuralAdaptiveIdentitySnr = 48.0f;
 constexpr float kNeuralAdaptiveSigmaFloor = 1.0e-8f;
 
 inline float neuralAdaptiveNoiseEvidenceFromSnr(float snr) noexcept {
@@ -41,11 +44,9 @@ inline float neuralAdaptiveNoiseEvidence(float normalizedSignal, float sigma) no
     return neuralAdaptiveNoiseEvidenceFromSnr(snr);
 }
 
-// Production Neural uses one physical SNR authority envelope.  The previous implementation
-// multiplied this evidence by a second sqrt(sigma/(signal+sigma)) gate, which attenuated the same
-// physical evidence twice and made otherwise valid Student residuals nearly identity.  Adaptive
-// Response is fixed at 100% in production and retained here only for ABI/source compatibility.
-// High-SNR protection is unchanged: SNR >= kNeuralAdaptiveIdentitySnr remains exact identity.
+// Use the residual SNR envelope exactly once. Adaptive Response is production-fixed at 100% and
+// retained only for ABI/source compatibility. No inverse-SNR multiplier or Dynamic-ISO coefficient
+// is applied here; Dynamic ISO already affected the physical baseline through effective S/O.
 inline float neuralAdaptiveAuthorityScale(
         float normalizedSignal,
         float sigma,

@@ -67,14 +67,14 @@ int main() {
     // More measured residual noise may grant more Neural correction authority. These sigmas are
     // deliberately independent of the pre-baseline S/O pair above: the production shader first
     // measures post-physical variance and only uses effective S/O as an upper bound.
-    constexpr float lowResidualSigma = 0.012f;
-    constexpr float highResidualSigma = 0.040f;
+    constexpr float lowResidualSigma = 0.0015f;  // SNR ~53: exact identity
+    constexpr float highResidualSigma = 0.0200f; // SNR 4: full residual-noise evidence
     const float lowResidualAuthority =
             neuralAdaptiveAuthorityScale(signal, lowResidualSigma, 1.0f);
     const float highResidualAuthority =
             neuralAdaptiveAuthorityScale(signal, highResidualSigma, 1.0f);
     assert(highResidualAuthority > lowResidualAuthority);
-    assert(highResidualAuthority - lowResidualAuthority > 0.50f);
+    assert(highResidualAuthority - lowResidualAuthority > 0.95f);
     assert(lowResidualAuthority >= 0.0f && lowResidualAuthority <= 1.0f);
     assert(highResidualAuthority >= 0.0f && highResidualAuthority <= 1.0f);
 
