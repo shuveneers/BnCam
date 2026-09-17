@@ -15,7 +15,7 @@ class ProfileSettingsArchitectureSourceContractTest {
         val app = appDir()
         val screen = File(app, "src/main/java/com/bncam/ui/screens/settings/lens_profiles/NoiseModelSettingsScreen.kt").readText()
         val resolver = File(app, "src/main/java/com/bncam/core/quality/LibpatcherProfileResolver.kt").readText()
-        assertTrue(screen.contains("SPECTRA Noise model"))
+        assertTrue(screen.contains("Sensor Noise Model"))
         assertTrue(screen.contains("Manual noise model"))
         assertFalse(resolver.contains("lens_noise_a"))
         assertFalse(resolver.contains("lens_noise_b"))
@@ -44,9 +44,9 @@ class ProfileSettingsArchitectureSourceContractTest {
         assertTrue(editor.contains("title = \"Capture mode\""))
         assertTrue(editor.contains("title = \"Buffer Type / Pipeline\""))
         assertTrue(editor.contains("title = \"Shot Bias\""))
-        assertTrue(editor.contains("title = \"SPECTRA\""))
         assertTrue(editor.contains("title = \"Demosaic\""))
-        assertTrue(editor.contains("title = \"Denoise\""))
+        assertTrue(editor.contains("title = \"Neural Denoise\""))
+        assertFalse(editor.contains("title = \"SPECTRA\""))
         assertTrue(editor.contains("title = \"Light & Shadow\""))
         assertTrue(editor.contains("title = \"Curves\""))
         assertTrue(editor.contains("title = \"Color Manager\""))
@@ -68,7 +68,7 @@ class ProfileSettingsArchitectureSourceContractTest {
             "PROFILE_COLOR_MANAGER", "PROFILE_SHARPNESS", "PROFILE_TRANSFER", "PROFILE_OTHER_SETTINGS",
             "PROFILE_MULTI_FRAME"
         ).forEach { assertTrue("missing $it", nav.contains(it)) }
-        assertTrue(subScreens.contains("fun ProfileSpectraSettingsScreen"))
+        assertFalse(subScreens.contains("fun ProfileSpectraSettingsScreen"))
         assertTrue(subScreens.contains("fun ProfileDenoiseSettingsScreen"))
         assertTrue(subScreens.contains("fun ProfileCurveSettingsScreen"))
         assertTrue(subScreens.contains("fun ProfileSharpnessSettingsScreen"))
@@ -83,7 +83,7 @@ class ProfileSettingsArchitectureSourceContractTest {
     }
 
     @Test
-    fun spectraHasNoUserMasterStrengthAndDenoiseIsIndependent() {
+    fun neuralDenoiseIsTheSingleProfileNoisePage() {
         val app = appDir()
         val keys = File(app, "src/main/java/com/bncam/data/settings/ProfileLensTuningSettings.kt").readText()
         val config = File(app, "src/main/java/com/bncam/core/quality/RenderQualityConfig.kt").readText()
@@ -92,15 +92,22 @@ class ProfileSettingsArchitectureSourceContractTest {
 
         assertTrue(keys.contains("SPECTRA_STRENGTH")) // legacy decode key only
         assertFalse(resolver.contains("ProfileIspKeys.SPECTRA_STRENGTH"))
-        assertTrue(config.contains("spectraStrength = SpectraProfileDefaults.STRENGTH"))
-        assertFalse(ui.substringAfter("fun ProfileSpectraSettingsScreen").substringBefore("fun ProfileMultiFrameSettingsScreen").contains("title = \"SPECTRA Strength\""))
-        listOf(
-            "DETAIL_NR_LUMINANCE", "DETAIL_NR_LUMINANCE_DETAIL", "DETAIL_NR_LUMINANCE_CONTRAST",
-            "DETAIL_NR_COLOR", "DETAIL_NR_COLOR_DETAIL", "DETAIL_NR_COLOR_SMOOTHNESS"
-        ).forEach {
-            assertTrue(resolver.contains("ProfileIspKeys.$it"))
-            assertTrue(ui.contains("ProfileIspKeys.$it"))
-        }
+        assertTrue(config.contains("MASTER_AUTHORITY"))
+        assertTrue(config.contains("get() = if (spectraEnabled) SpectraProfileDefaults.MASTER_AUTHORITY else 0f"))
+        val neuralBlock = ui.substringAfter("fun ProfileDenoiseSettingsScreen").substringBefore("fun ProfileMultiFrameSettingsScreen")
+        assertTrue(neuralBlock.contains("SettingsTopicScaffold(\"Neural Denoise\""))
+        assertFalse(neuralBlock.contains("key = ProfileIspKeys.NEURAL_DENOISE_STRENGTH"))
+        assertFalse(neuralBlock.contains("title = \"Strength\""))
+        assertFalse(neuralBlock.contains("ProfileIspKeys.NEURAL_ADAPTIVE_RESPONSE"))
+        assertFalse(neuralBlock.contains("title = \"Adaptive Response\""))
+        assertTrue(neuralBlock.contains("ProfileIspKeys.SPECTRA_LUMA"))
+        assertTrue(neuralBlock.contains("ProfileIspKeys.SPECTRA_CHROMA"))
+        assertTrue(neuralBlock.contains("ProfileIspKeys.SPECTRA_DETAIL"))
+        assertTrue(neuralBlock.contains("ProfileIspKeys.SPECTRA_LOW_FREQUENCY"))
+        assertFalse(neuralBlock.contains("NoiseModelSource"))
+        assertFalse(neuralBlock.contains("Manual ISO"))
+        assertFalse(neuralBlock.contains("title = \"Dynamic ISO\""))
+        assertFalse(ui.contains("fun ProfileSpectraSettingsScreen"))
     }
 
     @Test

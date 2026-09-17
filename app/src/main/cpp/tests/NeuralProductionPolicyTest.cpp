@@ -110,7 +110,7 @@ int main() {
         assert(!out.structuralOodSafe);
         assert(!out.controls.enabled);
         assert(out.controls.noiseReduction == 0.0f);
-        assert(out.structuralBypassReason == NeuralBypassReason::NeuralDisabled);
+        assert(out.structuralBypassReason == NeuralBypassReason::UserDisabled);
     }
     {
         const auto out = prepareNeuralProductionContext(validEvidence());

@@ -31,21 +31,18 @@ class SpectraMilestone6SourceContractTest {
     }
 
     @Test
-    fun `dual fit is selected by physical diagnostics and remains bounded`() {
+    fun `temporal observer cannot fit or adapt physical noise model`() {
         val app = appDir()
         val helper = File(app, "src/main/cpp/SpectraTemporalFusion.h").readText()
-        val calibration = File(app, "src/main/java/com/bncam/core/quality/SensorCalibration.kt").readText()
+        val merger = mergerText(app)
 
-        assertTrue(helper.contains("WEIGHTED_LEAST_SQUARES"))
-        assertTrue(helper.contains("HUBER_IRLS"))
-        assertTrue(helper.contains("innovationVariance"))
-        assertTrue(helper.contains("innovationLagCorrelation"))
-        assertTrue(helper.contains("heavyTailFraction"))
-        assertTrue(helper.contains("physicalScore"))
-        assertTrue(helper.contains("fitStability("))
-        assertTrue(mergerText(app).contains("SpectraFitConsensus"))
-        assertTrue(mergerText(app).contains("spectraFitStabilityConfidence"))
-        assertTrue(calibration.contains("spectraFitPhysicalScore"))
+        assertFalse(helper.contains("fitTemporalNoiseModel("))
+        assertFalse(helper.contains("fitStability("))
+        assertFalse(helper.contains("WEIGHTED_LEAST_SQUARES"))
+        assertFalse(helper.contains("HUBER_IRLS"))
+        assertFalse(merger.contains("SpectraFitConsensus"))
+        assertFalse(merger.contains("SPECTRA_ADAPTIVE_SO"))
+        assertTrue(merger.contains("FROZEN_PHYSICAL_SO_READ_ONLY"))
     }
 
     @Test

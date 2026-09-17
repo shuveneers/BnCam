@@ -565,8 +565,7 @@ void sampleNoiseModelFromProductionRaw(
 
     g_spatialNoiseMap = SpatialNoiseMap();
 
-    if (!meta.calibration.hasNoiseProfile || !meta.calibration.noiseProfileApplied ||
-        meta.calibration.noiseProfilePairCount <= 0) {
+    if (!meta.calibration.physicalNoiseModelAvailable()) {
         stats.noiseModelReason = "missing_or_invalid_effective_so";
         return;
     }
@@ -615,12 +614,12 @@ void sampleNoiseModelFromProductionRaw(
                 const float* row = raw.mosaic.ptr<float>(y);
                 for (int x = x0; x < x1; ++x) {
                     const int channel = cfaColorChannel(pattern, x, y);
-                    if (channel < 0 || channel >= meta.calibration.noiseProfilePairCount) continue;
+                    if (channel < 0 || channel >= 4) continue;
                     const float sampleVal = row[x];
                     if (!std::isfinite(sampleVal)) continue;
                     const double normalized = std::clamp(static_cast<double>(sampleVal), 0.0, 1.0);
-                    const double slopeS = meta.calibration.effectiveNoiseProfile[channel * 2];
-                    const double offsetO = meta.calibration.effectiveNoiseProfile[channel * 2 + 1];
+                    const double slopeS = meta.calibration.effectiveS[channel];
+                    const double offsetO = meta.calibration.effectiveO[channel];
                     const double variance = slopeS * normalized + offsetO;
                     if (std::isfinite(variance) && variance >= 0.0) {
                         tileVarSum += variance;
@@ -698,8 +697,7 @@ bool sampleNoiseModelFromResidentRaw(
         return false;
     };
 
-    if (!meta.calibration.hasNoiseProfile || !meta.calibration.noiseProfileApplied ||
-        meta.calibration.noiseProfilePairCount <= 0) {
+    if (!meta.calibration.physicalNoiseModelAvailable()) {
         stats.noiseModelReason = "missing_or_invalid_effective_so";
         if (failureReason != nullptr) failureReason->clear();
         return true;
@@ -753,7 +751,7 @@ bool sampleNoiseModelFromResidentRaw(
     double varianceMax = -std::numeric_limits<double>::infinity();
     std::size_t validTiles = 0u;
     std::size_t validSamples = 0u;
-    const int activeChannels = std::clamp(meta.calibration.noiseProfilePairCount, 0, 4);
+    const int activeChannels = meta.calibration.physicalNoiseModelAvailable() ? 4 : 0;
 
     for (std::size_t tileIndex = 0u; tileIndex < expectedTiles; ++tileIndex) {
         const auto& tile = gpu.tiles[tileIndex];
@@ -768,8 +766,8 @@ bool sampleNoiseModelFromResidentRaw(
             if (count == 0u) continue;
             const double signalSum = static_cast<double>(
                     tile.signalSum[static_cast<std::size_t>(channel)]);
-            const double slopeS = meta.calibration.effectiveNoiseProfile[channel * 2];
-            const double offsetO = meta.calibration.effectiveNoiseProfile[channel * 2 + 1];
+            const double slopeS = meta.calibration.effectiveS[channel];
+            const double offsetO = meta.calibration.effectiveO[channel];
             const double channelVarianceSum = slopeS * signalSum +
                     offsetO * static_cast<double>(count);
             if (!std::isfinite(channelVarianceSum) || channelVarianceSum < 0.0) continue;
@@ -2119,9 +2117,7 @@ std::string computeRawShadowDiagnostics(
     // Deterministic marker derived from the native snapshot actually consumed by SPECTRA.
     uint32_t spectraSnapshotHash = 0x811c9dc5u;
     for (int ch = 0; ch < 4; ++ch) {
-        const double values[4] = {
-            meta.calibration.cameraS[ch],
-            meta.calibration.cameraO[ch],
+        const double values[2] = {
             meta.calibration.effectiveS[ch],
             meta.calibration.effectiveO[ch]
         };
@@ -2139,8 +2135,8 @@ std::string computeRawShadowDiagnostics(
     std::ostringstream diag;
     diag << std::fixed << std::setprecision(4);
     diag << "rawShadowDiagnostics={"
-         << "lensKey=" << meta.calibration.spectraLensKey
-         << ";snapshotPresent=" << (meta.calibration.spectraSnapshotPresent ? "true" : "false")
+         << "lensKey=" << meta.calibration.lensId
+         << ";physicalNoiseAvailable=" << (meta.calibration.physicalNoiseModelAvailable() ? "true" : "false")
          << ";sourceFormat=" << rawSourceFormatName(raw.info.sourceFormat)
          << ";cfaPattern=" << rawCfaPatternName(raw.info.effectiveCfaPattern)
          << ";iso=" << meta.captureSensitivityIso
@@ -2176,8 +2172,6 @@ std::string computeRawShadowDiagnostics(
          << ";bMinusGMean=" << bgMean
          << ";rowMeanVar=" << rowVar
          << ";colMeanVar=" << colVar
-         << ";cameraS=[" << meta.calibration.cameraS[0] << "," << meta.calibration.cameraS[1] << "," << meta.calibration.cameraS[2] << "," << meta.calibration.cameraS[3] << "]"
-         << ";cameraO=[" << meta.calibration.cameraO[0] << "," << meta.calibration.cameraO[1] << "," << meta.calibration.cameraO[2] << "," << meta.calibration.cameraO[3] << "]"
          << ";effectiveS=[" << meta.calibration.effectiveS[0] << "," << meta.calibration.effectiveS[1] << "," << meta.calibration.effectiveS[2] << "," << meta.calibration.effectiveS[3] << "]"
          << ";effectiveO=[" << meta.calibration.effectiveO[0] << "," << meta.calibration.effectiveO[1] << "," << meta.calibration.effectiveO[2] << "," << meta.calibration.effectiveO[3] << "]"
          << ";spectraSnapshotHash=0x" << std::hex << spectraSnapshotHash << std::dec
@@ -2878,8 +2872,7 @@ std::string computeRawShadowDiagnosticsCompact(
 
     std::uint32_t spectraSnapshotHash = 0x811c9dc5u;
     for (int ch = 0; ch < 4; ++ch) {
-        const double values[4] = {
-            meta.calibration.cameraS[ch], meta.calibration.cameraO[ch],
+        const double values[2] = {
             meta.calibration.effectiveS[ch], meta.calibration.effectiveO[ch]
         };
         for (double value : values) {
@@ -2901,8 +2894,8 @@ std::string computeRawShadowDiagnosticsCompact(
          << "rawShadowDiagnostics={"
          << "samplingMethod=COMPACT_RAW16_16X16_8X8_CFA_QUADS"
          << ";rowColVarianceScope=GRID_PROXY"
-         << ";lensKey=" << meta.calibration.spectraLensKey
-         << ";snapshotPresent=" << (meta.calibration.spectraSnapshotPresent ? "true" : "false")
+         << ";lensKey=" << meta.calibration.lensId
+         << ";physicalNoiseAvailable=" << (meta.calibration.physicalNoiseModelAvailable() ? "true" : "false")
          << ";sourceFormat=" << rawSourceFormatName(raw.info.sourceFormat)
          << ";cfaPattern=" << rawCfaPatternName(raw.info.effectiveCfaPattern)
          << ";iso=" << meta.captureSensitivityIso
@@ -2938,8 +2931,6 @@ std::string computeRawShadowDiagnosticsCompact(
          << ";bMinusGMean=" << bgMean
          << ";rowMeanVar=" << rowVar
          << ";colMeanVar=" << colVar
-         << ";cameraS=[" << meta.calibration.cameraS[0] << "," << meta.calibration.cameraS[1] << "," << meta.calibration.cameraS[2] << "," << meta.calibration.cameraS[3] << "]"
-         << ";cameraO=[" << meta.calibration.cameraO[0] << "," << meta.calibration.cameraO[1] << "," << meta.calibration.cameraO[2] << "," << meta.calibration.cameraO[3] << "]"
          << ";effectiveS=[" << meta.calibration.effectiveS[0] << "," << meta.calibration.effectiveS[1] << "," << meta.calibration.effectiveS[2] << "," << meta.calibration.effectiveS[3] << "]"
          << ";effectiveO=[" << meta.calibration.effectiveO[0] << "," << meta.calibration.effectiveO[1] << "," << meta.calibration.effectiveO[2] << "," << meta.calibration.effectiveO[3] << "]"
          << ";spectraSnapshotHash=0x" << std::hex << spectraSnapshotHash << std::dec
@@ -4179,7 +4170,7 @@ SpectraPass1State computePass1StateForInputAvailability(
         state.fallbackReason = "mosaic_unavailable";
         return state;
     }
-    if (!meta.calibration.spectraSnapshotPresent) {
+    if (!meta.calibration.physicalNoiseModelAvailable()) {
         state.fallbackReason = "snapshot_not_present_or_invalid";
         return state;
     }
@@ -4505,7 +4496,7 @@ SpectraPass2State computePass2StateForInputAvailability(
         state.observerStatus = "RAW_INPUT_UNAVAILABLE";
         return state;
     }
-    if (!meta.calibration.spectraSnapshotPresent) {
+    if (!meta.calibration.physicalNoiseModelAvailable()) {
         state.observerStatus = "NO_VALID_SPECTRA_SNAPSHOT";
         return state;
     }
@@ -4858,7 +4849,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     spectraCaptureIntegration << std::fixed << std::setprecision(6)
             << "spectraCaptureIntegration={source=capture_snapshot"
             << ";active=" << (workingMeta.calibration.spectraProcessingMode != 0 ? "true" : "false")
-            << ";snapshotPresent=" << (workingMeta.calibration.spectraSnapshotPresent ? "true" : "false")
+            << ";physicalNoiseAvailable=" << (workingMeta.calibration.physicalNoiseModelAvailable() ? "true" : "false")
             << ";modelConfidence=" << workingMeta.calibration.signalModelConfidence
             << ";effectiveS=[" << workingMeta.calibration.effectiveS[0] << ","
             << workingMeta.calibration.effectiveS[1] << ","
@@ -5503,6 +5494,21 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     bool demosaicFailureRawFinalizeMaterialized = false;
     bncam::vulkan::SpectraRawFinalizeResult vulkanRawFinalize{};
     bncam::vulkan::neural::SpectraNeuralProductionTrace neuralProductionTrace{};
+    // Phase 9 debug-only truth flags. They describe the actual one-way authority chain and
+    // never participate in the processing decision.
+    bool neuralConditioningValid = false;
+    bool physicalNoiseUsedForNeuralConditioning = false;
+    if (meta.calibration.spectraProcessingMode == 0) {
+        // FASE 8: make user-disabled identity explicit even when the capture later selects
+        // a CPU/failure-recovery RAW-finalize route and never enters the resident Neural path.
+        neuralProductionTrace.exactPreflightBypass = true;
+        neuralProductionTrace.originalPublished = true;
+        neuralProductionTrace.neuralPublished = false;
+        neuralProductionTrace.attempted = false;
+        neuralProductionTrace.bypassReason =
+                bncam::spectra::neural::NeuralBypassReason::UserDisabled;
+        neuralProductionTrace.status = "EXACT_USER_DISABLED_IDENTITY";
+    }
     bool neuralPosteriorSeedApplied = false;
     bool neuralPosteriorLscPropagationReady = false;
     std::array<float, 4> neuralPosteriorPostLscVarianceCfa{{0.0f, 0.0f, 0.0f, 0.0f}};
@@ -5552,6 +5558,12 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
 
     const bool autoDemosaicRequested =
             meta.requestedDemosaicMode == static_cast<int>(DemosaicMode::Auto);
+
+    // Phase 3/8/11 contract: keep the frozen physical-noise export alive for the entire
+    // RAW finalize + downstream propagation section. Neural preparation and later read-only
+    // statistics must consume the same capture-local object; do not shadow it inside the
+    // Vulkan RAW-finalize request scope.
+    const auto frozenPhysicalNoise = meta.calibration.frozenPhysicalNoiseModel();
     {
         bncam::vulkan::SpectraRawFinalizeRequest request{};
         request.mosaicData = jpegRaw.mosaic.empty() ? nullptr : jpegRaw.mosaic.ptr<float>(0);
@@ -5569,11 +5581,10 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         request.isRaw10 = meta.isRaw10;
         request.adaptiveExposureEnabled = false;
 
-        // Phase 3: freeze one native physical-noise export for every downstream RAW consumer in
-        // this finalize invocation. Neural conditioning must consume this exact object; it must
-        // never re-read Camera2 noise evidence, re-resolve ISO, clamp coefficients, or synthesize
-        // missing channels. Invalid physical S/O stays unavailable and all-zero by contract.
-        const auto frozenPhysicalNoise = meta.calibration.frozenPhysicalNoiseModel();
+        // Phase 3: every downstream RAW consumer in this finalize invocation uses the one frozen
+        // physical-noise export declared above. Neural conditioning must never re-read Camera2
+        // evidence, re-resolve ISO, clamp coefficients, or synthesize missing channels. Invalid
+        // physical S/O stays unavailable and all-zero by contract.
         request.noiseModelValid = frozenPhysicalNoise.available;
         request.effectiveS = frozenPhysicalNoise.shotS;
         request.effectiveO = frozenPhysicalNoise.readO;
@@ -5583,7 +5594,16 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             request.lensShadingRows = static_cast<std::uint32_t>(meta.lensShadingRows);
             request.lensShadingGenerationId = spectraLensMapGenerationId(meta);
         }
-        if (residentEntry && !residentCpuFallbackUsed) {
+        if (residentEntry && !residentCpuFallbackUsed &&
+            meta.calibration.spectraProcessingMode == 0) {
+            // FASE 8: user-disabled Neural is an exact resident identity path. Do not enter
+            // Neural preparation/model readiness/backend code at all. The frozen Physical
+            // Noise Model remains attached to the baseline RAW finalizer for read-only
+            // statistics/propagation, but no neural pixel mutation is attempted.
+            vulkanRawFinalize = bncam::vulkan::VulkanRuntime::instance()
+                    .executeSpectraRawFinalizeFromRawNormalize(
+                            request, residentInput->rawNormalizeGeneration);
+        } else if (residentEntry && !residentCpuFallbackUsed) {
             // Phase 5 production neural integration. The request is evidence-only until the
             // runtime preflight grants mutation authority. Missing explicit analog gain is an
             // intentional structural OOD condition: ISO is never substituted for sensor gain.
@@ -5720,13 +5740,12 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                     break;
             }
 
-            // Phase 6: the profile steers the one neural Student residual directly. Master and
-            // Adaptive Response are explicit unit controls; existing component values retain signed
-            // profile storage and are deterministically projected to the fixed neural residual basis.
-            // Lens Dynamic ISO remains a separate hardware/observer policy and never enters this call.
+            // The profile shapes the one neural Student residual. Global authority is binary:
+            // mutationMode Off => 0%, enabled => 100%. Luma/Chroma/Detail/Low-frequency/Adaptive
+            // controls may only shape or protect that residual; they cannot create a second master.
+            // Lens Dynamic ISO remains a separate physical-noise policy and never enters this call.
             neuralEvidence.userControls = bncam::spectra::neural::projectVisibleProfileControlsToNeural(
                     neuralEvidence.mutationMode,
-                    uiConfig.profileSpectraStrength,
                     uiConfig.profileSpectraLuma,
                     uiConfig.profileSpectraChroma,
                     uiConfig.profileSpectraDetailProtection,
@@ -5737,6 +5756,14 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             bncam::vulkan::neural::SpectraNeuralProductionRequest neuralRequest{};
             neuralRequest.prepared =
                     bncam::spectra::neural::prepareNeuralProductionContext(neuralEvidence);
+            neuralConditioningValid =
+                    neuralRequest.prepared.structuralOodSafe &&
+                    neuralRequest.prepared.structuralBypassReason ==
+                            bncam::spectra::neural::NeuralBypassReason::None;
+            physicalNoiseUsedForNeuralConditioning =
+                    neuralConditioningValid &&
+                    frozenPhysicalNoise.available &&
+                    neuralRequest.prepared.core.noise.valid();
             neuralRequest.conditioningConfig.logSigmaFloor = 1.0e-8f;
             neuralRequest.conditioningConfig.headroomSpan = 0.08f;
             neuralRequest.conditioningConfig.clippingEpsilon = 0.0f;
@@ -6209,11 +6236,11 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     if (demosaicResolution.algorithm == DemosaicAlgorithm::Menon2007 && !vulkanDemosaic.gpuUsedForOutput) {
         recordMenonDemosaicTimeMs(demosaicMs);
     }
-    // DELTA 0215: expensive residual observability is not part of the pixel path.
-    // Keep it only when SPECTRA is active. Tone-noise propagation additionally remains
-    // available when profile-owned perceptual detail is requested, because that policy
-    // consumes the propagated display-domain physical sigma.
-    const bool spectraNoiseActive = meta.calibration.spectraProcessingMode != 0;
+    // FASE 8: physical-noise observability and propagation are independent from Neural Denoise.
+    // A user-disabled Neural engine must never make the frozen Physical Noise Model appear absent.
+    // Conversely, enabling Neural must not be required to keep physical noise statistics alive.
+    const bool neuralDenoiseActive = meta.calibration.spectraProcessingMode != 0;
+    const bool physicalNoiseStatisticsActive = frozenPhysicalNoise.available;
     // profileDetailRadius is a retired legacy ABI slot. Phase 12 decodes active Legibility
     // from the packed profileDetailDetail carrier, so the production gate mirrors the resolver.
     const bool profilePerceptualDetailRequested =
@@ -6221,7 +6248,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             std::abs(uiConfig.profileDetailDetail) > 1.0e-4f ||
             std::abs(uiConfig.profileDetailMasking) > 1.0e-4f;
     const bool toneNoisePropagationRequired =
-            spectraNoiseActive || profilePerceptualDetailRequested;
+            physicalNoiseStatisticsActive || profilePerceptualDetailRequested;
 
     const auto demosaicPropagationStart = IspClock::now();
     residualNoiseState.postDemosaic = autoHybridUsedForOutput
@@ -6236,7 +6263,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                     resolvedDemosaicNoiseModel(demosaicResolution.algorithm),
                     "POST_DEMOSAIC_RGB");
     residualNoiseState.demosaicPropagationMs = elapsedMs(demosaicPropagationStart);
-    if (spectraNoiseActive) {
+    if (physicalNoiseStatisticsActive) {
         const auto measuredPostDemosaicStart = IspClock::now();
         residualNoiseState.measuredPostDemosaic = vulkanDemosaicResident
                 ? measureLinearResidualGpuCandidates(
@@ -6916,7 +6943,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         cpuColorTransformApplied = true;
     }
     const float awbColourTransformMs = elapsedMs(awbColourTransformStart);
-    if (spectraNoiseActive) {
+    if (physicalNoiseStatisticsActive) {
         const auto measuredPostColourTransformStart = IspClock::now();
         residualNoiseState.measuredPostColourTransform = vulkanColorTransform.success
                 ? measureLinearResidualGpuCandidates(
@@ -6947,7 +6974,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         residualNoiseState.measuredPostColourTransform = {};
         residualNoiseState.measuredPostColourTransformResidualMs = 0.0f;
         residualNoiseState.postColourTransformCalibration = {};
-        residualNoiseState.calibrationStatus = "SKIPPED_SPECTRA_OFF";
+        residualNoiseState.calibrationStatus = "SKIPPED_PHYSICAL_NOISE_UNAVAILABLE";
     }
 
     const double totalPixelsD = static_cast<double>(std::max<size_t>(1u, expectedColorPixels));
@@ -8125,10 +8152,12 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
 
     std::ostringstream nativeNoiseSo;
     nativeNoiseSo << std::setprecision(17) << "[";
-    const int nativeNoiseValueCount = std::clamp(meta.calibration.noiseProfilePairCount * 2, 0, 16);
-    for (int i = 0; i < nativeNoiseValueCount; ++i) {
-        if (i > 0) nativeNoiseSo << ",";
-        nativeNoiseSo << meta.calibration.effectiveNoiseProfile[i];
+    if (physicalNoiseModelAvailable) {
+        for (int ch = 0; ch < 4; ++ch) {
+            if (ch > 0) nativeNoiseSo << ",";
+            nativeNoiseSo << meta.calibration.effectiveS[ch] << ","
+                          << meta.calibration.effectiveO[ch];
+        }
     }
     nativeNoiseSo << "]";
 
@@ -8328,7 +8357,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     residualNoiseState.downstreamSharpenPropagationMs = elapsedMs(quantizationPropagationStart);
 
     VisibleResidualMeasurement measuredPreSharpenResidual{};
-    if (spectraNoiseActive) {
+    if (physicalNoiseStatisticsActive) {
         const auto measuredPreSharpenStart = IspClock::now();
         measuredPreSharpenResidual = measureVisibleResidual8Bit(bgr8);
         residualNoiseState.measuredPreSharpenResidualMs = elapsedMs(measuredPreSharpenStart);
@@ -8356,7 +8385,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
 
 
     VisibleResidualMeasurement measuredVisibleResidual{};
-    if (spectraNoiseActive) {
+    if (physicalNoiseStatisticsActive) {
         const auto measuredVisibleResidualStart = IspClock::now();
         // Post-quantization sharpening is retired, so the already measured pre-sharpen surface
         // is also the final visible residual surface.
@@ -9410,8 +9439,22 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; absoluteMeanLumaSigma=" << g_threadLocalIspStats.absoluteMeanLumaSigma
             << "; absoluteMeanChromaSigma=" << g_threadLocalIspStats.absoluteMeanChromaSigma
             << "; physicalNoiseModelAvailable=" << (physicalNoiseModelAvailable ? "true" : "false")
-            << "; physicalNoiseModelPixelAuthority=false"
-            << "; spectraOffPhysicalLumaBaselineActive=false"
+            << "; physicalNoiseJniPayloadReceived="
+            << (meta.calibration.physicalNoiseJniPayloadReceived ? "true" : "false")
+            << "; physicalNoiseUsedForNeuralConditioning="
+            << (physicalNoiseUsedForNeuralConditioning ? "true" : "false")
+            << "; spectraNeuralConditioningValid="
+            << (neuralConditioningValid ? "true" : "false")
+            << "; phase8PhysicalNoiseStatisticsActive="
+            << (physicalNoiseStatisticsActive ? "true" : "false")
+            << "; phase8NoisePropagationActive="
+            << (toneNoisePropagationRequired ? "true" : "false")
+            << "; phase8NeuralDenoiseEnabled="
+            << (neuralDenoiseActive ? "true" : "false")
+            << "; phase8NeuralPixelMutation="
+            << (neuralProductionTrace.neuralPublished ? "true" : "false")
+            << "; phase8NeuralBypassReason="
+            << bncam::spectra::neural::neuralBypassReasonName(neuralProductionTrace.bypassReason)
             << "; residualSeedConfidence=" << residualSeedConfidence.confidence
             << "; residualSeedConfidenceStatus=" << residualSeedConfidence.status
             << "; residualSeedConfidenceMethod=" << residualSeedConfidence.method
@@ -9425,7 +9468,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; phase4PlannerInputModelConfidence=" << postToneResidualModelConfidence
             << "; phase4PhysicalNoiseModelAvailable="
             << (physicalNoiseModelAvailable ? "true" : "false")
-            << "; phase4SpectraContextFusionActive=" << (spectraNoiseActive ? "true" : "false")
+            << "; phase4SpectraContextFusionActive=" << (neuralDenoiseActive ? "true" : "false")
             << "; phase4ResidualBudgetActive=false"
             << "; phase4ResidualAuthoritySource=RETIRED_N003"
             << "; phase4ResidualCovarianceAuthoritative=true"
@@ -9441,7 +9484,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; phase4AppliedLumaSigma=0.0000"
             << "; phase4AppliedChromaSigma=0.0000"
             << "; phase4ResidualChromaStrengthScale=" << 0.0f
-            << "; phase4DynamicIsoChromaSpectraGate=" << (spectraNoiseActive ? "ACTIVE" : "IDENTITY_OFF")
+            << "; phase4DynamicIsoChromaSpectraGate=" << (neuralDenoiseActive ? "ACTIVE" : "IDENTITY_OFF")
             << "; effectiveLumaSigma=" << g_threadLocalIspStats.effectiveLumaSigma
             << "; effectiveChromaSigma=" << g_threadLocalIspStats.effectiveChromaSigma
             << "; rawBlackAnchorOwner=PREDEMOSAIC_CALIBRATED_SENSOR_BLACK_LEVEL"
@@ -9750,7 +9793,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; spectraMeasuredVisibleResidualMs=" << residualNoiseState.measuredVisibleResidualMs
             << "; spectraPropagationMathMs=" << spectraPropagationMathMs
             << "; spectraPropagationSequentialMs=" << spectraPropagationSequentialMs
-            << "; spectraResidualTelemetryEnabled=" << (spectraNoiseActive ? "true" : "false")
+            << "; spectraResidualTelemetryEnabled=" << (physicalNoiseStatisticsActive ? "true" : "false")
             << "; spectraToneNoisePropagationEnabled="
             << (toneNoisePropagationRequired ? "true" : "false")
             << "; phase7ExactCamera2ColorPair=" << (exactCamera2ColorPair ? "true" : "false")
@@ -10309,17 +10352,9 @@ std::string IspCore::validateNoiseModelImplementation(
         IspFrameMetadata meta{};
         meta.cfaPattern = CFA_BGGR;
         const bool physicalAvailable = mode != 0;
-        meta.calibration.hasNoiseProfile = physicalAvailable;
-        meta.calibration.noiseProfileApplied = physicalAvailable;
-        meta.calibration.noiseProfileValid = physicalAvailable;
-        meta.calibration.noiseProfilePairCount = physicalAvailable ? 4 : 0;
-        meta.calibration.noiseProfileChannelCount = physicalAvailable ? 4 : 0;
-        meta.calibration.spectraSnapshotPresent = physicalAvailable;
+        meta.calibration.physicalNoiseJniPayloadReceived = physicalAvailable;
         meta.calibration.signalModelConfidence = physicalAvailable ? 1.0f : 0.0f;
         meta.calibration.postRawSensitivityBoost = 100;
-        for (int i = 0; i < 8; ++i) {
-            meta.calibration.effectiveNoiseProfile[i] = values[static_cast<size_t>(i)];
-        }
         for (int ch = 0; ch < 4; ++ch) {
             meta.calibration.effectiveS[ch] = values[static_cast<size_t>(ch * 2)];
             meta.calibration.effectiveO[ch] = values[static_cast<size_t>(ch * 2 + 1)];

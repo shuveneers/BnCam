@@ -261,25 +261,23 @@ data class FinalSensorCalibration(
         pairs.add("WB Applied" to effectiveWbApplied.toString())
         pairs.add("WB Applied To" to wbAppliedTo())
 
-        pairs.add("Sensor Noise Profile Present" to hasNoiseProfile.toString())
-        pairs.add("Noise Profile Valid" to noiseProfileValid.toString())
         pairs.add("Normalization Calibration Valid" to normalizationCalibrationValid.toString())
         pairs.add("CFA Bayer Noise Model Supported" to cfaSupportedForBayerNoiseModel.toString())
-        pairs.add("Noise Model Mode" to noiseModelMode)
-        pairs.add("SPECTRA Processing Enabled" to spectraProcessingEnabled.toString())
-        pairs.add("Sensor Noise Profile Source" to effectiveNoiseProfileSource)
-        pairs.add("Sensor Noise Profile Fallback Reason" to effectiveNoiseProfileFallbackReason)
-        pairs.add("Sensor Noise Profile Applied" to effectiveNoiseProfileApplied.toString())
-        pairs.add("Sensor Noise Profile Not Applied Reason" to noiseProfileNotAppliedReason)
-        pairs.add("Manual Noise Anchor ISO" to manualNoiseAnchorIso.format5())
-        pairs.add("Manual Noise Gain Ratio" to manualNoiseGainRatio.format5())
-        pairs.add("Manual Noise Single Anchor Scaled" to manualNoiseSingleAnchorScaled.toString())
-        pairs.add("Sensor Noise Profile Formula" to effectiveNoiseProfileFormula)
-        pairs.add("Sensor Noise Profile Pair Count" to effectiveNoiseProfilePairCount.toString())
-        pairs.add("Sensor Noise Profile Channel Count" to effectiveNoiseProfileChannelCount.toString())
-        pairs.add("Sensor Noise Profile CFA/Channel Mapping" to effectiveNoiseProfileChannelMap)
-        pairs.add("Sensor Noise Profile Values S/O" to (effectiveNoiseProfile?.formatDoubleArray() ?: "missing"))
-        pairs.add("Sensor Noise Profile Applied To" to if (effectiveNoiseProfileApplied) "RAW_DOMAIN_NATIVE_ISP_DENOISE_SCALING" else "NOT_APPLIED")
+        pairs.add("Physical Noise Runtime Owner" to "PhysicalNoiseState")
+        pairs.add("Neural Denoise Effective Enabled" to spectraProcessingEnabled.toString())
+        // Phase 9: FinalSensorCalibration still mirrors the frozen physical profile for transport
+        // compatibility, but it is not a second source/resolver and must never be presented as one.
+        pairs.add("Legacy Physical S/O Mirror Present (Telemetry Only)" to hasNoiseProfile.toString())
+        pairs.add("Legacy Physical S/O Mirror Valid (Telemetry Only)" to noiseProfileValid.toString())
+        pairs.add("Legacy Physical S/O Mirror Applied (Telemetry Only)" to effectiveNoiseProfileApplied.toString())
+        pairs.add("Legacy Physical S/O Mirror Source (Telemetry Only)" to effectiveNoiseProfileSource)
+        pairs.add("Legacy Physical S/O Mirror Fallback (Telemetry Only)" to effectiveNoiseProfileFallbackReason)
+        pairs.add("Legacy Physical S/O Mirror Not Applied Reason (Telemetry Only)" to noiseProfileNotAppliedReason)
+        pairs.add("Legacy Physical S/O Mirror Formula (Telemetry Only)" to effectiveNoiseProfileFormula)
+        pairs.add("Legacy Physical S/O Mirror Pair Count (Telemetry Only)" to effectiveNoiseProfilePairCount.toString())
+        pairs.add("Legacy Physical S/O Mirror Channel Count (Telemetry Only)" to effectiveNoiseProfileChannelCount.toString())
+        pairs.add("Legacy Physical S/O Mirror CFA Mapping (Telemetry Only)" to effectiveNoiseProfileChannelMap)
+        pairs.add("Legacy Physical S/O Mirror Values (Telemetry Only)" to (effectiveNoiseProfile?.formatDoubleArray() ?: "missing"))
         pairs.add("Physical Fusion Variance Scale" to physicalFusionVarianceScale.toString())
         pairs.add("Physical Effective Frame Count" to physicalEffectiveFrameCount.toString())
 
@@ -661,50 +659,25 @@ object SensorCalibrationResolver {
             else -> base.baseBlackLevelSource
         }
 
-        val manualNoise = override.manualNoiseValues?.let { mosaicNoiseToCanonical(it, base.cfaPattern) }
         val manualNoiseAnchorIso = 100.0
-        var manualNoiseGainRatio = 1.0
-        var manualNoiseSingleAnchorScaled = false
+        val manualNoiseGainRatio = 1.0
+        val manualNoiseSingleAnchorScaled = false
 
         val cameraNoiseCanonical = base.baseNoiseProfile?.let { mosaicNoiseToCanonical(it, base.cfaPattern) }
 
-        // Physical sensor-noise calibration and SPECTRA pixel processing are independent authorities.
-        // Camera2 S/O remains available to the conventional RAW baseline even when the profile has
-        // SPECTRA disabled. SPECTRA only owns the extra Context Fusion passes; it never owns whether
-        // the physical variance model exists. An explicit Manual lens model remains authoritative.
+        // FinalSensorCalibration carries OEM/Camera2 evidence only. Physical source selection
+        // (OEM/System/Manual/Preset + Dynamic ISO) happens later and exactly once in PhysicalNoiseState.
         val spectraProcessingRequested = profileNoiseTuning?.spectraEnabled ?: false
-        val noiseAuthority = NoiseModelAuthorityPolicy.resolve(
-            lensNoiseMode = override.noiseMode,
-            spectraRequested = spectraProcessingRequested,
-            cameraNoiseProfileAvailable = cameraNoiseCanonical?.isNotEmpty() == true,
-            manualNoiseProfileAvailable = manualNoise?.isNotEmpty() == true
-        )
-        val effectiveNoiseMode = noiseAuthority.physicalNoiseMode
-        val spectraProcessingEnabled = noiseAuthority.spectraProcessingMode != "Off"
-
-        val noiseValues = when (effectiveNoiseMode) {
-            "Auto" -> cameraNoiseCanonical
-            "Manual" -> {
-                if (manualNoise != null) {
-                    val postRawGain = (base.postRawSensitivityBoost.toDouble() / 100.0).coerceAtLeast(0.01)
-                    val effectiveFrameIso = (base.sensorSensitivityIso.toDouble() * postRawGain).coerceAtLeast(1.0)
-                    manualNoiseGainRatio = (effectiveFrameIso / manualNoiseAnchorIso).coerceIn(0.01, 500.0)
-                    manualNoiseSingleAnchorScaled = true
-                    warnings.add("singleAnchorManualNoiseScaling applied: gainRatio=${manualNoiseGainRatio.format5()} (effectiveFrameIso=$effectiveFrameIso, manualAnchorIso=$manualNoiseAnchorIso); warning: single-anchor approximation in use")
-                    DoubleArray(manualNoise.size) { i ->
-                        val isSlope = (i % 2 == 0)
-                        val scale = if (isSlope) manualNoiseGainRatio else (manualNoiseGainRatio * manualNoiseGainRatio)
-                        (manualNoise[i] * scale).coerceAtLeast(0.0)
-                    }
-                } else null
-            }
-            else -> null
-        }
-        if (override.manualNoiseValues != null && manualNoise == null) {
-            warnings.add("Manual S/O noise model is unsupported for CFA ${base.cfaName}; no RGGB fallback was used")
+        // Legacy FinalSensorCalibration is no longer a physical source selector. It carries only
+        // Camera2/OEM evidence until withPhysicalNoiseAuthority() installs the frozen capture model.
+        val effectiveNoiseMode = if (cameraNoiseCanonical?.isNotEmpty() == true) "Auto" else "Off"
+        val spectraProcessingEnabled = spectraProcessingRequested
+        val noiseValues = cameraNoiseCanonical
+        if (override.manualNoiseValues != null) {
+            warnings.add("Legacy LensOverride manual S/O ignored; PhysicalNoiseState is the sole physical noise authority")
         }
 
-        val hasNoiseProfile = base.hasNoiseProfile || manualNoise != null
+        val hasNoiseProfile = base.hasNoiseProfile
         val noiseProfileValid = noiseValues != null && noiseValues.isNotEmpty() && noiseValues.all { it.isFinite() && it >= 0.0 }
         val normalizationCalibrationValid = base.normalizationCalibrationValid
         val cfaSupportedForBayer = base.cfaSupportedForBayerNoiseModel
@@ -862,7 +835,7 @@ object SensorCalibrationResolver {
                 RawDomain.RAW_SENSOR_16BIT -> "RAW_SENSOR_NATIVE_ISP_NORMALIZATION"
                 else -> "NOT_APPLICABLE_TO_YUV_OR_UNKNOWN"
             },
-            "Noise Model Applied To" to if (noiseValues != null) "RAW_DOMAIN_NATIVE_ISP_DENOISE_SCALING" else "NOT_APPLIED_MISSING_OR_INVALID",
+            "Noise Model Applied To" to if (noiseValues != null) "RAW_DOMAIN_NATIVE_ISP_PHYSICAL_SO" else "NOT_APPLIED_MISSING_OR_INVALID",
             "DNG Standard Tags Overridden" to "false"
         )
 
@@ -887,7 +860,7 @@ object SensorCalibrationResolver {
             effectiveO = effO,
             chromaUserScale = 1.0f,
             lumaUserScale = 1.0f,
-            spectraMode = noiseAuthority.spectraProcessingMode,
+            spectraMode = if (spectraProcessingEnabled) "On" else "Off",
             signalModelConfidence = when {
                 !effectiveNoiseProfileApplied -> 0.0f
                 effectiveNoiseMode == "Auto" -> 1.0f
@@ -913,16 +886,8 @@ object SensorCalibrationResolver {
             noiseModelMode = effectiveNoiseMode,
             spectraProcessingEnabled = spectraProcessingEnabled,
             effectiveNoiseProfile = noiseValues,
-            effectiveNoiseProfileSource = when {
-                effectiveNoiseMode == "Off" -> "Off"
-                manualNoise != null -> "Lens ID Manual S/O (${base.cfaName})"
-                else -> base.baseNoiseProfileSource
-            },
-            effectiveNoiseProfileFallbackReason = when {
-                override.noiseMode == "Off" -> "None"
-                manualNoise != null -> "None"
-                else -> base.baseNoiseProfileFallbackReason
-            },
+            effectiveNoiseProfileSource = if (effectiveNoiseMode == "Off") "Off" else base.baseNoiseProfileSource,
+            effectiveNoiseProfileFallbackReason = base.baseNoiseProfileFallbackReason,
             hasNoiseProfile = hasNoiseProfile,
             noiseProfileValid = noiseProfileValid,
             normalizationCalibrationValid = normalizationCalibrationValid,

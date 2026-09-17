@@ -6,8 +6,8 @@
 
 int main() {
     using namespace bncam::spectra::neural;
-    assert(std::strcmp(neuralBypassReasonName(NeuralBypassReason::NeuralDisabled),
-                       "neural_disabled") == 0);
+    assert(std::strcmp(neuralBypassReasonName(NeuralBypassReason::UserDisabled),
+                       "user_disabled") == 0);
     assert(std::strcmp(neuralBypassReasonName(NeuralBypassReason::PosteriorInvalid),
                        "posterior_invalid") == 0);
     assert(std::strcmp(neuralBackendFailureCodeName(NeuralBackendFailureCode::None),

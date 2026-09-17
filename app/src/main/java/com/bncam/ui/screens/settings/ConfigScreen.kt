@@ -174,7 +174,7 @@ fun ConfigScreen(
                 )
                 SettingValueRow(
                     title = "Saved content",
-                    description = "Profile UUID/name, capture mode, preferred frame source, AWB, curves, color, sharpness, SPECTRA/noise, JPEG, frame-selection and multi-frame settings.",
+                    description = "Profile UUID/name, capture mode, preferred frame source, AWB, curves, color, sharpness, Neural Denoise, JPEG, frame-selection and multi-frame settings.",
                     value = ".bnc",
                     onClick = {}
                 )

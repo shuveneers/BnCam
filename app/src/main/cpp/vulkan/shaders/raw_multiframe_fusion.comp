@@ -38,8 +38,7 @@ const uint P_MEAN_CORRELATION = 19u;
 const uint P_BLACK0 = 20u;
 const uint P_S0 = 24u;
 const uint P_O0 = 28u;
-const uint P_ADAPT_S0 = 32u;
-const uint P_ADAPT_O0 = 36u;
+// Parameter words 32..39 are reserved legacy padding; FASE 6 no longer adapts physical S/O.
 const uint P_HDR_ENABLED = 40u;
 const uint P_EXPOSURE_SCALE = 41u;
 const uint P_HDR_HIGHLIGHT_AUTHORITY = 42u;
@@ -195,12 +194,12 @@ bool fusePixel(uint x, uint y) {
         if (authority < 0.025) return false;
         weight *= authority;
         int ch = cfaChannel(int(x), int(y));
-        float adaptedS = pF(P_S0 + uint(ch)) * clamp(pF(P_ADAPT_S0 + uint(ch)), 0.75, 1.25);
-        float adaptedO = pF(P_O0 + uint(ch)) * clamp(pF(P_ADAPT_O0 + uint(ch)), 0.75, 1.25);
+        float physicalS = pF(P_S0 + uint(ch));
+        float physicalO = pF(P_O0 + uint(ch));
         // Noise is measured in each source's native exposure domain. For HDR the comparison
         // gate is transformed to anchor code values after exposure normalization.
-        float supportVariance = max(1.0e-12, adaptedS * supportNativeSignal + adaptedO);
-        float anchorVariance = max(1.0e-12, adaptedS * anchorSignal + adaptedO);
+        float supportVariance = max(1.0e-12, physicalS * supportNativeSignal + physicalO);
+        float anchorVariance = max(1.0e-12, physicalS * anchorSignal + physicalO);
         relativeVarianceRatio = clamp((supportVariance / max(exposureScale * exposureScale, 1.0e-4)) / anchorVariance, 0.10, 8.0);
         float sigmaCode = sqrt(supportVariance) * supportRange / exposureScale;
         float robustSigma = max(3.5 * sigmaCode, 1.5);
@@ -209,7 +208,7 @@ bool fusePixel(uint x, uint y) {
         if (hdrExposureBracketSupport && anchorSignal < 0.90 && diff > rejectGate) return false;
         float normalized = diff / robustSigma;
         float robustWeight = exp(-0.5 * normalized * normalized);
-        float inv = clamp(max(1.0e-12, adaptedS * 0.15 + adaptedO) / supportVariance, 0.25, 4.0);
+        float inv = clamp(max(1.0e-12, physicalS * 0.15 + physicalO) / supportVariance, 0.25, 4.0);
         float modelWeight = 1.0 + pF(P_MODEL_CONFIDENCE) * pF(P_TEMPORAL_AUTHORITY) * (inv - 1.0);
         weight *= robustWeight * modelWeight;
     } else if (!hdr || hdrTemporalMainSupport) {

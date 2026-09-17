@@ -54,7 +54,7 @@ object Routes {
     const val PROFILE_EDIT = "profile_edit/{lensId}/{profileIndex}"
     const val PROFILE_AWB = "profile_edit/{lensId}/{profileIndex}/awb"
     const val PROFILE_JPEG = "profile_edit/{lensId}/{profileIndex}/jpeg"
-    const val PROFILE_SPECTRA = "profile_edit/{lensId}/{profileIndex}/noise/spectra"
+    const val PROFILE_SPECTRA = "profile_edit/{lensId}/{profileIndex}/noise/spectra" // legacy deep link -> Neural Denoise
     const val PROFILE_CAPTURE_EXPOSURE = "profile_edit/{lensId}/{profileIndex}/capture/exposure"
     const val PROFILE_DENOISE = "profile_edit/{lensId}/{profileIndex}/isp/denoise"
     const val PROFILE_LIGHT_SHADOW = "profile_edit/{lensId}/{profileIndex}/isp/light_shadow"
@@ -742,9 +742,6 @@ fun AppNavigation() {
                     onNavigateToJpegTuning = {
                         navController.navigate(Routes.profileJpeg(lensId, index))
                     },
-                    onNavigateToSpectra = {
-                        navController.navigate(Routes.profileSpectra(lensId, index))
-                    },
                     onNavigateToShotBias = {
                         navController.navigate(Routes.profileCaptureExposure(lensId, index))
                     },
@@ -783,7 +780,7 @@ fun AppNavigation() {
                     navArgument("profileIndex") { type = NavType.IntType }
                 )
             ) { entry ->
-                ProfileSpectraSettingsScreen(
+                ProfileDenoiseSettingsScreen(
                     lensId = Routes.parseRouteArg(entry.arguments?.getString("lensId")),
                     profileIndex = entry.arguments?.getInt("profileIndex") ?: 1,
                     onNavigateBack = { navController.popBackStack() }

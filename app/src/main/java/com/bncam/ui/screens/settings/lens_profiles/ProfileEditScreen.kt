@@ -82,7 +82,6 @@ fun ProfileEditScreen(
     onSaveMode: (CaptureStrategy) -> Unit,
     onNavigateToAwb: () -> Unit = {},
     onNavigateToJpegTuning: () -> Unit = {},
-    onNavigateToSpectra: () -> Unit = {},
     onNavigateToShotBias: () -> Unit = {},
     onNavigateToDenoise: () -> Unit = {},
     onNavigateToLightShadow: () -> Unit = {},
@@ -187,7 +186,6 @@ fun ProfileEditScreen(
                     onNavigateToShotBias = onNavigateToShotBias,
                     onEditFrameSource = { showFrameSourceDialog = true },
                     onNavigateToAwb = onNavigateToAwb,
-                    onNavigateToSpectra = onNavigateToSpectra,
                     onNavigateToDenoise = onNavigateToDenoise,
                     onNavigateToLightShadow = onNavigateToLightShadow,
                     onNavigateToCurves = onNavigateToCurves,
@@ -369,7 +367,6 @@ private fun LibpatcherProfileOverview(
     onNavigateToShotBias: () -> Unit,
     onEditFrameSource: () -> Unit,
     onNavigateToAwb: () -> Unit,
-    onNavigateToSpectra: () -> Unit,
     onNavigateToDenoise: () -> Unit,
     onNavigateToLightShadow: () -> Unit,
     onNavigateToCurves: () -> Unit,
@@ -403,15 +400,9 @@ private fun LibpatcherProfileOverview(
         DemosaicMode.DEFAULT
     }
 
-    val spectraEnabledInt by repo.getProfileInt(profileId, ProfileIspKeys.SPECTRA_ENABLED, 0)
+    val neuralEnabledInt by repo.getProfileInt(profileId, ProfileIspKeys.SPECTRA_ENABLED, 0)
         .collectAsStateWithLifecycle(initialValue = 0)
-    val spectraEnabled = spectraEnabledInt == 1
-    val neuralMasterStrength by repo.getProfileFloat(
-        profileId, ProfileIspKeys.NEURAL_DENOISE_STRENGTH, SpectraProfileDefaults.MASTER_STRENGTH
-    ).collectAsStateWithLifecycle(initialValue = SpectraProfileDefaults.MASTER_STRENGTH)
-    val neuralAdaptiveResponse by repo.getProfileFloat(
-        profileId, ProfileIspKeys.NEURAL_ADAPTIVE_RESPONSE, SpectraProfileDefaults.ADAPTIVE_RESPONSE
-    ).collectAsStateWithLifecycle(initialValue = SpectraProfileDefaults.ADAPTIVE_RESPONSE)
+    val neuralEnabled = neuralEnabledInt == 1
     val spectraLuma by repo.getProfileFloat(profileId, ProfileIspKeys.SPECTRA_LUMA, SpectraProfileDefaults.LUMA)
         .collectAsStateWithLifecycle(initialValue = SpectraProfileDefaults.LUMA)
     val spectraChroma by repo.getProfileFloat(profileId, ProfileIspKeys.SPECTRA_CHROMA, SpectraProfileDefaults.CHROMA)
@@ -420,17 +411,15 @@ private fun LibpatcherProfileOverview(
         .collectAsStateWithLifecycle(initialValue = SpectraProfileDefaults.DETAIL_PROTECTION)
     val spectraLowFrequency by repo.getProfileFloat(profileId, ProfileIspKeys.SPECTRA_LOW_FREQUENCY, SpectraProfileDefaults.LOW_FREQUENCY)
         .collectAsStateWithLifecycle(initialValue = SpectraProfileDefaults.LOW_FREQUENCY)
-    val spectraCharacter = com.bncam.core.quality.SpectraProfileCharacters.infer(
+    val neuralCharacter = com.bncam.core.quality.SpectraProfileCharacters.infer(
         com.bncam.core.quality.SpectraProfileCharacterValues(
-            masterStrength = neuralMasterStrength,
-            adaptiveResponse = neuralAdaptiveResponse,
             luma = spectraLuma,
             chroma = spectraChroma,
             detailProtection = spectraDetail,
             lowFrequency = spectraLowFrequency
         )
     )
-    val spectraSummary = if (spectraEnabled) "On · $spectraCharacter" else "Off · $spectraCharacter latent"
+    val neuralDenoiseSummary = if (neuralEnabled) "On · $neuralCharacter" else "Off · $neuralCharacter latent"
 
     Column(
         modifier = Modifier
@@ -485,10 +474,10 @@ private fun LibpatcherProfileOverview(
                 description = "Sensor-adaptive cleanup and Bayer reconstruction for RAW10 / RAW_SENSOR."
             ) {
                 SettingValueRow(
-                    title = "SPECTRA",
-                    description = "Adaptive physical-noise processing. When enabled, the engine uses its full calibrated master authority; the component controls define its character.",
-                    value = spectraSummary,
-                    onClick = onNavigateToSpectra
+                    title = "Neural Denoise",
+                    description = "Profile-scoped neural RAW denoise. The lens Physical Noise Model remains separate and is consumed read-only.",
+                    value = neuralDenoiseSummary,
+                    onClick = onNavigateToDenoise
                 )
                 ChoiceSettingRow(
                     title = "Demosaic",
@@ -514,12 +503,6 @@ private fun LibpatcherProfileOverview(
                 description = "Configure automatic, reference or manual white balance for this profile.",
                 value = profileAwb.summary(),
                 onClick = onNavigateToAwb
-            )
-            SettingValueRow(
-                title = "Denoise",
-                description = "Luminance and colour noise reduction after reconstruction / in the YUV ISP.",
-                value = "Open",
-                onClick = onNavigateToDenoise
             )
             SettingValueRow(
                 title = "Light & Shadow",

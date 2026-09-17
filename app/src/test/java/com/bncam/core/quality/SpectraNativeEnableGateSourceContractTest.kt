@@ -10,7 +10,7 @@ class SpectraNativeEnableGateSourceContractTest {
         val nativeBridge = File("src/main/cpp/native-lib.cpp").readText()
 
         val canonicalSoIngress = nativeBridge.indexOf(
-            "meta.calibration.effectiveS[ch] = meta.calibration.effectiveNoiseProfile[ch * 2]"
+            "meta.calibration.effectiveS[ch] = physicalNoise.s[static_cast<std::size_t>(ch)]"
         )
         val physicalReadyGate = nativeBridge.indexOf(
             "const bool physicalNoiseReady = meta.calibration.physicalNoiseModelAvailable()"

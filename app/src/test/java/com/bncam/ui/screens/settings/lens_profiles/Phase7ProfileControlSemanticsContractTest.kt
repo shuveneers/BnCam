@@ -53,27 +53,39 @@ class Phase7ProfileControlSemanticsContractTest {
     }
 
     @Test
-    fun boostOnlyControlsKeepZeroToOneContract() {
+    fun neuralMasterAndAdaptiveResponseAreFixedBinaryRuntimeAuthorities() {
         val src = source("src/main/java/com/bncam/ui/screens/settings/lens_profiles/ProfileTuningSubScreens.kt")
-        val spectraKey = "ProfileIspKeys.SPECTRA_DYNAMIC_ISO"
-        val spectraIndex = src.indexOf("key = $spectraKey")
-        assertTrue(spectraIndex >= 0, "Missing boost control for $spectraKey")
-        assertTrue(src.lastIndexOf("ProfileBoostSlider(", spectraIndex) > src.lastIndexOf("ProfileSignedSlider(", spectraIndex))
+        val block = src.substringAfter("fun ProfileDenoiseSettingsScreen").substringBefore("fun ProfileMultiFrameSettingsScreen")
+        assertTrue(!block.contains("title = \"Strength\""))
+        assertTrue(!block.contains("key = ProfileIspKeys.NEURAL_DENOISE_STRENGTH"))
+        assertTrue(!block.contains("key = ProfileIspKeys.NEURAL_ADAPTIVE_RESPONSE"))
+        assertTrue(!block.contains("title = \"Adaptive Response\""))
+        assertTrue(block.contains("fixed at 100%"))
+        assertTrue(block.contains("full sigma/SNR adaptation"))
+    }
 
-        listOf(
-            "ProfileIspKeys.DETAIL_NR_LUMINANCE",
-            "ProfileIspKeys.DETAIL_NR_LUMINANCE_DETAIL",
-            "ProfileIspKeys.DETAIL_NR_LUMINANCE_CONTRAST",
-            "ProfileIspKeys.DETAIL_NR_COLOR",
-            "ProfileIspKeys.DETAIL_NR_COLOR_DETAIL",
-            "ProfileIspKeys.DETAIL_NR_COLOR_SMOOTHNESS"
-        ).forEach { key ->
-            val keyIndex = src.indexOf(key)
-            assertTrue(keyIndex >= 0, "Missing Lightroom Noise Reduction control for $key")
-            val rangeStart = src.lastIndexOf("ProfileRangeSlider(", keyIndex)
-            val signedStart = src.lastIndexOf("ProfileSignedSlider(", keyIndex)
-            assertTrue(rangeStart > signedStart, "$key must use the explicit 0..100 Lightroom range")
-        }
+    @Test
+    fun profileHasOneNeuralDenoisePageAndNoNoiseModelIsoControls() {
+        val src = source("src/main/java/com/bncam/ui/screens/settings/lens_profiles/ProfileTuningSubScreens.kt")
+        val editor = source("src/main/java/com/bncam/ui/screens/settings/lens_profiles/ProfileEditScreen.kt")
+        val lensNoiseModel = source("src/main/java/com/bncam/ui/screens/settings/lens_profiles/NoiseModelSettingsScreen.kt")
+        val neuralBlock = src.substringAfter("fun ProfileDenoiseSettingsScreen").substringBefore("fun ProfileMultiFrameSettingsScreen")
+
+        assertTrue(!src.contains("fun ProfileSpectraSettingsScreen"))
+        assertTrue(neuralBlock.contains("SettingsTopicScaffold(\"Neural Denoise\""))
+        assertTrue(neuralBlock.contains("title = \"Enabled\""))
+        assertTrue(!neuralBlock.contains("title = \"Strength\""))
+        assertTrue(neuralBlock.contains("title = \"Luma\""))
+        assertTrue(neuralBlock.contains("title = \"Chroma\""))
+        assertTrue(neuralBlock.contains("title = \"Detail Protection\""))
+        assertTrue(neuralBlock.contains("title = \"Low Frequency Cleanup\""))
+        assertTrue(!neuralBlock.contains("title = \"Adaptive Response\""))
+        assertTrue(!neuralBlock.contains("Manual ISO"))
+        assertTrue(!neuralBlock.contains("title = \"Dynamic ISO\""))
+        assertTrue(lensNoiseModel.contains("DynamicIsoCard("))
+        assertTrue(!lensNoiseModel.contains("Manual ISO"))
+        assertTrue(editor.contains("title = \"Neural Denoise\""))
+        assertTrue(!editor.contains("title = \"SPECTRA\""))
     }
 
     @Test

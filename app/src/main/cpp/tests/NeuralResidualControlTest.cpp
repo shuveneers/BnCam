@@ -43,7 +43,14 @@ int main() {
     const auto texture = neuralCharacterControls(NeuralCharacterPreset::Texture);
     const auto night = neuralCharacterControls(NeuralCharacterPreset::Night);
     assert(natural.valid() && clean.valid() && texture.valid() && night.valid());
-    assert(clean.noiseReduction > natural.noiseReduction);
+    assert(clean.noiseReduction == 1.0f);
+    assert(natural.noiseReduction == 1.0f);
+    assert(texture.noiseReduction == 1.0f);
+    assert(night.noiseReduction == 1.0f);
+    assert(natural.adaptiveResponse == 1.0f);
+    assert(clean.adaptiveResponse == 1.0f);
+    assert(texture.adaptiveResponse == 1.0f);
+    assert(night.adaptiveResponse == 1.0f);
     assert(texture.detailProtection > natural.detailProtection);
     assert(night.lowFrequencyCleanup > natural.lowFrequencyCleanup);
 
@@ -80,28 +87,18 @@ int main() {
         previousEvidence = evidence;
     }
 
-    // Phase 9 is strictly no-boost versus the previous adaptive-response formula.
-    for (float response : {0.0f, natural.adaptiveResponse, 1.0f}) {
-        for (int step = 0; step <= 200; ++step) {
-            const float snr = 0.1f * static_cast<float>(step);
-            const float sigma = 0.02f;
-            const float signal = snr * sigma;
-            const float inverseSnrFraction = sigma / (signal + sigma + kNeuralAdaptiveSigmaFloor);
-            const float phase6Scale = (1.0f - response) +
-                    response * std::sqrt(std::clamp(inverseSnrFraction, 0.0f, 1.0f));
-            const float phase9Scale = neuralAdaptiveAuthorityScale(signal, sigma, response);
-            assert(phase9Scale <= phase6Scale + 1.0e-6f);
-        }
+    // Corrective contract: SNR may attenuate writeback exactly once.  Adaptive Response is
+    // production-fixed and therefore cannot add a second inverse-SNR attenuation.  A representative
+    // SNR=4 sample must retain the physical evidence envelope (~0.741), rather than the retired
+    // double-gated value (~0.331).
+    const float evidenceMid = neuralAdaptiveNoiseEvidence(0.08f, 0.02f);
+    assert(evidenceMid > 0.70f);
+    for (float response : {0.0f, 0.5f, 1.0f}) {
+        const float authority = neuralAdaptiveAuthorityScale(0.08f, 0.02f, response);
+        assert(near(authority, evidenceMid));
     }
 
-    // Adaptive Response remains the Phase-6 scale. The Phase-9 gate may never increase
-    // mutation above that existing response or defeat high-SNR identity.
-    const float evidenceMid = neuralAdaptiveNoiseEvidence(0.08f, 0.02f);
-    const float response0 = neuralAdaptiveAuthorityScale(0.08f, 0.02f, 0.0f);
-    const float response1 = neuralAdaptiveAuthorityScale(0.08f, 0.02f, 1.0f);
-    assert(near(response0, evidenceMid));
-    assert(response1 <= response0);
-    assert(response1 >= 0.0f);
+    // High-SNR identity remains an invariant independent of the retained compatibility parameter.
     assert(near(neuralAdaptiveAuthorityScale(0.32f, 0.02f, 0.0f), 0.0f));
     assert(near(neuralAdaptiveAuthorityScale(0.32f, 0.02f, 1.0f), 0.0f));
 

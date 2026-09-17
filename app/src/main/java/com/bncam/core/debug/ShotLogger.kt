@@ -600,6 +600,112 @@ class ShotLogger(
         pipelineEvents.add(PipelineDebugEntry(group = group, key = key, value = value))
     }
 
+    /**
+     * Phase-9 canonical native authority bridge. The raw native stats string remains available
+     * elsewhere for deep diagnostics; this method promotes only the fields needed to prove the
+     * Physical Noise Model -> Neural Denoise chain for one shot.
+     */
+    fun recordNoiseAuthorityNativeStats(stats: Map<String, String>) {
+        if (stats.isEmpty()) return
+
+        fun canonical4(raw: String?): List<String>? {
+            if (raw.isNullOrBlank()) return null
+            val clean = raw.trim().removePrefix("[").removeSuffix("]")
+            val values = clean.split(',').map { it.trim() }
+            return values.takeIf { it.size == 4 && it.all { value -> value.isNotBlank() } }
+        }
+
+        val nativeS = canonical4(stats["effectiveS"])
+        val nativeO = canonical4(stats["effectiveO"])
+        val jniReceived = stats["physicalNoiseJniPayloadReceived"] ?: "not recorded"
+        val nativeAvailable = stats["physicalNoiseModelAvailable"] ?: "not recorded"
+        val usedForNeural = stats["physicalNoiseUsedForNeuralConditioning"] ?: "not recorded"
+
+        recordPipelineEvent("Physical Noise Model", "JNI Received", jniReceived)
+        recordPipelineEvent("Physical Noise Model", "Native Available", nativeAvailable)
+        recordPipelineEvent("Physical Noise Model", "Used For Neural Conditioning", usedForNeural)
+        nativeS?.let {
+            recordPipelineEvent("Physical Noise Model", "Native S R", it[0])
+            recordPipelineEvent("Physical Noise Model", "Native S Gr", it[1])
+            recordPipelineEvent("Physical Noise Model", "Native S Gb", it[2])
+            recordPipelineEvent("Physical Noise Model", "Native S B", it[3])
+        }
+        nativeO?.let {
+            recordPipelineEvent("Physical Noise Model", "Native O R", it[0])
+            recordPipelineEvent("Physical Noise Model", "Native O Gr", it[1])
+            recordPipelineEvent("Physical Noise Model", "Native O Gb", it[2])
+            recordPipelineEvent("Physical Noise Model", "Native O B", it[3])
+        }
+
+        recordPipelineEvent(
+            "Neural Denoise",
+            "Model Package Available",
+            stats["spectraNeuralModelAvailable"] ?: "not recorded"
+        )
+        recordPipelineEvent(
+            "Neural Denoise",
+            "Physical Noise Model Consumed",
+            usedForNeural
+        )
+        recordPipelineEvent(
+            "Neural Denoise",
+            "Conditioning Valid",
+            stats["spectraNeuralConditioningValid"] ?: "not recorded"
+        )
+        recordPipelineEvent(
+            "Neural Denoise",
+            "Inference Attempted",
+            stats["spectraNeuralAttempted"] ?: "not recorded"
+        )
+        recordPipelineEvent(
+            "Neural Denoise",
+            "Inference Published",
+            stats["spectraNeuralPublished"] ?: "not recorded"
+        )
+        recordPipelineEvent(
+            "Neural Denoise",
+            "Pixel Mutation",
+            stats["phase8NeuralPixelMutation"] ?: "not recorded"
+        )
+        recordPipelineEvent(
+            "Neural Denoise",
+            "Bypass Reason",
+            stats["spectraNeuralBypassReasonName"]
+                ?: stats["phase8NeuralBypassReason"]
+                ?: "not recorded"
+        )
+        recordPipelineEvent(
+            "Neural Denoise",
+            "Failure Code",
+            stats["spectraNeuralFailureCodeName"] ?: "not recorded"
+        )
+        recordPipelineEvent(
+            "Neural Denoise",
+            "Status",
+            stats["spectraNeuralStatus"] ?: "not recorded"
+        )
+        recordPipelineEvent(
+            "Neural Denoise",
+            "Input Noise Estimate",
+            stats["spectraNeuralMeanInputSigmaCfa"] ?: "not recorded"
+        )
+        recordPipelineEvent(
+            "Neural Denoise",
+            "Posterior Noise Estimate",
+            stats["spectraNeuralPosteriorMeanVarianceCfa"] ?: "not recorded"
+        )
+        recordPipelineEvent(
+            "Neural Denoise",
+            "Correction RMS",
+            stats["spectraNeuralCorrectionRmsCfa"] ?: "not recorded"
+        )
+        recordPipelineEvent(
+            "Neural Denoise",
+            "Noise Reduction Ratio",
+            stats["spectraNeuralPosteriorToInputVarianceRatioCfa"] ?: "not recorded"
+        )
+    }
+
     fun recordFrameAnalysisEntries(entries: List<FrameAnalysisDebugEntry>) {
         frameEntries.addAll(entries)
     }
@@ -1306,8 +1412,6 @@ class ShotLogger(
                 "nativeRawIsp.meanSensorNoiseVariance",
                 "nativeRawIsp.minSensorNoiseVariance",
                 "nativeRawIsp.maxSensorNoiseVariance",
-                "nativeRawIsp.noiseModelSoReceivedByCpp",
-                "nativeRawIsp.noiseModelApplied",
                 "nativeRawIsp.absoluteMeanLumaSigma",
                 "nativeRawIsp.absoluteMeanChromaSigma",
                 "nativeRawIsp.effectiveLumaSigma",
@@ -1317,9 +1421,6 @@ class ShotLogger(
                 "nativeRawIsp.postSharpenResidualEstimate",
                 "nativeRawIsp.avgAppliedBlend",
                 "nativeRawIsp.edgeProtectedPixelFraction",
-                "nativeRawIsp.physicalBaselineNrActive",
-                "nativeRawIsp.physicalBaselineLumaFraction",
-                "nativeRawIsp.physicalBaselineChromaFraction",
                 "nativeRawIsp.autoMeanGradient",
                 "nativeRawIsp.autoP90Gradient",
                 "nativeRawIsp.autoEdgeFraction",
@@ -1336,13 +1437,6 @@ class ShotLogger(
             )
             section("Native ISP High-Signal Metrics")
             keys.forEach { key -> if (metrics.has(key)) kv(humanizeKey(key.removePrefix("nativeRawIsp.")), jsonScalar(metrics.opt(key))) }
-        }
-
-        root.optJSONObject("captureNoiseState")?.let { state ->
-            section("Noise / Sensor State")
-            listOf("captureIso", "exposureTimeNs", "cfaName", "whiteLevel", "blackLevelMosaicOrder", "modelConfidence").forEach { key ->
-                if (state.has(key)) kv(humanizeKey(key), jsonScalar(state.opt(key)))
-            }
         }
     }
 
@@ -1378,17 +1472,67 @@ class ShotLogger(
     private fun StringBuilder.appendRawSingleFrameObjectiveTruth() {
         val metrics = noiseModelMetrics()
         section("Single-Frame Objective Truth — RAW")
-        kv("Noise model source", firstEventValue(
-            "Sensor Calibration Detail" to "Sensor Noise Profile Source",
-            "Sensor Calibration" to "Sensor Noise Profile Source"
-        ) ?: "not recorded")
-        kv("Noise model formula", firstEventValue(
-            "Sensor Calibration Detail" to "Sensor Noise Profile Formula",
-            "Sensor Calibration" to "Sensor Noise Profile Formula"
-        ) ?: metrics?.optString("nativeRawIsp.sensorNoiseVarianceFormula")?.takeIf { it.isNotBlank() } ?: "not recorded")
-        kv("Noise model S/O", metrics?.optString("nativeRawIsp.noiseModelSoReceivedByCpp")?.takeIf { it.isNotBlank() }
-            ?: firstEventValue("Sensor Calibration Detail" to "Sensor Noise Profile Values S/O")
-            ?: "not recorded")
+        kv("Physical noise selected source", eventValue("Physical Noise Model", "Selected Source") ?: "not recorded")
+        kv("Physical noise effective source", eventValue("Physical Noise Model", "Effective Source") ?: "not recorded")
+        kv("Physical noise capture ISO", eventValue("Physical Noise Model", "Capture ISO") ?: "not recorded")
+        kv("Physical noise effective ISO", eventValue("Physical Noise Model", "Effective Noise ISO") ?: "not recorded")
+        kv("Physical noise model valid", eventValue("Physical Noise Model", "Model Valid") ?: "not recorded")
+        kv("Physical noise JNI received", eventValue("Physical Noise Model", "JNI Received") ?: "not recorded")
+        kv("Physical noise native available", eventValue("Physical Noise Model", "Native Available") ?: "not recorded")
+        kv(
+            "Physical noise canonical S R/Gr/Gb/B",
+            listOf("S R", "S Gr", "S Gb", "S B")
+                .map { eventValue("Physical Noise Model", it) ?: "?" }
+                .joinToString(prefix = "[", postfix = "]")
+        )
+        kv(
+            "Physical noise canonical O R/Gr/Gb/B",
+            listOf("O R", "O Gr", "O Gb", "O B")
+                .map { eventValue("Physical Noise Model", it) ?: "?" }
+                .joinToString(prefix = "[", postfix = "]")
+        )
+        kv("Physical noise formula", "variance = S * x + O")
+        kv("Neural enabled", eventValue("Neural Denoise", "Enabled") ?: "not recorded")
+        kv("Neural conditioning valid", eventValue("Neural Denoise", "Conditioning Valid") ?: "not recorded")
+        kv("Neural pixel mutation", eventValue("Neural Denoise", "Pixel Mutation") ?: "not recorded")
+        kv("Neural bypass reason", eventValue("Neural Denoise", "Bypass Reason") ?: "not recorded")
+
+        // Phase 15: compact same-scene A/B signature. This is comparison telemetry only; it has
+        // no processing authority and never changes pixels. It intentionally repeats the minimum
+        // high-signal fields required to compare Neural Off/On or Preset X/Y captures without
+        // reconstructing state from unrelated legacy sections.
+        section("Phase 15 Visual A/B Signature")
+        kv("Physical selected source", eventValue("Physical Noise Model", "Selected Source") ?: "not recorded")
+        kv("Physical effective source", eventValue("Physical Noise Model", "Effective Source") ?: "not recorded")
+        kv("Physical preset", eventValue("Physical Noise Model", "Preset Name / ID") ?: "not recorded")
+        kv("Capture ISO", eventValue("Physical Noise Model", "Capture ISO") ?: "not recorded")
+        kv("Effective Noise ISO", eventValue("Physical Noise Model", "Effective Noise ISO") ?: "not recorded")
+        kv(
+            "Physical S R/Gr/Gb/B",
+            listOf("S R", "S Gr", "S Gb", "S B")
+                .map { eventValue("Physical Noise Model", it) ?: "?" }
+                .joinToString(prefix = "[", postfix = "]")
+        )
+        kv(
+            "Physical O R/Gr/Gb/B",
+            listOf("O R", "O Gr", "O Gb", "O B")
+                .map { eventValue("Physical Noise Model", it) ?: "?" }
+                .joinToString(prefix = "[", postfix = "]")
+        )
+        kv("Neural enabled", eventValue("Neural Denoise", "Enabled") ?: "not recorded")
+        kv("Neural luma", eventValue("Neural Denoise", "Luma") ?: "not recorded")
+        kv("Neural chroma", eventValue("Neural Denoise", "Chroma") ?: "not recorded")
+        kv("Neural detail protection", eventValue("Neural Denoise", "Detail Protection") ?: "not recorded")
+        kv("Neural low-frequency cleanup", eventValue("Neural Denoise", "Low Frequency Cleanup") ?: "not recorded")
+        kv("Neural master authority", eventValue("Neural Denoise", "Strength") ?: "not recorded")
+        kv("Neural adaptive response", eventValue("Neural Denoise", "Adaptive Response") ?: "not recorded")
+        kv("Neural inference published", eventValue("Neural Denoise", "Inference Published") ?: "not recorded")
+        kv("Neural pixel mutation", eventValue("Neural Denoise", "Pixel Mutation") ?: "not recorded")
+        kv("Input sigma CFA", eventValue("Neural Denoise", "Input Noise Estimate") ?: "not recorded")
+        kv("Correction RMS CFA", eventValue("Neural Denoise", "Correction RMS") ?: "not recorded")
+        kv("Posterior/input variance ratio CFA", eventValue("Neural Denoise", "Noise Reduction Ratio") ?: "not recorded")
+        kv("Neural effect status", eventValue("Neural Denoise", "Status") ?: "not recorded")
+
         kv("WB gains actually propagated", metrics?.optString("nativeRawIsp.spectraPropagationAwbGainsRgb")?.takeIf { it.isNotBlank() } ?: "not recorded")
         kv("CCM actually propagated", metrics?.optString("nativeRawIsp.spectraPropagationColourMatrix")?.takeIf { it.isNotBlank() } ?: "not recorded")
         kv("CCM metadata pre-normalization", eventValue("Sensor Calibration Detail", "Color Matrix Metadata Pre-Normalization Values") ?: "not recorded")
@@ -2111,10 +2255,6 @@ class ShotLogger(
         val wbSource: String = firstEventValue("Sensor Calibration" to "WB Source", "Sensor Calibration Detail" to "WB Source", "Master RAW Frame" to "WB Source") ?: "not recorded"
         val wbApplied: String = firstEventValue("Sensor Calibration" to "WB Applied", "Sensor Calibration Detail" to "WB Applied", "Master RAW Frame" to "WB Applied") ?: "not recorded"
 
-        val noiseSource: String = firstEventValue("Sensor Calibration" to "Sensor Noise Profile Source", "Sensor Calibration Detail" to "Sensor Noise Profile Source", "Master RAW Frame" to "Noise Profile Source") ?: "not recorded"
-        val noisePresent: String = firstEventValue("Sensor Calibration" to "Sensor Noise Profile Present", "Sensor Calibration Detail" to "Sensor Noise Profile Present", "Master RAW Frame" to "Noise Profile Present") ?: "not recorded"
-        val noiseApplied: String = firstEventValue("Sensor Calibration" to "Sensor Noise Profile Applied", "Sensor Calibration Detail" to "Sensor Noise Profile Applied", "Master RAW Frame" to "Noise Profile Applied") ?: "not recorded"
-
         val rawBlackLevels: String = firstEventValue("Sensor Calibration" to "Applied Black Levels", "Sensor Calibration Detail" to "Applied Black Levels", "Master RAW Frame" to "Applied Black Levels") ?: "not recorded"
         val rawWhiteLevel: String = firstEventValue("Sensor Calibration" to "Applied White Level", "Sensor Calibration Detail" to "Applied White Level", "Master RAW Frame" to "Applied White Level") ?: "not recorded"
         val rawColorMatrix: String = firstEventValue("Sensor Calibration" to "Color Matrix Values", "Sensor Calibration Detail" to "Color Matrix Values", "Master RAW Frame" to "Color Matrix Values") ?: "not recorded"
@@ -2133,9 +2273,12 @@ class ShotLogger(
         kv("WB source", wbSource)
         kv("WB applied yes/no", wbApplied)
 
-        kv("Noise profile source", noiseSource)
-        kv("Noise profile present yes/no", noisePresent)
-        kv("Noise profile applied yes/no", noiseApplied)
+        appendLine()
+        line("  Physical Noise Model Authority:")
+        writeEventsOrEmpty("Physical Noise Model", "No Physical Noise Model authority telemetry was recorded.")
+        appendLine()
+        line("  Neural Denoise Authority:")
+        writeEventsOrEmpty("Neural Denoise", "No Neural Denoise authority telemetry was recorded.")
 
         kv("Applied Black Levels", rawBlackLevels)
         kv("Applied White Level", rawWhiteLevel)
@@ -2148,18 +2291,16 @@ class ShotLogger(
         val nHasWhite: String = firstEventValue("Native Calibration" to "hasWhiteLevel") ?: "not recorded"
         val nHasColor: String = firstEventValue("Native Calibration" to "hasColorMatrix") ?: "not recorded"
         val nHasWb: String = firstEventValue("Native Calibration" to "hasWbGains") ?: "not recorded"
-        val nHasNoise: String = firstEventValue("Native Calibration" to "hasNoiseProfile") ?: "not recorded"
         val nCalApplied: String = firstEventValue("Native Calibration" to "calibrationApplied") ?: "not recorded"
-        val nNoiseApplied: String = firstEventValue("Native Calibration" to "noiseProfileApplied") ?: "not recorded"
         val nWarnings: String = firstEventValue("Native Calibration" to "calibrationWarnings") ?: "none"
 
         kv("  hasBlackLevel", nHasBlack)
         kv("  hasWhiteLevel", nHasWhite)
         kv("  hasColorMatrix", nHasColor)
         kv("  hasWbGains", nHasWb)
-        kv("  hasNoiseProfile", nHasNoise)
         kv("  calibrationApplied", nCalApplied)
-        kv("  noiseProfileApplied", nNoiseApplied)
+        kv("  physicalNoiseJniReceived", eventValue("Physical Noise Model", "JNI Received") ?: "not recorded")
+        kv("  physicalNoiseNativeAvailable", eventValue("Physical Noise Model", "Native Available") ?: "not recorded")
         kv("  calibrationWarnings", nWarnings)
     }
 

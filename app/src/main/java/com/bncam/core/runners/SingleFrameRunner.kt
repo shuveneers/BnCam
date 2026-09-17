@@ -2067,6 +2067,19 @@ class SingleFrameRunner(
                 "Single RAW16 materialization failed; no safe processing input exists."
             )
         }
+        if (isRawFrameSource && enableShotLogger) {
+            // Phase 9: record the exact post-shutter frozen authority, not the earlier compatibility
+            // mirrors from RenderQualityConfig construction.
+            acquiredRawInput?.finalCalibration?.noiseSnapshot
+                ?.physicalNoiseState()
+                ?.tracePairs()
+                ?.forEach { (key, value) ->
+                    shotLogger.recordPipelineEvent("Physical Noise Model", key, value)
+                }
+            renderQualityConfig.profileNoiseTuning.authorityDebugPairs().forEach { (key, value) ->
+                shotLogger.recordPipelineEvent("Neural Denoise", key, value)
+            }
+        }
         if (isRawFrameSource) {
             performanceTracker.mark("raw_unpack_time")
             performanceTracker.recordDuration("raw_materialization", rawUnpackMs)
@@ -2562,12 +2575,13 @@ class SingleFrameRunner(
                             com.bncam.core.isp.raw10.RawCameraColorProfileRepository.bindingDebugSummary(calibrationProfileId)
                         )
                         val masterIspStatsMap = parseNativeStats(masterIspStats)
+                        shotLogger.recordNoiseAuthorityNativeStats(masterIspStatsMap)
                         if (masterIspStatsMap["colorMatrixApplied"] == "false" || masterIspStats.contains("colorMatrixApplied=false")) {
                             shotLogger.recordWarning("RAW ISP", "Color Matrix Applied=false during Master RAW JPEG render. This is a quality warning, not a clean success.", "WARN")
                         }
                         masterIspStatsMap.forEach { (key, value) ->
                             shotLogger.recordPipelineEvent("Master RAW16 ISP Render", prettyStatKey(key), value)
-                            if (key in listOf("hasBlackLevel", "hasWhiteLevel", "hasColorMatrix", "hasWbGains", "hasNoiseProfile", "calibrationApplied", "noiseProfileApplied", "calibrationWarnings")) {
+                            if (key in listOf("hasBlackLevel", "hasWhiteLevel", "hasColorMatrix", "hasWbGains", "calibrationApplied", "calibrationWarnings")) {
                                 shotLogger.recordPipelineEvent("Native Calibration", key, value)
                             }
                         }
@@ -3753,6 +3767,7 @@ class SingleFrameRunner(
                         jniCalibration = renderQualityConfig.finalCalibration,
                         nativeStats = if (isRawFrameSource) masterIspStats else yuvNativeStats,
                         fusionStats = if (isRawFrameSource) dngMergeStats else "",
+                        dynamicIsoCoefficient = lensHardwareSettings.dynamicIsoCoeff,
                         captureAttemptId = attemptId,
                         recipe = recipe,
                         runnerPerformance = performanceTracker.traceSnapshot(),

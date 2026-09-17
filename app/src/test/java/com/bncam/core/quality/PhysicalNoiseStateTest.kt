@@ -63,6 +63,18 @@ class PhysicalNoiseStateTest {
     }
 
     @Test
+    fun canonicalPhysicalNoiseSoContractPacksRGrGbBExactlyOnce() {
+        val packed = PhysicalNoiseSoContract.pack(
+            doubleArrayOf(1.0, 2.0, 3.0, 4.0),
+            doubleArrayOf(11.0, 12.0, 13.0, 14.0)
+        )
+        assertContentEquals(
+            doubleArrayOf(1.0, 11.0, 2.0, 12.0, 3.0, 13.0, 4.0, 14.0),
+            packed
+        )
+    }
+
+    @Test
     fun unavailableZeroModelHasZeroPhysicalConfidence() {
         val zero = snapshot(DoubleArray(4), DoubleArray(4), legacyConfidence = 1.0f)
         assertFalse(zero.physicalNoiseModelAvailable)

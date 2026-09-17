@@ -7,21 +7,22 @@
 int main() {
     FinalSensorCalibrationNative calibration{};
     assert(!calibration.physicalNoiseModelAvailable());
+    assert(!calibration.physicalNoiseJniPayloadReceived);
 
-    calibration.hasNoiseProfile = true;
-    calibration.noiseProfileApplied = true;
-    calibration.noiseProfileValid = true;
-    calibration.noiseProfilePairCount = 4;
-    calibration.noiseProfileChannelCount = 4;
+    calibration.physicalNoiseJniPayloadReceived = true;
     for (int ch = 0; ch < 4; ++ch) {
         calibration.effectiveS[ch] = 1.0e-4 + ch * 1.0e-5;
         calibration.effectiveO[ch] = 1.0e-6 + ch * 1.0e-7;
     }
     assert(calibration.physicalNoiseModelAvailable());
+    assert(calibration.physicalNoiseJniPayloadReceived);
 
-    calibration.noiseProfileChannelCount = 3;
+    // Receipt is now the single JNI availability bit. Without it, otherwise-valid arrays are
+    // not allowed to become authority.
+    calibration.physicalNoiseJniPayloadReceived = false;
     assert(!calibration.physicalNoiseModelAvailable());
-    calibration.noiseProfileChannelCount = 4;
+    calibration.physicalNoiseJniPayloadReceived = true;
+    assert(calibration.physicalNoiseModelAvailable());
 
     // Native SPECTRA gate: profile request may only become active after physical S/O is valid.
     assert(resolveSpectraProcessingMode(false, calibration) == 0);
@@ -37,8 +38,8 @@ int main() {
 
     NativeRenderQualityConfig quality{};
     assert(quality.captureSensitivityIso == 0);
-    assert(std::abs(quality.profileSpectraStrength - 0.70f) < 1.0e-6f);
-    assert(std::abs(quality.profileNeuralAdaptiveResponse - 0.45f) < 1.0e-6f);
+    assert(std::abs(quality.profileSpectraStrength - 1.00f) < 1.0e-6f);
+    assert(std::abs(quality.profileNeuralAdaptiveResponse - 1.00f) < 1.0e-6f);
 
     // SPECTRA is an optional consumer: ISO alone can never synthesize noise authority.
     const auto unavailable = bncam::spectra::resolveSpectraNoiseAuthority(

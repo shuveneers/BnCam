@@ -22,8 +22,6 @@ struct RawMultiFrameSpectraConfig {
     float confidence = 0.0f;
     float noisePressure = 0.0f;
     float temporalAuthority = 0.0f;
-    double adaptationLowerBound = 0.92;
-    double adaptationUpperBound = 1.08;
 };
 
 struct RawMultiFrameRequest {
@@ -65,8 +63,6 @@ struct RawMultiFrameSupportResult {
     double reversePhaseResponse = 0.0;
     double forwardBackwardClosureErrorPixels = 0.0;
     float repeatedSupportConfidence = 0.0f;
-    float meanFitStabilityConfidence = 0.0f;
-    std::array<double, 4> fitStabilityConfidence{0.0, 0.0, 0.0, 0.0};
     SpectraTemporalObserverResult spectraObservation{};
     std::string rejectReason = "none";
     float canonicalizeMs = 0.0f;

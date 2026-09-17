@@ -23,7 +23,9 @@ class Phase3CompleteProfileSerializationSourceContractTest {
 
         // Eyecatcher/noise module.
         assertTrue(resolver.contains("add(i(ProfileIspKeys.SPECTRA_ENABLED, 0))"))
-        assertTrue(resolver.contains("add(f(ProfileIspKeys.NEURAL_ADAPTIVE_RESPONSE, SpectraProfileDefaults.ADAPTIVE_RESPONSE))"))
+        assertTrue(resolver.contains("ProfileSettingSpec(ProfileIspKeys.NEURAL_ADAPTIVE_RESPONSE, ProfileSettingValueType.FLOAT, SpectraProfileDefaults.ADAPTIVE_RESPONSE.toString())"))
+        val runtimeSpecs = resolver.substringAfter("fun runtimeProfileSettingSpecs").substringBefore("private fun legacyNoiseCompatibilitySpecs")
+        assertFalse(runtimeSpecs.contains("ProfileIspKeys.NEURAL_ADAPTIVE_RESPONSE"))
         assertTrue(resolver.contains("add(f(ProfileIspKeys.SPECTRA_CHROMA, SpectraProfileDefaults.CHROMA))"))
 
         // Presence and the four Lightroom-style Detail sharpening authorities.

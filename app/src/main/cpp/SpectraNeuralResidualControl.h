@@ -75,37 +75,37 @@ inline NeuralDenoiseControls neuralCharacterControls(
     out.enabled = enabled;
     switch (preset) {
         case NeuralCharacterPreset::Clean:
-            out.noiseReduction = 0.85f;
+            out.noiseReduction = 1.0f;
             out.lumaNoise = 0.775f;
             out.chromaNoise = 0.925f;
             out.detailProtection = 0.625f;
             out.lowFrequencyCleanup = 0.900f;
-            out.adaptiveResponse = 0.650f;
+            out.adaptiveResponse = 1.0f;
             break;
         case NeuralCharacterPreset::Texture:
-            out.noiseReduction = 0.60f;
+            out.noiseReduction = 1.0f;
             out.lumaNoise = 0.450f;
             out.chromaNoise = 0.700f;
             out.detailProtection = 0.825f;
             out.lowFrequencyCleanup = 0.675f;
-            out.adaptiveResponse = 0.300f;
+            out.adaptiveResponse = 1.0f;
             break;
         case NeuralCharacterPreset::Night:
-            out.noiseReduction = 0.95f;
+            out.noiseReduction = 1.0f;
             out.lumaNoise = 0.675f;
             out.chromaNoise = 0.950f;
             out.detailProtection = 0.575f;
             out.lowFrequencyCleanup = 0.960f;
-            out.adaptiveResponse = 0.750f;
+            out.adaptiveResponse = 1.0f;
             break;
         case NeuralCharacterPreset::Natural:
         default:
-            out.noiseReduction = 0.70f;
+            out.noiseReduction = 1.0f;
             out.lumaNoise = 0.600f;
             out.chromaNoise = 0.800f;
             out.detailProtection = 0.675f;
             out.lowFrequencyCleanup = 0.800f;
-            out.adaptiveResponse = 0.450f;
+            out.adaptiveResponse = 1.0f;
             break;
     }
     return out;

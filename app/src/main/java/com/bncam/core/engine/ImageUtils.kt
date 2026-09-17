@@ -15,7 +15,7 @@ import com.bncam.core.quality.FocusConfidenceState
 import com.bncam.core.quality.FinalSensorCalibration
 import com.bncam.core.quality.ProfileYuvAwbMapper
 import com.bncam.core.quality.PhysicalTemporalNoisePolicy
-import com.bncam.core.quality.SpectraProfileDefaults
+import com.bncam.core.quality.PhysicalNoiseSoContract
 import com.bncam.data.settings.ResolvedLensHardwareSettings
 import com.bncam.core.isp.raw.MasterRawFrame
 import com.bncam.core.isp.raw.Raw16RenderInput
@@ -661,31 +661,18 @@ object ImageUtils {
             whiteLevel = nativeWhiteLevel,
             blackLevel = nativeBlackLevels
         )
-        val spectraCameraS = spectraSnapshot?.cameraS ?: DoubleArray(0)
-        val spectraCameraO = spectraSnapshot?.cameraO ?: DoubleArray(0)
-        val spectraEffectiveS = spectraSnapshot?.effectiveS ?: DoubleArray(0)
-        val spectraEffectiveO = spectraSnapshot?.effectiveO ?: DoubleArray(0)
-
-        // PhysicalNoiseState is the sole native physical S/O authority. The previous JPEG
-        // handoff still populated this carrier from FinalSensorCalibration.effectiveNoiseProfile,
-        // which is a legacy Camera2/compatibility mirror and can disagree with the frozen
-        // OEM/System/Manual/Preset shutter snapshot. In particular, PRESET + Dynamic ISO could
-        // resolve correctly in spectraEffectiveS/O while C++ received an empty/old S/O carrier.
-        //
-        // Rebuild the JNI carrier from the exact render-time snapshot so generic native noise
-        // consumers and optional SPECTRA observe the same physical model. Do not fall back to
-        // the legacy effectiveNoiseProfile: an unavailable V2 physical model must remain
-        // unavailable instead of silently resurrecting legacy authority.
+        // FASE 11: one physical-noise JNI carrier only. The payload is exactly eight doubles
+        // in canonical R/Gr/Gb/B order: S_R,O_R,S_Gr,O_Gr,S_Gb,O_Gb,S_B,O_B.
+        // No presence/applied/count mirrors and no parallel SPECTRA effective-S/O arrays cross JNI.
         val physicalNoiseState = spectraSnapshot?.physicalNoiseState()
-        val nativeNoiseProfile = physicalNoiseState?.toInterleavedProfileOrNull() ?: DoubleArray(0)
-        val nativeNoiseProfilePresent = nativeNoiseProfile.size == 8
-        val nativeNoiseProfileApplied = nativeNoiseProfilePresent &&
-            finalCal?.let { calibration ->
-                calibration.normalizationCalibrationValid &&
-                    calibration.cfaSupportedForBayerNoiseModel
-            } == true
-        val nativeNoiseProfilePairCount = if (nativeNoiseProfilePresent) 4 else 0
-        val nativeNoiseProfileChannelCount = if (nativeNoiseProfilePresent) 4 else 0
+        val physicalNoiseSo = if (
+            finalCal?.normalizationCalibrationValid == true &&
+            finalCal.cfaSupportedForBayerNoiseModel
+        ) {
+            physicalNoiseState?.toInterleavedProfileOrNull() ?: DoubleArray(0)
+        } else {
+            DoubleArray(0)
+        }
 
         val lensShadingMap = captureResult.toNativeLensShadingMap()
         val curves = qualityConfig?.curves
@@ -796,34 +783,14 @@ object ImageUtils {
                     source.contains("CaptureResult", ignoreCase = true) || source.contains("CameraCharacteristics", ignoreCase = true)
                 } ?: (colorMatrix?.fromMetadata ?: false),
                 spectraProcessingEnabled = spectraRequestedByProfile,
-                sensorNoiseProfile = nativeNoiseProfile,
-                sensorNoiseProfilePresent = nativeNoiseProfilePresent,
-                sensorNoiseProfileApplied = nativeNoiseProfileApplied,
-                sensorNoiseProfilePairCount = nativeNoiseProfilePairCount,
-                sensorNoiseProfileChannelCount = nativeNoiseProfileChannelCount,
-                spectraSnapshotPresent = spectraSnapshot != null,
-                spectraLensKey = spectraSnapshot?.stableLensKey?.value ?: masterFrame.lensId,
-                spectraCameraS = spectraCameraS,
-                spectraCameraO = spectraCameraO,
-                spectraEffectiveS = spectraEffectiveS,
-                spectraEffectiveO = spectraEffectiveO,
-                spectraSignalModelConfidence = spectraSnapshot?.signalModelConfidence ?: 0.0f,
+                physicalNoiseSo = physicalNoiseSo,
                 spectraPostRawSensitivityBoost = capturePostRawSensitivityBoost,
-                profileSpectraStrength = qualityConfig?.profileNoiseTuning?.neuralDenoiseStrength
-                    ?: SpectraProfileDefaults.MASTER_STRENGTH,
+                // Neural master authority and Adaptive Response are fixed at 100% when the
+                // spectraProcessingEnabled gate is true. Only component/protection controls cross JNI.
                 profileSpectraLuma = qualityConfig?.profileNoiseTuning?.spectraLuma ?: 0.0f,
                 profileSpectraChroma = qualityConfig?.profileNoiseTuning?.spectraChroma ?: 0.0f,
                 profileSpectraDetailProtection = qualityConfig?.profileNoiseTuning?.spectraDetailProtection ?: 0.0f,
                 profileSpectraLowFrequency = qualityConfig?.profileNoiseTuning?.spectraLowFrequency ?: 0.0f,
-                // Phase 6 RAW transport: this retired first Profile-NR ABI slot carries only
-                // profile-owned Adaptive Response. It no longer means luminance denoise.
-                profileNrLuminance = qualityConfig?.profileNoiseTuning?.neuralAdaptiveResponse
-                    ?: SpectraProfileDefaults.ADAPTIVE_RESPONSE,
-                profileNrLuminanceDetail = 0.5f,
-                profileNrLuminanceContrast = 0.0f,
-                profileNrColor = 0.0f,
-                profileNrColorDetail = 0.5f,
-                profileNrColorSmoothness = 0.5f,
                 profileToneExposure = qualityConfig?.profileToneTuning?.exposure ?: 0.0f,
                 profileToneHighlights = qualityConfig?.profileToneTuning?.highlights ?: 0.0f,
                 profileToneShadows = qualityConfig?.profileToneTuning?.shadows ?: 0.0f,
@@ -1004,6 +971,11 @@ object ImageUtils {
         val authoritySource: String
     )
 
+    private fun PhysicalTemporalNoisePayload.toInterleavedSoOrEmpty(): DoubleArray {
+        if (!temporalNoiseModelEnabled) return DoubleArray(0)
+        return PhysicalNoiseSoContract.pack(effectiveS, effectiveO)
+    }
+
     private fun FinalSensorCalibration?.toPhysicalTemporalNoisePayload(): PhysicalTemporalNoisePayload {
         val snapshot = this?.noiseSnapshot
         val decision = PhysicalTemporalNoisePolicy.resolve(
@@ -1054,12 +1026,7 @@ object ImageUtils {
             maxFramesCap = maxFramesCap.coerceAtLeast(1),
             maxShiftPixels = maxShiftPixels,
             alignmentStrictness = alignmentStrictness,
-            spectraMode = 0, // JNI compatibility only: SPECTRA no longer owns temporal physical-noise authority.
-            temporalNoiseModelEnabled = physicalTemporalNoise.temporalNoiseModelEnabled,
-            spectraAdaptiveCalibrationEnabled = false, // FASE 5: frozen physical S/O cannot be adapted by SPECTRA.
-            spectraEffectiveS = physicalTemporalNoise.effectiveS,
-            spectraEffectiveO = physicalTemporalNoise.effectiveO,
-            spectraModelConfidence = physicalTemporalNoise.confidence,
+            physicalNoiseSo = physicalTemporalNoise.toInterleavedSoOrEmpty(),
             fuseSupportFrames = fuseSupportFrames,
             exposureScaleToAnchor = selectedExposureScales,
             computationalHdr = computationalHdr
@@ -1102,12 +1069,7 @@ object ImageUtils {
             maxFramesCap = maxFramesCap.coerceAtLeast(1),
             maxShiftPixels = maxShiftPixels,
             alignmentStrictness = alignmentStrictness,
-            spectraMode = 0, // JNI compatibility only: SPECTRA no longer owns temporal physical-noise authority.
-            temporalNoiseModelEnabled = physicalTemporalNoise.temporalNoiseModelEnabled,
-            spectraAdaptiveCalibrationEnabled = false, // FASE 5: frozen physical S/O cannot be adapted by SPECTRA.
-            spectraEffectiveS = physicalTemporalNoise.effectiveS,
-            spectraEffectiveO = physicalTemporalNoise.effectiveO,
-            spectraModelConfidence = physicalTemporalNoise.confidence,
+            physicalNoiseSo = physicalTemporalNoise.toInterleavedSoOrEmpty(),
             fuseSupportFrames = fuseSupportFrames,
             exposureScaleToAnchor = selectedExposureScales,
             computationalHdr = computationalHdr
@@ -1392,12 +1354,7 @@ object ImageUtils {
         maxFramesCap: Int,
         maxShiftPixels: Int,
         alignmentStrictness: Float,
-        spectraMode: Int,
-        temporalNoiseModelEnabled: Boolean,
-        spectraAdaptiveCalibrationEnabled: Boolean,
-        spectraEffectiveS: DoubleArray,
-        spectraEffectiveO: DoubleArray,
-        spectraModelConfidence: Float,
+        physicalNoiseSo: DoubleArray,
         fuseSupportFrames: Boolean,
         exposureScaleToAnchor: FloatArray,
         computationalHdr: Boolean
@@ -1414,12 +1371,7 @@ object ImageUtils {
         maxFramesCap: Int,
         maxShiftPixels: Int,
         alignmentStrictness: Float,
-        spectraMode: Int,
-        temporalNoiseModelEnabled: Boolean,
-        spectraAdaptiveCalibrationEnabled: Boolean,
-        spectraEffectiveS: DoubleArray,
-        spectraEffectiveO: DoubleArray,
-        spectraModelConfidence: Float,
+        physicalNoiseSo: DoubleArray,
         fuseSupportFrames: Boolean,
         exposureScaleToAnchor: FloatArray,
         computationalHdr: Boolean
@@ -1570,30 +1522,12 @@ object ImageUtils {
         colorMatrix: FloatArray,
         colorMatrixFromMetadata: Boolean,
         spectraProcessingEnabled: Boolean,
-        sensorNoiseProfile: DoubleArray,
-        sensorNoiseProfilePresent: Boolean,
-        sensorNoiseProfileApplied: Boolean,
-        sensorNoiseProfilePairCount: Int,
-        sensorNoiseProfileChannelCount: Int,
-        spectraSnapshotPresent: Boolean,
-        spectraLensKey: String,
-        spectraCameraS: DoubleArray,
-        spectraCameraO: DoubleArray,
-        spectraEffectiveS: DoubleArray,
-        spectraEffectiveO: DoubleArray,
-        spectraSignalModelConfidence: Float,
+        physicalNoiseSo: DoubleArray,
         spectraPostRawSensitivityBoost: Int,
-        profileSpectraStrength: Float,
         profileSpectraLuma: Float,
         profileSpectraChroma: Float,
         profileSpectraDetailProtection: Float,
         profileSpectraLowFrequency: Float,
-        profileNrLuminance: Float,
-        profileNrLuminanceDetail: Float,
-        profileNrLuminanceContrast: Float,
-        profileNrColor: Float,
-        profileNrColorDetail: Float,
-        profileNrColorSmoothness: Float,
         profileToneExposure: Float,
         profileToneHighlights: Float,
         profileToneShadows: Float,

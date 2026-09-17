@@ -212,7 +212,7 @@ int main() {
         controls.enabled = false;
         auto decision = decideNeuralInvocation(snapshot, controls, runtime);
         assert(!decision.runInference);
-        assert(decision.bypassReason == NeuralBypassReason::NeuralDisabled);
+        assert(decision.bypassReason == NeuralBypassReason::UserDisabled);
 
         controls.enabled = true;
         controls.noiseReduction = 0.0f;

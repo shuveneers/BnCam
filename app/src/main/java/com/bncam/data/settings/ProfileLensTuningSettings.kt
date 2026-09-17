@@ -31,10 +31,10 @@ object ProfileIspKeys {
     const val TONE_DEHAZE = "tone_dehaze"
     const val TONE_CLARITY = "tone_clarity"
 
-    // Phase 6: one profile-owned Neural RAW denoise control surface.
-    // Master and Adaptive Response use direct 0..1 authority. The four existing component keys
-    // retain their signed storage so older .bnc profiles migrate without changing their meaning.
+    // One profile-owned Neural RAW denoise control surface. On/Off owns the global master gate;
+    // when enabled, master authority is fixed at 100%. Component controls remain user-tunable.
     const val SPECTRA_ENABLED = "spectra_profile_enabled"
+    // Legacy import/reset keys only. Runtime ignores stored values; do not expose these in UI.
     const val NEURAL_DENOISE_STRENGTH = "neural_denoise_strength"
     const val NEURAL_ADAPTIVE_RESPONSE = "neural_adaptive_response"
     const val SPECTRA_LUMA = "spectra_profile_luma"
@@ -42,14 +42,13 @@ object ProfileIspKeys {
     const val SPECTRA_DETAIL = "spectra_profile_detail"
     const val SPECTRA_LOW_FREQUENCY = "spectra_profile_low_frequency"
 
-    // Legacy SPECTRA persistence keys. They remain import-readable only; neither key owns
-    // runtime neural pixels after Phase 6. Dynamic ISO may be used once as an Adaptive Response
-    // migration default, but capture ISO is never used to drive the neural control.
+    // Legacy SPECTRA persistence keys. They remain import-readable only and own no runtime
+    // neural pixels. Lens Dynamic ISO belongs exclusively to the Physical Noise Model.
     const val SPECTRA_DYNAMIC_ISO = "spectra_profile_dynamic_iso"
     const val SPECTRA_STRENGTH = "spectra_profile_strength"
 
     // Legacy Detail > Noise Reduction persistence/ABI. These keys no longer own pixels.
-    // The Denoise UI is rewired to the same NeuralDenoiseControls state as SPECTRA.
+    // The single Neural Denoise UI does not expose these retired Detail NR controls.
     const val DETAIL_NR_LUMINANCE = "detail_nr_luminance"
     const val DETAIL_NR_LUMINANCE_DETAIL = "detail_nr_luminance_detail"
     const val DETAIL_NR_LUMINANCE_CONTRAST = "detail_nr_luminance_contrast"

@@ -205,32 +205,7 @@ struct StaticConsensus {
     }
 };
 
-struct FitConsensus {
-    std::array<double,4> weightedS{0,0,0,0};
-    std::array<double,4> weightedO{0,0,0,0};
-    std::array<double,4> weights{0,0,0,0};
-    float compareAndUpdate(SpectraTemporalObserverResult& o, std::array<double,4>& stabilityOut) {
-        double sum = 0.0; int channels = 0;
-        for (int ch=0; ch<4; ++ch) {
-            if (o.samples[ch] < 64u || o.regressionConfidence[ch] <= 0.0) { stabilityOut[ch] = 0.0; continue; }
-            const double s = std::clamp(o.sAdaptationScale[ch], 0.75, 1.25);
-            const double off = std::clamp(o.oAdaptationScale[ch], 0.75, 1.25);
-            double stability = 0.50;
-            if (weights[ch] > 1.0e-12) {
-                stability = spectra_temporal::fitStability(s, off, weightedS[ch]/weights[ch], weightedO[ch]/weights[ch]);
-            }
-            stability = std::clamp(stability, 0.0, 1.0);
-            stabilityOut[ch] = stability;
-            const double authority = 0.50 + 0.50 * stability;
-            o.regressionConfidence[ch] *= authority;
-            o.fitPhysicalScore[ch] *= authority;
-            const double w = std::max(0.05, o.regressionConfidence[ch]) * std::sqrt(static_cast<double>(o.samples[ch]));
-            weightedS[ch] += w*s; weightedO[ch] += w*off; weights[ch] += w;
-            sum += stability; ++channels;
-        }
-        return channels > 0 ? static_cast<float>(std::clamp(sum/static_cast<double>(channels),0.0,1.0)) : 0.0f;
-    }
-};
+// FASE 6: capture-local S/O fit consensus removed.
 
 double percentile(std::vector<double> values, double q) {
     values.erase(std::remove_if(values.begin(), values.end(), [](double v){ return !std::isfinite(v); }), values.end());
@@ -647,7 +622,7 @@ RawMultiFrameResult VulkanRawMultiFrameBackend::execute(
     updateFusionDescriptors(defaultStaticBytes,defaultStatsBytes);
     float initMs=0.0f; if(!dispatchFusion(0u,ceilDiv(request.cropWidth,16u),ceilDiv(request.cropHeight,16u),initMs)){out.totalMs=elapsedMs(totalStart);return out;} out.fusionGpuMs+=initMs;
 
-    StaticConsensus staticConsensus{}; FitConsensus fitConsensus{}; out.supports.resize(request.frames.size()-1u);
+    StaticConsensus staticConsensus{}; out.supports.resize(request.frames.size()-1u);
     for(std::size_t i=0;i+1u<request.frames.size();++i){
         auto& sr=out.supports[i];
         const float exposureScale = (request.computationalHdr && i < request.exposureScaleToAnchor.size())
@@ -708,7 +683,7 @@ RawMultiFrameResult VulkanRawMultiFrameBackend::execute(
         if(request.spectra.enabled){
             SpectraTemporalObserverRequest orq{};orq.anchorWidth=request.cropWidth;orq.anchorHeight=request.cropHeight;orq.supportWidth=request.cropWidth;orq.supportHeight=request.cropHeight;orq.residentAnchorRaw16Buffer=anchor_.buffer;orq.residentSupportRaw16Buffer=support_.buffer;
             orq.applyDx=fwd.applyDx;orq.applyDy=fwd.applyDy;orq.strictness=std::clamp(request.alignmentStrictness,0.0f,1.0f);const double minR=0.03+0.07*orq.strictness;orq.alignmentConfidence=static_cast<float>(std::clamp((fwd.response-minR)/std::max(1.0e-6,0.35-minR),0.0,1.0));orq.forwardBackwardConsistency=fb;orq.whiteLevel=static_cast<int>(request.payloadWhite);
-            for(int ch=0;ch<4;++ch)orq.blackLevels[ch]=static_cast<int>(request.payloadBlack[ch]);orq.cfaPattern=static_cast<int>(request.cfaPattern);orq.effectiveS=request.spectra.effectiveS;orq.effectiveO=request.spectra.effectiveO;orq.modelConfidence=request.spectra.confidence;orq.temporalAuthority=request.spectra.temporalAuthority;orq.adaptationLowerBound=request.spectra.adaptationLowerBound;orq.adaptationUpperBound=request.spectra.adaptationUpperBound;
+            for(int ch=0;ch<4;++ch)orq.blackLevels[ch]=static_cast<int>(request.payloadBlack[ch]);orq.cfaPattern=static_cast<int>(request.cfaPattern);orq.effectiveS=request.spectra.effectiveS;orq.effectiveO=request.spectra.effectiveO;orq.modelConfidence=request.spectra.confidence;orq.temporalAuthority=request.spectra.temporalAuthority;
             obs=observer.execute(physicalDevice,device,computeQueue,commandPool,allocatorOwner,orq);out.observerGpuMs+=obs.totalMs;out.compactGpuReadbackBytes+=obs.compactReadbackBytes;
             if(obs.submissionMayRemainInFlight) out.submissionMayRemainInFlight=true;
             if(!obs.success){out.failureReason="RAW_MULTIFRAME_TEMPORAL_OBSERVER_FAILED_"+obs.failureReason;out.totalMs=elapsedMs(totalStart);return out;}
@@ -716,14 +691,8 @@ RawMultiFrameResult VulkanRawMultiFrameBackend::execute(
             const double repeatedAuthority=0.50+0.50*static_cast<double>(sr.repeatedSupportConfidence);
             obs.observerConfidence=std::clamp(obs.observerConfidence*repeatedAuthority,0.0,1.0);
             obs.supportWeight=obs.supportWeight*(0.65f+0.35f*sr.repeatedSupportConfidence);
-            for(int ch=0;ch<4;++ch) obs.regressionConfidence[ch]*=repeatedAuthority;
             obs.valid=obs.valid&&sr.repeatedSupportConfidence>=0.25f;
-            std::array<double,4> stability{};
-            if(obs.valid){
-                sr.meanFitStabilityConfidence=fitConsensus.compareAndUpdate(obs,stability);
-                obs.observerConfidence*=0.75+0.25*static_cast<double>(sr.meanFitStabilityConfidence);
-            }
-            sr.fitStabilityConfidence=stability;supportWeight=obs.supportWeight;sr.spectraObservation=obs;
+            supportWeight=obs.supportWeight;sr.spectraObservation=obs;
             if(!obs.valid){sr.rejectReason="SPECTRA observer/consensus rejected support";++out.supportRejected;continue;}
         }
         sr.acceptedForFusion=false; sr.rejectReason=request.fuseSupportFrames?"pending_fusion":"observer_only";
@@ -736,7 +705,7 @@ RawMultiFrameResult VulkanRawMultiFrameBackend::execute(
         auto* p=static_cast<std::uint32_t*>(fusionParams_.mapped);std::fill(p,p+48u,0u);auto putF=[&](std::uint32_t idx,float v){std::uint32_t u;std::memcpy(&u,&v,sizeof(u));p[idx]=u;};
         p[0]=request.cropWidth;p[1]=request.cropHeight;p[2]=static_cast<std::uint32_t>(fwd.applyDx);p[3]=static_cast<std::uint32_t>(fwd.applyDy);p[4]=request.cfaPattern;p[5]=request.spectra.enabled?1u:0u;p[6]=field.valid()?static_cast<std::uint32_t>(field.columns):0u;p[7]=field.valid()?static_cast<std::uint32_t>(field.rows):0u;p[8]=field.valid()?static_cast<std::uint32_t>(field.cellSize):0u;p[9]=sampleStride;p[10]=sampleCols;p[11]=sampleRows;
         putF(12,std::clamp(request.alignmentStrictness,0.0f,1.0f));putF(13,static_cast<float>(request.payloadWhite));putF(14,supportWeight);putF(15,request.spectra.confidence);putF(16,request.spectra.temporalAuthority);putF(17,request.spectra.enabled?obs.motionConfidence:1.0f);putF(18,fb);putF(19,request.spectra.enabled?obs.meanTemporalCorrelation:0.0f);
-        for(int ch=0;ch<4;++ch){putF(20+ch,static_cast<float>(request.payloadBlack[ch]));putF(24+ch,static_cast<float>(request.spectra.effectiveS[ch]));putF(28+ch,static_cast<float>(request.spectra.effectiveO[ch]));putF(32+ch,request.spectra.enabled?static_cast<float>(obs.sAdaptationScale[ch]):1.0f);putF(36+ch,request.spectra.enabled?static_cast<float>(obs.oAdaptationScale[ch]):1.0f);}
+        for(int ch=0;ch<4;++ch){putF(20+ch,static_cast<float>(request.payloadBlack[ch]));putF(24+ch,static_cast<float>(request.spectra.effectiveS[ch]));putF(28+ch,static_cast<float>(request.spectra.effectiveO[ch]));putF(32+ch,1.0f);putF(36+ch,1.0f);} // slots 32..39 are legacy ABI padding; frozen physical S/O is never adapted.
         p[40]=request.computationalHdr?1u:0u;putF(41,exposureScale);putF(42,sr.hdrHighlightAuthority?1.0f:0.0f);putF(43,sr.hdrShadowAuthority?1.0f:0.0f);
         vmaFlushAllocation(allocator_,fusionParams_.allocation,0,48u*sizeof(std::uint32_t));updateFusionDescriptors(staticBytes,statsBytes);
         auto* supportStatsWords = static_cast<std::uint32_t*>(finalStats_.mapped);

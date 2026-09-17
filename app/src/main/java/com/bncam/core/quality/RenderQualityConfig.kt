@@ -270,25 +270,25 @@ data class CurveRuntimeConfig(
 
 data class ProfileNoiseTuning(
     val spectraEnabled: Boolean = false,
-    val neuralDenoiseStrength: Float = SpectraProfileDefaults.MASTER_STRENGTH,
-    val neuralAdaptiveResponse: Float = SpectraProfileDefaults.ADAPTIVE_RESPONSE,
     val spectraLuma: Float = SpectraProfileDefaults.LUMA,
     val spectraChroma: Float = SpectraProfileDefaults.CHROMA,
     val spectraDetailProtection: Float = SpectraProfileDefaults.DETAIL_PROTECTION,
     val spectraLowFrequency: Float = SpectraProfileDefaults.LOW_FREQUENCY
 ) {
-    /**
-     * Phase-6 source compatibility only. Older immutable recipe/trace callsites still read
-     * `spectraStrength`; it is now a read-only alias of the single neural master authority.
-     * It owns no persistence key and cannot create a second denoise control.
-     */
-    @Deprecated("Use neuralDenoiseStrength", ReplaceWith("neuralDenoiseStrength"))
+    /** Fixed master writeback authority. It is deliberately not a profile setting. */
+    val neuralDenoiseStrength: Float
+        get() = if (spectraEnabled) SpectraProfileDefaults.MASTER_AUTHORITY else 0f
+
+    /** Fixed full sigma/SNR adaptivity. It is deliberately not a profile setting. */
+    val neuralAdaptiveResponse: Float
+        get() = SpectraProfileDefaults.ADAPTIVE_RESPONSE
+
+    /** Legacy trace/recipe alias only; no persistence key can change this value. */
+    @Deprecated("Global Neural strength is fixed; use spectraEnabled plus component controls")
     val spectraStrength: Float
         get() = neuralDenoiseStrength
 
     fun sanitized(): ProfileNoiseTuning = copy(
-        neuralDenoiseStrength = neuralDenoiseStrength.coerceIn(0f, 1f),
-        neuralAdaptiveResponse = neuralAdaptiveResponse.coerceIn(0f, 1f),
         spectraLuma = spectraLuma.coerceIn(-1f, 1f),
         spectraChroma = spectraChroma.coerceIn(-1f, 1f),
         spectraDetailProtection = spectraDetailProtection.coerceIn(-1f, 1f),
@@ -297,12 +297,23 @@ data class ProfileNoiseTuning(
 
     fun debugPairs(): List<Pair<String, String>> = listOf(
         "Profile Neural Enabled" to spectraEnabled.toString(),
-        "Neural Denoise Strength" to String.format(Locale.US, "%.2f", neuralDenoiseStrength),
-        "Neural Adaptive Response" to String.format(Locale.US, "%.2f", neuralAdaptiveResponse),
+        "Neural Master Authority" to (if (spectraEnabled) "1.00 (fixed)" else "0.00 (off)"),
+        "Neural Adaptive Response" to (if (spectraEnabled) "1.00 (fixed)" else "inactive"),
         "Neural Luma" to String.format(Locale.US, "%+.2f", spectraLuma),
         "Neural Chroma" to String.format(Locale.US, "%+.2f", spectraChroma),
         "Neural Detail Protection" to String.format(Locale.US, "%+.2f", spectraDetailProtection),
         "Neural Low Frequency" to String.format(Locale.US, "%+.2f", spectraLowFrequency)
+    )
+
+    /** Phase-9 dedicated authority/debug surface. */
+    fun authorityDebugPairs(): List<Pair<String, String>> = listOf(
+        "Enabled" to spectraEnabled.toString(),
+        "Strength" to (if (spectraEnabled) "1.00 (fixed)" else "0.00 (off)"),
+        "Luma" to String.format(Locale.US, "%+.2f", spectraLuma),
+        "Chroma" to String.format(Locale.US, "%+.2f", spectraChroma),
+        "Detail Protection" to String.format(Locale.US, "%+.2f", spectraDetailProtection),
+        "Low Frequency Cleanup" to String.format(Locale.US, "%+.2f", spectraLowFrequency),
+        "Adaptive Response" to (if (spectraEnabled) "1.00 (fixed)" else "0.00 (off)")
     )
 }
 
@@ -543,14 +554,6 @@ data class RenderQualityConfig(
             val profileAwb = repo.getProfileAwbSettingsFlow(profileId).first()
             val noiseTuning = ProfileNoiseTuning(
                 spectraEnabled = readProfileIntOrFallback(repo, profileId, ProfileIspKeys.SPECTRA_ENABLED, 0) == 1,
-                neuralDenoiseStrength = readProfileFloatOrFallback(
-                    repo, profileId, ProfileIspKeys.NEURAL_DENOISE_STRENGTH,
-                    SpectraProfileDefaults.MASTER_STRENGTH, 0f..1f
-                ),
-                neuralAdaptiveResponse = readProfileFloatOrFallback(
-                    repo, profileId, ProfileIspKeys.NEURAL_ADAPTIVE_RESPONSE,
-                    SpectraProfileDefaults.ADAPTIVE_RESPONSE, 0f..1f
-                ),
                 spectraLuma = readProfileFloatOrFallback(repo, profileId, ProfileIspKeys.SPECTRA_LUMA, SpectraProfileDefaults.LUMA, -1f..1f),
                 spectraChroma = readProfileFloatOrFallback(repo, profileId, ProfileIspKeys.SPECTRA_CHROMA, SpectraProfileDefaults.CHROMA, -1f..1f),
                 spectraDetailProtection = readProfileFloatOrFallback(repo, profileId, ProfileIspKeys.SPECTRA_DETAIL, SpectraProfileDefaults.DETAIL_PROTECTION, -1f..1f),

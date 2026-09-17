@@ -122,9 +122,9 @@ struct DngMergeStats {
     double rawMultiFrameGpuSynchronizationMs = 0.0;
     double rawMultiFrameFinalReadbackMs = 0.0;
 
-    // Physical temporal S/O availability is independent from optional SPECTRA adaptation.
+    // Frozen physical temporal S/O is read-only input to generic RAW fusion. SPECTRA cannot adapt it.
     bool temporalNoiseModelEnabled = false;
-    bool spectraAdaptiveCalibrationEnabled = false;
+    bool spectraAdaptiveCalibrationEnabled = false; // Legacy telemetry: permanently false since FASE 6.
     std::string temporalNoiseModelAuthority = "DISABLED";
 
     // SPECTRA capture-integrated temporal observation and fusion weighting.
@@ -230,11 +230,9 @@ jobject mergeRaw10DngToRaw16(
         jint maxFramesCap,
         jint maxShiftPixels,
         jfloat alignmentStrictness,
-        jint spectraMode,
         bool temporalNoiseModelEnabled,
-        bool spectraAdaptiveCalibrationEnabled,
-        const std::vector<double>& spectraEffectiveS,
-        const std::vector<double>& spectraEffectiveO,
+        const std::vector<double>& physicalEffectiveS,
+        const std::vector<double>& physicalEffectiveO,
         jfloat spectraModelConfidence,
         bool fuseSupportFrames,
         const std::vector<float>& exposureScaleToAnchor,
@@ -255,11 +253,9 @@ jobject mergeRawSensorDngToRaw16(
         jint maxFramesCap,
         jint maxShiftPixels,
         jfloat alignmentStrictness,
-        jint spectraMode,
         bool temporalNoiseModelEnabled,
-        bool spectraAdaptiveCalibrationEnabled,
-        const std::vector<double>& spectraEffectiveS,
-        const std::vector<double>& spectraEffectiveO,
+        const std::vector<double>& physicalEffectiveS,
+        const std::vector<double>& physicalEffectiveO,
         jfloat spectraModelConfidence,
         bool fuseSupportFrames,
         const std::vector<float>& exposureScaleToAnchor,

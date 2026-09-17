@@ -124,45 +124,30 @@ struct AlignmentDecision {
 };
 
 
-struct SpectraNoiseModel {
+struct PhysicalTemporalNoiseModel {
     bool enabled = false;
-    bool adaptiveCalibrationEnabled = false;
     std::array<double, 4> effectiveS{0.0, 0.0, 0.0, 0.0};
     std::array<double, 4> effectiveO{0.0, 0.0, 0.0, 0.0};
     float confidence = 0.0f;
     float noisePressure = 0.0f;
     float temporalAuthority = 0.0f;
-    double adaptationLowerBound = 0.92;
-    double adaptationUpperBound = 1.08;
 };
 
 struct SpectraSupportObservation {
     bool valid = false;
     std::array<double, 4> observedVariance{0.0, 0.0, 0.0, 0.0};
     std::array<double, 4> predictedVariance{0.0, 0.0, 0.0, 0.0};
-    std::array<double, 4> adaptationScale{1.0, 1.0, 1.0, 1.0};
-    std::array<double, 4> sAdaptationScale{1.0, 1.0, 1.0, 1.0};
-    std::array<double, 4> oAdaptationScale{1.0, 1.0, 1.0, 1.0};
-    std::array<double, 4> regressionConfidence{0.0, 0.0, 0.0, 0.0};
     std::array<double, 4> temporalCorrelation{0.0, 0.0, 0.0, 0.0};
     std::array<double, 4> persistentPatternFraction{0.0, 0.0, 0.0, 0.0};
     std::array<double, 4> signalSpan{0.0, 0.0, 0.0, 0.0};
     std::array<int, 4> populatedSignalBins{0, 0, 0, 0};
     std::array<uint64_t, 4> samples{0, 0, 0, 0};
-    std::array<int, 4> fitEstimator{0, 0, 0, 0};
-    std::array<double, 4> fitPhysicalScore{0.0, 0.0, 0.0, 0.0};
-    std::array<double, 4> fitInnovationMean{0.0, 0.0, 0.0, 0.0};
-    std::array<double, 4> fitInnovationVariance{0.0, 0.0, 0.0, 0.0};
-    std::array<double, 4> fitResidualCorrelation{0.0, 0.0, 0.0, 0.0};
-    std::array<double, 4> fitHeavyTailFraction{0.0, 0.0, 0.0, 0.0};
-    std::array<double, 4> fitStabilityConfidence{0.0, 0.0, 0.0, 0.0};
     spectra_temporal::StaticProbabilityField staticProbabilityField{};
     double observerConfidence = 0.0;
     float alignmentConfidence = 0.0f;
     float motionConfidence = 0.0f;
     float forwardBackwardConsistency = 0.0f;
     float repeatedSupportConfidence = 0.0f;
-    float meanFitStabilityConfidence = 0.0f;
     float meanTemporalCorrelation = 0.0f;
     float persistentPatternMean = 0.0f;
     float independentNoiseFraction = 1.0f;
@@ -311,7 +296,7 @@ inline double spectraNormalizedDifference(
     return rawDelta / range;
 }
 
-inline double spectraReferenceVariance(const SpectraNoiseModel& model, int channel) {
+inline double spectraReferenceVariance(const PhysicalTemporalNoiseModel& model, int channel) {
     const int safeChannel = std::clamp(channel, 0, 3);
     return std::max(
             1.0e-12,
@@ -321,63 +306,8 @@ inline double spectraReferenceVariance(const SpectraNoiseModel& model, int chann
 }
 
 
-/**
- * Capture-local stability check for the dual S/O fit. A fit may be individually plausible but
- * still unsafe when its bounded S/O scales oscillate between support pairs. This consensus never
- * persists across captures; it only reduces authority when repeated pairs disagree.
- */
-struct SpectraFitConsensus {
-    std::array<double, 4> weightedS{0.0, 0.0, 0.0, 0.0};
-    std::array<double, 4> weightedO{0.0, 0.0, 0.0, 0.0};
-    std::array<double, 4> weights{0.0, 0.0, 0.0, 0.0};
-
-    float compareAndUpdate(SpectraSupportObservation& observation) {
-        double stabilitySum = 0.0;
-        int stableChannels = 0;
-        for (int ch = 0; ch < 4; ++ch) {
-            if (observation.samples[ch] < 64u || observation.regressionConfidence[ch] <= 0.0) {
-                observation.fitStabilityConfidence[ch] = 0.0;
-                continue;
-            }
-            const double currentS = std::clamp(observation.sAdaptationScale[ch], 0.75, 1.25);
-            const double currentO = std::clamp(observation.oAdaptationScale[ch], 0.75, 1.25);
-            double stability = 0.50;
-            if (weights[ch] > 1.0e-12) {
-                const double previousS = weightedS[ch] / weights[ch];
-                const double previousO = weightedO[ch] / weights[ch];
-                stability = spectra_temporal::fitStability(
-                        currentS,
-                        currentO,
-                        previousS,
-                        previousO
-                );
-            }
-            stability = std::clamp(stability, 0.0, 1.0);
-            observation.fitStabilityConfidence[ch] = stability;
-            const double stabilityAuthority = 0.50 + 0.50 * stability;
-            observation.regressionConfidence[ch] *= stabilityAuthority;
-            observation.fitPhysicalScore[ch] *= stabilityAuthority;
-
-            const double updateWeight = std::max(
-                    0.05,
-                    observation.regressionConfidence[ch]
-            ) * std::sqrt(static_cast<double>(observation.samples[ch]));
-            weightedS[ch] += updateWeight * currentS;
-            weightedO[ch] += updateWeight * currentO;
-            weights[ch] += updateWeight;
-            stabilitySum += stability;
-            stableChannels++;
-        }
-        observation.meanFitStabilityConfidence = stableChannels > 0
-                ? static_cast<float>(std::clamp(
-                        stabilitySum / static_cast<double>(stableChannels), 0.0, 1.0
-                ))
-                : 0.0f;
-        return observation.meanFitStabilityConfidence;
-    }
-};
-
-bool validSpectraNoiseModel(const SpectraNoiseModel& model) {
+// FASE 6: capture-local S/O fit consensus removed; physical S/O is immutable.
+bool validSpectraNoiseModel(const PhysicalTemporalNoiseModel& model) {
     if (!model.enabled || model.confidence <= 0.0f) return false;
     for (int ch = 0; ch < 4; ++ch) {
         if (!std::isfinite(model.effectiveS[ch]) || !std::isfinite(model.effectiveO[ch]) ||
@@ -981,7 +911,7 @@ SpectraSupportObservation analyzeAlignedSupportNoise(
         int whiteLevel,
         const std::array<int, 4>& blackLevels,
         int cfaPattern,
-        const SpectraNoiseModel& model
+        const PhysicalTemporalNoiseModel& model
 ) {
     SpectraSupportObservation observation{};
     const float safeStrictness = clampStrictness(strictness);
@@ -1014,7 +944,7 @@ SpectraSupportObservation analyzeAlignedSupportNoise(
     if (xStart >= xEnd || yStart >= yEnd) return observation;
 
     // Milestone 8H-D: the pixel-scale temporal observer is GPU-primary. Only
-    // compact reductions/fits remain CPU-side inside the Vulkan backend. CPU
+    // compact reductions remain CPU-side inside the Vulkan backend. CPU
     // executes the legacy full-frame observer exclusively on a typed Vulkan
     // execution failure, never merely because the GPU observation is invalid.
     bncam::vulkan::SpectraTemporalObserverRequest gpuRequest{};
@@ -1038,8 +968,6 @@ SpectraSupportObservation analyzeAlignedSupportNoise(
     gpuRequest.effectiveO = model.effectiveO;
     gpuRequest.modelConfidence = model.confidence;
     gpuRequest.temporalAuthority = model.temporalAuthority;
-    gpuRequest.adaptationLowerBound = model.adaptationLowerBound;
-    gpuRequest.adaptationUpperBound = model.adaptationUpperBound;
     const auto gpuResult = bncam::vulkan::VulkanRuntime::instance().executeSpectraTemporalObserver(gpuRequest);
     observation.vulkanAttempted = gpuResult.attempted;
     observation.vulkanExecutionSucceeded = gpuResult.success;
@@ -1065,21 +993,11 @@ SpectraSupportObservation analyzeAlignedSupportNoise(
         observation.valid = gpuResult.valid;
         observation.observedVariance = gpuResult.observedVariance;
         observation.predictedVariance = gpuResult.predictedVariance;
-        observation.adaptationScale = gpuResult.adaptationScale;
-        observation.sAdaptationScale = gpuResult.sAdaptationScale;
-        observation.oAdaptationScale = gpuResult.oAdaptationScale;
-        observation.regressionConfidence = gpuResult.regressionConfidence;
         observation.temporalCorrelation = gpuResult.temporalCorrelation;
         observation.persistentPatternFraction = gpuResult.persistentPatternFraction;
         observation.signalSpan = gpuResult.signalSpan;
         observation.populatedSignalBins = gpuResult.populatedSignalBins;
         observation.samples = gpuResult.samples;
-        observation.fitEstimator = gpuResult.fitEstimator;
-        observation.fitPhysicalScore = gpuResult.fitPhysicalScore;
-        observation.fitInnovationMean = gpuResult.fitInnovationMean;
-        observation.fitInnovationVariance = gpuResult.fitInnovationVariance;
-        observation.fitResidualCorrelation = gpuResult.fitResidualCorrelation;
-        observation.fitHeavyTailFraction = gpuResult.fitHeavyTailFraction;
         observation.staticProbabilityField = gpuResult.staticProbabilityField;
         observation.observerConfidence = gpuResult.observerConfidence;
         observation.alignmentConfidence = gpuResult.alignmentConfidence;
@@ -1421,14 +1339,6 @@ SpectraSupportObservation analyzeAlignedSupportNoise(
                 : 0.0;
         const double heavyTailFraction = static_cast<double>(heavyTailCount[ch]) /
                 static_cast<double>(std::max<uint64_t>(1u, count));
-        const spectra_temporal::InnovationDiagnostics innovation{
-                innovationMean,
-                innovationVariance,
-                innovationLag,
-                heavyTailFraction,
-                count
-        };
-
         double temporalCorrelation = 0.0;
         const double residualWeight = residualWeightSum[ch];
         if (residualWeight > 64.0) {
@@ -1469,87 +1379,28 @@ SpectraSupportObservation analyzeAlignedSupportNoise(
         }
         observation.temporalCorrelation[ch] = temporalCorrelation;
         observation.persistentPatternFraction[ch] = temporalCorrelation;
-        const double correlationCorrection = 1.0 / std::max(0.15, 1.0 - temporalCorrelation);
-
-        std::vector<spectra_temporal::TemporalFitPoint> points;
-        points.reserve(kSignalBins);
+        // FASE 6: observer-only signal coverage. No residual-derived S/O fit,
+        // no bounded scale estimation, and no capture-local learning.
+        int populatedBins = 0;
         double minSignal = 1.0;
         double maxSignal = 0.0;
         for (int bin = 0; bin < kSignalBins; ++bin) {
             const uint64_t binSamples = binCount[ch][bin];
             const double weight = binWeight[ch][bin];
             if (binSamples < 24u || weight <= 1.0e-12) continue;
-            const double binMeanDiff = binDiffSum[ch][bin] / weight;
-            const double binVariance = std::max(
-                    0.0,
-                    binDiffSqSum[ch][bin] / weight - binMeanDiff * binMeanDiff
-            );
             const double signal = binSignalSum[ch][bin] / weight;
-            const double variance = 0.5 * binVariance * correlationCorrection;
-            if (!std::isfinite(signal) || !std::isfinite(variance) || variance <= 0.0) continue;
-            points.push_back({signal, variance, std::sqrt(weight)});
+            if (!std::isfinite(signal)) continue;
+            ++populatedBins;
             minSignal = std::min(minSignal, signal);
             maxSignal = std::max(maxSignal, signal);
         }
+        observation.populatedSignalBins[ch] = populatedBins;
+        observation.signalSpan[ch] = populatedBins > 0 ? std::max(0.0, maxSignal - minSignal) : 0.0;
 
-        const double signalSpan = points.empty() ? 0.0 : std::max(0.0, maxSignal - minSignal);
-        observation.populatedSignalBins[ch] = static_cast<int>(points.size());
-        observation.signalSpan[ch] = signalSpan;
-        // Dual estimator: weighted least squares plus Huber IRLS, selected by physical residual score.
-        const auto fit = spectra_temporal::fitTemporalNoiseModel(points, innovation);
-
-        double sScale = 1.0;
-        double oScale = 1.0;
-        double regressionConfidence = 0.0;
-        if (fit.valid && points.size() >= 3u && signalSpan >= 0.035) {
-            if (model.effectiveS[ch] > 1.0e-12) {
-                sScale = std::clamp(
-                        fit.slope / model.effectiveS[ch],
-                        model.adaptationLowerBound,
-                        model.adaptationUpperBound
-                );
-            }
-            if (model.effectiveO[ch] > 1.0e-12) {
-                oScale = std::clamp(
-                        fit.offset / model.effectiveO[ch],
-                        model.adaptationLowerBound,
-                        model.adaptationUpperBound
-                );
-            }
-            const double sampleConfidence = std::clamp(static_cast<double>(count) / 4096.0, 0.0, 1.0);
-            regressionConfidence = fit.confidence * sampleConfidence;
-            observation.fitEstimator[ch] = static_cast<int>(fit.estimator);
-            observation.fitPhysicalScore[ch] = fit.metrics.physicalScore;
-        }
-        if (regressionConfidence < 0.05) {
-            const double commonScale = std::clamp(
-                    (observed * correlationCorrection) / predicted,
-                    model.adaptationLowerBound,
-                    model.adaptationUpperBound
-            );
-            sScale = commonScale;
-            oScale = commonScale;
-            regressionConfidence = 0.15 * std::clamp(
-                    static_cast<double>(count) / 4096.0,
-                    0.0,
-                    1.0
-            ) * observation.staticProbabilityP50;
-            observation.fitEstimator[ch] = static_cast<int>(
-                    spectra_temporal::TemporalFitEstimator::NONE
-            );
-        }
-
-        observation.sAdaptationScale[ch] = sScale;
-        observation.oAdaptationScale[ch] = oScale;
-        observation.adaptationScale[ch] = std::sqrt(std::max(0.0, sScale * oScale));
-        observation.regressionConfidence[ch] = regressionConfidence;
-        observation.fitInnovationMean[ch] = innovationMean;
-        observation.fitInnovationVariance[ch] = innovationVariance;
-        observation.fitResidualCorrelation[ch] = innovationLag;
-        observation.fitHeavyTailFraction[ch] = heavyTailFraction;
-
-        const double channelConfidence = std::clamp(static_cast<double>(count) / 2048.0, 0.0, 1.0) *
-                std::clamp(0.30 + 0.70 * regressionConfidence, 0.0, 1.0);
+        const double sampleConfidence = std::clamp(static_cast<double>(count) / 2048.0, 0.0, 1.0);
+        const double staticConfidence = std::clamp(0.35 + 0.65 * observation.staticProbabilityP50, 0.0, 1.0);
+        const double channelConfidence = sampleConfidence * staticConfidence *
+                std::clamp(static_cast<double>(model.confidence), 0.0, 1.0);
         confidenceSum += channelConfidence;
         correlationWeighted += temporalCorrelation * channelConfidence;
         correlationWeight += channelConfidence;
@@ -1615,7 +1466,7 @@ void mergeAlignedSupport(
         int whiteLevel,
         const std::array<int, 4>& blackLevels,
         int cfaPattern,
-        const SpectraNoiseModel& model,
+        const PhysicalTemporalNoiseModel& model,
         const SpectraSupportObservation& observation,
         cv::Mat& accum32,
         cv::Mat& weight32,
@@ -1679,13 +1530,11 @@ void mergeAlignedSupport(
                             whiteLevel,
                             blackLevels
                     );
-                    const double adaptedS = model.effectiveS[ch] *
-                            std::clamp(observation.sAdaptationScale[ch], 0.75, 1.25);
-                    const double adaptedO = model.effectiveO[ch] *
-                            std::clamp(observation.oAdaptationScale[ch], 0.75, 1.25);
+                    const double physicalS = model.effectiveS[ch];
+                    const double physicalO = model.effectiveO[ch];
                     const double supportVariance = std::max(
                             1.0e-12,
-                            adaptedS * supportSignal + adaptedO
+                            physicalS * supportSignal + physicalO
                     );
                     const double anchorSignal = spectraNormalizedSignal(
                             anchorValue,
@@ -1696,7 +1545,7 @@ void mergeAlignedSupport(
                     );
                     const double anchorVariance = std::max(
                             1.0e-12,
-                            adaptedS * anchorSignal + adaptedO
+                            physicalS * anchorSignal + physicalO
                     );
                     relativeVarianceRatio = std::clamp(
                             supportVariance / anchorVariance,
@@ -1718,7 +1567,7 @@ void mergeAlignedSupport(
                     const float robustWeight = std::exp(-0.5f * normalized * normalized);
                     const double referenceVariance = std::max(
                             1.0e-12,
-                            adaptedS * 0.15 + adaptedO
+                            physicalS * 0.15 + physicalO
                     );
                     const float inverseVarianceWeight = static_cast<float>(std::clamp(
                             referenceVariance / supportVariance,
@@ -1824,14 +1673,9 @@ void applyGpuRawMultiFrameStats(
     double fbMin = std::numeric_limits<double>::infinity(), repeatedSum = 0.0;
     double staticMeanSum = 0.0, staticP10Sum = 0.0, staticP50Sum = 0.0, staticP90Sum = 0.0;
     double innovationMeanSum = 0.0, innovationVarianceSum = 0.0, innovationP90Sum = 0.0;
-    double innovationLagSum = 0.0, heavyTailSum = 0.0, persistentSum = 0.0, fitStabilitySum = 0.0;
-    double fitStabilityMin = std::numeric_limits<double>::infinity();
+    double innovationLagSum = 0.0, heavyTailSum = 0.0, persistentSum = 0.0;
     std::array<double,4> channelWeight{0,0,0,0}, observed{0,0,0,0}, predicted{0,0,0,0};
-    std::array<double,4> scale{0,0,0,0}, sScale{0,0,0,0}, oScale{0,0,0,0};
-    std::array<double,4> regression{0,0,0,0}, signalSpan{0,0,0,0}, bins{0,0,0,0};
-    std::array<double,4> physical{0,0,0,0}, fitMean{0,0,0,0}, fitVar{0,0,0,0};
-    std::array<double,4> fitCorr{0,0,0,0}, fitTail{0,0,0,0}, fitStability{0,0,0,0};
-    std::array<int,4> wls{0,0,0,0}, huber{0,0,0,0};
+    std::array<double,4> signalSpan{0,0,0,0}, bins{0,0,0,0};
 
     for (const auto& support : gpu.supports) {
         if (spectraEnabled && support.rejectReason == "forward_backward_inconsistent") {
@@ -1878,8 +1722,6 @@ void applyGpuRawMultiFrameStats(
         innovationMeanSum += o.normalizedInnovationMean; innovationVarianceSum += o.normalizedInnovationVariance;
         innovationP90Sum += o.normalizedInnovationP90; innovationLagSum += o.normalizedInnovationLagCorrelation;
         heavyTailSum += o.heavyTailFraction; persistentSum += o.persistentPatternMean;
-        fitStabilitySum += support.meanFitStabilityConfidence;
-        fitStabilityMin = std::min(fitStabilityMin, static_cast<double>(support.meanFitStabilityConfidence));
         stats.spectraHighConfidenceStaticSamples += o.highConfidenceStaticSamples;
         stats.spectraClippingRejectedSamples += o.clippingRejectedSamples;
         stats.spectraTextureRejectedSamples += o.textureRejectedSamples;
@@ -1892,12 +1734,8 @@ void applyGpuRawMultiFrameStats(
             if (w <= 0.0) continue;
             channelWeight[ch] += w;
             observed[ch] += o.observedVariance[ch]*w; predicted[ch] += o.predictedVariance[ch]*w;
-            scale[ch] += o.adaptationScale[ch]*w; sScale[ch] += o.sAdaptationScale[ch]*w; oScale[ch] += o.oAdaptationScale[ch]*w;
-            regression[ch] += o.regressionConfidence[ch]*w; signalSpan[ch] += o.signalSpan[ch]*w; bins[ch] += static_cast<double>(o.populatedSignalBins[ch])*w;
-            physical[ch] += o.fitPhysicalScore[ch]*w; fitMean[ch] += o.fitInnovationMean[ch]*w; fitVar[ch] += o.fitInnovationVariance[ch]*w;
-            fitCorr[ch] += o.fitResidualCorrelation[ch]*w; fitTail[ch] += o.fitHeavyTailFraction[ch]*w; fitStability[ch] += support.fitStabilityConfidence[ch]*w;
-            if (o.fitEstimator[ch] == static_cast<int>(spectra_temporal::TemporalFitEstimator::WEIGHTED_LEAST_SQUARES)) ++wls[ch];
-            if (o.fitEstimator[ch] == static_cast<int>(spectra_temporal::TemporalFitEstimator::HUBER_IRLS)) ++huber[ch];
+            signalSpan[ch] += o.signalSpan[ch]*w;
+            bins[ch] += static_cast<double>(o.populatedSignalBins[ch])*w;
             stats.spectraObserverSamples += static_cast<int>(o.samples[ch]);
         }
     }
@@ -1928,17 +1766,11 @@ void applyGpuRawMultiFrameStats(
         stats.spectraNormalizedInnovationLagCorrelation = std::clamp(innovationLagSum/n,-1.0,1.0);
         stats.spectraHeavyTailFraction = std::clamp(heavyTailSum/n,0.0,1.0);
         stats.spectraPersistentPatternFraction = std::clamp(persistentSum/n,0.0,0.95);
-        stats.spectraFitStabilityConfidence = std::clamp(fitStabilitySum/n,0.0,1.0);
-        stats.spectraFitStabilityMin = std::isfinite(fitStabilityMin) ? std::clamp(fitStabilityMin,0.0,1.0) : 0.0;
         for (int ch=0; ch<4; ++ch) if (channelWeight[ch] > 0.0) {
-            stats.spectraObservedVariance[ch]=observed[ch]/channelWeight[ch]; stats.spectraPredictedVariance[ch]=predicted[ch]/channelWeight[ch];
-            stats.spectraAdaptationScale[ch]=std::clamp(scale[ch]/channelWeight[ch],0.75,1.25); stats.spectraSAdaptationScale[ch]=std::clamp(sScale[ch]/channelWeight[ch],0.75,1.25); stats.spectraOAdaptationScale[ch]=std::clamp(oScale[ch]/channelWeight[ch],0.75,1.25);
-            stats.spectraRegressionConfidence[ch]=std::clamp(regression[ch]/channelWeight[ch],0.0,1.0); stats.spectraSignalSpan[ch]=std::max(0.0,signalSpan[ch]/channelWeight[ch]); stats.spectraRegressionBins[ch]=static_cast<int>(std::lround(bins[ch]/channelWeight[ch]));
-            stats.spectraFitPhysicalScore[ch]=std::clamp(physical[ch]/channelWeight[ch],0.0,1.0); stats.spectraFitInnovationMean[ch]=fitMean[ch]/channelWeight[ch]; stats.spectraFitInnovationVariance[ch]=std::max(0.0,fitVar[ch]/channelWeight[ch]);
-            stats.spectraFitResidualCorrelation[ch]=std::clamp(fitCorr[ch]/channelWeight[ch],-1.0,1.0); stats.spectraFitHeavyTailFraction[ch]=std::clamp(fitTail[ch]/channelWeight[ch],0.0,1.0); stats.spectraFitStabilityByChannel[ch]=std::clamp(fitStability[ch]/channelWeight[ch],0.0,1.0);
-            stats.spectraFitEstimator[ch] = huber[ch] > wls[ch] ? static_cast<int>(spectra_temporal::TemporalFitEstimator::HUBER_IRLS) : (wls[ch] > 0 ? static_cast<int>(spectra_temporal::TemporalFitEstimator::WEIGHTED_LEAST_SQUARES) : static_cast<int>(spectra_temporal::TemporalFitEstimator::NONE));
-            if (stats.spectraFitEstimator[ch] == static_cast<int>(spectra_temporal::TemporalFitEstimator::WEIGHTED_LEAST_SQUARES)) ++stats.spectraWlsSelectedChannels;
-            if (stats.spectraFitEstimator[ch] == static_cast<int>(spectra_temporal::TemporalFitEstimator::HUBER_IRLS)) ++stats.spectraHuberSelectedChannels;
+            stats.spectraObservedVariance[ch]=observed[ch]/channelWeight[ch];
+            stats.spectraPredictedVariance[ch]=predicted[ch]/channelWeight[ch];
+            stats.spectraSignalSpan[ch]=std::max(0.0,signalSpan[ch]/channelWeight[ch]);
+            stats.spectraRegressionBins[ch]=static_cast<int>(std::lround(bins[ch]/channelWeight[ch]));
         }
     }
     if (!fuseSupportFrames && spectraEnabled) {
@@ -1958,11 +1790,9 @@ jobject mergeRawToDngRaw16Internal(
         jint maxFramesCap,
         jint maxShiftPixels,
         jfloat alignmentStrictness,
-        jint spectraMode,
         bool temporalNoiseModelEnabled,
-        bool spectraAdaptiveCalibrationEnabled,
-        const std::vector<double>& spectraEffectiveS,
-        const std::vector<double>& spectraEffectiveO,
+        const std::vector<double>& physicalEffectiveS,
+        const std::vector<double>& physicalEffectiveO,
         jfloat spectraModelConfidence,
         bool fuseSupportFrames,
         const std::vector<float>& exposureScaleToAnchor,
@@ -2004,21 +1834,19 @@ jobject mergeRawToDngRaw16Internal(
     localStats.maxShiftPixels = std::max(1, static_cast<int>(maxShiftPixels));
     localStats.alignmentStrictness = clampStrictness(alignmentStrictness);
 
-    SpectraNoiseModel spectraModel{};
+    PhysicalTemporalNoiseModel spectraModel{};
     spectraModel.enabled = temporalNoiseModelEnabled &&
-            spectraEffectiveS.size() >= 4u && spectraEffectiveO.size() >= 4u;
-    spectraModel.adaptiveCalibrationEnabled =
-            spectraAdaptiveCalibrationEnabled && spectraMode > 0;
+            physicalEffectiveS.size() >= 4u && physicalEffectiveO.size() >= 4u;
     spectraModel.confidence = std::clamp(
             std::isfinite(spectraModelConfidence) ? static_cast<float>(spectraModelConfidence) : 0.0f,
             0.0f,
             1.0f
     );
     for (int ch = 0; ch < 4; ++ch) {
-        spectraModel.effectiveS[ch] = spectraEffectiveS.size() > static_cast<size_t>(ch)
-                ? spectraEffectiveS[static_cast<size_t>(ch)] : 0.0;
-        spectraModel.effectiveO[ch] = spectraEffectiveO.size() > static_cast<size_t>(ch)
-                ? spectraEffectiveO[static_cast<size_t>(ch)] : 0.0;
+        spectraModel.effectiveS[ch] = physicalEffectiveS.size() > static_cast<size_t>(ch)
+                ? physicalEffectiveS[static_cast<size_t>(ch)] : 0.0;
+        spectraModel.effectiveO[ch] = physicalEffectiveO.size() > static_cast<size_t>(ch)
+                ? physicalEffectiveO[static_cast<size_t>(ch)] : 0.0;
     }
     double meanReferenceVariance = 0.0;
     int pressureChannels = 0;
@@ -2040,26 +1868,13 @@ jobject mergeRawToDngRaw16Internal(
             0.0f,
             0.95f
     );
-    const double allowedDrift = 0.08 + 0.17 * static_cast<double>(spectraModel.noisePressure);
-    if (spectraModel.adaptiveCalibrationEnabled) {
-        spectraModel.adaptationLowerBound = 1.0 - allowedDrift;
-        spectraModel.adaptationUpperBound = 1.0 + allowedDrift;
-    } else {
-        // Physical Camera2 S/O is immutable in SPECTRA-Off baseline. The observer remains
-        // useful for motion/static classification but cannot become a second calibration authority.
-        spectraModel.adaptationLowerBound = 1.0;
-        spectraModel.adaptationUpperBound = 1.0;
-    }
     spectraModel.enabled = validSpectraNoiseModel(spectraModel);
     localStats.spectraEnabled = spectraModel.enabled;
     localStats.temporalNoiseModelEnabled = spectraModel.enabled;
-    localStats.spectraAdaptiveCalibrationEnabled =
-            spectraModel.enabled && spectraModel.adaptiveCalibrationEnabled;
-    localStats.temporalNoiseModelAuthority = !spectraModel.enabled
-            ? "DISABLED"
-            : (spectraModel.adaptiveCalibrationEnabled
-                    ? "SPECTRA_ADAPTIVE_SO"
-                    : "PHYSICAL_CAMERA2_FIXED_SO");
+    localStats.spectraAdaptiveCalibrationEnabled = false;
+    localStats.temporalNoiseModelAuthority = spectraModel.enabled
+            ? "FROZEN_PHYSICAL_SO_READ_ONLY"
+            : "DISABLED";
     localStats.spectraModelConfidence = spectraModel.confidence;
     localStats.spectraNoisePressure = spectraModel.noisePressure;
     localStats.spectraTemporalAuthority = spectraModel.temporalAuthority;
@@ -2263,8 +2078,6 @@ jobject mergeRawToDngRaw16Internal(
             gpuRequest.spectra.confidence = spectraModel.confidence;
             gpuRequest.spectra.noisePressure = spectraModel.noisePressure;
             gpuRequest.spectra.temporalAuthority = spectraModel.temporalAuthority;
-            gpuRequest.spectra.adaptationLowerBound = spectraModel.adaptationLowerBound;
-            gpuRequest.spectra.adaptationUpperBound = spectraModel.adaptationUpperBound;
             gpuRequest.generationId = static_cast<uint64_t>(
                     std::chrono::duration_cast<std::chrono::microseconds>(
                             DngClock::now().time_since_epoch()).count());
@@ -2557,19 +2370,8 @@ jobject mergeRawToDngRaw16Internal(
 
             std::array<double, 4> spectraObservedWeighted{0.0, 0.0, 0.0, 0.0};
             std::array<double, 4> spectraPredictedWeighted{0.0, 0.0, 0.0, 0.0};
-            std::array<double, 4> spectraScaleWeighted{0.0, 0.0, 0.0, 0.0};
-            std::array<double, 4> spectraSScaleWeighted{0.0, 0.0, 0.0, 0.0};
-            std::array<double, 4> spectraOScaleWeighted{0.0, 0.0, 0.0, 0.0};
-            std::array<double, 4> spectraRegressionConfidenceWeighted{0.0, 0.0, 0.0, 0.0};
             std::array<double, 4> spectraSignalSpanWeighted{0.0, 0.0, 0.0, 0.0};
             std::array<double, 4> spectraRegressionBinsWeighted{0.0, 0.0, 0.0, 0.0};
-            std::array<double, 4> spectraFitPhysicalScoreWeighted{0.0, 0.0, 0.0, 0.0};
-            std::array<double, 4> spectraFitInnovationMeanWeighted{0.0, 0.0, 0.0, 0.0};
-            std::array<double, 4> spectraFitInnovationVarianceWeighted{0.0, 0.0, 0.0, 0.0};
-            std::array<double, 4> spectraFitResidualCorrelationWeighted{0.0, 0.0, 0.0, 0.0};
-            std::array<double, 4> spectraFitHeavyTailWeighted{0.0, 0.0, 0.0, 0.0};
-            std::array<int, 4> spectraWlsVotes{0, 0, 0, 0};
-            std::array<int, 4> spectraHuberVotes{0, 0, 0, 0};
             std::array<double, 4> spectraChannelWeight{0.0, 0.0, 0.0, 0.0};
             double spectraConfidenceSum = 0.0;
             double spectraSupportWeightSum = 0.0;
@@ -2578,7 +2380,6 @@ jobject mergeRawToDngRaw16Internal(
             double spectraMotionConfidenceSum = 0.0;
             int spectraAcceptedObservations = 0;
             SpectraStaticConsensus spectraStaticConsensus{};
-            SpectraFitConsensus spectraFitConsensus{};
             double spectraForwardBackwardSum = 0.0;
             double spectraForwardBackwardMin = std::numeric_limits<double>::infinity();
             double spectraRepeatedSupportSum = 0.0;
@@ -2592,9 +2393,6 @@ jobject mergeRawToDngRaw16Internal(
             double spectraInnovationLagSum = 0.0;
             double spectraHeavyTailSum = 0.0;
             double spectraPersistentPatternSum = 0.0;
-            double spectraFitStabilitySum = 0.0;
-            double spectraFitStabilityMin = std::numeric_limits<double>::infinity();
-            std::array<double, 4> spectraFitStabilityWeighted{0.0, 0.0, 0.0, 0.0};
 
             double alignmentScale = 1.0;
             stageStart = DngClock::now();
@@ -2728,18 +2526,8 @@ jobject mergeRawToDngRaw16Internal(
                     spectraObservation.supportWeight *= static_cast<float>(
                             0.65 + 0.35 * spectraObservation.repeatedSupportConfidence
                     );
-                    for (int ch = 0; ch < 4; ++ch) {
-                        spectraObservation.regressionConfidence[ch] *= repeatedAuthority;
-                    }
                     spectraObservation.valid = spectraObservation.valid &&
                             spectraObservation.repeatedSupportConfidence >= 0.25f;
-                }
-                if (spectraModel.enabled && spectraObservation.valid) {
-                    stageStart = DngClock::now();
-                    const float fitStability = spectraFitConsensus.compareAndUpdate(spectraObservation);
-                    localStats.spectraFitConsensusMs += elapsedDngMs(stageStart);
-                    const double fitStabilityAuthority = 0.75 + 0.25 * fitStability;
-                    spectraObservation.observerConfidence *= fitStabilityAuthority;
                 }
 
                 bool supportAcceptedForOutput = false;
@@ -2794,11 +2582,6 @@ jobject mergeRawToDngRaw16Internal(
                     spectraInnovationLagSum += spectraObservation.normalizedInnovationLagCorrelation;
                     spectraHeavyTailSum += spectraObservation.heavyTailFraction;
                     spectraPersistentPatternSum += spectraObservation.persistentPatternMean;
-                    spectraFitStabilitySum += spectraObservation.meanFitStabilityConfidence;
-                    spectraFitStabilityMin = std::min(
-                            spectraFitStabilityMin,
-                            static_cast<double>(spectraObservation.meanFitStabilityConfidence)
-                    );
                     localStats.spectraHighConfidenceStaticSamples +=
                             spectraObservation.highConfidenceStaticSamples;
                     localStats.spectraClippingRejectedSamples +=
@@ -2818,32 +2601,9 @@ jobject mergeRawToDngRaw16Internal(
                         if (channelWeight <= 0.0) continue;
                         spectraObservedWeighted[ch] += spectraObservation.observedVariance[ch] * channelWeight;
                         spectraPredictedWeighted[ch] += spectraObservation.predictedVariance[ch] * channelWeight;
-                        spectraScaleWeighted[ch] += spectraObservation.adaptationScale[ch] * channelWeight;
-                        spectraSScaleWeighted[ch] += spectraObservation.sAdaptationScale[ch] * channelWeight;
-                        spectraOScaleWeighted[ch] += spectraObservation.oAdaptationScale[ch] * channelWeight;
-                        spectraRegressionConfidenceWeighted[ch] +=
-                                spectraObservation.regressionConfidence[ch] * channelWeight;
                         spectraSignalSpanWeighted[ch] += spectraObservation.signalSpan[ch] * channelWeight;
                         spectraRegressionBinsWeighted[ch] +=
                                 static_cast<double>(spectraObservation.populatedSignalBins[ch]) * channelWeight;
-                        spectraFitPhysicalScoreWeighted[ch] +=
-                                spectraObservation.fitPhysicalScore[ch] * channelWeight;
-                        spectraFitInnovationMeanWeighted[ch] +=
-                                spectraObservation.fitInnovationMean[ch] * channelWeight;
-                        spectraFitInnovationVarianceWeighted[ch] +=
-                                spectraObservation.fitInnovationVariance[ch] * channelWeight;
-                        spectraFitResidualCorrelationWeighted[ch] +=
-                                spectraObservation.fitResidualCorrelation[ch] * channelWeight;
-                        spectraFitHeavyTailWeighted[ch] +=
-                                spectraObservation.fitHeavyTailFraction[ch] * channelWeight;
-                        spectraFitStabilityWeighted[ch] +=
-                                spectraObservation.fitStabilityConfidence[ch] * channelWeight;
-                        if (spectraObservation.fitEstimator[ch] == static_cast<int>(
-                                spectra_temporal::TemporalFitEstimator::WEIGHTED_LEAST_SQUARES
-                        )) spectraWlsVotes[ch]++;
-                        if (spectraObservation.fitEstimator[ch] == static_cast<int>(
-                                spectra_temporal::TemporalFitEstimator::HUBER_IRLS
-                        )) spectraHuberVotes[ch]++;
                         spectraChannelWeight[ch] += channelWeight;
                         localStats.spectraObserverSamples += static_cast<int>(spectraObservation.samples[ch]);
                     }
@@ -2864,8 +2624,6 @@ jobject mergeRawToDngRaw16Internal(
                         formatDouble(spectraObservation.staticProbabilityP50, 4) +
                         ",repeatedSupport=" +
                         formatDouble(spectraObservation.repeatedSupportConfidence, 4) +
-                        ",fitStability=" +
-                        formatDouble(spectraObservation.meanFitStabilityConfidence, 4) +
                         ",spectraWeight=" + formatDouble(spectraObservation.supportWeight, 4) +
                         ",temporalCorrelation=" +
                         formatDouble(spectraObservation.meanTemporalCorrelation, 4)
@@ -2938,47 +2696,6 @@ jobject mergeRawToDngRaw16Internal(
                 localStats.spectraPersistentPatternFraction = std::clamp(
                         spectraPersistentPatternSum / observationCount, 0.0, 0.95
                 );
-                localStats.spectraFitStabilityConfidence = std::clamp(
-                        spectraFitStabilitySum / observationCount, 0.0, 1.0
-                );
-                localStats.spectraFitStabilityMin = std::isfinite(spectraFitStabilityMin)
-                        ? std::clamp(spectraFitStabilityMin, 0.0, 1.0)
-                        : 0.0;
-                for (int ch = 0; ch < 4; ++ch) {
-                    if (spectraChannelWeight[ch] <= 0.0) continue;
-                    localStats.spectraFitPhysicalScore[ch] = std::clamp(
-                            spectraFitPhysicalScoreWeighted[ch] / spectraChannelWeight[ch],
-                            0.0, 1.0
-                    );
-                    localStats.spectraFitInnovationMean[ch] =
-                            spectraFitInnovationMeanWeighted[ch] / spectraChannelWeight[ch];
-                    localStats.spectraFitInnovationVariance[ch] = std::max(
-                            0.0, spectraFitInnovationVarianceWeighted[ch] / spectraChannelWeight[ch]
-                    );
-                    localStats.spectraFitResidualCorrelation[ch] = std::clamp(
-                            spectraFitResidualCorrelationWeighted[ch] / spectraChannelWeight[ch],
-                            -1.0, 1.0
-                    );
-                    localStats.spectraFitHeavyTailFraction[ch] = std::clamp(
-                            spectraFitHeavyTailWeighted[ch] / spectraChannelWeight[ch],
-                            0.0, 1.0
-                    );
-                    localStats.spectraFitStabilityByChannel[ch] = std::clamp(
-                            spectraFitStabilityWeighted[ch] / spectraChannelWeight[ch],
-                            0.0, 1.0
-                    );
-                    localStats.spectraFitEstimator[ch] = spectraHuberVotes[ch] > spectraWlsVotes[ch]
-                            ? static_cast<int>(spectra_temporal::TemporalFitEstimator::HUBER_IRLS)
-                            : (spectraWlsVotes[ch] > 0
-                                    ? static_cast<int>(spectra_temporal::TemporalFitEstimator::WEIGHTED_LEAST_SQUARES)
-                                    : static_cast<int>(spectra_temporal::TemporalFitEstimator::NONE));
-                    if (localStats.spectraFitEstimator[ch] == static_cast<int>(
-                            spectra_temporal::TemporalFitEstimator::WEIGHTED_LEAST_SQUARES
-                    )) localStats.spectraWlsSelectedChannels++;
-                    if (localStats.spectraFitEstimator[ch] == static_cast<int>(
-                            spectra_temporal::TemporalFitEstimator::HUBER_IRLS
-                    )) localStats.spectraHuberSelectedChannels++;
-                }
             }
 
             if (!fuseSupportFrames && spectraModel.enabled) {
@@ -3008,26 +2725,6 @@ jobject mergeRawToDngRaw16Internal(
                                 spectraObservedWeighted[ch] / spectraChannelWeight[ch];
                         localStats.spectraPredictedVariance[ch] =
                                 spectraPredictedWeighted[ch] / spectraChannelWeight[ch];
-                        localStats.spectraAdaptationScale[ch] = std::clamp(
-                                spectraScaleWeighted[ch] / spectraChannelWeight[ch],
-                                0.75,
-                                1.25
-                        );
-                        localStats.spectraSAdaptationScale[ch] = std::clamp(
-                                spectraSScaleWeighted[ch] / spectraChannelWeight[ch],
-                                0.75,
-                                1.25
-                        );
-                        localStats.spectraOAdaptationScale[ch] = std::clamp(
-                                spectraOScaleWeighted[ch] / spectraChannelWeight[ch],
-                                0.75,
-                                1.25
-                        );
-                        localStats.spectraRegressionConfidence[ch] = std::clamp(
-                                spectraRegressionConfidenceWeighted[ch] / spectraChannelWeight[ch],
-                                0.0,
-                                1.0
-                        );
                         localStats.spectraSignalSpan[ch] = std::max(
                                 0.0,
                                 spectraSignalSpanWeighted[ch] / spectraChannelWeight[ch]
@@ -3172,26 +2869,6 @@ jobject mergeRawToDngRaw16Internal(
                                     spectraObservedWeighted[ch] / spectraChannelWeight[ch];
                             localStats.spectraPredictedVariance[ch] =
                                     spectraPredictedWeighted[ch] / spectraChannelWeight[ch];
-                            localStats.spectraAdaptationScale[ch] = std::clamp(
-                                    spectraScaleWeighted[ch] / spectraChannelWeight[ch],
-                                    0.75,
-                                    1.25
-                            );
-                            localStats.spectraSAdaptationScale[ch] = std::clamp(
-                                    spectraSScaleWeighted[ch] / spectraChannelWeight[ch],
-                                    0.75,
-                                    1.25
-                            );
-                            localStats.spectraOAdaptationScale[ch] = std::clamp(
-                                    spectraOScaleWeighted[ch] / spectraChannelWeight[ch],
-                                    0.75,
-                                    1.25
-                            );
-                            localStats.spectraRegressionConfidence[ch] = std::clamp(
-                                    spectraRegressionConfidenceWeighted[ch] / spectraChannelWeight[ch],
-                                    0.0,
-                                    1.0
-                            );
                             localStats.spectraSignalSpan[ch] = std::max(
                                     0.0,
                                     spectraSignalSpanWeighted[ch] / spectraChannelWeight[ch]
@@ -3367,11 +3044,9 @@ jobject mergeRaw10DngToRaw16(
         jint maxFramesCap,
         jint maxShiftPixels,
         jfloat alignmentStrictness,
-        jint spectraMode,
         bool temporalNoiseModelEnabled,
-        bool spectraAdaptiveCalibrationEnabled,
-        const std::vector<double>& spectraEffectiveS,
-        const std::vector<double>& spectraEffectiveO,
+        const std::vector<double>& physicalEffectiveS,
+        const std::vector<double>& physicalEffectiveO,
         jfloat spectraModelConfidence,
         bool fuseSupportFrames,
         const std::vector<float>& exposureScaleToAnchor,
@@ -3391,11 +3066,9 @@ jobject mergeRaw10DngToRaw16(
             maxFramesCap,
             maxShiftPixels,
             alignmentStrictness,
-            spectraMode,
             temporalNoiseModelEnabled,
-            spectraAdaptiveCalibrationEnabled,
-            spectraEffectiveS,
-            spectraEffectiveO,
+            physicalEffectiveS,
+            physicalEffectiveO,
             spectraModelConfidence,
             fuseSupportFrames,
             exposureScaleToAnchor,
@@ -3420,11 +3093,9 @@ jobject mergeRawSensorDngToRaw16(
         jint maxFramesCap,
         jint maxShiftPixels,
         jfloat alignmentStrictness,
-        jint spectraMode,
         bool temporalNoiseModelEnabled,
-        bool spectraAdaptiveCalibrationEnabled,
-        const std::vector<double>& spectraEffectiveS,
-        const std::vector<double>& spectraEffectiveO,
+        const std::vector<double>& physicalEffectiveS,
+        const std::vector<double>& physicalEffectiveO,
         jfloat spectraModelConfidence,
         bool fuseSupportFrames,
         const std::vector<float>& exposureScaleToAnchor,
@@ -3444,11 +3115,9 @@ jobject mergeRawSensorDngToRaw16(
             maxFramesCap,
             maxShiftPixels,
             alignmentStrictness,
-            spectraMode,
             temporalNoiseModelEnabled,
-            spectraAdaptiveCalibrationEnabled,
-            spectraEffectiveS,
-            spectraEffectiveO,
+            physicalEffectiveS,
+            physicalEffectiveO,
             spectraModelConfidence,
             fuseSupportFrames,
             exposureScaleToAnchor,

@@ -41,9 +41,11 @@ inline float neuralAdaptiveNoiseEvidence(float normalizedSignal, float sigma) no
     return neuralAdaptiveNoiseEvidenceFromSnr(snr);
 }
 
-// Preserve the Phase-6 adaptive response exactly, then apply the Phase-9 evidence envelope.
-// This makes the change strictly downward-only versus the previous writeback: evidence=1 leaves
-// the existing response untouched, while SNR >= 8 forces exact identity.
+// Production Neural uses one physical SNR authority envelope.  The previous implementation
+// multiplied this evidence by a second sqrt(sigma/(signal+sigma)) gate, which attenuated the same
+// physical evidence twice and made otherwise valid Student residuals nearly identity.  Adaptive
+// Response is fixed at 100% in production and retained here only for ABI/source compatibility.
+// High-SNR protection is unchanged: SNR >= kNeuralAdaptiveIdentitySnr remains exact identity.
 inline float neuralAdaptiveAuthorityScale(
         float normalizedSignal,
         float sigma,
@@ -51,14 +53,8 @@ inline float neuralAdaptiveAuthorityScale(
     if (!std::isfinite(normalizedSignal) || !std::isfinite(sigma) || sigma <= 0.0f) {
         return 0.0f;
     }
-    const float evidence = neuralAdaptiveNoiseEvidence(normalizedSignal, sigma);
-    const float response = std::isfinite(adaptiveResponse)
-            ? std::clamp(adaptiveResponse, 0.0f, 1.0f) : 0.0f;
-    const float inverseSnrFraction = sigma /
-            (std::abs(normalizedSignal) + sigma + kNeuralAdaptiveSigmaFloor);
-    const float phase6Scale = (1.0f - response) +
-            response * std::sqrt(std::clamp(inverseSnrFraction, 0.0f, 1.0f));
-    return evidence * phase6Scale;
+    (void) adaptiveResponse;
+    return neuralAdaptiveNoiseEvidence(normalizedSignal, sigma);
 }
 
 } // namespace bncam::spectra::neural

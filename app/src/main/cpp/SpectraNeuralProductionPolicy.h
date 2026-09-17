@@ -90,12 +90,18 @@ inline NeuralDenoiseControls phase5ProductionControls(
         NeuralProductionMutationMode mode) noexcept {
     NeuralDenoiseControls out{};
     out.enabled = mode != NeuralProductionMutationMode::Off;
-    out.noiseReduction = out.enabled ? 1.0f : 0.0f;
+    if (!out.enabled) {
+        // FASE 8: user Off is an exact runtime identity contract. No legacy shaping value
+        // remains "effective" while mutation is disabled, even though profile persistence may
+        // retain the user's preferred controls for the next On capture.
+        return out;
+    }
+    out.noiseReduction = 1.0f;
     out.lumaNoise = 1.0f;
     out.chromaNoise = 1.0f;
     out.detailProtection = 0.0f;
     out.lowFrequencyCleanup = 1.0f;
-    out.adaptiveResponse = 0.0f;
+    out.adaptiveResponse = 1.0f;
     return out;
 }
 
@@ -104,34 +110,31 @@ inline float signedProfileControlToUnit(float value) noexcept {
     return 0.5f * (safe + 1.0f);
 }
 
-// The historical hidden SPECTRA strength used signed neutral=0. Phase 6 makes
-// master strength an explicit 0..1 neural authority while retaining old profiles:
-// signed -1 -> 0, 0 -> Natural 0.70, +1 -> 1. This is a migration projection only.
-inline float legacySpectraMasterToUnit(float signedStrength) noexcept {
-    const float s = std::isfinite(signedStrength)
-            ? std::clamp(signedStrength, -1.0f, 1.0f) : 0.0f;
-    return s < 0.0f ? 0.70f * (1.0f + s) : 0.70f + 0.30f * s;
-}
-
+// Global neural authority is binary by contract: Off=0, On=1. Legacy strength
+// values may still arrive through old profile/ABI surfaces, but production ignores them.
 inline NeuralDenoiseControls projectVisibleProfileControlsToNeural(
         NeuralProductionMutationMode mode,
-        float masterStrength,
         float signedLuma,
         float signedChroma,
         float signedDetailProtection,
         float signedLowFrequency,
-        float adaptiveResponse) noexcept {
+        float legacyAdaptiveResponse) noexcept {
+    (void) legacyAdaptiveResponse;
     NeuralDenoiseControls out{};
     out.enabled = mode != NeuralProductionMutationMode::Off;
-    const float safeMaster = std::isfinite(masterStrength)
-            ? std::clamp(masterStrength, 0.0f, 1.0f) : 0.0f;
-    out.noiseReduction = out.enabled ? safeMaster : 0.0f;
+    if (!out.enabled) {
+        // FASE 8: Off is not a weak denoise setting. It is a complete neural mutation bypass.
+        // Stored Luma/Chroma/Detail/LF values remain profile preferences, not effective controls.
+        return out;
+    }
+    out.noiseReduction = 1.0f;
     out.lumaNoise = signedProfileControlToUnit(signedLuma);
     out.chromaNoise = signedProfileControlToUnit(signedChroma);
     out.detailProtection = signedProfileControlToUnit(signedDetailProtection);
     out.lowFrequencyCleanup = signedProfileControlToUnit(signedLowFrequency);
-    out.adaptiveResponse = std::isfinite(adaptiveResponse)
-            ? std::clamp(adaptiveResponse, 0.0f, 1.0f) : 0.0f;
+    // Adaptive response is binary by contract: enabled Neural always runs with full
+    // sigma/SNR adaptation. Legacy profile values are accepted only for ABI compatibility.
+    out.adaptiveResponse = 1.0f;
     return out;
 }
 
@@ -145,9 +148,9 @@ inline NeuralDenoiseControls projectProfileControlsToNeural(
         float legacySignedDetailProtection,
         float legacySignedLowFrequency,
         float adaptiveResponse) noexcept {
+    (void) legacySignedMaster;
     return projectVisibleProfileControlsToNeural(
             mode,
-            legacySpectraMasterToUnit(legacySignedMaster),
             legacySignedLuma,
             legacySignedChroma,
             legacySignedDetailProtection,
@@ -170,9 +173,10 @@ inline NeuralProductionPreparedContext prepareNeuralProductionContext(
         return out;
     }
     if (input.mutationMode == NeuralProductionMutationMode::Off) {
-        out.controls.enabled = false;
-        out.controls.noiseReduction = 0.0f;
-        out.structuralBypassReason = NeuralBypassReason::NeuralDisabled;
+        // FASE 8: effective runtime controls are all-zero under user Off. Persisted profile
+        // preferences are intentionally not copied into the prepared mutation contract.
+        out.controls = NeuralDenoiseControls{};
+        out.structuralBypassReason = NeuralBypassReason::UserDisabled;
         return out;
     }
     if (!out.controls.valid()) {
@@ -180,7 +184,8 @@ inline NeuralProductionPreparedContext prepareNeuralProductionContext(
         return out;
     }
     if (!out.controls.enabled) {
-        out.structuralBypassReason = NeuralBypassReason::NeuralDisabled;
+        out.controls = NeuralDenoiseControls{};
+        out.structuralBypassReason = NeuralBypassReason::UserDisabled;
         return out;
     }
     if (out.controls.noiseReduction <= kNeuralAuthorityBypassEpsilon) {

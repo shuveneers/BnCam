@@ -146,8 +146,6 @@ object LibpatcherProfileResolver {
             // Phase 6: one Neural RAW denoise owner. Physical per-lens sensor calibration
             // remains outside profiles; these controls only shape the one Student residual.
             add(i(ProfileIspKeys.SPECTRA_ENABLED, 0))
-            add(f(ProfileIspKeys.NEURAL_DENOISE_STRENGTH, SpectraProfileDefaults.MASTER_STRENGTH))
-            add(f(ProfileIspKeys.NEURAL_ADAPTIVE_RESPONSE, SpectraProfileDefaults.ADAPTIVE_RESPONSE))
             add(f(ProfileIspKeys.SPECTRA_LUMA, SpectraProfileDefaults.LUMA))
             add(f(ProfileIspKeys.SPECTRA_CHROMA, SpectraProfileDefaults.CHROMA))
             add(f(ProfileIspKeys.SPECTRA_DETAIL, SpectraProfileDefaults.DETAIL_PROTECTION))
@@ -204,6 +202,7 @@ object LibpatcherProfileResolver {
     private fun legacyNoiseCompatibilitySpecs(): List<ProfileSettingSpec> = listOf(
         // Import/export compatibility only. These keys are deliberately excluded from the runtime
         // setting contract and cannot create a second denoise pixel-owner.
+        ProfileSettingSpec(ProfileIspKeys.NEURAL_ADAPTIVE_RESPONSE, ProfileSettingValueType.FLOAT, SpectraProfileDefaults.ADAPTIVE_RESPONSE.toString()),
         ProfileSettingSpec(ProfileIspKeys.SPECTRA_DYNAMIC_ISO, ProfileSettingValueType.FLOAT, SpectraProfileDefaults.ADAPTIVE_RESPONSE.toString()),
         ProfileSettingSpec(ProfileIspKeys.SPECTRA_STRENGTH, ProfileSettingValueType.FLOAT, SpectraProfileDefaults.STRENGTH.toString()),
         ProfileSettingSpec(ProfileIspKeys.DETAIL_NR_LUMINANCE, ProfileSettingValueType.FLOAT, ProfileNoiseReductionDefaults.LUMINANCE.toString()),

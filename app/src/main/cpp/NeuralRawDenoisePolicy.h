@@ -34,7 +34,7 @@ struct NeuralDenoiseControls {
 
 enum class NeuralBypassReason : std::uint16_t {
     None = 0,
-    NeuralDisabled,
+    UserDisabled,
     ZeroAuthority,
     InvalidControls,
     UnsupportedCfa,
@@ -54,7 +54,7 @@ enum class NeuralBypassReason : std::uint16_t {
 inline const char* neuralBypassReasonName(NeuralBypassReason reason) noexcept {
     switch (reason) {
         case NeuralBypassReason::None: return "none";
-        case NeuralBypassReason::NeuralDisabled: return "neural_disabled";
+        case NeuralBypassReason::UserDisabled: return "user_disabled";
         case NeuralBypassReason::ZeroAuthority: return "zero_authority";
         case NeuralBypassReason::InvalidControls: return "invalid_controls";
         case NeuralBypassReason::UnsupportedCfa: return "unsupported_cfa";
@@ -101,7 +101,7 @@ inline NeuralInvocationDecision decideNeuralInvocation(
         return out;
     }
     if (!controls.enabled) {
-        out.bypassReason = NeuralBypassReason::NeuralDisabled;
+        out.bypassReason = NeuralBypassReason::UserDisabled;
         return out;
     }
     if (controls.noiseReduction <= kNeuralAuthorityBypassEpsilon) {

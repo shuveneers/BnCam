@@ -7,6 +7,31 @@ package com.bncam.core.quality
  * S/O vectors are finite, non-negative and contain non-zero noise energy. Camera S/O is retained
  * only as OEM evidence; consumers must use effectiveS/effectiveO.
  */
+
+/**
+ * Canonical Kotlin/JNI physical-noise payload contract.
+ *
+ * The order is always [S_R,O_R,S_Gr,O_Gr,S_Gb,O_Gb,S_B,O_B], independent of RAW10/RAW_SENSOR
+ * storage layout or mosaic-site order. Callers must decide availability before packing; this object
+ * owns serialization only so every RAW route crosses JNI with the exact same channel order.
+ */
+internal object PhysicalNoiseSoContract {
+    const val CHANNEL_COUNT: Int = 4
+    const val VALUE_COUNT: Int = CHANNEL_COUNT * 2
+
+    fun pack(effectiveS: DoubleArray, effectiveO: DoubleArray): DoubleArray {
+        require(effectiveS.size >= CHANNEL_COUNT && effectiveO.size >= CHANNEL_COUNT) {
+            "physical S/O requires four canonical R/Gr/Gb/B channels"
+        }
+        return doubleArrayOf(
+            effectiveS[0], effectiveO[0],
+            effectiveS[1], effectiveO[1],
+            effectiveS[2], effectiveO[2],
+            effectiveS[3], effectiveO[3]
+        )
+    }
+}
+
 class PhysicalNoiseState private constructor(
     val lensKey: String,
     val sourceFormat: String,
@@ -57,13 +82,10 @@ class PhysicalNoiseState private constructor(
         require(confidence.isFinite() && confidence in 0.0f..1.0f) { "confidence must be finite in [0,1]" }
     }
 
-    /** Interleaved [S_R,O_R,S_Gr,O_Gr,S_Gb,O_Gb,S_B,O_B] for legacy/native transport. */
+    /** Canonical JNI payload [S_R,O_R,S_Gr,O_Gr,S_Gb,O_Gb,S_B,O_B]. */
     fun toInterleavedProfileOrNull(): DoubleArray? {
         if (!modelAvailable) return null
-        return DoubleArray(8) { index ->
-            val channel = index / 2
-            if (index % 2 == 0) _effectiveS[channel] else _effectiveO[channel]
-        }
+        return PhysicalNoiseSoContract.pack(_effectiveS, _effectiveO)
     }
 
     /** Physical variance in the normalized RAW domain: Var(x)=S*x+O. */
@@ -74,21 +96,36 @@ class PhysicalNoiseState private constructor(
         return (_effectiveS[channel] * x + _effectiveO[channel]).coerceAtLeast(0.0)
     }
 
+    /**
+     * Phase-9 high-signal authority trace.
+     *
+     * Keys are intentionally source/authority oriented instead of exposing the historical
+     * SensorNoiseProfile mirror. The current product contract has no separate model-ISO override:
+     * the physical model uses capture ISO directly or Dynamic ISO upstream in the resolver.
+     */
     fun tracePairs(): List<Pair<String, String>> = listOf(
-        "Physical Noise Model Available" to modelAvailable.toString(),
-        "Physical Noise Requested Source" to requestedSource,
-        "Physical Noise Effective Source" to effectiveSource,
-        "Physical Noise Provenance" to provenance,
-        "Physical Noise Fallback Reason" to (fallbackReason ?: "none"),
-        "Physical Noise Capture ISO" to captureIso.toString(),
-        "Physical Noise Effective Model ISO" to (effectiveModelIso?.toString() ?: "OEM_DIRECT"),
-        "Physical Noise Dynamic ISO Enabled" to dynamicIsoEnabled.toString(),
-        "Physical Noise Dynamic ISO Coefficient" to (dynamicIsoCoefficient?.toString() ?: "N/A"),
-        "Physical Noise ISO Step" to (isoStep?.toString() ?: "N/A"),
-        "Physical Noise Preset" to (presetName ?: "none"),
-        "Physical Noise Confidence" to confidence.toString(),
-        "Physical Noise Canonical S" to _effectiveS.take(4).joinToString(prefix = "[", postfix = "]"),
-        "Physical Noise Canonical O" to _effectiveO.take(4).joinToString(prefix = "[", postfix = "]")
+        "Selected Source" to requestedSource,
+        "Effective Source" to effectiveSource,
+        "Preset Name / ID" to (presetName ?: "none"),
+        "Capture ISO" to captureIso.toString(),
+        "Effective Noise ISO" to (effectiveModelIso?.toString() ?: "OEM_DIRECT"),
+        "Dynamic ISO Mode" to if (dynamicIsoEnabled) "DYNAMIC" else "CAPTURE_ISO",
+        "Dynamic ISO Coefficient" to (dynamicIsoCoefficient?.toString() ?: "N/A"),
+        "CFA" to "$cfaPattern / $cfaName",
+        "S R" to _effectiveS[0].toString(),
+        "S Gr" to _effectiveS[1].toString(),
+        "S Gb" to _effectiveS[2].toString(),
+        "S B" to _effectiveS[3].toString(),
+        "O R" to _effectiveO[0].toString(),
+        "O Gr" to _effectiveO[1].toString(),
+        "O Gb" to _effectiveO[2].toString(),
+        "O B" to _effectiveO[3].toString(),
+        "Model Valid" to modelAvailable.toString(),
+        "Confidence" to confidence.toString(),
+        "Fallback Reason" to (fallbackReason ?: "none"),
+        "Frozen Capture State" to "true",
+        "Settings Ready" to settingsReady.toString(),
+        "Provenance" to provenance
     )
 
     companion object {

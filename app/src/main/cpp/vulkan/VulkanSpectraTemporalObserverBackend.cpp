@@ -214,9 +214,6 @@ struct ReducedObserver {
                 : 0.0;
         const double heavyTailFraction = static_cast<double>(reduced.heavyTailCount[ch]) /
                 static_cast<double>(std::max<std::uint64_t>(1u, count));
-        const spectra_temporal::InnovationDiagnostics innovation{
-                innovationMean, innovationVariance, innovationLag, heavyTailFraction, count};
-
         double temporalCorrelation = 0.0;
         const double residualWeight = reduced.residualWeightSum[ch];
         if (residualWeight > 64.0) {
@@ -245,73 +242,28 @@ struct ReducedObserver {
         }
         result.temporalCorrelation[ch] = temporalCorrelation;
         result.persistentPatternFraction[ch] = temporalCorrelation;
-        const double correlationCorrection = 1.0 / std::max(0.15, 1.0 - temporalCorrelation);
-
-        std::vector<spectra_temporal::TemporalFitPoint> points;
-        points.reserve(kSignalBins);
+        // FASE 6: the temporal observer is read-only evidence. It may summarize signal
+        // coverage, residual variance and temporal correlation, but it must never fit or
+        // adapt the frozen physical S/O model. Legacy adaptation telemetry remains neutral.
+        int populatedBins = 0;
         double minSignal = 1.0;
         double maxSignal = 0.0;
         for (std::uint32_t bin = 0; bin < kSignalBins; ++bin) {
             const std::uint64_t binSamples = reduced.binCount[ch][bin];
             const double weight = reduced.binWeight[ch][bin];
             if (binSamples < 24u || weight <= 1.0e-12) continue;
-            const double binMeanDiff = reduced.binDiffSum[ch][bin] / weight;
-            const double binVariance = std::max(
-                    0.0, reduced.binDiffSqSum[ch][bin] / weight - binMeanDiff * binMeanDiff);
             const double signal = reduced.binSignalSum[ch][bin] / weight;
-            const double variance = 0.5 * binVariance * correlationCorrection;
-            if (!std::isfinite(signal) || !std::isfinite(variance) || variance <= 0.0) continue;
-            points.push_back({signal, variance, std::sqrt(weight)});
+            if (!std::isfinite(signal)) continue;
+            ++populatedBins;
             minSignal = std::min(minSignal, signal);
             maxSignal = std::max(maxSignal, signal);
         }
-
-        const double signalSpan = points.empty() ? 0.0 : std::max(0.0, maxSignal - minSignal);
-        result.populatedSignalBins[ch] = static_cast<int>(points.size());
-        result.signalSpan[ch] = signalSpan;
-        const auto fit = spectra_temporal::fitTemporalNoiseModel(points, innovation);
-
-        double sScale = 1.0;
-        double oScale = 1.0;
-        double regressionConfidence = 0.0;
-        if (fit.valid && points.size() >= 3u && signalSpan >= 0.035) {
-            if (request.effectiveS[ch] > 1.0e-12) {
-                sScale = std::clamp(
-                        fit.slope / request.effectiveS[ch],
-                        request.adaptationLowerBound, request.adaptationUpperBound);
-            }
-            if (request.effectiveO[ch] > 1.0e-12) {
-                oScale = std::clamp(
-                        fit.offset / request.effectiveO[ch],
-                        request.adaptationLowerBound, request.adaptationUpperBound);
-            }
-            const double sampleConfidence = std::clamp(static_cast<double>(count) / 4096.0, 0.0, 1.0);
-            regressionConfidence = fit.confidence * sampleConfidence;
-            result.fitEstimator[ch] = static_cast<int>(fit.estimator);
-            result.fitPhysicalScore[ch] = fit.metrics.physicalScore;
-        }
-        if (regressionConfidence < 0.05) {
-            const double commonScale = std::clamp(
-                    (observed * correlationCorrection) / predicted,
-                    request.adaptationLowerBound, request.adaptationUpperBound);
-            sScale = commonScale;
-            oScale = commonScale;
-            regressionConfidence = 0.15 * std::clamp(
-                    static_cast<double>(count) / 4096.0, 0.0, 1.0) * result.staticProbabilityP50;
-            result.fitEstimator[ch] = static_cast<int>(spectra_temporal::TemporalFitEstimator::NONE);
-        }
-
-        result.sAdaptationScale[ch] = sScale;
-        result.oAdaptationScale[ch] = oScale;
-        result.adaptationScale[ch] = std::sqrt(std::max(0.0, sScale * oScale));
-        result.regressionConfidence[ch] = regressionConfidence;
-        result.fitInnovationMean[ch] = innovationMean;
-        result.fitInnovationVariance[ch] = innovationVariance;
-        result.fitResidualCorrelation[ch] = innovationLag;
-        result.fitHeavyTailFraction[ch] = heavyTailFraction;
-
-        const double channelConfidence = std::clamp(static_cast<double>(count) / 2048.0, 0.0, 1.0) *
-                std::clamp(0.30 + 0.70 * regressionConfidence, 0.0, 1.0);
+        result.populatedSignalBins[ch] = populatedBins;
+        result.signalSpan[ch] = populatedBins > 0 ? std::max(0.0, maxSignal - minSignal) : 0.0;
+        const double sampleConfidence = std::clamp(static_cast<double>(count) / 2048.0, 0.0, 1.0);
+        const double staticConfidence = std::clamp(0.35 + 0.65 * result.staticProbabilityP50, 0.0, 1.0);
+        const double channelConfidence = sampleConfidence * staticConfidence *
+                std::clamp(static_cast<double>(request.modelConfidence), 0.0, 1.0);
         confidenceSum += channelConfidence;
         correlationWeighted += temporalCorrelation * channelConfidence;
         correlationWeight += channelConfidence;

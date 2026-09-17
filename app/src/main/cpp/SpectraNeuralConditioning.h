@@ -63,6 +63,10 @@ constexpr std::size_t conditioningChannelIndex(SpatialConditioningChannel channe
     return static_cast<std::size_t>(channel);
 }
 
+// Capture-domain identity is validation/telemetry context only. It is deliberately excluded
+// from encodeGlobalConditioning(): RAW10 and RAW_SENSOR must not receive different Neural
+// denoise merely because their storage/container route differs. Genuine physical differences
+// (normalized samples, bit depth, S/O, exposure and evidence) remain model inputs.
 enum class RawCaptureDomain : std::uint8_t {
     Unknown = 0,
     Raw10 = 1,

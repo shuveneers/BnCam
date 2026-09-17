@@ -27,49 +27,11 @@ data class NoiseModelPublicationState(
 )
 
 /**
- * Authoritative SPECTRA 2 trace.
+ * Capture-local observability trace.
  *
- * Schema 22 preserves Schema 21 and adds Milestone-8H-D GPU-primary temporal observer,
- * normalized-innovation/static-probability Vulkan execution and compact CPU robust-fit authority.
- * Schema 21 preserves Schema 20 and adds Milestone-8H-C GPU-primary pre-demosaic
- * Pass 2/Pass 3, compact CPU No-Regret decisions, persistent Vulkan resources and
- * typed CPU fallback without normal full-frame CPU candidate execution.
- * Schema 20 preserves Schema 19 and adds Milestone-8H-B GPU-primary pre-demosaic Pass 1,
- * on-device candidate/No-Regret blending, persistent resources and typed CPU fallback.
- * Schema 19 preserves Milestones 1-8G and adds Milestone-8H production Vulkan-resident
- * visible-chroma filtering, covariance-aware No-Regret final decisions, persistent resources,
- * GPU timing and typed CPU fallback without normal shadow CPU pixel execution.
- * Schema 18 preserves Milestones 1-8F and adds Milestone-8G shadow-qualified Vulkan
- * visible-chroma candidate filtering with shader-equivalence, sampled final-decision
- * compatibility and explicit CPU-authoritative No-Regret telemetry.
- * Schema 17 preserves Milestones 1-8E and adds Milestone-8F bounded striped Vulkan
- * opponent execution, persistent mapped-buffer reuse, strip assembly/memory evidence and
- * route-isolated qualification for the hybrid visible-chroma preprocessing stage.
- * Schema 16 preserves Milestones 1-8D and adds Milestone-8E production-connected Vulkan
- * FP32 opponent-feature shadow qualification, CPU-equivalence evidence, end-to-end transfer/
- * latency gating, next-capture activation and deterministic CPU fallback telemetry.
- * Schema 15 preserves Milestones 1-8C and adds Milestone-8D warm-device profiling,
- * thermal-drift evidence and explicit Vulkan-FP32 runtime, production-kernel, numerical,
- * total-path latency, transfer, thermal and memory qualification gates. Prepared Vulkan
- * scaffolding remains unselected until every gate is backed by a production benchmark.
- * Schema 14 preserves Milestones 1-8B and adds Milestone-8C pixel-kernel backend
- * selection, numerical and latency qualification, fused tile-owned visible-chroma processing,
- * deterministic lock-free telemetry reduction and Pass-2 full-frame-clone observability.
- * Vulkan remains prepared but unselected pending device evidence.
- * Schema 13 added Milestone-8B ARM NEON selection, runtime scalar-equivalence self-test,
- * deterministic scalar fallback and per-stage SIMD lane/dispatch observability.
- * Schema 12 added the Milestone-8A deterministic fused-tiled CPU backend, memory-bandwidth
- * estimates and explicit SIMD/Vulkan non-selection status.
- * Schema 11 preserves Milestones 1-6 and adds Milestone-7 noise-aware downstream ISP
- * observability, quantisation propagation and the final JPEG pre-encode residual state.
- * Schema 10 preserves Milestones 1-5 and adds Milestone-6 temporal-observer and
- * correlation-aware local-fusion observability. Schema 9 added green/luma structure-tensor
- * observability for directional high-frequency filtering and low-confidence isotropic fallback.
- * Schema 8 added the Milestone-4 post-tone visible-chroma correction with propagated
- * R-G/B-G covariance, continuous No-Regret 2.0 and measured pre/post residual observability.
- * Schema 5 added stage-by-stage variance/covariance propagation,
- * actual curve-derivative statistics, a visible-domain Pass 2 target and measured post-ISP
- * opponent residuals. Predicted and measured values remain explicitly separated by domain.
+ * Physical noise authority lives in PhysicalNoiseState; Neural Denoise is the only noise-related
+ * RAW pixel mutation owner. This trace may report observer/residual evidence but must never
+ * select, fit or mutate physical S/O.
  */
 object NoiseModelTrace {
     const val CURRENT_SCHEMA_VERSION = 22
@@ -79,6 +41,7 @@ object NoiseModelTrace {
         jniCalibration: FinalSensorCalibration?,
         nativeStats: String,
         fusionStats: String = "",
+        dynamicIsoCoefficient: Float,
         captureAttemptId: String? = null,
         recipe: CaptureRecipe? = null,
         runnerPerformance: CapturePerformanceTraceSnapshot? = null,
@@ -91,20 +54,6 @@ object NoiseModelTrace {
         val anchor = frames.firstOrNull()
         val renderPreferences = recipe?.executionSettings?.renderPreferences
         val profileNoiseTuning = renderPreferences?.noiseTuning ?: ProfileNoiseTuning()
-        val captureNoiseState = (anchor?.calibration?.noiseSnapshot ?: jniCalibration?.noiseSnapshot)?.let {
-            CaptureNoiseState.from(
-                snapshot = it,
-                profileNoiseTuning = profileNoiseTuning,
-                lensShadingAlreadyApplied = stats.boolean("lensShadingApplied"),
-                lensShadingMapFromMetadata = stats.boolean("lensShadingMapFromMetadata"),
-                lensShadingMapColumns = stats.number("lensShadingMapColumns")?.toInt(),
-                lensShadingMapRows = stats.number("lensShadingMapRows")?.toInt(),
-                lensShadingGainP10 = stats.floatOrNull("spectraCaptureProvenanceShadingGainP10"),
-                lensShadingGainP50 = stats.floatOrNull("spectraCaptureProvenanceShadingGainP50"),
-                lensShadingGainP90 = stats.floatOrNull("spectraCaptureProvenanceShadingGainP90")
-            )
-        }
-
         val residualNoiseState = ResidualNoiseState.fromNativeStats(stats)
         val residualTrace = residualNoiseState.toTraceMap()
         val multiscaleChroma = SpectraChromaBandsTrace.fromNativeStats(stats)
@@ -129,9 +78,8 @@ object NoiseModelTrace {
                 "formula" to "variance = S * x + O",
                 "canonicalSoOrder" to "R,G1,G2,B",
                 "captureIdentity" to captureIdentity(captureAttemptId, recipe, frames),
-                "profileSettings" to profileSettings(recipe),
+                "profileSettings" to profileSettings(recipe, dynamicIsoCoefficient),
                 "frames" to frames.map(::frameMap),
-                "captureNoiseState" to captureNoiseState?.toTraceMap(),
                 "sensorState" to sensorState(anchor, jniCalibration, stats),
                 "passes" to (0..3).associate { index -> "pass$index" to passMap(index, stats) },
                 "noRegret" to (0..3).associate { index -> "pass$index" to noRegretMap(index, stats) },
@@ -184,8 +132,7 @@ object NoiseModelTrace {
                     } else {
                         null
                     }
-                ),
-                "finalRenderOutput" to legacyFinalOutput(anchor, jniCalibration, stats)
+                )
             )
         )
     }
@@ -207,14 +154,16 @@ object NoiseModelTrace {
     )
 
     private fun profileSettings(
-        recipe: CaptureRecipe?
+        recipe: CaptureRecipe?,
+        dynamicIsoCoefficient: Float
     ): Map<String, Any?> {
         val render = recipe?.executionSettings?.renderPreferences
         val noise = render?.noiseTuning ?: ProfileNoiseTuning()
         val nr = render?.noiseReductionTuning ?: ProfileNoiseReductionTuning()
         return linkedMapOf(
             "spectraMode" to (if (noise.spectraEnabled) "Auto" else "Off"),
-            "profileSpectraStrength" to noise.spectraStrength,
+            "dynamicIso" to dynamicIsoCoefficient.coerceIn(-1f, 1f),
+            "neuralMasterAuthority" to noise.neuralDenoiseStrength,
             "profileSpectraLuma" to noise.spectraLuma,
             "profileSpectraChroma" to noise.spectraChroma,
             "profileSpectraDetailProtection" to noise.spectraDetailProtection,
@@ -267,16 +216,9 @@ object NoiseModelTrace {
         return linkedMapOf(
             "captureIso" to (snapshot?.iso ?: stats.number("actualIso")),
             "postRawSensitivityBoost" to snapshot?.postRawSensitivityBoost,
-            // Physical Dynamic ISO is already resolved in Kotlin before JNI. Native `effectiveIso`
-            // is only capture-ISO context for legacy SPECTRA telemetry and must never be confused
-            // with the physical noise-model ISO below.
-            "captureContextIsoNativeTelemetry" to (
+            "effectiveIso" to (
                 stats.number("spectraResidualEffectiveIso") ?: stats.number("effectiveIso")
             ),
-            "physicalNoiseEffectiveModelIso" to snapshot?.physicalNoiseEffectiveModelIso,
-            "physicalNoiseDynamicIsoEnabled" to snapshot?.physicalNoiseDynamicIsoEnabled,
-            "physicalNoiseDynamicIsoCoefficient" to snapshot?.physicalNoiseDynamicIsoCoefficient,
-            "physicalNoiseDynamicIsoOwnership" to "NoiseModelResolver_ONLY",
             "exposureTimeNs" to snapshot?.exposureTimeNs,
             "cfaPattern" to snapshot?.cfaPattern,
             "cfaName" to snapshot?.cfaName,
@@ -820,47 +762,6 @@ object NoiseModelTrace {
         "totalRawIspCoreMs" to stats.number("totalRawIspCoreMs")
     )
 
-    private fun legacyFinalOutput(
-        anchorFrame: NoiseModelTraceFrame?,
-        jniCalibration: FinalSensorCalibration?,
-        stats: Map<String, String>
-    ): Map<String, Any?> {
-        val calibration = anchorFrame?.calibration
-        val sampleCount = stats["sensorNoiseVarianceSamples"]?.toLongOrNull() ?: 0L
-        val nativeApplied = stats["noiseModelApplied"].equals("yes", ignoreCase = true)
-        val applied = nativeApplied && sampleCount > 0L && calibration?.noiseModelMode != "Off"
-        return linkedMapOf(
-            "appliedNoiseModelMode" to (calibration?.noiseModelMode ?: "Off"),
-            "physicalNoiseEffectiveModelIso" to calibration?.noiseSnapshot?.physicalNoiseEffectiveModelIso,
-            "physicalNoiseDynamicIsoEnabled" to calibration?.noiseSnapshot?.physicalNoiseDynamicIsoEnabled,
-            "physicalNoiseDynamicIsoCoefficient" to calibration?.noiseSnapshot?.physicalNoiseDynamicIsoCoefficient,
-            "soValuesSentToJni" to jniCalibration?.effectiveNoiseProfile?.toList().orEmpty(),
-            "soValuesReceivedByCpp" to parseNumberArray(stats["noiseModelSoReceivedByCpp"]),
-            "normalizedSignalSampleCount" to sampleCount,
-            "meanX" to stats.number("meanNormalizedNoiseSignal"),
-            "minX" to stats.number("minNormalizedNoiseSignal"),
-            "maxX" to stats.number("maxNormalizedNoiseSignal"),
-            "meanVariance" to stats.number("meanSensorNoiseVariance"),
-            "minVariance" to stats.number("minSensorNoiseVariance"),
-            "maxVariance" to stats.number("maxSensorNoiseVariance"),
-            "processedPixelCount" to stats.number("processedPixelCount"),
-            "changedPixelCount" to stats.number("changedPixelCount"),
-            "changedPixelFraction" to stats.number("changedPixelFraction"),
-            "meanAbsLumaDelta" to stats.number("meanAbsLumaDelta"),
-            "meanAbsChromaDelta" to stats.number("meanAbsChromaDelta"),
-            "preDenoiseResidualEstimate" to stats.number("preDenoiseResidualEstimate"),
-            "postDenoiseResidualEstimate" to stats.number("postDenoiseResidualEstimate"),
-            "postSharpenResidualEstimate" to stats.number("postSharpenResidualEstimate"),
-            "noiseModelApplied" to applied,
-            "notAppliedReason" to if (applied) {
-                "None"
-            } else {
-                stats["noiseModelReason"]
-                    ?: calibration?.effectiveNoiseProfileFallbackReason?.ifBlank { "None" }
-                    ?: "None"
-            }
-        )
-    }
 
     internal fun parseNativeStats(raw: String): Map<String, String> = raw
         .split(';')
@@ -870,13 +771,6 @@ object NoiseModelTrace {
             else field.substring(0, separator).trim() to field.substring(separator + 1).trim()
         }
         .toMap()
-
-    private fun parseNumberArray(value: String?): List<Double> = value
-        ?.removePrefix("[")
-        ?.removeSuffix("]")
-        ?.split(',')
-        ?.mapNotNull { it.trim().toDoubleOrNull()?.takeIf(Double::isFinite) }
-        .orEmpty()
 
     private fun Map<String, String>.number(key: String): Number? {
         val raw = this[key]?.trim() ?: return null

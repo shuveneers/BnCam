@@ -767,6 +767,15 @@ class MultiFrameRunner(
             finalCalibration.debugPairs().forEach { (key, value) ->
                 shotLogger.recordPipelineEvent("Sensor Calibration Detail", key, value)
             }
+            finalCalibration.noiseSnapshot
+                ?.physicalNoiseState()
+                ?.tracePairs()
+                ?.forEach { (key, value) ->
+                    shotLogger.recordPipelineEvent("Physical Noise Model", key, value)
+                }
+            renderQualityConfig.profileNoiseTuning.authorityDebugPairs().forEach { (key, value) ->
+                shotLogger.recordPipelineEvent("Neural Denoise", key, value)
+            }
 
             // Strikt contract voor ShotLogger mapping (YUV vs RAW netjes gescheiden)
             shotLogger.recordPipelineEvent("Sensor Calibration", "Black Level Source", finalCalibration.effectiveBlackLevelSource)
@@ -783,9 +792,6 @@ class MultiFrameRunner(
             shotLogger.recordPipelineEvent("Sensor Calibration", "WB Source", finalCalibration.effectiveWbSource)
             shotLogger.recordPipelineEvent("Sensor Calibration", "WB Applied", finalCalibration.effectiveWbApplied.toString())
 
-            shotLogger.recordPipelineEvent("Sensor Calibration", "Noise Profile Source", finalCalibration.effectiveNoiseProfileSource)
-            shotLogger.recordPipelineEvent("Sensor Calibration", "Noise Profile Present", (finalCalibration.effectiveNoiseProfile != null).toString())
-            shotLogger.recordPipelineEvent("Sensor Calibration", "Noise Profile Applied", finalCalibration.effectiveNoiseProfileApplied.toString())
 
             capturedSettings.renderPreferences.resolvedIspSettings
                 .debugPairs().forEach { (key, value) ->
@@ -2117,10 +2123,11 @@ class MultiFrameRunner(
 
             if (isRawEnabled) {
                 shotLogger.recordPipelineEvent("Master RAW16 ISP Render", "Stats", masterIspStats)
-                parseNativeStats(masterIspStats).forEach { (key, value) ->
+                val masterRawIspStatsMap = parseNativeStats(masterIspStats)
+                shotLogger.recordNoiseAuthorityNativeStats(masterRawIspStatsMap)
+                masterRawIspStatsMap.forEach { (key, value) ->
                     shotLogger.recordPipelineEvent("Master RAW16 ISP Render", prettyStatKey(key), value)
-                    // 🔥 NIEUW: Native Calibration Bridge
-                    if (key in listOf("hasBlackLevel", "hasWhiteLevel", "hasColorMatrix", "hasWbGains", "hasNoiseProfile", "calibrationApplied", "noiseProfileApplied", "calibrationWarnings")) {
+                    if (key in listOf("hasBlackLevel", "hasWhiteLevel", "hasColorMatrix", "hasWbGains", "calibrationApplied", "calibrationWarnings")) {
                         shotLogger.recordPipelineEvent("Native Calibration", key, value)
                     }
                 }
@@ -2365,6 +2372,7 @@ class MultiFrameRunner(
                     jniCalibration = renderQualityConfig.finalCalibration,
                     nativeStats = if (isRawEnabled) masterIspStats else yuvNativeStats,
                     fusionStats = if (isRawEnabled) jpegMergeStats else "",
+                    dynamicIsoCoefficient = lensHardwareSettings.dynamicIsoCoeff,
                     captureAttemptId = attemptId,
                     recipe = recipe,
                     runnerPerformance = performanceTracker.traceSnapshot(),

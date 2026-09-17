@@ -29,26 +29,19 @@ struct FinalSensorCalibrationNative {
     float effectiveBlackLevels[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     float blackLevelScaleFactor = 1.0f;
 
-    // Compatibility JNI ingress for physical shutter S/O flattened as
-    // S0,O0,S1,O1... in canonical R,Gr,Gb,B order. Native consumers must not treat this
-    // array as an independent authority: native-lib validates it once and copies it into
-    // effectiveS/effectiveO below, which are the sole native physical S/O truth.
-    double effectiveNoiseProfile[16] = {0.0};
+    // FASE 11 canonical native physical-noise contract.
+    // The JNI payload is exactly 8 doubles in canonical R,Gr,Gb,B order:
+    // S_R,O_R,S_Gr,O_Gr,S_Gb,O_Gb,S_B,O_B.
+    // native-lib validates that payload once and stores only these separated vectors.
+    bool physicalNoiseJniPayloadReceived = false;
+    double effectiveS[4] = {0.0};
+    double effectiveO[4] = {0.0};
 
-    // Physical model availability is derived from the validated frozen S/O payload below.
-    // OEM/System/Manual/Preset source identity remains Kotlin snapshot metadata and is never
-    // re-encoded as a native mode integer.
-
-    // SPECTRA is an optional consumer. 0=off, non-zero=requested/eligible; it is not a physical
-    // model source selector. The exact enable decision additionally requires valid physical S/O.
+    // SPECTRA/Neural is an optional consumer, never a physical model selector.
     int spectraProcessingMode = 0;
-    bool hasNoiseProfile = false;
-    bool noiseProfileValid = false;
-    bool noiseProfileApplied = false;
+    int spectraMode = 0;
+    float signalModelConfidence = 0.0f;
     std::string noiseProfileNotAppliedReason = "none";
-
-    int noiseProfilePairCount = 0;
-    int noiseProfileChannelCount = 0;
 
     bool hasBlackLevel = false;
     bool hasWhiteLevel = false;
@@ -65,25 +58,11 @@ struct FinalSensorCalibrationNative {
     NativeRawDomain rawInputDomain = NativeRawDomain::UNKNOWN;
     NativeRawDomain ispWorkingDomain = NativeRawDomain::MASTER_RAW16_NORMALIZED;
 
-    // Optional SPECTRA-consumer metadata. cameraS/cameraO are OEM evidence/telemetry only.
-    // effectiveS/effectiveO are populated exclusively from the validated PhysicalNoiseState
-    // JNI payload and are the sole native physical shutter-noise authority.
-    bool spectraSnapshotPresent = false;
-    std::string spectraLensKey = "unknown";
-    int spectraMode = 0;
-    float signalModelConfidence = 1.0f;
-    double cameraS[4] = {0.0};
-    double cameraO[4] = {0.0};
-    double effectiveS[4] = {0.0};
-    double effectiveO[4] = {0.0};
     int postRawSensitivityBoost = 0;
     std::string lensId = "unknown";
 
     bool physicalNoiseModelAvailable() const noexcept {
-        if (!(hasNoiseProfile && noiseProfileApplied && noiseProfileValid &&
-              noiseProfilePairCount == 4 && noiseProfileChannelCount == 4)) {
-            return false;
-        }
+        if (!physicalNoiseJniPayloadReceived) return false;
         bool hasEnergy = false;
         for (int ch = 0; ch < 4; ++ch) {
             if (!std::isfinite(effectiveS[ch]) || !std::isfinite(effectiveO[ch]) ||
@@ -95,10 +74,8 @@ struct FinalSensorCalibrationNative {
         return hasEnergy;
     }
 
-    // Phase 3: the only native export into Neural conditioning. This is deliberately all-or-none:
-    // no Camera2/OEM fallback, no ISO synthesis, no clamping and no partial-channel recovery.
-    // The float cast is the sole representation change between frozen JNI physical S/O and the
-    // Vulkan/Neural conditioning contract. Invalid physical state exports a zero unavailable model.
+    // The only native export into Neural conditioning. All-or-none: no OEM fallback,
+    // no ISO synthesis, no clamping and no partial-channel recovery.
     FrozenPhysicalNoiseModelNative frozenPhysicalNoiseModel() const noexcept {
         FrozenPhysicalNoiseModelNative out{};
         if (!physicalNoiseModelAvailable()) return out;
@@ -110,7 +87,6 @@ struct FinalSensorCalibrationNative {
         return out;
     }
 };
-
 inline int resolveSpectraProcessingMode(
         bool spectraRequested,
         const FinalSensorCalibrationNative& calibration) noexcept {
@@ -170,8 +146,8 @@ struct NativeRenderQualityConfig {
     int captureSensitivityIso = 0;
 
     // Neural SPECTRA control transport.
-    float profileSpectraStrength = 0.70f;
-    float profileNeuralAdaptiveResponse = 0.45f;
+    float profileSpectraStrength = 1.00f;
+    float profileNeuralAdaptiveResponse = 1.00f;
     float profileSpectraLuma = 0.0f;
     float profileSpectraChroma = 0.0f;
     float profileSpectraDetailProtection = 0.0f;

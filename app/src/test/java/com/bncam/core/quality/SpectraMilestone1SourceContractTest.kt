@@ -80,7 +80,7 @@ class SpectraMilestone1SourceContractTest {
         val schemaVersion = Regex("CURRENT_SCHEMA_VERSION\\s*=\\s*(\\d+)")
             .find(trace)?.groupValues?.get(1)?.toIntOrNull() ?: 0
         assertTrue(schemaVersion >= 7)
-        assertTrue(trace.contains("\"captureNoiseState\""))
+        assertFalse(trace.contains("\"captureNoiseState\""))
         assertTrue(trace.contains("\"residualNoiseState\""))
         assertTrue(trace.contains("\"noRegret\""))
         assertTrue(trace.contains("\"multiFrame\""))

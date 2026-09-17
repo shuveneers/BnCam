@@ -125,16 +125,37 @@ std::vector<int32_t> extractBlackLevelVector(JNIEnv* env, jintArray blackLevelAr
     return values;
 }
 
-std::vector<double> extractFiniteNonNegativeDouble4(JNIEnv* env, jdoubleArray array) {
-    std::vector<double> values(4, 0.0);
-    if (array == nullptr || env->GetArrayLength(array) < 4) return values;
-    jdouble raw[4] = {0.0, 0.0, 0.0, 0.0};
-    env->GetDoubleArrayRegion(array, 0, 4, raw);
-    for (int i = 0; i < 4; ++i) {
-        const double value = static_cast<double>(raw[i]);
-        values[static_cast<size_t>(i)] = std::isfinite(value) && value >= 0.0 ? value : 0.0;
+struct CanonicalPhysicalNoiseSoPayload {
+    std::array<double, 4> s{{0.0, 0.0, 0.0, 0.0}};
+    std::array<double, 4> o{{0.0, 0.0, 0.0, 0.0}};
+    bool valid = false;
+};
+
+CanonicalPhysicalNoiseSoPayload extractCanonicalPhysicalNoiseSo(
+        JNIEnv* env,
+        jdoubleArray array
+) {
+    CanonicalPhysicalNoiseSoPayload out{};
+    if (array == nullptr || env->GetArrayLength(array) != 8) return out;
+    jdouble raw[8] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+    env->GetDoubleArrayRegion(array, 0, 8, raw);
+    bool hasEnergy = false;
+    for (int ch = 0; ch < 4; ++ch) {
+        const double sValue = static_cast<double>(raw[ch * 2]);
+        const double oValue = static_cast<double>(raw[ch * 2 + 1]);
+        if (!std::isfinite(sValue) || !std::isfinite(oValue) || sValue < 0.0 || oValue < 0.0) {
+            return CanonicalPhysicalNoiseSoPayload{};
+        }
+        out.s[static_cast<std::size_t>(ch)] = sValue;
+        out.o[static_cast<std::size_t>(ch)] = oValue;
+        hasEnergy = hasEnergy || sValue > 0.0 || oValue > 0.0;
     }
-    return values;
+    out.valid = hasEnergy;
+    return out;
+}
+
+std::vector<double> physicalNoiseVector(const std::array<double, 4>& values) {
+    return std::vector<double>(values.begin(), values.end());
 }
 
 jbyteArray createJavaByteArray(JNIEnv *env, const std::vector<uint8_t>& cppBuffer) {
@@ -381,17 +402,10 @@ NativeRenderQualityConfig makeQualityConfig(
         jfloatArray colorMatrixArray,
         jboolean colorMatrixFromMetadata,
         jint jpegQuality,
-        jfloat profileSpectraStrength,
         jfloat profileSpectraLuma,
         jfloat profileSpectraChroma,
         jfloat profileSpectraDetailProtection,
         jfloat profileSpectraLowFrequency,
-        jfloat profileNrLuminance,
-        jfloat profileNrLuminanceDetail,
-        jfloat profileNrLuminanceContrast,
-        jfloat profileNrColor,
-        jfloat profileNrColorDetail,
-        jfloat profileNrColorSmoothness,
         jfloat profileToneExposure,
         jfloat profileToneHighlights,
         jfloat profileToneShadows,
@@ -415,24 +429,14 @@ NativeRenderQualityConfig makeQualityConfig(
     cfg.wbFromMetadata = wbFromMetadata == JNI_TRUE;
     cfg.colorMatrixFromMetadata = colorMatrixFromMetadata == JNI_TRUE;
 
-    // Phase 6 neural RAW controls. Master is direct unit authority; existing component
-    // values retain their signed profile storage and are projected in the production policy.
-    cfg.profileSpectraStrength = std::isfinite(profileSpectraStrength)
-            ? std::clamp(profileSpectraStrength, 0.0f, 1.0f) : 0.70f;
+    // FASE 11: On/Off is the sole global Neural gate. Master authority and Adaptive Response
+    // are fixed at 100% and therefore no longer consume JNI slots.
+    cfg.profileSpectraStrength = 1.0f;
+    cfg.profileNeuralAdaptiveResponse = 1.0f;
     cfg.profileSpectraLuma = std::isfinite(profileSpectraLuma) ? std::clamp(profileSpectraLuma, -1.0f, 1.0f) : 0.0f;
     cfg.profileSpectraChroma = std::isfinite(profileSpectraChroma) ? std::clamp(profileSpectraChroma, -1.0f, 1.0f) : 0.0f;
     cfg.profileSpectraDetailProtection = std::isfinite(profileSpectraDetailProtection) ? std::clamp(profileSpectraDetailProtection, -1.0f, 1.0f) : 0.0f;
     cfg.profileSpectraLowFrequency = std::isfinite(profileSpectraLowFrequency) ? std::clamp(profileSpectraLowFrequency, -1.0f, 1.0f) : 0.0f;
-
-    // RAW-only ABI migration: the retired first Profile-NR slot now carries only Adaptive
-    // Response. It is profile-owned 0..1 state and is never derived from capture ISO.
-    cfg.profileNeuralAdaptiveResponse = std::isfinite(profileNrLuminance)
-            ? std::clamp(profileNrLuminance, 0.0f, 1.0f) : 0.45f;
-    (void)profileNrLuminanceDetail;
-    (void)profileNrLuminanceContrast;
-    (void)profileNrColor;
-    (void)profileNrColorDetail;
-    (void)profileNrColorSmoothness;
     cfg.profileToneExposure = std::isfinite(profileToneExposure) ? std::clamp(profileToneExposure, -1.0f, 1.0f) : 0.0f;
     cfg.profileToneHighlights = std::isfinite(profileToneHighlights) ? std::clamp(profileToneHighlights, -1.0f, 1.0f) : 0.0f;
     cfg.profileToneShadows = std::isfinite(profileToneShadows) ? std::clamp(profileToneShadows, -1.0f, 1.0f) : 0.0f;
@@ -2956,12 +2960,7 @@ Java_com_bncam_core_engine_ImageUtils_mergeNativeRaw10DirectRaw16(
         jint maxFramesCap,
         jint maxShiftPixels,
         jfloat alignmentStrictness,
-        jint spectraMode,
-        jboolean temporalNoiseModelEnabled,
-        jboolean spectraAdaptiveCalibrationEnabled,
-        jdoubleArray spectraEffectiveSArray,
-        jdoubleArray spectraEffectiveOArray,
-        jfloat spectraModelConfidence,
+        jdoubleArray physicalNoiseSoArray,
         jboolean fuseSupportFrames,
         jfloatArray exposureScaleToAnchorArray,
         jboolean computationalHdr
@@ -2975,8 +2974,10 @@ Java_com_bncam_core_engine_ImageUtils_mergeNativeRaw10DirectRaw16(
     }
     jint sourceCrop[4] = {0, 0, 0, 0};
     env->GetIntArrayRegion(sourceCropArray, 0, 4, sourceCrop);
-    const std::vector<double> spectraEffectiveS = extractFiniteNonNegativeDouble4(env, spectraEffectiveSArray);
-    const std::vector<double> spectraEffectiveO = extractFiniteNonNegativeDouble4(env, spectraEffectiveOArray);
+    const CanonicalPhysicalNoiseSoPayload physicalNoise =
+            extractCanonicalPhysicalNoiseSo(env, physicalNoiseSoArray);
+    const std::vector<double> physicalEffectiveS = physicalNoiseVector(physicalNoise.s);
+    const std::vector<double> physicalEffectiveO = physicalNoiseVector(physicalNoise.o);
     const std::vector<float> exposureScaleToAnchor = extractPositiveFloatVector(env, exposureScaleToAnchorArray);
 
     DngMergeStats stats{};
@@ -2989,12 +2990,10 @@ Java_com_bncam_core_engine_ImageUtils_mergeNativeRaw10DirectRaw16(
             maxFramesCap,
             maxShiftPixels,
             alignmentStrictness,
-            spectraMode,
-            temporalNoiseModelEnabled == JNI_TRUE,
-            spectraAdaptiveCalibrationEnabled == JNI_TRUE,
-            spectraEffectiveS,
-            spectraEffectiveO,
-            spectraModelConfidence,
+            physicalNoise.valid,
+            physicalEffectiveS,
+            physicalEffectiveO,
+            physicalNoise.valid ? 1.0f : 0.0f,
             fuseSupportFrames == JNI_TRUE,
             exposureScaleToAnchor,
             computationalHdr == JNI_TRUE,
@@ -3028,12 +3027,7 @@ Java_com_bncam_core_engine_ImageUtils_mergeNativeRawSensorDirectRaw16(
         jint maxFramesCap,
         jint maxShiftPixels,
         jfloat alignmentStrictness,
-        jint spectraMode,
-        jboolean temporalNoiseModelEnabled,
-        jboolean spectraAdaptiveCalibrationEnabled,
-        jdoubleArray spectraEffectiveSArray,
-        jdoubleArray spectraEffectiveOArray,
-        jfloat spectraModelConfidence,
+        jdoubleArray physicalNoiseSoArray,
         jboolean fuseSupportFrames,
         jfloatArray exposureScaleToAnchorArray,
         jboolean computationalHdr
@@ -3047,8 +3041,10 @@ Java_com_bncam_core_engine_ImageUtils_mergeNativeRawSensorDirectRaw16(
     }
     jint sourceCrop[4] = {0, 0, 0, 0};
     env->GetIntArrayRegion(sourceCropArray, 0, 4, sourceCrop);
-    const std::vector<double> spectraEffectiveS = extractFiniteNonNegativeDouble4(env, spectraEffectiveSArray);
-    const std::vector<double> spectraEffectiveO = extractFiniteNonNegativeDouble4(env, spectraEffectiveOArray);
+    const CanonicalPhysicalNoiseSoPayload physicalNoise =
+            extractCanonicalPhysicalNoiseSo(env, physicalNoiseSoArray);
+    const std::vector<double> physicalEffectiveS = physicalNoiseVector(physicalNoise.s);
+    const std::vector<double> physicalEffectiveO = physicalNoiseVector(physicalNoise.o);
     const std::vector<float> exposureScaleToAnchor = extractPositiveFloatVector(env, exposureScaleToAnchorArray);
 
     DngMergeStats stats{};
@@ -3061,12 +3057,10 @@ Java_com_bncam_core_engine_ImageUtils_mergeNativeRawSensorDirectRaw16(
             maxFramesCap,
             maxShiftPixels,
             alignmentStrictness,
-            spectraMode,
-            temporalNoiseModelEnabled == JNI_TRUE,
-            spectraAdaptiveCalibrationEnabled == JNI_TRUE,
-            spectraEffectiveS,
-            spectraEffectiveO,
-            spectraModelConfidence,
+            physicalNoise.valid,
+            physicalEffectiveS,
+            physicalEffectiveO,
+            physicalNoise.valid ? 1.0f : 0.0f,
             fuseSupportFrames == JNI_TRUE,
             exposureScaleToAnchor,
             computationalHdr == JNI_TRUE,
@@ -3356,30 +3350,12 @@ Java_com_bncam_core_engine_ImageUtils_renderJpegFromMasterNative(
         jfloatArray colorMatrixArray,
         jboolean colorMatrixFromMetadata,
         jboolean spectraProcessingEnabled,
-        jdoubleArray sensorNoiseProfileArray,
-        jboolean sensorNoiseProfilePresent,
-        jboolean sensorNoiseProfileApplied,
-        jint sensorNoiseProfilePairCount,
-        jint sensorNoiseProfileChannelCount,
-        jboolean spectraSnapshotPresent,
-        jstring spectraLensKeyString,
-        jdoubleArray spectraCameraSArray,
-        jdoubleArray spectraCameraOArray,
-        jdoubleArray spectraEffectiveSArray,
-        jdoubleArray spectraEffectiveOArray,
-        jfloat spectraSignalModelConfidence,
+        jdoubleArray physicalNoiseSoArray,
         jint spectraPostRawSensitivityBoost,
-        jfloat profileSpectraStrength,
         jfloat profileSpectraLuma,
         jfloat profileSpectraChroma,
         jfloat profileSpectraDetailProtection,
         jfloat profileSpectraLowFrequency,
-        jfloat profileNrLuminance,
-        jfloat profileNrLuminanceDetail,
-        jfloat profileNrLuminanceContrast,
-        jfloat profileNrColor,
-        jfloat profileNrColorDetail,
-        jfloat profileNrColorSmoothness,
         jfloat profileToneExposure,
         jfloat profileToneHighlights,
         jfloat profileToneShadows,
@@ -3486,10 +3462,8 @@ Java_com_bncam_core_engine_ImageUtils_renderJpegFromMasterNative(
     NativeRenderQualityConfig qualityConfig = makeQualityConfig(
             env, wbGainsArray, wbFromMetadata, colorMatrixArray, colorMatrixFromMetadata,
             jpegQuality,
-            profileSpectraStrength, profileSpectraLuma, profileSpectraChroma,
+            profileSpectraLuma, profileSpectraChroma,
             profileSpectraDetailProtection, profileSpectraLowFrequency,
-            profileNrLuminance, profileNrLuminanceDetail, profileNrLuminanceContrast,
-            profileNrColor, profileNrColorDetail, profileNrColorSmoothness,
             profileToneExposure, profileToneHighlights, profileToneShadows, profileToneWhites,
             profileToneBlacks, profileToneContrast, profileLocalToneBias,
             profileColorSaturation, profileColorContrast, profilePresenceVibrance,
@@ -3633,104 +3607,32 @@ Java_com_bncam_core_engine_ImageUtils_renderJpegFromMasterNative(
     meta.calibration.spectraProcessingMode = 0;
     meta.calibration.spectraMode = 0;
     meta.calibration.lensId = lensId;
-    const int requestedNoisePairs = std::clamp(static_cast<int>(sensorNoiseProfilePairCount), 0, 8);
-    const int requestedNoiseFloats = requestedNoisePairs * 2;
-    if (sensorNoiseProfilePresent == JNI_TRUE && sensorNoiseProfileApplied == JNI_TRUE &&
-        sensorNoiseProfileArray != nullptr && requestedNoiseFloats > 0 &&
-        env->GetArrayLength(sensorNoiseProfileArray) >= requestedNoiseFloats) {
-        jdouble noiseValues[16] = {0.0};
-        env->GetDoubleArrayRegion(sensorNoiseProfileArray, 0, requestedNoiseFloats, noiseValues);
-        bool validNoise = true;
-        for (int i = 0; i < requestedNoiseFloats; ++i) {
-            const double value = noiseValues[i];
-            if (std::isfinite(value) && value >= 0.0) {
-                meta.calibration.effectiveNoiseProfile[i] = value;
-            } else {
-                validNoise = false;
-                meta.calibration.calibrationWarnings = "invalid negative or non-finite SENSOR_NOISE_PROFILE value";
-                break;
-            }
-        }
-        meta.calibration.hasNoiseProfile = validNoise;
-        meta.calibration.noiseProfileApplied = validNoise;
-        meta.calibration.noiseProfileValid = validNoise;
-        meta.calibration.signalModelConfidence = validNoise ? 1.0f : 0.0f;
-        meta.calibration.noiseProfilePairCount = validNoise ? requestedNoisePairs : 0;
-        meta.calibration.noiseProfileChannelCount = validNoise ? std::clamp(static_cast<int>(sensorNoiseProfileChannelCount), 0, 8) : 0;
-        if (validNoise && requestedNoisePairs == 4 && meta.calibration.noiseProfileChannelCount == 4) {
-            for (int ch = 0; ch < 4; ++ch) {
-                meta.calibration.effectiveS[ch] = meta.calibration.effectiveNoiseProfile[ch * 2];
-                meta.calibration.effectiveO[ch] = meta.calibration.effectiveNoiseProfile[ch * 2 + 1];
-            }
-        }
-    } else {
-        meta.calibration.hasNoiseProfile = false;
-        meta.calibration.noiseProfileApplied = false;
-        meta.calibration.noiseProfilePairCount = 0;
-        meta.calibration.noiseProfileChannelCount = 0;
-        meta.calibration.calibrationWarnings = "SENSOR_NOISE_PROFILE missing or not applied";
+    // FASE 11: exactly one physical-noise JNI carrier. The payload is canonical
+    // R,Gr,Gb,B interleaved S/O and must contain exactly eight finite non-negative values.
+    // No independent presence/applied/count flags and no parallel SPECTRA/OEM S/O arrays exist.
+    const CanonicalPhysicalNoiseSoPayload physicalNoise =
+            extractCanonicalPhysicalNoiseSo(env, physicalNoiseSoArray);
+    meta.calibration.physicalNoiseJniPayloadReceived = physicalNoise.valid;
+    for (int ch = 0; ch < 4; ++ch) {
+        meta.calibration.effectiveS[ch] = physicalNoise.s[static_cast<std::size_t>(ch)];
+        meta.calibration.effectiveO[ch] = physicalNoise.o[static_cast<std::size_t>(ch)];
     }
-    // IMPORTANT: resolve SPECTRA only after the canonical PhysicalNoiseState JNI payload has
-    // populated effectiveS/effectiveO above. Computing this gate before canonical S/O ingress
-    // recreates the historical failure where SPECTRA was requested but native permanently latched
-    // Off, even though the same capture later reported Physical Noise Model Available=true.
+    if (!physicalNoise.valid) {
+        meta.calibration.calibrationWarnings =
+                "PhysicalNoiseState canonical S/O payload missing or invalid";
+    }
+
     const bool physicalNoiseReady = meta.calibration.physicalNoiseModelAvailable();
     const bool spectraRequested = spectraProcessingEnabled == JNI_TRUE;
     meta.calibration.spectraProcessingMode =
             resolveSpectraProcessingMode(spectraRequested, meta.calibration);
     meta.calibration.spectraMode = meta.calibration.spectraProcessingMode;
-    if (spectraRequested && !physicalNoiseReady) {
-        meta.calibration.calibrationWarnings += "; SPECTRA disabled: physical S/O unavailable";
-    }
-
-    // Physical S/O has already been validated above and copied into effectiveS/effectiveO.
-    // The legacy SPECTRA arrays remain in the JNI signature for ABI compatibility only; they
-    // are never allowed to create, replace or rescue physical authority. cameraS/cameraO remain
-    // optional OEM telemetry. A mismatch is reported rather than silently switching authority.
-    auto copyValidatedDouble4 = [&](jdoubleArray source, double destination[4]) -> bool {
-        if (source == nullptr || env->GetArrayLength(source) < 4) return false;
-        jdouble values[4] = {0.0, 0.0, 0.0, 0.0};
-        env->GetDoubleArrayRegion(source, 0, 4, values);
-        for (int i = 0; i < 4; ++i) {
-            if (!std::isfinite(values[i]) || values[i] < 0.0) return false;
-        }
-        for (int i = 0; i < 4; ++i) destination[i] = values[i];
-        return true;
-    };
-
-    meta.calibration.spectraSnapshotPresent = spectraSnapshotPresent == JNI_TRUE;
-    meta.calibration.spectraLensKey = getJniString(env, spectraLensKeyString, lensId.c_str());
-    meta.calibration.postRawSensitivityBoost = std::clamp(static_cast<int>(spectraPostRawSensitivityBoost), 1, 1600);
-    const bool cameraSValid = copyValidatedDouble4(spectraCameraSArray, meta.calibration.cameraS);
-    const bool cameraOValid = copyValidatedDouble4(spectraCameraOArray, meta.calibration.cameraO);
-    if (!cameraSValid || !cameraOValid) {
-        for (int ch = 0; ch < 4; ++ch) {
-            meta.calibration.cameraS[ch] = 0.0;
-            meta.calibration.cameraO[ch] = 0.0;
-        }
-    }
-
-    double compatibilityEffectiveS[4] = {0.0, 0.0, 0.0, 0.0};
-    double compatibilityEffectiveO[4] = {0.0, 0.0, 0.0, 0.0};
-    const bool compatibilitySValid = copyValidatedDouble4(spectraEffectiveSArray, compatibilityEffectiveS);
-    const bool compatibilityOValid = copyValidatedDouble4(spectraEffectiveOArray, compatibilityEffectiveO);
-    if (physicalNoiseReady && compatibilitySValid && compatibilityOValid) {
-        constexpr double kAuthorityMismatchEpsilon = 1.0e-12;
-        bool mismatch = false;
-        for (int ch = 0; ch < 4; ++ch) {
-            mismatch = mismatch ||
-                    std::abs(compatibilityEffectiveS[ch] - meta.calibration.effectiveS[ch]) > kAuthorityMismatchEpsilon ||
-                    std::abs(compatibilityEffectiveO[ch] - meta.calibration.effectiveO[ch]) > kAuthorityMismatchEpsilon;
-        }
-        if (mismatch) {
-            meta.calibration.calibrationWarnings +=
-                    "; legacy SPECTRA effective S/O mismatch ignored; PhysicalNoiseState JNI payload wins";
-        }
-    }
     meta.calibration.signalModelConfidence = physicalNoiseReady ? 1.0f : 0.0f;
-    if (meta.calibration.spectraSnapshotPresent && !physicalNoiseReady) {
+    meta.calibration.postRawSensitivityBoost =
+            std::clamp(static_cast<int>(spectraPostRawSensitivityBoost), 1, 1600);
+    if (spectraRequested && !physicalNoiseReady) {
         meta.calibration.calibrationWarnings +=
-                "; SPECTRA snapshot present without valid PhysicalNoiseState S/O; no authority fallback";
+                "; SPECTRA disabled: physical S/O unavailable";
     }
 
     const int lscColumns = std::max(0, static_cast<int>(lensShadingColumns));
@@ -3794,7 +3696,8 @@ Java_com_bncam_core_engine_ImageUtils_renderJpegFromMasterNative(
         meta.calibration.hasWbGains = true;
     }
     meta.calibration.calibrationApplied = meta.calibration.hasBlackLevel || meta.calibration.hasWhiteLevel ||
-            meta.calibration.hasWbGains || meta.calibration.hasColorMatrix || meta.calibration.hasNoiseProfile;
+            meta.calibration.hasWbGains || meta.calibration.hasColorMatrix ||
+            meta.calibration.physicalNoiseModelAvailable();
 
     if (activeArrayArray != nullptr && env->GetArrayLength(activeArrayArray) >= 4) {
         jint coords[4];
@@ -4059,9 +3962,7 @@ Java_com_bncam_core_engine_ImageUtils_renderJpegFromMasterNative(
             normalizeRequest.blackLevels = rawDomainInfo.effectiveBlackLevelPatternInMasterUnits;
             normalizeRequest.sensorCfaPattern = static_cast<std::uint32_t>(
                     std::clamp(rawDomainInfo.sensorCfaPattern, 0, 3));
-            normalizeRequest.noiseModelValid =
-                    meta.calibration.noiseProfileApplied &&
-                    meta.calibration.signalModelConfidence > 0.0f;
+            normalizeRequest.noiseModelValid = meta.calibration.physicalNoiseModelAvailable();
             for (int ch = 0; ch < 4; ++ch) {
                 normalizeRequest.effectiveS[static_cast<std::size_t>(ch)] =
                         static_cast<float>(std::max(0.0, meta.calibration.effectiveS[ch]));
@@ -4209,10 +4110,10 @@ Java_com_bncam_core_engine_ImageUtils_renderJpegFromMasterNative(
           << ";hasWhiteLevel=" << (meta.calibration.hasWhiteLevel ? "true" : "false")
           << ";hasColorMatrix=" << (meta.calibration.hasColorMatrix ? "true" : "false")
           << ";hasWbGains=" << (meta.calibration.hasWbGains ? "true" : "false")
-          << ";hasNoiseProfile=" << (meta.calibration.hasNoiseProfile ? "true" : "false")
-          << ";noiseProfileApplied=" << (meta.calibration.noiseProfileApplied ? "true" : "false")
-          << ";noiseProfilePairCount=" << meta.calibration.noiseProfilePairCount
-          << ";noiseProfileChannelCount=" << meta.calibration.noiseProfileChannelCount
+          << ";physicalNoiseJniPayloadReceived="
+          << (meta.calibration.physicalNoiseJniPayloadReceived ? "true" : "false")
+          << ";physicalNoiseModelAvailable="
+          << (meta.calibration.physicalNoiseModelAvailable() ? "true" : "false")
           << ";calibrationApplied=" << (meta.calibration.calibrationApplied ? "true" : "false")
           << ";calibrationWarnings=" << meta.calibration.calibrationWarnings
           << ";lensShadingMapFromMetadata=" << (lensShadingFromMetadata == JNI_TRUE ? "true" : "false")

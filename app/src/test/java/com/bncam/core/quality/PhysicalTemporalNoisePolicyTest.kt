@@ -6,7 +6,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
-class TemporalNoiseModelAuthorityPolicyTest {
+class PhysicalTemporalNoisePolicyTest {
     @Test
     fun snapshotIsRequired() {
         val decision = PhysicalTemporalNoisePolicy.resolve(

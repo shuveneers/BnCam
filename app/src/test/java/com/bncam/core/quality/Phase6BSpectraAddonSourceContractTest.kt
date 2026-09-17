@@ -34,10 +34,4 @@ class Phase6BSpectraAddonSourceContractTest {
         assertFalse(text.contains("PhysicalNoiseModelRuntimeRegistry"))
     }
 
-    @Test
-    fun legacyPolicyNoLongerUsesPhysicalAvailabilityToEraseSpectraRequest() {
-        val text = source("app/src/main/java/com/bncam/core/quality/NoiseModelAuthorityPolicy.kt")
-        assertTrue(text.contains("val spectraMode = if (spectraRequested) ON else OFF"))
-        assertFalse(text.contains("if (spectraRequested && physicalModelAvailable)"))
-    }
 }

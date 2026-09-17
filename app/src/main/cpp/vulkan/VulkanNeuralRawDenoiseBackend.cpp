@@ -238,7 +238,7 @@ NeuralVulkanSubmissionTicket VulkanNeuralRawDenoiseBackend::submitAsync(
         ticket.immediate.bypassReason = !request.controls.valid()
                 ? NeuralBypassReason::InvalidControls
                 : (!request.controls.enabled
-                        ? NeuralBypassReason::NeuralDisabled
+                        ? NeuralBypassReason::UserDisabled
                         : NeuralBypassReason::ZeroAuthority);
         ++diag_.bypassed;
         return ticket;

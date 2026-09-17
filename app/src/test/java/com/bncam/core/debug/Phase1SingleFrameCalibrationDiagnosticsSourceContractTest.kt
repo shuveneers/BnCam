@@ -26,7 +26,12 @@ class Phase1SingleFrameCalibrationDiagnosticsSourceContractTest {
         assertFalse("?: \"1023\"" in logger)
         assertFalse("?: \"CaptureResult.COLOR_TRANSFORM\"" in logger)
         assertTrue("?: \"not recorded\"" in logger)
-        assertTrue("Sensor Calibration Detail\" to \"Sensor Noise Profile Source" in logger)
+        assertTrue("Physical Noise Model Authority:" in logger)
+        assertTrue("Neural Denoise Authority:" in logger)
+        assertTrue("JNI Received" in logger)
+        assertTrue("Native Available" in logger)
+        assertFalse("Sensor Noise Profile Applied" in logger)
+        assertFalse("Noise Model Mode" in logger)
     }
     @Test
     fun `white level application is derived from the actual RAW domain`() {

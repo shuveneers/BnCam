@@ -10,19 +10,27 @@ class ProfileV3SettingsSourceContractTest {
     private fun source(path: String) = File(root, path).readText()
 
     @Test
-    fun `spectra has full calibrated master authority without a user strength knob`() {
+    fun `neural denoise profile page is separate from physical noise model ownership`() {
         val ui = source("src/main/java/com/bncam/ui/screens/settings/lens_profiles/ProfileTuningSubScreens.kt")
         val resolver = source("src/main/java/com/bncam/core/quality/LibpatcherProfileResolver.kt")
-        val config = source("src/main/java/com/bncam/core/quality/RenderQualityConfig.kt")
         val characters = source("src/main/java/com/bncam/core/quality/SpectraProfileCharacter.kt")
-        val spectraBlock = ui.substringAfter("fun ProfileSpectraSettingsScreen").substringBefore("fun ProfileMultiFrameSettingsScreen")
+        val neuralBlock = ui.substringAfter("fun ProfileDenoiseSettingsScreen").substringBefore("fun ProfileMultiFrameSettingsScreen")
 
-        assertFalse(spectraBlock.contains("SPECTRA Strength"))
-        assertFalse(spectraBlock.contains("ProfileIspKeys.SPECTRA_STRENGTH"))
-        assertFalse(resolver.contains("ProfileIspKeys.SPECTRA_STRENGTH"))
-        assertTrue(config.contains("spectraStrength = SpectraProfileDefaults.STRENGTH"))
-        assertTrue(characters.contains("there is intentionally no second"))
-        assertFalse(characters.contains("val strength: Float"))
+        assertFalse(ui.contains("fun ProfileSpectraSettingsScreen"))
+        assertTrue(neuralBlock.contains("SettingsTopicScaffold(\"Neural Denoise\""))
+        assertFalse(neuralBlock.contains("key = ProfileIspKeys.NEURAL_DENOISE_STRENGTH"))
+        assertFalse(neuralBlock.contains("title = \"Strength\""))
+        assertFalse(neuralBlock.contains("ProfileIspKeys.NEURAL_ADAPTIVE_RESPONSE"))
+        assertFalse(neuralBlock.contains("title = \"Adaptive Response\""))
+        assertFalse(neuralBlock.contains("NoiseModelSource"))
+        assertFalse(neuralBlock.contains("Manual ISO"))
+        assertFalse(neuralBlock.contains("title = \"Dynamic ISO\""))
+        val runtimeSpecs = resolver.substringAfter("fun runtimeProfileSettingSpecs").substringBefore("private fun legacyNoiseCompatibilitySpecs")
+        assertFalse(runtimeSpecs.contains("ProfileIspKeys.SPECTRA_STRENGTH"))
+        assertFalse(runtimeSpecs.contains("ProfileIspKeys.NEURAL_ADAPTIVE_RESPONSE"))
+        assertTrue(characters.contains("MASTER_AUTHORITY = 1.00f"))
+        assertTrue(characters.contains("ADAPTIVE_RESPONSE = 1.00f"))
+        assertFalse(characters.contains("masterStrength"))
     }
 
     @Test

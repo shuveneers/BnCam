@@ -44,8 +44,6 @@ struct SpectraTemporalObserverRequest {
     std::array<double, 4> effectiveO{0.0, 0.0, 0.0, 0.0};
     float modelConfidence = 0.0f;
     float temporalAuthority = 0.0f;
-    double adaptationLowerBound = 0.92;
-    double adaptationUpperBound = 1.08;
 };
 
 struct SpectraTemporalObserverResult {
@@ -63,21 +61,11 @@ struct SpectraTemporalObserverResult {
 
     std::array<double, 4> observedVariance{0.0, 0.0, 0.0, 0.0};
     std::array<double, 4> predictedVariance{0.0, 0.0, 0.0, 0.0};
-    std::array<double, 4> adaptationScale{1.0, 1.0, 1.0, 1.0};
-    std::array<double, 4> sAdaptationScale{1.0, 1.0, 1.0, 1.0};
-    std::array<double, 4> oAdaptationScale{1.0, 1.0, 1.0, 1.0};
-    std::array<double, 4> regressionConfidence{0.0, 0.0, 0.0, 0.0};
     std::array<double, 4> temporalCorrelation{0.0, 0.0, 0.0, 0.0};
     std::array<double, 4> persistentPatternFraction{0.0, 0.0, 0.0, 0.0};
     std::array<double, 4> signalSpan{0.0, 0.0, 0.0, 0.0};
     std::array<int, 4> populatedSignalBins{0, 0, 0, 0};
     std::array<std::uint64_t, 4> samples{0, 0, 0, 0};
-    std::array<int, 4> fitEstimator{0, 0, 0, 0};
-    std::array<double, 4> fitPhysicalScore{0.0, 0.0, 0.0, 0.0};
-    std::array<double, 4> fitInnovationMean{0.0, 0.0, 0.0, 0.0};
-    std::array<double, 4> fitInnovationVariance{0.0, 0.0, 0.0, 0.0};
-    std::array<double, 4> fitResidualCorrelation{0.0, 0.0, 0.0, 0.0};
-    std::array<double, 4> fitHeavyTailFraction{0.0, 0.0, 0.0, 0.0};
 
     spectra_temporal::StaticProbabilityField staticProbabilityField{};
     double observerConfidence = 0.0;
@@ -107,7 +95,7 @@ struct SpectraTemporalObserverResult {
     float coarseReductionMs = 0.0f;
     float observerKernelMs = 0.0f;
     float staticFieldKernelMs = 0.0f;
-    float compactReductionAndFitMs = 0.0f;
+    float compactReductionAndFitMs = 0.0f; // Legacy trace field name; FASE 6 performs reduction only.
     float synchronizationMs = 0.0f;
     float readbackMs = 0.0f;
     float totalMs = 0.0f;

@@ -1,19 +1,19 @@
 package com.bncam.core.quality
 
 /**
- * Named neural-denoise characters are transparent projections onto the same six
- * user-visible controls. There is no hidden preset state: editing any control
+ * Named neural-denoise characters are transparent projections onto the four
+ * user-visible shaping controls. There is no hidden preset state: editing any control
  * after selecting a character naturally resolves back to Custom.
+ *
+ * Adaptive response is intentionally not a profile control. When Neural Denoise is enabled,
+ * sigma/SNR adaptation runs at full authority (1.0) for every character.
  */
 data class SpectraProfileCharacterValues(
-    val masterStrength: Float,
-    val adaptiveResponse: Float,
     val luma: Float,
     val chroma: Float,
     val detailProtection: Float,
     val lowFrequency: Float
-) {
-}
+)
 
 data class SpectraProfileCharacter(
     val name: String,
@@ -24,9 +24,10 @@ data class SpectraProfileCharacter(
 object SpectraProfileDefaults {
     const val ENABLED = false
 
-    // Phase 6 neural controls. Master and Adaptive Response are direct unit authorities.
-    const val MASTER_STRENGTH = 0.70f
-    const val ADAPTIVE_RESPONSE = 0.45f
+    // Neural On/Off owns the global writeback gate. When enabled, master authority and
+    // sigma/SNR adaptive response are both fixed at 100%.
+    const val MASTER_AUTHORITY = 1.00f
+    const val ADAPTIVE_RESPONSE = 1.00f
 
     // Existing signed component storage is retained so old .bnc profiles remain compatible.
     const val LUMA = 0.20f
@@ -38,8 +39,6 @@ object SpectraProfileDefaults {
     const val STRENGTH = 0.00f
 
     fun values(): SpectraProfileCharacterValues = SpectraProfileCharacterValues(
-        masterStrength = MASTER_STRENGTH,
-        adaptiveResponse = ADAPTIVE_RESPONSE,
         luma = LUMA,
         chroma = CHROMA,
         detailProtection = DETAIL_PROTECTION,
@@ -52,10 +51,8 @@ object SpectraProfileCharacters {
 
     val natural = SpectraProfileCharacter(
         name = "Natural",
-        description = "Balanced neural cleanup with restrained residual authority and strong texture retention.",
+        description = "Balanced neural cleanup with restrained luma/chroma shaping and strong texture retention.",
         values = SpectraProfileCharacterValues(
-            masterStrength = 0.70f,
-            adaptiveResponse = 0.45f,
             luma = SpectraProfileDefaults.LUMA,
             chroma = SpectraProfileDefaults.CHROMA,
             detailProtection = SpectraProfileDefaults.DETAIL_PROTECTION,
@@ -64,10 +61,8 @@ object SpectraProfileCharacters {
     )
     val clean = SpectraProfileCharacter(
         name = "Clean",
-        description = "Cleaner surfaces and colour with stronger neural residual authority.",
+        description = "Cleaner surfaces and colour with stronger luma/chroma and low-frequency cleanup.",
         values = SpectraProfileCharacterValues(
-            masterStrength = 0.85f,
-            adaptiveResponse = 0.65f,
             luma = 0.55f,
             chroma = 0.85f,
             detailProtection = 0.25f,
@@ -78,8 +73,6 @@ object SpectraProfileCharacters {
         name = "Texture",
         description = "Prioritises microtexture and natural grain while still suppressing false colour.",
         values = SpectraProfileCharacterValues(
-            masterStrength = 0.60f,
-            adaptiveResponse = 0.30f,
             luma = -0.10f,
             chroma = 0.40f,
             detailProtection = 0.65f,
@@ -90,8 +83,6 @@ object SpectraProfileCharacters {
         name = "Night",
         description = "Strong low-light chroma and low-frequency cleanup with bounded luminance smoothing.",
         values = SpectraProfileCharacterValues(
-            masterStrength = 0.95f,
-            adaptiveResponse = 0.75f,
             luma = 0.35f,
             chroma = 0.90f,
             detailProtection = 0.15f,
@@ -110,9 +101,7 @@ object SpectraProfileCharacters {
     }
 
     private fun SpectraProfileCharacterValues.near(other: SpectraProfileCharacterValues, tolerance: Float): Boolean =
-        kotlin.math.abs(masterStrength - other.masterStrength) <= tolerance &&
-            kotlin.math.abs(adaptiveResponse - other.adaptiveResponse) <= tolerance &&
-            kotlin.math.abs(luma - other.luma) <= tolerance &&
+        kotlin.math.abs(luma - other.luma) <= tolerance &&
             kotlin.math.abs(chroma - other.chroma) <= tolerance &&
             kotlin.math.abs(detailProtection - other.detailProtection) <= tolerance &&
             kotlin.math.abs(lowFrequency - other.lowFrequency) <= tolerance

@@ -290,19 +290,17 @@ class CaptureRecipe private constructor(
                 "warningCount" to executionSettings.lensHardwareSettings.warnings.size
             ),
             "noiseModelRequest" to linkedMapOf(
-                "neuralDenoiseRequested" to executionSettings.renderPreferences.noiseTuning.spectraEnabled,
-                "physicalNoiseAuthority" to "PhysicalNoiseModelSettingsStore->NoiseModelResolver",
-                "physicalDynamicIsoAuthority" to "NoiseModelResolver_ONLY",
-                "legacyLensDynamicIsoCoefficientMigrationOnly" to executionSettings.lensHardwareSettings.dynamicIsoCoeff,
-                "legacyNoiseModelCalibrationAdjustmentMigrationOnly" to executionSettings.lensHardwareSettings.noiseModelCalibrationAdjustment,
-                "legacyDynamicChromaAuthorityAdjustmentMigrationOnly" to executionSettings.lensHardwareSettings.dynamicChromaAuthorityAdjustment,
-                "legacyDynamicLumaAuthorityAdjustmentMigrationOnly" to executionSettings.lensHardwareSettings.dynamicLumaAuthorityAdjustment,
-                "legacyCalibrationFactorMigrationOnly" to executionSettings.lensHardwareSettings.noiseModelCalibrationFactor,
-                "legacyChromaUserScaleNeutralized" to executionSettings.lensHardwareSettings.chromaUserScale,
-                "legacyLumaUserScaleNeutralized" to executionSettings.lensHardwareSettings.lumaUserScale,
-                "legacyOuterRingAuthorityNeutralized" to executionSettings.lensHardwareSettings.outerRingAuthority,
+                "requestedNoiseModelMode" to (if (executionSettings.renderPreferences.noiseTuning.spectraEnabled) "Auto" else "Off"),
+                "requestedDynamicIsoCoefficient" to executionSettings.lensHardwareSettings.dynamicIsoCoeff,
+                "requestedNoiseModelCalibrationAdjustment" to executionSettings.lensHardwareSettings.noiseModelCalibrationAdjustment,
+                "requestedDynamicChromaAuthorityAdjustment" to executionSettings.lensHardwareSettings.dynamicChromaAuthorityAdjustment,
+                "requestedDynamicLumaAuthorityAdjustment" to executionSettings.lensHardwareSettings.dynamicLumaAuthorityAdjustment,
+                "requestedCalibrationFactor" to executionSettings.lensHardwareSettings.noiseModelCalibrationFactor,
+                "requestedChromaUserScale" to executionSettings.lensHardwareSettings.chromaUserScale,
+                "requestedLumaUserScale" to executionSettings.lensHardwareSettings.lumaUserScale,
+                "requestedOuterRingAuthority" to executionSettings.lensHardwareSettings.outerRingAuthority,
                 "stableLensKey" to executionSettings.lensHardwareSettings.lensId,
-                "physicalNoiseResolutionStage" to "capture_local_snapshot"
+                "noiseModelResolutionStatus" to "pending"
             ),
             "thermalState" to thermalState,
             "captureTimestampEpochMs" to captureTimestampEpochMs,
@@ -447,7 +445,7 @@ private fun CaptureExecutionSettings.frozenCopy(): CaptureExecutionSettings {
 
 
 internal fun RenderQualityPreferencesSnapshot.spectraProfileMap(): Map<String, Any> = linkedMapOf(
-    "spectraStrength" to noiseTuning.spectraStrength,
+    "neuralMasterAuthority" to noiseTuning.neuralDenoiseStrength,
     "spectraLuma" to noiseTuning.spectraLuma,
     "spectraChroma" to noiseTuning.spectraChroma,
     "spectraDetailProtection" to noiseTuning.spectraDetailProtection,

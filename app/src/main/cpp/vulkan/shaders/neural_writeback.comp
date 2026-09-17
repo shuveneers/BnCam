@@ -95,18 +95,14 @@ void main(){
     vec4 controlled=componentControlled(fine,clamp(pc.lumaAuthority,0.0,1.0),clamp(pc.chromaAuthority,0.0,1.0));
     controlled+=clamp(pc.lowFrequencyCleanup,0.0,1.0)*componentControlled(coarse,clamp(pc.lumaAuthority,0.0,1.0),clamp(pc.chromaAuthority,0.0,1.0));
 
-    // Phase 9: physical noise evidence, never sensor/lens identity, owns the clean-frame gate.
-    // Preserve the exact Phase-6 adaptive-response scale and only attenuate it: the new path
-    // can never increase writeback authority above the previous behavior. SNR >= identity
-    // threshold becomes exact identity with a smooth transition from full noise evidence.
-    vec4 invSnr=sigma/(abs(x)+sigma+vec4(1.0e-8));
+    // Physical noise evidence, never sensor/lens identity, owns the clean-frame gate.
+    // Use this SNR envelope exactly once.  The retired Phase-6 sqrt(inverse-SNR) multiplier
+    // described the same physics a second time and collapsed real Neural corrections toward
+    // identity.  SNR >= identity threshold remains exact identity for texture protection.
     vec4 snr=abs(x)/max(sigma,vec4(1.0e-8));
     vec4 noiseEvidence=vec4(1.0)-smoothstep(
         vec4(pc.adaptiveFullEvidenceSnr),vec4(pc.adaptiveIdentitySnr),snr);
-    float response=clamp(pc.adaptiveResponse,0.0,1.0);
-    vec4 phase6AdaptiveGain=mix(
-        vec4(1.0),sqrt(clamp(invSnr,vec4(0.0),vec4(1.0))),response);
-    vec4 adaptiveGain=phase6AdaptiveGain*noiseEvidence;
+    vec4 adaptiveGain=noiseEvidence;
 
     // Detail Protection is a correction gate, not sharpening. Low correction
     // confidence and posterior uncertainty can only reduce mutation authority.

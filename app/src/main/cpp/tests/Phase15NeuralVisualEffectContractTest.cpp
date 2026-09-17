@@ -1,0 +1,101 @@
+#include "../SpectraCoreSnapshot.h"
+#include "../SpectraNeuralAdaptiveAuthority.h"
+#include "../SpectraNeuralConditioning.h"
+#include "../SpectraNeuralResidualControl.h"
+
+#include <array>
+#include <cassert>
+#include <cmath>
+#include <iostream>
+
+using namespace bncam::spectra::neural;
+
+static bool near(float a, float b, float eps = 1.0e-6f) {
+    return std::fabs(a - b) <= eps;
+}
+
+static SpectraCoreSnapshot snapshotWithNoise(float sScale, float oScale) {
+    SpectraCoreSnapshot snapshot{};
+    snapshot.schemaVersion = kSpectraCoreSnapshotSchemaVersion;
+    snapshot.cfa = resolveCanonicalBayerPack(bncam::raw::CFA_RGGB, 0, 0);
+    snapshot.rawWidth = 4000u;
+    snapshot.rawHeight = 3000u;
+    snapshot.noise.shotS = {{
+        0.0010f * sScale,
+        0.0011f * sScale,
+        0.0012f * sScale,
+        0.0013f * sScale,
+    }};
+    snapshot.noise.readO = {{
+        0.000010f * oScale,
+        0.000011f * oScale,
+        0.000012f * oScale,
+        0.000013f * oScale,
+    }};
+    snapshot.noise.trust = 1.0f;
+    snapshot.metadataTrust = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
+    snapshot.blackResidual.trust = 1.0f;
+    snapshot.remainingLsc.mapTrust = 1.0f;
+    return snapshot;
+}
+
+int main() {
+    const auto lowNoise = snapshotWithNoise(0.5f, 0.5f);
+    const auto highNoise = snapshotWithNoise(2.0f, 2.0f);
+    assert(lowNoise.noise.valid());
+    assert(highNoise.noise.valid());
+
+    // Same normalized RAW signal, different physical S/O. A stronger physical model must
+    // predict strictly larger sigma in every canonical CFA channel. This is the code-side
+    // prerequisite for Preset X/Y to drive different neural denoise behavior.
+    constexpr float signal = 0.08f;
+    for (std::size_t i = 0; i < 4; ++i) {
+        const auto ch = static_cast<CanonicalCfaChannel>(i);
+        const float lowSigma = lowNoise.noise.sigma(ch, signal);
+        const float highSigma = highNoise.noise.sigma(ch, signal);
+        assert(std::isfinite(lowSigma));
+        assert(std::isfinite(highSigma));
+        assert(highSigma > lowSigma);
+
+        // Adaptive response is fixed to 100% in production. Higher predicted noise at the
+        // same signal must not receive less denoise authority.
+        const float lowAuthority = neuralAdaptiveAuthorityScale(signal, lowSigma, 1.0f);
+        const float highAuthority = neuralAdaptiveAuthorityScale(signal, highSigma, 1.0f);
+        assert(highAuthority > lowAuthority);
+        // This synthetic pair deliberately moves from high-SNR identity into the active physical
+        // noise envelope.  Require a material authority response so an almost-identity denoiser
+        // can no longer satisfy Phase 15 merely because its residual is non-zero.
+        assert(highAuthority - lowAuthority > 0.20f);
+        assert(lowAuthority >= 0.0f && lowAuthority <= 1.0f);
+        assert(highAuthority >= 0.0f && highAuthority <= 1.0f);
+    }
+
+    // Neural Off is exact identity at the residual-authority layer.
+    NeuralDenoiseControls off = neuralCharacterControls(NeuralCharacterPreset::Natural, false);
+    off.noiseReduction = 0.0f;
+    off.lumaNoise = 0.0f;
+    off.chromaNoise = 0.0f;
+    off.detailProtection = 0.0f;
+    off.lowFrequencyCleanup = 0.0f;
+    off.adaptiveResponse = 0.0f;
+    const std::array<float, 4> predictedResidual{{0.10f, -0.05f, 0.03f, -0.08f}};
+    const auto offResidual = applyNeuralResidualComponentAuthorities(predictedResidual, off);
+    for (float value : offResidual) {
+        assert(near(value, 0.0f));
+    }
+
+    // Neural On is allowed to publish non-zero correction; master/adaptive authority are fixed.
+    const auto on = neuralCharacterControls(NeuralCharacterPreset::Natural, true);
+    assert(on.enabled);
+    assert(near(on.noiseReduction, 1.0f));
+    assert(near(on.adaptiveResponse, 1.0f));
+    const auto onResidual = applyNeuralResidualComponentAuthorities(predictedResidual, on);
+    bool anyNonZero = false;
+    for (float value : onResidual) {
+        anyNonZero = anyNonZero || std::fabs(value) > 1.0e-7f;
+    }
+    assert(anyNonZero);
+
+    std::cout << "PHASE15_NEURAL_VISUAL_EFFECT_CONTRACT_PASS\n";
+    return 0;
+}

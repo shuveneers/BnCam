@@ -14,7 +14,7 @@ class SpectraRuntimeIntegrationSourceContractTest {
     fun temporalPhysicalNoiseIsIndependentFromSpectraToggle() {
         val app = appDir()
         val imageUtils = File(app, "src/main/java/com/bncam/core/engine/ImageUtils.kt").readText()
-        val policy = File(app, "src/main/java/com/bncam/core/quality/TemporalNoiseModelAuthorityPolicy.kt").readText()
+        val policy = File(app, "src/main/java/com/bncam/core/quality/PhysicalTemporalNoisePolicy.kt").readText()
 
         assertTrue(imageUtils.contains("toPhysicalTemporalNoisePayload"))
         assertTrue(imageUtils.contains("spectraMode = 0"))
@@ -46,9 +46,11 @@ class SpectraRuntimeIntegrationSourceContractTest {
 
         assertFalse(config.contains("ProfileIspKeys.SPECTRA_DYNAMIC_ISO"))
         assertFalse(edit.contains("ProfileIspKeys.SPECTRA_DYNAMIC_ISO"))
-        assertTrue(edit.contains("ProfileIspKeys.NEURAL_ADAPTIVE_RESPONSE"))
-        assertTrue(edit.contains("ProfileIspKeys.NEURAL_DENOISE_STRENGTH"))
-        assertTrue(screen.contains("ProfileIspKeys.NEURAL_ADAPTIVE_RESPONSE"))
+        assertFalse(edit.contains("ProfileIspKeys.NEURAL_ADAPTIVE_RESPONSE"))
+        assertFalse(edit.contains("ProfileIspKeys.NEURAL_DENOISE_STRENGTH"))
+        val neuralBlock = screen.substringAfter("fun ProfileDenoiseSettingsScreen").substringBefore("fun ProfileMultiFrameSettingsScreen")
+        assertFalse(neuralBlock.contains("ProfileIspKeys.NEURAL_ADAPTIVE_RESPONSE"))
+        assertFalse(neuralBlock.contains("title = \"Adaptive Response\""))
         assertFalse(screen.contains("val legacyAdaptive"))
     }
 
