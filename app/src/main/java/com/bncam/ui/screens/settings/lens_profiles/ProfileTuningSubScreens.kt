@@ -63,12 +63,9 @@ fun ProfileSpectraSettingsScreen(
     val neuralMaster by repo.getProfileFloat(
         profileId, ProfileIspKeys.NEURAL_DENOISE_STRENGTH, SpectraProfileDefaults.MASTER_STRENGTH
     ).collectAsStateWithLifecycle(initialValue = SpectraProfileDefaults.MASTER_STRENGTH)
-    val legacyAdaptive by repo.getProfileFloat(
-        profileId, ProfileIspKeys.SPECTRA_DYNAMIC_ISO, SpectraProfileDefaults.ADAPTIVE_RESPONSE
-    ).collectAsStateWithLifecycle(initialValue = SpectraProfileDefaults.ADAPTIVE_RESPONSE)
     val adaptiveResponse by repo.getProfileFloat(
-        profileId, ProfileIspKeys.NEURAL_ADAPTIVE_RESPONSE, legacyAdaptive
-    ).collectAsStateWithLifecycle(initialValue = legacyAdaptive)
+        profileId, ProfileIspKeys.NEURAL_ADAPTIVE_RESPONSE, SpectraProfileDefaults.ADAPTIVE_RESPONSE
+    ).collectAsStateWithLifecycle(initialValue = SpectraProfileDefaults.ADAPTIVE_RESPONSE)
     val spectraLuma by repo.getProfileFloat(profileId, ProfileIspKeys.SPECTRA_LUMA, SpectraProfileDefaults.LUMA)
         .collectAsStateWithLifecycle(initialValue = SpectraProfileDefaults.LUMA)
     val spectraChroma by repo.getProfileFloat(profileId, ProfileIspKeys.SPECTRA_CHROMA, SpectraProfileDefaults.CHROMA)

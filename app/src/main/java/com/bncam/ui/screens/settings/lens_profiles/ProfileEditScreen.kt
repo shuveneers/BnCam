@@ -406,8 +406,12 @@ private fun LibpatcherProfileOverview(
     val spectraEnabledInt by repo.getProfileInt(profileId, ProfileIspKeys.SPECTRA_ENABLED, 0)
         .collectAsStateWithLifecycle(initialValue = 0)
     val spectraEnabled = spectraEnabledInt == 1
-    val spectraDynamicIso by repo.getProfileFloat(profileId, ProfileIspKeys.SPECTRA_DYNAMIC_ISO, SpectraProfileDefaults.DYNAMIC_ISO)
-        .collectAsStateWithLifecycle(initialValue = SpectraProfileDefaults.DYNAMIC_ISO)
+    val neuralMasterStrength by repo.getProfileFloat(
+        profileId, ProfileIspKeys.NEURAL_DENOISE_STRENGTH, SpectraProfileDefaults.MASTER_STRENGTH
+    ).collectAsStateWithLifecycle(initialValue = SpectraProfileDefaults.MASTER_STRENGTH)
+    val neuralAdaptiveResponse by repo.getProfileFloat(
+        profileId, ProfileIspKeys.NEURAL_ADAPTIVE_RESPONSE, SpectraProfileDefaults.ADAPTIVE_RESPONSE
+    ).collectAsStateWithLifecycle(initialValue = SpectraProfileDefaults.ADAPTIVE_RESPONSE)
     val spectraLuma by repo.getProfileFloat(profileId, ProfileIspKeys.SPECTRA_LUMA, SpectraProfileDefaults.LUMA)
         .collectAsStateWithLifecycle(initialValue = SpectraProfileDefaults.LUMA)
     val spectraChroma by repo.getProfileFloat(profileId, ProfileIspKeys.SPECTRA_CHROMA, SpectraProfileDefaults.CHROMA)
@@ -418,7 +422,8 @@ private fun LibpatcherProfileOverview(
         .collectAsStateWithLifecycle(initialValue = SpectraProfileDefaults.LOW_FREQUENCY)
     val spectraCharacter = com.bncam.core.quality.SpectraProfileCharacters.infer(
         com.bncam.core.quality.SpectraProfileCharacterValues(
-            dynamicIso = spectraDynamicIso,
+            masterStrength = neuralMasterStrength,
+            adaptiveResponse = neuralAdaptiveResponse,
             luma = spectraLuma,
             chroma = spectraChroma,
             detailProtection = spectraDetail,

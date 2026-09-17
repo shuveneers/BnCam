@@ -13,32 +13,6 @@ data class SpectraProfileCharacterValues(
     val detailProtection: Float,
     val lowFrequency: Float
 ) {
-    /**
-     * Compatibility constructor for the legacy profile-overview inference callsite.
-     * `dynamicIso` is migration input only and maps to Adaptive Response; the active neural
-     * master uses the Phase-6 default until that overview is migrated to the new profile key.
-     * Production capture and the SPECTRA/Denoise controls use the primary six-control API.
-     */
-    @Deprecated(
-        message = "Use masterStrength + adaptiveResponse",
-        replaceWith = ReplaceWith(
-            "SpectraProfileCharacterValues(SpectraProfileDefaults.MASTER_STRENGTH, dynamicIso, luma, chroma, detailProtection, lowFrequency)"
-        )
-    )
-    constructor(
-        dynamicIso: Float,
-        luma: Float,
-        chroma: Float,
-        detailProtection: Float,
-        lowFrequency: Float
-    ) : this(
-        masterStrength = SpectraProfileDefaults.MASTER_STRENGTH,
-        adaptiveResponse = dynamicIso,
-        luma = luma,
-        chroma = chroma,
-        detailProtection = detailProtection,
-        lowFrequency = lowFrequency
-    )
 }
 
 data class SpectraProfileCharacter(
@@ -60,8 +34,7 @@ object SpectraProfileDefaults {
     const val DETAIL_PROTECTION = 0.35f
     const val LOW_FREQUENCY = 0.60f
 
-    // Legacy persistence defaults only. These names are not active runtime neural controls.
-    const val DYNAMIC_ISO = 0.45f
+    // Legacy persistence default only. No legacy Dynamic-ISO value participates in runtime.
     const val STRENGTH = 0.00f
 
     fun values(): SpectraProfileCharacterValues = SpectraProfileCharacterValues(

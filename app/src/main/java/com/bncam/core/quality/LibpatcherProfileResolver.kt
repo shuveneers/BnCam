@@ -204,7 +204,7 @@ object LibpatcherProfileResolver {
     private fun legacyNoiseCompatibilitySpecs(): List<ProfileSettingSpec> = listOf(
         // Import/export compatibility only. These keys are deliberately excluded from the runtime
         // setting contract and cannot create a second denoise pixel-owner.
-        ProfileSettingSpec(ProfileIspKeys.SPECTRA_DYNAMIC_ISO, ProfileSettingValueType.FLOAT, SpectraProfileDefaults.DYNAMIC_ISO.toString()),
+        ProfileSettingSpec(ProfileIspKeys.SPECTRA_DYNAMIC_ISO, ProfileSettingValueType.FLOAT, SpectraProfileDefaults.ADAPTIVE_RESPONSE.toString()),
         ProfileSettingSpec(ProfileIspKeys.SPECTRA_STRENGTH, ProfileSettingValueType.FLOAT, SpectraProfileDefaults.STRENGTH.toString()),
         ProfileSettingSpec(ProfileIspKeys.DETAIL_NR_LUMINANCE, ProfileSettingValueType.FLOAT, ProfileNoiseReductionDefaults.LUMINANCE.toString()),
         ProfileSettingSpec(ProfileIspKeys.DETAIL_NR_LUMINANCE_DETAIL, ProfileSettingValueType.FLOAT, ProfileNoiseReductionDefaults.LUMINANCE_DETAIL.toString()),

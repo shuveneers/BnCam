@@ -85,17 +85,12 @@ fun FinalSensorCalibration.withSpectraNoiseAdapter(): FinalSensorCalibration {
         physical = physical,
         requested = spectraProcessingEnabled
     )
-    val adaptedSnapshot = snapshot.copy(
-        spectraMode = if (input.enabled) "On" else "Off",
-        signalModelConfidence = if (input.enabled) input.physicalConfidence else 0.0f
-    )
     val warning = "SpectraNoiseAdapter: requested=${input.requested}; enabled=${input.enabled}; " +
         "physicalSource=${input.physicalEffectiveSource}; reason=${input.disabledReason}; " +
         "physicalSOImmutable=true"
 
     return copy(
         spectraProcessingEnabled = input.enabled,
-        noiseSnapshot = adaptedSnapshot,
         pipelineWarnings = pipelineWarnings
             .filterNot { it.startsWith("SpectraNoiseAdapter:") }
             .plus(warning)

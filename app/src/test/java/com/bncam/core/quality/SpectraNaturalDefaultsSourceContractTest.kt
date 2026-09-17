@@ -15,12 +15,13 @@ class SpectraNaturalDefaultsSourceContractTest {
 
         assertFalse(SpectraProfileDefaults.ENABLED)
         listOf(
-            "DYNAMIC_ISO", "STRENGTH", "LUMA", "CHROMA", "DETAIL_PROTECTION", "LOW_FREQUENCY"
+            "MASTER_STRENGTH", "ADAPTIVE_RESPONSE", "LUMA", "CHROMA", "DETAIL_PROTECTION", "LOW_FREQUENCY"
         ).forEach { suffix ->
             assertTrue(render.contains("SpectraProfileDefaults.$suffix"))
             assertTrue(tuningUi.contains("SpectraProfileDefaults.$suffix"))
         }
-        assertTrue(resolver.contains("ProfileIspKeys.SPECTRA_DYNAMIC_ISO, SpectraProfileDefaults.DYNAMIC_ISO"))
+        assertTrue(resolver.contains("ProfileIspKeys.NEURAL_ADAPTIVE_RESPONSE, SpectraProfileDefaults.ADAPTIVE_RESPONSE"))
+        assertFalse(render.contains("ProfileIspKeys.SPECTRA_DYNAMIC_ISO"))
         assertTrue(resolver.contains("ProfileIspKeys.SPECTRA_CHROMA, SpectraProfileDefaults.CHROMA"))
         assertTrue(resolver.contains("ProfileIspKeys.SPECTRA_LOW_FREQUENCY, SpectraProfileDefaults.LOW_FREQUENCY"))
         assertTrue(profileUi.contains("Off · \$spectraCharacter latent"))

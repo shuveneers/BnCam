@@ -1,19 +1,15 @@
 package com.bncam.core.quality
 
-internal data class TemporalNoiseModelDecision(
+internal data class PhysicalTemporalNoiseDecision(
     val enabled: Boolean,
-    val adaptiveSpectraCalibration: Boolean,
-    val spectraMode: Int,
     val effectiveS: DoubleArray,
     val effectiveO: DoubleArray,
     val confidence: Float,
     val authoritySource: String
 ) {
     companion object {
-        fun disabled(reason: String) = TemporalNoiseModelDecision(
+        fun disabled(reason: String) = PhysicalTemporalNoiseDecision(
             enabled = false,
-            adaptiveSpectraCalibration = false,
-            spectraMode = 0,
             effectiveS = DoubleArray(4),
             effectiveO = DoubleArray(4),
             confidence = 0.0f,
@@ -23,67 +19,29 @@ internal data class TemporalNoiseModelDecision(
 }
 
 /**
- * Final temporal/native consumer policy after physical-noise authority migration.
+ * Read-only temporal consumer policy for the frozen shutter-time physical noise model.
  *
- * Production authority is exclusively the immutable shutter-time physical snapshot. Legacy
- * FinalSensorCalibration S/O, Camera2-validity flags and retired Off/Auto/Manual mode strings are
- * accepted in the call signature only until the JNI transport is simplified; they can no longer
- * create, replace or rescue physical authority.
- *
- * SPECTRA is a downstream add-on. Its effective on/off decision changes only SPECTRA processing;
- * it never changes the physical S/O vectors or their confidence.
+ * This object never reads SPECTRA/Neural profile state and cannot enable adaptation. Temporal RAW
+ * fusion may use the physical S/O vectors for weighting, but it must not select a source, alter
+ * Dynamic ISO, fit replacement S/O, or let the SPECTRA toggle change physical behavior.
  */
-internal object TemporalNoiseModelAuthorityPolicy {
+internal object PhysicalTemporalNoisePolicy {
     fun resolve(
-        spectraProcessingEnabled: Boolean,
-        spectraModeName: String?,
         snapshotEffectiveS: DoubleArray?,
-        snapshotEffectiveO: DoubleArray?,
-        snapshotConfidence: Float?,
-        effectiveNoiseProfile: DoubleArray?,
-        effectiveNoiseProfileApplied: Boolean,
-        cameraNoiseProfilePresent: Boolean,
-        cameraNoiseProfileValid: Boolean,
-        normalizationCalibrationValid: Boolean,
-        cfaSupportedForBayerNoiseModel: Boolean
-    ): TemporalNoiseModelDecision {
+        snapshotEffectiveO: DoubleArray?
+    ): PhysicalTemporalNoiseDecision {
         val snapshotS = snapshotEffectiveS?.takeIf(::validFour)
         val snapshotO = snapshotEffectiveO?.takeIf(::validFour)
         if (snapshotS == null || snapshotO == null || !hasEnergy(snapshotS, snapshotO)) {
-            return TemporalNoiseModelDecision.disabled("PHYSICAL_SHUTTER_SNAPSHOT_REQUIRED")
+            return PhysicalTemporalNoiseDecision.disabled("PHYSICAL_SHUTTER_SNAPSHOT_REQUIRED")
         }
 
-        // The frozen physical snapshot is deterministic capture authority. SPECTRA fit/observer
-        // confidence is a separate processing metric and must never reduce physical confidence.
-        val physicalConfidence = 1.0f
-        val spectraEnabled = spectraProcessingEnabled
-
-        // Keep compatibility parameters referenced while old call sites/JNI fields still exist.
-        // None of them is allowed to participate in the authority decision anymore.
-        @Suppress("UNUSED_VARIABLE")
-        val retiredCompatibilityInputs = listOf(
-            spectraModeName,
-            snapshotConfidence,
-            effectiveNoiseProfile?.size,
-            effectiveNoiseProfileApplied,
-            cameraNoiseProfilePresent,
-            cameraNoiseProfileValid,
-            normalizationCalibrationValid,
-            cfaSupportedForBayerNoiseModel
-        )
-
-        return TemporalNoiseModelDecision(
+        return PhysicalTemporalNoiseDecision(
             enabled = true,
-            adaptiveSpectraCalibration = spectraEnabled,
-            spectraMode = if (spectraEnabled) 1 else 0,
             effectiveS = snapshotS.copyOf(4),
             effectiveO = snapshotO.copyOf(4),
-            confidence = physicalConfidence,
-            authoritySource = if (spectraEnabled) {
-                "SPECTRA_ADDON_CONSUMES_PHYSICAL_SHUTTER_SO"
-            } else {
-                "PHYSICAL_SHUTTER_SNAPSHOT_FIXED_SO"
-            }
+            confidence = 1.0f,
+            authoritySource = "PHYSICAL_SHUTTER_SNAPSHOT_FIXED_SO"
         )
     }
 

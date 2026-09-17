@@ -14,7 +14,7 @@ import com.bncam.core.quality.RenderQualityConfig
 import com.bncam.core.quality.FocusConfidenceState
 import com.bncam.core.quality.FinalSensorCalibration
 import com.bncam.core.quality.ProfileYuvAwbMapper
-import com.bncam.core.quality.TemporalNoiseModelAuthorityPolicy
+import com.bncam.core.quality.PhysicalTemporalNoisePolicy
 import com.bncam.core.quality.SpectraProfileDefaults
 import com.bncam.data.settings.ResolvedLensHardwareSettings
 import com.bncam.core.isp.raw.MasterRawFrame
@@ -996,36 +996,22 @@ object ImageUtils {
         rotationDegrees = rotationDegrees
     )
 
-    private data class SpectraMergePayload(
+    private data class PhysicalTemporalNoisePayload(
         val temporalNoiseModelEnabled: Boolean,
-        val adaptiveSpectraCalibration: Boolean,
-        val mode: Int,
         val effectiveS: DoubleArray,
         val effectiveO: DoubleArray,
         val confidence: Float,
         val authoritySource: String
     )
 
-    private fun FinalSensorCalibration?.toSpectraMergePayload(): SpectraMergePayload {
-        val calibration = this
-        val snapshot = calibration?.noiseSnapshot
-        val decision = TemporalNoiseModelAuthorityPolicy.resolve(
-            spectraProcessingEnabled = calibration?.spectraProcessingEnabled == true,
-            spectraModeName = snapshot?.spectraMode,
+    private fun FinalSensorCalibration?.toPhysicalTemporalNoisePayload(): PhysicalTemporalNoisePayload {
+        val snapshot = this?.noiseSnapshot
+        val decision = PhysicalTemporalNoisePolicy.resolve(
             snapshotEffectiveS = snapshot?.effectiveS,
-            snapshotEffectiveO = snapshot?.effectiveO,
-            snapshotConfidence = snapshot?.signalModelConfidence,
-            effectiveNoiseProfile = calibration?.effectiveNoiseProfile,
-            effectiveNoiseProfileApplied = calibration?.effectiveNoiseProfileApplied == true,
-            cameraNoiseProfilePresent = calibration?.base?.baseNoiseProfilePresent == true,
-            cameraNoiseProfileValid = calibration?.base?.noiseProfileValid == true,
-            normalizationCalibrationValid = calibration?.normalizationCalibrationValid == true,
-            cfaSupportedForBayerNoiseModel = calibration?.cfaSupportedForBayerNoiseModel == true
+            snapshotEffectiveO = snapshot?.effectiveO
         )
-        return SpectraMergePayload(
+        return PhysicalTemporalNoisePayload(
             temporalNoiseModelEnabled = decision.enabled,
-            adaptiveSpectraCalibration = decision.adaptiveSpectraCalibration,
-            mode = decision.spectraMode,
             effectiveS = decision.effectiveS,
             effectiveO = decision.effectiveO,
             confidence = decision.confidence,
@@ -1047,7 +1033,7 @@ object ImageUtils {
         exposureScaleToAnchor: FloatArray = FloatArray(buffers.size) { 1f },
         computationalHdr: Boolean = false
     ): NativeRaw16Buffer? {
-        val spectra = finalCalibration.toSpectraMergePayload()
+        val physicalTemporalNoise = finalCalibration.toPhysicalTemporalNoisePayload()
         return createNativeRaw16Buffer(
             route = "RAW10_NATIVE_MASTER",
             sourceFormat = android.graphics.ImageFormat.RAW10,
@@ -1068,12 +1054,12 @@ object ImageUtils {
             maxFramesCap = maxFramesCap.coerceAtLeast(1),
             maxShiftPixels = maxShiftPixels,
             alignmentStrictness = alignmentStrictness,
-            spectraMode = spectra.mode,
-            temporalNoiseModelEnabled = spectra.temporalNoiseModelEnabled,
-            spectraAdaptiveCalibrationEnabled = spectra.adaptiveSpectraCalibration,
-            spectraEffectiveS = spectra.effectiveS,
-            spectraEffectiveO = spectra.effectiveO,
-            spectraModelConfidence = spectra.confidence,
+            spectraMode = 0, // JNI compatibility only: SPECTRA no longer owns temporal physical-noise authority.
+            temporalNoiseModelEnabled = physicalTemporalNoise.temporalNoiseModelEnabled,
+            spectraAdaptiveCalibrationEnabled = false, // FASE 5: frozen physical S/O cannot be adapted by SPECTRA.
+            spectraEffectiveS = physicalTemporalNoise.effectiveS,
+            spectraEffectiveO = physicalTemporalNoise.effectiveO,
+            spectraModelConfidence = physicalTemporalNoise.confidence,
             fuseSupportFrames = fuseSupportFrames,
             exposureScaleToAnchor = selectedExposureScales,
             computationalHdr = computationalHdr
@@ -1095,7 +1081,7 @@ object ImageUtils {
         exposureScaleToAnchor: FloatArray = FloatArray(buffers.size) { 1f },
         computationalHdr: Boolean = false
     ): NativeRaw16Buffer? {
-        val spectra = finalCalibration.toSpectraMergePayload()
+        val physicalTemporalNoise = finalCalibration.toPhysicalTemporalNoisePayload()
         return createNativeRaw16Buffer(
             route = "RAW_SENSOR_NATIVE_MASTER",
             sourceFormat = android.graphics.ImageFormat.RAW_SENSOR,
@@ -1116,12 +1102,12 @@ object ImageUtils {
             maxFramesCap = maxFramesCap.coerceAtLeast(1),
             maxShiftPixels = maxShiftPixels,
             alignmentStrictness = alignmentStrictness,
-            spectraMode = spectra.mode,
-            temporalNoiseModelEnabled = spectra.temporalNoiseModelEnabled,
-            spectraAdaptiveCalibrationEnabled = spectra.adaptiveSpectraCalibration,
-            spectraEffectiveS = spectra.effectiveS,
-            spectraEffectiveO = spectra.effectiveO,
-            spectraModelConfidence = spectra.confidence,
+            spectraMode = 0, // JNI compatibility only: SPECTRA no longer owns temporal physical-noise authority.
+            temporalNoiseModelEnabled = physicalTemporalNoise.temporalNoiseModelEnabled,
+            spectraAdaptiveCalibrationEnabled = false, // FASE 5: frozen physical S/O cannot be adapted by SPECTRA.
+            spectraEffectiveS = physicalTemporalNoise.effectiveS,
+            spectraEffectiveO = physicalTemporalNoise.effectiveO,
+            spectraModelConfidence = physicalTemporalNoise.confidence,
             fuseSupportFrames = fuseSupportFrames,
             exposureScaleToAnchor = selectedExposureScales,
             computationalHdr = computationalHdr

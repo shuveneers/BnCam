@@ -541,12 +541,6 @@ data class RenderQualityConfig(
             val gammaPreset = loadCurvePreset(repo, profileId, ProfileCurveDefaults.TYPE_GAMMA)
             val sectionPreset = loadCurvePreset(repo, profileId, ProfileCurveDefaults.TYPE_SECT)
             val profileAwb = repo.getProfileAwbSettingsFlow(profileId).first()
-            // Phase 6 migration: old Dynamic ISO storage can seed Adaptive Response once, but
-            // the runtime control itself is profile-owned and never reads capture ISO.
-            val legacyAdaptiveResponse = readProfileFloatOrFallback(
-                repo, profileId, ProfileIspKeys.SPECTRA_DYNAMIC_ISO,
-                SpectraProfileDefaults.ADAPTIVE_RESPONSE, 0f..1f
-            )
             val noiseTuning = ProfileNoiseTuning(
                 spectraEnabled = readProfileIntOrFallback(repo, profileId, ProfileIspKeys.SPECTRA_ENABLED, 0) == 1,
                 neuralDenoiseStrength = readProfileFloatOrFallback(
@@ -555,7 +549,7 @@ data class RenderQualityConfig(
                 ),
                 neuralAdaptiveResponse = readProfileFloatOrFallback(
                     repo, profileId, ProfileIspKeys.NEURAL_ADAPTIVE_RESPONSE,
-                    legacyAdaptiveResponse, 0f..1f
+                    SpectraProfileDefaults.ADAPTIVE_RESPONSE, 0f..1f
                 ),
                 spectraLuma = readProfileFloatOrFallback(repo, profileId, ProfileIspKeys.SPECTRA_LUMA, SpectraProfileDefaults.LUMA, -1f..1f),
                 spectraChroma = readProfileFloatOrFallback(repo, profileId, ProfileIspKeys.SPECTRA_CHROMA, SpectraProfileDefaults.CHROMA, -1f..1f),
