@@ -44,20 +44,23 @@ vec4 sampleVariance3(vec4 a, vec4 b, vec4 c) {
 }
 
 vec4 postPhysicalResidualVariance(uint x, uint y, vec4 center, vec4 modelVariance) {
-    // Production Neural receives the hard-physical RAW-finalize output. S/O therefore describes
-    // the pre-baseline physical noise budget, not noise that is still present after baseline NR.
-    // Measure the remaining same-CFA C4 variance from the actual post-physical image and use the
-    // original S/O variance only as a physical upper bound. Dynamic ISO is already inside S/O;
-    // it is deliberately not multiplied or otherwise applied a second time here.
+    // Production Neural receives the hard-physical RAW-finalize output. Effective S/O is the
+    // physical pre-baseline budget after the upstream Dynamic-ISO resolver has already done its
+    // one permitted coefficient application. Neural must only act on noise that remains after
+    // physical baseline NR, with effective S/O used strictly as an upper bound.
+    //
+    // Missing spatial evidence is fail-closed: do not resurrect the complete pre-baseline S/O
+    // budget at borders or after invalid samples. Zero residual variance maps to the numerical
+    // sigma floor and therefore to effectively identity correction authority.
     if (x == 0u || y == 0u || x + 1u >= pc.fullW || y + 1u >= pc.fullH) {
-        return modelVariance;
+        return vec4(0.0);
     }
     vec4 left = rawAt(x - 1u, y);
     vec4 right = rawAt(x + 1u, y);
     vec4 up = rawAt(x, y - 1u);
     vec4 down = rawAt(x, y + 1u);
     if (!finite4(center) || !finite4(left) || !finite4(right) || !finite4(up) || !finite4(down)) {
-        return modelVariance;
+        return vec4(0.0);
     }
     vec4 horizontal = sampleVariance3(left, center, right);
     vec4 vertical = sampleVariance3(up, center, down);
