@@ -35,6 +35,7 @@ uvec2 channelOffset(uint c) {
 
 vec4 shotS() { return vec4(pc.shotS0, pc.shotS1, pc.shotS2, pc.shotS3); }
 vec4 readO() { return vec4(pc.readO0, pc.readO1, pc.readO2, pc.readO3); }
+bool finiteVec4(vec4 v) { return !(any(isnan(v)) || any(isinf(v))); }
 
 shared vec4 reductionPartial[EFFECT_SLOT_COUNT * LOCAL_COUNT];
 
@@ -56,11 +57,41 @@ vec4 finiteNonNegativePosterior(uint packedBase) {
     return v;
 }
 
-bool finiteVec4(vec4 v) {
-    return !(any(isnan(v)) || any(isinf(v)));
+vec4 packedAt(uint x, uint y) {
+    uint base = (y * pc.packedWidth + x) * 4u;
+    return vec4(src.data[base + 0u], src.data[base + 1u], src.data[base + 2u], src.data[base + 3u]);
 }
 
-void accumulateEffectSample(uint packedBase, inout vec4 sums[EFFECT_SLOT_COUNT]) {
+vec4 sampleVariance3(vec4 a, vec4 b, vec4 c) {
+    vec4 mean = (a + b + c) * (1.0 / 3.0);
+    vec4 da = a - mean;
+    vec4 db = b - mean;
+    vec4 dc = c - mean;
+    return 0.5 * (da * da + db * db + dc * dc);
+}
+
+vec4 postPhysicalResidualVariance(uint px, uint py, vec4 center, vec4 modelVariance) {
+    // Effect telemetry mirrors production Neural conditioning exactly. The bridge input is already
+    // hard-physical output. Effective S/O is the pre-baseline upper bound after Dynamic ISO has
+    // been resolved once upstream; it is never a second Neural strength multiplier.
+    // Missing residual evidence is fail-closed rather than restoring the full pre-baseline budget.
+    if (px == 0u || py == 0u || px + 1u >= pc.packedWidth || py + 1u >= pc.packedHeight) {
+        return vec4(0.0);
+    }
+    vec4 left = packedAt(px - 1u, py);
+    vec4 right = packedAt(px + 1u, py);
+    vec4 up = packedAt(px, py - 1u);
+    vec4 down = packedAt(px, py + 1u);
+    if (!finiteVec4(center) || !finiteVec4(left) || !finiteVec4(right) ||
+        !finiteVec4(up) || !finiteVec4(down)) {
+        return vec4(0.0);
+    }
+    vec4 horizontal = sampleVariance3(left, center, right);
+    vec4 vertical = sampleVariance3(up, center, down);
+    return min(modelVariance, max(min(horizontal, vertical), vec4(0.0)));
+}
+
+void accumulateEffectSample(uint px, uint py, uint packedBase, inout vec4 sums[EFFECT_SLOT_COUNT]) {
     const vec4 x = vec4(src.data[packedBase + 0u], src.data[packedBase + 1u],
                         src.data[packedBase + 2u], src.data[packedBase + 3u]);
     const vec4 clean = vec4(cleanBuf.data[packedBase + 0u], cleanBuf.data[packedBase + 1u],
@@ -75,7 +106,8 @@ void accumulateEffectSample(uint packedBase, inout vec4 sums[EFFECT_SLOT_COUNT])
 
     const vec4 delta = x - clean;
     const vec4 absDelta = abs(delta);
-    const vec4 variance = max(shotS() * clamp(x, vec4(0.0), vec4(1.0)) + readO(), vec4(1.0e-12));
+    const vec4 modelVariance = max(shotS() * clamp(x, vec4(0.0), vec4(1.0)) + readO(), vec4(0.0));
+    const vec4 variance = max(postPhysicalResidualVariance(px, py, x, modelVariance), vec4(1.0e-12));
     const vec4 sigma = sqrt(variance);
     const vec4 deltaSigma = delta / sigma;
     const vec4 snr = abs(x) / sigma;
@@ -129,8 +161,7 @@ void reduceAndWrite(uint outputGroupIndex, uint slotCount) {
     if (lid == 0u) {
         const uint outBase = outputGroupIndex * slotCount * 4u;
         for (uint slot = 0u; slot < slotCount; ++slot) {
-            vec4 value;
-            value = reductionPartial[slot * LOCAL_COUNT];
+            vec4 value = reductionPartial[slot * LOCAL_COUNT];
             dst.data[outBase + slot * 4u + 0u] = value.x;
             dst.data[outBase + slot * 4u + 1u] = value.y;
             dst.data[outBase + slot * 4u + 2u] = value.z;
@@ -155,7 +186,7 @@ void main() {
                 const uint px = startX + dx;
                 if (px >= pc.packedWidth) continue;
                 const uint packedBase = (py * pc.packedWidth + px) * 4u;
-                accumulateEffectSample(packedBase, sums);
+                accumulateEffectSample(px, py, packedBase, sums);
             }
         }
         for (uint slot = 0u; slot < EFFECT_SLOT_COUNT; ++slot) {
@@ -169,8 +200,7 @@ void main() {
 
     const uint px = gl_GlobalInvocationID.x;
     const uint py = gl_GlobalInvocationID.y;
-    bool insidePacked;
-    insidePacked = (px < pc.packedWidth) && (py < pc.packedHeight);
+    const bool insidePacked = (px < pc.packedWidth) && (py < pc.packedHeight);
     const uint packedBase = insidePacked ? (py * pc.packedWidth + px) * 4u : 0u;
 
     if (pc.mode == 2u) {
