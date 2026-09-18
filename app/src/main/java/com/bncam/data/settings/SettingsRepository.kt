@@ -787,36 +787,6 @@ class SettingsRepository(private val context: Context) {
         }
     }
 
-    fun getProfileAwbSettingsFlow(profileId: String): Flow<ProfileAwbSettings> {
-        return context.dataStore.data.map { preferences ->
-            ProfileAwbSettings(
-                mode = preferences[stringPreferencesKey("${profileId}_awb_mode")]
-                    ?: ProfileAwbModes.SYSTEM_AUTO,
-                brand = preferences[stringPreferencesKey("${profileId}_awb_brand")] ?: "Canon",
-                preset = preferences[stringPreferencesKey("${profileId}_awb_preset")] ?: "Daylight",
-                kelvin = preferences[intPreferencesKey("${profileId}_awb_kelvin")] ?: 5200,
-                illuminantModel = preferences[stringPreferencesKey("${profileId}_awb_model")]
-                    ?: ProfileAwbModels.CIE_DAYLIGHT,
-                tint = preferences[floatPreferencesKey("${profileId}_awb_tint")] ?: 0f,
-                referenceIntensity = preferences[floatPreferencesKey("${profileId}_awb_reference_intensity")] ?: 1f
-            ).sanitized()
-        }
-    }
-
-    /** Writes the complete profile AWB tuple in one DataStore transaction. */
-    suspend fun setProfileAwbSettings(profileId: String, settings: ProfileAwbSettings) {
-        val safe = settings.sanitized()
-        context.dataStore.edit { preferences ->
-            preferences[stringPreferencesKey("${profileId}_awb_mode")] = safe.mode
-            preferences[stringPreferencesKey("${profileId}_awb_brand")] = safe.brand
-            preferences[stringPreferencesKey("${profileId}_awb_preset")] = safe.preset
-            preferences[intPreferencesKey("${profileId}_awb_kelvin")] = safe.kelvin
-            preferences[stringPreferencesKey("${profileId}_awb_model")] = safe.illuminantModel
-            preferences[floatPreferencesKey("${profileId}_awb_tint")] = safe.tint
-            preferences[floatPreferencesKey("${profileId}_awb_reference_intensity")] = safe.referenceIntensity
-        }
-    }
-
     // ==========================================
     // 4. UNIVERSELE PIPELINE SETTINGS (De GCam logica)
     // ==========================================
@@ -1310,7 +1280,6 @@ class SettingsRepository(private val context: Context) {
                 key.startsWith("curve_") && key.contains("_point_") -> finite.coerceIn(0f, 1f)
                 key == ProfileIspKeys.PRESENCE_POP -> finite.coerceIn(0f, 1f)
                 key == ProfileIspKeys.SPECTRA_DYNAMIC_ISO -> finite.coerceIn(0f, 1f)
-                key == "awb_reference_intensity" -> finite.coerceIn(0f, 1.5f)
                 key == ProfileIspKeys.DETAIL_NR_LUMINANCE ||
                     key == ProfileIspKeys.DETAIL_NR_LUMINANCE_DETAIL ||
                     key == ProfileIspKeys.DETAIL_NR_LUMINANCE_CONTRAST ||

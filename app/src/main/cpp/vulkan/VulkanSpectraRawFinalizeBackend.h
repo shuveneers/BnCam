@@ -39,6 +39,10 @@ struct SpectraRawFinalizeRequest {
     std::array<float, 4> effectiveS{0.0f, 0.0f, 0.0f, 0.0f};
     std::array<float, 4> effectiveO{0.0f, 0.0f, 0.0f, 0.0f};
 
+    // Relative Camera2/GCam-calibrated green-even/green-odd WB ratio. The shader applies
+    // this prior before sampling the residual green split, then applies only the measured residual.
+    float greenCalibrationRatio = 1.0f;
+
     const float* lensShadingMap = nullptr;
     std::uint32_t lensShadingColumns = 0;
     std::uint32_t lensShadingRows = 0;

@@ -10,8 +10,6 @@ import com.bncam.data.settings.ProfileDetailDefaults
 import com.bncam.data.settings.ProfileNoiseReductionDefaults
 import com.bncam.data.settings.ProfilePlannedDefaults
 import com.bncam.data.settings.ProfileSharpnessMethods
-import com.bncam.data.settings.ProfileAwbModes
-import com.bncam.data.settings.ProfileAwbModels
 import com.bncam.data.settings.SettingsRepository
 import kotlinx.coroutines.flow.first
 import java.util.Locale
@@ -165,15 +163,6 @@ object LibpatcherProfileResolver {
             add(f(ProfileIspKeys.DETAIL_SHARPENING_LEGIBILITY, ProfilePlannedDefaults.LEGIBILITY))
             add(f(ProfileIspKeys.DETAIL_SHARPENING_ANTI_ZIPPER, ProfilePlannedDefaults.ANTI_ZIPPER))
             add(f(ProfileIspKeys.DETAIL_SHARPENING_MASKING, ProfileDetailDefaults.MASKING))
-
-            // Complete profile AWB tuple.
-            add(s("awb_mode", ProfileAwbModes.SYSTEM_AUTO))
-            add(s("awb_brand", "Canon"))
-            add(s("awb_preset", "Daylight"))
-            add(i("awb_kelvin", 5200))
-            add(s("awb_model", ProfileAwbModels.CIE_DAYLIGHT))
-            add(f("awb_tint"))
-            add(f("awb_reference_intensity", 1f))
 
             // Capture-route settings owned by the profile.
             add(s(CaptureSettingKeys.ALIGNMENT_METHOD, "Auto"))

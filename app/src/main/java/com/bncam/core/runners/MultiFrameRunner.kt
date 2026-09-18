@@ -724,8 +724,7 @@ class MultiFrameRunner(
                     frameSourceFormat = activeZslFormat,
                     characteristics = calibrationInput.characteristics,
                     sensorMetadata = calibrationInput.sensorMetadata,
-                    lensSettings = lensHardwareSettings,
-                    profileAwbSettings = capturedSettings.renderPreferences.profileAwb
+                    lensSettings = lensHardwareSettings
                 )
                 NoiseModelTraceFrame(
                     captureId = "${activeLens.id}-$shutterTimestampNs",
@@ -791,7 +790,12 @@ class MultiFrameRunner(
 
             shotLogger.recordPipelineEvent("Sensor Calibration", "WB Source", finalCalibration.effectiveWbSource)
             shotLogger.recordPipelineEvent("Sensor Calibration", "WB Applied", finalCalibration.effectiveWbApplied.toString())
-
+            shotLogger.recordPipelineEvent("AWB Calibration", "Source", finalCalibration.awbCalibrationSource)
+            shotLogger.recordPipelineEvent("AWB Calibration", "Fingerprint", finalCalibration.awbCalibrationFingerprint)
+            shotLogger.recordPipelineEvent("AWB Calibration", "Authority", finalCalibration.awbCalibrationAuthority.toString())
+            shotLogger.recordPipelineEvent("AWB Calibration", "GR/GB", finalCalibration.awbGrGbRatio?.toString() ?: "not supplied")
+            shotLogger.recordPipelineEvent("AWB Calibration", "G_even/G_odd", finalCalibration.awbGreenEvenOddRatio.toString())
+            shotLogger.recordPipelineEvent("AWB Calibration", "DNG Override", "false")
 
             capturedSettings.renderPreferences.resolvedIspSettings
                 .debugPairs().forEach { (key, value) ->

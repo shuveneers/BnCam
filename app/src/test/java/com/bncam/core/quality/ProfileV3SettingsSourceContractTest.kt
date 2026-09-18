@@ -97,14 +97,16 @@ class ProfileV3SettingsSourceContractTest {
     }
 
     @Test
-    fun `awb intensity is universal and bounded in log gain space`() {
-        val ui = source("src/main/java/com/bncam/ui/screens/settings/lens_profiles/ProfileAwbSettingsScreen.kt")
-        val resolver = source("src/main/java/com/bncam/core/quality/ProfileAwbResolver.kt")
+    fun `awb is not a profile setting and is owned by lens calibration`() {
+        val editor = source("src/main/java/com/bncam/ui/screens/settings/lens_profiles/ProfileEditScreen.kt")
+        val resolver = source("src/main/java/com/bncam/core/quality/LibpatcherProfileResolver.kt")
         val settings = source("src/main/java/com/bncam/data/settings/ProfileLensTuningSettings.kt")
-        assertTrue(ui.contains("title = \"AWB intensity\""))
-        assertTrue(ui.contains("valueRange = 0f..1.5f"))
-        assertTrue(resolver.contains("logBlendGains"))
-        assertTrue(settings.contains("coerceIn(0f, 1.5f)"))
+        val lens = source("src/main/java/com/bncam/ui/screens/settings/lens_profiles/LensDetailScreen.kt")
+        assertFalse(editor.contains("title = \"AWB\""))
+        assertFalse(resolver.contains("awb_reference_intensity"))
+        assertFalse(settings.contains("ProfileAwb"))
+        assertTrue(lens.contains("title = \"AWB\""))
+        assertTrue(lens.contains("onNavigateToAwbCalibration"))
     }
     @Test
     fun `long choice dialogs scroll and curve tabs inherit dark background`() {

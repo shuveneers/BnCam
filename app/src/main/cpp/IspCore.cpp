@@ -2397,7 +2397,7 @@ DefectCorrectionDebug applyDefectCorrectionToJpegRaw(LinearFloatRaw& raw, const 
     return debug;
 }
 
-GreenSplitDebug applyGreenSplitCorrectionToJpegRaw(LinearFloatRaw& raw) {
+GreenSplitDebug applyGreenSplitCorrectionToJpegRaw(LinearFloatRaw& raw, float greenCalibrationRatio) {
     GreenSplitDebug debug{};
     const auto start = IspClock::now();
     if (raw.mosaic.empty() || raw.mosaic.type() != CV_32FC1) {
@@ -2409,8 +2409,14 @@ GreenSplitDebug applyGreenSplitCorrectionToJpegRaw(LinearFloatRaw& raw) {
     std::vector<float> greenEven;
     std::vector<float> greenOdd;
     const int pattern = cfaPatternOrDefault(raw.info.effectiveCfaPattern);
+    const float safeGreenRatio = std::clamp(
+            std::isfinite(greenCalibrationRatio) ? greenCalibrationRatio : 1.0f, 0.50f, 2.0f);
+    const float greenEvenPriorScale = (2.0f * safeGreenRatio) / (safeGreenRatio + 1.0f);
+    const float greenOddPriorScale = 2.0f / (safeGreenRatio + 1.0f);
 
-    // Sample aligned 2x2 blocks to ensure equal channel representation
+    // Sample aligned 2x2 blocks after the Lens AWB green-site calibration prior. The robust
+    // split estimator therefore measures only residual G-even/G-odd mismatch and cannot double
+    // apply the same sensor calibration.
     const int yStep = std::max(2, (raw.mosaic.rows / 100) * 2);
     const int xStep = std::max(2, (raw.mosaic.cols / 100) * 2);
     greenEven.reserve(10000);
@@ -2421,20 +2427,20 @@ GreenSplitDebug applyGreenSplitCorrectionToJpegRaw(LinearFloatRaw& raw) {
         const float* row1 = raw.mosaic.ptr<float>(y + 1);
         for (int x = 0; x < raw.mosaic.cols - 1; x += xStep) {
             const int c00 = cfaColorChannel(pattern, x, y);
-            if (c00 == 1) greenEven.push_back(row0[x]);
-            else if (c00 == 2) greenOdd.push_back(row0[x]);
+            if (c00 == 1) greenEven.push_back(row0[x] * greenEvenPriorScale);
+            else if (c00 == 2) greenOdd.push_back(row0[x] * greenOddPriorScale);
 
             const int c01 = cfaColorChannel(pattern, x + 1, y);
-            if (c01 == 1) greenEven.push_back(row0[x + 1]);
-            else if (c01 == 2) greenOdd.push_back(row0[x + 1]);
+            if (c01 == 1) greenEven.push_back(row0[x + 1] * greenEvenPriorScale);
+            else if (c01 == 2) greenOdd.push_back(row0[x + 1] * greenOddPriorScale);
 
             const int c10 = cfaColorChannel(pattern, x, y + 1);
-            if (c10 == 1) greenEven.push_back(row1[x]);
-            else if (c10 == 2) greenOdd.push_back(row1[x]);
+            if (c10 == 1) greenEven.push_back(row1[x] * greenEvenPriorScale);
+            else if (c10 == 2) greenOdd.push_back(row1[x] * greenOddPriorScale);
 
             const int c11 = cfaColorChannel(pattern, x + 1, y + 1);
-            if (c11 == 1) greenEven.push_back(row1[x + 1]);
-            else if (c11 == 2) greenOdd.push_back(row1[x + 1]);
+            if (c11 == 1) greenEven.push_back(row1[x + 1] * greenEvenPriorScale);
+            else if (c11 == 2) greenOdd.push_back(row1[x + 1] * greenOddPriorScale);
         }
     }
 
@@ -2446,13 +2452,10 @@ GreenSplitDebug applyGreenSplitCorrectionToJpegRaw(LinearFloatRaw& raw) {
     debug.relativeMad = evidence.relativeMad;
     debug.signConsensus = evidence.signConsensus;
     debug.reason = bncam::raw_green_split::reasonName(evidence.reason);
-    if (!evidence.apply) {
-        debug.elapsedMs = elapsedMs(start);
-        return debug;
-    }
-
-    debug.greenEvenScale = evidence.evenScale;
-    debug.greenOddScale = evidence.oddScale;
+    const float residualEvenScale = evidence.apply ? evidence.evenScale : 1.0f;
+    const float residualOddScale = evidence.apply ? evidence.oddScale : 1.0f;
+    debug.greenEvenScale = greenEvenPriorScale * residualEvenScale;
+    debug.greenOddScale = greenOddPriorScale * residualOddScale;
     cv::parallel_for_(cv::Range(0, raw.mosaic.rows), [&](const cv::Range& range) {
         for (int y = range.start; y < range.end; ++y) {
             float* row = raw.mosaic.ptr<float>(y);
@@ -2464,8 +2467,10 @@ GreenSplitDebug applyGreenSplitCorrectionToJpegRaw(LinearFloatRaw& raw) {
         }
     });
 
-    debug.applied = true;
-    debug.reason = "paired_green_split_consensus_applied_in_jpeg_clone";
+    debug.applied = evidence.apply || std::abs(safeGreenRatio - 1.0f) > 1.0e-4f;
+    debug.reason = evidence.apply
+            ? "lens_awb_green_prior_plus_residual_consensus_applied_in_jpeg_clone"
+            : (debug.applied ? "lens_awb_green_prior_applied_no_residual" : debug.reason);
     debug.elapsedMs = elapsedMs(start);
     return debug;
 }
@@ -5548,7 +5553,10 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                         static_cast<double>(jpegRaw.mosaic.total())
                 : 0.0;
         defectDebug = applyDefectCorrectionToJpegRaw(jpegRaw, meta);
-        greenSplitDebug = applyGreenSplitCorrectionToJpegRaw(jpegRaw);
+        const float greenWbEven = safeWbGain(meta.calibration.effectiveWbGains[1]);
+        const float greenWbOdd = safeWbGain(meta.calibration.effectiveWbGains[2]);
+        const float greenCalibrationRatio = std::clamp(greenWbEven / std::max(1.0e-4f, greenWbOdd), 0.50f, 2.0f);
+        greenSplitDebug = applyGreenSplitCorrectionToJpegRaw(jpegRaw, greenCalibrationRatio);
         lensDebug = applyLensShadingToJpegRaw(jpegRaw, meta);
         // Automatic software exposure is intentionally neutral. Local FLLF tone mapping owns
         // automatic brightness/DR placement after calibrated scene-linear colour.
@@ -5588,6 +5596,10 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         request.noiseModelValid = frozenPhysicalNoise.available;
         request.effectiveS = frozenPhysicalNoise.shotS;
         request.effectiveO = frozenPhysicalNoise.readO;
+        const float greenWbEven = safeWbGain(meta.calibration.effectiveWbGains[1]);
+        const float greenWbOdd = safeWbGain(meta.calibration.effectiveWbGains[2]);
+        request.greenCalibrationRatio = std::clamp(
+                greenWbEven / std::max(1.0e-4f, greenWbOdd), 0.50f, 2.0f);
         if (lensShadingMapValid(meta)) {
             request.lensShadingMap = meta.lensShadingMap.data();
             request.lensShadingColumns = static_cast<std::uint32_t>(meta.lensShadingColumns);

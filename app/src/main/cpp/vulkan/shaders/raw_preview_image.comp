@@ -36,7 +36,7 @@ layout(push_constant) uniform Params {
     uint previewWidth;
     uint previewHeight;
     uint cfaCellDecimation;
-    uint cfaAndMode; // low 8 CFA, next 8 dispatch mode, next 8 demosaic, high 8 focus priority
+    uint cfaAndMode; // low 8 CFA, next 8 dispatch, next 8 green-even/odd ratio, high 8 focus priority
     float black0;
     float black1;
     float black2;
@@ -108,6 +108,14 @@ uint sourceFormat() { return pc.sourceLayout & 0xffffu; }
 uint sourcePixelStride() { return max(2u, pc.sourceLayout >> 16u); }
 uint cfaPattern() { return pc.cfaAndMode & 0xffu; }
 uint dispatchMode() { return (pc.cfaAndMode >> 8u) & 0xffu; }
+float greenEvenOddRatio() {
+    float encoded = float((pc.cfaAndMode >> 16u) & 0xffu) / 255.0;
+    return mix(0.50, 2.0, encoded);
+}
+float greenRowCalibrationScale(uint localY) {
+    float ratio = clamp(greenEvenOddRatio(), 0.50, 2.0);
+    return (localY & 1u) == 0u ? (2.0 * ratio) / (ratio + 1.0) : 2.0 / (ratio + 1.0);
+}
 float focusPriority() { return float((pc.cfaAndMode >> 24u) & 0xffu) / 255.0; }
 uint sourceCropLeft() { return pc.sourceCropPacked & 0xffffu; }
 uint sourceCropTop() { return pc.sourceCropPacked >> 16u; }
@@ -148,6 +156,14 @@ int mirrorCoord(int p, int extent) {
     return q < extent ? q : period - q;
 }
 
+bool isGreenSite(uint pattern, uint localX, uint localY) {
+    uint p = min(pattern, 3u);
+    uint xm = localX & 1u;
+    uint ym = localY & 1u;
+    if (p == 0u || p == 3u) return xm != ym; // RGGB / BGGR
+    return xm == ym;                          // GRBG / GBRG
+}
+
 float rawNormalizedLocal(int localX, int localY) {
     int lx = clamp(localX, 0, int(max(2u, pc.previewWidth * max(1u, pc.cfaCellDecimation))) - 1);
     int ly = clamp(localY, 0, int(max(2u, pc.previewHeight * max(1u, pc.cfaCellDecimation))) - 1);
@@ -155,7 +171,12 @@ float rawNormalizedLocal(int localX, int localY) {
     uint sy = min(pc.sourceHeight - 1u, sourceCropTop() + uint(ly));
     uint site = ((uint(ly) & 1u) << 1u) | (uint(lx) & 1u);
     float black = clamp(siteBlack(site), 0.0, max(0.0, pc.whiteLevel - 1.0));
-    return clamp((float(readRaw(sx, sy)) - black) / max(1.0, pc.whiteLevel - black), 0.0, 1.0);
+    float normalized = clamp((float(readRaw(sx, sy)) - black) /
+            max(1.0, pc.whiteLevel - black), 0.0, 1.0);
+    if (isGreenSite(cfaPattern(), uint(lx), uint(ly))) {
+        normalized = clamp(normalized * greenRowCalibrationScale(uint(ly)), 0.0, 1.0);
+    }
+    return normalized;
 }
 
 float normalizedAt(int previewX, int previewY) {

@@ -56,6 +56,8 @@ import com.bncam.data.settings.PhysicalNoiseModelSettingsStore
 import com.bncam.data.settings.PhysicalNoiseModelUiPolicy
 import com.bncam.data.settings.SettingsRepository
 import com.bncam.data.settings.LensWhiteLevelSettings
+import com.bncam.data.settings.LensAwbCalibrationSettings
+import com.bncam.data.settings.LensAwbCalibrationSettingsStore
 import com.bncam.data.settings.WhiteLevelModes
 import com.bncam.data.settings.WhiteLevelPresets
 import com.bncam.data.settings.WhiteLevelSettingsStore
@@ -74,6 +76,7 @@ fun LensDetailScreen(
     onNavigateToProfileList: (String) -> Unit,
     onNavigateToNoiseModel: () -> Unit = {},
     onNavigateToBlackLevel: () -> Unit = {},
+    onNavigateToAwbCalibration: () -> Unit = {},
     onNavigateToColorMatrix: () -> Unit = {},
     @Suppress("UNUSED_PARAMETER") onNavigateToRawStreamBinding: () -> Unit = {},
     onNavigateBack: () -> Unit
@@ -84,6 +87,7 @@ fun LensDetailScreen(
     val physicalNoiseStore = remember(context) { PhysicalNoiseModelSettingsStore(context) }
     val blackLevelStore = remember(context) { BlackLevelSettingsStore(context) }
     val whiteLevelStore = remember(context) { WhiteLevelSettingsStore(context) }
+    val awbCalibrationStore = remember(context) { LensAwbCalibrationSettingsStore(context) }
     val coroutineScope = rememberCoroutineScope()
     val hardwareSummary by produceState(
         initialValue = unavailableLensHardwareSummary(),
@@ -100,11 +104,12 @@ fun LensDetailScreen(
     // Preview orientation is no longer a user calibration. Retire any previously persisted
     // per-lens rotation as soon as this hardware page is opened. At the same time materialize
     // the current v2 Noise Model / Black Level state so this overview never reports legacy UI state.
-    LaunchedEffect(lensId, physicalNoiseStore, blackLevelStore, whiteLevelStore) {
+    LaunchedEffect(lensId, physicalNoiseStore, blackLevelStore, whiteLevelStore, awbCalibrationStore) {
         settingsRepo.setLensPreviewOrientationCorrection(lensId, "Auto")
         physicalNoiseStore.ensureMigrated(lensId)
         blackLevelStore.ensureMigrated(lensId)
         whiteLevelStore.ensureInitialized(lensId)
+        awbCalibrationStore.ensureInitialized(lensId)
     }
 
     // Use the same authoritative profile-count value as the viewfinder and ProfileManager.
@@ -120,6 +125,8 @@ fun LensDetailScreen(
         .collectAsStateWithLifecycle(initialValue = LensBlackLevelControlSettings())
     val whiteLevelSettings by whiteLevelStore.settingsFlow(lensId)
         .collectAsStateWithLifecycle(initialValue = LensWhiteLevelSettings())
+    val awbCalibrationSettings by awbCalibrationStore.settingsFlow(lensId)
+        .collectAsStateWithLifecycle(initialValue = LensAwbCalibrationSettings())
 
     val colorMatrixMode by settingsRepo.getColorMatrixModeFlow(lensId)
         .collectAsStateWithLifecycle(initialValue = "System")
@@ -204,6 +211,13 @@ fun LensDetailScreen(
                 description = "RAW sensor saturation authority for developed RAW processing. Auto uses Camera2 metadata.",
                 value = whiteLevelSettings.summary(),
                 onClick = { showWhiteLevelDialog = true }
+            )
+
+            SettingValueRow(
+                title = "AWB",
+                description = "Per-lens GCam-style sensor white-balance calibration and green-split authority.",
+                value = awbCalibrationSettings.summary(),
+                onClick = onNavigateToAwbCalibration
             )
 
             SettingValueRow(

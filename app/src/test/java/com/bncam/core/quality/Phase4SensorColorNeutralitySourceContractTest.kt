@@ -84,15 +84,16 @@ class Phase4SensorColorNeutralitySourceContractTest {
     }
 
     @Test
-    fun `manual profile white balance publishes a coherent wb and matrix pair`() {
+    fun `transient live white balance publishes a coherent wb and matrix pair without profile ownership`() {
         val manager = File(appDir, "src/main/java/com/bncam/core/engine/BnCameraManager.kt").readText()
         val renderer = File(appDir, "src/main/java/com/bncam/ui/screens/capture/RawPreviewRenderer.kt").readText()
         val calibration = File(appDir, "src/main/java/com/bncam/core/quality/SensorCalibration.kt").readText()
         assertTrue("val targetColorMatrix = targetColorSolution?.mPostCompensated" in manager)
         assertTrue("updateWhiteBalanceColorPair(targetSensorGains, targetColorMatrix)" in manager)
         assertTrue("liveColorPair?.colorMatrix" in renderer)
-        assertTrue("sensorAwareProfileAwb?.mPostCompensated" in calibration)
-        assertTrue("Profile Kelvin uses coherent Camera2 calibration-derived WB + post-WB sensor-to-linear-sRGB matrix" in calibration)
+        assertTrue("liveManualWhiteBalance?.mPostCompensated" in calibration)
+        assertTrue("Live Kelvin uses coherent Camera2 calibration-derived WB + post-WB sensor-to-linear-sRGB matrix" in calibration)
+        assertFalse("ProfileAwb" in calibration)
     }
 
 }

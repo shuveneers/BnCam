@@ -32,7 +32,12 @@ class StableWhiteBalanceSnapshot(
     val mixedLightScore: Float = 0f,
     val priorDisagreement: Float = 0f,
     val validTileCount: Int = 0,
-    val sensorTimestampNs: Long = 0L
+    val sensorTimestampNs: Long = 0L,
+    val calibrationSource: String = "CAMERA2_EXACT_FRAME",
+    val calibrationFingerprint: String = "UNAVAILABLE",
+    val calibrationAuthority: Float = 0f,
+    val grGbRatio: Float? = null,
+    val greenEvenOddRatio: Float = 1f
 ) {
     private val storedGains: FloatArray = gains.copyOf()
     private val storedColorMatrix: FloatArray? = colorMatrix?.copyOf()
@@ -73,6 +78,11 @@ class WhiteBalanceStateEngine {
     private var stablePriorDisagreement: Float = 0f
     private var stableValidTileCount: Int = 0
     private var stableSensorTimestampNs: Long = 0L
+    private var stableCalibrationSource: String = "CAMERA2_EXACT_FRAME"
+    private var stableCalibrationFingerprint: String = "UNAVAILABLE"
+    private var stableCalibrationAuthority: Float = 0f
+    private var stableGrGbRatio: Float? = null
+    private var stableGreenEvenOddRatio: Float = 1f
 
     private var lastTemporalDelta: Float = 0f
     private var sceneChangeDetected: Boolean = false
@@ -122,7 +132,12 @@ class WhiteBalanceStateEngine {
             mixedLightScore = 0f,
             priorDisagreement = 0f,
             validTileCount = 0,
-            sensorTimestampNs = sensorTimestampNs
+            sensorTimestampNs = sensorTimestampNs,
+            calibrationSource = "CAMERA2_EXACT_FRAME",
+            calibrationFingerprint = "UNAVAILABLE",
+            calibrationAuthority = 0f,
+            grGbRatio = null,
+            greenEvenOddRatio = (safe[1] / max(1.0e-4f, safe[2])).coerceIn(0.50f, 2.0f)
         )
     }
 
@@ -138,7 +153,12 @@ class WhiteBalanceStateEngine {
         priorDisagreement: Float,
         validTileCount: Int,
         dataReady: Boolean,
-        sensorTimestampNs: Long
+        sensorTimestampNs: Long,
+        calibrationSource: String = "UNAVAILABLE",
+        calibrationFingerprint: String = "UNAVAILABLE",
+        calibrationAuthority: Float = 0f,
+        grGbRatio: Float? = null,
+        greenEvenOddRatio: Float = 1f
     ): StableWhiteBalanceSnapshot? = synchronized(lock) {
         transitionScope(scopeKey, pipelineGeneration)
         if (!dataReady) return@synchronized snapshotLocked()
@@ -180,7 +200,12 @@ class WhiteBalanceStateEngine {
             mixedLightScore = safeMixed,
             priorDisagreement = safeDisagreement,
             validTileCount = validTileCount.coerceAtLeast(0),
-            sensorTimestampNs = sensorTimestampNs
+            sensorTimestampNs = sensorTimestampNs,
+            calibrationSource = calibrationSource.ifBlank { "UNAVAILABLE" },
+            calibrationFingerprint = calibrationFingerprint.ifBlank { "UNAVAILABLE" },
+            calibrationAuthority = calibrationAuthority.takeIf(Float::isFinite)?.coerceIn(0f, 1f) ?: 0f,
+            grGbRatio = grGbRatio?.takeIf { it.isFinite() && it in 0.50f..2.0f },
+            greenEvenOddRatio = greenEvenOddRatio.takeIf(Float::isFinite)?.coerceIn(0.50f, 2.0f) ?: 1f
         )
     }
 
@@ -201,7 +226,12 @@ class WhiteBalanceStateEngine {
         mixedLightScore: Float,
         priorDisagreement: Float,
         validTileCount: Int,
-        sensorTimestampNs: Long
+        sensorTimestampNs: Long,
+        calibrationSource: String,
+        calibrationFingerprint: String,
+        calibrationAuthority: Float,
+        grGbRatio: Float?,
+        greenEvenOddRatio: Float
     ): StableWhiteBalanceSnapshot? {
         val confidence = observationConfidence.coerceIn(0f, 1f)
         val authority = movementAuthority.coerceIn(0f, 1f)
@@ -224,7 +254,9 @@ class WhiteBalanceStateEngine {
                 clearSceneChangeCandidate()
                 updateStableEvidence(
                     source, dataAuthority, neutralSupport, mixedLightScore,
-                    priorDisagreement, validTileCount, sensorTimestampNs
+                    priorDisagreement, validTileCount, sensorTimestampNs,
+                    calibrationSource, calibrationFingerprint, calibrationAuthority,
+                    grGbRatio, greenEvenOddRatio
                 )
             }
             return snapshotLocked()
@@ -242,7 +274,9 @@ class WhiteBalanceStateEngine {
             stableConvergence = convergence
             updateStableEvidence(
                 source, dataAuthority, neutralSupport, mixedLightScore,
-                priorDisagreement, validTileCount, sensorTimestampNs
+                priorDisagreement, validTileCount, sensorTimestampNs,
+                calibrationSource, calibrationFingerprint, calibrationAuthority,
+                grGbRatio, greenEvenOddRatio
             )
             return snapshotLocked()
         }
@@ -273,7 +307,9 @@ class WhiteBalanceStateEngine {
         stableConvergence = convergence
         updateStableEvidence(
             source, dataAuthority, neutralSupport, mixedLightScore,
-            priorDisagreement, validTileCount, sensorTimestampNs
+            priorDisagreement, validTileCount, sensorTimestampNs,
+            calibrationSource, calibrationFingerprint, calibrationAuthority,
+            grGbRatio, greenEvenOddRatio
         )
         return snapshotLocked()
     }
@@ -319,7 +355,12 @@ class WhiteBalanceStateEngine {
         mixedLightScore: Float,
         priorDisagreement: Float,
         validTileCount: Int,
-        sensorTimestampNs: Long
+        sensorTimestampNs: Long,
+        calibrationSource: String,
+        calibrationFingerprint: String,
+        calibrationAuthority: Float,
+        grGbRatio: Float?,
+        greenEvenOddRatio: Float
     ) {
         stableSource = source
         stableDataAuthority = dataAuthority.coerceIn(0f, 1f)
@@ -328,6 +369,11 @@ class WhiteBalanceStateEngine {
         stablePriorDisagreement = priorDisagreement.coerceAtLeast(0f)
         stableValidTileCount = validTileCount.coerceAtLeast(0)
         if (sensorTimestampNs > 0L) stableSensorTimestampNs = sensorTimestampNs
+        stableCalibrationSource = calibrationSource.ifBlank { "UNAVAILABLE" }
+        stableCalibrationFingerprint = calibrationFingerprint.ifBlank { "UNAVAILABLE" }
+        stableCalibrationAuthority = calibrationAuthority.takeIf(Float::isFinite)?.coerceIn(0f, 1f) ?: 0f
+        stableGrGbRatio = grGbRatio?.takeIf { it.isFinite() && it in 0.50f..2.0f }
+        stableGreenEvenOddRatio = greenEvenOddRatio.takeIf(Float::isFinite)?.coerceIn(0.50f, 2.0f) ?: 1f
     }
 
     private fun transitionScope(nextScopeKey: String, nextGeneration: Int) {
@@ -350,6 +396,11 @@ class WhiteBalanceStateEngine {
             stablePriorDisagreement = 0f
             stableValidTileCount = 0
             stableSensorTimestampNs = 0L
+            stableCalibrationSource = "CAMERA2_EXACT_FRAME"
+            stableCalibrationFingerprint = "UNAVAILABLE"
+            stableCalibrationAuthority = 0f
+            stableGrGbRatio = null
+            stableGreenEvenOddRatio = 1f
             lastTemporalDelta = 0f
             sceneChangeDetected = false
             clearSceneChangeCandidate()
@@ -416,7 +467,12 @@ class WhiteBalanceStateEngine {
             mixedLightScore = stableMixedLightScore,
             priorDisagreement = stablePriorDisagreement,
             validTileCount = stableValidTileCount,
-            sensorTimestampNs = stableSensorTimestampNs
+            sensorTimestampNs = stableSensorTimestampNs,
+            calibrationSource = stableCalibrationSource,
+            calibrationFingerprint = stableCalibrationFingerprint,
+            calibrationAuthority = stableCalibrationAuthority,
+            grGbRatio = stableGrGbRatio,
+            greenEvenOddRatio = stableGreenEvenOddRatio
         )
     }
 

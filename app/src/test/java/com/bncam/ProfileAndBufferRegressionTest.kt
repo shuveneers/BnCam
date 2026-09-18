@@ -35,7 +35,7 @@ class ProfileAndBufferRegressionTest {
     @Test
     fun `profile list and viewfinder use the unchanged editor route identity`() {
         assertEquals("profile_edit/camera0/7", Routes.profileEdit("camera0", 7))
-        assertEquals("profile_edit/camera0/7/awb", Routes.profileAwb("camera0", 7))
-        assertFalse(Routes.profileAwb("camera0", 7).startsWith("awb/"))
+        assertEquals("lens_detail/camera0/awb", Routes.lensAwbCalibration("camera0"))
+        assertFalse(Routes.lensAwbCalibration("camera0").startsWith("profile_edit/"))
     }
 }

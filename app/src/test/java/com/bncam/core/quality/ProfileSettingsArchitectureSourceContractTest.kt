@@ -111,16 +111,17 @@ class ProfileSettingsArchitectureSourceContractTest {
     }
 
     @Test
-    fun profileExportIncludesAwbMultiFrameAllCurvesButNotAppDngOwnership() {
+    fun profileExportExcludesAwbButKeepsMultiFrameCurvesAndProfileOwnedTuning() {
         val app = appDir()
         val resolver = File(app, "src/main/java/com/bncam/core/quality/LibpatcherProfileResolver.kt").readText()
         val repo = File(app, "src/main/java/com/bncam/data/settings/SettingsRepository.kt").readText()
-        val awb = File(app, "src/main/java/com/bncam/ui/screens/settings/lens_profiles/ProfileAwbSettingsScreen.kt").readText()
+        val editor = File(app, "src/main/java/com/bncam/ui/screens/settings/lens_profiles/ProfileEditScreen.kt").readText()
         val subScreens = File(app, "src/main/java/com/bncam/ui/screens/settings/lens_profiles/ProfileTuningSubScreens.kt").readText()
 
-        assertTrue(awb.contains("AWB intensity"))
-        assertTrue(awb.contains("0f..1.5f"))
-        assertTrue(resolver.contains("add(s(\"awb_mode\", ProfileAwbModes.SYSTEM_AUTO))"))
+        assertFalse(resolver.contains("awb_mode"))
+        assertFalse(resolver.contains("awb_reference_intensity"))
+        assertFalse(editor.contains("title = \"AWB\""))
+        assertFalse(repo.contains("getProfileAwb"))
         assertTrue(resolver.contains("CaptureSettingKeys.ALIGNMENT_METHOD"))
         assertTrue(resolver.contains("CaptureSettingKeys.FUSION_FRAMES_RAW10"))
         assertTrue(resolver.contains("ProfileCurveDefaults.TYPE_TONE"))
@@ -132,7 +133,6 @@ class ProfileSettingsArchitectureSourceContractTest {
         assertTrue(repo.contains("includePortableDefaults = true"))
         assertTrue(subScreens.contains("title = \"JPEG quality\""))
         assertTrue(subScreens.contains("valueRange = 80f..100f"))
-        assertFalse(subScreens.contains("jpegQualityToSignedAdjustment"))
     }
 
     @Test
@@ -142,8 +142,8 @@ class ProfileSettingsArchitectureSourceContractTest {
         val bridge = File(app, "src/main/cpp/native-lib.cpp").readText()
         val nativeConfig = File(app, "src/main/cpp/NativeRenderQualityConfig.h").readText()
 
-        assertTrue(imageUtils.contains("resolveYuvProfileAwbCompensation"))
-        assertTrue(imageUtils.contains("profileYuvWbRed = yuvAwbCompensation[0]"))
+        assertTrue(imageUtils.contains("resolveYuvLiveAwbCompensation"))
+        assertTrue(imageUtils.contains("targetGains = calibration?.effectiveWbGains"))
         assertTrue(bridge.contains("applyYuvProfileRgbAdjustments(bgrMat, qualityConfig)"))
         assertFalse(bridge.contains("applyYuvProfileRgbAdjustments(bgrMat, rawCfg)"))
         assertTrue(bridge.contains("profileColorSaturation"))

@@ -92,9 +92,7 @@ data class ResolvedLensHardwareSettings(
     val settingsResolved: Boolean = true
     val nativeHardwareConfigPushedExpected: Boolean = true
 
-    val anyManualEffectActive: Boolean =
-        colorMatrixNativeMode != 0 ||
-            awbNativeMode != 0
+    val anyManualEffectActive: Boolean = colorMatrixNativeMode != 0
 
     /**
      * Legacy compatibility projection only. Black Level v2 owns developed RAW.
@@ -115,30 +113,18 @@ data class ResolvedLensHardwareSettings(
         return defaultSource
     }
 
+    /**
+     * Retired compatibility projection. Lens ID AWB Calibration is the only persistent AWB owner.
+     * Legacy ratio/temp/intensity values are deliberately ignored.
+     */
     fun effectiveWhiteBalance(
         defaultRed: Float,
         defaultGreenEven: Float,
         defaultGreenOdd: Float,
         defaultBlue: Float
-    ): FloatArray {
-        if (awbNativeMode == 0) {
-            return floatArrayOf(defaultRed, defaultGreenEven, defaultGreenOdd, defaultBlue)
-        }
-        val temp = (awbTemp * awbIntensity).coerceIn(-1.0f, 1.0f)
-        val ratio = awbRatio.coerceIn(0.25f, 1.75f)
-        val red = (defaultRed * ratio * (1.0f + temp)).coerceIn(0.1f, 10.0f)
-        val blue = (defaultBlue * (2.0f - ratio) * (1.0f - temp)).coerceIn(0.1f, 10.0f)
-        return floatArrayOf(
-            red,
-            defaultGreenEven.coerceIn(0.1f, 10.0f),
-            defaultGreenOdd.coerceIn(0.1f, 10.0f),
-            blue
-        )
-    }
+    ): FloatArray = floatArrayOf(defaultRed, defaultGreenEven, defaultGreenOdd, defaultBlue)
 
-    fun whiteBalanceSource(defaultSource: String): String =
-        if (awbNativeMode == 0) defaultSource
-        else "Lens ID AWB override profile=$awbProfile ratio=$awbRatioRaw temp=${awbTemp.format3()} intensity=${awbIntensity.format3()}"
+    fun whiteBalanceSource(defaultSource: String): String = defaultSource
 
     fun effectiveColorMatrix(defaultMatrix: FloatArray): FloatArray =
         if (colorMatrixNativeMode == 1 && colorMatrixValidationPassed && manualColorMatrix.size == 9) {
@@ -388,6 +374,9 @@ object LensHardwareSettingsResolver {
         val awbActive =
             !safeAwbRatioRaw.equals(LensHardwareModes.AWB_AUTO_RATIO, ignoreCase = true) ||
                 (abs(temp) > 0.0001f && intensity > 0.0001f)
+        if (awbActive || !safeAwbProfile.equals(LensHardwareModes.AWB_SYSTEM, ignoreCase = true)) {
+            warn("Legacy Lens Hardware AWB values are migration-only and ignored; LensAwbCalibrationSettingsStore is the sole persistent AWB owner.")
+        }
 
         return ResolvedLensHardwareSettings(
             lensId = lensId,
@@ -423,12 +412,12 @@ object LensHardwareSettingsResolver {
             colorMatrixValidationPassed = cmValidation.first,
             colorMatrixRejectReason = cmValidation.second,
 
-            awbProfile = safeAwbProfile,
-            awbRatioRaw = safeAwbRatioRaw,
-            awbRatio = ratio,
-            awbTemp = temp,
-            awbIntensity = intensity,
-            awbNativeMode = if (awbActive) 1 else 0,
+            awbProfile = LensHardwareModes.AWB_SYSTEM,
+            awbRatioRaw = LensHardwareModes.AWB_AUTO_RATIO,
+            awbRatio = 1.0f,
+            awbTemp = 0.0f,
+            awbIntensity = 0.0f,
+            awbNativeMode = 0,
 
             // Retire hidden native noise-shaping controls together with the visible legacy path.
             noiseModelCalibrationAdjustment = 0.0f,

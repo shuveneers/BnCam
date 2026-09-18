@@ -2,9 +2,21 @@ package com.bncam.core.quality
 
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.params.ColorSpaceTransform
-import com.bncam.data.settings.ProfileAwbSettings
 import kotlin.math.abs
 import kotlin.math.exp
+
+
+data class ManualWhiteBalanceTarget(
+    val kelvin: Int,
+    val illuminantModel: String,
+    val tint: Float = 0f
+) {
+    fun sanitized(): ManualWhiteBalanceTarget = copy(
+        kelvin = kelvin.coerceIn(2000, 10000),
+        illuminantModel = illuminantModel.ifBlank { if (kelvin >= 4000) "CIE Daylight" else "Planckian Blackbody" },
+        tint = tint.takeIf(Float::isFinite)?.coerceIn(-1f, 1f) ?: 0f
+    )
+}
 
 data class TargetChromaticity(
     val x: Float,
@@ -170,11 +182,11 @@ object RawColorTransformEngine {
      * and reference illuminants for the active physical sensor. The returned post matrix is
      * explicitly compensated for the WB diagonal so WB is applied exactly once.
      */
-    fun computeProfileWhiteBalance(
+    fun computeManualWhiteBalance(
         characteristics: CameraCharacteristics,
-        settings: ProfileAwbSettings
+        target: ManualWhiteBalanceTarget
     ): ResolvedColorTransformResult {
-        val safe = settings.sanitized()
+        val safe = target.sanitized()
         val base = computeOptionBMatrices(
             characteristics = characteristics,
             targetKelvin = safe.kelvin,
@@ -200,7 +212,7 @@ object RawColorTransformEngine {
             w3Diagonal = w3,
             mPostCompensated = post,
             isValid = valid,
-            rejectionReason = if (valid) "none" else "profile_wb_solution_out_of_bounds"
+            rejectionReason = if (valid) "none" else "manual_wb_solution_out_of_bounds"
         )
     }
 

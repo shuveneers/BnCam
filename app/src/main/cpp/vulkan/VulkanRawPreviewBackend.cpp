@@ -1391,13 +1391,24 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
     push.previewWidth = request.previewWidth;
     push.previewHeight = request.previewHeight;
     push.cfaCellDecimation = request.cfaCellDecimation;
-    const std::uint32_t packedDemosaic = (std::min(request.demosaicMode, 3u) & 0xffu) << 16u;
+    // raw_preview.comp currently uses one resident Malvar preview demosaic regardless of the
+    // legacy demosaicMode transport. Reuse that otherwise-dead byte for a quantized Camera2
+    // green-even/green-odd ratio without growing the exact 128-byte Vulkan push layout.
+    const float safeGreenEvenOddRatio = std::clamp(
+            std::isfinite(request.greenEvenOddRatio) ? request.greenEvenOddRatio : 1.0f,
+            0.50f, 2.0f);
+    const auto greenRatioByte = static_cast<std::uint32_t>(std::lround(
+            ((safeGreenEvenOddRatio - 0.50f) / 1.50f) * 255.0f));
+    const std::uint32_t packedGreenRatio = (greenRatioByte & 0xffu) << 16u;
     const auto focusDetailByte = static_cast<std::uint32_t>(std::lround(
             std::clamp(request.focusDetailPriority, 0.0f, 1.0f) * 255.0f));
     const std::uint32_t packedFocusDetail = (focusDetailByte & 0xffu) << 24u;
-    // The high byte was intentionally unused. Packing focus priority here preserves the exact
-    // 128-byte push-constant layout required for Vulkan portability.
-    push.cfaAndMode = std::min(request.cfaPattern, 3u) | packedDemosaic | packedFocusDetail;
+    const auto packedMode = [&](std::uint32_t mode) {
+        return std::min(request.cfaPattern, 3u) | ((mode & 0xffu) << 8u) |
+                packedGreenRatio | packedFocusDetail;
+    };
+    // Packing calibration/focus metadata preserves the exact 128-byte push-constant layout.
+    push.cfaAndMode = packedMode(0u);
     std::copy(request.blackLevels.begin(), request.blackLevels.end(), push.blackLevels);
     push.whiteLevel = request.whiteLevel;
     push.captureIso = static_cast<float>(request.captureSensitivityIso);
@@ -1424,7 +1435,7 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
 
     // Compact 64x48 pre-WB physical-AWB observer. This is twelve small workgroups in the
     // existing command buffer; it adds no queue submission, fence wait or full-frame readback.
-    push.cfaAndMode = std::min(request.cfaPattern, 3u) | (4u << 8u) | packedDemosaic;
+    push.cfaAndMode = packedMode(4u);
     vkCmdPushConstants(slot.commandBuffer, activePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
                        0u, sizeof(push), &push);
     vkCmdDispatch(slot.commandBuffer,
@@ -1445,7 +1456,7 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
 
     // FASE 5: derive the signed 64x48 exposure field entirely inside the existing preview
     // command buffer. There is no CPU round-trip and no additional queue submission/wait.
-    push.cfaAndMode = std::min(request.cfaPattern, 3u) | (5u << 8u) | packedDemosaic;
+    push.cfaAndMode = packedMode(5u);
     vkCmdPushConstants(slot.commandBuffer, activePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
                        0u, sizeof(push), &push);
     vkCmdDispatch(slot.commandBuffer,
@@ -1455,7 +1466,7 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr,
                          1u, &statsBarrier, 0u, nullptr);
 
-    push.cfaAndMode = std::min(request.cfaPattern, 3u) | (6u << 8u) | packedDemosaic;
+    push.cfaAndMode = packedMode(6u);
     vkCmdPushConstants(slot.commandBuffer, activePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
                        0u, sizeof(push), &push);
     // Exactly one 16x16 workgroup: the resolver uses workgroup-shared scene percentiles.
@@ -1464,7 +1475,7 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr,
                          1u, &statsBarrier, 0u, nullptr);
 
-    push.cfaAndMode = std::min(request.cfaPattern, 3u) | (1u << 8u) | packedDemosaic;
+    push.cfaAndMode = packedMode(1u);
     vkCmdPushConstants(slot.commandBuffer, activePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
                        0u, sizeof(push), &push);
     vkCmdDispatch(slot.commandBuffer, 1u, 1u, 1u);
@@ -1475,7 +1486,7 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
     // The old preview local-tone exposure pass is intentionally not dispatched in FASE 5.
     // Spatial exposure has one owner; FLLF/local contrast is rebuilt in the later tone phase.
 
-    push.cfaAndMode = std::min(request.cfaPattern, 3u) | (2u << 8u) | packedDemosaic;
+    push.cfaAndMode = packedMode(2u);
     vkCmdPushConstants(slot.commandBuffer, activePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
                        0u, sizeof(push), &push);
     vkCmdDispatch(slot.commandBuffer, (request.previewWidth + 15u) / 16u,

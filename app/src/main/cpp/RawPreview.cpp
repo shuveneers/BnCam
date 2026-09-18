@@ -489,8 +489,10 @@ RawPreviewResult renderRawPreviewRgba(
     previewRequest.physicalGreenNoiseO = std::max(0.0f, parameters.physicalGreenNoiseO);
     previewRequest.physicalNoiseConfidence = std::clamp(parameters.physicalNoiseConfidence, 0.0f, 1.0f);
     previewRequest.focusDetailPriority = std::clamp(parameters.focusDetailPriority, 0.0f, 1.0f);
-    const float previewGreen = std::max(
-            1.0e-4f, 0.5f * (parameters.quality.wbGreenEven + parameters.quality.wbGreenOdd));
+    const float safeGreenEven = std::max(1.0e-4f, parameters.quality.wbGreenEven);
+    const float safeGreenOdd = std::max(1.0e-4f, parameters.quality.wbGreenOdd);
+    const float previewGreen = std::max(1.0e-4f, 0.5f * (safeGreenEven + safeGreenOdd));
+    previewRequest.greenEvenOddRatio = std::clamp(safeGreenEven / safeGreenOdd, 0.50f, 2.0f);
     previewRequest.wbRgb = {
             parameters.quality.wbRed / previewGreen,
             1.0f,
@@ -807,8 +809,24 @@ RawPreviewResult renderRawPreviewRgba(
                         (static_cast<int>(localX) & 1);
                 const float black = std::clamp(
                         parameters.blackLevels[channel], 0.0f, safeWhite - 1.0f);
-                destination[x] = std::clamp(
+                float normalizedValue = std::clamp(
                         (rawValue - black) / std::max(1.0f, safeWhite - black), 0.0f, 1.0f);
+                // Detect both green sites from CFA pattern and row/column parity.
+                const int xm = static_cast<int>(localX) & 1;
+                const int ym = static_cast<int>(localY) & 1;
+                const int cfa = std::clamp(parameters.cfaPattern, 0, 3);
+                const bool isGreen = (cfa == 0 || cfa == 3) ? (xm != ym) : (xm == ym);
+                if (isGreen) {
+                    const float ratio = std::clamp(
+                            std::max(1.0e-4f, parameters.quality.wbGreenEven) /
+                                    std::max(1.0e-4f, parameters.quality.wbGreenOdd),
+                            0.50f, 2.0f);
+                    const float greenScale = (ym == 0)
+                            ? (2.0f * ratio) / (ratio + 1.0f)
+                            : 2.0f / (ratio + 1.0f);
+                    normalizedValue = std::clamp(normalizedValue * greenScale, 0.0f, 1.0f);
+                }
+                destination[x] = normalizedValue;
             }
         }
     });

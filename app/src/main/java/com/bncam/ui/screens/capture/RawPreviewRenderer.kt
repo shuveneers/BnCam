@@ -634,7 +634,7 @@ class RawPreviewRenderer(
      * touching Camera2 session state.
      */
     fun updateWhiteBalanceGains(gains: FloatArray?) {
-        // Gain-only is retained only as a compatibility/clear boundary. Manual/profile WB uses
+        // Gain-only is retained only as a compatibility/clear boundary. Live manual WB uses
         // updateWhiteBalanceColorPair so the sensor WB diagonal and its post-WB CCM change atomically.
         liveWhiteBalanceColorPair.set(null)
         if (gains == null) {
@@ -979,7 +979,7 @@ class RawPreviewRenderer(
             val liveWb = liveColorPair?.wbGains?.copyOf() ?: liveWhiteBalanceOverride.get()?.copyOf()
             // Exact Camera2 metadata is consumed for every System-Auto frame even when a temporal
             // render pair is active. This prevents the filtered output from feeding back as its own
-            // PhysicalAwbEstimator prior. Manual/profile WB intentionally clears these pairs.
+            // PhysicalAwbEstimator prior. Live manual WB intentionally clears these pairs.
             val exactFramePair = if (liveWb == null) {
                 exactFrameColorPairs.remove(request.sensorTimestampNs)
             } else {

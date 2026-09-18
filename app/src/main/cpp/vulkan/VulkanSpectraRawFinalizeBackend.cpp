@@ -77,7 +77,7 @@ struct PushConstants {
     float baseDefectThreshold = 0.050f;
     float greenEvenScale = 1.0f;
     float greenOddScale = 1.0f;
-    float padding0 = 0.0f;
+    float greenCalibrationRatio = 1.0f;
     std::uint32_t noiseModelEnabled = 0u;
     float s0 = 0.0f;
     float s1 = 0.0f;
@@ -611,6 +611,7 @@ SpectraRawFinalizeResult VulkanSpectraRawFinalizeBackend::executeInternal(
     push.lensEnabled = (request.lensShadingMap != nullptr && request.lensShadingColumns > 0u &&
                         request.lensShadingRows > 0u) ? 1u : 0u;
     push.baseDefectThreshold = request.isRaw10 ? 0.070f : 0.050f;
+    push.greenCalibrationRatio = std::clamp(request.greenCalibrationRatio, 0.50f, 2.0f);
     push.noiseModelEnabled = request.noiseModelValid ? 1u : 0u;
     push.s0 = request.effectiveS[0]; push.s1 = request.effectiveS[1];
     push.s2 = request.effectiveS[2]; push.s3 = request.effectiveS[3];

@@ -6,7 +6,6 @@ import android.hardware.camera2.CaptureResult
 import com.bncam.core.engine.CaptureStrategy
 import com.bncam.data.settings.ResolvedLensHardwareSettings
 import com.bncam.data.settings.SettingsRepository
-import com.bncam.data.settings.ProfileAwbSettings
 import com.bncam.data.settings.ProfileIspKeys
 import com.bncam.data.settings.ProfileDetailDefaults
 import com.bncam.data.settings.ProfileDetailSettings
@@ -438,7 +437,6 @@ data class RenderQualityPreferencesSnapshot(
     val jpegQuality: Int,
     val demosaic: DemosaicSelection,
     val curves: CurveRuntimeConfig,
-    val profileAwb: ProfileAwbSettings = ProfileAwbSettings(),
     val noiseTuning: ProfileNoiseTuning = ProfileNoiseTuning(),
     val noiseReductionTuning: ProfileNoiseReductionTuning = ProfileNoiseReductionTuning(),
     val toneTuning: ProfileToneTuning = ProfileToneTuning(),
@@ -550,7 +548,6 @@ data class RenderQualityConfig(
             val tonePreset = loadCurvePreset(repo, profileId, ProfileCurveDefaults.TYPE_TONE)
             val gammaPreset = loadCurvePreset(repo, profileId, ProfileCurveDefaults.TYPE_GAMMA)
             val sectionPreset = loadCurvePreset(repo, profileId, ProfileCurveDefaults.TYPE_SECT)
-            val profileAwb = repo.getProfileAwbSettingsFlow(profileId).first()
             val noiseTuning = ProfileNoiseTuning(
                 spectraEnabled = readProfileIntOrFallback(repo, profileId, ProfileIspKeys.SPECTRA_ENABLED, 0) == 1,
                 spectraLuma = readProfileFloatOrFallback(repo, profileId, ProfileIspKeys.SPECTRA_LUMA, SpectraProfileDefaults.LUMA, -1f..1f),
@@ -587,11 +584,6 @@ data class RenderQualityConfig(
             ).sanitized()
             val liveViewfinderTuning = ViewfinderLiveTuning.snapshot()
             val colorTuning = liveViewfinderTuning.applyColor(baseColorTuning)
-            // Live WB is a BnCam colour-pipeline override for every source. RAW applies the
-            // target before demosaic; YUV converts the same absolute target into a post-HAL
-            // compensation relative to the captured Camera2 AWB metadata. Never push this
-            // creative/UI control into a vendor Camera2 manual-WB request.
-            val effectiveProfileAwb = liveViewfinderTuning.applyRawWhiteBalance(profileAwb)
             val sharpeningMethod = ProfileSharpnessMethods.sanitize(
                 repo.getProfileString(
                     profileId,
@@ -648,7 +640,6 @@ data class RenderQualityConfig(
                         sectionPreset
                     )
                 ),
-                profileAwb = effectiveProfileAwb,
                 noiseTuning = noiseTuning,
                 noiseReductionTuning = noiseReductionTuning,
                 toneTuning = toneTuning,
@@ -690,8 +681,7 @@ data class RenderQualityConfig(
                 characteristics = calibrationInput.characteristics,
                 sensorMetadata = calibrationInput.sensorMetadata,
                 lensSettings = lensHardwareSettings,
-                profileAwbSettings = preferenceSnapshot?.profileAwb
-                    ?: repo.getProfileAwbSettingsFlow(profileId).first(),
+                liveWhiteBalanceKelvin = preferenceSnapshot?.liveViewfinderTuning?.whiteBalanceKelvin,
                 profileNoiseTuning = preferenceSnapshot?.noiseTuning,
                 stableAutoWhiteBalance = stableAutoWhiteBalance
             )

@@ -139,7 +139,6 @@ import com.bncam.data.profile.CameraProfile
 import com.bncam.data.settings.SettingsRepository
 import com.bncam.data.settings.LensIndicatorStyle
 import com.bncam.data.settings.lensIndicatorStyleFlow
-import com.bncam.data.settings.ProfileAwbSettings
 import com.bncam.data.settings.ViewfinderSliderAssignment
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.async
@@ -907,8 +906,6 @@ fun CameraScreen(
     val dedicatedShutterSlider by repository.shutterSpeedSliderFlow.collectAsState(initial = false)
     val dedicatedIsoSlider by repository.isoSliderFlow.collectAsState(initial = false)
     val liveViewfinderTuning by ViewfinderLiveTuning.state.collectAsState()
-    val activeProfileAwbSettings by repository.getProfileAwbSettingsFlow(activeProfile.id)
-        .collectAsState(initial = ProfileAwbSettings())
     val focusRing by repository.focusRingFlow.collectAsState(initial = true)
     val focusLock by repository.focusLockFlow.collectAsState(initial = "3s")
     val resetFocusCapture by repository.resetFocusCaptureFlow.collectAsState(initial = false)
@@ -1412,11 +1409,10 @@ fun CameraScreen(
         bnCameraManager.setFocusMode(focusMode)
     }
 
-    // Profile/lens changes re-apply the current live override. Slider movement itself calls the
-    // lightweight WB render target directly below, avoiding a recomposition/effect round-trip.
-    LaunchedEffect(activeProfileAwbSettings, activeLens.id) {
+    // AWB is lens hardware calibration, not profile state. A lens switch re-applies only the
+    // process-local live Kelvin override; System Auto otherwise owns the render target.
+    LaunchedEffect(activeLens.id) {
         bnCameraManager.setViewfinderWhiteBalance(
-            profileSettings = activeProfileAwbSettings,
             liveKelvin = liveViewfinderTuning.whiteBalanceKelvin,
             cameraId = activeLens.id
         )
@@ -2614,7 +2610,6 @@ fun CameraScreen(
                 onWhiteBalanceChange = { kelvin ->
                     ViewfinderLiveTuning.setWhiteBalanceKelvin(kelvin)
                     bnCameraManager.setViewfinderWhiteBalance(
-                        profileSettings = activeProfileAwbSettings,
                         liveKelvin = kelvin,
                         cameraId = activeLens.id
                     )
@@ -2623,7 +2618,6 @@ fun CameraScreen(
                 onWhiteBalanceReset = {
                     ViewfinderLiveTuning.resetWhiteBalance()
                     bnCameraManager.setViewfinderWhiteBalance(
-                        profileSettings = activeProfileAwbSettings,
                         liveKelvin = null,
                         cameraId = activeLens.id
                     )
@@ -2718,7 +2712,6 @@ fun CameraScreen(
                 onWhiteBalanceChange = { kelvin ->
                     ViewfinderLiveTuning.setWhiteBalanceKelvin(kelvin)
                     bnCameraManager.setViewfinderWhiteBalance(
-                        profileSettings = activeProfileAwbSettings,
                         liveKelvin = kelvin,
                         cameraId = activeLens.id
                     )
@@ -2727,7 +2720,6 @@ fun CameraScreen(
                 onWhiteBalanceReset = {
                     ViewfinderLiveTuning.resetWhiteBalance()
                     bnCameraManager.setViewfinderWhiteBalance(
-                        profileSettings = activeProfileAwbSettings,
                         liveKelvin = null,
                         cameraId = activeLens.id
                     )

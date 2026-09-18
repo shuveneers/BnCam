@@ -2,17 +2,6 @@ package com.bncam.data.settings
 
 import java.util.Locale
 
-object ProfileAwbModes {
-    const val SYSTEM_AUTO = "System"
-    const val BRAND_REFERENCE = "Brand"
-    const val MANUAL_KELVIN = "Manual"
-}
-
-object ProfileAwbModels {
-    const val PLANCKIAN = "Planckian Blackbody"
-    const val CIE_DAYLIGHT = "CIE Daylight"
-}
-
 object ProfileIspKeys {
     // Lightroom-style profile tone controls. These are ISP/render controls only; Camera2 exposure
     // strategy (shutter/ISO/EV acquisition) has a separate authority and must never read these keys.
@@ -178,47 +167,6 @@ data class ProfileDetailSettings(
     }
 }
 
-data class ProfileAwbSettings(
-    val mode: String = ProfileAwbModes.SYSTEM_AUTO,
-    val brand: String = "Canon",
-    val preset: String = "Daylight",
-    val kelvin: Int = 5200,
-    val illuminantModel: String = ProfileAwbModels.CIE_DAYLIGHT,
-    val tint: Float = 0f,
-    /**
-     * Profile V3 AWB intensity. 1.00 is the normal resolved correction, 0.00 neutralizes the
-     * profile/system correction, and values above 1.00 apply a bounded stronger correction.
-     * The persisted field name is retained for .bnc/DataStore compatibility.
-     */
-    val referenceIntensity: Float = 1f
-) {
-    fun sanitized(): ProfileAwbSettings = copy(
-        mode = mode.takeIf { it in MODES } ?: ProfileAwbModes.SYSTEM_AUTO,
-        brand = brand.takeIf { it in BRANDS } ?: "Canon",
-        preset = preset.takeIf { it in PRESETS } ?: "Daylight",
-        kelvin = kelvin.coerceIn(2000, 10000),
-        illuminantModel = illuminantModel.takeIf { it in MODELS } ?: ProfileAwbModels.CIE_DAYLIGHT,
-        tint = tint.takeIf { it.isFinite() }?.coerceIn(-1f, 1f) ?: 0f,
-        referenceIntensity = referenceIntensity.takeIf { it.isFinite() }?.coerceIn(0f, 1.5f) ?: 1f
-    )
-
-    fun summary(): String = when (mode) {
-        ProfileAwbModes.BRAND_REFERENCE -> "$brand reference · $preset · $kelvin K · ${String.format(java.util.Locale.US, "%.0f%%", referenceIntensity * 100f)}"
-        ProfileAwbModes.MANUAL_KELVIN -> "Manual Kelvin · $kelvin K · $illuminantModel · ${String.format(java.util.Locale.US, "%.0f%%", referenceIntensity * 100f)}"
-        else -> "System / Auto · ${String.format(java.util.Locale.US, "%.0f%%", referenceIntensity * 100f)}"
-    }
-
-    companion object {
-        val MODES = listOf(
-            ProfileAwbModes.SYSTEM_AUTO,
-            ProfileAwbModes.BRAND_REFERENCE,
-            ProfileAwbModes.MANUAL_KELVIN
-        )
-        val BRANDS = listOf("Canon", "Nikon", "Leica", "Fujifilm")
-        val PRESETS = listOf("Daylight", "Cloudy", "Shade", "Tungsten / Incandescent", "Fluorescent", "Flash")
-        val MODELS = listOf(ProfileAwbModels.PLANCKIAN, ProfileAwbModels.CIE_DAYLIGHT)
-    }
-}
 
 object LensHardwareTuningModes {
     const val OFF = "Off"

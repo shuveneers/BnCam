@@ -1163,7 +1163,7 @@ bool encodeNv21ToJpegCpuFallback(
     }
     if (timingOut != nullptr) timingOut->yuvRotateMs = nativeElapsedMs(stageStart);
 
-    // Profile AWB/color and Lightroom Detail are active in both YUV_FAST and YUV_COMPUTE.
+    // Developed YUV WB compensation, profile color and detail remain active in both YUV_FAST and YUV_COMPUTE.
     applyYuvProfileRgbAdjustments(bgrMat, qualityConfig);
     applyYuvProfileDetailCpuFallback(bgrMat, qualityConfig);
 
@@ -2825,12 +2825,12 @@ Java_com_bncam_core_engine_ImageUtils_processNativeYuv(
           << ";planeCopyOk=" << (planeCopyOk ? "true" : "false")
           << ";jpegBytes=" << jpegBuf.size()
           << ";curveApplied=" << (encodeTiming.yuvToneAlignmentApplied ? "true" : "false")
-          << ";profileYuvAwbApplied=" << (
+          << ";developedYuvAwbApplied=" << (
                   std::abs(yuvQuality.profileYuvWbRed - 1.0f) > 1.0e-4f ||
                   std::abs(yuvQuality.profileYuvWbGreen - 1.0f) > 1.0e-4f ||
                   std::abs(yuvQuality.profileYuvWbBlue - 1.0f) > 1.0e-4f
                   ? "true" : "false")
-          << ";profileYuvWb=[" << yuvQuality.profileYuvWbRed
+          << ";developedYuvWb=[" << yuvQuality.profileYuvWbRed
           << "," << yuvQuality.profileYuvWbGreen
           << "," << yuvQuality.profileYuvWbBlue << "]"
           << ";profileColorManagementApplied=" << (

@@ -190,14 +190,6 @@ class CaptureRecipe private constructor(
                 "gammaCurveNodes" to executionSettings.renderPreferences.curves.gammaNodes,
                 "sectionCurvePreset" to executionSettings.renderPreferences.curves.sectionPreset,
                 "sectionCurveNodes" to executionSettings.renderPreferences.curves.sectionNodes,
-                "awb" to linkedMapOf(
-                    "mode" to executionSettings.renderPreferences.profileAwb.mode,
-                    "brand" to executionSettings.renderPreferences.profileAwb.brand,
-                    "preset" to executionSettings.renderPreferences.profileAwb.preset,
-                    "kelvin" to executionSettings.renderPreferences.profileAwb.kelvin,
-                    "model" to executionSettings.renderPreferences.profileAwb.illuminantModel,
-                    "tint" to executionSettings.renderPreferences.profileAwb.tint
-                ),
                 "spectraProfile" to executionSettings.renderPreferences.spectraProfileMap(),
                 "colorProfile" to executionSettings.renderPreferences.colorProfileMap(),
                 "liveViewfinderTuning" to linkedMapOf(
@@ -483,14 +475,6 @@ internal fun RenderQualityPreferencesSnapshot.profileVersionMap(): Map<String, A
         "gammaNodes" to curves.gammaNodes,
         "sectionPreset" to curves.sectionPreset,
         "sectionNodes" to curves.sectionNodes
-    ),
-    "awb" to linkedMapOf(
-        "mode" to profileAwb.mode,
-        "brand" to profileAwb.brand,
-        "preset" to profileAwb.preset,
-        "kelvin" to profileAwb.kelvin,
-        "illuminantModel" to profileAwb.illuminantModel,
-        "tint" to profileAwb.tint
     ),
     "spectraProfile" to spectraProfileMap(),
     "noiseReductionProfile" to noiseReductionProfileMap(),

@@ -18,10 +18,10 @@ class Phase3LiveWhiteBalanceSourceContractTest {
         assertTrue(manager.contains("lastLiveWhiteBalanceDisplayUpdateMs < 33L"))
         assertTrue(manager.contains("liveWhiteBalanceResolutionJob?.cancel()"))
         assertTrue(screen.contains("bnCameraManager.setViewfinderWhiteBalance("))
-        assertTrue(screen.contains("LaunchedEffect(activeProfileAwbSettings, activeLens.id)"))
+        assertTrue(screen.contains("LaunchedEffect(activeLens.id)"))
         assertTrue(screen.contains("liveKelvin = ViewfinderLiveTuning.snapshot().whiteBalanceKelvin"))
         assertTrue(screen.contains("pushLiveWhiteBalanceToPreview()"))
-        assertFalse(screen.contains("LaunchedEffect(activeProfileAwbSettings, liveViewfinderTuning.whiteBalanceKelvin"))
+        assertFalse(screen.contains("activeProfileAwbSettings"))
         val wbFunction = manager.substring(
             manager.indexOf("fun setViewfinderWhiteBalance("),
             manager.indexOf("fun setLiveWhiteBalanceKelvin(")

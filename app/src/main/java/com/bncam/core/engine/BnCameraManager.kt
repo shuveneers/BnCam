@@ -129,7 +129,9 @@ import com.bncam.core.isp.raw.RawDomainContractResolver
 import com.bncam.core.isp.raw.RawWhiteDomainBinding
 import com.bncam.core.isp.raw10.RawCameraColorProfileRepository
 import com.bncam.core.quality.RawColorTransformEngine
-import com.bncam.core.quality.ProfileYuvAwbMapper
+import com.bncam.core.quality.GcamAwbCalibrationEngine
+import com.bncam.core.quality.YuvAwbMapper
+import com.bncam.core.quality.ManualWhiteBalanceTarget
 import com.bncam.core.quality.StableWhiteBalanceSnapshot
 import com.bncam.core.quality.WhiteBalanceConvergence
 import com.bncam.core.quality.WhiteBalanceStateEngine
@@ -140,10 +142,8 @@ import com.bncam.core.runtime.RawPreviewProducerAuthorityTracker
 import com.bncam.core.runtime.RawPreviewProducerKind
 import com.bncam.data.profile.CameraProfile
 import com.bncam.data.settings.SettingsRepository
+import com.bncam.data.settings.LensAwbCalibrationRuntimeRegistry
 import com.bncam.data.settings.CaptureSettingKeys
-import com.bncam.data.settings.ProfileAwbModels
-import com.bncam.data.settings.ProfileAwbModes
-import com.bncam.data.settings.ProfileAwbSettings
 import com.bncam.data.settings.parseCameraFormatCode
 import com.bncam.data.settings.rawPreviewFormatCompatibility
 import com.bncam.data.settings.RawPreviewFormatCompatibility
@@ -12048,7 +12048,54 @@ class BnCameraManager(private val context: Context) {
             val finalRgb = frame.physicalAwbFinalRgb
             if (finalRgb.size < 3 || finalRgb.any { !it.isFinite() || it <= 0f }) return
             val scopeKey = identity.physicalCameraId ?: identity.logicalCameraId
-            val finalGains = floatArrayOf(finalRgb[0], 1f, 1f, finalRgb[2])
+
+            // Lens ID AWB Calibration is the sole persistent calibration owner. GCam/AGC-style
+            // RG/BG calibration constrains the physical scene solution without replacing scene
+            // evidence. Camera2 exact-frame Gr/Gb remains the fallback green-site calibration.
+            val runtimeCalibration = LensAwbCalibrationRuntimeRegistry.resolve(scopeKey)
+            val characteristics = liveWhiteBalanceCharacteristics(scopeKey)
+                ?: identity.logicalCameraId.takeIf { it != scopeKey }?.let(::liveWhiteBalanceCharacteristics)
+            val resolvedCalibration = characteristics?.let {
+                GcamAwbCalibrationEngine.resolve(runtimeCalibration.settings, it)
+            }
+            val priorGains = frame.camera2PriorWbGains
+            val priorGrGb = if (
+                priorGains.size >= 4 && priorGains[1].isFinite() && priorGains[2].isFinite() &&
+                priorGains[1] > 1.0e-4f && priorGains[2] > 1.0e-4f
+            ) {
+                (priorGains[1] / priorGains[2]).coerceIn(0.50f, 2.0f)
+            } else 1.0f
+            val importedGrGbRatio = resolvedCalibration?.grGbRatio?.takeIf { it.isFinite() && it in 0.50f..2.0f }
+            val cfaPattern = characteristics?.get(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT)
+            // QcColorCalibration GR/GB is semantic Gr/Gb. Camera2 RGGB vectors use
+            // greenEven/greenOdd, so GBRG/BGGR require the reciprocal mapping.
+            val calibratedEvenOddRatio = importedGrGbRatio?.let { grGb ->
+                when (cfaPattern) {
+                    CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT_GBRG,
+                    CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT_BGGR -> 1.0f / grGb
+                    else -> grGb
+                }
+            }
+            val greenEvenOddRatio = calibratedEvenOddRatio ?: priorGrGb
+            val greenRoot = sqrt(greenEvenOddRatio.coerceAtLeast(1.0e-6f))
+            val sceneGains = floatArrayOf(
+                finalRgb[0],
+                greenRoot,
+                1.0f / greenRoot,
+                finalRgb[2]
+            )
+            val calibrationAuthority = if (resolvedCalibration?.valid == true) {
+                (0.55f * frame.physicalAwbConfidence.coerceIn(0f, 1f) *
+                    (0.50f + 0.50f * frame.physicalAwbDataAuthority.coerceIn(0f, 1f))).coerceIn(0f, 0.55f)
+            } else 0f
+            val finalGains = if (resolvedCalibration != null) {
+                GcamAwbCalibrationEngine.constrainPhysicalGains(
+                    physicalGains = sceneGains,
+                    calibration = resolvedCalibration,
+                    authority = calibrationAuthority
+                )
+            } else sceneGains
+
             val before = whiteBalanceStateEngine.snapshot(scopeKey)
             val after = whiteBalanceStateEngine.observePhysical(
                 scopeKey = scopeKey,
@@ -12062,7 +12109,12 @@ class BnCameraManager(private val context: Context) {
                 priorDisagreement = frame.physicalAwbPriorDisagreement,
                 validTileCount = frame.physicalAwbValidTileCount,
                 dataReady = frame.physicalAwbDataReady,
-                sensorTimestampNs = frame.sensorTimestampNs
+                sensorTimestampNs = frame.sensorTimestampNs,
+                calibrationSource = resolvedCalibration?.source ?: "UNAVAILABLE",
+                calibrationFingerprint = resolvedCalibration?.fingerprint ?: "UNAVAILABLE",
+                calibrationAuthority = calibrationAuthority,
+                grGbRatio = importedGrGbRatio,
+                greenEvenOddRatio = greenEvenOddRatio
             ) ?: return
             val matrix = after.copyColorMatrix()
             if (matrix != null) {
@@ -12089,7 +12141,12 @@ class BnCameraManager(private val context: Context) {
                         "priorRgb=${prior.joinToString(prefix = "[", postfix = "]") { "%.4f".format(Locale.US, it) }} " +
                         "dataRgb=${data.joinToString(prefix = "[", postfix = "]") { "%.4f".format(Locale.US, it) }} " +
                         "finalRgb=${finalRgb.joinToString(prefix = "[", postfix = "]") { "%.4f".format(Locale.US, it) }} " +
-                        "appliedRgb=[${"%.4f".format(Locale.US, applied[0])},1.0000,${"%.4f".format(Locale.US, applied[3])}] " +
+                        "appliedRggb=${applied.joinToString(prefix = "[", postfix = "]") { "%.4f".format(Locale.US, it) }} " +
+                        "calibration=${resolvedCalibration?.source ?: "unavailable"} " +
+                        "calibrationFp=${resolvedCalibration?.fingerprint ?: "unavailable"} " +
+                        "calibrationAuthority=${"%.3f".format(Locale.US, calibrationAuthority)} " +
+                        "grGbRatio=${"%.5f".format(Locale.US, importedGrGbRatio ?: Float.NaN)} " +
+                        "greenEvenOddRatio=${"%.5f".format(Locale.US, greenEvenOddRatio)} " +
                         "confidence=${"%.3f".format(Locale.US, frame.physicalAwbConfidence)} " +
                         "dataAuthority=${"%.3f".format(Locale.US, frame.physicalAwbDataAuthority)} " +
                         "neutralSupport=${"%.3f".format(Locale.US, frame.physicalAwbNeutralSupport)} " +
@@ -12180,7 +12237,7 @@ class BnCameraManager(private val context: Context) {
         }
 
         /**
-         * BnCam manual/profile WB is implemented in our own colour pipeline. It therefore does
+         * BnCam live manual WB is implemented in our own colour pipeline. It therefore does
          * not depend on vendor support for CONTROL_AWB_MODE_OFF / manual Camera2 colour keys.
          * Keeping Camera2 AWB running also preserves trustworthy per-frame neutral metadata.
          */
@@ -12203,33 +12260,24 @@ class BnCameraManager(private val context: Context) {
         }
 
         fun setViewfinderWhiteBalance(
-            profileSettings: ProfileAwbSettings,
             liveKelvin: Int?,
             cameraId: String
         ) {
             val requestEpoch = liveWhiteBalanceRequestEpoch.incrementAndGet()
             val requestedKelvin = liveKelvin?.coerceIn(2000, 10000)
-            val base = profileSettings.sanitized()
             liveWhiteBalanceResolutionJob?.cancel()
             liveWhiteBalanceResolutionJob = sessionTransitionScope.launch {
-                val effective = requestedKelvin?.let { targetKelvin ->
-                    base.copy(
-                        mode = ProfileAwbModes.MANUAL_KELVIN,
-                        kelvin = targetKelvin,
-                        illuminantModel = if (targetKelvin >= 4000) {
-                            ProfileAwbModels.CIE_DAYLIGHT
-                        } else {
-                            ProfileAwbModels.PLANCKIAN
-                        }
-                    ).sanitized()
-                } ?: base
-
-                val targetColorSolution = if (effective.mode == ProfileAwbModes.SYSTEM_AUTO) {
-                    null
-                } else {
+                val targetColorSolution = requestedKelvin?.let { targetKelvin ->
                     liveWhiteBalanceCharacteristics(cameraId)?.let { characteristics ->
                         runCatching {
-                            RawColorTransformEngine.computeProfileWhiteBalance(characteristics, effective)
+                            RawColorTransformEngine.computeManualWhiteBalance(
+                                characteristics,
+                                ManualWhiteBalanceTarget(
+                                    kelvin = targetKelvin,
+                                    illuminantModel = if (targetKelvin >= 4000) "CIE Daylight" else "Planckian Blackbody",
+                                    tint = 0f
+                                )
+                            )
                         }.getOrNull()?.takeIf { solution ->
                             solution.isValid && solution.bayerWbGains.size >= 4 &&
                                 solution.bayerWbGains.take(4).all { it.isFinite() && it in 0.35f..4.50f } &&
@@ -12245,15 +12293,12 @@ class BnCameraManager(private val context: Context) {
                 requestedLiveWhiteBalanceKelvin = requestedKelvin
                 liveWhiteBalanceTargetSensorGains = targetSensorGains?.copyOf(4)
                 if (targetSensorGains != null && targetColorMatrix != null) {
-                    // Explicit profile/manual WB intentionally overrides System-Auto state. Publish
-                    // the calibrated WB diagonal + post-WB CCM atomically; a gain-only override
-                    // would pair a new illuminant with the previous Camera2 color transform.
+                    // Live Kelvin is a temporary viewfinder/capture override. It does not belong
+                    // to a profile and does not mutate the per-lens GCam AWB calibration.
                     rawPreviewRenderer.clearExactFrameCamera2ColorPairs()
                     rawPreviewRenderer.clearAutoWhiteBalanceColorPair()
                     rawPreviewRenderer.updateWhiteBalanceColorPair(targetSensorGains, targetColorMatrix)
                 } else {
-                    // System Auto keeps Camera2 exact-frame metadata as the physical prior while
-                    // the independent temporal pair controls rendering once validated.
                     rawPreviewRenderer.updateWhiteBalanceGains(null)
                     val stable = stableAutoWhiteBalanceSnapshotForActiveCamera()
                     val stableMatrix = stable?.copyColorMatrix()
@@ -12268,25 +12313,19 @@ class BnCameraManager(private val context: Context) {
                     _liveWhiteBalanceDisplayCompensation.value = LiveWhiteBalanceDisplayCompensation()
                 }
                 lastLiveWhiteBalanceSummary = when {
-                    effective.mode == ProfileAwbModes.SYSTEM_AUTO -> "BNCAM_AUTO;lens=$cameraId"
-                    targetSensorGains == null ->
-                        "BNCAM_PROFILE_TARGET_UNAVAILABLE;mode=${effective.mode};kelvin=${effective.kelvin}K;lens=$cameraId"
-                    requestedKelvin != null ->
-                        "BNCAM_LIVE;kelvin=${effective.kelvin}K;tint=${effective.tint};lens=$cameraId"
-                    else ->
-                        "BNCAM_PROFILE;mode=${effective.mode};kelvin=${effective.kelvin}K;tint=${effective.tint};lens=$cameraId"
+                    requestedKelvin == null -> "BNCAM_AUTO;lens=$cameraId"
+                    targetSensorGains == null -> "BNCAM_LIVE_TARGET_UNAVAILABLE;kelvin=${requestedKelvin}K;lens=$cameraId"
+                    else -> "BNCAM_LIVE;kelvin=${requestedKelvin}K;lens=$cameraId"
                 }
             }
-            // No Camera2 request/session update. RAW consumes an atomic per-frame render target;
-            // YUV maps the same absolute target relative to the latest HAL AWB result below.
         }
 
         fun setLiveWhiteBalanceKelvin(kelvin: Int?, cameraId: String) {
-            setViewfinderWhiteBalance(ProfileAwbSettings(), kelvin, cameraId)
+            setViewfinderWhiteBalance(kelvin, cameraId)
         }
 
         private fun updateLiveWhiteBalanceDisplayCompensation(result: CaptureResult) {
-            // Manual/profile/live WB supplies an explicit absolute target. System Auto remains
+            // Live manual WB supplies an explicit absolute target. System Auto remains
             // continuously estimated by Camera2; BnCam no longer owns a separate AWB-lock state.
             val target = liveWhiteBalanceTargetSensorGains ?: run {
                 if (_liveWhiteBalanceDisplayCompensation.value.active) {
@@ -12299,9 +12338,9 @@ class BnCameraManager(private val context: Context) {
             val nowMs = android.os.SystemClock.elapsedRealtime()
             if (nowMs - lastLiveWhiteBalanceDisplayUpdateMs < 33L) return
             val base = result.get(CaptureResult.COLOR_CORRECTION_GAINS) ?: return
-            val relative = ProfileYuvAwbMapper.resolve(
+            val relative = YuvAwbMapper.resolve(
                 baseCameraGains = floatArrayOf(base.red, base.greenEven, base.greenOdd, base.blue),
-                effectiveProfileGains = target
+                targetGains = target
             )
             val next = LiveWhiteBalanceDisplayCompensation(
                 red = relative.getOrElse(0) { 1f }.coerceIn(0.5f, 2f),
@@ -12321,7 +12360,7 @@ class BnCameraManager(private val context: Context) {
         }
 
         private fun applyLiveWhiteBalancePolicy(builder: CaptureRequest.Builder) {
-            // Camera2 AWB remains the continuously-running neutral estimator. Manual/profile/live
+            // Camera2 AWB remains the continuously-running neutral estimator. Live manual
             // WB is applied by BnCam's colour pipeline; there is intentionally no user AWB lock.
             builder.set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
             // Explicitly clear a stale lock bit on a recycled request builder from older app state.

@@ -3,8 +3,6 @@ package com.bncam.core.quality
 import android.graphics.ImageFormat
 import android.util.Log
 import android.hardware.camera2.CameraCharacteristics
-import com.bncam.data.settings.ProfileAwbModes
-import com.bncam.data.settings.ProfileAwbSettings
 import com.bncam.data.settings.ResolvedLensHardwareSettings
 import java.util.Locale
 import kotlin.math.abs
@@ -167,6 +165,11 @@ data class FinalSensorCalibration(
     val effectiveWbGains: FloatArray,
     val effectiveWbSource: String,
     val effectiveWbApplied: Boolean,
+    val awbCalibrationSource: String = "UNAVAILABLE",
+    val awbCalibrationFingerprint: String = "UNAVAILABLE",
+    val awbCalibrationAuthority: Float = 0f,
+    val awbGrGbRatio: Float? = null,
+    val awbGreenEvenOddRatio: Float = 1f,
 
     val effectiveColorMatrix: FloatArray?,
     val effectiveColorMatrixSource: String,
@@ -257,9 +260,17 @@ data class FinalSensorCalibration(
         pairs.add("Color Matrix Applied To" to colorMatrixAppliedTo())
 
         pairs.add("WB Source" to effectiveWbSource)
-        pairs.add("WB Gains" to effectiveWbGains.formatArray5())
+        pairs.add("WB Gains [R,G_even,G_odd,B]" to effectiveWbGains.formatArray5())
         pairs.add("WB Applied" to effectiveWbApplied.toString())
         pairs.add("WB Applied To" to wbAppliedTo())
+        pairs.add("AWB Calibration Owner" to "Lens ID hardware settings")
+        pairs.add("AWB Calibration Source" to awbCalibrationSource)
+        pairs.add("AWB Calibration Fingerprint" to awbCalibrationFingerprint)
+        pairs.add("AWB Calibration Authority" to awbCalibrationAuthority.format6())
+        pairs.add("AWB Calibration GR/GB Ratio" to (awbGrGbRatio?.format6() ?: "not supplied"))
+        pairs.add("AWB Applied G_even/G_odd Ratio" to awbGreenEvenOddRatio.format6())
+        pairs.add("AWB Profile-owned State" to "none")
+        pairs.add("DNG Developed AWB Override" to "false")
 
         pairs.add("Normalization Calibration Valid" to normalizationCalibrationValid.toString())
         pairs.add("CFA Bayer Noise Model Supported" to cfaSupportedForBayerNoiseModel.toString())
@@ -330,11 +341,11 @@ fun ResolvedLensHardwareSettings.toOverrideLayer(): LensOverrideLayer {
         colorMode = colorMatrixMode,
         colorPresetName = colorMatrixMode,
         manualColorMatrix = manualColorMatrix.takeIf { colorMatrixNativeMode == 1 && colorMatrixValidationPassed && it.size == 9 }?.toFloatArray(),
-        awbMode = if (awbNativeMode == 1) "Manual_Override" else "System",
-        awbProfile = awbProfile,
-        awbRatio = awbRatio,
-        awbTemp = awbTemp,
-        awbIntensity = awbIntensity,
+        awbMode = "System",
+        awbProfile = "RetiredLegacyTransport",
+        awbRatio = 1f,
+        awbTemp = 0f,
+        awbIntensity = 0f,
         warnings = warnings
     )
 }
@@ -348,7 +359,7 @@ object SensorCalibrationResolver {
         characteristics: CameraCharacteristics,
         sensorMetadata: SensorMetadata,
         lensSettings: ResolvedLensHardwareSettings?,
-        profileAwbSettings: ProfileAwbSettings? = null,
+        liveWhiteBalanceKelvin: Int? = null,
         profileNoiseTuning: ProfileNoiseTuning? = null,
         stableAutoWhiteBalance: StableWhiteBalanceSnapshot? = null
     ): FinalSensorCalibration {
@@ -363,7 +374,7 @@ object SensorCalibrationResolver {
         return buildFinalCalibration(
             base,
             override,
-            profileAwbSettings,
+            liveWhiteBalanceKelvin,
             profileNoiseTuning,
             stableAutoWhiteBalance,
             characteristics
@@ -627,7 +638,7 @@ object SensorCalibrationResolver {
     private fun buildFinalCalibration(
         base: BaseSensorCalibration,
         override: LensOverrideLayer,
-        profileAwbSettings: ProfileAwbSettings?,
+        liveWhiteBalanceKelvin: Int?,
         profileNoiseTuning: ProfileNoiseTuning? = null,
         stableAutoWhiteBalance: StableWhiteBalanceSnapshot? = null,
         characteristics: CameraCharacteristics
@@ -693,35 +704,42 @@ object SensorCalibrationResolver {
         }
 
         val manualColorOverrideActive = override.manualColorMatrix != null
-        val safeProfileAwb = profileAwbSettings?.sanitized()
-        val sensorAwareProfileAwb = safeProfileAwb
-            ?.takeIf { it.mode != ProfileAwbModes.SYSTEM_AUTO }
-            ?.let { settings ->
-                runCatching { RawColorTransformEngine.computeProfileWhiteBalance(characteristics, settings) }
-                    .getOrNull()
-                    ?.takeIf { solution ->
-                        val gains = solution.bayerWbGains
-                        val safeGains = gains.size >= 4 && gains.take(4).all { gain ->
-                            gain.isFinite() && gain in 0.35f..4.50f
-                        }
-                        val redBlueRatio = if (gains.size >= 4 && gains[3] > 1.0e-4f) gains[0] / gains[3] else Float.NaN
-                        solution.isValid && safeGains && redBlueRatio.isFinite() && redBlueRatio in 0.15f..6.67f
+        val liveManualWhiteBalance = liveWhiteBalanceKelvin?.let { requestedKelvin ->
+            val target = ManualWhiteBalanceTarget(
+                kelvin = requestedKelvin,
+                illuminantModel = if (requestedKelvin >= 4000) "CIE Daylight" else "Planckian Blackbody",
+                tint = 0f
+            )
+            runCatching { RawColorTransformEngine.computeManualWhiteBalance(characteristics, target) }
+                .getOrNull()
+                ?.takeIf { solution ->
+                    val gains = solution.bayerWbGains
+                    val safeGains = gains.size >= 4 && gains.take(4).all { gain ->
+                        gain.isFinite() && gain in 0.35f..4.50f
                     }
-            }
-
-        val systemAwbRequested = when {
-            safeProfileAwb?.mode == ProfileAwbModes.SYSTEM_AUTO -> true
-            safeProfileAwb == null && override.awbMode == "System" -> true
-            else -> false
+                    val redBlueRatio = if (gains.size >= 4 && gains[3] > 1.0e-4f) gains[0] / gains[3] else Float.NaN
+                    solution.isValid && safeGains && redBlueRatio.isFinite() && redBlueRatio in 0.15f..6.67f
+                }
         }
+        if (liveWhiteBalanceKelvin != null && liveManualWhiteBalance == null) {
+            warnings.add(
+                "Live manual WB ${liveWhiteBalanceKelvin}K rejected by the sensor color-calibration safety envelope; " +
+                    "falling back to Lens ID/Camera2 automatic white balance for this capture."
+            )
+        }
+        if (override.awbMode != "System") {
+            warnings.add("Retired legacy Lens Hardware AWB override ignored; Lens ID AWB Calibration is the sole persistent AWB owner")
+        }
+
+        val systemAwbRequested = liveManualWhiteBalance == null
         val exactFrameCamera2Wb = base.baseWbAppliedByDefault &&
             base.baseWbSource.contains("CaptureResult.COLOR_CORRECTION_GAINS", ignoreCase = true)
         val exactFrameCamera2Ccm = base.baseColorMatrixApplied &&
             base.baseColorMatrixSource.contains("CaptureResult.COLOR_CORRECTION_TRANSFORM", ignoreCase = true)
         val exactFrameCamera2ColorPair = systemAwbRequested && exactFrameCamera2Wb && exactFrameCamera2Ccm
 
-        // System Auto uses the single temporal owner's recent physical scene solution only when
-        // it carries a coherent WB+CCM pair. Camera2 remains the exact-frame prior/fallback whenever
+        // Lens Auto uses the single temporal owner's recent physical scene solution only when it
+        // carries a coherent WB+CCM pair. Camera2 remains the exact-frame prior/fallback whenever
         // physical evidence is unavailable, weak, stale or incomplete; no gain-only history is
         // mixed with a current-frame matrix.
         val stablePhysicalSystemAutoPair = stableAutoWhiteBalance?.takeIf { snapshot ->
@@ -746,12 +764,6 @@ object SensorCalibrationResolver {
                 snapshot.gains.take(4).all { gain -> gain.isFinite() && gain in 0.25f..6.0f }
         }
 
-        if (safeProfileAwb != null && safeProfileAwb.mode != ProfileAwbModes.SYSTEM_AUTO && sensorAwareProfileAwb == null) {
-            warnings.add(
-                "Profile manual WB rejected by safe sensor-gain envelope; falling back to capture-result Camera2 AWB. " +
-                    "The stored profile is preserved and cannot brick RAW preview/startup."
-            )
-        }
         if (systemAwbRequested && exactFrameCamera2Wb.xor(exactFrameCamera2Ccm)) {
             warnings.add(
                 "Incomplete selected-frame Camera2 color pair: exactWb=$exactFrameCamera2Wb exactCcm=$exactFrameCamera2Ccm. " +
@@ -760,68 +772,84 @@ object SensorCalibrationResolver {
         }
 
         val wb = when {
-            sensorAwareProfileAwb != null -> sensorAwareProfileAwb.bayerWbGains.copyOf()
+            liveManualWhiteBalance != null -> liveManualWhiteBalance.bayerWbGains.copyOf()
             stablePhysicalSystemAutoPair != null -> stablePhysicalSystemAutoPair.copyGains()
-            systemAwbRequested && exactFrameCamera2Wb -> base.baseWbGains.copyOf()
+            exactFrameCamera2Wb -> base.baseWbGains.copyOf()
             stableSystemAutoWbFallback != null -> stableSystemAutoWbFallback.copyGains()
-            safeProfileAwb?.mode == ProfileAwbModes.SYSTEM_AUTO -> base.baseWbGains.copyOf()
-            safeProfileAwb != null -> base.baseWbGains.copyOf()
-            override.awbMode != "System" -> {
-                warnings.add("Legacy Lens ID AWB override applied because no profile AWB snapshot was supplied")
-                applyAwbOverride(base.baseWbGains, override)
-            }
             else -> base.baseWbGains.copyOf()
         }
         val wbSource = when {
-            sensorAwareProfileAwb != null ->
-                "Sensor-aware profile WB ${sensorAwareProfileAwb.targetKelvin}K / ${sensorAwareProfileAwb.illuminantModel} / Camera2 calibration matrices"
+            liveManualWhiteBalance != null ->
+                "Live manual WB ${liveManualWhiteBalance.targetKelvin}K / ${liveManualWhiteBalance.illuminantModel} / Camera2 calibration matrices"
             stablePhysicalSystemAutoPair != null ->
-                "BnCam physical AWB confidence=${String.format(Locale.US, "%.3f", stablePhysicalSystemAutoPair.confidence)} " +
+                "BnCam Lens AWB physical scene confidence=${String.format(Locale.US, "%.3f", stablePhysicalSystemAutoPair.confidence)} " +
                     "dataAuthority=${String.format(Locale.US, "%.3f", stablePhysicalSystemAutoPair.dataAuthority)} " +
                     "mixedLight=${String.format(Locale.US, "%.3f", stablePhysicalSystemAutoPair.mixedLightScore)}"
             exactFrameCamera2ColorPair ->
                 "CaptureResult exact-frame color pair: COLOR_CORRECTION_GAINS + COLOR_CORRECTION_TRANSFORM"
-            systemAwbRequested && exactFrameCamera2Wb ->
+            exactFrameCamera2Wb ->
                 "Exact-frame Camera2 WB gains with non-frame CCM fallback: ${base.baseColorMatrixSource}"
             stableSystemAutoWbFallback != null ->
                 "BnCam stable Camera2 AWB bootstrap confidence=${String.format(Locale.US, "%.3f", stableSystemAutoWbFallback.confidence)} samples=${stableSystemAutoWbFallback.acceptedSampleCount}"
-            safeProfileAwb?.mode == ProfileAwbModes.SYSTEM_AUTO -> base.baseWbSource
-            safeProfileAwb != null -> "Profile WB fallback -> ${base.baseWbSource}"
-            override.awbMode != "System" -> "Legacy Lens ID AWB override profile=${override.awbProfile} over ${base.baseWbSource}"
             else -> base.baseWbSource
         }
 
-        // WB gains and the post-demosaic sensor->linear-sRGB matrix are separate operations but
-        // they form one colorimetric solution. System Auto uses the exact/temporal Camera2 pair.
-        // Manual/profile Kelvin uses RawColorTransformEngine's calibration-derived post-WB matrix
-        // so a new illuminant is never paired with a CCM solved for a different white point.
-        val profileColorMatrix = sensorAwareProfileAwb?.mPostCompensated?.copyOf()?.takeIf {
+        val awbCalibrationSource = when {
+            liveManualWhiteBalance != null -> "LIVE_MANUAL_KELVIN_TRANSIENT_OVERRIDE"
+            stablePhysicalSystemAutoPair != null -> stablePhysicalSystemAutoPair.calibrationSource
+            exactFrameCamera2Wb -> "CAMERA2_EXACT_FRAME"
+            stableSystemAutoWbFallback != null -> stableSystemAutoWbFallback.calibrationSource
+            else -> "CAMERA2_BASE_METADATA"
+        }
+        val awbCalibrationFingerprint = when {
+            liveManualWhiteBalance != null -> "transient:${liveManualWhiteBalance.targetKelvin}K:${liveManualWhiteBalance.illuminantModel}"
+            stablePhysicalSystemAutoPair != null -> stablePhysicalSystemAutoPair.calibrationFingerprint
+            stableSystemAutoWbFallback != null -> stableSystemAutoWbFallback.calibrationFingerprint
+            else -> "UNAVAILABLE"
+        }
+        val awbCalibrationAuthority = when {
+            liveManualWhiteBalance != null -> 1f
+            stablePhysicalSystemAutoPair != null -> stablePhysicalSystemAutoPair.calibrationAuthority
+            else -> 0f
+        }
+        val awbGrGbRatio = stablePhysicalSystemAutoPair?.grGbRatio
+        val awbGreenEvenOddRatio = when {
+            stablePhysicalSystemAutoPair != null -> stablePhysicalSystemAutoPair.greenEvenOddRatio
+            wb.size >= 3 && wb[1].isFinite() && wb[2].isFinite() && wb[1] > 1.0e-4f && wb[2] > 1.0e-4f ->
+                (wb[1] / wb[2]).coerceIn(0.50f, 2.0f)
+            else -> 1f
+        }
+
+        // WB gains and the post-demosaic sensor->linear-sRGB matrix form one colorimetric pair.
+        // A temporary live Kelvin target gets a calibration-derived paired CCM; Lens Auto uses
+        // the exact/temporal Camera2 pair. No profile-owned AWB state exists anymore.
+        val liveManualColorMatrix = liveManualWhiteBalance?.mPostCompensated?.copyOf()?.takeIf {
             RawColorTransformEngine.validateSensorToLinearSrgbMatrix(it).valid
         }
         val colorMatrix = when {
             manualColorOverrideActive -> override.manualColorMatrix
-            sensorAwareProfileAwb != null && profileColorMatrix != null -> profileColorMatrix
+            liveManualWhiteBalance != null && liveManualColorMatrix != null -> liveManualColorMatrix
             stablePhysicalSystemAutoPair != null -> stablePhysicalSystemAutoPair.copyColorMatrix()
             else -> base.baseColorMatrix
         }
         val colorSource = when {
             manualColorOverrideActive -> "Lens ID Manual color matrix override"
-            sensorAwareProfileAwb != null && profileColorMatrix != null ->
-                "Sensor-aware profile WB ${sensorAwareProfileAwb.targetKelvin}K paired post-WB sensor->linear-sRGB matrix"
+            liveManualWhiteBalance != null && liveManualColorMatrix != null ->
+                "Live manual WB ${liveManualWhiteBalance.targetKelvin}K paired post-WB sensor->linear-sRGB matrix"
             stablePhysicalSystemAutoPair != null ->
-                "BnCam physical AWB temporally paired Camera2 CCM"
+                "BnCam Lens AWB temporally paired Camera2 CCM"
             exactFrameCamera2ColorPair ->
                 "CaptureResult exact-frame color pair: COLOR_CORRECTION_TRANSFORM + COLOR_CORRECTION_GAINS"
             else -> base.baseColorMatrixSource
         }
         val colorApplied = when {
             manualColorOverrideActive -> true
-            sensorAwareProfileAwb != null && profileColorMatrix != null -> true
+            liveManualWhiteBalance != null && liveManualColorMatrix != null -> true
             stablePhysicalSystemAutoPair != null -> colorMatrix != null
             else -> colorMatrix != null && !base.baseColorMatrixIdentityFallbackUsed
         }
         val identityFallback = !manualColorOverrideActive &&
-            !(sensorAwareProfileAwb != null && profileColorMatrix != null) &&
+            !(liveManualWhiteBalance != null && liveManualColorMatrix != null) &&
             stablePhysicalSystemAutoPair == null && base.baseColorMatrixIdentityFallbackUsed
 
         val applicability = listOf(
@@ -836,6 +864,8 @@ object SensorCalibrationResolver {
                 else -> "NOT_APPLICABLE_TO_YUV_OR_UNKNOWN"
             },
             "Noise Model Applied To" to if (noiseValues != null) "RAW_DOMAIN_NATIVE_ISP_PHYSICAL_SO" else "NOT_APPLIED_MISSING_OR_INVALID",
+            "Lens AWB Calibration Applied To" to "DEVELOPED_RAW_PRE_DEMOSAIC_GREEN_SPLIT_AND_POST_DEMOSAIC_RB_CCM",
+            "DNG Developed AWB/CCM Overridden" to "false",
             "DNG Standard Tags Overridden" to "false"
         )
 
@@ -904,22 +934,27 @@ object SensorCalibrationResolver {
             effectiveWbGains = wb,
             effectiveWbSource = wbSource,
             effectiveWbApplied = wb.size >= 4 && wb.all { it.isFinite() && it > 0f },
+            awbCalibrationSource = awbCalibrationSource,
+            awbCalibrationFingerprint = awbCalibrationFingerprint,
+            awbCalibrationAuthority = awbCalibrationAuthority,
+            awbGrGbRatio = awbGrGbRatio,
+            awbGreenEvenOddRatio = awbGreenEvenOddRatio,
             effectiveColorMatrix = colorMatrix,
             effectiveColorMatrixSource = colorSource,
             effectiveColorMatrixApplied = colorApplied,
             effectiveColorMatrixIdentityFallbackUsed = identityFallback,
             effectiveColorMatrixRejectReason = when {
                 override.manualColorMatrix != null -> "none"
-                sensorAwareProfileAwb != null && profileColorMatrix != null -> "none"
-                sensorAwareProfileAwb != null -> "profile_color_matrix_invalid_fallback_to_base"
+                liveManualWhiteBalance != null && liveManualColorMatrix != null -> "none"
+                liveManualWhiteBalance != null -> "live_manual_color_matrix_invalid_fallback_to_base"
                 else -> base.baseColorMatrixRejectReason
             },
             effectiveColorMatrixNote = when {
                 override.manualColorMatrix != null -> "Manual valid 3x3 matrix applied"
-                sensorAwareProfileAwb != null && profileColorMatrix != null ->
-                    "Profile Kelvin uses coherent Camera2 calibration-derived WB + post-WB sensor-to-linear-sRGB matrix"
-                sensorAwareProfileAwb != null ->
-                    "Profile color matrix unavailable; base sensor matrix fallback retained"
+                liveManualWhiteBalance != null && liveManualColorMatrix != null ->
+                    "Live Kelvin uses coherent Camera2 calibration-derived WB + post-WB sensor-to-linear-sRGB matrix"
+                liveManualWhiteBalance != null ->
+                    "Live Kelvin color matrix unavailable; base sensor matrix fallback retained"
                 else -> base.baseColorMatrixNote
             },
             rawInputDomain = base.inputDomain,

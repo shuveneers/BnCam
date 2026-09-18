@@ -52,8 +52,6 @@ class BncProfileCatalogSourceContractTest {
             "POLYSHARP_RADIUS_MEDIUM",
             "POLYSHARP_RADIUS_LARGE",
             "SELECTION_ACCEPT_ALL",
-            "awb_mode",
-            "awb_reference_intensity",
             "ProfileCurveDefaults.TYPE_GAMMA",
             "ProfileCurveDefaults.TYPE_SECT",
             "ProfileCurveDefaults.pointKey(type, index)"
@@ -70,7 +68,9 @@ class BncProfileCatalogSourceContractTest {
             "DNG_MASTER_FRAMES_RAW10",
             "DNG_MASTER_FRAMES_RAW_SENSOR",
             "ProfileIspKeys.SPECTRA_STRENGTH",
-            "ProfileIspKeys.LOCAL_TONE_BIAS"
+            "ProfileIspKeys.LOCAL_TONE_BIAS",
+            "awb_mode",
+            "awb_reference_intensity"
         ).forEach { key -> assertFalse("Legacy/non-profile key leaked into Profile V3 portable catalog: $key", resolver.contains(key)) }
 
         assertTrue(resolver.contains("Physical lens calibration, global"))

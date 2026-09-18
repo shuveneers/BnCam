@@ -55,7 +55,7 @@ layout(push_constant) uniform Params {
     float baseDefectThreshold;
     float greenEvenScale;
     float greenOddScale;
-    float padding0;
+    float greenCalibrationRatio;
     uint noiseModelEnabled;
     float s0;
     float s1;
@@ -111,6 +111,15 @@ float predictedNoiseSigma(float signal, int ch) {
     return sqrt(predictedNoiseVariance(signal, ch));
 }
 
+
+float greenCalibrationScale(int channel) {
+    float ratio = finite1(pc.greenCalibrationRatio) ? clamp(pc.greenCalibrationRatio, 0.50, 2.0) : 1.0;
+    // Arithmetic-mean-normalized pair keeps overall green luminance neutral while preserving
+    // the calibrated green-even/green-odd response ratio.
+    if (channel == 1) return (2.0 * ratio) / (ratio + 1.0);
+    if (channel == 2) return 2.0 / (ratio + 1.0);
+    return 1.0;
+}
 float sourceAt(int x, int y) {
     x = clamp(x, 0, int(pc.frameWidth) - 1);
     y = clamp(y, 0, int(pc.frameHeight) - 1);
@@ -319,8 +328,8 @@ void sampleGreen() {
             int ch = cfaChannel4(pc.effectiveCfaPattern, x + dx, y + dy);
             float value = sourceAt(x + dx, y + dy);
             if (!finite1(value)) continue;
-            if (ch == 1) { g1 = value; v1 = 1.0; }
-            else if (ch == 2) { g2 = value; v2 = 1.0; }
+            if (ch == 1) { g1 = sceneClamp(value * greenCalibrationScale(1)); v1 = 1.0; }
+            else if (ch == 2) { g2 = sceneClamp(value * greenCalibrationScale(2)); v2 = 1.0; }
         }
     }
     greenSamples[sampleIndex] = vec4(g1, g2, v1, v2);
@@ -782,8 +791,8 @@ void finalizePixel() {
         value = baselineNoiseReducedAt(x, y, value);
 
         int effectiveChannel = cfaChannel4(pc.effectiveCfaPattern, x, y);
-        if (effectiveChannel == 1) value = sceneClamp(value * pc.greenEvenScale);
-        else if (effectiveChannel == 2) value = sceneClamp(value * pc.greenOddScale);
+        if (effectiveChannel == 1) value = sceneClamp(value * greenCalibrationScale(1) * pc.greenEvenScale);
+        else if (effectiveChannel == 2) value = sceneClamp(value * greenCalibrationScale(2) * pc.greenOddScale);
 
         int sensorChannel = cfaChannel4(
             pc.sensorCfaPattern, x + pc.cfaOffsetX, y + pc.cfaOffsetY);

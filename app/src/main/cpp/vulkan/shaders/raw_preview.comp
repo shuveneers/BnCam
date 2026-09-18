@@ -17,7 +17,7 @@ layout(push_constant) uniform Params {
     uint previewWidth;
     uint previewHeight;
     uint cfaCellDecimation;
-    uint cfaAndMode; // low 8: CFA, next 8: dispatch mode, next 8: BnCam demosaic bridge mode
+    uint cfaAndMode; // low 8: CFA, next 8: dispatch, next 8: green-even/odd ratio, high 8: focus
     float black0;
     float black1;
     float black2;
@@ -134,6 +134,16 @@ uint sourceFormat() { return pc.sourceLayout & 0xffffu; }
 uint sourcePixelStride() { return max(2u, pc.sourceLayout >> 16u); }
 uint cfaPattern() { return pc.cfaAndMode & 0xffu; }
 uint dispatchMode() { return (pc.cfaAndMode >> 8u) & 0xffu; }
+float greenEvenOddRatio() {
+    float encoded = float((pc.cfaAndMode >> 16u) & 0xffu) / 255.0;
+    return mix(0.50, 2.0, encoded);
+}
+float greenRowCalibrationScale(uint localY) {
+    float ratio = clamp(greenEvenOddRatio(), 0.50, 2.0);
+    // RggbChannelVector defines G_even/G_odd by OUTPUT ROW parity. Arithmetic-mean
+    // normalization keeps common green luminance neutral; R/B WB remains post-demosaic.
+    return (localY & 1u) == 0u ? (2.0 * ratio) / (ratio + 1.0) : 2.0 / (ratio + 1.0);
+}
 float previewFocusDetailPriority() { return float((pc.cfaAndMode >> 24u) & 0xffu) / 255.0; }
 uint sourceCropLeft() { return pc.sourceCropPacked & 0xffffu; }
 uint sourceCropTop() { return pc.sourceCropPacked >> 16u; }
@@ -177,6 +187,14 @@ float siteBlack(uint site) {
     return pc.black3;
 }
 
+bool isGreenSite(uint pattern, uint localX, uint localY) {
+    uint p = min(pattern, 3u);
+    uint xm = localX & 1u;
+    uint ym = localY & 1u;
+    if (p == 0u || p == 3u) return xm != ym; // RGGB / BGGR
+    return xm == ym;                          // GRBG / GBRG
+}
+
 float rawAtSource(int sourceX, int sourceY) {
     uint localX = uint(clamp(sourceX, 0, int(localSourceWidth()) - 1));
     uint localY = uint(clamp(sourceY, 0, int(localSourceHeight()) - 1));
@@ -184,7 +202,14 @@ float rawAtSource(int sourceX, int sourceY) {
     uint sy = min(pc.sourceHeight - 1u, sourceCropTop() + localY);
     uint site = ((localY & 1u) << 1u) | (localX & 1u);
     float black = clamp(siteBlack(site), 0.0, pc.whiteLevel - 1.0);
-    return clamp((float(readRaw(sx, sy)) - black) / max(1.0, pc.whiteLevel - black), 0.0, 1.0);
+    float normalized = clamp((float(readRaw(sx, sy)) - black) /
+            max(1.0, pc.whiteLevel - black), 0.0, 1.0);
+    // Apply only the green-site split of the four-channel WB before demosaic. R/B remain in
+    // the existing post-demosaic wbRgb stage, preventing double white-balance application.
+    if (isGreenSite(cfaPattern(), localX, localY)) {
+        normalized = clamp(normalized * greenRowCalibrationScale(localY), 0.0, 1.0);
+    }
+    return normalized;
 }
 
 float normalizedAtUncached(int previewX, int previewY) {

@@ -57,6 +57,9 @@ struct RawPreviewGpuRequest {
     float physicalGreenNoiseO = 0.0f;
     float physicalNoiseConfidence = 0.0f;
     float focusDetailPriority = 1.0f;
+    // Camera2 RggbChannelVector green-even / green-odd gain ratio. This is applied in the
+    // Bayer domain before demosaic; wbRgb then carries only the RGB-normalized remainder.
+    float greenEvenOddRatio = 1.0f;
     std::array<float, 3> wbRgb{1.0f, 1.0f, 1.0f};
     std::array<float, 9> colorMatrix{1.0f, 0.0f, 0.0f,
                                      0.0f, 1.0f, 0.0f,

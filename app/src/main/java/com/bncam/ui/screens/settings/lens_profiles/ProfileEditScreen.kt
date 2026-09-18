@@ -53,7 +53,6 @@ import com.bncam.core.capture.OutputPolicy
 import com.bncam.core.capture.FrameCapacityPolicy
 import com.bncam.data.settings.CaptureSettingKeys
 import com.bncam.data.settings.ProfileSettingValueType
-import com.bncam.data.settings.ProfileAwbSettings
 import com.bncam.data.settings.ProfileIspKeys
 import com.bncam.data.settings.ProfileSettingSpec
 import com.bncam.ui.components.SettingSliderRow
@@ -80,7 +79,6 @@ fun ProfileEditScreen(
     initialMode: CaptureStrategy,
     onSaveName: (String) -> Unit,
     onSaveMode: (CaptureStrategy) -> Unit,
-    onNavigateToAwb: () -> Unit = {},
     onNavigateToJpegTuning: () -> Unit = {},
     onNavigateToShotBias: () -> Unit = {},
     onNavigateToDenoise: () -> Unit = {},
@@ -185,7 +183,6 @@ fun ProfileEditScreen(
                     onEditMode = { showModeDialog = true },
                     onNavigateToShotBias = onNavigateToShotBias,
                     onEditFrameSource = { showFrameSourceDialog = true },
-                    onNavigateToAwb = onNavigateToAwb,
                     onNavigateToDenoise = onNavigateToDenoise,
                     onNavigateToLightShadow = onNavigateToLightShadow,
                     onNavigateToCurves = onNavigateToCurves,
@@ -366,7 +363,6 @@ private fun LibpatcherProfileOverview(
     onEditMode: () -> Unit,
     onNavigateToShotBias: () -> Unit,
     onEditFrameSource: () -> Unit,
-    onNavigateToAwb: () -> Unit,
     onNavigateToDenoise: () -> Unit,
     onNavigateToLightShadow: () -> Unit,
     onNavigateToCurves: () -> Unit,
@@ -384,8 +380,6 @@ private fun LibpatcherProfileOverview(
     val isMultiFrameMode = captureMode == CaptureStrategy.MULTI_FRAME_ZSL
     val isRawFrameSource = activeFrameSource == "RAW10" || activeFrameSource == "RAW_SENSOR"
 
-    val profileAwb by repo.getProfileAwbSettingsFlow(profileId)
-        .collectAsStateWithLifecycle(initialValue = ProfileAwbSettings())
 
     val demosaicOverridden by repo.isProfileOverrideFlow(profileId, DemosaicMode.PROFILE_KEY)
         .collectAsStateWithLifecycle(initialValue = false)
@@ -496,14 +490,8 @@ private fun LibpatcherProfileOverview(
 
         SettingsCard(
             title = "ISP Tuning",
-            description = "White balance, denoise, light and shadow, curves, colour and sharpening."
+            description = "Light and shadow, curves, colour and sharpening."
         ) {
-            SettingValueRow(
-                title = "Auto white balance",
-                description = "Configure automatic, reference or manual white balance for this profile.",
-                value = profileAwb.summary(),
-                onClick = onNavigateToAwb
-            )
             SettingValueRow(
                 title = "Light & Shadow",
                 description = "Exposure, contrast, shadows, highlights, whites and blacks in one tonal workspace.",

@@ -89,18 +89,18 @@ class Phase7ProfileControlSemanticsContractTest {
     }
 
     @Test
-    fun awbIntensityIsPortableAndHasExplicitBoundedEndpoints() {
-        val awbUi = source("src/main/java/com/bncam/ui/screens/settings/lens_profiles/ProfileAwbSettingsScreen.kt")
-        val resolver = source("src/main/java/com/bncam/core/quality/ProfileAwbResolver.kt")
+    fun awbIsLensHardwareCalibrationAndNeverPortableProfileState() {
+        val lensUi = source("src/main/java/com/bncam/ui/screens/settings/lens_profiles/LensDetailScreen.kt")
+        val awbUi = source("src/main/java/com/bncam/ui/screens/settings/lens_profiles/AwbCalibrationSettingsScreen.kt")
         val catalog = source("src/main/java/com/bncam/core/quality/LibpatcherProfileResolver.kt")
         val repository = source("src/main/java/com/bncam/data/settings/SettingsRepository.kt")
 
-        assertTrue(awbUi.contains("title = \"AWB intensity\""))
-        assertTrue(awbUi.contains("valueRange = 0f..1.5f"))
-        assertTrue(awbUi.contains("100% is the normal resolved AWB"))
-        assertTrue(resolver.contains("logBlendGains"))
-        assertTrue(resolver.contains("safe.referenceIntensity.coerceIn(0f, 1.5f)"))
-        assertTrue(catalog.contains("f(\"awb_reference_intensity\", 1f)"))
-        assertTrue(repository.contains("\"awb_reference_intensity\""))
+        assertTrue(lensUi.contains("title = \"AWB\""))
+        assertTrue(awbUi.contains("Sensor Auto"))
+        assertTrue(awbUi.contains("Custom GCam"))
+        assertTrue(awbUi.contains(".gawb"))
+        assertTrue(!catalog.contains("awb_reference_intensity"))
+        assertTrue(!repository.contains("getProfileAwb"))
     }
+
 }

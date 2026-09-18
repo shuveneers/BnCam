@@ -48,11 +48,11 @@ object Routes {
     const val LENS_NOISE_MODEL = "lens_detail/{lensId}/noise_model"
     const val LENS_MANUAL_NOISE_MODEL = "lens_detail/{lensId}/noise_model/manual"
     const val LENS_BLACK_LEVEL = "lens_detail/{lensId}/black_level"
+    const val LENS_AWB_CALIBRATION = "lens_detail/{lensId}/awb"
     const val LENS_COLOR_MATRIX = "lens_detail/{lensId}/color_matrix"
     const val LENS_RAW_STREAM_BINDING = "lens_detail/{lensId}/raw_stream_binding"
     const val PROFILE_LIST = "profile_list/{lensId}/{profileCount}"
     const val PROFILE_EDIT = "profile_edit/{lensId}/{profileIndex}"
-    const val PROFILE_AWB = "profile_edit/{lensId}/{profileIndex}/awb"
     const val PROFILE_JPEG = "profile_edit/{lensId}/{profileIndex}/jpeg"
     const val PROFILE_SPECTRA = "profile_edit/{lensId}/{profileIndex}/noise/spectra" // legacy deep link -> Neural Denoise
     const val PROFILE_CAPTURE_EXPOSURE = "profile_edit/{lensId}/{profileIndex}/capture/exposure"
@@ -83,11 +83,11 @@ object Routes {
     fun lensManualNoiseModel(lensId: String) = "lens_detail/${encodeRouteArg(lensId)}/noise_model/manual"
     fun lensAdvancedNoiseCalibration(lensId: String) = "lens_detail/${encodeRouteArg(lensId)}/noise_model/advanced"
     fun lensBlackLevel(lensId: String) = "lens_detail/${encodeRouteArg(lensId)}/black_level"
+    fun lensAwbCalibration(lensId: String) = "lens_detail/${encodeRouteArg(lensId)}/awb"
     fun lensColorMatrix(lensId: String) = "lens_detail/${encodeRouteArg(lensId)}/color_matrix"
     fun lensRawStreamBinding(lensId: String) = "lens_detail/${encodeRouteArg(lensId)}/raw_stream_binding"
     fun profileList(lensId: String, count: Int) = "profile_list/${encodeRouteArg(lensId)}/$count"
     fun profileEdit(lensId: String, index: Int) = "profile_edit/${encodeRouteArg(lensId)}/$index"
-    fun profileAwb(lensId: String, index: Int) = "profile_edit/${encodeRouteArg(lensId)}/$index/awb"
     fun profileJpeg(lensId: String, index: Int) = "profile_edit/${encodeRouteArg(lensId)}/$index/jpeg"
     fun profileSpectra(lensId: String, index: Int) = "profile_edit/${encodeRouteArg(lensId)}/$index/noise/spectra"
     fun profileCaptureExposure(lensId: String, index: Int) = "profile_edit/${encodeRouteArg(lensId)}/$index/capture/exposure"
@@ -599,6 +599,9 @@ fun AppNavigation() {
                     onNavigateToBlackLevel = {
                         navController.navigate(Routes.lensBlackLevel(lensId))
                     },
+                    onNavigateToAwbCalibration = {
+                        navController.navigate(Routes.lensAwbCalibration(lensId))
+                    },
                     onNavigateToColorMatrix = {
                         navController.navigate(Routes.lensColorMatrix(lensId))
                     },
@@ -679,6 +682,16 @@ fun AppNavigation() {
             }
 
             composable(
+                route = Routes.LENS_AWB_CALIBRATION,
+                arguments = listOf(navArgument("lensId") { type = NavType.StringType })
+            ) { entry ->
+                AwbCalibrationSettingsScreen(
+                    lensId = Routes.parseRouteArg(entry.arguments?.getString("lensId")),
+                    onNavigateBack = { navController.popBackStack() }
+                )
+            }
+
+            composable(
                 route = Routes.PROFILE_LIST,
                 arguments = listOf(
                     navArgument("lensId") { type = NavType.StringType },
@@ -735,9 +748,6 @@ fun AppNavigation() {
                                 newStrategy
                             )
                         }
-                    },
-                    onNavigateToAwb = {
-                        navController.navigate(Routes.profileAwb(lensId, index))
                     },
                     onNavigateToJpegTuning = {
                         navController.navigate(Routes.profileJpeg(lensId, index))
@@ -965,20 +975,6 @@ fun AppNavigation() {
             ) { entry ->
                 ProfileMultiFrameSettingsScreen(
                     lensId = Routes.parseRouteArg(entry.arguments?.getString("lensId")),
-                    profileIndex = entry.arguments?.getInt("profileIndex") ?: 1,
-                    onNavigateBack = { navController.popBackStack() }
-                )
-            }
-
-            composable(
-                route = Routes.PROFILE_AWB,
-                arguments = listOf(
-                    navArgument("lensId") { type = NavType.StringType },
-                    navArgument("profileIndex") { type = NavType.IntType }
-                )
-            ) { entry ->
-                ProfileAwbSettingsScreen(
-                    lensId = entry.arguments?.getString("lensId") ?: "0",
                     profileIndex = entry.arguments?.getInt("profileIndex") ?: 1,
                     onNavigateBack = { navController.popBackStack() }
                 )

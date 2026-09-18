@@ -13,7 +13,7 @@ import com.bncam.core.quality.ProfileColorTuning
 import com.bncam.core.quality.RenderQualityConfig
 import com.bncam.core.quality.FocusConfidenceState
 import com.bncam.core.quality.FinalSensorCalibration
-import com.bncam.core.quality.ProfileYuvAwbMapper
+import com.bncam.core.quality.YuvAwbMapper
 import com.bncam.core.quality.PhysicalTemporalNoisePolicy
 import com.bncam.core.quality.PhysicalNoiseSoContract
 import com.bncam.data.settings.ResolvedLensHardwareSettings
@@ -301,15 +301,15 @@ object ImageUtils {
     }
 
     /**
-     * YUV frames already contain Camera HAL white balance. Convert the profile AWB
+     * YUV frames already contain Camera HAL white balance. Convert the resolved live/lens AWB
      * from an absolute RAW gain target into a bounded post-HAL RGB compensation.
      * System/Auto resolves to identity because effective and base gains are equal.
      */
-    private fun resolveYuvProfileAwbCompensation(
+    private fun resolveYuvLiveAwbCompensation(
         calibration: FinalSensorCalibration?
-    ): FloatArray = ProfileYuvAwbMapper.resolve(
+    ): FloatArray = YuvAwbMapper.resolve(
         baseCameraGains = calibration?.base?.baseWbGains,
-        effectiveProfileGains = calibration?.effectiveWbGains
+        targetGains = calibration?.effectiveWbGains
     )
 
     private data class NativeLensShadingMap(
@@ -436,7 +436,7 @@ object ImageUtils {
         portraitCaptureContext: com.bncam.core.capture.PortraitCaptureContext? = null
     ): ByteArray? {
         val post = qualityConfig?.post
-        val yuvAwbCompensation = resolveYuvProfileAwbCompensation(qualityConfig?.finalCalibration)
+        val yuvAwbCompensation = resolveYuvLiveAwbCompensation(qualityConfig?.finalCalibration)
         val routeLabel = if (buffers.size > 1) "YUV_COMPUTE" else "YUV_FAST"
         val portrait = portraitCaptureContext?.takeIf { it.available }
         val portraitMaskArtifact = portrait?.mask

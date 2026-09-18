@@ -18,11 +18,12 @@ class ViewfinderWhiteBalanceRoutingContractTest {
     }
 
     @Test
-    fun `cached characteristics keep live kelvin updates off coroutine dispatch`() {
-        assertTrue(managerSource.contains("cachedLiveWhiteBalanceCharacteristics(cameraId)"))
-        assertTrue(managerSource.contains("if (effective.mode == ProfileAwbModes.SYSTEM_AUTO || cachedCharacteristics != null)"))
-        assertTrue(managerSource.contains("commitLiveWhiteBalanceTarget("))
-        assertTrue(managerSource.contains("Cold fallback only"))
+    fun `live kelvin is a transient sensor calibrated override and never profile state`() {
+        assertTrue(managerSource.contains("liveWhiteBalanceCharacteristics(cameraId)"))
+        assertTrue(managerSource.contains("RawColorTransformEngine.computeManualWhiteBalance("))
+        assertTrue(managerSource.contains("Live Kelvin is a temporary viewfinder/capture override"))
+        assertFalse(managerSource.contains("ProfileAwbModes"))
+        assertFalse(managerSource.contains("ProfileAwbSettings"))
     }
     @Test
     fun `live white balance ownership is scoped to the requested lens`() {

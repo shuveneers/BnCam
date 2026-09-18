@@ -13,7 +13,7 @@ class Phase3WhiteBalanceLockFallbackSourceContractTest {
 
         assertFalse(manager.contains("whiteBalanceLockRequested"))
         assertFalse(manager.contains("fun setWhiteBalanceLock"))
-        assertTrue(manager.contains("ProfileYuvAwbMapper.resolve("))
+        assertTrue(manager.contains("YuvAwbMapper.resolve("))
         assertTrue(manager.contains("CaptureRequest.CONTROL_AWB_LOCK, false"))
         assertTrue(state.contains("private val storedGains: FloatArray = gains.copyOf()"))
         assertTrue(state.contains("get() = storedGains.copyOf()"))

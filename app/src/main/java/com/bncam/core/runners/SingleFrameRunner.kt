@@ -1773,6 +1773,14 @@ class SingleFrameRunner(
             renderQualityConfig.finalCalibration?.debugPairs()?.forEach { (key, value) ->
                 shotLogger.recordPipelineEvent("Sensor Calibration Detail", key, value)
             }
+            renderQualityConfig.finalCalibration?.let { calibration ->
+                shotLogger.recordPipelineEvent("AWB Calibration", "Source", calibration.awbCalibrationSource)
+                shotLogger.recordPipelineEvent("AWB Calibration", "Fingerprint", calibration.awbCalibrationFingerprint)
+                shotLogger.recordPipelineEvent("AWB Calibration", "Authority", calibration.awbCalibrationAuthority.toString())
+                shotLogger.recordPipelineEvent("AWB Calibration", "GR/GB", calibration.awbGrGbRatio?.toString() ?: "not supplied")
+                shotLogger.recordPipelineEvent("AWB Calibration", "G_even/G_odd", calibration.awbGreenEvenOddRatio.toString())
+                shotLogger.recordPipelineEvent("AWB Calibration", "DNG Override", "false")
+            }
             renderQualityConfig.commonPostRender?.debugPairs()?.forEach { (key, value) ->
                 shotLogger.recordPipelineEvent("Common Post-Render", key, value)
             }

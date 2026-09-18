@@ -1,8 +1,5 @@
 package com.bncam.core.quality
 
-import com.bncam.data.settings.ProfileAwbModels
-import com.bncam.data.settings.ProfileAwbModes
-import com.bncam.data.settings.ProfileAwbSettings
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -36,14 +33,7 @@ data class ViewfinderLiveTuningSnapshot(
         contrast = (base.contrast + contrastOffset).coerceIn(-1f, 1f)
     ).sanitized()
 
-    fun applyRawWhiteBalance(base: ProfileAwbSettings): ProfileAwbSettings {
-        val kelvin = whiteBalanceKelvin ?: return base
-        return base.copy(
-            mode = ProfileAwbModes.MANUAL_KELVIN,
-            kelvin = kelvin,
-            illuminantModel = if (kelvin >= 4000) ProfileAwbModels.CIE_DAYLIGHT else ProfileAwbModels.PLANCKIAN
-        ).sanitized()
-    }
+
 }
 
 object ViewfinderLiveTuning {
