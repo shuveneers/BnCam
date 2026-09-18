@@ -84,6 +84,7 @@ fun ProfileEditScreen(
     onNavigateToDenoise: () -> Unit = {},
     onNavigateToLightShadow: () -> Unit = {},
     onNavigateToCurves: () -> Unit = {},
+    onNavigateToAwb: () -> Unit = {},
     onNavigateToColorManager: () -> Unit = {},
     onNavigateToSharpness: () -> Unit = {},
     onNavigateToProfileTransfer: () -> Unit = {},
@@ -186,6 +187,7 @@ fun ProfileEditScreen(
                     onNavigateToDenoise = onNavigateToDenoise,
                     onNavigateToLightShadow = onNavigateToLightShadow,
                     onNavigateToCurves = onNavigateToCurves,
+                    onNavigateToAwb = onNavigateToAwb,
                     onNavigateToColorManager = onNavigateToColorManager,
                     onNavigateToSharpness = onNavigateToSharpness,
                     onNavigateToProfileTransfer = onNavigateToProfileTransfer,
@@ -366,6 +368,7 @@ private fun LibpatcherProfileOverview(
     onNavigateToDenoise: () -> Unit,
     onNavigateToLightShadow: () -> Unit,
     onNavigateToCurves: () -> Unit,
+    onNavigateToAwb: () -> Unit,
     onNavigateToColorManager: () -> Unit,
     onNavigateToSharpness: () -> Unit,
     onNavigateToProfileTransfer: () -> Unit,
@@ -490,7 +493,7 @@ private fun LibpatcherProfileOverview(
 
         SettingsCard(
             title = "ISP Tuning",
-            description = "Light and shadow, curves, colour and sharpening."
+            description = "Light and shadow, curves, white balance, colour and sharpening."
         ) {
             SettingValueRow(
                 title = "Light & Shadow",
@@ -503,6 +506,12 @@ private fun LibpatcherProfileOverview(
                 description = "Tone, Gamma and Sect response curves with presets and manual node control.",
                 value = "Tone · Gamma · Sect",
                 onClick = onNavigateToCurves
+            )
+            SettingValueRow(
+                title = "AWB",
+                description = "Profile-owned automatic white-balance response, warm/cool presets and signed R/G · B/G trims.",
+                value = "Open",
+                onClick = onNavigateToAwb
             )
             SettingValueRow(
                 title = "Color Manager",

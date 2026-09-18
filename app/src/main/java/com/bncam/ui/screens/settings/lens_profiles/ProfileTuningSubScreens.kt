@@ -666,11 +666,11 @@ fun ProfileImportExportScreen(
     SettingsTopicScaffold("Profile export/import", onNavigateBack) {
         SettingsCard(
             "Profile export/import",
-            "Portable BnCam profile transfer. The profile name and all Profile Settings are preserved; sensor calibration remains owned by the target lens."
+            "Portable BnCam profile transfer. Profile AWB is preserved with the profile; physical noise, black/white-level and color-matrix calibration remain owned by the target lens."
         ) {
             SettingValueRow(
                 title = "Export profile",
-                description = "Save this complete profile as ${BncProfileCodec.FILE_EXTENSION}. Black levels and physical sensor/hardware calibration are never embedded.",
+                description = "Save this complete profile as ${BncProfileCodec.FILE_EXTENSION}. Profile AWB is included; physical noise, black/white-level and color-matrix calibration are not embedded.",
                 value = if (busy) "Busy" else "Save .bnc",
                 onClick = {
                     if (!busy) {

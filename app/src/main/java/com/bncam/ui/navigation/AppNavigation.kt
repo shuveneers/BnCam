@@ -48,7 +48,6 @@ object Routes {
     const val LENS_NOISE_MODEL = "lens_detail/{lensId}/noise_model"
     const val LENS_MANUAL_NOISE_MODEL = "lens_detail/{lensId}/noise_model/manual"
     const val LENS_BLACK_LEVEL = "lens_detail/{lensId}/black_level"
-    const val LENS_AWB_CALIBRATION = "lens_detail/{lensId}/awb"
     const val LENS_COLOR_MATRIX = "lens_detail/{lensId}/color_matrix"
     const val LENS_RAW_STREAM_BINDING = "lens_detail/{lensId}/raw_stream_binding"
     const val PROFILE_LIST = "profile_list/{lensId}/{profileCount}"
@@ -58,6 +57,7 @@ object Routes {
     const val PROFILE_CAPTURE_EXPOSURE = "profile_edit/{lensId}/{profileIndex}/capture/exposure"
     const val PROFILE_DENOISE = "profile_edit/{lensId}/{profileIndex}/isp/denoise"
     const val PROFILE_LIGHT_SHADOW = "profile_edit/{lensId}/{profileIndex}/isp/light_shadow"
+    const val PROFILE_AWB = "profile_edit/{lensId}/{profileIndex}/isp/awb"
     const val PROFILE_COLOR_MANAGER = "profile_edit/{lensId}/{profileIndex}/isp/color_manager"
     const val PROFILE_EXPOSURE = "profile_edit/{lensId}/{profileIndex}/isp/exposure" // legacy deep link
     const val PROFILE_TONAL_RANGE = "profile_edit/{lensId}/{profileIndex}/isp/tonal_range"
@@ -83,7 +83,6 @@ object Routes {
     fun lensManualNoiseModel(lensId: String) = "lens_detail/${encodeRouteArg(lensId)}/noise_model/manual"
     fun lensAdvancedNoiseCalibration(lensId: String) = "lens_detail/${encodeRouteArg(lensId)}/noise_model/advanced"
     fun lensBlackLevel(lensId: String) = "lens_detail/${encodeRouteArg(lensId)}/black_level"
-    fun lensAwbCalibration(lensId: String) = "lens_detail/${encodeRouteArg(lensId)}/awb"
     fun lensColorMatrix(lensId: String) = "lens_detail/${encodeRouteArg(lensId)}/color_matrix"
     fun lensRawStreamBinding(lensId: String) = "lens_detail/${encodeRouteArg(lensId)}/raw_stream_binding"
     fun profileList(lensId: String, count: Int) = "profile_list/${encodeRouteArg(lensId)}/$count"
@@ -93,6 +92,7 @@ object Routes {
     fun profileCaptureExposure(lensId: String, index: Int) = "profile_edit/${encodeRouteArg(lensId)}/$index/capture/exposure"
     fun profileDenoise(lensId: String, index: Int) = "profile_edit/${encodeRouteArg(lensId)}/$index/isp/denoise"
     fun profileLightShadow(lensId: String, index: Int) = "profile_edit/${encodeRouteArg(lensId)}/$index/isp/light_shadow"
+    fun profileAwb(lensId: String, index: Int) = "profile_edit/${encodeRouteArg(lensId)}/$index/isp/awb"
     fun profileColorManager(lensId: String, index: Int) = "profile_edit/${encodeRouteArg(lensId)}/$index/isp/color_manager"
     fun profileExposure(lensId: String, index: Int) = "profile_edit/${encodeRouteArg(lensId)}/$index/isp/exposure"
     fun profileTonalRange(lensId: String, index: Int) = "profile_edit/${encodeRouteArg(lensId)}/$index/isp/tonal_range"
@@ -599,9 +599,6 @@ fun AppNavigation() {
                     onNavigateToBlackLevel = {
                         navController.navigate(Routes.lensBlackLevel(lensId))
                     },
-                    onNavigateToAwbCalibration = {
-                        navController.navigate(Routes.lensAwbCalibration(lensId))
-                    },
                     onNavigateToColorMatrix = {
                         navController.navigate(Routes.lensColorMatrix(lensId))
                     },
@@ -682,16 +679,6 @@ fun AppNavigation() {
             }
 
             composable(
-                route = Routes.LENS_AWB_CALIBRATION,
-                arguments = listOf(navArgument("lensId") { type = NavType.StringType })
-            ) { entry ->
-                AwbCalibrationSettingsScreen(
-                    lensId = Routes.parseRouteArg(entry.arguments?.getString("lensId")),
-                    onNavigateBack = { navController.popBackStack() }
-                )
-            }
-
-            composable(
                 route = Routes.PROFILE_LIST,
                 arguments = listOf(
                     navArgument("lensId") { type = NavType.StringType },
@@ -763,6 +750,9 @@ fun AppNavigation() {
                     },
                     onNavigateToCurves = {
                         navController.navigate(Routes.profileCurves(lensId, index))
+                    },
+                    onNavigateToAwb = {
+                        navController.navigate(Routes.profileAwb(lensId, index))
                     },
                     onNavigateToColorManager = {
                         navController.navigate(Routes.profileColorManager(lensId, index))
@@ -836,6 +826,21 @@ fun AppNavigation() {
                 ProfileLightShadowSettingsScreen(
                     lensId = Routes.parseRouteArg(entry.arguments?.getString("lensId")),
                     profileIndex = entry.arguments?.getInt("profileIndex") ?: 1,
+                    onNavigateBack = { navController.popBackStack() }
+                )
+            }
+
+            composable(
+                route = Routes.PROFILE_AWB,
+                arguments = listOf(
+                    navArgument("lensId") { type = NavType.StringType },
+                    navArgument("profileIndex") { type = NavType.IntType }
+                )
+            ) { entry ->
+                val lensId = Routes.parseRouteArg(entry.arguments?.getString("lensId"))
+                val profileIndex = entry.arguments?.getInt("profileIndex") ?: 1
+                AwbCalibrationSettingsScreen(
+                    profileId = "${lensId}_profile_$profileIndex",
                     onNavigateBack = { navController.popBackStack() }
                 )
             }

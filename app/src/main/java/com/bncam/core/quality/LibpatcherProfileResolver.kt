@@ -6,6 +6,7 @@ import com.bncam.data.settings.CaptureSettingKeys
 import com.bncam.data.settings.ProfileSettingSpec
 import com.bncam.data.settings.ProfileSettingValueType
 import com.bncam.data.settings.ProfileIspKeys
+import com.bncam.data.settings.ProfileAwbSettingKeys
 import com.bncam.data.settings.ProfileDetailDefaults
 import com.bncam.data.settings.ProfileNoiseReductionDefaults
 import com.bncam.data.settings.ProfilePlannedDefaults
@@ -233,8 +234,8 @@ object LibpatcherProfileResolver {
 
         // This list is the complete portable profile contract, not only the currently visible ISP UI.
         // Capture selection/merge values are profile-owned and therefore must round-trip too, including
-        // values that are temporarily hidden by capability/mode gating. Physical lens calibration, global
-        // app/output settings and legacy duplicate keys remain outside the portable profile boundary.
+        // values that are temporarily hidden by capability/mode gating. Profile AWB is portable; physical
+        // noise/black/white/color-matrix calibration, global app/output settings and legacy duplicate keys remain outside.
         val captureProfileSpecs = listOf(
             s(CaptureSettingKeys.SHOT_BIAS_EXPOSURE, "Auto"),
             s(CaptureSettingKeys.SHOT_BIAS_MAX_FRAME_EXPOSURE, "Max exposure time"),
@@ -244,6 +245,7 @@ object LibpatcherProfileResolver {
         return (
             runtimeProfileSettingSpecs() +
                 captureProfileSpecs +
+                ProfileAwbSettingKeys.portableSpecs() +
                 plannedProfileSettingSpecs() +
                 legacyNoiseCompatibilitySpecs()
             ).distinctBy { "${it.type}:${it.key}" }

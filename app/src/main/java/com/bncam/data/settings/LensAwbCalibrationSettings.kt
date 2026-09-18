@@ -25,6 +25,41 @@ object LensAwbGreenSplitModes {
         if (value.equals(MANUAL, ignoreCase = true)) MANUAL else AUTO
 }
 
+/**
+ * User-facing signed AWB trim. The runtime keeps the existing physical coefficient domain:
+ * -1.00 -> 0.25, 0.00 -> 1.00, +1.00 -> 5.00.
+ *
+ * Keeping this mapping outside Compose guarantees preview, import/export and tests use one
+ * reversible contract without changing the proven AWB engine semantics.
+ */
+object AwbCoefficientUiMapping {
+    const val MIN_COEFFICIENT = 0.25f
+    const val NEUTRAL_COEFFICIENT = 1.00f
+    const val MAX_COEFFICIENT = 5.00f
+
+    fun toSigned(coefficient: Float): Float {
+        val safe = coefficient.takeIf(Float::isFinite)
+            ?.coerceIn(MIN_COEFFICIENT, MAX_COEFFICIENT)
+            ?: NEUTRAL_COEFFICIENT
+        return if (safe >= NEUTRAL_COEFFICIENT) {
+            ((safe - NEUTRAL_COEFFICIENT) / (MAX_COEFFICIENT - NEUTRAL_COEFFICIENT))
+                .coerceIn(0.0f, 1.0f)
+        } else {
+            ((safe - NEUTRAL_COEFFICIENT) / (NEUTRAL_COEFFICIENT - MIN_COEFFICIENT))
+                .coerceIn(-1.0f, 0.0f)
+        }
+    }
+
+    fun fromSigned(value: Float): Float {
+        val safe = value.takeIf(Float::isFinite)?.coerceIn(-1.0f, 1.0f) ?: 0.0f
+        return if (safe >= 0.0f) {
+            NEUTRAL_COEFFICIENT + safe * (MAX_COEFFICIENT - NEUTRAL_COEFFICIENT)
+        } else {
+            NEUTRAL_COEFFICIENT + safe * (NEUTRAL_COEFFICIENT - MIN_COEFFICIENT)
+        }
+    }
+}
+
 data class AwbCalibrationPoint(
     val rgRatio: Float,
     val bgRatio: Float
@@ -51,7 +86,13 @@ data class LensAwbCalibrationSettings(
     val importedName: String = "",
     val importedFormat: String = "",
     val customPoints: List<AwbCalibrationPoint> = emptyList(),
-    val importedGrGbRatio: Float? = null
+    val importedGrGbRatio: Float? = null,
+    /**
+     * Blend between exact-frame Camera2 AWB and the selected BnCam preset.
+     * Kept as the final constructor field for source compatibility with older positional callers.
+     * 0.00 = Auto baseline, 1.00 = full (still restrained) preset tone.
+     */
+    val presetStrength: Float = 1.0f
 ) {
     fun sanitized(): LensAwbCalibrationSettings {
         val points = customPoints.mapNotNull { it.sanitizedOrNull() }.take(MAX_POINTS)
@@ -60,10 +101,11 @@ data class LensAwbCalibrationSettings(
         return copy(
             schemaVersion = LENS_AWB_CALIBRATION_SCHEMA_VERSION,
             mode = LensAwbCalibrationModes.sanitize(mode),
-            rgCoefficient = rgCoefficient.takeIf(Float::isFinite)?.coerceIn(0.25f, 5.0f) ?: 1.0f,
-            bgCoefficient = bgCoefficient.takeIf(Float::isFinite)?.coerceIn(0.25f, 5.0f) ?: 1.0f,
+            rgCoefficient = rgCoefficient.takeIf(Float::isFinite)?.coerceIn(AwbCoefficientUiMapping.MIN_COEFFICIENT, AwbCoefficientUiMapping.MAX_COEFFICIENT) ?: 1.0f,
+            bgCoefficient = bgCoefficient.takeIf(Float::isFinite)?.coerceIn(AwbCoefficientUiMapping.MIN_COEFFICIENT, AwbCoefficientUiMapping.MAX_COEFFICIENT) ?: 1.0f,
             greenSplitMode = LensAwbGreenSplitModes.sanitize(greenSplitMode),
             presetId = presetId.coerceIn(0, BnCamAwbPresetCatalog.all.lastIndex),
+            presetStrength = presetStrength.takeIf(Float::isFinite)?.coerceIn(0.0f, 1.0f) ?: 1.0f,
             manualGrGbRatio = manualGrGbRatio.takeIf(Float::isFinite)?.coerceIn(0.50f, 2.0f) ?: 1.0f,
             importedName = importedName.trim().take(120),
             importedFormat = importedFormat.trim().take(32),
@@ -108,6 +150,7 @@ data class LensAwbCalibrationSettings(
             append(";bg=").append(String.format(Locale.US, "%.8f", safe.bgCoefficient))
             append(";green=").append(safe.greenSplitMode)
             append(";preset=").append(safe.presetId)
+            append(";preset_strength=").append(String.format(Locale.US, "%.8f", safe.presetStrength))
             append(";grgb=").append(String.format(Locale.US, "%.8f", safe.manualGrGbRatio))
             append(";igrgb=").append(safe.importedGrGbRatio?.let { String.format(Locale.US, "%.8f", it) } ?: "none")
             safe.customPoints.forEach { point ->

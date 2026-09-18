@@ -89,18 +89,22 @@ class Phase7ProfileControlSemanticsContractTest {
     }
 
     @Test
-    fun awbIsLensHardwareCalibrationAndNeverPortableProfileState() {
+    fun awbIsProfileOwnedPortableStateAndNotLensHardwareUi() {
+        val editor = source("src/main/java/com/bncam/ui/screens/settings/lens_profiles/ProfileEditScreen.kt")
         val lensUi = source("src/main/java/com/bncam/ui/screens/settings/lens_profiles/LensDetailScreen.kt")
         val awbUi = source("src/main/java/com/bncam/ui/screens/settings/lens_profiles/AwbCalibrationSettingsScreen.kt")
         val catalog = source("src/main/java/com/bncam/core/quality/LibpatcherProfileResolver.kt")
-        val repository = source("src/main/java/com/bncam/data/settings/SettingsRepository.kt")
+        val store = source("src/main/java/com/bncam/data/settings/ProfileAwbCalibrationSettingsStore.kt")
 
-        assertTrue(lensUi.contains("title = \"AWB\""))
+        assertTrue(editor.contains("title = \"AWB\""))
+        assertTrue(!lensUi.contains("title = \"AWB\""))
+        assertTrue(awbUi.contains("ProfileAwbCalibrationSettingsStore"))
         assertTrue(awbUi.contains("LensAwbCalibrationModes.AUTO"))
         assertTrue(awbUi.contains("Custom Import"))
         assertTrue(awbUi.contains("Import AWB calibration"))
-        assertTrue(!catalog.contains("awb_reference_intensity"))
-        assertTrue(!repository.contains("getProfileAwb"))
+        assertTrue(awbUi.contains("valueRange = -1.00f..1.00f"))
+        assertTrue(!awbUi.contains("title = \"Authority status\""))
+        assertTrue(catalog.contains("ProfileAwbSettingKeys.portableSpecs()"))
+        assertTrue(store.contains("delta 20/21 migration"))
     }
-
 }

@@ -191,7 +191,9 @@ object AwbCalibrationEngine {
         val explicitTrim = abs(safe.rgCoefficient - 1.0f) > 0.0005f ||
             abs(safe.bgCoefficient - 1.0f) > 0.0005f ||
             safe.greenSplitMode == LensAwbGreenSplitModes.MANUAL
-        return safe.mode == LensAwbCalibrationModes.BNCAM_PRESET ||
+        val explicitPreset = safe.mode == LensAwbCalibrationModes.BNCAM_PRESET &&
+            safe.presetStrength > 0.0005f
+        return explicitPreset ||
             safe.mode == LensAwbCalibrationModes.CUSTOM_IMPORT || explicitTrim
     }
 
@@ -216,11 +218,11 @@ object AwbCalibrationEngine {
         val calibrated = if (safeSettings.mode == LensAwbCalibrationModes.BNCAM_PRESET) {
             val preset = BnCamAwbPresetCatalog.byId(safeSettings.presetId) ?: return null
             camera2Gains.copyOf(4).also { gains ->
-                // Presets are scene-response choices relative to the actual lens/frame AWB, not
-                // another sensor locus. RG/BG trims keep their existing neutral-ratio semantics.
-                gains[0] = (gains[0] * preset.redGainScale / safeSettings.rgCoefficient)
+                // Strength blends only the preset tone. Advanced RG/BG trims remain independent:
+                // 0.00 strength therefore returns to exact-frame Camera2 AWB when trims are neutral.
+                gains[0] = (gains[0] * preset.redScaleAt(safeSettings.presetStrength) / safeSettings.rgCoefficient)
                     .coerceIn(0.25f, 6.0f)
-                gains[3] = (gains[3] * preset.blueGainScale / safeSettings.bgCoefficient)
+                gains[3] = (gains[3] * preset.blueScaleAt(safeSettings.presetStrength) / safeSettings.bgCoefficient)
                     .coerceIn(0.25f, 6.0f)
             }
         } else {

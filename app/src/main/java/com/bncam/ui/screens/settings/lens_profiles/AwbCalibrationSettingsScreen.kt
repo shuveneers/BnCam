@@ -36,9 +36,10 @@ import com.bncam.core.quality.AwbCalibrationImportParser
 import com.bncam.data.settings.BnCamAwbPreset
 import com.bncam.data.settings.BnCamAwbPresetCatalog
 import com.bncam.data.settings.BnCamAwbPresetGroup
+import com.bncam.data.settings.AwbCoefficientUiMapping
 import com.bncam.data.settings.LensAwbCalibrationModes
 import com.bncam.data.settings.LensAwbCalibrationSettings
-import com.bncam.data.settings.LensAwbCalibrationSettingsStore
+import com.bncam.data.settings.ProfileAwbCalibrationSettingsStore
 import com.bncam.data.settings.LensAwbGreenSplitModes
 import com.bncam.ui.components.AccentPistachio
 import com.bncam.ui.components.SettingSliderRow
@@ -51,25 +52,25 @@ import java.util.Locale
 
 @Composable
 fun AwbCalibrationSettingsScreen(
-    lensId: String,
+    profileId: String,
     onNavigateBack: () -> Unit
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    val store = remember(context) { LensAwbCalibrationSettingsStore(context) }
+    val store = remember(context) { ProfileAwbCalibrationSettingsStore(context) }
 
-    LaunchedEffect(lensId, store) { store.ensureInitialized(lensId) }
+    LaunchedEffect(profileId, store) { store.ensureInitialized(profileId) }
 
-    val authoritative by store.settingsFlow(lensId).collectAsStateWithLifecycle(
+    val authoritative by store.settingsFlow(profileId).collectAsStateWithLifecycle(
         initialValue = LensAwbCalibrationSettings()
     )
     val binding = rememberOptimisticPersistedBinding(
-        stableKey = "$lensId:awb_calibration_v2",
+        stableKey = "$profileId:awb_profile_v3",
         authoritativeValue = authoritative,
-        persist = { store.set(lensId, it) }
+        persist = { store.set(profileId, it) }
     )
     val settings = binding.value.sanitized()
-    var showPresetPicker by remember(lensId) { mutableStateOf(false) }
+    var showPresetPicker by remember(profileId) { mutableStateOf(false) }
 
     val importLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
@@ -113,14 +114,14 @@ fun AwbCalibrationSettingsScreen(
         }
     }
 
-    SettingsTopicScaffold("AWB Calibration", onNavigateBack) {
+    SettingsTopicScaffold("AWB", onNavigateBack) {
         SettingsCard(
-            title = "AWB authority",
-            description = "Per-lens white-balance response. Auto is the default and remains scene-adaptive. Presets are deliberate developed-JPEG responses, not color-matrix looks."
+            title = "AWB profile response",
+            description = "Profile-owned white-balance response. Auto remains scene-adaptive; presets and trims deliberately shape the developed preview/JPEG colour response."
         ) {
             ChoiceSettingRow(
                 title = "Calibration source",
-                description = "Auto follows the active lens and scene. BnCam Preset changes the illuminant response. Custom Import uses a user-supplied RG/BG calibration.",
+                description = "Auto follows the active scene. BnCam Preset changes the developed illuminant response. Custom Import uses a user-supplied RG/BG response.",
                 value = settings.mode,
                 options = listOf(
                     LensAwbCalibrationModes.AUTO,
@@ -131,20 +132,24 @@ fun AwbCalibrationSettingsScreen(
             )
 
             SettingSliderRow(
-                title = "R/G calibration trim",
-                description = "Advanced sensor-neutral trim. 1.000 leaves the selected response unchanged.",
-                value = settings.rgCoefficient,
-                valueRange = 0.25f..5.00f,
-                valueFormatter = { String.format(Locale.US, "%.3f", it) },
-                onValueChange = { binding.update(settings.copy(rgCoefficient = it)) }
+                title = "R/G trim",
+                description = "Signed profile trim. 0.00 is neutral; -1.00..0.00 maps to 0.25..1.00 and 0.00..+1.00 maps to 1.00..5.00 internally.",
+                value = AwbCoefficientUiMapping.toSigned(settings.rgCoefficient),
+                valueRange = -1.00f..1.00f,
+                valueFormatter = { String.format(Locale.US, "%.2f", it) },
+                onValueChange = {
+                    binding.update(settings.copy(rgCoefficient = AwbCoefficientUiMapping.fromSigned(it)))
+                }
             )
             SettingSliderRow(
-                title = "B/G calibration trim",
-                description = "Advanced sensor-neutral trim. 1.000 leaves the selected response unchanged.",
-                value = settings.bgCoefficient,
-                valueRange = 0.25f..5.00f,
-                valueFormatter = { String.format(Locale.US, "%.3f", it) },
-                onValueChange = { binding.update(settings.copy(bgCoefficient = it)) }
+                title = "B/G trim",
+                description = "Signed profile trim. 0.00 is neutral; -1.00..0.00 maps to 0.25..1.00 and 0.00..+1.00 maps to 1.00..5.00 internally.",
+                value = AwbCoefficientUiMapping.toSigned(settings.bgCoefficient),
+                valueRange = -1.00f..1.00f,
+                valueFormatter = { String.format(Locale.US, "%.2f", it) },
+                onValueChange = {
+                    binding.update(settings.copy(bgCoefficient = AwbCoefficientUiMapping.fromSigned(it)))
+                }
             )
         }
 
@@ -152,13 +157,21 @@ fun AwbCalibrationSettingsScreen(
             val selected = BnCamAwbPresetCatalog.byId(settings.presetId) ?: BnCamAwbPresetCatalog.all.first()
             SettingsCard(
                 title = "BnCam AWB preset",
-                description = "Fifteen lighting-response presets grouped by the kind of illumination they are designed to handle."
+                description = "Profile tone presets relative to exact-frame Camera2 AWB. Strength 0.00 returns to the Auto baseline; 1.00 applies the full restrained preset tone."
             ) {
                 SettingValueRow(
                     title = "AWB preset",
                     description = selected.description,
                     value = selected.name,
                     onClick = { showPresetPicker = true }
+                )
+                SettingSliderRow(
+                    title = "Preset strength",
+                    description = "0.00 = exact-frame Auto/Camera2 white-balance baseline. 1.00 = full preset tone. Manual R/G and B/G trims remain independent.",
+                    value = settings.presetStrength,
+                    valueRange = 0.00f..1.00f,
+                    valueFormatter = { String.format(Locale.US, "%.2f", it) },
+                    onValueChange = { binding.update(settings.copy(presetStrength = it)) }
                 )
             }
         }
@@ -189,7 +202,7 @@ fun AwbCalibrationSettingsScreen(
 
         SettingsCard(
             title = "G1/G2 sensor calibration",
-            description = "Technical Bayer green-site calibration. This is not a green/magenta creative tint control."
+            description = "Technical Bayer green-site response stored with this profile. This is not a green/magenta creative tint control."
         ) {
             ChoiceSettingRow(
                 title = "G1/G2 authority",
@@ -217,21 +230,13 @@ fun AwbCalibrationSettingsScreen(
             }
         }
 
-        SettingsCard(
-            title = "Authority status",
-            description = "The fingerprint identifies the exact per-lens AWB state used by the runtime."
-        ) {
-            SettingValueRow("Calibration", "Current per-lens AWB state.", settings.summary(), onClick = {})
-            SettingValueRow("Fingerprint", "Short hash of the persisted calibration values.", settings.fingerprint(), onClick = {})
-        }
-
         Button(
             onClick = { binding.update(LensAwbCalibrationSettings()) },
             modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
             shape = RoundedCornerShape(28.dp),
             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF8B1A1A))
         ) {
-            Text("Reset AWB calibration", color = Color.White, fontWeight = FontWeight.Bold)
+            Text("Reset profile AWB", color = Color.White, fontWeight = FontWeight.Bold)
         }
     }
 
