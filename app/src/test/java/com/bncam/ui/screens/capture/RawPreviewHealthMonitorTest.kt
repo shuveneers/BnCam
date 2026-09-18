@@ -41,16 +41,38 @@ class RawPreviewHealthMonitorTest {
     }
 
     @Test
-    fun presentationIsRequiredOnlyAfterRealPresentationWasObserved() {
+    fun firstPresentationIsRequiredAfterBoundedGlGraceWindow() {
         val g = 103
         val start = 3_000_000_000L
         startHealthy(g, start, present = false)
-        assertFalse(RawPreviewHealthMonitor.snapshot(start + 10).actualPresentationObserved)
-        assertEquals(RawPreviewHealthStage.HEALTHY, RawPreviewHealthMonitor.snapshot(start + 10).stage)
+        val initial = RawPreviewHealthMonitor.snapshot(start + 10)
+        assertFalse(initial.actualPresentationObserved)
+        assertTrue(initial.firstGlDrawElapsedNs > 0L)
+        assertEquals(RawPreviewHealthStage.HEALTHY, initial.stage)
 
+        val now = initial.firstGlDrawElapsedNs + initial.stallThresholdNs + 1
+        // Keep every upstream stage and GL draw alive. Absence of any actual presentation must now
+        // be attributed to EGL/presentation instead of being mislabelled HEALTHY forever.
+        RawPreviewHealthMonitor.captureResultProgress(g, 2L, 33_333_333L, 10_000_000L, now)
+        RawPreviewHealthMonitor.imageReaderProgress(g, 2L, now)
+        RawPreviewHealthMonitor.rendererOffer(g, now)
+        RawPreviewHealthMonitor.rendererPublication(g, 4, 0.01f, 0.8f, 0.2f, "available=3", now)
+        RawPreviewHealthMonitor.glAccepted(g, 4, now)
+        RawPreviewHealthMonitor.glDraw(g, 4, now)
+        assertEquals(RawPreviewHealthStage.EGL_PRESENTATION, RawPreviewHealthMonitor.snapshot(now).stage)
+    }
+
+    @Test
+    fun actualPresentationClearsFirstPresentationFaultAndThenUsesRollingFreshness() {
+        val g = 109
+        val start = 8_000_000_000L
+        startHealthy(g, start, present = false)
         RawPreviewHealthMonitor.displayPresented(g, start + 20)
-        val threshold = RawPreviewHealthMonitor.snapshot(start + 21).stallThresholdNs
-        val now = start + 20 + threshold + 1
+        val healthy = RawPreviewHealthMonitor.snapshot(start + 21)
+        assertTrue(healthy.actualPresentationObserved)
+        assertEquals(RawPreviewHealthStage.HEALTHY, healthy.stage)
+
+        val now = start + 20 + healthy.stallThresholdNs + 1
         RawPreviewHealthMonitor.captureResultProgress(g, 2L, 33_333_333L, 10_000_000L, now)
         RawPreviewHealthMonitor.imageReaderProgress(g, 2L, now)
         RawPreviewHealthMonitor.rendererOffer(g, now)

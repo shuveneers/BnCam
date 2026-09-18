@@ -147,6 +147,9 @@ import com.bncam.data.settings.CaptureSettingKeys
 import com.bncam.data.settings.parseCameraFormatCode
 import com.bncam.data.settings.rawPreviewFormatCompatibility
 import com.bncam.data.settings.RawPreviewFormatCompatibility
+import com.bncam.data.settings.StreamConfigurationMode
+import com.bncam.data.settings.StreamConfigurationRuntimeFingerprint
+import com.bncam.data.settings.StreamConfigurationSettingsStore
 import com.bncam.data.settings.VendorTagTarget
 import com.bncam.vendor.DynamicVendorTag
 import com.bncam.vendor.VendorInjectionEngine
@@ -173,6 +176,7 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
@@ -194,9 +198,16 @@ import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
 private const val RAW_PREVIEW_CONFIG_REFRESH_MS = 1_500L
+private const val STREAM_CONFIGURATION_REFRESH_WAIT_MS = 3_500L
+private const val STREAM_FIRST_FRAME_MIN_TIMEOUT_MS = 900L
+private const val STREAM_FIRST_FRAME_MAX_TIMEOUT_MS = 4_000L
+private const val VIEWFINDER_PRESENTATION_MIN_TIMEOUT_NS = 900_000_000L
+private const val VIEWFINDER_PRESENTATION_MAX_TIMEOUT_NS = 3_500_000_000L
+private const val VIEWFINDER_PRESENTATION_RECOVERY_MAX_ATTEMPTS = 3
 private const val SESSION_TRANSITION_TIMEOUT_MS = 2_500L
 private const val CAMERA_HARD_CLOSE_RECOVERY_TIMEOUT_MS = 1_500L
 private const val CAMERA_HARD_START_READY_TIMEOUT_MS = 3_500L
+private const val PREVIEW_GEOMETRY_APPLY_TIMEOUT_MS = 1_000L
 private const val DIRECT_CAMERA_PROBE_TIMEOUT_MS = 3_500L
 
 private enum class PipelineTransitionState {
@@ -276,7 +287,10 @@ data class PipelineIdentity(
     val rawPreviewBindingSignature: String = "none",
     val rawPreviewFormatCode: Int? = null,
     val vendorConfigSignature: String = "none",
-    val vendorSessionRebuildRequired: Boolean = false
+    val vendorSessionRebuildRequired: Boolean = false,
+    val streamConfigurationMode: StreamConfigurationMode = StreamConfigurationMode.AUTO,
+    val streamConfigurationCandidateId: String? = null,
+    val streamRuntimeFallbackTier: StreamRuntimeFallbackTier = StreamRuntimeFallbackTier.NONE
 ) {
     /**
      * Compares the canonical near-ZSL producer while deliberately ignoring the optional
@@ -738,12 +752,26 @@ class BnCameraManager(private val context: Context) {
         val advertised: Boolean
     )
 
+    private data class PendingYuvPresentationRecoverySnapshot(
+        val producerFrameReady: Boolean,
+        val stagedElapsedNs: Long,
+        val firstProducerElapsedNs: Long,
+        val attempts: Int,
+        val lastRecoveryElapsedNs: Long,
+        val exhaustedLogged: Boolean
+    )
+
     private data class PendingViewfinderDisplayTransition(
         val source: ViewfinderEffectiveSource,
         val generation: Int,
         val requiresProducerFrame: Boolean,
+        val stagedElapsedNs: Long = android.os.SystemClock.elapsedRealtimeNanos(),
         var producerFrameReady: Boolean = false,
-        var firstProducerTimestampNs: Long = Long.MIN_VALUE
+        var firstProducerTimestampNs: Long = Long.MIN_VALUE,
+        var firstProducerElapsedNs: Long = 0L,
+        var presentationRecoveryAttempts: Int = 0,
+        var lastPresentationRecoveryElapsedNs: Long = 0L,
+        var presentationRecoveryExhaustedLogged: Boolean = false
     )
 
     private var customRawPreviewReader: ImageReader? = null
@@ -925,6 +953,12 @@ class BnCameraManager(private val context: Context) {
     private val focusAnalysisRequests = Channel<BufferFrameAnalysisRequest>(Channel.CONFLATED)
     private val yuvAnalysisRequests = Channel<YuvFrameAnalysisRequest>(Channel.CONFLATED)
     private var warmBufferWatchdogJob: Job? = null
+    private var streamConfigurationObserverJob: Job? = null
+    private var streamConfigurationRefreshJob: Job? = null
+    @Volatile private var streamConfigurationObservedLensId: String? = null
+    @Volatile private var streamConfigurationObservedRuntimeFingerprint: String? = null
+    @Volatile private var manualCustomRawPreviewBindingConfigured: Boolean = false
+    private val streamRuntimeFallbackByLens = ConcurrentHashMap<String, StreamRuntimeFallbackOverride>()
     @Volatile private var lastWarmBufferWatchdogRebuildMs: Long = 0L
     @Volatile private var warmBufferWatchdogRebuildAttemptsSinceHealthy: Int = 0
     private val rawPreviewRenderer = RawPreviewRenderer rawPreviewFrame@{ frame ->
@@ -1092,8 +1126,57 @@ class BnCameraManager(private val context: Context) {
     private val sessionLifecycleLock = Any()
     private val sessionCloseBarriers = IdentityHashMap<CameraCaptureSession, CompletableDeferred<Unit>>()
     private val sessionSurfaceNames = IdentityHashMap<CameraCaptureSession, IdentityHashMap<Surface, String>>()
+    private data class SessionOutputAttemptOwnership(
+        val generation: Int,
+        val epoch: Long,
+        val cameraId: String,
+        val namedSurfaces: List<Pair<Surface, String>>,
+        val readers: Set<ImageReader>,
+        val reason: String,
+        val submittedElapsedNs: Long
+    )
+
+    private data class SessionOwnershipIdentity(
+        val generation: Int,
+        val epoch: Long,
+        val reason: String
+    )
+
+    private data class SessionOutputFailureRecord(
+        val generation: Int,
+        val epoch: Long,
+        val diagnosis: SessionOutputFailureDiagnosis
+    )
+
+    @Volatile
+    private var lastSessionOutputFailure: SessionOutputFailureRecord? = null
+
+    private data class PreviewGeometryRecoveryState(
+        val generation: Int,
+        val lensId: String,
+        val attemptedRecoverySizes: LinkedHashSet<String> = linkedSetOf()
+    )
+
+    private data class PendingPreviewGeometryPromotion(
+        val generation: Int,
+        val cacheKey: PreviewGeometryRuntimeCache.Key,
+        val geometry: PreviewGeometryRuntimeCache.Geometry,
+        val failedGeometry: PreviewGeometryRuntimeCache.Geometry
+    )
+
+    private var previewGeometryRecoveryState: PreviewGeometryRecoveryState? = null
+    private val previewGeometryRuntimeCache = PreviewGeometryRuntimeCache()
+    private var pendingPreviewGeometryPromotion: PendingPreviewGeometryPromotion? = null
+
     private val sessionOwnedReaders = IdentityHashMap<CameraCaptureSession, Set<ImageReader>>()
     private val readerOwningSessions = IdentityHashMap<ImageReader, MutableSet<CameraCaptureSession>>()
+    // createCaptureSession() is asynchronous. Readers referenced by a submitted-but-not-yet-
+    // configured attempt are just as HAL-owned as readers referenced by an active session.
+    // Keep that ownership explicit so a fast RAW10/RAW_SENSOR/session transition can never close
+    // an ImageReader while Camera2 is still configuring a session against its Surface.
+    private val pendingSessionOutputAttempts = mutableMapOf<Long, SessionOutputAttemptOwnership>()
+    private val readerPendingSessionEpochs = IdentityHashMap<ImageReader, MutableSet<Long>>()
+    private val sessionOwnershipIdentity = IdentityHashMap<CameraCaptureSession, SessionOwnershipIdentity>()
     private val retiringImageReaders = IdentityHashMap<ImageReader, String>()
     private val controlRequestEpochTracker = ControlRequestEpochTracker()
     private var activeOisDecision: OisDecision? = null
@@ -1680,7 +1763,12 @@ class BnCameraManager(private val context: Context) {
         }
     }
 
-    /** Updates display routing only; this deliberately never rebuilds the Camera2 session. */
+    /**
+     * Updates display routing. Normal Auto/Validated routes never rebuild Camera2 here. The only
+     * exception is an explicitly configured Manual custom RAW preview output whose Surface set
+     * must follow SELECTED_BUFFER <-> YUV; even then the existing identity-driven reset owner
+     * decides whether a session-only refresh is actually required.
+     */
     fun configureViewfinderStream(
         setting: ViewfinderStream,
         profileId: String,
@@ -1712,6 +1800,18 @@ class BnCameraManager(private val context: Context) {
                 } == true
         viewfinderStreamSetting = setting
         viewfinderProfileId = profileId
+        if (previousStreamSetting != setting) {
+            val activeIdentity = synchronized(pipelineLock) { activePipelineIdentity }
+            val customBindingWasActive = activeIdentity?.rawPreviewFormatCode != null
+            if (manualCustomRawPreviewBindingConfigured || customBindingWasActive) {
+                activeLensId?.let { lensId ->
+                    requestActiveStreamConfigurationRefresh(
+                        expectedLensId = lensId,
+                        reason = "MANUAL_RAW_BINDING_VIEWFINDER_${previousStreamSetting.name}_TO_${setting.name}"
+                    )
+                }
+            }
+        }
         if (setting == ViewfinderStream.SELECTED_BUFFER &&
             traceIdentity != null &&
             (traceIdentity.bufferFormat == ImageFormat.RAW10 ||
@@ -2149,6 +2249,9 @@ class BnCameraManager(private val context: Context) {
             val pending = pendingViewfinderDisplayTransition ?: return
             if (pending.generation != generation || pending.source != source) return
             pending.producerFrameReady = true
+            if (pending.firstProducerElapsedNs == 0L) {
+                pending.firstProducerElapsedNs = android.os.SystemClock.elapsedRealtimeNanos()
+            }
             if (sensorTimestampNs > 0L && pending.firstProducerTimestampNs == Long.MIN_VALUE) {
                 pending.firstProducerTimestampNs = sensorTimestampNs
             }
@@ -6430,9 +6533,13 @@ class BnCameraManager(private val context: Context) {
 
     private suspend fun resolveCustomRawPreviewBinding(
         cameraId: String,
-        requestedSource: String
+        requestedSource: String,
+        manualStreamConfigurationActive: Boolean
     ): RawPreviewBindingResolution {
-        if (viewfinderStreamSetting != ViewfinderStream.SELECTED_BUFFER) {
+        // Custom/vendor RAW preview codes are an explicit Manual Stream Configuration tool.
+        // Auto and Validated must remain on the canonical producer/session contract so a stale
+        // legacy binding cannot silently add a third output Surface to an otherwise validated plan.
+        if (!manualStreamConfigurationActive || viewfinderStreamSetting != ViewfinderStream.SELECTED_BUFFER) {
             return RawPreviewBindingResolution("none", null)
         }
         val source = ViewfinderEffectiveSource.fromFrameSource(requestedSource)
@@ -6836,17 +6943,74 @@ class BnCameraManager(private val context: Context) {
             }
         }
 
-        val bestSize = availableSizes.maxByOrNull { it.width.toLong() * it.height.toLong() } ?: run {
+        val autoBestSize = availableSizes.maxByOrNull { it.width.toLong() * it.height.toLong() } ?: run {
             Log.e(tag, "PIPELINE_UNSUPPORTED_FRAME_SOURCE_NO_FALLBACK requested=$requestedSource camera=$cameraId reason=no output size for ${formatName(effectiveFormat)}")
             return null
         }
 
+        // Stream Configuration is resolved only after the existing full-FOV/capability policy has
+        // produced a known-safe Auto geometry. Auto therefore remains behaviorally identical to the
+        // pre-Stream-Configuration pipeline. Validated is allowed to replace only the resolution of
+        // this exact profile-owned format and must pass an exact active-preview HAL preflight first.
+        val configuredPreviewSize = if (
+            configuredPreviewStreamWidth > 0 && configuredPreviewStreamHeight > 0
+        ) {
+            android.util.Size(configuredPreviewStreamWidth, configuredPreviewStreamHeight)
+        } else {
+            null
+        }
+        // Vendor/session tags may alter the real SessionConfiguration later in createCaptureSession.
+        // Keep the API35 "Validated" promise strict: while such overrides are active, retain Auto
+        // geometry rather than preflighting a regular session and then creating a different one.
+        val vendorFingerprint = buildVendorConfigFingerprint(cameraId)
+        val runtimeFallback = streamRuntimeFallbackByLens[cameraId]
+        val resolvedStreamPlan = StreamConfigResolver.resolvePhoto(
+            context = context,
+            cameraManager = cameraManager,
+            requestedLensId = cameraId,
+            logicalCameraId = logicalId,
+            physicalCameraId = physicalId,
+            characteristics = chars,
+            requestedFormatCode = effectiveFormat,
+            autoCaptureSize = autoBestSize,
+            configuredPreviewSize = configuredPreviewSize,
+            sessionHasVendorOverrides = vendorFingerprint.requiresSessionRebuild,
+            runtimeFallback = runtimeFallback
+        )
+        val bestSize = resolvedStreamPlan.captureSize
+
         Log.i(
             tag,
             "PIPELINE_STREAM_GEOMETRY_SELECTED format=${formatName(effectiveFormat)} " +
-                "selected=${bestSize.width}x${bestSize.height} candidates=${availableSizes.size} " +
-                "source=$geometrySource sensor=${sensorWidth}x$sensorHeight " +
-                "standardCandidates=${standardSizes.size} recommendedCandidates=${recommendedSizes.size}"
+                "selected=${bestSize.width}x${bestSize.height} auto=${autoBestSize.width}x${autoBestSize.height} " +
+                "candidates=${availableSizes.size} source=$geometrySource sensor=${sensorWidth}x$sensorHeight " +
+                "standardCandidates=${standardSizes.size} recommendedCandidates=${recommendedSizes.size} " +
+                "streamMode=${resolvedStreamPlan.configuredMode.name} " +
+                "streamCandidate=${resolvedStreamPlan.selectedCandidateId ?: "none"} " +
+                "halValidated=${resolvedStreamPlan.halSessionValidated} " +
+                "fallbackToAuto=${resolvedStreamPlan.fallbackToAuto} " +
+                "runtimeFallbackTier=${resolvedStreamPlan.runtimeFallbackTier.name} reason=${resolvedStreamPlan.reason}"
+        )
+        writePipelineLifecycleDebug(
+            event = "STREAM_CONFIGURATION_RESOLVED",
+            decision = null,
+            extra = buildString {
+                append("lensId=").append(cameraId).append('\n')
+                append("logicalCameraId=").append(logicalId).append('\n')
+                append("physicalCameraId=").append(physicalId ?: "none").append('\n')
+                append("requestedFormat=").append(formatName(effectiveFormat)).append('\n')
+                append("mode=").append(resolvedStreamPlan.configuredMode.name).append('\n')
+                append("candidateId=").append(resolvedStreamPlan.selectedCandidateId ?: "none").append('\n')
+                append("autoSize=").append(autoBestSize.width).append('x').append(autoBestSize.height).append('\n')
+                append("resolvedSize=").append(bestSize.width).append('x').append(bestSize.height).append('\n')
+                append("previewSize=").append(
+                    configuredPreviewSize?.let { "${it.width}x${it.height}" } ?: "unknown"
+                ).append('\n')
+                append("halSessionValidated=").append(resolvedStreamPlan.halSessionValidated).append('\n')
+                append("fallbackToAuto=").append(resolvedStreamPlan.fallbackToAuto).append('\n')
+                append("runtimeFallbackTier=").append(resolvedStreamPlan.runtimeFallbackTier.name).append('\n')
+                append("reason=").append(resolvedStreamPlan.reason)
+            }
         )
 
         val (totalRamBytes, memoryClassBytes) = memoryBudgetInputs(context)
@@ -6869,8 +7033,12 @@ class BnCameraManager(private val context: Context) {
                     "limitingReasons=${bufferBudget.capacityResolution.limitingReasons.joinToString(",").ifBlank { "none" }}"
         )
 
-        val vendorFingerprint = buildVendorConfigFingerprint(cameraId)
-        val rawPreviewBinding = resolveCustomRawPreviewBinding(cameraId, requestedSource)
+        val rawPreviewBinding = resolveCustomRawPreviewBinding(
+            cameraId = cameraId,
+            requestedSource = requestedSource,
+            manualStreamConfigurationActive = resolvedStreamPlan.configuredMode == StreamConfigurationMode.MANUAL &&
+                resolvedStreamPlan.runtimeFallbackTier == StreamRuntimeFallbackTier.NONE
+        )
 
         return PipelineIdentity(
             selectedLensId = cameraId,
@@ -6893,7 +7061,10 @@ class BnCameraManager(private val context: Context) {
             rawPreviewBindingSignature = rawPreviewBinding.signature,
             rawPreviewFormatCode = rawPreviewBinding.formatCode,
             vendorConfigSignature = vendorFingerprint.signature,
-            vendorSessionRebuildRequired = vendorFingerprint.requiresSessionRebuild
+            vendorSessionRebuildRequired = vendorFingerprint.requiresSessionRebuild,
+            streamConfigurationMode = resolvedStreamPlan.configuredMode,
+            streamConfigurationCandidateId = resolvedStreamPlan.selectedCandidateId,
+            streamRuntimeFallbackTier = resolvedStreamPlan.runtimeFallbackTier
         )
     }
 
@@ -6942,7 +7113,9 @@ class BnCameraManager(private val context: Context) {
                 "cameraRoute=$cameraRouteKind " +
                 "lensRole=${lensRole ?: "none"} route=$backendRoute size=${width}x$height maxImages=$maxImages " +
                 "rawPreviewBinding=$rawPreviewBindingSignature vendorSig=$vendorConfigSignature " +
-                "vendorSessionRebuildRequired=$vendorSessionRebuildRequired"
+                "vendorSessionRebuildRequired=$vendorSessionRebuildRequired " +
+                "streamMode=${streamConfigurationMode.name} streamCandidate=${streamConfigurationCandidateId ?: "none"} " +
+                "streamFallbackTier=${streamRuntimeFallbackTier.name}"
     }
 
     private fun resolvePhysicalYuvFullFovDecision(): PhysicalYuvFullFovDecision {
@@ -7467,6 +7640,268 @@ class BnCameraManager(private val context: Context) {
         return false
     }
 
+    private data class StreamFirstFrameBaseline(
+        val imageTimestampNs: Long,
+        val metadataTimestampNs: Long,
+        val eventSequence: Long
+    )
+
+    private fun latestCaptureResultTimestampNs(generation: Int): Long {
+        if (lastCaptureResultGeneration != generation) return Long.MIN_VALUE
+        return (lastCaptureResult as? TotalCaptureResult)
+            ?.get(CaptureResult.SENSOR_TIMESTAMP)
+            ?: Long.MIN_VALUE
+    }
+
+    private fun captureStreamFirstFrameBaseline(generation: Int = pipelineGeneration): StreamFirstFrameBaseline =
+        StreamFirstFrameBaseline(
+            imageTimestampNs = ringBuffer.latestImageTimestamp(generation) ?: Long.MIN_VALUE,
+            metadataTimestampNs = latestCaptureResultTimestampNs(generation),
+            eventSequence = ringBuffer.currentEventSequence()
+        )
+
+    private fun streamFirstFrameTimeoutMs(identity: PipelineIdentity?): Long {
+        if (identity == null) return STREAM_FIRST_FRAME_MAX_TIMEOUT_MS
+        val streamCharacteristicsId = identity.physicalCameraId ?: identity.logicalCameraId
+        val characteristics = runCatching {
+            cameraManager.getCameraCharacteristics(streamCharacteristicsId)
+        }.getOrNull() ?: return STREAM_FIRST_FRAME_MAX_TIMEOUT_MS
+        val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            ?: return STREAM_FIRST_FRAME_MAX_TIMEOUT_MS
+        val captureSize = android.util.Size(identity.width, identity.height)
+        val captureDurationNs = runCatching {
+            map.getOutputMinFrameDuration(identity.bufferFormat, captureSize)
+        }.getOrDefault(0L)
+        val previewDurationNs = if (configuredPreviewStreamWidth > 0 && configuredPreviewStreamHeight > 0) {
+            runCatching {
+                map.getOutputMinFrameDuration(
+                    android.graphics.SurfaceTexture::class.java,
+                    android.util.Size(configuredPreviewStreamWidth, configuredPreviewStreamHeight)
+                )
+            }.getOrDefault(0L)
+        } else {
+            0L
+        }
+        val realizedExposureNs = if (lastCaptureResultGeneration == pipelineGeneration) {
+            (lastCaptureResult as? TotalCaptureResult)
+                ?.get(CaptureResult.SENSOR_EXPOSURE_TIME)
+                ?.coerceAtLeast(0L) ?: 0L
+        } else {
+            0L
+        }
+        val limitingDurationNs = maxOf(captureDurationNs, previewDurationNs, realizedExposureNs)
+        if (limitingDurationNs <= 0L) return STREAM_FIRST_FRAME_MAX_TIMEOUT_MS
+        val expectedFrameMs = limitingDurationNs / 1_000_000.0
+        return (expectedFrameMs * 12.0).toLong()
+            .coerceIn(STREAM_FIRST_FRAME_MIN_TIMEOUT_MS, STREAM_FIRST_FRAME_MAX_TIMEOUT_MS)
+    }
+
+    /**
+     * Session onConfigured is not stream readiness. Require both a new image and new capture-result
+     * timestamp from the exact generation after the session transition began. Pairing may lag, so
+     * transport liveness is deliberately proven without demanding a completed near-ZSL pair.
+     */
+    private suspend fun awaitFirstProducerFrameAfter(
+        generation: Int,
+        baseline: StreamFirstFrameBaseline,
+        reason: String,
+        identity: PipelineIdentity? = synchronized(pipelineLock) { activePipelineIdentity }
+    ): Boolean {
+        val timeoutMs = streamFirstFrameTimeoutMs(identity)
+        val startedMs = android.os.SystemClock.elapsedRealtime()
+        var eventSequence = baseline.eventSequence
+        while (android.os.SystemClock.elapsedRealtime() - startedMs < timeoutMs) {
+            if (generation != pipelineGeneration) {
+                discardPendingPreviewGeometryPromotion(generation, "PIPELINE_GENERATION_CHANGED")
+                return false
+            }
+            val newestImageTimestamp = ringBuffer.latestImageTimestamp(generation) ?: Long.MIN_VALUE
+            val newestMetadataTimestamp = latestCaptureResultTimestampNs(generation)
+            val imageAdvanced = newestImageTimestamp > baseline.imageTimestampNs
+            val metadataAdvanced = newestMetadataTimestamp > baseline.metadataTimestampNs
+            if (imageAdvanced && metadataAdvanced) {
+                promotePendingPreviewGeometryIfReady(generation, identity)
+                val elapsedMs = android.os.SystemClock.elapsedRealtime() - startedMs
+                Log.i(
+                    previewDiagnosticsTag,
+                    "event=FIRST_PRODUCER_FRAME_READY generation=$generation reason=$reason " +
+                        "elapsedMs=$elapsedMs imageTimestampNs=$newestImageTimestamp " +
+                        "metadataTimestampNs=$newestMetadataTimestamp targetViewfinder=${targetViewfinderSource.name} " +
+                        "displayCommitted=${effectiveViewfinderGeneration == generation}"
+                )
+                com.bncam.core.debug.DiagnosticsAggregator.record(
+                    stream = com.bncam.core.debug.DiagnosticsAggregator.Stream.PERFORMANCE,
+                    scope = "CAMERA PIPELINE",
+                    section = "FIRST PRODUCER FRAME READY",
+                    content = "generation=$generation;reason=$reason;elapsedMs=$elapsedMs;" +
+                        "imageTimestampNs=$newestImageTimestamp;metadataTimestampNs=$newestMetadataTimestamp;" +
+                        "targetViewfinder=${targetViewfinderSource.name};" +
+                        "displayCommitted=${effectiveViewfinderGeneration == generation}"
+                )
+                return true
+            }
+
+            val remainingMs = timeoutMs -
+                (android.os.SystemClock.elapsedRealtime() - startedMs)
+            if (remainingMs <= 0L) break
+            val wake = withTimeoutOrNull(minOf(80L, remainingMs)) {
+                ringBuffer.awaitEventAfter(eventSequence)
+            }
+            if (wake != null) eventSequence = wake.sequence
+        }
+
+        val health = ringBuffer.healthDiagnostics()
+        Log.e(
+            previewDiagnosticsTag,
+            "event=FIRST_PRODUCER_FRAME_TIMEOUT generation=$generation reason=$reason " +
+                "timeoutMs=$timeoutMs baselineImageTimestampNs=${baseline.imageTimestampNs} " +
+                "baselineMetadataTimestampNs=${baseline.metadataTimestampNs} " +
+                "latestImageTimestampNs=${ringBuffer.latestImageTimestamp(generation) ?: Long.MIN_VALUE} " +
+                "latestMetadataTimestampNs=${latestCaptureResultTimestampNs(generation)} " +
+                "startupState=${health.startupPairingState} validComplete=${health.validCompleteFrameCount} " +
+                "pendingPairs=${health.pendingPairs} producerHeadroom=${health.actualProducerHeadroom}"
+        )
+        com.bncam.core.debug.DiagnosticsAggregator.record(
+            stream = com.bncam.core.debug.DiagnosticsAggregator.Stream.PERFORMANCE,
+            scope = "CAMERA PIPELINE",
+            section = "FIRST PRODUCER FRAME TIMEOUT",
+            content = "generation=$generation;reason=$reason;timeoutMs=$timeoutMs;" +
+                "baselineImageTimestampNs=${baseline.imageTimestampNs};" +
+                "baselineMetadataTimestampNs=${baseline.metadataTimestampNs};" +
+                "latestImageTimestampNs=${ringBuffer.latestImageTimestamp(generation) ?: Long.MIN_VALUE};" +
+                "latestMetadataTimestampNs=${latestCaptureResultTimestampNs(generation)};" +
+                "startupState=${health.startupPairingState};validComplete=${health.validCompleteFrameCount};" +
+                "pendingPairs=${health.pendingPairs};producerHeadroom=${health.actualProducerHeadroom}"
+        )
+        discardPendingPreviewGeometryPromotion(generation, "FIRST_PRODUCER_FRAME_TIMEOUT:$reason")
+        return false
+    }
+
+    private fun viewfinderPresentationTimeoutNs(generation: Int): Long {
+        val cadenceNs = ((ringBuffer.streamTimingEstimate().frameDurationMedianMs ?: 33.3) * 1_000_000.0)
+            .toLong().coerceAtLeast(8_000_000L)
+        val exposureNs = if (lastCaptureResultGeneration == generation) {
+            (lastCaptureResult as? TotalCaptureResult)
+                ?.get(CaptureResult.SENSOR_EXPOSURE_TIME)
+                ?.coerceAtLeast(0L) ?: 0L
+        } else {
+            0L
+        }
+        val expectedIntervalNs = maxOf(cadenceNs, exposureNs, 33_333_333L)
+        return (expectedIntervalNs * 10L)
+            .coerceIn(VIEWFINDER_PRESENTATION_MIN_TIMEOUT_NS, VIEWFINDER_PRESENTATION_MAX_TIMEOUT_NS)
+    }
+
+    /**
+     * YUV SurfaceTexture/OES presentation recovery is display-local. A healthy capture producer
+     * must never be converted into a StreamConfig fallback merely because the GL bridge missed a
+     * callback or render. RAW has its richer stage monitor below; this helper closes the equivalent
+     * YUV gap while retaining the last-known-good displayed texture.
+     */
+    private fun recoverPendingYuvPresentationIfNeeded(
+        sessionGeneration: Int,
+        nowElapsedNs: Long
+    ) {
+        val pendingSnapshot = synchronized(pipelineLock) {
+            val pending = pendingViewfinderDisplayTransition ?: return
+            if (pending.source != ViewfinderEffectiveSource.YUV ||
+                pending.generation != sessionGeneration ||
+                targetViewfinderSource != ViewfinderEffectiveSource.YUV ||
+                targetViewfinderGeneration != sessionGeneration ||
+                pipelineGeneration != sessionGeneration
+            ) return
+            PendingYuvPresentationRecoverySnapshot(
+                producerFrameReady = pending.producerFrameReady,
+                stagedElapsedNs = pending.stagedElapsedNs,
+                firstProducerElapsedNs = pending.firstProducerElapsedNs,
+                attempts = pending.presentationRecoveryAttempts,
+                lastRecoveryElapsedNs = pending.lastPresentationRecoveryElapsedNs,
+                exhaustedLogged = pending.presentationRecoveryExhaustedLogged
+            )
+        }
+
+        val timeoutNs = viewfinderPresentationTimeoutNs(sessionGeneration)
+        val anchorNs = pendingSnapshot.firstProducerElapsedNs.takeIf {
+            pendingSnapshot.producerFrameReady && it > 0L
+        } ?: pendingSnapshot.stagedElapsedNs
+        if (anchorNs <= 0L || nowElapsedNs - anchorNs < timeoutNs) return
+
+        // If no SurfaceTexture callback was observed yet, require independent Camera2/ImageReader
+        // progress before declaring this a display-layer problem. Otherwise the producer watchdog
+        // from Delta 0004 remains the correct owner.
+        if (!pendingSnapshot.producerFrameReady) {
+            val health = com.bncam.ui.screens.capture.RawPreviewHealthMonitor.snapshot(nowElapsedNs)
+            val freshnessNs = maxOf(timeoutNs, health.stallThresholdNs)
+            val captureAlive = health.pipelineGeneration == sessionGeneration &&
+                health.lastCaptureResultElapsedNs > 0L &&
+                nowElapsedNs - health.lastCaptureResultElapsedNs <= freshnessNs
+            val imageReaderAlive = health.pipelineGeneration == sessionGeneration &&
+                health.lastImageReaderElapsedNs > 0L &&
+                nowElapsedNs - health.lastImageReaderElapsedNs <= freshnessNs
+            if (!captureAlive || !imageReaderAlive) return
+        }
+
+        val cooldownNs = timeoutNs.coerceAtLeast(1_000_000_000L)
+        if (pendingSnapshot.lastRecoveryElapsedNs > 0L &&
+            nowElapsedNs - pendingSnapshot.lastRecoveryElapsedNs < cooldownNs
+        ) return
+
+        if (pendingSnapshot.attempts >= VIEWFINDER_PRESENTATION_RECOVERY_MAX_ATTEMPTS) {
+            if (!pendingSnapshot.exhaustedLogged) {
+                synchronized(pipelineLock) {
+                    pendingViewfinderDisplayTransition
+                        ?.takeIf { it.source == ViewfinderEffectiveSource.YUV && it.generation == sessionGeneration }
+                        ?.presentationRecoveryExhaustedLogged = true
+                }
+                Log.e(
+                    previewDiagnosticsTag,
+                    "event=YUV_PRESENTATION_LOCAL_RECOVERY_EXHAUSTED generation=$sessionGeneration " +
+                        "attempts=${pendingSnapshot.attempts} retaining=${effectiveViewfinderSource.name}/$effectiveViewfinderGeneration"
+                )
+                com.bncam.core.debug.DiagnosticsAggregator.record(
+                    stream = com.bncam.core.debug.DiagnosticsAggregator.Stream.PERFORMANCE,
+                    scope = "VIEWFINDER",
+                    section = "YUV PRESENTATION RECOVERY EXHAUSTED",
+                    content = "generation=$sessionGeneration;attempts=${pendingSnapshot.attempts};" +
+                        "producerReady=${pendingSnapshot.producerFrameReady};" +
+                        "retaining=${effectiveViewfinderSource.name}/$effectiveViewfinderGeneration;" +
+                        "cameraSessionUntouched=true"
+                )
+            }
+            return
+        }
+
+        val attempt = pendingSnapshot.attempts + 1
+        val recoveredLocally = com.bncam.ui.screens.capture.FocusPeakingView.requestYuvDisplayRecovery(
+            generation = sessionGeneration,
+            reason = "presentation_not_proven_attempt_$attempt"
+        )
+        if (!recoveredLocally) return
+
+        synchronized(pipelineLock) {
+            pendingViewfinderDisplayTransition
+                ?.takeIf { it.source == ViewfinderEffectiveSource.YUV && it.generation == sessionGeneration }
+                ?.let { pending ->
+                    pending.presentationRecoveryAttempts = attempt
+                    pending.lastPresentationRecoveryElapsedNs = nowElapsedNs
+                }
+        }
+        Log.w(
+            previewDiagnosticsTag,
+            "event=YUV_PRESENTATION_LOCAL_RECOVERY generation=$sessionGeneration attempt=$attempt " +
+                "producerReady=${pendingSnapshot.producerFrameReady} timeoutMs=${timeoutNs / 1_000_000.0} " +
+                "cameraSessionUntouched=true"
+        )
+        com.bncam.core.debug.DiagnosticsAggregator.record(
+            stream = com.bncam.core.debug.DiagnosticsAggregator.Stream.PERFORMANCE,
+            scope = "VIEWFINDER",
+            section = "YUV PRESENTATION LOCAL RECOVERY",
+            content = "generation=$sessionGeneration;attempt=$attempt;" +
+                "producerReady=${pendingSnapshot.producerFrameReady};timeoutNs=$timeoutNs;" +
+                "cameraSessionUntouched=true"
+        )
+    }
+
     private fun stopWarmBufferWatchdog() {
         warmBufferWatchdogJob?.cancel()
         warmBufferWatchdogJob = null
@@ -7501,13 +7936,19 @@ class BnCameraManager(private val context: Context) {
                 ) {
                     return@launch
                 }
+                // STARTING/RECONFIGURING first-frame readiness is owned synchronously by the
+                // serialized transition. The warm watchdog must not race that owner with another
+                // reset while the transition is still proving its first producer frame.
+                if (pipelineTransitionState != PipelineTransitionState.PREVIEW_ATTACHED) continue
+
+                val watchdogNowNs = android.os.SystemClock.elapsedRealtimeNanos()
+                recoverPendingYuvPresentationIfNeeded(sessionGeneration, watchdogNowNs)
 
                 val health = ringBuffer.healthDiagnostics()
                 val streamHealthRequirement = WarmBufferReadinessPolicy.streamHealth(
                     format = activeZslFormat,
                     bufferCapacity = ringBuffer.currentCapacity()
                 )
-                val watchdogNowNs = android.os.SystemClock.elapsedRealtimeNanos()
                 val ringPressure = rawRingPressureSummary()
                 com.bncam.ui.screens.capture.RawPreviewHealthMonitor.updateRingPressure(
                     sessionGeneration,
@@ -7744,7 +8185,573 @@ class BnCameraManager(private val context: Context) {
         }
     }
 
-    private fun registerSessionOutputOwnership(
+    @SuppressLint("NewApi")
+    private fun diagnoseSessionConfigureFailure(
+        sessionBufferFormat: Int,
+        previewSurface: Surface?,
+        vendorSessionType: Int,
+        hasCustomRawPreviewOutput: Boolean
+    ): SessionOutputFailureDiagnosis {
+        if (hasCustomRawPreviewOutput) {
+            return SessionOutputFailureDiagnosis(
+                kind = SessionOutputFailureKind.OPTIONAL_CUSTOM_RAW_OUTPUT,
+                reason = "The optional custom RAW preview output was present in the rejected session."
+            )
+        }
+        if (vendorSessionType != SessionConfiguration.SESSION_REGULAR || activeVendorOperationProbe != null) {
+            return SessionOutputFailureDiagnosis(
+                kind = SessionOutputFailureKind.VENDOR_SESSION_MODE,
+                reason = "A vendor session mode/probe owned the rejected session; generic stream geometry must not compete with that authority."
+            )
+        }
+
+        val identity = synchronized(pipelineLock) { activePipelineIdentity }
+        if (identity == null || identity.bufferFormat != sessionBufferFormat) {
+            return SessionOutputFailureDiagnosis(
+                kind = SessionOutputFailureKind.UNKNOWN,
+                reason = "Active pipeline identity was unavailable or changed while diagnosing the rejected session."
+            )
+        }
+        if (previewSurface == null) {
+            return SessionOutputFailureDiagnosis(
+                kind = SessionOutputFailureKind.UNKNOWN,
+                reason = "Rejected session had no attached preview output; regular preview+capture diagnosis is not applicable."
+            )
+        }
+        if (Build.VERSION.SDK_INT < 35) {
+            return SessionOutputFailureDiagnosis(
+                kind = SessionOutputFailureKind.PREFLIGHT_UNAVAILABLE,
+                reason = "CameraDeviceSetup diagnosis requires API 35+."
+            )
+        }
+        val previewWidth = configuredPreviewStreamWidth
+        val previewHeight = configuredPreviewStreamHeight
+        if (previewWidth <= 0 || previewHeight <= 0) {
+            return SessionOutputFailureDiagnosis(
+                kind = SessionOutputFailureKind.PREFLIGHT_UNAVAILABLE,
+                reason = "Exact active preview geometry is unavailable for output-combination diagnosis."
+            )
+        }
+
+        return CameraSessionPreflight.diagnoseRegularPhotoCombination(
+            manager = cameraManager,
+            logicalCameraId = identity.logicalCameraId,
+            physicalCameraId = identity.physicalCameraId,
+            previewSize = android.util.Size(previewWidth, previewHeight),
+            captureFormat = identity.bufferFormat,
+            captureSize = android.util.Size(identity.width, identity.height)
+        )
+    }
+
+    private fun recordSessionOutputFailure(
+        generation: Int,
+        epoch: Long,
+        diagnosis: SessionOutputFailureDiagnosis
+    ) {
+        val record = SessionOutputFailureRecord(
+            generation = generation,
+            epoch = epoch,
+            diagnosis = diagnosis
+        )
+        lastSessionOutputFailure = record
+        Log.e(
+            previewDiagnosticsTag,
+            "event=SESSION_OUTPUT_COMBINATION_DIAGNOSIS generation=$generation epoch=$epoch " +
+                "kind=${diagnosis.kind.name} action=${diagnosis.recoveryAction.name} " +
+                "previewSupported=${diagnosis.previewIndividuallySupported} " +
+                "captureSupported=${diagnosis.captureIndividuallySupported} " +
+                "combinedSupported=${diagnosis.combinedSupported} reason=${diagnosis.reason}"
+        )
+        recordRawSessionOutputDiagnostic(
+            "SESSION_OUTPUT_COMBINATION_DIAGNOSIS",
+            "generation=$generation;epoch=$epoch;kind=${diagnosis.kind.name};" +
+                "action=${diagnosis.recoveryAction.name};previewSupported=${diagnosis.previewIndividuallySupported};" +
+                "captureSupported=${diagnosis.captureIndividuallySupported};combinedSupported=${diagnosis.combinedSupported};" +
+                "reason=${diagnosis.reason}"
+        )
+    }
+
+    private fun sessionOutputFailureForGeneration(generation: Int): SessionOutputFailureRecord? =
+        lastSessionOutputFailure?.takeIf { it.generation == generation }
+
+    private fun clearSessionOutputFailureForNewAttempt(generation: Int) {
+        val current = lastSessionOutputFailure
+        if (current == null || current.generation == generation) {
+            lastSessionOutputFailure = null
+        }
+    }
+
+    private fun previewGeometryCacheKey(identity: PipelineIdentity): PreviewGeometryRuntimeCache.Key =
+        PreviewGeometryRuntimeCache.Key(
+            selectedLensId = identity.selectedLensId,
+            logicalCameraId = identity.logicalCameraId,
+            physicalCameraId = identity.physicalCameraId,
+            cameraRouteKind = identity.cameraRouteKind.name,
+            backendRoute = identity.backendRoute,
+            captureFormat = identity.bufferFormat,
+            captureWidth = identity.width,
+            captureHeight = identity.height,
+            vendorConfigSignature = identity.vendorConfigSignature,
+            rawPreviewBindingSignature = identity.rawPreviewBindingSignature
+        )
+
+    private fun discardPendingPreviewGeometryPromotion(
+        generation: Int,
+        reason: String
+    ) {
+        val discarded = synchronized(pipelineLock) {
+            val pending = pendingPreviewGeometryPromotion
+            if (pending != null && pending.generation == generation) {
+                pendingPreviewGeometryPromotion = null
+                pending
+            } else {
+                null
+            }
+        } ?: return
+        Log.i(
+            previewDiagnosticsTag,
+            "event=PREVIEW_GEOMETRY_CACHE_PROMOTION_DISCARDED generation=$generation " +
+                "lensId=${discarded.cacheKey.selectedLensId} geometry=${discarded.geometry.key} reason=$reason"
+        )
+    }
+
+    private fun markPendingPreviewGeometryPromotion(
+        identity: PipelineIdentity,
+        generation: Int,
+        recovered: android.util.Size,
+        failedWidth: Int,
+        failedHeight: Int
+    ) {
+        val pending = PendingPreviewGeometryPromotion(
+            generation = generation,
+            cacheKey = previewGeometryCacheKey(identity),
+            geometry = PreviewGeometryRuntimeCache.Geometry(recovered.width, recovered.height),
+            failedGeometry = PreviewGeometryRuntimeCache.Geometry(failedWidth, failedHeight)
+        )
+        synchronized(pipelineLock) {
+            pendingPreviewGeometryPromotion = pending
+        }
+        Log.i(
+            previewDiagnosticsTag,
+            "event=PREVIEW_GEOMETRY_CACHE_PROMOTION_PENDING generation=$generation " +
+                "lensId=${identity.selectedLensId} failed=${failedWidth}x$failedHeight " +
+                "candidate=${recovered.width}x${recovered.height} proofRequired=image_plus_metadata"
+        )
+    }
+
+    private fun promotePendingPreviewGeometryIfReady(
+        generation: Int,
+        identity: PipelineIdentity?
+    ) {
+        val resolvedIdentity = identity ?: synchronized(pipelineLock) { activePipelineIdentity } ?: return
+        val expectedKey = previewGeometryCacheKey(resolvedIdentity)
+        val pending = synchronized(pipelineLock) {
+            val current = pendingPreviewGeometryPromotion
+            when {
+                current == null -> null
+                current.generation != generation -> {
+                    pendingPreviewGeometryPromotion = null
+                    null
+                }
+                else -> current
+            }
+        } ?: return
+
+        if (pending.cacheKey != expectedKey ||
+            configuredPreviewStreamWidth != pending.geometry.width ||
+            configuredPreviewStreamHeight != pending.geometry.height
+        ) {
+            discardPendingPreviewGeometryPromotion(generation, "STREAM_PLAN_OR_PREVIEW_GEOMETRY_CHANGED")
+            return
+        }
+
+        previewGeometryRuntimeCache.promote(pending.cacheKey, pending.geometry)
+        synchronized(pipelineLock) {
+            if (pendingPreviewGeometryPromotion === pending) {
+                pendingPreviewGeometryPromotion = null
+            }
+        }
+        Log.i(
+            previewDiagnosticsTag,
+            "event=PREVIEW_GEOMETRY_CACHE_PROMOTED generation=$generation " +
+                "lensId=${pending.cacheKey.selectedLensId} geometry=${pending.geometry.key} " +
+                "failedGeometry=${pending.failedGeometry.key} proof=image_plus_metadata"
+        )
+        recordRawSessionOutputDiagnostic(
+            "PREVIEW_GEOMETRY_CACHE_PROMOTED",
+            "generation=$generation;lensId=${pending.cacheKey.selectedLensId};" +
+                "logicalCameraId=${pending.cacheKey.logicalCameraId};" +
+                "physicalCameraId=${pending.cacheKey.physicalCameraId ?: "none"};" +
+                "cameraRouteKind=${pending.cacheKey.cameraRouteKind};backendRoute=${pending.cacheKey.backendRoute};" +
+                "captureFormat=${pending.cacheKey.captureFormat};" +
+                "captureSize=${pending.cacheKey.captureWidth}x${pending.cacheKey.captureHeight};" +
+                "geometry=${pending.geometry.key};failedGeometry=${pending.failedGeometry.key}"
+        )
+    }
+
+    private fun validatedCachedPreviewGeometry(identity: PipelineIdentity): android.util.Size? {
+        val key = previewGeometryCacheKey(identity)
+        val cached = previewGeometryRuntimeCache.get(key) ?: return null
+        if (!cached.valid || Build.VERSION.SDK_INT < 35) {
+            previewGeometryRuntimeCache.invalidate(key)
+            return null
+        }
+
+        val characteristics = runCatching {
+            cameraManager.getCameraCharacteristics(identity.selectedLensId)
+        }.getOrElse {
+            runCatching { cameraManager.getCameraCharacteristics(identity.logicalCameraId) }.getOrNull()
+        }
+        if (characteristics == null) {
+            previewGeometryRuntimeCache.invalidate(key)
+            Log.w(
+                previewDiagnosticsTag,
+                "event=PREVIEW_GEOMETRY_CACHE_INVALIDATED lensId=${identity.selectedLensId} " +
+                    "geometry=${cached.key} reason=characteristics_unavailable"
+            )
+            return null
+        }
+
+        val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+        val reported = runCatching {
+            map?.getOutputSizes(android.graphics.SurfaceTexture::class.java)?.toList().orEmpty()
+        }.getOrDefault(emptyList())
+        val activeRect = characteristics.get(CameraCharacteristics.SENSOR_INFO_PRE_CORRECTION_ACTIVE_ARRAY_SIZE)
+            ?: characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+        if (reported.isEmpty() || activeRect == null) {
+            previewGeometryRuntimeCache.invalidate(key)
+            Log.w(
+                previewDiagnosticsTag,
+                "event=PREVIEW_GEOMETRY_CACHE_INVALIDATED lensId=${identity.selectedLensId} " +
+                    "geometry=${cached.key} reason=preview_capabilities_unavailable"
+            )
+            return null
+        }
+
+        val fullFovKeys = CameraStreamGeometryPolicy.fullFovCandidates(
+            candidates = reported.map { CameraStreamGeometryPolicy.Extent(it.width, it.height) },
+            sensorWidth = activeRect.width(),
+            sensorHeight = activeRect.height()
+        ).mapTo(hashSetOf()) { it.width to it.height }
+        if ((cached.width to cached.height) !in fullFovKeys) {
+            previewGeometryRuntimeCache.invalidate(key)
+            Log.w(
+                previewDiagnosticsTag,
+                "event=PREVIEW_GEOMETRY_CACHE_INVALIDATED lensId=${identity.selectedLensId} " +
+                    "geometry=${cached.key} reason=no_longer_reported_full_fov"
+            )
+            return null
+        }
+
+        val size = android.util.Size(cached.width, cached.height)
+        val preflight = CameraSessionPreflight.validateRegularSession(
+            manager = cameraManager,
+            logicalCameraId = identity.logicalCameraId,
+            physicalCameraId = identity.physicalCameraId,
+            previewSize = size,
+            captureFormat = identity.bufferFormat,
+            captureSize = android.util.Size(identity.width, identity.height)
+        )
+        if (preflight.status != StreamCandidateValidationStatus.SESSION_VALIDATED) {
+            previewGeometryRuntimeCache.invalidate(key)
+            Log.w(
+                previewDiagnosticsTag,
+                "event=PREVIEW_GEOMETRY_CACHE_INVALIDATED lensId=${identity.selectedLensId} " +
+                    "geometry=${cached.key} validation=${preflight.status.name} reason=${preflight.reason}"
+            )
+            return null
+        }
+
+        Log.i(
+            previewDiagnosticsTag,
+            "event=PREVIEW_GEOMETRY_CACHE_HIT lensId=${identity.selectedLensId} " +
+                "logicalCameraId=${identity.logicalCameraId} physicalCameraId=${identity.physicalCameraId ?: "none"} " +
+                "capture=${formatName(identity.bufferFormat)}:${identity.width}x${identity.height} " +
+                "geometry=${cached.key} validation=${preflight.status.name}"
+        )
+        return size
+    }
+
+    private suspend fun applyCachedPreviewGeometryIfAvailable(
+        identity: PipelineIdentity,
+        generation: Int,
+        reason: String
+    ): Boolean {
+        val cached = validatedCachedPreviewGeometry(identity) ?: return false
+        if (configuredPreviewStreamWidth == cached.width &&
+            configuredPreviewStreamHeight == cached.height
+        ) {
+            Log.i(
+                previewDiagnosticsTag,
+                "event=PREVIEW_GEOMETRY_CACHE_REUSED generation=$generation lensId=${identity.selectedLensId} " +
+                    "geometry=${cached.width}x${cached.height} reason=$reason surfaceResizeRequired=false"
+            )
+            return true
+        }
+
+        val applied = applyPreviewGeometryRecoveryToSurface(
+            lensId = identity.selectedLensId,
+            generation = generation,
+            size = cached,
+            reason = "RUNTIME_CACHE_REUSE:$reason"
+        )
+        Log.i(
+            previewDiagnosticsTag,
+            "event=PREVIEW_GEOMETRY_CACHE_REUSED generation=$generation lensId=${identity.selectedLensId} " +
+                "geometry=${cached.width}x${cached.height} reason=$reason surfaceResizeRequired=true applied=$applied"
+        )
+        return applied
+    }
+
+    private fun nextPreviewGeometryRecoveryCandidate(
+        identity: PipelineIdentity,
+        generation: Int,
+        failedWidth: Int,
+        failedHeight: Int
+    ): android.util.Size? {
+        if (failedWidth <= 0 || failedHeight <= 0 || Build.VERSION.SDK_INT < 35) return null
+
+        val failed = PreviewGeometryRecoveryPolicy.Extent(failedWidth, failedHeight)
+        val attempted = synchronized(pipelineLock) {
+            val current = previewGeometryRecoveryState
+            val state = if (current == null || current.generation != generation || current.lensId != identity.selectedLensId) {
+                PreviewGeometryRecoveryState(generation = generation, lensId = identity.selectedLensId).also {
+                    previewGeometryRecoveryState = it
+                }
+            } else {
+                current
+            }
+            if (state.attemptedRecoverySizes.size >= PreviewGeometryRecoveryPolicy.MAX_ATTEMPTS_PER_GENERATION) {
+                return@synchronized null
+            }
+            state.attemptedRecoverySizes.toSet()
+        } ?: return null
+
+        val characteristics = runCatching {
+            cameraManager.getCameraCharacteristics(identity.selectedLensId)
+        }.getOrElse {
+            runCatching { cameraManager.getCameraCharacteristics(identity.logicalCameraId) }.getOrNull()
+        } ?: return null
+
+        val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: return null
+        val reported = runCatching {
+            map.getOutputSizes(android.graphics.SurfaceTexture::class.java)?.toList().orEmpty()
+        }.getOrDefault(emptyList())
+        if (reported.isEmpty()) return null
+
+        val activeRect = characteristics.get(CameraCharacteristics.SENSOR_INFO_PRE_CORRECTION_ACTIVE_ARRAY_SIZE)
+            ?: characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+            ?: return null
+        val fullFovExtents = CameraStreamGeometryPolicy.fullFovCandidates(
+            candidates = reported.map { CameraStreamGeometryPolicy.Extent(it.width, it.height) },
+            sensorWidth = activeRect.width(),
+            sensorHeight = activeRect.height()
+        )
+        if (fullFovExtents.isEmpty()) {
+            Log.e(
+                previewDiagnosticsTag,
+                "event=PREVIEW_GEOMETRY_RECOVERY_EXHAUSTED generation=$generation lensId=${identity.selectedLensId} " +
+                    "failed=${failedWidth}x$failedHeight reason=no_full_fov_candidates"
+            )
+            return null
+        }
+
+        val ranked = PreviewGeometryRecoveryPolicy.rankedAlternatives(
+            fullFovCandidates = fullFovExtents.map { PreviewGeometryRecoveryPolicy.Extent(it.width, it.height) },
+            failed = failed,
+            alreadyAttempted = attempted,
+            maxAttempts = (PreviewGeometryRecoveryPolicy.MAX_ATTEMPTS_PER_GENERATION - attempted.size).coerceAtLeast(0)
+        )
+
+        ranked.forEach { candidate ->
+            val size = android.util.Size(candidate.width, candidate.height)
+            val preflight = CameraSessionPreflight.validateRegularSession(
+                manager = cameraManager,
+                logicalCameraId = identity.logicalCameraId,
+                physicalCameraId = identity.physicalCameraId,
+                previewSize = size,
+                captureFormat = identity.bufferFormat,
+                captureSize = android.util.Size(identity.width, identity.height)
+            )
+            Log.i(
+                previewDiagnosticsTag,
+                "event=PREVIEW_GEOMETRY_RECOVERY_CANDIDATE generation=$generation lensId=${identity.selectedLensId} " +
+                    "failed=${failedWidth}x$failedHeight candidate=${candidate.key} validation=${preflight.status.name} " +
+                    "reason=${preflight.reason}"
+            )
+            if (preflight.status == StreamCandidateValidationStatus.SESSION_VALIDATED) {
+                synchronized(pipelineLock) {
+                    val state = previewGeometryRecoveryState
+                    if (state?.generation == generation && state.lensId == identity.selectedLensId) {
+                        state.attemptedRecoverySizes += candidate.key
+                    }
+                }
+                return size
+            }
+        }
+        return null
+    }
+
+    private suspend fun applyPreviewGeometryRecoveryToSurface(
+        lensId: String,
+        generation: Int,
+        size: android.util.Size,
+        reason: String
+    ): Boolean {
+        val completion = CompletableDeferred<Boolean>()
+        val accepted = com.bncam.ui.screens.capture.FocusPeakingView.requestPreviewSurfaceBufferGeometry(
+            lensId = lensId,
+            width = size.width,
+            height = size.height,
+            reason = reason
+        ) { applied ->
+            if (!completion.isCompleted) completion.complete(applied)
+        }
+        if (!accepted) return false
+        val applied = withTimeoutOrNull(PREVIEW_GEOMETRY_APPLY_TIMEOUT_MS) { completion.await() } ?: false
+        if (!applied) return false
+        if (generation != pipelineGeneration || activeLensId != lensId) return false
+        configuredPreviewStreamWidth = size.width
+        configuredPreviewStreamHeight = size.height
+        Log.w(
+            previewDiagnosticsTag,
+            "event=PREVIEW_GEOMETRY_RECOVERY_APPLIED generation=$generation lensId=$lensId " +
+                "preview=${size.width}x${size.height} reason=$reason"
+        )
+        return true
+    }
+
+    private suspend fun retryConfigureFailureWithPreviewGeometry(
+        camera: CameraDevice,
+        previewSurface: Surface,
+        sessionSettings: SessionRequestSettingsSnapshot,
+        sessionGeneration: Int,
+        reason: String,
+        onSessionReady: ((Boolean) -> Unit)?
+    ): Boolean {
+        val identity = synchronized(pipelineLock) { activePipelineIdentity } ?: return false
+        if (sessionGeneration != pipelineGeneration || cameraDevice !== camera) return false
+        discardPendingPreviewGeometryPromotion(
+            sessionGeneration,
+            "NEW_PREVIEW_GEOMETRY_RECOVERY_ATTEMPT"
+        )
+        val failedWidth = configuredPreviewStreamWidth
+        val failedHeight = configuredPreviewStreamHeight
+        val cacheKey = previewGeometryCacheKey(identity)
+        previewGeometryRuntimeCache.get(cacheKey)
+            ?.takeIf { it.width == failedWidth && it.height == failedHeight }
+            ?.let { rejectedCachedGeometry ->
+                previewGeometryRuntimeCache.invalidate(cacheKey)
+                Log.w(
+                    previewDiagnosticsTag,
+                    "event=PREVIEW_GEOMETRY_CACHE_INVALIDATED generation=$sessionGeneration " +
+                        "lensId=${identity.selectedLensId} geometry=${rejectedCachedGeometry.key} " +
+                        "reason=runtime_preview_output_rejected"
+                )
+            }
+        val candidate = nextPreviewGeometryRecoveryCandidate(
+            identity = identity,
+            generation = sessionGeneration,
+            failedWidth = failedWidth,
+            failedHeight = failedHeight
+        ) ?: run {
+            Log.e(
+                previewDiagnosticsTag,
+                "event=PREVIEW_GEOMETRY_RECOVERY_EXHAUSTED generation=$sessionGeneration " +
+                    "lensId=${identity.selectedLensId} failed=${failedWidth}x$failedHeight"
+            )
+            return false
+        }
+
+        val applyReason = "HAL_PREVIEW_OUTPUT_REJECTED_${failedWidth}x${failedHeight}_TO_${candidate.width}x${candidate.height}"
+        if (!applyPreviewGeometryRecoveryToSurface(identity.selectedLensId, sessionGeneration, candidate, applyReason)) {
+            Log.e(
+                previewDiagnosticsTag,
+                "event=PREVIEW_GEOMETRY_RECOVERY_APPLY_FAILED generation=$sessionGeneration " +
+                    "lensId=${identity.selectedLensId} candidate=${candidate.width}x${candidate.height}"
+            )
+            return false
+        }
+
+        markPendingPreviewGeometryPromotion(
+            identity = identity,
+            generation = sessionGeneration,
+            recovered = candidate,
+            failedWidth = failedWidth,
+            failedHeight = failedHeight
+        )
+
+        Log.w(
+            previewDiagnosticsTag,
+            "event=PREVIEW_GEOMETRY_SESSION_RETRY generation=$sessionGeneration lensId=${identity.selectedLensId} " +
+                "preview=${candidate.width}x${candidate.height} cameraDeviceRetained=true"
+        )
+        createCaptureSession(
+            camera = camera,
+            previewSurface = previewSurface,
+            sessionSettings = sessionSettings,
+            reason = "PREVIEW_GEOMETRY_RECOVERY_SESSION_RETRY:$reason",
+            onSessionReady = onSessionReady
+        )
+        return true
+    }
+
+    private fun validateSessionOutputSnapshot(
+        namedSurfaces: List<Pair<Surface, String>>
+    ): String? {
+        if (namedSurfaces.isEmpty()) return "NO_OUTPUT_SURFACES"
+        namedSurfaces.forEachIndexed { index, (surface, name) ->
+            if (!surface.isValid) return "INVALID_SURFACE:$name@$index"
+            for (other in 0 until index) {
+                if (namedSurfaces[other].first === surface) {
+                    return "DUPLICATE_SURFACE:$name:${namedSurfaces[other].second}"
+                }
+            }
+        }
+        return null
+    }
+
+    private fun registerPendingSessionOutputOwnership(
+        cameraId: String,
+        namedSurfaces: List<Pair<Surface, String>>,
+        readers: List<ImageReader>,
+        generation: Int,
+        epoch: Long,
+        reason: String
+    ) {
+        val ownership = SessionOutputAttemptOwnership(
+            generation = generation,
+            epoch = epoch,
+            cameraId = cameraId,
+            namedSurfaces = namedSurfaces.toList(),
+            readers = readers.toSet(),
+            reason = reason,
+            submittedElapsedNs = android.os.SystemClock.elapsedRealtimeNanos()
+        )
+        synchronized(sessionLifecycleLock) {
+            check(pendingSessionOutputAttempts[epoch] == null) {
+                "Duplicate pending Camera2 session epoch=$epoch"
+            }
+            pendingSessionOutputAttempts[epoch] = ownership
+            ownership.readers.forEach { reader ->
+                readerPendingSessionEpochs.getOrPut(reader) { mutableSetOf() }.add(epoch)
+            }
+        }
+        Log.i(
+            previewDiagnosticsTag,
+            "event=SESSION_OUTPUT_ATTEMPT_OWNERSHIP_REGISTERED camera=$cameraId generation=$generation " +
+                "epoch=$epoch reason=$reason surfaces=${namedSurfaces.joinToString { (surface, name) ->
+                    "$name@${System.identityHashCode(surface)}"
+                }} readers=${readers.joinToString { System.identityHashCode(it).toString() }}"
+        )
+    }
+
+    /**
+     * Atomically transfers reader/Surface ownership from the asynchronous create-session attempt
+     * to the exact CameraCaptureSession returned by Camera2. There is no ownership gap in which a
+     * retiring ImageReader could be physically closed between callback dispatch and registration.
+     */
+    private fun promotePendingSessionOutputOwnership(
         session: CameraCaptureSession,
         namedSurfaces: List<Pair<Surface, String>>,
         readers: List<ImageReader>,
@@ -7753,11 +8760,24 @@ class BnCameraManager(private val context: Context) {
         reason: String
     ) {
         synchronized(sessionLifecycleLock) {
+            val pending = pendingSessionOutputAttempts.remove(epoch)
+            val exactSurfaces = pending?.namedSurfaces ?: namedSurfaces
+            val exactReaders = pending?.readers ?: readers.toSet()
+            exactReaders.forEach { reader ->
+                readerPendingSessionEpochs[reader]?.let { epochs ->
+                    epochs.remove(epoch)
+                    if (epochs.isEmpty()) readerPendingSessionEpochs.remove(reader)
+                }
+            }
             sessionCloseBarriers.getOrPut(session) { CompletableDeferred() }
             val names = sessionSurfaceNames.getOrPut(session) { IdentityHashMap() }
-            namedSurfaces.forEach { (surface, name) -> names[surface] = name }
-            val exactReaders = readers.toSet()
+            exactSurfaces.forEach { (surface, name) -> names[surface] = name }
             sessionOwnedReaders[session] = exactReaders
+            sessionOwnershipIdentity[session] = SessionOwnershipIdentity(
+                generation = pending?.generation ?: generation,
+                epoch = pending?.epoch ?: epoch,
+                reason = pending?.reason ?: reason
+            )
             exactReaders.forEach { reader ->
                 readerOwningSessions.getOrPut(reader) {
                     java.util.Collections.newSetFromMap(IdentityHashMap<CameraCaptureSession, Boolean>())
@@ -7766,11 +8786,46 @@ class BnCameraManager(private val context: Context) {
         }
         Log.i(
             previewDiagnosticsTag,
-            "event=SESSION_OUTPUT_OWNERSHIP_REGISTERED generation=$generation epoch=$epoch " +
-                "sessionIdentity=${System.identityHashCode(session)} reason=$reason " +
-                "surfaces=${namedSurfaces.joinToString { (surface, name) -> "$name@${System.identityHashCode(surface)}" }} " +
-                "readers=${readers.joinToString { System.identityHashCode(it).toString() }}"
+            "event=SESSION_OUTPUT_ATTEMPT_PROMOTED generation=$generation epoch=$epoch " +
+                "sessionIdentity=${System.identityHashCode(session)} reason=$reason"
         )
+    }
+
+    private fun releasePendingSessionOutputOwnership(epoch: Long, reason: String) {
+        val readyToClose = mutableListOf<Pair<ImageReader, String>>()
+        val released = synchronized(sessionLifecycleLock) {
+            val pending = pendingSessionOutputAttempts.remove(epoch) ?: return@synchronized null
+            pending.readers.forEach { reader ->
+                readerPendingSessionEpochs[reader]?.let { epochs ->
+                    epochs.remove(epoch)
+                    if (epochs.isEmpty()) readerPendingSessionEpochs.remove(reader)
+                }
+                val noConfiguredOwners = readerOwningSessions[reader].isNullOrEmpty()
+                val noPendingOwners = readerPendingSessionEpochs[reader].isNullOrEmpty()
+                if (noConfiguredOwners && noPendingOwners) {
+                    retiringImageReaders.remove(reader)?.let { retireReason ->
+                        readyToClose += reader to retireReason
+                    }
+                }
+            }
+            pending
+        }
+        readyToClose.forEach { (reader, retireReason) -> closeImageReaderNow(reader, retireReason) }
+        if (released != null) {
+            val ageMs = (android.os.SystemClock.elapsedRealtimeNanos() - released.submittedElapsedNs)
+                .coerceAtLeast(0L) / 1_000_000.0
+            Log.i(
+                previewDiagnosticsTag,
+                "event=SESSION_OUTPUT_ATTEMPT_OWNERSHIP_RELEASED camera=${released.cameraId} " +
+                    "generation=${released.generation} epoch=${released.epoch} reason=$reason " +
+                    "ageMs=${String.format(Locale.US, "%.3f", ageMs)}"
+            )
+        }
+    }
+
+    private fun releaseAllPendingSessionOutputOwnership(reason: String) {
+        val epochs = synchronized(sessionLifecycleLock) { pendingSessionOutputAttempts.keys.toList() }
+        epochs.forEach { epoch -> releasePendingSessionOutputOwnership(epoch, reason) }
     }
 
     private fun sessionSurfaceDiagnosticName(session: CameraCaptureSession, surface: Surface): String =
@@ -7880,7 +8935,8 @@ class BnCameraManager(private val context: Context) {
         if (reader == null) return
         val closeNow = synchronized(sessionLifecycleLock) {
             val owners = readerOwningSessions[reader]
-            if (owners.isNullOrEmpty()) {
+            val pendingEpochs = readerPendingSessionEpochs[reader]
+            if (owners.isNullOrEmpty() && pendingEpochs.isNullOrEmpty()) {
                 retiringImageReaders.remove(reader)
                 true
             } else {
@@ -7903,19 +8959,39 @@ class BnCameraManager(private val context: Context) {
         val readyToClose = mutableListOf<Pair<ImageReader, String>>()
         synchronized(sessionLifecycleLock) {
             sessionSurfaceNames.remove(session)
+            sessionOwnershipIdentity.remove(session)
             val readers = sessionOwnedReaders.remove(session).orEmpty()
             readers.forEach { reader ->
                 val owners = readerOwningSessions[reader]
                 owners?.remove(session)
                 if (owners.isNullOrEmpty()) {
                     readerOwningSessions.remove(reader)
-                    retiringImageReaders.remove(reader)?.let { reason ->
-                        readyToClose += reader to reason
+                    if (readerPendingSessionEpochs[reader].isNullOrEmpty()) {
+                        retiringImageReaders.remove(reader)?.let { reason ->
+                            readyToClose += reader to reason
+                        }
                     }
                 }
             }
         }
         readyToClose.forEach { (reader, reason) -> closeImageReaderNow(reader, reason) }
+    }
+
+    /**
+     * CameraDevice.StateCallback.onClosed is an authoritative barrier for every session owned by
+     * that device. Some HALs omit a later session onClosed callback; release the exact session's
+     * output ownership here so reader retirement cannot leak forever behind a callback that will
+     * never arrive.
+     */
+    private fun acknowledgeSessionClosedByDevice(session: CameraCaptureSession, reason: String) {
+        releaseSessionOutputOwnership(session)
+        synchronized(sessionLifecycleLock) {
+            sessionCloseBarriers.remove(session)?.complete(Unit)
+        }
+        Log.i(
+            previewDiagnosticsTag,
+            "event=CAPTURE_SESSION_CLOSED_BY_DEVICE_ACK sessionIdentity=${System.identityHashCode(session)} reason=$reason"
+        )
     }
 
     private fun closeCustomRawPreviewReader(reason: String) {
@@ -8209,6 +9285,10 @@ class BnCameraManager(private val context: Context) {
         lastProfileId = profileId
         configuredPreviewStreamWidth = previewWidth
         configuredPreviewStreamHeight = previewHeight
+        // Bind before resolving identity so a preference edit racing camera startup is observed.
+        // The observer's first emission is baseline-only; any later edit waits for PREVIEW_ATTACHED
+        // and then reconciles through the serialized soft-reset owner.
+        bindActiveStreamConfigurationObserver(cameraId)
 
         startBackgroundThread()
         ringBuffer.clear()
@@ -8244,6 +9324,11 @@ class BnCameraManager(private val context: Context) {
                 extra = "previousSelectedLensId=${previousLensId ?: "none"} requestedFrameSource=$preferredFormat"
             )
             val startGeneration = pipelineGeneration
+            applyCachedPreviewGeometryIfAvailable(
+                identity = requestedIdentity,
+                generation = startGeneration,
+                reason = "HARD_START"
+            )
             prewarmRawStillWorkingSetAsync(
                 identity = requestedIdentity,
                 generation = startGeneration,
@@ -8430,6 +9515,7 @@ class BnCameraManager(private val context: Context) {
                 }
             }, backgroundHandler)
 
+            val startupFirstFrameBaseline = captureStreamFirstFrameBaseline(startGeneration)
             val startupReady = CompletableDeferred<Boolean>()
             // Settings/vendor discovery can run in parallel with CameraDevice.openCamera(). The
             // CameraDevice callback itself never waits on DataStore or scanner IO.
@@ -8571,12 +9657,102 @@ class BnCameraManager(private val context: Context) {
             val ready = kotlinx.coroutines.withTimeoutOrNull(CAMERA_HARD_START_READY_TIMEOUT_MS) {
                 startupReady.await()
             } ?: false
-            if (!ready) {
+            val firstProducerFrameReady = if (ready) {
+                awaitFirstProducerFrameAfter(
+                    generation = startGeneration,
+                    baseline = startupFirstFrameBaseline,
+                    reason = "HARD_START_INITIAL_SESSION",
+                    identity = requestedIdentity
+                )
+            } else {
+                false
+            }
+            if (!ready || !firstProducerFrameReady) {
+                val failureReason = if (!ready) {
+                    "HARD_START_SESSION_NOT_READY"
+                } else {
+                    "HARD_START_FIRST_PRODUCER_FRAME_TIMEOUT"
+                }
+                if (ready && !firstProducerFrameReady &&
+                    sessionOutputFailureForGeneration(pipelineGeneration) == null
+                ) {
+                    recordSessionOutputFailure(
+                        generation = pipelineGeneration,
+                        epoch = activeConfiguredSessionEpoch,
+                        diagnosis = SessionOutputFailureDiagnosis(
+                            kind = SessionOutputFailureKind.FIRST_PRODUCER_FRAME_TIMEOUT,
+                            reason = "Initial session configured, but the canonical producer did not deliver new image+metadata evidence before the adaptive first-frame deadline."
+                        )
+                    )
+                }
+                val diagnosedFailure = sessionOutputFailureForGeneration(pipelineGeneration)
+                val recoveryAction = diagnosedFailure?.diagnosis?.recoveryAction
+                val classifiedFailureReason = diagnosedFailure?.let {
+                    "${it.diagnosis.kind.name}:${it.diagnosis.reason}"
+                } ?: failureReason
+                if (recoveryAction == SessionOutputRecoveryAction.FAIL_WITHOUT_GEOMETRY_RETRY) {
+                    Log.e(
+                        tag,
+                        "CAMERA_HARD_START_GEOMETRY_FALLBACK_SKIPPED cameraId=$cameraId " +
+                            "generation=$pipelineGeneration kind=${diagnosedFailure.diagnosis.kind.name} " +
+                            "reason=${diagnosedFailure.diagnosis.reason}"
+                    )
+                } else {
+                    val fallback = advanceStreamRuntimeFallback(requestedIdentity, classifiedFailureReason)
+                    if (fallback != null) {
+                        Log.e(
+                            tag,
+                            "CAMERA_HARD_START_STREAM_FALLBACK cameraId=$cameraId logical=${requestedIdentity.logicalCameraId} " +
+                                "generation=$pipelineGeneration tier=${fallback.tier.name} reason=$classifiedFailureReason"
+                        )
+                        // A configure rejection is a session/output problem, not evidence that the
+                        // CameraDevice itself is dead. Reuse the already-open logical device and
+                        // let the existing producer-reset transaction replace only the canonical
+                        // ImageReader/session. This avoids a needless close/open cycle and preserves
+                        // the single serialized lifecycle owner.
+                        if (cameraDevice != null && cameraDevice?.id == requestedIdentity.logicalCameraId) {
+                            val recoveredInPlace = performSoftResetPipeline(
+                                PendingPipelineResetRequest(
+                                    previewSurface = previewSurface,
+                                    newFormat = preferredFormat,
+                                    profileId = profileId,
+                                    forceSessionRebuild = true,
+                                    reason = "HARD_START_IN_PLACE_OUTPUT_RECOVERY_${fallback.tier.name}"
+                                )
+                            )
+                            if (recoveredInPlace) {
+                                pipelineTransitionState = PipelineTransitionState.PREVIEW_ATTACHED
+                                Log.i(
+                                    previewDiagnosticsTag,
+                                    "event=HARD_START_IN_PLACE_OUTPUT_RECOVERY_READY cameraId=$cameraId " +
+                                        "generation=$pipelineGeneration tier=${fallback.tier.name}"
+                                )
+                                return true
+                            }
+                        }
+
+                        // Device close/open is the final recovery barrier only after in-place
+                        // session/output recovery failed or the device itself is no longer owned.
+                        closeCameraOwned("HARD_START_STREAM_FALLBACK_${fallback.tier.name}", retainBackgroundThread = true)
+                        val released = awaitCameraHardwareClosed(CAMERA_HARD_CLOSE_RECOVERY_TIMEOUT_MS)
+                        if (released) {
+                            return startCameraAndZslOwned(
+                                cameraId = cameraId,
+                                previewSurface = previewSurface,
+                                preferredFormat = preferredFormat,
+                                profileId = profileId,
+                                previewWidth = previewWidth,
+                                previewHeight = previewHeight
+                            )
+                        }
+                    }
+                }
                 cameraState.value = CameraEngineState.ERROR
                 Log.e(
                     tag,
                     "CAMERA_HARD_START_NOT_READY cameraId=$cameraId logical=${requestedIdentity.logicalCameraId} " +
-                        "generation=$startGeneration timeoutMs=$CAMERA_HARD_START_READY_TIMEOUT_MS"
+                        "generation=$startGeneration configured=$ready firstProducerFrame=$firstProducerFrameReady " +
+                        "timeoutMs=$CAMERA_HARD_START_READY_TIMEOUT_MS"
                 )
                 closeCameraOwned("HARD_START_NOT_READY")
                 return false
@@ -8598,6 +9774,265 @@ class BnCameraManager(private val context: Context) {
             return false
         }
     }
+
+        // ========================================================
+        // STREAM CONFIGURATION LIVE AUTHORITY
+        // ========================================================
+        /**
+         * Observe only runtime-relevant Photo Stream Configuration state for the active Lens ID.
+         * The first DataStore emission establishes the baseline and never causes a reset. Later
+         * changes are coalesced through the already-existing soft-reset owner.
+         */
+        private fun bindActiveStreamConfigurationObserver(lensId: String) {
+            if (streamConfigurationObservedLensId == lensId &&
+                streamConfigurationObserverJob?.isActive == true
+            ) return
+
+            streamConfigurationObserverJob?.cancel()
+            streamConfigurationRefreshJob?.cancel()
+            streamConfigurationObservedLensId = lensId
+            streamConfigurationObservedRuntimeFingerprint = null
+            manualCustomRawPreviewBindingConfigured = false
+
+            streamConfigurationObserverJob = sessionTransitionScope.launch {
+                val appContext = context.applicationContext
+                val store = StreamConfigurationSettingsStore(appContext)
+                val repo = SettingsRepository(appContext)
+                var previousSignature: String? = null
+
+                combine(
+                    store.settingsFlow(lensId),
+                    repo.getRawPreviewFormatCodeFlow(lensId, "RAW10"),
+                    repo.getRawPreviewFormatCodeFlow(lensId, "RAW_SENSOR")
+                ) { settings, raw10Binding, rawSensorBinding ->
+                    val photo = settings.photo
+                    val hasManualCustomBinding = photo.mode == StreamConfigurationMode.MANUAL &&
+                        listOf(
+                            "RAW10" to raw10Binding,
+                            "RAW_SENSOR" to rawSensorBinding
+                        ).any { (source, encoded) ->
+                            val code = parseCameraFormatCode(encoded)
+                            code != null &&
+                                rawPreviewFormatCompatibility(source, code) ==
+                                RawPreviewFormatCompatibility.CUSTOM_VENDOR_UNVERIFIED
+                        }
+                    Pair(
+                        StreamConfigurationRuntimeFingerprint.photo(
+                            configuration = photo,
+                            raw10Binding = raw10Binding,
+                            rawSensorBinding = rawSensorBinding
+                        ),
+                        hasManualCustomBinding
+                    )
+                }.collectLatest { (signature, hasManualCustomBinding) ->
+                    manualCustomRawPreviewBindingConfigured = hasManualCustomBinding
+                    streamConfigurationObservedRuntimeFingerprint = signature
+                    val previous = previousSignature
+                    previousSignature = signature
+                    if (previous == null) {
+                        streamRuntimeFallbackByLens[lensId]?.let { fallback ->
+                            if (fallback.settingsFingerprint != null &&
+                                fallback.settingsFingerprint != signature
+                            ) {
+                                streamRuntimeFallbackByLens.remove(lensId, fallback)
+                                Log.i(
+                                    tag,
+                                    "STREAM_RUNTIME_FALLBACK_CLEARED lensId=$lensId reason=settings_changed_while_inactive " +
+                                        "oldFingerprint=${fallback.settingsFingerprint} newFingerprint=$signature"
+                                )
+                            }
+                        }
+                        Log.i(
+                            tag,
+                            "STREAM_CONFIGURATION_OBSERVER_BOUND lensId=$lensId signature=$signature " +
+                                "manualCustomRawBinding=$hasManualCustomBinding"
+                        )
+                        return@collectLatest
+                    }
+                    if (previous == signature) return@collectLatest
+
+                    streamRuntimeFallbackByLens.remove(lensId)?.let { fallback ->
+                        Log.i(
+                            tag,
+                            "STREAM_RUNTIME_FALLBACK_CLEARED lensId=$lensId reason=settings_changed " +
+                                "tier=${fallback.tier.name} from=$previous to=$signature"
+                        )
+                    }
+                    Log.i(
+                        tag,
+                        "STREAM_CONFIGURATION_PREFERENCE_CHANGED lensId=$lensId " +
+                            "from=$previous to=$signature"
+                    )
+                    requestActiveStreamConfigurationRefresh(
+                        expectedLensId = lensId,
+                        reason = "STREAM_CONFIGURATION_PREFERENCE_CHANGED"
+                    )
+                }
+            }
+        }
+
+        private fun stopActiveStreamConfigurationObserver(reason: String) {
+            streamConfigurationObserverJob?.cancel()
+            streamConfigurationObserverJob = null
+            streamConfigurationRefreshJob?.cancel()
+            streamConfigurationRefreshJob = null
+            streamConfigurationObservedLensId = null
+            streamConfigurationObservedRuntimeFingerprint = null
+            manualCustomRawPreviewBindingConfigured = false
+            Log.i(tag, "STREAM_CONFIGURATION_OBSERVER_STOPPED reason=$reason")
+        }
+
+        private fun advanceStreamRuntimeFallback(
+            failedIdentity: PipelineIdentity,
+            failureReason: String
+        ): StreamRuntimeFallbackOverride? {
+            if (failedIdentity.vendorSessionRebuildRequired || activeVendorOperationProbe != null) {
+                Log.i(
+                    tag,
+                    "STREAM_RUNTIME_FALLBACK_SKIPPED lensId=${failedIdentity.selectedLensId} " +
+                        "reason=vendor_session_authority failure=$failureReason"
+                )
+                return null
+            }
+
+            val lensId = failedIdentity.selectedLensId
+            val existing = streamRuntimeFallbackByLens[lensId]
+                ?.takeIf {
+                    it.appliesTo(
+                        failedIdentity.streamConfigurationMode,
+                        failedIdentity.streamConfigurationCandidateId
+                    )
+                }
+            val currentTier = existing?.tier ?: StreamRuntimeFallbackTier.NONE
+            val nextTier = StreamRuntimeFallbackPolicy.nextTier(
+                mode = failedIdentity.streamConfigurationMode,
+                currentTier = currentTier
+            ) ?: run {
+                Log.e(
+                    tag,
+                    "STREAM_RUNTIME_FALLBACK_EXHAUSTED lensId=$lensId mode=${failedIdentity.streamConfigurationMode.name} " +
+                        "tier=${currentTier.name} failure=$failureReason"
+                )
+                return null
+            }
+
+            val fallback = StreamRuntimeFallbackOverride(
+                tier = nextTier,
+                configuredMode = failedIdentity.streamConfigurationMode,
+                candidateId = failedIdentity.streamConfigurationCandidateId,
+                settingsFingerprint = if (streamConfigurationObservedLensId == lensId) {
+                    streamConfigurationObservedRuntimeFingerprint
+                } else {
+                    existing?.settingsFingerprint
+                },
+                failureReason = failureReason,
+                failureCount = (existing?.failureCount ?: 0) + 1
+            )
+            streamRuntimeFallbackByLens[lensId] = fallback
+            Log.e(
+                tag,
+                "STREAM_RUNTIME_FALLBACK_ADVANCED lensId=$lensId mode=${failedIdentity.streamConfigurationMode.name} " +
+                    "candidate=${failedIdentity.streamConfigurationCandidateId ?: "none"} " +
+                    "from=${currentTier.name} to=${nextTier.name} failures=${fallback.failureCount} " +
+                    "reason=$failureReason"
+            )
+            writePipelineLifecycleDebug(
+                event = "STREAM_RUNTIME_FALLBACK_ADVANCED",
+                decision = null,
+                extra = "lensId=$lensId\nmode=${failedIdentity.streamConfigurationMode.name}\n" +
+                    "candidate=${failedIdentity.streamConfigurationCandidateId ?: "none"}\n" +
+                    "fromTier=${currentTier.name}\ntoTier=${nextTier.name}\n" +
+                    "failureCount=${fallback.failureCount}\nreason=$failureReason"
+            )
+            return fallback
+        }
+
+        private suspend fun retrySoftResetWithStreamFallback(
+            request: PendingPipelineResetRequest,
+            failedIdentity: PipelineIdentity,
+            failureReason: String
+        ): Boolean {
+            val fallback = advanceStreamRuntimeFallback(failedIdentity, failureReason) ?: return false
+            return performSoftResetPipeline(
+                request.copy(
+                    forceSessionRebuild = true,
+                    reason = "STREAM_RUNTIME_FALLBACK_${fallback.tier.name}:$failureReason"
+                )
+            )
+        }
+
+        /**
+         * Latest-wins reconciliation. It never creates a parallel Camera2 lifecycle: after the
+         * active transition settles, it submits one request to softResetPipeline(), whose existing
+         * identity diff decides whether this is a no-op, a custom-output session refresh, or a full
+         * producer rebuild.
+         */
+        private fun requestActiveStreamConfigurationRefresh(
+            expectedLensId: String,
+            reason: String
+        ) {
+            if (managerShutdownRequested.get()) return
+            streamConfigurationRefreshJob?.cancel()
+            streamConfigurationRefreshJob = sessionTransitionScope.launch {
+                val startMs = android.os.SystemClock.elapsedRealtime()
+                while (true) {
+                    if (managerShutdownRequested.get()) return@launch
+                    if (activeLensId != expectedLensId) {
+                        Log.i(
+                            tag,
+                            "STREAM_CONFIGURATION_REFRESH_STALE expectedLens=$expectedLensId " +
+                                "activeLens=${activeLensId ?: "none"} reason=$reason"
+                        )
+                        return@launch
+                    }
+
+                    val state = pipelineTransitionState
+                    val surface = lastPreviewSurface
+                    if (state == PipelineTransitionState.PREVIEW_ATTACHED &&
+                        surface != null && cameraDevice != null
+                    ) {
+                        val format = lastPreferredFormat
+                        val profile = lastProfileId
+                        Log.i(
+                            tag,
+                            "STREAM_CONFIGURATION_REFRESH_REQUEST lensId=$expectedLensId " +
+                                "format=$format profile=$profile reason=$reason"
+                        )
+                        softResetPipeline(
+                            previewSurface = surface,
+                            newFormat = format,
+                            profileId = profile,
+                            forceSessionRebuild = false,
+                            reason = reason
+                        )
+                        return@launch
+                    }
+
+                    if (state == PipelineTransitionState.CLOSED ||
+                        state == PipelineTransitionState.CLOSING
+                    ) {
+                        Log.i(
+                            tag,
+                            "STREAM_CONFIGURATION_REFRESH_DEFERRED_TO_NEXT_START " +
+                                "lensId=$expectedLensId state=$state reason=$reason"
+                        )
+                        return@launch
+                    }
+
+                    if (android.os.SystemClock.elapsedRealtime() - startMs >=
+                        STREAM_CONFIGURATION_REFRESH_WAIT_MS
+                    ) {
+                        Log.w(
+                            tag,
+                            "STREAM_CONFIGURATION_REFRESH_TIMEOUT lensId=$expectedLensId " +
+                                "state=$state reason=$reason"
+                        )
+                        return@launch
+                    }
+                    delay(20L)
+                }
+            }
+        }
 
         // ========================================================
         // SOFT RESET: IDENTITY-DRIVEN FORMAT / PROFILE / SETTINGS REFRESH
@@ -8848,7 +10283,26 @@ class BnCameraManager(private val context: Context) {
                         "raw_preview_binding_session_refresh_late_ack"
                     )
                 }
-                if (!configured) return false
+                if (!configured) {
+                    val failure = sessionOutputFailureForGeneration(pipelineGeneration)
+                    if (failure?.diagnosis?.recoveryAction ==
+                        SessionOutputRecoveryAction.FAIL_WITHOUT_GEOMETRY_RETRY
+                    ) {
+                        Log.e(
+                            tag,
+                            "STREAM_GEOMETRY_RETRY_SKIPPED generation=$pipelineGeneration " +
+                                "kind=${failure.diagnosis.kind.name} reason=${failure.diagnosis.reason}"
+                        )
+                        return false
+                    }
+                    return retrySoftResetWithStreamFallback(
+                        request = request,
+                        failedIdentity = requestedIdentity,
+                        failureReason = failure?.let {
+                            "${it.diagnosis.kind.name}:${it.diagnosis.reason}"
+                        } ?: "RAW_PREVIEW_BINDING_SESSION_NOT_READY"
+                    )
+                }
                 Log.i(
                     tag,
                     "RAW_PREVIEW_BINDING_SESSION_ONLY_REFRESH generation=$pipelineGeneration " +
@@ -8907,6 +10361,7 @@ class BnCameraManager(private val context: Context) {
             var imageReaderClosed = false
 
             try {
+                val cachedPreviewGeometryForReplacement = validatedCachedPreviewGeometry(requestedIdentity)
                 val oldSession = captureSession
                 val retiringImageReader = imageReader
                 retiringImageReader?.setOnImageAvailableListener(null, null)
@@ -8920,6 +10375,29 @@ class BnCameraManager(private val context: Context) {
                 }
                 captureCallback = null
                 currentCaptureRequest = null
+
+                if (cachedPreviewGeometryForReplacement != null &&
+                    (configuredPreviewStreamWidth != cachedPreviewGeometryForReplacement.width ||
+                        configuredPreviewStreamHeight != cachedPreviewGeometryForReplacement.height)
+                ) {
+                    val previousSessionClosedForResize =
+                        oldSessionCloseTicket?.let { awaitCaptureSessionClosed(it) } ?: true
+                    if (previousSessionClosedForResize) {
+                        applyPreviewGeometryRecoveryToSurface(
+                            lensId = requestedIdentity.selectedLensId,
+                            generation = resetGeneration,
+                            size = cachedPreviewGeometryForReplacement,
+                            reason = "RUNTIME_CACHE_REUSE:PIPELINE_PRODUCER_RESET"
+                        )
+                    } else {
+                        Log.w(
+                            previewDiagnosticsTag,
+                            "event=PREVIEW_GEOMETRY_CACHE_REUSE_SKIPPED generation=$resetGeneration " +
+                                "lensId=${requestedIdentity.selectedLensId} geometry=${cachedPreviewGeometryForReplacement.width}x${cachedPreviewGeometryForReplacement.height} " +
+                                "reason=previous_session_close_not_acknowledged"
+                        )
+                    }
+                }
 
                 activePipelineIdentity = requestedIdentity
                 activeZslFormat = requestedIdentity.bufferFormat
@@ -9140,7 +10618,24 @@ class BnCameraManager(private val context: Context) {
                         totalWallMs = transitionElapsedMs(),
                         outcome = "PRODUCER_SESSION_FAILED"
                     )
-                    return false
+                    val failure = sessionOutputFailureForGeneration(resetGeneration)
+                    if (failure?.diagnosis?.recoveryAction ==
+                        SessionOutputRecoveryAction.FAIL_WITHOUT_GEOMETRY_RETRY
+                    ) {
+                        Log.e(
+                            tag,
+                            "STREAM_GEOMETRY_RETRY_SKIPPED generation=$resetGeneration " +
+                                "kind=${failure.diagnosis.kind.name} reason=${failure.diagnosis.reason}"
+                        )
+                        return false
+                    }
+                    return retrySoftResetWithStreamFallback(
+                        request = request,
+                        failedIdentity = requestedIdentity,
+                        failureReason = failure?.let {
+                            "${it.diagnosis.kind.name}:${it.diagnosis.reason}"
+                        } ?: "PRODUCER_SESSION_OR_FIRST_FRAME_NOT_READY"
+                    )
                 }
 
                 writePipelineLifecycleDebug(
@@ -9868,6 +11363,7 @@ class BnCameraManager(private val context: Context) {
                 sessionConfigurationEpoch += 1L
                 sessionConfigurationEpoch
             }
+            clearSessionOutputFailureForNewAttempt(sessionGeneration)
             try {
                 val sessionBufferFormat = synchronized(pipelineLock) {
                     activePipelineIdentity?.bufferFormat ?: activeZslFormat
@@ -9887,8 +11383,6 @@ class BnCameraManager(private val context: Context) {
                         "template=${warmTemplate.template} captureIntent=${warmTemplate.captureIntent} " +
                         "reason=${warmTemplate.reason} generation=$sessionGeneration"
                 )
-                previewSurface?.let { requestBuilder.addTarget(it) }
-
                 // Dwing direct de opgeslagen hardware metering af bij de start van de sessie
                 applyMeteringPolicy(requestBuilder)
 
@@ -9896,7 +11390,7 @@ class BnCameraManager(private val context: Context) {
                 // Capture the exact reader identity used by this session; mutable manager fields
                 // may already point at a replacement before this session finally dispatches onClosed().
                 val sessionCanonicalReader = imageReader
-                sessionCanonicalReader?.surface?.let { requestBuilder.addTarget(it) }
+                val sessionCanonicalSurface = sessionCanonicalReader?.surface
                 // A custom RAW preview reader is display-only and exists only while a real
                 // preview Surface is attached. UI navigation itself never rebuilds this session.
                 val customRawPreviewSurface = if (previewSurface != null) {
@@ -9910,11 +11404,10 @@ class BnCameraManager(private val context: Context) {
                     // retirement is completed only after its identity-bound onClosed barrier.
                     null
                 }
-                customRawPreviewSurface?.let { requestBuilder.addTarget(it) }
                 val sessionCustomRawReader = if (customRawPreviewSurface != null) customRawPreviewReader else null
                 val sessionNamedSurfaces = buildList<Pair<Surface, String>> {
                     previewSurface?.let { add(it to "YUV_VIEWFINDER") }
-                    sessionCanonicalReader?.surface?.let { surface ->
+                    sessionCanonicalSurface?.let { surface ->
                         add(
                             surface to if (sessionBufferFormat == ImageFormat.RAW10 ||
                                 sessionBufferFormat == ImageFormat.RAW_SENSOR
@@ -9924,6 +11417,32 @@ class BnCameraManager(private val context: Context) {
                     customRawPreviewSurface?.let { add(it to "CUSTOM_RAW_PREVIEW") }
                 }
                 val sessionReaders = listOfNotNull(sessionCanonicalReader, sessionCustomRawReader)
+                validateSessionOutputSnapshot(sessionNamedSurfaces)?.let { invalidReason ->
+                    recordRawSessionOutputDiagnostic(
+                        "SESSION_OUTPUT_SNAPSHOT_REJECTED",
+                        "generation=$sessionGeneration;epoch=$sessionEpoch;reason=$invalidReason;" +
+                            "outputs=${sessionNamedSurfaces.joinToString { (surface, name) ->
+                                "$name@${System.identityHashCode(surface)}:valid=${surface.isValid}"
+                            }}"
+                    )
+                    onSessionReady?.invoke(false)
+                    return
+                }
+                // One immutable Surface snapshot feeds both CaptureRequest targets and
+                // SessionConfiguration outputs. Mutable manager fields are never re-read later.
+                sessionNamedSurfaces.forEach { (surface, _) -> requestBuilder.addTarget(surface) }
+                // Ownership begins as soon as the exact output snapshot exists, not only after the
+                // asynchronous createCaptureSession call. This closes the final window in which a
+                // concurrent retirement path could close a newly selected ImageReader before the
+                // HAL has returned its StateCallback.
+                registerPendingSessionOutputOwnership(
+                    cameraId = camera.id,
+                    namedSurfaces = sessionNamedSurfaces,
+                    readers = sessionReaders,
+                    generation = sessionGeneration,
+                    epoch = sessionEpoch,
+                    reason = reason
+                )
 
                 var sessionParameters: CaptureRequest? = null
                 var vendorSessionType: Int = SessionConfiguration.SESSION_REGULAR
@@ -10150,6 +11669,20 @@ class BnCameraManager(private val context: Context) {
                         result: TotalCaptureResult
                     ) {
                         super.onCaptureCompleted(session, request, result)
+                        if (sessionGeneration != pipelineGeneration ||
+                            sessionEpoch != sessionConfigurationEpoch ||
+                            captureSession !== session
+                        ) {
+                            if (result.frameNumber % 30L == 0L) {
+                                Log.i(
+                                    previewDiagnosticsTag,
+                                    "event=STALE_CAPTURE_RESULT_DROPPED generation=$sessionGeneration epoch=$sessionEpoch " +
+                                        "activeGeneration=$pipelineGeneration activeEpoch=$sessionConfigurationEpoch " +
+                                        "frameNumber=${result.frameNumber}"
+                                )
+                            }
+                            return
+                        }
                         captureAttempts.captureResultReceived()
 
                         val auditLogicalId = synchronized(pipelineLock) { activePipelineIdentity?.logicalCameraId } ?: camera.id
@@ -10573,6 +12106,17 @@ class BnCameraManager(private val context: Context) {
                         target: Surface,
                         frameNumber: Long
                     ) {
+                        if (sessionGeneration != pipelineGeneration ||
+                            sessionEpoch != sessionConfigurationEpoch ||
+                            captureSession !== session
+                        ) {
+                            Log.i(
+                                previewDiagnosticsTag,
+                                "event=STALE_CAPTURE_BUFFER_LOST_DROPPED generation=$sessionGeneration epoch=$sessionEpoch " +
+                                    "activeGeneration=$pipelineGeneration activeEpoch=$sessionConfigurationEpoch frameNumber=$frameNumber"
+                            )
+                            return
+                        }
                         val targetName = sessionSurfaceDiagnosticName(session, target)
                         val content =
                             "generation=$sessionGeneration;epoch=$sessionEpoch;frameNumber=$frameNumber;" +
@@ -10591,6 +12135,17 @@ class BnCameraManager(private val context: Context) {
                         request: CaptureRequest,
                         failure: android.hardware.camera2.CaptureFailure
                     ) {
+                        if (sessionGeneration != pipelineGeneration ||
+                            sessionEpoch != sessionConfigurationEpoch ||
+                            captureSession !== session
+                        ) {
+                            Log.i(
+                                previewDiagnosticsTag,
+                                "event=STALE_CAPTURE_FAILURE_DROPPED generation=$sessionGeneration epoch=$sessionEpoch " +
+                                    "activeGeneration=$pipelineGeneration activeEpoch=$sessionConfigurationEpoch frameNumber=${failure.frameNumber}"
+                            )
+                            return
+                        }
                         val content =
                             "generation=$sessionGeneration;epoch=$sessionEpoch;reason=${failure.reason};" +
                                 "sequenceId=${failure.sequenceId};frameNumber=${failure.frameNumber};" +
@@ -10602,13 +12157,17 @@ class BnCameraManager(private val context: Context) {
                     }
 
                     override fun onCaptureSequenceAborted(session: CameraCaptureSession, sequenceId: Int) {
+                        if (sessionGeneration != pipelineGeneration ||
+                            sessionEpoch != sessionConfigurationEpoch ||
+                            captureSession !== session
+                        ) return
                         Log.e(tag, "captureSequenceAborted generation=$sessionGeneration sequenceId=$sequenceId")
                     }
                 }
 
                 val stateCallback = object : CameraCaptureSession.StateCallback() {
                     override fun onConfigured(session: CameraCaptureSession) {
-                        registerSessionOutputOwnership(
+                        promotePendingSessionOutputOwnership(
                             session = session,
                             namedSurfaces = sessionNamedSurfaces,
                             readers = sessionReaders,
@@ -10622,7 +12181,7 @@ class BnCameraManager(private val context: Context) {
                                 "Ignoring obsolete Camera2 session callback generation=$sessionGeneration epoch=$sessionEpoch " +
                                     "activeGeneration=$pipelineGeneration activeEpoch=$sessionConfigurationEpoch"
                             )
-                            session.close()
+                            requestCaptureSessionClose(session, "OBSOLETE_SESSION_ON_CONFIGURED")
                             onSessionReady?.invoke(false)
                             return
                         }
@@ -10673,6 +12232,9 @@ class BnCameraManager(private val context: Context) {
                                     detail = "logical=${camera.id};reason=$reason"
                                 )
                             }
+                            if (lastSessionOutputFailure?.generation == sessionGeneration) {
+                                lastSessionOutputFailure = null
+                            }
                             Log.d(tag, "ZSL Engine Draait! Hartslag (metadata) geactiveerd.")
                             onSessionReady?.invoke(true)
                         } catch (e: Exception) {
@@ -10685,11 +12247,19 @@ class BnCameraManager(private val context: Context) {
                                 }
                             }
                             Log.e(tag, "Repeating request failed", e)
-                            onSessionReady?.invoke(false)
+                            val failedSessionTicket = requestCaptureSessionClose(
+                                session,
+                                "INITIAL_REPEATING_REQUEST_FAILED"
+                            )
+                            sessionTransitionScope.launch {
+                                awaitCaptureSessionClosed(failedSessionTicket)
+                                onSessionReady?.invoke(false)
+                            }
                         }
                     }
 
                     override fun onClosed(session: CameraCaptureSession) {
+                        releasePendingSessionOutputOwnership(sessionEpoch, "session_onClosed")
                         releaseSessionOutputOwnership(session)
                         synchronized(sessionLifecycleLock) {
                             sessionCloseBarriers.remove(session)?.complete(Unit)
@@ -10708,7 +12278,7 @@ class BnCameraManager(private val context: Context) {
                     }
 
                     override fun onConfigureFailed(session: CameraCaptureSession) {
-                        registerSessionOutputOwnership(
+                        promotePendingSessionOutputOwnership(
                             session = session,
                             namedSurfaces = sessionNamedSurfaces,
                             readers = sessionReaders,
@@ -10717,10 +12287,21 @@ class BnCameraManager(private val context: Context) {
                             reason = "$reason:configure_failed"
                         )
                         if (sessionGeneration != pipelineGeneration || sessionEpoch != sessionConfigurationEpoch) {
-                            session.close()
+                            requestCaptureSessionClose(session, "OBSOLETE_SESSION_ON_CONFIGURE_FAILED")
                             onSessionReady?.invoke(false)
                             return
                         }
+                        val configureFailureDiagnosis = diagnoseSessionConfigureFailure(
+                            sessionBufferFormat = sessionBufferFormat,
+                            previewSurface = previewSurface,
+                            vendorSessionType = vendorSessionType,
+                            hasCustomRawPreviewOutput = customRawPreviewSurface != null
+                        )
+                        recordSessionOutputFailure(
+                            generation = sessionGeneration,
+                            epoch = sessionEpoch,
+                            diagnosis = configureFailureDiagnosis
+                        )
                         if (customRawPreviewBinding?.generation == sessionGeneration && customRawPreviewReader != null) {
                             Log.w(
                                 tag,
@@ -10773,13 +12354,48 @@ class BnCameraManager(private val context: Context) {
                             }
                             return
                         }
+                        if (configureFailureDiagnosis.kind == SessionOutputFailureKind.PREVIEW_OUTPUT_REJECTED &&
+                            previewSurface != null
+                        ) {
+                            synchronized(pipelineLock) {
+                                if (sessionGeneration == pipelineGeneration && sessionEpoch == sessionConfigurationEpoch) {
+                                    sessionConfiguredGeneration = -1
+                                }
+                            }
+                            val failedSessionTicket = requestCaptureSessionClose(
+                                session,
+                                "PREVIEW_OUTPUT_CONFIGURE_FAILED"
+                            )
+                            sessionTransitionScope.launch {
+                                val closed = awaitCaptureSessionClosed(failedSessionTicket)
+                                val retryLaunched = closed && retryConfigureFailureWithPreviewGeometry(
+                                    camera = camera,
+                                    previewSurface = previewSurface,
+                                    sessionSettings = sessionSettings,
+                                    sessionGeneration = sessionGeneration,
+                                    reason = reason,
+                                    onSessionReady = onSessionReady
+                                )
+                                if (!retryLaunched) {
+                                    onSessionReady?.invoke(false)
+                                }
+                            }
+                            return
+                        }
                         synchronized(pipelineLock) {
                             if (sessionGeneration == pipelineGeneration && sessionEpoch == sessionConfigurationEpoch) {
                                 sessionConfiguredGeneration = -1
                             }
                         }
                         Log.e(tag, "Capture Session configuratie gefaald previewAttached=${previewSurface != null}")
-                        onSessionReady?.invoke(false)
+                        val failedSessionTicket = requestCaptureSessionClose(
+                            session,
+                            "SESSION_CONFIGURE_FAILED"
+                        )
+                        sessionTransitionScope.launch {
+                            awaitCaptureSessionClosed(failedSessionTicket)
+                            onSessionReady?.invoke(false)
+                        }
                         val probe = activeVendorOperationProbe
                         if (probe != null) {
                             writePipelineLifecycleDebug(
@@ -10822,33 +12438,17 @@ class BnCameraManager(private val context: Context) {
                 com.bncam.core.debug.HalParityAuditor.auditStaticCapabilities(cameraManager, activeLogicalId, activePhysicalId)
                 com.bncam.core.debug.AfParityAuditor.auditRouteAfCapability(cameraManager, activeLogicalId, activePhysicalId)
 
-                if (previewSurface != null) {
-                    val previewOutput = OutputConfiguration(previewSurface)
-                    if (activePhysicalId != null) {
-                        previewOutput.setPhysicalCameraId(activePhysicalId)
+                lastPreviewOutputPhysicalCameraId = null
+                lastImageReaderOutputPhysicalCameraId = null
+                sessionNamedSurfaces.forEach { (surface, name) ->
+                    val output = OutputConfiguration(surface)
+                    if (activePhysicalId != null) output.setPhysicalCameraId(activePhysicalId)
+                    when (name) {
+                        "YUV_VIEWFINDER" -> lastPreviewOutputPhysicalCameraId = activePhysicalId
+                        "CANONICAL_RAW_RING", "YUV_WARM_RING" ->
+                            lastImageReaderOutputPhysicalCameraId = activePhysicalId
                     }
-                    lastPreviewOutputPhysicalCameraId = activePhysicalId
-                    outputs.add(previewOutput)
-                } else {
-                    lastPreviewOutputPhysicalCameraId = null
-                }
-
-                imageReader?.surface?.let {
-                    val readerOutput = OutputConfiguration(it)
-                    if (activePhysicalId != null) {
-                        readerOutput.setPhysicalCameraId(activePhysicalId)
-                    }
-                    lastImageReaderOutputPhysicalCameraId = activePhysicalId
-                    outputs.add(readerOutput)
-                }
-                if (imageReader?.surface == null) {
-                    lastImageReaderOutputPhysicalCameraId = null
-                }
-
-                customRawPreviewSurface?.let { customSurface ->
-                    val customOutput = OutputConfiguration(customSurface)
-                    if (activePhysicalId != null) customOutput.setPhysicalCameraId(activePhysicalId)
-                    outputs.add(customOutput)
+                    outputs.add(output)
                 }
 
                 val sessionConfig = SessionConfiguration(
@@ -10870,10 +12470,9 @@ class BnCameraManager(private val context: Context) {
                     }
                 }
 
-                val outputBindings = mutableListOf<Pair<String, String?>>()
-                if (previewSurface != null) outputBindings.add("preview" to lastPreviewOutputPhysicalCameraId)
-                if (imageReader?.surface != null) outputBindings.add("imageReader" to lastImageReaderOutputPhysicalCameraId)
-                if (customRawPreviewSurface != null) outputBindings.add("customRawPreview" to activePhysicalId)
+                val outputBindings = sessionNamedSurfaces.map { (_, name) ->
+                    name to activePhysicalId
+                }
                 com.bncam.core.debug.HalParityAuditor.auditSessionCreation(
                     activeLogicalId,
                     activePhysicalId,
@@ -10914,6 +12513,7 @@ class BnCameraManager(private val context: Context) {
                 camera.createCaptureSession(sessionConfig)
 
             } catch (e: Exception) {
+                releasePendingSessionOutputOwnership(sessionEpoch, "session_creation_exception")
                 Log.e(tag, "Session creation failed", e)
                 onSessionReady?.invoke(false)
             }
@@ -10941,12 +12541,13 @@ class BnCameraManager(private val context: Context) {
         session: CameraCaptureSession,
         reason: String
     ): SessionCloseTicket {
+        val ownershipIdentity = synchronized(sessionLifecycleLock) { sessionOwnershipIdentity[session] }
         val ticket = SessionCloseTicket(
             session = session,
             closeBarrier = sessionCloseBarrierFor(session),
             reason = reason,
-            generation = pipelineGeneration,
-            sessionEpoch = sessionConfigurationEpoch
+            generation = ownershipIdentity?.generation ?: pipelineGeneration,
+            sessionEpoch = ownershipIdentity?.epoch ?: sessionConfigurationEpoch
         )
         try {
             session.stopRepeating()
@@ -11070,11 +12671,57 @@ class BnCameraManager(private val context: Context) {
             }
             Log.e(
                 tag,
-                "Camera2 session handshake timed out reason=$reason generation=$pipelineGeneration"
+                "Camera2 session handshake timed out reason=$reason generation=$pipelineGeneration; " +
+                    "pending output ownership is retained until callback or CameraDevice close"
+            )
+            recordRawSessionOutputDiagnostic(
+                "SESSION_CONFIGURATION_TIMEOUT_PENDING_OUTPUTS_RETAINED",
+                "generation=$pipelineGeneration;reason=$reason;pendingEpochs=${
+                    synchronized(sessionLifecycleLock) { pendingSessionOutputAttempts.keys.sorted() }
+                }"
             )
             return false
         }
-        return configured
+        if (!configured) return false
+
+        // Snapshot only after onConfigured/repeating ownership is live. Requiring a frame newer
+        // than this point prevents a late frame from the retired same-generation session from
+        // falsely proving the replacement session healthy.
+        val generationAtConfiguration = pipelineGeneration
+        val firstFrameBaseline = captureStreamFirstFrameBaseline(generationAtConfiguration)
+        val identityAtConfiguration = synchronized(pipelineLock) { activePipelineIdentity }
+        val firstFrameReady = awaitFirstProducerFrameAfter(
+            generation = generationAtConfiguration,
+            baseline = firstFrameBaseline,
+            reason = reason,
+            identity = identityAtConfiguration
+        )
+        if (!firstFrameReady) {
+            stopWarmBufferWatchdog()
+            val stalledSession = captureSession
+            if (stalledSession != null) {
+                val closeTicket = requestCaptureSessionClose(
+                    stalledSession,
+                    "FIRST_PRODUCER_FRAME_TIMEOUT:$reason"
+                )
+                awaitCaptureSessionClosed(closeTicket)
+            }
+            synchronized(pipelineLock) {
+                if (generationAtConfiguration == pipelineGeneration) {
+                    sessionConfiguredGeneration = -1
+                }
+            }
+            recordSessionOutputFailure(
+                generation = generationAtConfiguration,
+                epoch = activeConfiguredSessionEpoch,
+                diagnosis = SessionOutputFailureDiagnosis(
+                    kind = SessionOutputFailureKind.FIRST_PRODUCER_FRAME_TIMEOUT,
+                    reason = "Session configured, but no new canonical producer image+metadata evidence arrived before the adaptive first-frame deadline."
+                )
+            )
+            return false
+        }
+        return true
     }
 
     /**
@@ -11150,6 +12797,7 @@ class BnCameraManager(private val context: Context) {
         lastProfileId = profileId
         configuredPreviewStreamWidth = previewWidth
         configuredPreviewStreamHeight = previewHeight
+        bindActiveStreamConfigurationObserver(cameraId)
 
         Log.i(
             previewDiagnosticsTag,
@@ -11344,6 +12992,7 @@ class BnCameraManager(private val context: Context) {
         val retiringCustomRawReader = detachCustomRawPreviewReaderForRetirement("camera_close:$reason")
         val pendingOpenSettled = synchronized(cameraDeviceLifecycleLock) { pendingCameraOpenSettled }
 
+        stopActiveStreamConfigurationObserver("camera_close:$reason")
         lastPreviewSurface = null
         activeLensId = null
         lastCaptureResult = null
@@ -11397,6 +13046,20 @@ class BnCameraManager(private val context: Context) {
         val hardwareSettled = deviceClosed && awaitCameraHardwareClosed(
             maxWaitMs = CAMERA_HARD_CLOSE_RECOVERY_TIMEOUT_MS
         )
+        if (deviceTicket != null && hardwareSettled) {
+            sessionTicket?.let { ticket ->
+                if (!ticket.closeBarrier.isCompleted) {
+                    acknowledgeSessionClosedByDevice(
+                        ticket.session,
+                        "CameraDevice.onClosed:${ticket.reason}"
+                    )
+                }
+            }
+            // A createCaptureSession attempt can time out before Camera2 yields a session object.
+            // Device onClosed is the only universal barrier proving those pending Surfaces are no
+            // longer HAL-owned.
+            releaseAllPendingSessionOutputOwnership("CameraDevice.onClosed:$reason")
+        }
         val sessionClosed = when {
             sessionTicket == null -> true
             // CameraDevice.StateCallback.onClosed is the authoritative hardware-ownership

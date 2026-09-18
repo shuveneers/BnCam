@@ -63,6 +63,34 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
             rebuildRawTexturePool = rebuildRawTexturePool
         ) ?: false
 
+        fun requestYuvDisplayRecovery(
+            generation: Int,
+            reason: String
+        ): Boolean = activeInstance?.requestYuvDisplayRecoveryInternal(
+            generation = generation,
+            reason = reason
+        ) ?: false
+
+        /**
+         * Requests a buffer-queue geometry change on the actual SurfaceTexture owner. Camera2
+         * recovery may select the size, but it never reaches into the SurfaceTexture directly.
+         * Completion means setDefaultBufferSize() was accepted by the live view; the caller still
+         * owns CameraCaptureSession recreation and HAL validation.
+         */
+        fun requestPreviewSurfaceBufferGeometry(
+            lensId: String,
+            width: Int,
+            height: Int,
+            reason: String,
+            onApplied: (Boolean) -> Unit
+        ): Boolean = activeInstance?.requestPreviewSurfaceBufferGeometryInternal(
+            lensId = lensId,
+            width = width,
+            height = height,
+            reason = reason,
+            onApplied = onApplied
+        ) ?: false
+
         /**
          * Stages a target without changing committed display authority. The last-known-good texture
          * remains drawable until a target candidate has actually been submitted and presented.
@@ -270,6 +298,8 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
     @Volatile private var rawTextureGeneration: Int = -1
     @Volatile private var currentEglGeneration: Int = -1
     @Volatile private var lastRawDisplayRecoveryElapsedMs: Long = 0L
+    @Volatile private var lastYuvDisplayRecoveryElapsedMs: Long = 0L
+    @Volatile private var stagedYuvBaselineTimestampNs: Long = 0L
     private val pendingRawFrame = AtomicReference<RawPreviewFrame?>(null)
     // GL-thread-owned display pin. A GPU-resident AHardwareBuffer must remain unavailable to
     // Vulkan for as long as it is the texture currently eligible for redraw. Releasing it after
@@ -550,6 +580,11 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
         stagedTargetSource = source
         stagedTargetGeneration = generation
         stagedYuvFrameReady = false
+        stagedYuvBaselineTimestampNs = if (source == ViewfinderEffectiveSource.YUV) {
+            surfaceTexture?.timestamp?.takeIf { it > 0L } ?: lastDrawnSensorTimestampNs.coerceAtLeast(0L)
+        } else {
+            0L
+        }
         phase0PendingDisplayCommit = Phase0PendingDisplayCommit(
             lensId = diagnosticLensId,
             source = source.name,
@@ -579,6 +614,7 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
             stagedTargetSource = null
             stagedTargetGeneration = -1
             stagedYuvFrameReady = false
+            stagedYuvBaselineTimestampNs = 0L
         } else if (source != ViewfinderEffectiveSource.YUV || phase0DispatchingYuvFrame) {
             // Compatibility path for an external commit that was not pre-staged by 0217A.
             phase0PendingDisplayCommit = Phase0PendingDisplayCommit(
@@ -615,6 +651,7 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
         stagedTargetSource = null
         stagedTargetGeneration = -1
         stagedYuvFrameReady = false
+        stagedYuvBaselineTimestampNs = 0L
         pendingRawFrame.getAndSet(null)?.close()
         runCatching { queueEvent { retirePinnedDisplayedGpuFrameOnGlThread() } }
         synchronized(presentationLock) { pendingPresentations.clear() }
@@ -710,9 +747,10 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
         reason: String,
         rebuildRawTexturePool: Boolean
     ): Boolean {
-        if (detached || displayedSource == ViewfinderEffectiveSource.YUV || displayedGeneration != generation) {
-            return false
-        }
+        val displayedMatch = displayedSource != ViewfinderEffectiveSource.YUV && displayedGeneration == generation
+        val stagedMatch = stagedTargetSource != null && stagedTargetSource != ViewfinderEffectiveSource.YUV &&
+            stagedTargetGeneration == generation
+        if (detached || (!displayedMatch && !stagedMatch)) return false
         val nowMs = SystemClock.elapsedRealtime()
         if (nowMs - lastRawDisplayRecoveryElapsedMs < 1_000L) return false
         lastRawDisplayRecoveryElapsedMs = nowMs
@@ -722,13 +760,17 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
             SystemClock.elapsedRealtimeNanos()
         )
         post {
-            if (detached || displayedSource == ViewfinderEffectiveSource.YUV || displayedGeneration != generation) {
-                return@post
-            }
+            val stillDisplayed = displayedSource != ViewfinderEffectiveSource.YUV && displayedGeneration == generation
+            val stillStaged = stagedTargetSource != null && stagedTargetSource != ViewfinderEffectiveSource.YUV &&
+                stagedTargetGeneration == generation
+            if (detached || (!stillDisplayed && !stillStaged)) return@post
             if (rebuildRawTexturePool) {
                 runCatching {
                     queueEvent {
-                        if (detached || displayedGeneration != generation) return@queueEvent
+                        val glDisplayed = displayedSource != ViewfinderEffectiveSource.YUV && displayedGeneration == generation
+                        val glStaged = stagedTargetSource != null && stagedTargetSource != ViewfinderEffectiveSource.YUV &&
+                            stagedTargetGeneration == generation
+                        if (detached || (!glDisplayed && !glStaged)) return@queueEvent
                         retirePinnedDisplayedGpuFrameOnGlThread()
                         synchronized(presentationLock) { pendingPresentations.clear() }
                         if (rawTextureIds.any { it != 0 }) {
@@ -748,7 +790,9 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
                         }
                         rawTextureId = rawTextureIds[0]
                         rawTextureGeneration = -1
-                        displayReady = false
+                        // If YUV is the retained last-known-good route while RAW is only staged,
+                        // rebuilding RAW textures must never blank that healthy YUV texture.
+                        if (glDisplayed) displayReady = false
                         Log.w(
                             "BnCamRawPreview",
                             "RAW_PREVIEW_DISPLAY_REBIND generation=$generation eglGeneration=$currentEglGeneration reason=$reason"
@@ -757,6 +801,119 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
                 }
             }
             requestRender()
+        }
+        return true
+    }
+
+    /**
+     * Display-local YUV recovery. This deliberately does not touch Camera2 or replace the output
+     * Surface. It re-arms the SurfaceTexture listener and opportunistically drains the newest OES
+     * image on the GL owner thread, which repairs a lost frame callback / dormant render request
+     * without turning a healthy producer into a camera-session restart.
+     */
+    private fun requestYuvDisplayRecoveryInternal(
+        generation: Int,
+        reason: String
+    ): Boolean {
+        val displayedMatch = displayedSource == ViewfinderEffectiveSource.YUV && displayedGeneration == generation
+        val stagedMatch = stagedTargetSource == ViewfinderEffectiveSource.YUV && stagedTargetGeneration == generation
+        if (detached || (!displayedMatch && !stagedMatch)) return false
+        val nowMs = SystemClock.elapsedRealtime()
+        if (nowMs - lastYuvDisplayRecoveryElapsedMs < 1_000L) return false
+        lastYuvDisplayRecoveryElapsedMs = nowMs
+        post {
+            val stillDisplayed = displayedSource == ViewfinderEffectiveSource.YUV && displayedGeneration == generation
+            val stillStaged = stagedTargetSource == ViewfinderEffectiveSource.YUV && stagedTargetGeneration == generation
+            if (detached || (!stillDisplayed && !stillStaged)) return@post
+            runCatching {
+                queueEvent {
+                    val glDisplayed = displayedSource == ViewfinderEffectiveSource.YUV && displayedGeneration == generation
+                    val glStaged = stagedTargetSource == ViewfinderEffectiveSource.YUV && stagedTargetGeneration == generation
+                    if (detached || (!glDisplayed && !glStaged)) return@queueEvent
+                    val texture = surfaceTexture ?: return@queueEvent
+                    texture.setOnFrameAvailableListener(this@FocusPeakingView)
+                    val beforeTimestampNs = texture.timestamp
+                    runCatching {
+                        texture.updateTexImage()
+                        texture.getTransformMatrix(yuvStMatrix)
+                        val afterTimestampNs = texture.timestamp
+                        val baselineTimestampNs = stagedYuvBaselineTimestampNs
+                        val freshTargetFrame = afterTimestampNs > 0L &&
+                            (afterTimestampNs != beforeTimestampNs || afterTimestampNs > baselineTimestampNs)
+                        if (freshTargetFrame) {
+                            oesFrameAvailable = false
+                            displayReady = true
+                            if (glStaged && afterTimestampNs > baselineTimestampNs) {
+                                stagedYuvFrameReady = true
+                            }
+                            onYuvFrameAvailable?.invoke(afterTimestampNs)
+                        }
+                        Log.w(
+                            "BnCamPreviewDiag",
+                            "event=YUV_DISPLAY_LOCAL_RECOVERY generation=$generation reason=$reason " +
+                                "beforeTimestampNs=$beforeTimestampNs afterTimestampNs=$afterTimestampNs " +
+                                "baselineTimestampNs=$baselineTimestampNs freshTargetFrame=$freshTargetFrame " +
+                                "staged=$glStaged"
+                        )
+                    }.onFailure { error ->
+                        Log.w(
+                            "BnCamPreviewDiag",
+                            "event=YUV_DISPLAY_LOCAL_RECOVERY_FAILED generation=$generation " +
+                                "reason=$reason error=${error.javaClass.simpleName}:${error.message}"
+                        )
+                    }
+                }
+            }
+            requestRender()
+        }
+        return true
+    }
+
+    private fun requestPreviewSurfaceBufferGeometryInternal(
+        lensId: String,
+        width: Int,
+        height: Int,
+        reason: String,
+        onApplied: (Boolean) -> Unit
+    ): Boolean {
+        if (detached || width <= 0 || height <= 0) return false
+        post {
+            if (detached) {
+                onApplied(false)
+                return@post
+            }
+            val target = surfaceTexture
+            if (target == null) {
+                Log.w(
+                    "BnCamPreviewDiag",
+                    "event=PREVIEW_SURFACE_GEOMETRY_APPLY_FAILED lensId=$lensId " +
+                        "requested=${width}x$height reason=$reason cause=no_surface_texture"
+                )
+                onApplied(false)
+                return@post
+            }
+            runCatching {
+                target.setDefaultBufferSize(width, height)
+                diagnosticLensId = lensId
+                diagnosticBufferWidth = width
+                diagnosticBufferHeight = height
+                firstFrameDiagnosticsLogged = false
+            }.onSuccess {
+                Log.w(
+                    "BnCamPreviewDiag",
+                    "event=PREVIEW_SURFACE_GEOMETRY_APPLIED lensId=$lensId " +
+                        "buffer=${width}x$height reason=$reason"
+                )
+                onApplied(true)
+            }.onFailure { error ->
+                Log.e(
+                    "BnCamPreviewDiag",
+                    "event=PREVIEW_SURFACE_GEOMETRY_APPLY_FAILED lensId=$lensId " +
+                        "requested=${width}x$height reason=$reason cause=${error.javaClass.simpleName}",
+                    error
+                )
+                onApplied(false)
+            }
         }
         return true
     }

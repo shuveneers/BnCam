@@ -29,6 +29,7 @@ data class RawPreviewHealthSnapshot(
     val lastRendererOfferElapsedNs: Long,
     val lastRendererPublicationElapsedNs: Long,
     val lastGlAcceptedElapsedNs: Long,
+    val firstGlDrawElapsedNs: Long,
     val lastGlDrawElapsedNs: Long,
     val lastDisplayPresentElapsedNs: Long,
     val latestSensorTimestampNs: Long,
@@ -53,7 +54,7 @@ data class RawPreviewHealthSnapshot(
         appendLine("RAW_PREVIEW_HEALTH source=$source generation=$pipelineGeneration eglGeneration=$eglGeneration stage=$stage")
         appendLine("expectedIntervalMs=${expectedIntervalNs / 1_000_000.0} stallThresholdMs=${stallThresholdNs / 1_000_000.0}")
         appendLine("ageCaptureResultMs=${age(lastCaptureResultElapsedNs)} ageImageReaderMs=${age(lastImageReaderElapsedNs)} ageRendererOfferMs=${age(lastRendererOfferElapsedNs)}")
-        appendLine("ageRendererPublicationMs=${age(lastRendererPublicationElapsedNs)} ageGlAcceptedMs=${age(lastGlAcceptedElapsedNs)} ageGlDrawMs=${age(lastGlDrawElapsedNs)} ageDisplayPresentMs=${age(lastDisplayPresentElapsedNs)}")
+        appendLine("ageRendererPublicationMs=${age(lastRendererPublicationElapsedNs)} ageGlAcceptedMs=${age(lastGlAcceptedElapsedNs)} firstGlDrawAgeMs=${age(firstGlDrawElapsedNs)} ageGlDrawMs=${age(lastGlDrawElapsedNs)} ageDisplayPresentMs=${age(lastDisplayPresentElapsedNs)}")
         appendLine("latestSensorTimestampNs=$latestSensorTimestampNs frameDurationNs=$latestSensorFrameDurationNs exposureTimeNs=$latestExposureTimeNs advertisedMinFrameDurationNs=$advertisedMinFrameDurationNs")
         appendLine(
             "rgbMin=$outputRgbMin rgbMax=$outputRgbMax rgbMean=$outputRgbMean " +
@@ -90,6 +91,7 @@ object RawPreviewHealthMonitor {
     private var lastRendererOfferElapsedNs: Long = 0L
     private var lastRendererPublicationElapsedNs: Long = 0L
     private var lastGlAcceptedElapsedNs: Long = 0L
+    private var firstGlDrawElapsedNs: Long = 0L
     private var lastGlDrawElapsedNs: Long = 0L
     private var lastDisplayPresentElapsedNs: Long = 0L
     private var actualPresentationObserved: Boolean = false
@@ -131,6 +133,7 @@ object RawPreviewHealthMonitor {
         lastRendererOfferElapsedNs = 0L
         lastRendererPublicationElapsedNs = 0L
         lastGlAcceptedElapsedNs = 0L
+        firstGlDrawElapsedNs = 0L
         lastGlDrawElapsedNs = 0L
         lastDisplayPresentElapsedNs = 0L
         actualPresentationObserved = false
@@ -227,6 +230,7 @@ object RawPreviewHealthMonitor {
     @Synchronized
     fun glDraw(generation: Int, currentEglGeneration: Int, nowElapsedNs: Long) {
         if (!matches(generation)) return
+        if (firstGlDrawElapsedNs == 0L) firstGlDrawElapsedNs = nowElapsedNs
         lastGlDrawElapsedNs = nowElapsedNs
         if (currentEglGeneration > 0) eglGeneration = currentEglGeneration
     }
@@ -286,6 +290,7 @@ object RawPreviewHealthMonitor {
             lastRendererOfferElapsedNs = lastRendererOfferElapsedNs,
             lastRendererPublicationElapsedNs = lastRendererPublicationElapsedNs,
             lastGlAcceptedElapsedNs = lastGlAcceptedElapsedNs,
+            firstGlDrawElapsedNs = firstGlDrawElapsedNs,
             lastGlDrawElapsedNs = lastGlDrawElapsedNs,
             lastDisplayPresentElapsedNs = lastDisplayPresentElapsedNs,
             latestSensorTimestampNs = latestSensorTimestampNs,
@@ -322,6 +327,15 @@ object RawPreviewHealthMonitor {
         if (!recent(lastRendererPublicationElapsedNs)) return RawPreviewHealthStage.RENDERER_PUBLICATION
         if (!recent(lastGlAcceptedElapsedNs)) return RawPreviewHealthStage.GL_ACCEPT
         if (!recent(lastGlDrawElapsedNs)) return RawPreviewHealthStage.GL_DRAW
+        // A route is not healthy merely because GL keeps drawing. The first actual presentation
+        // must also arrive within one bounded liveness window after the first successful GL draw.
+        // This closes the startup hole where a broken EGL/presentation bridge could be labelled
+        // HEALTHY forever simply because no presentation had ever been observed.
+        if (!actualPresentationObserved && firstGlDrawElapsedNs > 0L &&
+            nowElapsedNs - firstGlDrawElapsedNs > thresholdNs
+        ) {
+            return RawPreviewHealthStage.EGL_PRESENTATION
+        }
         if (actualPresentationObserved && !recent(lastDisplayPresentElapsedNs)) {
             return RawPreviewHealthStage.EGL_PRESENTATION
         }

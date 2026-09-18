@@ -75,7 +75,7 @@ fun LensDetailScreen(
     onNavigateToNoiseModel: () -> Unit = {},
     onNavigateToBlackLevel: () -> Unit = {},
     onNavigateToColorMatrix: () -> Unit = {},
-    @Suppress("UNUSED_PARAMETER") onNavigateToRawStreamBinding: () -> Unit = {},
+    onNavigateToRawStreamBinding: () -> Unit = {},
     onNavigateBack: () -> Unit
 ) {
     val scrollState = rememberScrollState()
@@ -183,7 +183,7 @@ fun LensDetailScreen(
 
         SettingsCard(
             title = "Lens hardware settings",
-            description = "Per-lens sensor calibration and color transform settings."
+            description = "Per-lens sensor calibration, color transform and stream/session settings."
         ) {
             SettingValueRow(
                 title = "Noise model",
@@ -211,6 +211,13 @@ fun LensDetailScreen(
                 description = "Sensor-to-RGB color transformation for this Lens ID.",
                 value = colorMatrixMode,
                 onClick = onNavigateToColorMatrix
+            )
+
+            SettingValueRow(
+                title = "Stream configuration",
+                description = "Per-lens Camera2 stream/session policy for Photo and Video.",
+                value = "Open",
+                onClick = onNavigateToRawStreamBinding
             )
         }
 
