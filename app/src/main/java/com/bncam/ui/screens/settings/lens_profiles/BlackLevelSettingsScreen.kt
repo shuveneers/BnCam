@@ -95,7 +95,7 @@ fun BlackLevelSettingsScreen(lensId: String, onNavigateBack: () -> Unit) {
         if (settings.type == BlackLevelTypes.MANUAL) {
             SettingsCard(
                 title = "Manual black levels",
-                description = "AGC-style four-channel input in physical sensor mosaic order [00, 10, 01, 11]. Values remain floating point."
+                description = "Four-channel input in physical sensor mosaic order [00, 10, 01, 11]. Values remain floating point."
             ) {
                 when (cfa) {
                     is CfaArrangementDescriptor.Bayer -> labels.forEachIndexed { index, label ->

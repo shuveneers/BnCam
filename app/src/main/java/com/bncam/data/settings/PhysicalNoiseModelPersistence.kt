@@ -86,7 +86,7 @@ data class LensPhysicalNoiseModelSettings(
         schemaVersion = PHYSICAL_NOISE_MODEL_SCHEMA_VERSION,
         dynamicIsoCoefficient = sanitizePhysicalDynamicIsoCoefficient(dynamicIsoCoefficient),
         systemModelOrigin = systemModelOrigin.cleanOptionalToken(),
-        selectedPresetId = selectedPresetId.cleanOptionalToken()
+        selectedPresetId = selectedPresetId.cleanOptionalToken()?.takeIf { it.startsWith("bncam:") || it.startsWith("user:") }
     )
 
     val selectedParametricModel: PersistedParametricNoiseModel?

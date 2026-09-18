@@ -38,7 +38,7 @@ object RawUnpackValidator {
     }
 
     /**
-     * Calculates noise variance from GCam-style noise model A and B: variance = A * pixelValue + B.
+     * Calculates noise variance from parametric noise model A and B: variance = A * pixelValue + B.
      */
     fun calculateNoiseVariance(pixelValue: Float, noiseA: Float, noiseB: Float): Float {
         return (noiseA * pixelValue.coerceAtLeast(0.0f) + noiseB).coerceAtLeast(1e-6f)

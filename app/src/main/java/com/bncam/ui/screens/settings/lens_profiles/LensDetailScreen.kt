@@ -215,7 +215,7 @@ fun LensDetailScreen(
 
             SettingValueRow(
                 title = "AWB",
-                description = "Per-lens GCam-style sensor white-balance calibration and green-split authority.",
+                description = "Per-lens parametric sensor white-balance calibration and green-split authority.",
                 value = awbCalibrationSettings.summary(),
                 onClick = onNavigateToAwbCalibration
             )

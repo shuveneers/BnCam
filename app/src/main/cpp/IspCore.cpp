@@ -6477,7 +6477,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     const bool exactCamera2ColorPair = uiConfig.wbFromMetadata && uiConfig.colorMatrixFromMetadata;
 
     // User-selected Lens-ID AWB is a developed-image authority, not a weak prior.  The Kotlin
-    // calibration layer has already resolved the requested AGC preset / Custom GCam / RG-BG trim
+    // calibration layer has already resolved the requested built-in preset / custom calibration / RG-BG trim
     // into effectiveWbGains.  Once this flag is true, no native scene estimator, auxiliary sensor
     // or temporal/gray-world stage may pull those gains back toward Auto.  Sensor Auto keeps the
     // physical refinement path below.
@@ -6525,7 +6525,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     if (explicitLensAwbAuthority) {
         // Hard ownership boundary: Auto is the only mode allowed to run physical/gray-world AWB.
         // Any explicit Lens-ID choice must appear in the developed JPEG exactly as resolved by the
-        // Kotlin GCam calibration layer.  This branch intentionally does NOT depend on
+        // Kotlin AWB calibration layer.  This branch intentionally does NOT depend on
         // exactCamera2ColorPair: many RAW routes have exact gains but no per-frame CCM, and that
         // was the bypass that made presets look like no-ops.
         phase7AwbEstimate.finalGainsRgb[0] = std::clamp(

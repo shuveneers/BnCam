@@ -129,7 +129,7 @@ import com.bncam.core.isp.raw.RawDomainContractResolver
 import com.bncam.core.isp.raw.RawWhiteDomainBinding
 import com.bncam.core.isp.raw10.RawCameraColorProfileRepository
 import com.bncam.core.quality.RawColorTransformEngine
-import com.bncam.core.quality.GcamAwbCalibrationEngine
+import com.bncam.core.quality.AwbCalibrationEngine
 import com.bncam.core.quality.YuvAwbMapper
 import com.bncam.core.quality.ManualWhiteBalanceTarget
 import com.bncam.core.quality.StableWhiteBalanceSnapshot
@@ -4861,8 +4861,8 @@ class BnCameraManager(private val context: Context) {
     /**
      * Last-write stabilization contract applied immediately before every Camera2 submission.
      *
-     * The Honor hidden-physical tele route under-reports OIS capability metadata, while GCam
-     * proves that the same logical->physical route accepts the standard OIS request and returns
+     * Some hidden-physical tele routes under-report OIS capability metadata, while validated captures
+     * prove that the same logical->physical route accepts the standard OIS request and returns
      * LENS_OPTICAL_STABILIZATION_MODE_ON. Keeping this at the single submission choke point also
      * prevents later AF/AE/vendor mutations from accidentally carrying an earlier OFF value.
      */
@@ -12049,14 +12049,14 @@ class BnCameraManager(private val context: Context) {
             if (finalRgb.size < 3 || finalRgb.any { !it.isFinite() || it <= 0f }) return
             val scopeKey = identity.physicalCameraId ?: identity.logicalCameraId
 
-            // Lens ID AWB Calibration is the sole persistent calibration owner. GCam/AGC-style
+            // Lens ID AWB Calibration is the sole persistent calibration owner. Sensor-calibrated
             // RG/BG calibration constrains the physical scene solution without replacing scene
             // evidence. Camera2 exact-frame Gr/Gb remains the fallback green-site calibration.
             val runtimeCalibration = LensAwbCalibrationRuntimeRegistry.resolve(scopeKey)
             val characteristics = liveWhiteBalanceCharacteristics(scopeKey)
                 ?: identity.logicalCameraId.takeIf { it != scopeKey }?.let(::liveWhiteBalanceCharacteristics)
             val resolvedCalibration = characteristics?.let {
-                GcamAwbCalibrationEngine.resolve(runtimeCalibration.settings, it)
+                AwbCalibrationEngine.resolve(runtimeCalibration.settings, it)
             }
             val priorGains = frame.camera2PriorWbGains
             val priorGrGb = if (
@@ -12070,7 +12070,7 @@ class BnCameraManager(private val context: Context) {
             // QcColorCalibration GR/GB is semantic Gr/Gb. Camera2 RGGB vectors use
             // greenEven/greenOdd, so GBRG/BGGR require the reciprocal mapping.
             val calibratedEvenOddRatio = importedGrGbRatio?.let { grGb ->
-                GcamAwbCalibrationEngine.semanticGrGbToCamera2EvenOdd(grGb, cfaPattern ?: -1)
+                AwbCalibrationEngine.semanticGrGbToCamera2EvenOdd(grGb, cfaPattern ?: -1)
             }
             val greenEvenOddRatio = calibratedEvenOddRatio ?: priorGrGb
             val greenRoot = sqrt(greenEvenOddRatio.coerceAtLeast(1.0e-6f))
@@ -12081,7 +12081,7 @@ class BnCameraManager(private val context: Context) {
                 finalRgb[2]
             )
             val calibrationAuthority = if (resolvedCalibration?.valid == true) {
-                val staticAuthority = GcamAwbCalibrationEngine.staticPriorAuthority(runtimeCalibration.settings)
+                val staticAuthority = AwbCalibrationEngine.staticPriorAuthority(runtimeCalibration.settings)
                 val evidenceAuthority = frame.physicalAwbConfidence.coerceIn(0f, 1f) *
                     (0.50f + 0.50f * frame.physicalAwbDataAuthority.coerceIn(0f, 1f))
                 // Explicit Custom/trim calibration must remain visible when the physical observer is accepted;
@@ -12089,7 +12089,7 @@ class BnCameraManager(private val context: Context) {
                 if (staticAuthority >= 0.999f) 1.0f else (staticAuthority * evidenceAuthority).coerceIn(0f, staticAuthority)
             } else 0f
             val finalGains = if (resolvedCalibration != null) {
-                GcamAwbCalibrationEngine.constrainPhysicalGains(
+                AwbCalibrationEngine.constrainPhysicalGains(
                     physicalGains = sceneGains,
                     calibration = resolvedCalibration,
                     authority = calibrationAuthority
@@ -12190,17 +12190,17 @@ class BnCameraManager(private val context: Context) {
             val transform = calibrationResult.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)
             val camera2Matrix = transform?.let(RawColorTransformEngine::colorSpaceTransformToArray)
 
-            // Developed preview uses the same Lens ID GCam calibration as capture. Keep the raw
+            // Developed preview uses the same Lens ID AWB calibration as capture. Keep the raw
             // exact-frame Camera2 pair separately below as the physical estimator prior so the
             // calibrated render path can never feed itself back into scene observation.
             val runtimeAwb = LensAwbCalibrationRuntimeRegistry.resolve(scopeKey)
             val awbCharacteristics = liveWhiteBalanceCharacteristics(scopeKey)
                 ?: identity.logicalCameraId.takeIf { it != scopeKey }?.let(::liveWhiteBalanceCharacteristics)
             val resolvedAwb = awbCharacteristics?.let {
-                runCatching { GcamAwbCalibrationEngine.resolve(runtimeAwb.settings, it) }.getOrNull()
+                runCatching { AwbCalibrationEngine.resolve(runtimeAwb.settings, it) }.getOrNull()
             }
             val calibratedCamera2Prior = if (resolvedAwb?.valid == true && awbCharacteristics != null) {
-                GcamAwbCalibrationEngine.applyToCamera2Prior(
+                AwbCalibrationEngine.applyToCamera2Prior(
                     camera2Gains = camera2Gains,
                     calibration = resolvedAwb,
                     settings = runtimeAwb.settings,
@@ -12320,7 +12320,7 @@ class BnCameraManager(private val context: Context) {
                 liveWhiteBalanceTargetSensorGains = targetSensorGains?.copyOf(4)
                 if (targetSensorGains != null && targetColorMatrix != null) {
                     // Live Kelvin is a temporary viewfinder/capture override. It does not belong
-                    // to a profile and does not mutate the per-lens GCam AWB calibration.
+                    // to a profile and does not mutate the per-lens AWB calibration.
                     rawPreviewRenderer.clearExactFrameCamera2ColorPairs()
                     rawPreviewRenderer.clearAutoWhiteBalanceColorPair()
                     rawPreviewRenderer.updateWhiteBalanceColorPair(targetSensorGains, targetColorMatrix)

@@ -107,7 +107,7 @@ fun SettingValueRow(
 }
 
 /**
- * NIEUW: Een geavanceerde slider-rij voor numerieke (GCam-stijl) instellingen.
+ * NIEUW: Een geavanceerde slider-rij voor numerieke instellingen.
  */
 @Composable
 fun SettingSliderRow(

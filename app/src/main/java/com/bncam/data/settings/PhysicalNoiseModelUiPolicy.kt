@@ -6,8 +6,8 @@ import com.bncam.core.quality.NoiseModelSource
 /**
  * User-facing policy for the physical noise-model settings page.
  *
- * This deliberately contains no capture wiring. Phase 3 only exposes/persists the new
- * physical model configuration while the production authority remains on the legacy route.
+ * Keeps user-facing source labels and summaries aligned with the active physical
+ * noise-model authority.
  */
 object PhysicalNoiseModelUiPolicy {
     val selectableSources: List<NoiseModelSource> = listOf(
@@ -46,8 +46,15 @@ object PhysicalNoiseModelUiPolicy {
             } else {
                 "Manual · incomplete"
             }
-            NoiseModelSource.PRESET -> settings.selectedPresetId?.let { "Preset · $it" }
-                ?: "Preset · none selected"
+            NoiseModelSource.PRESET -> settings.selectedPresetId?.let { presetId ->
+                BnCamNoiseModelPresets.find(presetId)?.let { preset ->
+                    "Preset · ${preset.displayName}"
+                } ?: if (presetId.startsWith("user:")) {
+                    "Preset · imported"
+                } else {
+                    "Preset · missing"
+                }
+            } ?: "Preset · none selected"
         }
 
         if (!dynamicIsoAvailable(settings.source) || !settings.dynamicIsoEnabled) return sourceText

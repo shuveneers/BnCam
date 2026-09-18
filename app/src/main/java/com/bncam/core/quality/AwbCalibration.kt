@@ -1,8 +1,8 @@
 package com.bncam.core.quality
 
 import android.hardware.camera2.CameraCharacteristics
-import com.bncam.data.settings.AgcAwbPresetCatalog
-import com.bncam.data.settings.GcamAwbCalibrationPoint
+import com.bncam.data.settings.BnCamAwbPresetCatalog
+import com.bncam.data.settings.AwbCalibrationPoint
 import com.bncam.data.settings.LensAwbCalibrationModes
 import com.bncam.data.settings.LensAwbCalibrationSettings
 import com.bncam.data.settings.LensAwbGreenSplitModes
@@ -13,23 +13,23 @@ import kotlin.math.exp
 import kotlin.math.ln
 import kotlin.math.sqrt
 
-data class ParsedGcamAwbCalibration(
+data class ParsedAwbCalibration(
     val format: String,
-    val points: List<GcamAwbCalibrationPoint>,
+    val points: List<AwbCalibrationPoint>,
     val grGbRatio: Float?,
     val warnings: List<String> = emptyList()
 )
 
-object GcamAwbCalibrationParser {
+object AwbCalibrationImportParser {
     private val numberRegex = Regex("[-+]?(?:\\d+\\.?\\d*|\\.\\d+)(?:[eE][-+]?\\d+)?")
 
-    fun parse(text: String, fileName: String = ""): ParsedGcamAwbCalibration {
+    fun parse(text: String, fileName: String = ""): ParsedAwbCalibration {
         val clean = text.replace("\\r", "")
         val rg = firstSeries(clean, listOf("WB_RG", "RG", "rg_ratio"))
         val bg = firstSeries(clean, listOf("WB_BG", "BG", "bg_ratio"))
         val pairCount = minOf(rg.size, bg.size, com.bncam.data.settings.LensAwbCalibrationSettings.MAX_POINTS)
         val points = (0 until pairCount).mapNotNull { index ->
-            GcamAwbCalibrationPoint(rg[index], bg[index]).sanitizedOrNull()
+            AwbCalibrationPoint(rg[index], bg[index]).sanitizedOrNull()
         }
         val grgb = firstScalar(clean, listOf("BGRG", "GRGB", "grgb_ratio"))
             ?.takeIf { it.isFinite() && it in 0.50f..2.0f }
@@ -41,11 +41,11 @@ object GcamAwbCalibrationParser {
         }
         val lower = fileName.lowercase(Locale.US)
         val format = when {
-            lower.endsWith(".gawb") || clean.contains("BGRG", ignoreCase = true) -> "AGC .gawb"
-            lower.endsWith(".txt") || clean.contains("WB_RG", ignoreCase = true) -> "GCam .txt"
-            else -> "GCam AWB text"
+            lower.endsWith(".awb") || clean.contains("BGRG", ignoreCase = true) -> "AWB calibration"
+            lower.endsWith(".txt") || clean.contains("WB_RG", ignoreCase = true) -> "AWB calibration text"
+            else -> "AWB calibration text"
         }
-        return ParsedGcamAwbCalibration(format, points, grgb, warnings)
+        return ParsedAwbCalibration(format, points, grgb, warnings)
     }
 
     private fun firstSeries(text: String, keys: List<String>): List<Float> {
@@ -73,16 +73,16 @@ object GcamAwbCalibrationParser {
     }
 }
 
-data class ResolvedGcamAwbCalibration(
+data class ResolvedAwbCalibration(
     val valid: Boolean,
     val source: String,
-    val points: List<GcamAwbCalibrationPoint>,
+    val points: List<AwbCalibrationPoint>,
     val grGbRatio: Float?,
     val fingerprint: String,
     val warning: String = "none"
 )
 
-data class AppliedGcamAwbPrior(
+data class AppliedAwbPrior(
     val gains: FloatArray,
     val calibrationSource: String,
     val calibrationFingerprint: String,
@@ -92,54 +92,61 @@ data class AppliedGcamAwbPrior(
 )
 
 /**
- * BnCam representation of the useful AGC/GCam AWB calibration concept: a per-sensor RG/BG
- * illuminant locus plus an optional G1/G2 calibration ratio. It intentionally does not copy any
- * device table from AGC. Sensor Auto derives its anchors from this lens' own Camera2 matrices.
+ * BnCam AWB calibration model: a per-sensor RG/BG
+ * illuminant locus plus an optional G1/G2 calibration ratio. Built-in BnCam presets remain relative to the
+ * active lens; Auto derives its anchors from this lens' own Camera2 matrices.
  */
-object GcamAwbCalibrationEngine {
+object AwbCalibrationEngine {
     fun resolve(
         settings: LensAwbCalibrationSettings,
         characteristics: CameraCharacteristics
-    ): ResolvedGcamAwbCalibration {
+    ): ResolvedAwbCalibration {
         val safe = settings.sanitized()
         return when (safe.mode) {
-            LensAwbCalibrationModes.AGC_PRESET -> resolveAgcPreset(safe)
-            LensAwbCalibrationModes.CUSTOM_GCAM -> {
+            LensAwbCalibrationModes.BNCAM_PRESET -> resolveBuiltinPreset(safe, characteristics)
+            LensAwbCalibrationModes.CUSTOM_IMPORT -> {
                 val points = safe.customPoints.mapNotNull { point ->
-                    GcamAwbCalibrationPoint(
+                    AwbCalibrationPoint(
                         rgRatio = point.rgRatio * safe.rgCoefficient,
                         bgRatio = point.bgRatio * safe.bgCoefficient
                     ).sanitizedOrNull()
                 }
-                if (points.size < 2) invalid("CUSTOM_GCAM", "custom_calibration_has_fewer_than_two_valid_points")
-                else result("CUSTOM_GCAM:${safe.importedName.ifBlank { "import" }}", points, safe.effectiveCustomGrGbRatioOrNull())
+                if (points.size < 2) invalid("CUSTOM_IMPORT", "custom_calibration_has_fewer_than_two_valid_points")
+                else result("CUSTOM_IMPORT:${safe.importedName.ifBlank { "import" }}", points, safe.effectiveCustomGrGbRatioOrNull())
             }
             else -> resolveSensorAuto(safe, characteristics)
         }
     }
 
-    private fun resolveAgcPreset(settings: LensAwbCalibrationSettings): ResolvedGcamAwbCalibration {
-        val preset = AgcAwbPresetCatalog.byId(settings.agcPresetId)
-            ?: return invalid("AGC_V12_PRESET", "preset_id_${settings.agcPresetId}_unavailable")
-        val points = preset.points.mapNotNull { point ->
-            GcamAwbCalibrationPoint(
-                rgRatio = point.rgRatio * settings.rgCoefficient,
-                bgRatio = point.bgRatio * settings.bgCoefficient
-            ).sanitizedOrNull()
+    private fun resolveBuiltinPreset(
+        settings: LensAwbCalibrationSettings,
+        characteristics: CameraCharacteristics? = null
+    ): ResolvedAwbCalibration {
+        val preset = BnCamAwbPresetCatalog.byId(settings.presetId)
+            ?: return invalid("BNCAM_PRESET", "preset_id_${settings.presetId}_unavailable")
+        // Built-in response presets are relative to the exact-frame Camera2 neutral point. Keep a
+        // sensor-derived locus available for diagnostics/physical observation, but do not import
+        // another sensor's calibration table.
+        val base = characteristics?.let {
+            resolveSensorAuto(
+                settings.copy(rgCoefficient = 1.0f, bgCoefficient = 1.0f),
+                it
+            )
         }
-        if (points.size < 2) return invalid("AGC_V12_PRESET:${preset.id}", "preset_has_fewer_than_two_valid_points")
+        val points = base?.points?.takeIf { it.size >= 2 } ?: listOf(
+            AwbCalibrationPoint(0.35f, 0.70f),
+            AwbCalibrationPoint(0.70f, 0.35f)
+        )
         val grGb = if (settings.greenSplitMode == LensAwbGreenSplitModes.MANUAL) {
             settings.manualGrGbRatio
-        } else {
-            preset.grGbRatio
-        }
-        return result("AGC_V12_PRESET:${preset.id}:${preset.name}", points, grGb)
+        } else null
+        return result("BNCAM_PRESET:${preset.id}:${preset.name}", points, grGb)
     }
 
     private fun resolveSensorAuto(
         settings: LensAwbCalibrationSettings,
         characteristics: CameraCharacteristics
-    ): ResolvedGcamAwbCalibration {
+    ): ResolvedAwbCalibration {
         val i1 = characteristics.get(CameraCharacteristics.SENSOR_REFERENCE_ILLUMINANT1)?.toInt()
         val i2 = characteristics.get(CameraCharacteristics.SENSOR_REFERENCE_ILLUMINANT2)?.toInt()
         val kelvins = listOfNotNull(
@@ -157,7 +164,7 @@ object GcamAwbCalibrationEngine {
             val bGain = solution.bayerWbGains[3]
             if (!rGain.isFinite() || !bGain.isFinite() || rGain <= 0f || bGain <= 0f) return@mapNotNull null
             // QcColorCalibration stores sensor-neutral ratios. Camera2 WB gains are their inverse.
-            GcamAwbCalibrationPoint(
+            AwbCalibrationPoint(
                 rgRatio = (1f / rGain) * settings.rgCoefficient,
                 bgRatio = (1f / bGain) * settings.bgCoefficient
             ).sanitizedOrNull()
@@ -168,24 +175,24 @@ object GcamAwbCalibrationEngine {
             } else {
                 null
             }
-            result("SENSOR_AUTO_CAMERA2_REFERENCE_ILLUMINANTS", points, manualGrGb)
+            result("AUTO_CAMERA2_REFERENCE_ILLUMINANTS", points, manualGrGb)
         } else {
-            invalid("SENSOR_AUTO", "camera2_reference_illuminant_calibration_unavailable")
+            invalid("AUTO", "camera2_reference_illuminant_calibration_unavailable")
         }
     }
 
     /**
-     * Static lens calibration authority for the exact-frame Camera2 prior. The default Sensor Auto
+     * Static lens calibration authority for the exact-frame Camera2 prior. The default Auto
      * locus is intentionally a moderate constraint; an explicit RG/BG trim, manual Gr/Gb or Custom
-     * GCam calibration is a deliberate calibration request and therefore owns the developed WB.
+     * BnCam calibration is a deliberate calibration request and therefore owns the developed WB.
      */
     fun hasExplicitDevelopedAuthority(settings: LensAwbCalibrationSettings): Boolean {
         val safe = settings.sanitized()
         val explicitTrim = abs(safe.rgCoefficient - 1.0f) > 0.0005f ||
             abs(safe.bgCoefficient - 1.0f) > 0.0005f ||
             safe.greenSplitMode == LensAwbGreenSplitModes.MANUAL
-        return safe.mode == LensAwbCalibrationModes.AGC_PRESET ||
-            safe.mode == LensAwbCalibrationModes.CUSTOM_GCAM || explicitTrim
+        return safe.mode == LensAwbCalibrationModes.BNCAM_PRESET ||
+            safe.mode == LensAwbCalibrationModes.CUSTOM_IMPORT || explicitTrim
     }
 
     fun staticPriorAuthority(settings: LensAwbCalibrationSettings): Float =
@@ -198,14 +205,27 @@ object GcamAwbCalibrationEngine {
      */
     fun applyToCamera2Prior(
         camera2Gains: FloatArray,
-        calibration: ResolvedGcamAwbCalibration,
+        calibration: ResolvedAwbCalibration,
         settings: LensAwbCalibrationSettings,
         cfaPattern: Int
-    ): AppliedGcamAwbPrior? {
+    ): AppliedAwbPrior? {
         if (!calibration.valid || camera2Gains.size < 4) return null
         if (camera2Gains.take(4).any { !it.isFinite() || it <= 0f }) return null
-        val authority = staticPriorAuthority(settings)
-        val calibrated = constrainPhysicalGains(camera2Gains, calibration, authority)
+        val safeSettings = settings.sanitized()
+        val authority = staticPriorAuthority(safeSettings)
+        val calibrated = if (safeSettings.mode == LensAwbCalibrationModes.BNCAM_PRESET) {
+            val preset = BnCamAwbPresetCatalog.byId(safeSettings.presetId) ?: return null
+            camera2Gains.copyOf(4).also { gains ->
+                // Presets are scene-response choices relative to the actual lens/frame AWB, not
+                // another sensor locus. RG/BG trims keep their existing neutral-ratio semantics.
+                gains[0] = (gains[0] * preset.redGainScale / safeSettings.rgCoefficient)
+                    .coerceIn(0.25f, 6.0f)
+                gains[3] = (gains[3] * preset.blueGainScale / safeSettings.bgCoefficient)
+                    .coerceIn(0.25f, 6.0f)
+            }
+        } else {
+            constrainPhysicalGains(camera2Gains, calibration, authority)
+        }
         val grGb = calibration.grGbRatio?.takeIf { it.isFinite() && it in 0.50f..2.0f }
         val evenOdd = grGb?.let { semanticGrGbToCamera2EvenOdd(it, cfaPattern) }
             ?: safeGreenEvenOddRatio(camera2Gains)
@@ -215,7 +235,7 @@ object GcamAwbCalibrationEngine {
             calibrated[1] = (greenMean * root).coerceIn(0.25f, 6.0f)
             calibrated[2] = (greenMean / root).coerceIn(0.25f, 6.0f)
         }
-        return AppliedGcamAwbPrior(
+        return AppliedAwbPrior(
             gains = calibrated,
             calibrationSource = calibration.source + "+CAMERA2_EXACT_FRAME",
             calibrationFingerprint = calibration.fingerprint,
@@ -247,14 +267,14 @@ object GcamAwbCalibrationEngine {
      */
     fun constrainPhysicalGains(
         physicalGains: FloatArray,
-        calibration: ResolvedGcamAwbCalibration,
+        calibration: ResolvedAwbCalibration,
         authority: Float
     ): FloatArray {
         if (!calibration.valid || calibration.points.size < 2 || physicalGains.size < 4) return physicalGains.copyOf()
         val rGain = physicalGains[0]
         val bGain = physicalGains[3]
         if (!rGain.isFinite() || !bGain.isFinite() || rGain <= 0f || bGain <= 0f) return physicalGains.copyOf()
-        val observed = GcamAwbCalibrationPoint(1f / rGain, 1f / bGain)
+        val observed = AwbCalibrationPoint(1f / rGain, 1f / bGain)
         val projected = nearestPointOnLocus(observed, calibration.points) ?: return physicalGains.copyOf()
         val a = authority.takeIf(Float::isFinite)?.coerceIn(0f, 1f) ?: 0f
         val rg = logBlend(observed.rgRatio, projected.rgRatio, a)
@@ -266,9 +286,9 @@ object GcamAwbCalibrationEngine {
     }
 
     private fun nearestPointOnLocus(
-        observed: GcamAwbCalibrationPoint,
-        points: List<GcamAwbCalibrationPoint>
-    ): GcamAwbCalibrationPoint? {
+        observed: AwbCalibrationPoint,
+        points: List<AwbCalibrationPoint>
+    ): AwbCalibrationPoint? {
         if (points.size < 2) return null
         val ox = ln(observed.rgRatio.toDouble())
         val oy = ln(observed.bgRatio.toDouble())
@@ -294,22 +314,22 @@ object GcamAwbCalibrationEngine {
             }
         }
         if (!bestX.isFinite() || !bestY.isFinite()) return null
-        return GcamAwbCalibrationPoint(exp(bestX).toFloat(), exp(bestY).toFloat()).sanitizedOrNull()
+        return AwbCalibrationPoint(exp(bestX).toFloat(), exp(bestY).toFloat()).sanitizedOrNull()
     }
 
     private fun logBlend(a: Float, b: Float, t: Float): Float =
         exp((ln(a.toDouble()) * (1.0 - t) + ln(b.toDouble()) * t)).toFloat()
 
-    private fun result(source: String, points: List<GcamAwbCalibrationPoint>, grGb: Float?): ResolvedGcamAwbCalibration {
+    private fun result(source: String, points: List<AwbCalibrationPoint>, grGb: Float?): ResolvedAwbCalibration {
         val canonical = buildString {
             append(source).append(';').append(grGb ?: "none")
             points.forEach { append(';').append(it.rgRatio).append(',').append(it.bgRatio) }
         }
         val fp = MessageDigest.getInstance("SHA-256")
             .digest(canonical.toByteArray(Charsets.UTF_8)).take(8).joinToString("") { "%02x".format(it) }
-        return ResolvedGcamAwbCalibration(true, source, points, grGb, fp)
+        return ResolvedAwbCalibration(true, source, points, grGb, fp)
     }
 
     private fun invalid(source: String, warning: String) =
-        ResolvedGcamAwbCalibration(false, source, emptyList(), null, "unavailable", warning)
+        ResolvedAwbCalibration(false, source, emptyList(), null, "unavailable", warning)
 }

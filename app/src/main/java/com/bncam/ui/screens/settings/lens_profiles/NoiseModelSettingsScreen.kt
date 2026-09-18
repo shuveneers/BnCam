@@ -45,6 +45,7 @@ import com.bncam.data.settings.LensPhysicalNoiseModelSettings
 import com.bncam.data.settings.NoiseModelPreset
 import com.bncam.data.settings.NoiseModelPresetCatalog
 import com.bncam.data.settings.NoiseModelPresetImportParser
+import com.bncam.data.settings.NoiseModelPresetGroup
 import com.bncam.data.settings.NoiseModelPresetOrigin
 import com.bncam.data.settings.PersistedParametricNoiseModel
 import com.bncam.data.settings.PhysicalNoiseModelSettingsStore
@@ -291,7 +292,7 @@ private fun PresetNoiseModelCard(
 
     SettingsCard(
         title = "Preset model",
-        description = "User imports are listed first, followed by the 96 read-only AGC 8.8.224 V12 presets."
+        description = "User imports are listed first, followed by 20 BnCam sensor-class presets grouped by lens type."
     ) {
         SettingValueRow(
             title = "Preset",
@@ -346,7 +347,7 @@ private fun PresetPickerDialog(
     onSelected: (NoiseModelPreset) -> Unit
 ) {
     val userPresets = presets.filter { it.origin == NoiseModelPresetOrigin.USER }
-    val agcPresets = presets.filter { it.origin == NoiseModelPresetOrigin.AGC_V12 }
+    val builtinPresets = presets.filter { it.origin == NoiseModelPresetOrigin.BNCAM }
     AlertDialog(
         onDismissRequest = onDismiss,
         containerColor = Color(0xFF1E1E1E),
@@ -363,12 +364,12 @@ private fun PresetPickerDialog(
                     userPresets.forEach { preset ->
                         PresetPickerRow(preset, preset.id == selectedPresetId, onSelected)
                     }
-                    PresetSectionHeader("AGC 8.8.224 V12 presets")
-                } else {
-                    PresetSectionHeader("AGC 8.8.224 V12 presets")
                 }
-                agcPresets.forEach { preset ->
-                    PresetPickerRow(preset, preset.id == selectedPresetId, onSelected)
+                NoiseModelPresetGroup.entries.forEach { group ->
+                    PresetSectionHeader(group.sectionTitle)
+                    builtinPresets.filter { it.group == group }.forEach { preset ->
+                        PresetPickerRow(preset, preset.id == selectedPresetId, onSelected)
+                    }
                 }
             }
         },
@@ -404,7 +405,7 @@ private fun PresetPickerRow(
         Column(modifier = Modifier.weight(1f)) {
             Text(preset.displayName, color = Color.White, fontSize = 14.sp)
             Text(
-                text = if (preset.origin == NoiseModelPresetOrigin.USER) "Imported" else "AGC V12",
+                text = if (preset.origin == NoiseModelPresetOrigin.USER) "Imported" else preset.description,
                 color = Color.Gray,
                 fontSize = 11.sp
             )
@@ -419,7 +420,7 @@ private fun PresetPickerRow(
 private fun PresetModelBlock(preset: NoiseModelPreset) {
     ReadOnlyValueBlock(
         title = "Preset A/B/C/D",
-        subtitle = "Canonical R/Gr/Gb/B · ${if (preset.origin == NoiseModelPresetOrigin.USER) "Imported" else "AGC 8.8.224 V12"}",
+        subtitle = "Canonical R/Gr/Gb/B · ${if (preset.origin == NoiseModelPresetOrigin.USER) "Imported" else "BnCam built-in"}",
         value = buildString {
             appendCoefficientLine("A", preset.model.a)
             appendCoefficientLine("B", preset.model.b)
@@ -441,7 +442,7 @@ private fun DynamicIsoCard(
     ) {
         ChoiceSettingRow(
             title = "Dynamic ISO",
-            description = "Disabled evaluates the model at capture ISO. Enabled applies AGC V12: ISO_NM = trunc(50 + k × (ISO_capture - 50)) before A/B/C/D.",
+            description = "Disabled evaluates the model at capture ISO. Enabled applies BnCam Dynamic ISO: ISO_NM = trunc(50 + k × (ISO_capture - 50)) before A/B/C/D.",
             value = if (settings.dynamicIsoEnabled) "Enabled" else "Disabled",
             options = listOf("Disabled", "Enabled"),
             onSelected = { selected ->
@@ -455,7 +456,7 @@ private fun DynamicIsoCard(
             }
             SettingSliderRow(
                 title = "Dynamic ISO coefficient",
-                description = "AGC-compatible coefficient. 0.00 locks to ISO 50; 1.00 follows capture ISO; 2.00 expands twice as fast. The transformed ISO is truncated to an integer before A/B/C/D.",
+                description = "Dynamic ISO coefficient. 0.00 locks to ISO 50; 1.00 follows capture ISO; 2.00 expands twice as fast. The transformed ISO is truncated to an integer before A/B/C/D.",
                 value = coefficientDraft,
                 valueRange = NoiseModelResolver.MIN_DYNAMIC_ISO_COEFFICIENT.toFloat()..
                     NoiseModelResolver.MAX_DYNAMIC_ISO_COEFFICIENT.toFloat(),

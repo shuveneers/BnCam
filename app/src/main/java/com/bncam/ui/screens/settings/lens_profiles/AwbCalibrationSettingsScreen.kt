@@ -4,18 +4,27 @@ import android.provider.OpenableColumns
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
@@ -23,8 +32,10 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.bncam.core.quality.GcamAwbCalibrationParser
-import com.bncam.data.settings.AgcAwbPresetCatalog
+import com.bncam.core.quality.AwbCalibrationImportParser
+import com.bncam.data.settings.BnCamAwbPreset
+import com.bncam.data.settings.BnCamAwbPresetCatalog
+import com.bncam.data.settings.BnCamAwbPresetGroup
 import com.bncam.data.settings.LensAwbCalibrationModes
 import com.bncam.data.settings.LensAwbCalibrationSettings
 import com.bncam.data.settings.LensAwbCalibrationSettingsStore
@@ -53,11 +64,12 @@ fun AwbCalibrationSettingsScreen(
         initialValue = LensAwbCalibrationSettings()
     )
     val binding = rememberOptimisticPersistedBinding(
-        stableKey = "$lensId:awb_calibration_v1",
+        stableKey = "$lensId:awb_calibration_v2",
         authoritativeValue = authoritative,
         persist = { store.set(lensId, it) }
     )
     val settings = binding.value.sanitized()
+    var showPresetPicker by remember(lensId) { mutableStateOf(false) }
 
     val importLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
@@ -76,12 +88,12 @@ fun AwbCalibrationSettingsScreen(
                         ?: "Imported AWB"
                     val text = resolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
                         ?: throw IllegalArgumentException("Could not read selected AWB file.")
-                    val parsed = GcamAwbCalibrationParser.parse(text, displayName)
+                    val parsed = AwbCalibrationImportParser.parse(text, displayName)
                     if (parsed.points.size < 2) {
                         throw IllegalArgumentException(parsed.warnings.joinToString().ifBlank { "No valid RG/BG calibration points." })
                     }
                     settings.copy(
-                        mode = LensAwbCalibrationModes.CUSTOM_GCAM,
+                        mode = LensAwbCalibrationModes.CUSTOM_IMPORT,
                         importedName = displayName.substringBeforeLast('.').take(120),
                         importedFormat = parsed.format,
                         customPoints = parsed.points,
@@ -103,32 +115,32 @@ fun AwbCalibrationSettingsScreen(
 
     SettingsTopicScaffold("AWB Calibration", onNavigateBack) {
         SettingsCard(
-            title = "GCam AWB authority",
-            description = "Per-lens sensor white-balance calibration. This is hardware calibration, not a profile look."
+            title = "AWB authority",
+            description = "Per-lens white-balance response. Auto is the default and remains scene-adaptive. Presets are deliberate developed-JPEG responses, not color-matrix looks."
         ) {
             ChoiceSettingRow(
                 title = "Calibration source",
-                description = "Sensor Auto derives a sensor-specific locus from Camera2 calibration. AGC Preset uses an original AGC V12 built-in sensor calibration. Custom GCam imports .gawb/.txt.",
+                description = "Auto follows the active lens and scene. BnCam Preset changes the illuminant response. Custom Import uses a user-supplied RG/BG calibration.",
                 value = settings.mode,
                 options = listOf(
-                    LensAwbCalibrationModes.SENSOR_AUTO,
-                    LensAwbCalibrationModes.AGC_PRESET,
-                    LensAwbCalibrationModes.CUSTOM_GCAM
+                    LensAwbCalibrationModes.AUTO,
+                    LensAwbCalibrationModes.BNCAM_PRESET,
+                    LensAwbCalibrationModes.CUSTOM_IMPORT
                 ),
                 onSelected = { binding.update(settings.copy(mode = it)) }
             )
 
             SettingSliderRow(
-                title = "RG coefficient",
-                description = "Multiplicative calibration trim for the sensor RG locus.",
+                title = "R/G calibration trim",
+                description = "Advanced sensor-neutral trim. 1.000 leaves the selected response unchanged.",
                 value = settings.rgCoefficient,
                 valueRange = 0.25f..5.00f,
                 valueFormatter = { String.format(Locale.US, "%.3f", it) },
                 onValueChange = { binding.update(settings.copy(rgCoefficient = it)) }
             )
             SettingSliderRow(
-                title = "BG coefficient",
-                description = "Multiplicative calibration trim for the sensor BG locus.",
+                title = "B/G calibration trim",
+                description = "Advanced sensor-neutral trim. 1.000 leaves the selected response unchanged.",
                 value = settings.bgCoefficient,
                 valueRange = 0.25f..5.00f,
                 valueFormatter = { String.format(Locale.US, "%.3f", it) },
@@ -136,51 +148,32 @@ fun AwbCalibrationSettingsScreen(
             )
         }
 
-        if (settings.mode == LensAwbCalibrationModes.AGC_PRESET) {
-            val selectedPreset = AgcAwbPresetCatalog.byId(settings.agcPresetId) ?: AgcAwbPresetCatalog.all.first()
+        if (settings.mode == LensAwbCalibrationModes.BNCAM_PRESET) {
+            val selected = BnCamAwbPresetCatalog.byId(settings.presetId) ?: BnCamAwbPresetCatalog.all.first()
             SettingsCard(
-                title = "AGC V12 built-in preset",
-                description = "Original AGC 8.8.224 V12 PreComputedAWB sensor tables. Presets contain their native RG/BG calibration locus and, where AGC supplies it, GR/GB calibration."
+                title = "BnCam AWB preset",
+                description = "Fifteen lighting-response presets grouped by the kind of illumination they are designed to handle."
             ) {
-                ChoiceSettingRow(
+                SettingValueRow(
                     title = "AWB preset",
-                    description = "Select one of the 56 presets exposed by AGC V12.",
-                    value = selectedPreset.selectionLabel,
-                    options = AgcAwbPresetCatalog.all.map { it.selectionLabel },
-                    onSelected = { label ->
-                        AgcAwbPresetCatalog.bySelectionLabel(label)?.let { preset ->
-                            binding.update(settings.copy(agcPresetId = preset.id))
-                        }
-                    }
-                )
-                SettingValueRow(
-                    title = "Calibration points",
-                    description = "Native RG/BG points in this AGC preset.",
-                    value = selectedPreset.points.size.toString(),
-                    onClick = {}
-                )
-                SettingValueRow(
-                    title = "Preset Gr/Gb",
-                    description = "Native AGC GR/GB value when the preset contains one.",
-                    value = selectedPreset.grGbRatio?.let { String.format(Locale.US, "%.6f", it) } ?: "Not supplied",
-                    onClick = {}
+                    description = selected.description,
+                    value = selected.name,
+                    onClick = { showPresetPicker = true }
                 )
             }
         }
 
-        if (settings.mode == LensAwbCalibrationModes.CUSTOM_GCAM) {
+        if (settings.mode == LensAwbCalibrationModes.CUSTOM_IMPORT) {
             SettingsCard(
-                title = "Custom GCam calibration",
-                description = "Import `.gawb` or `.txt`. BnCam reads the AGC/GCam RG/BG locus and optional BGRG/GRGB calibration."
+                title = "Custom calibration",
+                description = "Import a text calibration containing paired RG/BG points and, optionally, a Gr/Gb value."
             ) {
                 SettingValueRow(
                     title = "Imported calibration",
-                    description = "The import must contain at least two paired RG/BG points.",
+                    description = "At least two paired RG/BG points are required.",
                     value = if (settings.customPoints.size >= 2) {
                         "${settings.importedName.ifBlank { "Imported" }} · ${settings.customPoints.size} pts"
-                    } else {
-                        "Not configured"
-                    },
+                    } else "Not configured",
                     onClick = { importLauncher.launch(arrayOf("text/plain", "text/*", "application/octet-stream")) }
                 )
                 Button(
@@ -189,26 +182,18 @@ fun AwbCalibrationSettingsScreen(
                     shape = RoundedCornerShape(12.dp),
                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2C2C2C))
                 ) {
-                    Text("Import .gawb / .txt", color = AccentPistachio, fontWeight = FontWeight.Medium)
-                }
-                if (settings.customPoints.size < 2) {
-                    Text(
-                        "Custom GCam remains inactive until a valid calibration is imported.",
-                        color = Color(0xFFFFC38A),
-                        fontSize = 13.sp,
-                        modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp)
-                    )
+                    Text("Import AWB calibration", color = AccentPistachio, fontWeight = FontWeight.Medium)
                 }
             }
         }
 
         SettingsCard(
-            title = "Green split calibration",
-            description = "Controls GCam semantic Gr/Gb sensor calibration. BnCam maps it to Camera2 G_even/G_odd for the active CFA. Auto uses the selected AGC/imported GR/GB when supplied; otherwise exact-frame Camera2 green gains remain authoritative."
+            title = "G1/G2 sensor calibration",
+            description = "Technical Bayer green-site calibration. This is not a green/magenta creative tint control."
         ) {
             ChoiceSettingRow(
-                title = "GR/GB authority",
-                description = "Manual is a calibration ratio, not a creative tint control.",
+                title = "G1/G2 authority",
+                description = "Auto preserves exact-frame green balance. Manual applies the requested sensor-site ratio before demosaic.",
                 value = settings.greenSplitMode,
                 options = listOf(LensAwbGreenSplitModes.AUTO, LensAwbGreenSplitModes.MANUAL),
                 onSelected = { binding.update(settings.copy(greenSplitMode = it)) }
@@ -216,7 +201,7 @@ fun AwbCalibrationSettingsScreen(
             if (settings.greenSplitMode == LensAwbGreenSplitModes.MANUAL) {
                 SettingSliderRow(
                     title = "Gr / Gb ratio",
-                    description = "Semantic GCam Gr/Gb calibration ratio. 1.0000 is neutral; CFA mapping happens at runtime.",
+                    description = "Sensor calibration ratio. 1.0000 is neutral; CFA mapping happens at runtime.",
                     value = settings.manualGrGbRatio,
                     valueRange = 0.80f..1.20f,
                     valueFormatter = { String.format(Locale.US, "%.4f", it) },
@@ -224,16 +209,9 @@ fun AwbCalibrationSettingsScreen(
                 )
             } else {
                 SettingValueRow(
-                    title = "Imported Gr/Gb",
-                    description = "AGC/GCam BGRG/GRGB calibration value when present.",
-                    value = when (settings.mode) {
-                        LensAwbCalibrationModes.AGC_PRESET ->
-                            AgcAwbPresetCatalog.byId(settings.agcPresetId)?.grGbRatio
-                                ?.let { String.format(Locale.US, "%.4f", it) } ?: "Frame metadata"
-                        LensAwbCalibrationModes.CUSTOM_GCAM ->
-                            settings.importedGrGbRatio?.let { String.format(Locale.US, "%.4f", it) } ?: "Frame metadata"
-                        else -> "Frame metadata"
-                    },
+                    title = "Green-site source",
+                    description = "Auto uses exact-frame Camera2 green gains unless an imported calibration provides a valid ratio.",
+                    value = settings.importedGrGbRatio?.let { String.format(Locale.US, "%.4f", it) } ?: "Frame metadata",
                     onClick = {}
                 )
             }
@@ -241,20 +219,10 @@ fun AwbCalibrationSettingsScreen(
 
         SettingsCard(
             title = "Authority status",
-            description = "The fingerprint identifies the exact per-lens calibration state used by the runtime."
+            description = "The fingerprint identifies the exact per-lens AWB state used by the runtime."
         ) {
-            SettingValueRow(
-                title = "Calibration",
-                description = "Current per-lens AWB calibration state.",
-                value = settings.summary(),
-                onClick = {}
-            )
-            SettingValueRow(
-                title = "Fingerprint",
-                description = "Short hash of the persisted calibration values.",
-                value = settings.fingerprint(),
-                onClick = {}
-            )
+            SettingValueRow("Calibration", "Current per-lens AWB state.", settings.summary(), onClick = {})
+            SettingValueRow("Fingerprint", "Short hash of the persisted calibration values.", settings.fingerprint(), onClick = {})
         }
 
         Button(
@@ -265,5 +233,78 @@ fun AwbCalibrationSettingsScreen(
         ) {
             Text("Reset AWB calibration", color = Color.White, fontWeight = FontWeight.Bold)
         }
+    }
+
+    if (showPresetPicker) {
+        AwbPresetPickerDialog(
+            selectedPresetId = settings.presetId,
+            onDismiss = { showPresetPicker = false },
+            onSelected = { preset ->
+                binding.update(settings.copy(presetId = preset.id))
+                showPresetPicker = false
+            }
+        )
+    }
+}
+
+@Composable
+private fun AwbPresetPickerDialog(
+    selectedPresetId: Int,
+    onDismiss: () -> Unit,
+    onSelected: (BnCamAwbPreset) -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = Color(0xFF1E1E1E),
+        title = { Text("AWB preset", color = Color.White) },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 520.dp)
+                    .verticalScroll(rememberScrollState())
+            ) {
+                BnCamAwbPresetGroup.entries.forEach { group ->
+                    AwbPresetSectionHeader(group.sectionTitle)
+                    BnCamAwbPresetCatalog.inGroup(group).forEach { preset ->
+                        AwbPresetPickerRow(preset, preset.id == selectedPresetId, onSelected)
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel", color = Color.Gray) }
+        }
+    )
+}
+
+@Composable
+private fun AwbPresetSectionHeader(title: String) {
+    Text(
+        text = title,
+        color = AccentPistachio,
+        fontSize = 13.sp,
+        fontWeight = FontWeight.Medium,
+        modifier = Modifier.padding(start = 12.dp, top = 14.dp, bottom = 6.dp)
+    )
+}
+
+@Composable
+private fun AwbPresetPickerRow(
+    preset: BnCamAwbPreset,
+    selected: Boolean,
+    onSelected: (BnCamAwbPreset) -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onSelected(preset) }
+            .padding(horizontal = 12.dp, vertical = 11.dp)
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(preset.name, color = Color.White, fontSize = 14.sp)
+            Text(preset.description, color = Color.Gray, fontSize = 11.sp)
+        }
+        if (selected) Text("Selected", color = AccentPistachio, fontSize = 12.sp)
     }
 }

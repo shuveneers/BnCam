@@ -89,7 +89,7 @@ class CanonicalNoiseProfile(
 }
 
 /**
- * AGC-compatible parametric physical noise model in canonical R,Gr,Gb,B order.
+ * BnCam-compatible parametric physical noise model in canonical R,Gr,Gb,B order.
  * Coefficients may be negative; only resolved S/O are clamped to zero.
  */
 class ParametricNoiseModel(
@@ -190,8 +190,8 @@ class ResolvedNoiseModel internal constructor(
  *
  * OEM consumes Camera2 S/O directly.
  * SYSTEM, MANUAL and PRESET evaluate A/B/C/D exactly once. With Dynamic ISO disabled,
- * the model is evaluated at capture ISO. With Dynamic ISO enabled, the AGC transform
- * ISO_NM = trunc(50 + k * (ISO_capture - 50)) is applied first. AGC V12 converts this
+ * the model is evaluated at capture ISO. With Dynamic ISO enabled, the BnCam transform
+ * ISO_NM = trunc(50 + k * (ISO_capture - 50)) is applied first. BnCam converts this
  * positive intermediate to integer ISO before A/B/C/D evaluation; BnCam mirrors that exactly.
  */
 object NoiseModelResolver {
@@ -258,11 +258,11 @@ object NoiseModelResolver {
     }
 
     /**
-     * Exact AGC V12 Dynamic ISO transform for an enabled parametric model.
+     * Exact BnCam Dynamic ISO transform for an enabled parametric model.
      *
-     * AGC converts the positive transformed ISO to an integer before evaluating A/B/C/D. Kotlin
+     * BnCam converts the positive transformed ISO to an integer before evaluating A/B/C/D. Kotlin
      * Double.toInt() truncates toward zero; because this domain is non-negative, that is the same
-     * operation as AGC's integer conversion. Keep the public return type Double because the
+     * operation as BnCam's integer conversion. Keep the public return type Double because the
      * parametric equations are floating point, but the value itself is always an integer ISO.
      */
     fun effectiveNoiseModelIso(captureIso: Int, dynamicIsoCoefficient: Double): Double {

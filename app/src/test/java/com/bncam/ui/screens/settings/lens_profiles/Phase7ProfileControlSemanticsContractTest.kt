@@ -96,9 +96,9 @@ class Phase7ProfileControlSemanticsContractTest {
         val repository = source("src/main/java/com/bncam/data/settings/SettingsRepository.kt")
 
         assertTrue(lensUi.contains("title = \"AWB\""))
-        assertTrue(awbUi.contains("Sensor Auto"))
-        assertTrue(awbUi.contains("Custom GCam"))
-        assertTrue(awbUi.contains(".gawb"))
+        assertTrue(awbUi.contains("LensAwbCalibrationModes.AUTO"))
+        assertTrue(awbUi.contains("Custom Import"))
+        assertTrue(awbUi.contains("Import AWB calibration"))
         assertTrue(!catalog.contains("awb_reference_intensity"))
         assertTrue(!repository.contains("getProfileAwb"))
     }

@@ -32,7 +32,7 @@ class PhysicalNoiseStateTest {
         physicalAuthorityLocked = true,
         physicalNoiseRequestedSource = "PRESET",
         physicalNoiseEffectiveSource = "PRESET",
-        physicalNoiseProvenance = "AGC V12 preset 42",
+        physicalNoiseProvenance = "BnCam preset 42",
         physicalNoiseEffectiveModelIso = 1600.0,
         physicalNoiseDynamicIsoEnabled = true,
         physicalNoiseDynamicIsoCoefficient = 1.0,

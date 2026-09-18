@@ -788,7 +788,7 @@ class SettingsRepository(private val context: Context) {
     }
 
     // ==========================================
-    // 4. UNIVERSELE PIPELINE SETTINGS (De GCam logica)
+    // 4. UNIVERSELE PIPELINE SETTINGS (BnCam pipeline logic)
     // ==========================================
 
     fun getProfileFloat(profileId: String, settingKey: String, default: Float): Flow<Float> {

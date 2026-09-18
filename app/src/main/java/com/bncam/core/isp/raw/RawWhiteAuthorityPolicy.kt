@@ -22,12 +22,12 @@ data class RawWhiteAuthorityDecision(
 /**
  * Single selection policy for developed-RAW White Level authority.
  *
- * AUTO precedence intentionally improves on AGC V12's RAW10-capability heuristic:
+ * AUTO precedence is based on the active frame/domain rather than a RAW10-capability heuristic:
  *   1. valid same-frame CaptureResult.SENSOR_DYNAMIC_WHITE_LEVEL
  *   2. valid CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL
  *   3. no fabricated sensor white; caller must fail closed or use an explicitly non-sensor path
  *
- * MANUAL accepts only the AGC-compatible presets exposed by BnCam. Invalid manual input never
+ * MANUAL accepts only the explicit full-scale presets exposed by BnCam. Invalid manual input never
  * becomes an authority: valid Camera2 metadata is used as a safety fallback, otherwise authority
  * remains unavailable.
  *
@@ -60,7 +60,7 @@ object RawWhiteAuthorityPolicy {
             if (isSupportedManualWhite(manualWhiteLevel)) {
                 return RawWhiteAuthorityDecision(
                     sourceWhiteLevel = manualWhiteLevel,
-                    source = "MANUAL_OVERRIDE: BnCam AGC-compatible preset=$manualWhiteLevel",
+                    source = "MANUAL_OVERRIDE: BnCam full-scale preset=$manualWhiteLevel",
                     metadataAuthoritative = false,
                     fallbackReason = "none",
                     mode = requestedMode,

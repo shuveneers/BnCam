@@ -14,7 +14,7 @@ class WhiteLevelSettingsModelTest {
     }
 
     @Test
-    fun `all AGC compatible white presets remain exact`() {
+    fun `all BnCam full-scale white presets remain exact`() {
         val expected = listOf(1023, 4095, 16383, 65535)
         assertEquals(expected, WhiteLevelPresets.values.map { it.value })
 

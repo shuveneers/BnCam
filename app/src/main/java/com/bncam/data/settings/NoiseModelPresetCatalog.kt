@@ -6,7 +6,7 @@ import java.util.Base64
 
 enum class NoiseModelPresetOrigin {
     USER,
-    AGC_V12
+    BNCAM
 }
 
 data class NoiseModelPreset(
@@ -14,7 +14,9 @@ data class NoiseModelPreset(
     val displayName: String,
     val origin: NoiseModelPresetOrigin,
     val model: PersistedParametricNoiseModel,
-    val importedAtEpochMs: Long? = null
+    val importedAtEpochMs: Long? = null,
+    val group: NoiseModelPresetGroup? = null,
+    val description: String = ""
 ) {
     init {
         require(id.isNotBlank()) { "preset id must not be blank" }
@@ -37,16 +39,16 @@ object NoiseModelPresetCatalog {
                 compareByDescending<NoiseModelPreset> { it.importedAtEpochMs ?: Long.MIN_VALUE }
                     .thenBy { it.displayName.lowercase() }
             )
-        return users + AgcV12NoiseModelPresets.all
+        return users + BnCamNoiseModelPresets.all
     }
 
     fun resolve(id: String?, userPresets: List<NoiseModelPreset>): NoiseModelPreset? {
         if (id.isNullOrBlank()) return null
-        return userPresets.firstOrNull { it.id == id } ?: AgcV12NoiseModelPresets.find(id)
+        return userPresets.firstOrNull { it.id == id } ?: BnCamNoiseModelPresets.find(id)
     }
 }
 
-/** Parser for AGC/CameraITS C-style noise-model text files. */
+/** Parser for CameraITS-compatible C-style noise-model text files. */
 object NoiseModelPresetImportParser {
     private val arrayRegexes = mapOf(
         "A" to Regex("""(?is)static\s+double\s+noise_model_A\s*\[\s*]\s*=\s*\{(.*?)}\s*;"""),

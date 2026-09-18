@@ -769,12 +769,12 @@ object SensorCalibrationResolver {
             null
         }
         val resolvedLensAwbCalibration = lensAwbRuntime?.let { runtime ->
-            runCatching { GcamAwbCalibrationEngine.resolve(runtime.settings, characteristics) }.getOrNull()
+            runCatching { AwbCalibrationEngine.resolve(runtime.settings, characteristics) }.getOrNull()
         }
         val calibratedExactFrameAwb = if (
             systemAwbRequested && exactFrameCamera2Wb && resolvedLensAwbCalibration?.valid == true && lensAwbRuntime != null
         ) {
-            GcamAwbCalibrationEngine.applyToCamera2Prior(
+            AwbCalibrationEngine.applyToCamera2Prior(
                 camera2Gains = base.baseWbGains,
                 calibration = resolvedLensAwbCalibration,
                 settings = lensAwbRuntime.settings,
@@ -792,11 +792,11 @@ object SensorCalibrationResolver {
         }
         val requestedAwbSettings = lensAwbRuntime?.settings?.sanitized()
         val explicitLensAwbAuthority = requestedAwbSettings?.let(
-            GcamAwbCalibrationEngine::hasExplicitDevelopedAuthority
+            AwbCalibrationEngine::hasExplicitDevelopedAuthority
         ) == true
         val requestedAwbPreset = requestedAwbSettings
-            ?.takeIf { it.mode == com.bncam.data.settings.LensAwbCalibrationModes.AGC_PRESET }
-            ?.let { com.bncam.data.settings.AgcAwbPresetCatalog.byId(it.agcPresetId) }
+            ?.takeIf { it.mode == com.bncam.data.settings.LensAwbCalibrationModes.BNCAM_PRESET }
+            ?.let { com.bncam.data.settings.BnCamAwbPresetCatalog.byId(it.presetId) }
 
         // Lens Auto uses the single temporal owner's recent physical scene solution only when it
         // carries a coherent WB+CCM pair. Camera2 remains the exact-frame prior/fallback whenever
@@ -844,14 +844,14 @@ object SensorCalibrationResolver {
             liveManualWhiteBalance != null ->
                 "Live manual WB ${liveManualWhiteBalance.targetKelvin}K / ${liveManualWhiteBalance.illuminantModel} / Camera2 calibration matrices"
             explicitLensAwbAuthority && calibratedExactFrameAwb != null ->
-                "Lens ID explicit GCam AWB calibration ${calibratedExactFrameAwb.calibrationSource} " +
+                "Lens ID explicit AWB calibration ${calibratedExactFrameAwb.calibrationSource} " +
                     "authority=${String.format(Locale.US, "%.3f", calibratedExactFrameAwb.calibrationAuthority)} + Camera2 exact-frame CCM"
             stablePhysicalSystemAutoPair != null ->
                 "BnCam Lens AWB physical scene confidence=${String.format(Locale.US, "%.3f", stablePhysicalSystemAutoPair.confidence)} " +
                     "dataAuthority=${String.format(Locale.US, "%.3f", stablePhysicalSystemAutoPair.dataAuthority)} " +
                     "mixedLight=${String.format(Locale.US, "%.3f", stablePhysicalSystemAutoPair.mixedLightScore)}"
             calibratedExactFrameAwb != null ->
-                "Lens ID GCam AWB calibration ${calibratedExactFrameAwb.calibrationSource} " +
+                "Lens ID AWB calibration ${calibratedExactFrameAwb.calibrationSource} " +
                     "authority=${String.format(Locale.US, "%.3f", calibratedExactFrameAwb.calibrationAuthority)} + Camera2 exact-frame CCM"
             exactFrameCamera2ColorPair ->
                 "CaptureResult exact-frame color pair: COLOR_CORRECTION_GAINS + COLOR_CORRECTION_TRANSFORM"
@@ -1026,7 +1026,7 @@ object SensorCalibrationResolver {
             awbGreenEvenOddRatio = awbGreenEvenOddRatio,
             awbRuntimeSettingsReady = lensAwbRuntime?.settingsReady == true,
             awbRequestedMode = requestedAwbSettings?.mode ?: "UNAVAILABLE",
-            awbRequestedPresetId = requestedAwbSettings?.agcPresetId ?: -1,
+            awbRequestedPresetId = requestedAwbSettings?.presetId ?: -1,
             awbRequestedPresetName = requestedAwbPreset?.name ?: "UNAVAILABLE",
             awbRequestedRgCoefficient = requestedAwbSettings?.rgCoefficient ?: 1f,
             awbRequestedBgCoefficient = requestedAwbSettings?.bgCoefficient ?: 1f,

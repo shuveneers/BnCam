@@ -51,7 +51,7 @@ class PhysicalNoiseModelTest {
                 model = model(),
                 dynamicIsoEnabled = true,
                 dynamicIsoCoefficient = 0.30,
-                provenance = "AGC integer ISO parity"
+                provenance = "BnCam integer ISO parity"
             )
         )
 

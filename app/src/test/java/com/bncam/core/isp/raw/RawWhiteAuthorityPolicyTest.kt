@@ -62,7 +62,7 @@ class RawWhiteAuthorityPolicyTest {
     }
 
     @Test
-    fun `manual AGC preset wins over both metadata values`() {
+    fun `manual BnCam preset wins over both metadata values`() {
         val decision = RawWhiteAuthorityPolicy.resolve(
             dynamicWhiteLevel = 4000,
             staticWhiteLevel = 4095,
@@ -76,7 +76,7 @@ class RawWhiteAuthorityPolicyTest {
     }
 
     @Test
-    fun `every exposed AGC compatible preset is accepted exactly`() {
+    fun `every exposed BnCam full-scale preset is accepted exactly`() {
         listOf(1023, 4095, 16383, 65535).forEach { preset ->
             val decision = RawWhiteAuthorityPolicy.resolve(
                 dynamicWhiteLevel = 4000,

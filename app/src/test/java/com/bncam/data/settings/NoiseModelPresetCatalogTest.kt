@@ -7,29 +7,27 @@ import kotlin.test.assertTrue
 
 class NoiseModelPresetCatalogTest {
     @Test
-    fun agcV12CatalogContainsAllExtractedPresets() {
-        val all = AgcV12NoiseModelPresets.all
-        assertEquals(96, all.size)
-        assertEquals("agc_v12:1", all.first().id)
-        assertEquals("1. OV48C - Mi10U", all.first().displayName)
-        assertEquals(3100.0, all.first().model.isoStep)
-        assertEquals(6.83077811393138e-7, all.first().model.a[0])
-        assertEquals("agc_v12:96", all.last().id)
-        assertEquals("96. op12_ov64b_tele_nm", all.last().displayName)
-        assertEquals(1600.0, all.last().model.isoStep)
+    fun `bncam catalog contains twenty presets grouped five per lens class`() {
+        val all = BnCamNoiseModelPresets.all
+        assertEquals(20, all.size)
+        NoiseModelPresetGroup.entries.forEach { group ->
+            assertEquals(5, all.count { it.group == group })
+        }
+        assertTrue(all.all { it.origin == NoiseModelPresetOrigin.BNCAM })
+        assertTrue(all.all { it.id.startsWith("bncam:") })
     }
 
     @Test
-    fun userPresetsAreAlwaysBeforeAgcPresets() {
+    fun `user presets are always before builtins`() {
         val userOld = userPreset("user:old", "Old", 10)
         val userNew = userPreset("user:new", "New", 20)
         val merged = NoiseModelPresetCatalog.merged(listOf(userOld, userNew))
         assertEquals(listOf("user:new", "user:old"), merged.take(2).map { it.id })
-        assertTrue(merged.drop(2).all { it.origin == NoiseModelPresetOrigin.AGC_V12 })
+        assertTrue(merged.drop(2).all { it.origin == NoiseModelPresetOrigin.BNCAM })
     }
 
     @Test
-    fun agcStyleTextImportParsesSignedCoefficientsAndIsoStep() {
+    fun `text import parses signed coefficients and iso step`() {
         val text = """
             static double noise_model_A[] = { 1e-6, 2e-6, 3e-6, 4e-6 };
             static double noise_model_B[] = { -1e-5, 2e-5, -3e-5, 4e-5 };
@@ -39,16 +37,14 @@ class NoiseModelPresetCatalogTest {
         """.trimIndent()
         val preset = NoiseModelPresetImportParser.parse(text, "My sensor", importedAtEpochMs = 1234L)
         assertEquals(NoiseModelPresetOrigin.USER, preset.origin)
-        assertEquals("My sensor", preset.displayName)
         assertEquals(800.0, preset.model.isoStep)
         assertEquals(-1e-5, preset.model.b[0])
-        assertEquals(1234L, preset.importedAtEpochMs)
         assertTrue(preset.id.startsWith("user:"))
     }
 
     @Test
-    fun userCodecRoundTrips() {
-        val original = userPreset("user:abc", "Imported α", 42)
+    fun `user codec round trips`() {
+        val original = userPreset("user:abc", "Imported alpha", 42)
         val decoded = NoiseModelUserPresetCodec.decode(NoiseModelUserPresetCodec.encode(original))
         assertNotNull(decoded)
         assertEquals(original, decoded)

@@ -226,7 +226,7 @@ object OisResolver {
                     applied = true
                     reason = when {
                         !selectedLensSupportsOis ->
-                            "Hidden physical route: request standard OIS despite under-reported physical OIS capability; device GCam proves this HAL can report OIS ON with static has_ois=0"
+                            "Hidden physical route: request standard OIS despite under-reported physical OIS capability; validated device behavior shows this HAL can report OIS ON with static has_ois=0"
                         openedCameraSupportsStandardOis ->
                             "Opened logical camera standard OIS controls the selected physical output"
                         else ->

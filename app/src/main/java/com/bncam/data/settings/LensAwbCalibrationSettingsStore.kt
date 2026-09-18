@@ -52,11 +52,11 @@ class LensAwbCalibrationSettingsStore(private val context: Context) {
         if (schema < LENS_AWB_CALIBRATION_SCHEMA_VERSION) return null
         return LensAwbCalibrationSettings(
             schemaVersion = schema,
-            mode = preferences[keys.mode] ?: LensAwbCalibrationModes.SENSOR_AUTO,
+            mode = preferences[keys.mode] ?: LensAwbCalibrationModes.AUTO,
             rgCoefficient = preferences[keys.rgCoeff] ?: 1.0f,
             bgCoefficient = preferences[keys.bgCoeff] ?: 1.0f,
             greenSplitMode = preferences[keys.greenMode] ?: LensAwbGreenSplitModes.AUTO,
-            agcPresetId = preferences[keys.agcPresetId] ?: 0,
+            presetId = preferences[keys.presetId] ?: 0,
             manualGrGbRatio = preferences[keys.manualGrGb] ?: 1.0f,
             importedName = preferences[keys.importedName] ?: "",
             importedFormat = preferences[keys.importedFormat] ?: "",
@@ -72,7 +72,7 @@ class LensAwbCalibrationSettingsStore(private val context: Context) {
         preferences[keys.rgCoeff] = safe.rgCoefficient
         preferences[keys.bgCoeff] = safe.bgCoefficient
         preferences[keys.greenMode] = safe.greenSplitMode
-        preferences[keys.agcPresetId] = safe.agcPresetId
+        preferences[keys.presetId] = safe.presetId
         preferences[keys.manualGrGb] = safe.manualGrGbRatio
         preferences[keys.importedName] = safe.importedName
         preferences[keys.importedFormat] = safe.importedFormat
@@ -88,7 +88,7 @@ class LensAwbCalibrationSettingsStore(private val context: Context) {
             rgCoeff = floatPreferencesKey("${base}rg_coeff"),
             bgCoeff = floatPreferencesKey("${base}bg_coeff"),
             greenMode = stringPreferencesKey("${base}green_mode"),
-            agcPresetId = intPreferencesKey("${base}agc_preset_id"),
+            presetId = intPreferencesKey("${base}preset_id"),
             manualGrGb = floatPreferencesKey("${base}manual_grgb"),
             importedName = stringPreferencesKey("${base}import_name"),
             importedFormat = stringPreferencesKey("${base}import_format"),
@@ -97,17 +97,17 @@ class LensAwbCalibrationSettingsStore(private val context: Context) {
         )
     }
 
-    private fun encodePoints(points: List<GcamAwbCalibrationPoint>): String =
+    private fun encodePoints(points: List<AwbCalibrationPoint>): String =
         points.joinToString(";") { "${it.rgRatio},${it.bgRatio}" }
 
-    private fun decodePoints(raw: String): List<GcamAwbCalibrationPoint> = raw
+    private fun decodePoints(raw: String): List<AwbCalibrationPoint> = raw
         .split(';')
         .mapNotNull { token ->
             val values = token.split(',')
             if (values.size != 2) return@mapNotNull null
             val rg = values[0].trim().toFloatOrNull() ?: return@mapNotNull null
             val bg = values[1].trim().toFloatOrNull() ?: return@mapNotNull null
-            GcamAwbCalibrationPoint(rg, bg).sanitizedOrNull()
+            AwbCalibrationPoint(rg, bg).sanitizedOrNull()
         }
         .take(LensAwbCalibrationSettings.MAX_POINTS)
 
@@ -117,7 +117,7 @@ class LensAwbCalibrationSettingsStore(private val context: Context) {
         val rgCoeff: Preferences.Key<Float>,
         val bgCoeff: Preferences.Key<Float>,
         val greenMode: Preferences.Key<String>,
-        val agcPresetId: Preferences.Key<Int>,
+        val presetId: Preferences.Key<Int>,
         val manualGrGb: Preferences.Key<Float>,
         val importedName: Preferences.Key<String>,
         val importedFormat: Preferences.Key<String>,

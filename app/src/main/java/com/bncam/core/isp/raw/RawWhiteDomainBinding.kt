@@ -9,7 +9,7 @@ import com.bncam.data.settings.WhiteLevelRuntimeRegistry
  * Binds the one developed-RAW White Level authority to a resolved [RawDomainContract].
  *
  * Physical/native/payload white values remain untouched for DNG and RAW16 semantics. Only the
- * developed JPEG/noise normalization white is replaced. Manual AGC/GCam presets are exact
+ * developed JPEG/noise normalization white is replaced. Manual BnCam full-scale presets are exact
  * developed-domain white code values; they are not remapped to the physical DNG payload white.
  */
 object RawWhiteDomainBinding {
@@ -50,7 +50,7 @@ object RawWhiteDomainBinding {
         val selected = decision.sourceWhiteLevel
             ?: throw SensorAuthorityUnavailableException("UNSAFE_TO_PROCESS:WHITE_LEVEL_UNAVAILABLE")
 
-        // AGC/GCam manual presets patch the engine white-level metadata as literal code values.
+        // Manual BnCam presets patch the developed engine white-level authority as literal code values.
         // Keep the selected value literal in the developed RAW domain. Physical RAW10 canonicalization
         // may still expand its payload to a different white level, but that DNG/master contract must
         // not neutralize the manual developed override by scaling it back to physical full-scale.

@@ -6,7 +6,7 @@ import androidx.datastore.preferences.core.stringSetPreferencesKey
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 
-/** Global user-imported preset catalog. Built-in AGC presets are code-backed and never persisted. */
+/** Global user-imported preset catalog. Built-in BnCam presets are code-backed and never persisted. */
 class PhysicalNoiseModelPresetStore(private val context: Context) {
     private val userPresetsKey = stringSetPreferencesKey("physical_noise_user_presets_v1")
 

@@ -193,8 +193,8 @@ class PhysicalNoiseModelSettingsStore(private val context: Context) {
     /**
      * The legacy coefficient fed SensorNoiseCalibrationMapper and native IspCore's
      * `dynamicUserGain`. New Dynamic ISO is already consumed when resolving physical A/B/C/D.
-     * Force the retired carrier to neutral zero so 0.30 in the new UI means exactly one AGC-style
-     * 0.30 transform, not an AGC transform plus a second SPECTRA authority boost.
+     * Force the retired carrier to neutral zero so 0.30 in the new UI means exactly one Dynamic ISO
+     * transform, not the BnCam transform plus a second SPECTRA authority boost.
      */
     private fun retireLegacyDynamicIsoRuntimeCarrier(
         preferences: MutablePreferences,

@@ -5,7 +5,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
-class GcamOisParitySourceContractTest {
+class OisParitySourceContractTest {
     private fun source(path: String): String = File(path).readText()
 
     @Test
