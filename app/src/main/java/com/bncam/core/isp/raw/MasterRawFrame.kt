@@ -152,6 +152,12 @@ class MasterRawFrame(
             "RawDomainContract Source Format" to rawFrameInfo.sourceFormat.name,
             "RawDomainContract Native BL/WL" to "${rawFrameInfo.nativeBlackLevels} / ${rawFrameInfo.nativeWhiteLevel}",
             "RawDomainContract Payload BL/WL" to "${rawFrameInfo.payloadBlackLevels} / ${rawFrameInfo.payloadWhiteLevel}",
+            "RawDomainContract Developed White" to rawFrameInfo.developedRawWhiteLevel.toString(),
+            "RawDomainContract Developed White Source" to rawFrameInfo.developedRawWhiteLevelSource,
+            "RawDomainContract Developed White Metadata Authoritative" to rawFrameInfo.developedWhiteMetadataAuthoritative.toString(),
+            "RawDomainContract Developed White Manual Override" to rawFrameInfo.developedWhiteManualOverrideUsed.toString(),
+            "RawDomainContract Developed White Fallback" to rawFrameInfo.developedWhiteFallbackReason,
+            "RawDomainContract Developed White Scale" to rawFrameInfo.developedWhiteScaleFactor.toString(),
             "RawDomainContract Storage Alignment" to "${rawFrameInfo.sourceStorageAlignment} -> ${rawFrameInfo.masterStorageAlignment}",
             "RawDomainContract Sample Transform" to rawFrameInfo.sampleTransform.name,
             "RawDomainContract Lens Shading State" to rawFrameInfo.lensShadingState.name,
@@ -256,14 +262,17 @@ object RawMasterBuilder {
             cfaPattern = qualityConfig.cfaPattern
         )?.withPhysicalNoiseAuthority()
             ?.withSpectraNoiseAdapter()
-        val initialContract = RawBlackDomainBinding.bindForQualityConfig(
-            contract = RawDomainContractResolver.resolve(
-                lensId = lensId,
-                sourceFormat = sourceFormat,
-                width = width,
-                height = height,
-                characteristics = characteristics,
-                captureResult = captureResult,
+        val initialContract = RawWhiteDomainBinding.bindForQualityConfig(
+            contract = RawBlackDomainBinding.bindForQualityConfig(
+                contract = RawDomainContractResolver.resolve(
+                    lensId = lensId,
+                    sourceFormat = sourceFormat,
+                    width = width,
+                    height = height,
+                    characteristics = characteristics,
+                    captureResult = captureResult,
+                    qualityConfig = qualityConfig
+                ),
                 qualityConfig = qualityConfig
             ),
             qualityConfig = qualityConfig
@@ -275,6 +284,8 @@ object RawMasterBuilder {
                 characteristics = characteristics,
                 payloadWhiteLevel = initialContract.payloadWhiteLevel,
                 payloadBlackLevels = initialContract.payloadBlackLevelsIntArray(),
+                developedWhiteLevel = initialContract.developedRawWhiteLevel,
+                developedBlackLevels = RawBlackDomainBinding.developedMosaicRounded(initialContract).toIntArray(),
                 maxFramesCap = selectedCap,
                 maxShiftPixels = maxShiftPixels,
                 alignmentStrictness = alignmentStrictness,
@@ -288,6 +299,8 @@ object RawMasterBuilder {
                 characteristics = characteristics,
                 payloadWhiteLevel = initialContract.payloadWhiteLevel,
                 payloadBlackLevels = initialContract.payloadBlackLevelsIntArray(),
+                developedWhiteLevel = initialContract.developedRawWhiteLevel,
+                developedBlackLevels = RawBlackDomainBinding.developedMosaicRounded(initialContract).toIntArray(),
                 maxFramesCap = selectedCap,
                 maxShiftPixels = maxShiftPixels,
                 alignmentStrictness = alignmentStrictness,
@@ -318,8 +331,9 @@ object RawMasterBuilder {
                 else -> error("RawMasterBuilder only accepts RAW10 or RAW_SENSOR")
             }
 
-            val rawDomainContract = RawBlackDomainBinding.bindForQualityConfig(
-                contract = RawDomainContractResolver.resolve(
+            val rawDomainContract = RawWhiteDomainBinding.bindForQualityConfig(
+                contract = RawBlackDomainBinding.bindForQualityConfig(
+                    contract = RawDomainContractResolver.resolve(
                     lensId = lensId,
                     sourceFormat = sourceFormat,
                     width = outputWidth,
@@ -328,6 +342,8 @@ object RawMasterBuilder {
                     captureResult = captureResult,
                     qualityConfig = qualityConfig,
                     dngMergeStats = dngMergeStats
+                    ),
+                    qualityConfig = qualityConfig
                 ),
                 qualityConfig = qualityConfig
             )

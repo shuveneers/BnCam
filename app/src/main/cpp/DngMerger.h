@@ -34,8 +34,10 @@ struct DngMergeStats {
     int whiteLevel = 0;
     int inputNativeWhiteLevel = 0;
     int payloadWhiteLevel = 0;
+    int developedWhiteLevel = 0;
     std::string inputNativeBlackLevels = "unknown";
     std::string payloadBlackLevels = "unknown";
+    std::string developedBlackLevels = "unknown";
     float payloadScaleFactor = 1.0f;
     uint16_t raw16Min = 0;
     uint16_t raw16P01 = 0;
@@ -227,6 +229,8 @@ jobject mergeRaw10DngToRaw16(
         jint cfaPattern,
         jint whiteLevel,
         const std::vector<int32_t>& blackLevels,
+        jint developedWhiteLevel,
+        const std::vector<int32_t>& developedBlackLevels,
         jint maxFramesCap,
         jint maxShiftPixels,
         jfloat alignmentStrictness,
@@ -250,6 +254,8 @@ jobject mergeRawSensorDngToRaw16(
         jint cfaPattern,
         jint whiteLevel,
         const std::vector<int32_t>& blackLevels,
+        jint developedWhiteLevel,
+        const std::vector<int32_t>& developedBlackLevels,
         jint maxFramesCap,
         jint maxShiftPixels,
         jfloat alignmentStrictness,

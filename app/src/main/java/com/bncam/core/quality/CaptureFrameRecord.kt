@@ -27,7 +27,8 @@ data class CaptureFrameRecord(
     val noiseModel: NoiseModelRecord,
     val frameBlackLevels: FloatArray, // Preserved as floating-point channel values
     val frameBlackLevelSource: String,
-    val frameWhiteLevel: Int,        // Preserved losslessly as Int
+    /** Same-frame/static Camera2 sensor saturation authority; null when the HAL reports none. */
+    val frameWhiteLevel: Int?,
     val frameWhiteLevelSource: String,
     val colorCorrectionGains: FloatArray?,     // From CaptureResult.COLOR_CORRECTION_GAINS
     val colorCorrectionTransform: FloatArray?, // 3x3 array from CaptureResult.COLOR_CORRECTION_TRANSFORM

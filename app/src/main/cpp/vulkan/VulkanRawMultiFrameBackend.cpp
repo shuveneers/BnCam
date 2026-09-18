@@ -398,7 +398,8 @@ RawMultiFrameResult VulkanRawMultiFrameBackend::execute(
     out.failureReason="VMA_HEADER_NOT_AVAILABLE"; return out;
 #else
     if (device==VK_NULL_HANDLE || computeQueue==VK_NULL_HANDLE || commandPool==VK_NULL_HANDLE || request.frames.size()<2u ||
-        request.cropWidth<16u || request.cropHeight<16u || request.nativeWhite==0u || request.payloadWhite==0u) {
+        request.cropWidth<16u || request.cropHeight<16u || request.nativeWhite==0u ||
+        request.payloadWhite==0u || request.developedWhite==0u) {
         out.failureReason="RAW_MULTIFRAME_REQUEST_INVALID"; return out;
     }
     std::lock_guard<std::mutex> lock(mutex_);
@@ -611,12 +612,14 @@ RawMultiFrameResult VulkanRawMultiFrameBackend::execute(
     const std::uint64_t defaultStaticBytes=sizeof(float), defaultStatsBytes=sizeof(float)*4u;
     if(!ensureBufferLocked(allocator_,defaultStaticBytes,true,staticField_,out.failureReason)||!ensureBufferLocked(allocator_,defaultStatsBytes,true,fusionStats_,out.failureReason))return out;
     *static_cast<float*>(staticField_.mapped)=0.0f; vmaFlushAllocation(allocator_,staticField_.allocation,0,defaultStaticBytes);
+    const std::uint32_t fusionWhite = request.spectra.enabled ? request.developedWhite : request.payloadWhite;
+    const auto& fusionBlack = request.spectra.enabled ? request.developedBlack : request.payloadBlack;
     auto* initParams=static_cast<std::uint32_t*>(fusionParams_.mapped);std::fill(initParams,initParams+48u,0u);
     auto initPutF=[&](std::uint32_t idx,float v){std::uint32_t u;std::memcpy(&u,&v,sizeof(u));initParams[idx]=u;};
     initParams[0]=request.cropWidth;initParams[1]=request.cropHeight;initParams[4]=request.cfaPattern;initParams[5]=request.spectra.enabled?1u:0u;
-    initPutF(12,std::clamp(request.alignmentStrictness,0.0f,1.0f));initPutF(13,static_cast<float>(request.payloadWhite));
+    initPutF(12,std::clamp(request.alignmentStrictness,0.0f,1.0f));initPutF(13,static_cast<float>(fusionWhite));
     initPutF(15,request.spectra.confidence);initPutF(16,request.spectra.temporalAuthority);initPutF(17,1.0f);initPutF(18,1.0f);
-    for(int ch=0;ch<4;++ch){initPutF(20+ch,static_cast<float>(request.payloadBlack[ch]));initPutF(24+ch,static_cast<float>(request.spectra.effectiveS[ch]));initPutF(28+ch,static_cast<float>(request.spectra.effectiveO[ch]));initPutF(32+ch,1.0f);initPutF(36+ch,1.0f);}
+    for(int ch=0;ch<4;++ch){initPutF(20+ch,static_cast<float>(fusionBlack[ch]));initPutF(24+ch,static_cast<float>(request.spectra.effectiveS[ch]));initPutF(28+ch,static_cast<float>(request.spectra.effectiveO[ch]));initPutF(32+ch,1.0f);initPutF(36+ch,1.0f);}
     initParams[40]=request.computationalHdr?1u:0u;initPutF(41,1.0f);initPutF(42,1.0f);initPutF(43,1.0f);
     vmaFlushAllocation(allocator_,fusionParams_.allocation,0,48u*sizeof(std::uint32_t));
     updateFusionDescriptors(defaultStaticBytes,defaultStatsBytes);
@@ -682,8 +685,8 @@ RawMultiFrameResult VulkanRawMultiFrameBackend::execute(
                 : 0.25f;
         if(request.spectra.enabled){
             SpectraTemporalObserverRequest orq{};orq.anchorWidth=request.cropWidth;orq.anchorHeight=request.cropHeight;orq.supportWidth=request.cropWidth;orq.supportHeight=request.cropHeight;orq.residentAnchorRaw16Buffer=anchor_.buffer;orq.residentSupportRaw16Buffer=support_.buffer;
-            orq.applyDx=fwd.applyDx;orq.applyDy=fwd.applyDy;orq.strictness=std::clamp(request.alignmentStrictness,0.0f,1.0f);const double minR=0.03+0.07*orq.strictness;orq.alignmentConfidence=static_cast<float>(std::clamp((fwd.response-minR)/std::max(1.0e-6,0.35-minR),0.0,1.0));orq.forwardBackwardConsistency=fb;orq.whiteLevel=static_cast<int>(request.payloadWhite);
-            for(int ch=0;ch<4;++ch)orq.blackLevels[ch]=static_cast<int>(request.payloadBlack[ch]);orq.cfaPattern=static_cast<int>(request.cfaPattern);orq.effectiveS=request.spectra.effectiveS;orq.effectiveO=request.spectra.effectiveO;orq.modelConfidence=request.spectra.confidence;orq.temporalAuthority=request.spectra.temporalAuthority;
+            orq.applyDx=fwd.applyDx;orq.applyDy=fwd.applyDy;orq.strictness=std::clamp(request.alignmentStrictness,0.0f,1.0f);const double minR=0.03+0.07*orq.strictness;orq.alignmentConfidence=static_cast<float>(std::clamp((fwd.response-minR)/std::max(1.0e-6,0.35-minR),0.0,1.0));orq.forwardBackwardConsistency=fb;orq.whiteLevel=static_cast<int>(request.developedWhite);
+            for(int ch=0;ch<4;++ch)orq.blackLevels[ch]=static_cast<int>(request.developedBlack[ch]);orq.cfaPattern=static_cast<int>(request.cfaPattern);orq.effectiveS=request.spectra.effectiveS;orq.effectiveO=request.spectra.effectiveO;orq.modelConfidence=request.spectra.confidence;orq.temporalAuthority=request.spectra.temporalAuthority;
             obs=observer.execute(physicalDevice,device,computeQueue,commandPool,allocatorOwner,orq);out.observerGpuMs+=obs.totalMs;out.compactGpuReadbackBytes+=obs.compactReadbackBytes;
             if(obs.submissionMayRemainInFlight) out.submissionMayRemainInFlight=true;
             if(!obs.success){out.failureReason="RAW_MULTIFRAME_TEMPORAL_OBSERVER_FAILED_"+obs.failureReason;out.totalMs=elapsedMs(totalStart);return out;}
@@ -704,8 +707,8 @@ RawMultiFrameResult VulkanRawMultiFrameBackend::execute(
         if(field.valid())std::memcpy(staticField_.mapped,field.values.data(),field.values.size()*sizeof(float));else *static_cast<float*>(staticField_.mapped)=0.0f;vmaFlushAllocation(allocator_,staticField_.allocation,0,staticBytes);
         auto* p=static_cast<std::uint32_t*>(fusionParams_.mapped);std::fill(p,p+48u,0u);auto putF=[&](std::uint32_t idx,float v){std::uint32_t u;std::memcpy(&u,&v,sizeof(u));p[idx]=u;};
         p[0]=request.cropWidth;p[1]=request.cropHeight;p[2]=static_cast<std::uint32_t>(fwd.applyDx);p[3]=static_cast<std::uint32_t>(fwd.applyDy);p[4]=request.cfaPattern;p[5]=request.spectra.enabled?1u:0u;p[6]=field.valid()?static_cast<std::uint32_t>(field.columns):0u;p[7]=field.valid()?static_cast<std::uint32_t>(field.rows):0u;p[8]=field.valid()?static_cast<std::uint32_t>(field.cellSize):0u;p[9]=sampleStride;p[10]=sampleCols;p[11]=sampleRows;
-        putF(12,std::clamp(request.alignmentStrictness,0.0f,1.0f));putF(13,static_cast<float>(request.payloadWhite));putF(14,supportWeight);putF(15,request.spectra.confidence);putF(16,request.spectra.temporalAuthority);putF(17,request.spectra.enabled?obs.motionConfidence:1.0f);putF(18,fb);putF(19,request.spectra.enabled?obs.meanTemporalCorrelation:0.0f);
-        for(int ch=0;ch<4;++ch){putF(20+ch,static_cast<float>(request.payloadBlack[ch]));putF(24+ch,static_cast<float>(request.spectra.effectiveS[ch]));putF(28+ch,static_cast<float>(request.spectra.effectiveO[ch]));putF(32+ch,1.0f);putF(36+ch,1.0f);} // slots 32..39 are legacy ABI padding; frozen physical S/O is never adapted.
+        putF(12,std::clamp(request.alignmentStrictness,0.0f,1.0f));putF(13,static_cast<float>(fusionWhite));putF(14,supportWeight);putF(15,request.spectra.confidence);putF(16,request.spectra.temporalAuthority);putF(17,request.spectra.enabled?obs.motionConfidence:1.0f);putF(18,fb);putF(19,request.spectra.enabled?obs.meanTemporalCorrelation:0.0f);
+        for(int ch=0;ch<4;++ch){putF(20+ch,static_cast<float>(fusionBlack[ch]));putF(24+ch,static_cast<float>(request.spectra.effectiveS[ch]));putF(28+ch,static_cast<float>(request.spectra.effectiveO[ch]));putF(32+ch,1.0f);putF(36+ch,1.0f);} // slots 32..39 are legacy ABI padding; frozen physical S/O is never adapted.
         p[40]=request.computationalHdr?1u:0u;putF(41,exposureScale);putF(42,sr.hdrHighlightAuthority?1.0f:0.0f);putF(43,sr.hdrShadowAuthority?1.0f:0.0f);
         vmaFlushAllocation(allocator_,fusionParams_.allocation,0,48u*sizeof(std::uint32_t));updateFusionDescriptors(staticBytes,statsBytes);
         auto* supportStatsWords = static_cast<std::uint32_t*>(finalStats_.mapped);

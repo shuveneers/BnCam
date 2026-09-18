@@ -770,7 +770,7 @@ object ImageUtils {
                 sensorBlackLevelPattern = domainInfo.sensorBlackLevelPattern,
                 sensorDynamicBlackLevel = domainInfo.sensorDynamicBlackLevel,
                 chosenBlackLevelSource = domainInfo.developedRawBlackLevelSource,
-                chosenWhiteLevelSource = domainInfo.chosenWhiteLevelSource,
+                chosenWhiteLevelSource = domainInfo.developedRawWhiteLevelSource,
                 sourceBitDepth = domainInfo.sourceBitDepth,
                 effectiveSourceRange = domainInfo.effectiveSourceRange,
                 masterStorageScale = domainInfo.masterStorageScale,
@@ -1003,7 +1003,9 @@ object ImageUtils {
         finalCalibration: FinalSensorCalibration? = null,
         fuseSupportFrames: Boolean = true,
         exposureScaleToAnchor: FloatArray = FloatArray(buffers.size) { 1f },
-        computationalHdr: Boolean = false
+        computationalHdr: Boolean = false,
+        developedWhiteLevel: Int = payloadWhiteLevel,
+        developedBlackLevels: IntArray = payloadBlackLevels
     ): NativeRaw16Buffer? {
         val physicalTemporalNoise = finalCalibration.toPhysicalTemporalNoisePayload()
         return createNativeRaw16Buffer(
@@ -1013,15 +1015,19 @@ object ImageUtils {
             characteristics = characteristics,
             payloadWhiteLevel = payloadWhiteLevel,
             payloadBlackLevels = payloadBlackLevels,
+            developedWhiteLevel = developedWhiteLevel,
+            developedBlackLevels = developedBlackLevels,
             maxFramesCap = maxFramesCap,
             frameExposureScales = exposureScaleToAnchor
-        ) { selected, selectedExposureScales, cfa, whiteLevel, blackLevels, crop ->
+        ) { selected, selectedExposureScales, cfa, whiteLevel, blackLevels, developedWhite, developedBlack, crop ->
         mergeNativeRaw10DirectRaw16(
             lensId = lensId,
             buffers = selected,
             cfaPattern = cfa,
             whiteLevel = whiteLevel,
             blackLevelArray = blackLevels,
+            developedWhiteLevel = developedWhite,
+            developedBlackLevelArray = developedBlack,
             sourceCrop = crop,
             maxFramesCap = maxFramesCap.coerceAtLeast(1),
             maxShiftPixels = maxShiftPixels,
@@ -1046,7 +1052,9 @@ object ImageUtils {
         finalCalibration: FinalSensorCalibration? = null,
         fuseSupportFrames: Boolean = true,
         exposureScaleToAnchor: FloatArray = FloatArray(buffers.size) { 1f },
-        computationalHdr: Boolean = false
+        computationalHdr: Boolean = false,
+        developedWhiteLevel: Int = payloadWhiteLevel,
+        developedBlackLevels: IntArray = payloadBlackLevels
     ): NativeRaw16Buffer? {
         val physicalTemporalNoise = finalCalibration.toPhysicalTemporalNoisePayload()
         return createNativeRaw16Buffer(
@@ -1056,15 +1064,19 @@ object ImageUtils {
             characteristics = characteristics,
             payloadWhiteLevel = payloadWhiteLevel,
             payloadBlackLevels = payloadBlackLevels,
+            developedWhiteLevel = developedWhiteLevel,
+            developedBlackLevels = developedBlackLevels,
             maxFramesCap = maxFramesCap,
             frameExposureScales = exposureScaleToAnchor
-        ) { selected, selectedExposureScales, cfa, whiteLevel, blackLevels, crop ->
+        ) { selected, selectedExposureScales, cfa, whiteLevel, blackLevels, developedWhite, developedBlack, crop ->
         mergeNativeRawSensorDirectRaw16(
             lensId = lensId,
             buffers = selected,
             cfaPattern = cfa,
             whiteLevel = whiteLevel,
             blackLevelArray = blackLevels,
+            developedWhiteLevel = developedWhite,
+            developedBlackLevelArray = developedBlack,
             sourceCrop = crop,
             maxFramesCap = maxFramesCap.coerceAtLeast(1),
             maxShiftPixels = maxShiftPixels,
@@ -1084,9 +1096,11 @@ object ImageUtils {
         characteristics: CameraCharacteristics,
         payloadWhiteLevel: Int,
         payloadBlackLevels: IntArray,
+        developedWhiteLevel: Int,
+        developedBlackLevels: IntArray,
         maxFramesCap: Int,
         frameExposureScales: FloatArray,
-        nativeMerge: (Array<HardwareBuffer>, FloatArray, Int, Int, IntArray, IntArray) -> ByteBuffer?
+        nativeMerge: (Array<HardwareBuffer>, FloatArray, Int, Int, IntArray, Int, IntArray, IntArray) -> ByteBuffer?
     ): NativeRaw16Buffer? {
         val selectedCount = minOf(buffers.size, maxFramesCap.coerceAtLeast(1))
         val selected = buffers.takeLast(selectedCount).toTypedArray()
@@ -1144,8 +1158,23 @@ object ImageUtils {
                 baseBlackLevels[sourceSite]
             }
         }
+        val developedWhite = developedWhiteLevel.coerceIn(1, 65535)
+        val baseDevelopedBlack = developedBlackLevels.takeIf { it.size >= 4 } ?: localBlackLevels
+        val localDevelopedBlack = if (phaseMask == 0) {
+            baseDevelopedBlack
+        } else {
+            IntArray(4) { localSite ->
+                val localX = localSite and 1
+                val localY = (localSite shr 1) and 1
+                val sourceSite = ((localY xor phaseY) shl 1) or (localX xor phaseX)
+                baseDevelopedBlack[sourceSite]
+            }
+        }
         return invokeNativeSafely(route) {
-            val directBuffer = nativeMerge(selected, selectedExposureScales, localCfa, whiteLevel, localBlackLevels, crop)
+            val directBuffer = nativeMerge(
+                selected, selectedExposureScales, localCfa, whiteLevel, localBlackLevels,
+                developedWhite, localDevelopedBlack, crop
+            )
                 ?: return@invokeNativeSafely null
             val byteCount = directBuffer.capacity()
             val expectedBytes = cropWidth.toLong() * cropHeight.toLong() * 2L
@@ -1350,6 +1379,8 @@ object ImageUtils {
         cfaPattern: Int,
         whiteLevel: Int,
         blackLevelArray: IntArray,
+        developedWhiteLevel: Int,
+        developedBlackLevelArray: IntArray,
         sourceCrop: IntArray,
         maxFramesCap: Int,
         maxShiftPixels: Int,
@@ -1367,6 +1398,8 @@ object ImageUtils {
         cfaPattern: Int,
         whiteLevel: Int,
         blackLevelArray: IntArray,
+        developedWhiteLevel: Int,
+        developedBlackLevelArray: IntArray,
         sourceCrop: IntArray,
         maxFramesCap: Int,
         maxShiftPixels: Int,

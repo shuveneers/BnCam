@@ -986,6 +986,9 @@ class MultiFrameRunner(
                                 built.debugPairs().forEach { (key, value) ->
                                     shotLogger.recordPipelineEvent(debugGroup, key, value)
                                 }
+                                built.rawFrameInfo.whiteAuthorityDebugPairs().forEach { (key, value) ->
+                                    shotLogger.recordPipelineEvent("White Level Authority", key, value)
+                                }
                                 built.warnings().forEach { warning ->
                                     shotLogger.recordWarning(debugGroup, warning, "WARN")
                                 }

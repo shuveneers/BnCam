@@ -2278,6 +2278,13 @@ class ShotLogger(
         kv("White level applied yes/no", whiteApplied)
         kv("White level applied domain", whiteDomain)
 
+        appendLine()
+        line("  White Level Authority:")
+        writeEventsOrEmpty(
+            "White Level Authority",
+            "No developed White Level authority telemetry was recorded."
+        )
+
         kv("Color matrix source", colorSource)
         kv("Color matrix applied yes/no", colorApplied)
 

@@ -356,7 +356,19 @@ class WarmBufferPairingCoordinator(
         val rawBlacks = result.get(CaptureResult.SENSOR_DYNAMIC_BLACK_LEVEL)
         val blackLevels = rawBlacks ?: floatArrayOf(64f, 64f, 64f, 64f)
 
-        val whiteLevel = characteristics.get(CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL) ?: 1023
+        // Preserve the actual sensor/frame authority. RAW10's storage ceiling (1023) is a format
+        // fact, not a substitute for missing sensor saturation metadata, and RAW_SENSOR's 16-bit
+        // container is likewise not proof that the physical white point is 65535.
+        val dynamicWhiteLevel = result.get(CaptureResult.SENSOR_DYNAMIC_WHITE_LEVEL)
+            ?.takeIf { it > 0 }
+        val staticWhiteLevel = characteristics.get(CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL)
+            ?.takeIf { it > 0 }
+        val whiteLevel = dynamicWhiteLevel ?: staticWhiteLevel
+        val whiteLevelSource = when {
+            dynamicWhiteLevel != null -> "CaptureResult.SENSOR_DYNAMIC_WHITE_LEVEL"
+            staticWhiteLevel != null -> "CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL"
+            else -> "unavailable"
+        }
         val iso = result.get(CaptureResult.SENSOR_SENSITIVITY) ?: 100
         val expNs = result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 10_000_000L
 
@@ -380,7 +392,7 @@ class WarmBufferPairingCoordinator(
             frameBlackLevels = blackLevels,
             frameBlackLevelSource = if (rawBlacks != null) "CaptureResult.SENSOR_DYNAMIC_BLACK_LEVEL" else "Format Fallback",
             frameWhiteLevel = whiteLevel,
-            frameWhiteLevelSource = "CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL",
+            frameWhiteLevelSource = whiteLevelSource,
             colorCorrectionGains = result.get(CaptureResult.COLOR_CORRECTION_GAINS)?.let { floatArrayOf(it.red, it.greenEven, it.greenOdd, it.blue) },
             colorCorrectionTransform = result.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)?.let { RawColorTransformEngine.colorSpaceTransformToArray(it) },
             neutralColorPoint = neutralDoubles,

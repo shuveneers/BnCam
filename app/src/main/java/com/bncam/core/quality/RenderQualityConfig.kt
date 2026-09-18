@@ -3,7 +3,6 @@ package com.bncam.core.quality
 import android.graphics.ImageFormat
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CaptureResult
-import android.hardware.camera2.params.BlackLevelPattern
 import com.bncam.core.engine.CaptureStrategy
 import com.bncam.data.settings.ResolvedLensHardwareSettings
 import com.bncam.data.settings.SettingsRepository
@@ -789,61 +788,6 @@ data class RenderQualityConfig(
             )
         }
 
-        private data class EffectiveRawLevels(
-            val blackLevels: List<Int>,
-            val whiteLevel: Int,
-            val scaledToRaw10: Boolean,
-            val note: String
-        )
-
-        private fun readBlackLevelPattern(pattern: BlackLevelPattern?): List<Int> {
-            fun offset(column: Int, row: Int): Int = try {
-                pattern?.getOffsetForIndex(column, row) ?: 64
-            } catch (_: Throwable) {
-                64
-            }
-            return listOf(
-                offset(0, 0),
-                offset(1, 0),
-                offset(0, 1),
-                offset(1, 1)
-            )
-        }
-
-        private fun resolveEffectiveRawLevels(
-            frameSourceFormat: Int,
-            reportedBlackLevels: List<Int>,
-            reportedWhiteLevel: Int?
-        ): EffectiveRawLevels {
-            val fallbackWhite = if (frameSourceFormat == ImageFormat.RAW_SENSOR) 65535 else 1023
-            val reportedWhite = (reportedWhiteLevel ?: fallbackWhite).coerceAtLeast(1)
-
-            if (frameSourceFormat == ImageFormat.RAW10 && reportedWhite > 1023) {
-                val scale = 1023f / reportedWhite.toFloat()
-                val scaledBlack = reportedBlackLevels.map { value ->
-                    (value * scale).toInt().coerceIn(0, 1022)
-                }
-                return EffectiveRawLevels(
-                    blackLevels = scaledBlack,
-                    whiteLevel = 1023,
-                    scaledToRaw10 = true,
-                    note = "RAW10 uses packed 10-bit samples. Phone metadata reported white=$reportedWhite, so black/white levels were scaled into RAW10 domain with scale=${String.format(Locale.US, "%.5f", scale)}."
-                )
-            }
-
-            val safeWhite = reportedWhite.coerceAtLeast(2)
-            val safeBlack = reportedBlackLevels.map { it.coerceIn(0, safeWhite - 1) }
-            return EffectiveRawLevels(
-                blackLevels = safeBlack,
-                whiteLevel = safeWhite,
-                scaledToRaw10 = false,
-                note = if (reportedWhiteLevel == null) {
-                    "Metadata white level missing; using format fallback white=$safeWhite with black levels $safeBlack."
-                } else {
-                    "Using phone metadata raw levels directly for this frame source."
-                }
-            )
-        }
 
 
         private suspend fun readProfileFloatCompat(

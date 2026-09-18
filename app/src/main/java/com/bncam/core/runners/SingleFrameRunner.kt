@@ -1366,8 +1366,12 @@ class SingleFrameRunner(
             if (activeZslFormat == ImageFormat.YUV_420_888) return 255 to intArrayOf(0, 0, 0, 0)
             val dynamicWhite = metadata?.get(CaptureResult.SENSOR_DYNAMIC_WHITE_LEVEL)
             val staticWhite = chars.get(CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL)
-            val payloadWhite = (dynamicWhite ?: staticWhite ?: if (activeZslFormat == ImageFormat.RAW10) 1023 else 65535)
-                .coerceIn(1, 65535)
+            val payloadWhite = (dynamicWhite ?: staticWhite)
+                ?.takeIf { it > 0 }
+                ?.coerceIn(1, 65535)
+                ?: throw IllegalStateException(
+                    "UNSAFE_TO_PROCESS:WHITE_LEVEL_METADATA_UNAVAILABLE:CANDIDATE_ANALYSIS"
+                )
             val dynamicBlack = metadata?.get(CaptureResult.SENSOR_DYNAMIC_BLACK_LEVEL)?.takeIf { it.size >= 4 }
             val staticBlack = chars.get(CameraCharacteristics.SENSOR_BLACK_LEVEL_PATTERN)
             val payloadBlack = FloatArray(4) { index ->
@@ -2061,6 +2065,11 @@ class SingleFrameRunner(
             0.0
         }
         acquiredRawInputForCleanup = acquiredRawInput
+        if (enableShotLogger && acquiredRawInput != null) {
+            acquiredRawInput.rawFrameInfo.whiteAuthorityDebugPairs().forEach { (key, value) ->
+                shotLogger.recordPipelineEvent("White Level Authority", key, value)
+            }
+        }
         if (isRawFrameSource && acquiredRawInput == null) {
             rawWorkReservation?.fail("raw16_materialization_returned_empty")
             throw IllegalStateException(

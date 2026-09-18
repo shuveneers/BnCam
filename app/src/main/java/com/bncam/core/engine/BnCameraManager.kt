@@ -124,6 +124,9 @@ import com.bncam.core.quality.PhysicalSensorProfileRegistry
 import com.bncam.core.quality.FrameSensorMetadataSnapshot
 import com.bncam.core.quality.RawCalibrationRole
 import com.bncam.core.quality.SizeSnapshot
+import com.bncam.core.isp.raw.RawBlackDomainBinding
+import com.bncam.core.isp.raw.RawDomainContractResolver
+import com.bncam.core.isp.raw.RawWhiteDomainBinding
 import com.bncam.core.isp.raw10.RawCameraColorProfileRepository
 import com.bncam.core.quality.RawColorTransformEngine
 import com.bncam.core.quality.ProfileYuvAwbMapper
@@ -2519,6 +2522,23 @@ class BnCameraManager(private val context: Context) {
                     preferenceSnapshot = preferences,
                     stableAutoWhiteBalance = stableAutoWhiteBalanceSnapshotForActiveCamera()
                 )
+                val previewRawContract = RawWhiteDomainBinding.bindForQualityConfig(
+                    contract = RawBlackDomainBinding.bindForQualityConfig(
+                        contract = RawDomainContractResolver.resolve(
+                            lensId = calibrationCameraId,
+                            sourceFormat = identity.bufferFormat,
+                            width = identity.width,
+                            height = identity.height,
+                            characteristics = characteristics,
+                            captureResult = calibrationResult,
+                            qualityConfig = quality
+                        ),
+                        qualityConfig = quality
+                    ),
+                    qualityConfig = quality
+                )
+                val previewDevelopedLevels =
+                    RawPreviewCalibrationTransform.developedLevelsInSourceDomain(previewRawContract)
                 val sensitivityIso = (calibrationResult?.get(CaptureResult.SENSOR_SENSITIVITY) ?: 100)
                     .coerceAtLeast(1)
                 val exposureTimeNs = (calibrationResult?.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 0L)
@@ -2558,10 +2578,8 @@ class BnCameraManager(private val context: Context) {
                     profileId = profileId,
                     cfaPattern = quality.cfaPattern,
                     demosaicMode = previewDemosaic.bridgeMode,
-                    blackLevels = RawPreviewCalibrationTransform.canonicalBlackLevelsToMosaic(
-                        quality.blackLevels.toFloatArray(), quality.cfaPattern
-                    ),
-                    whiteLevel = quality.whiteLevel,
+                    blackLevels = previewDevelopedLevels.blackLevels,
+                    whiteLevel = previewDevelopedLevels.whiteLevel,
                     wbGains = previewWbGains,
                     colorMatrix = quality.colorCorrectionMatrix.toNativeArray(),
                     exposureGain = previewExposureGain,
@@ -2617,6 +2635,12 @@ class BnCameraManager(private val context: Context) {
                         tag,
                         "RAW_PREVIEW_DEMOSAIC requested=${quality.demosaic.requestedMode.displayName} " +
                             "effectiveBridge=${previewDemosaic.bridgeMode} reason=${previewDemosaic.reason}"
+                    )
+                    Log.i(
+                        tag,
+                        "RAW_PREVIEW_WHITE_AUTHORITY white=${previewDevelopedLevels.whiteLevel} " +
+                            "source=${previewDevelopedLevels.source} payloadWhite=${previewRawContract.payloadWhiteLevel} " +
+                            "developedWhite=${previewRawContract.developedRawWhiteLevel}"
                     )
                 }
             } catch (error: Exception) {
@@ -2686,9 +2710,25 @@ class BnCameraManager(private val context: Context) {
         val calibrationCameraId = identity.physicalCameraId ?: identity.logicalCameraId
         val characteristics = cameraManager.getCameraCharacteristics(calibrationCameraId)
         val calibrationResult = result?.let { previewCaptureResult(it, identity.physicalCameraId) }
-        val reportedWhite = calibrationResult?.get(CaptureResult.SENSOR_DYNAMIC_WHITE_LEVEL)
-            ?: characteristics.get(CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL)
-            ?: if (source == ViewfinderEffectiveSource.RAW10) 1023 else 65535
+        val dynamicWhite = calibrationResult?.get(CaptureResult.SENSOR_DYNAMIC_WHITE_LEVEL)
+            ?.takeIf { it > 0 }
+        val staticWhite = characteristics.get(CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL)
+            ?.takeIf { it > 0 }
+        val reportedWhite = dynamicWhite ?: staticWhite
+        // A packed RAW10 sample has a structurally known 10-bit source ceiling, so bootstrap can
+        // render it safely while the full developed-white configuration is loading. RAW_SENSOR is
+        // only a 16-bit container: without Camera2 white metadata, 65535 would invent a physical
+        // saturation point and darken metering/preview. In that case skip bootstrap and let the
+        // authoritative async configuration fail closed instead.
+        if (reportedWhite == null && source != ViewfinderEffectiveSource.RAW10) {
+            Log.w(
+                tag,
+                "RAW_PREVIEW_BOOTSTRAP_WHITE_UNAVAILABLE source=${source.name} " +
+                    "lens=$calibrationCameraId; waiting for authoritative configuration"
+            )
+            return@runCatching null
+        }
+        val sourceAuthorityWhite = reportedWhite ?: 1023
         val staticBlack = characteristics.get(CameraCharacteristics.SENSOR_BLACK_LEVEL_PATTERN)
         val reportedBlack = calibrationResult?.get(CaptureResult.SENSOR_DYNAMIC_BLACK_LEVEL)
             ?.takeIf { it.size >= 4 }
@@ -2699,8 +2739,8 @@ class BnCameraManager(private val context: Context) {
                 staticBlack?.getOffsetForIndex(0, 1)?.toFloat() ?: 0f,
                 staticBlack?.getOffsetForIndex(1, 1)?.toFloat() ?: 0f
             )
-        val nativeWhite = if (source == ViewfinderEffectiveSource.RAW10) 1023 else reportedWhite
-        val levelScale = nativeWhite.toFloat() / reportedWhite.coerceAtLeast(1).toFloat()
+        val nativeWhite = if (source == ViewfinderEffectiveSource.RAW10) 1023 else sourceAuthorityWhite
+        val levelScale = nativeWhite.toFloat() / sourceAuthorityWhite.coerceAtLeast(1).toFloat()
         val nativeBlack = FloatArray(4) { index ->
             (reportedBlack[index] * levelScale).coerceIn(0f, nativeWhite.coerceAtLeast(2) - 1f)
         }

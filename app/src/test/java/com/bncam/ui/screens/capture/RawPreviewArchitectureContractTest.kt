@@ -129,11 +129,12 @@ class RawPreviewArchitectureContractTest {
     }
 
     @Test
-    fun rawSensorUsesMosaicOrderedLevelsAndRatioPreservingHighlightHeadroom() {
+    fun rawSensorUsesDevelopedAuthorityAndRatioPreservingHighlightHeadroom() {
         val manager = source("src/main/java/com/bncam/core/engine/BnCameraManager.kt")
         val previewNative = source("src/main/cpp/RawPreview.cpp")
 
-        assertTrue(manager.contains("RawPreviewCalibrationTransform.canonicalBlackLevelsToMosaic"))
+        assertTrue(manager.contains("RawPreviewCalibrationTransform.developedLevelsInSourceDomain"))
+        assertTrue(manager.contains("RAW_PREVIEW_WHITE_AUTHORITY"))
         assertTrue(previewNative.contains("const float commonScale = 1.0f / maximumChannel"))
         assertTrue(previewNative.contains("r *= commonScale"))
         assertTrue(previewNative.contains("g *= commonScale"))

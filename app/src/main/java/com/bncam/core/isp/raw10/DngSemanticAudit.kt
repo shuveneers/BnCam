@@ -206,6 +206,12 @@ object DngSemanticAuditor {
                 cfaOriginX = contract?.cfaOriginX ?: 0,
                 cfaOriginY = contract?.cfaOriginY ?: 0
             )
+            items += DngSemanticRules.validateDevelopedWhiteIsolation(
+                snapshot = snapshot,
+                payloadWhiteLevel = contract?.payloadWhiteLevel,
+                developedWhiteLevel = contract?.developedRawWhiteLevel,
+                manualDevelopedOverrideUsed = contract?.developedWhiteManualOverrideUsed == true
+            )
 
             val hueSatSnapshot = buildHueSatMapSnapshot(tags)
             lastHueSatMapProfile = hueSatSnapshot

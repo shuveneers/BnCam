@@ -59,6 +59,27 @@ class DngSemanticRulesTest {
     }
 
     @Test
+    fun manualDevelopedWhiteDoesNotReplacePhysicalDngWhite() {
+        val snapshot = validSnapshot().copy(whiteLevels = listOf(4095))
+
+        val isolated = DngSemanticRules.validateDevelopedWhiteIsolation(
+            snapshot = snapshot,
+            payloadWhiteLevel = 4095,
+            developedWhiteLevel = 1023,
+            manualDevelopedOverrideUsed = true
+        )
+        val leaked = DngSemanticRules.validateDevelopedWhiteIsolation(
+            snapshot = snapshot.copy(whiteLevels = listOf(1023)),
+            payloadWhiteLevel = 4095,
+            developedWhiteLevel = 1023,
+            manualDevelopedOverrideUsed = true
+        )
+
+        assertTrue(isolated.detail, isolated.passed)
+        assertFalse(leaked.detail, leaked.passed)
+    }
+
+    @Test
     fun wrongCfaPatternFailsAudit() {
         val snapshot = validSnapshot(cfaPattern = listOf(0, 1, 1, 2))
 

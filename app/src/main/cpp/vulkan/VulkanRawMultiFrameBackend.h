@@ -33,8 +33,12 @@ struct RawMultiFrameRequest {
     std::uint32_t cropHeight = 0u;
     std::uint32_t nativeWhite = 1u;
     std::uint32_t payloadWhite = 1u;
+    // Developed-only normalization authority for temporal SPECTRA/fusion weighting.
+    // Physical canonicalization/DNG continues to use payloadWhite/payloadBlack.
+    std::uint32_t developedWhite = 1u;
     std::array<std::uint32_t, 4> nativeBlack{0u, 0u, 0u, 0u};
     std::array<std::uint32_t, 4> payloadBlack{0u, 0u, 0u, 0u};
+    std::array<std::uint32_t, 4> developedBlack{0u, 0u, 0u, 0u};
     std::uint32_t cfaPattern = 0u;
     std::uint32_t maxShiftPixels = 1u;
     float alignmentStrictness = 0.8f;

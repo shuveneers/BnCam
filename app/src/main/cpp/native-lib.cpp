@@ -2956,6 +2956,8 @@ Java_com_bncam_core_engine_ImageUtils_mergeNativeRaw10DirectRaw16(
         jint cfaPattern,
         jint whiteLevel,
         jintArray blackLevelArray,
+        jint developedWhiteLevel,
+        jintArray developedBlackLevelArray,
         jintArray sourceCropArray,
         jint maxFramesCap,
         jint maxShiftPixels,
@@ -2968,6 +2970,7 @@ Java_com_bncam_core_engine_ImageUtils_mergeNativeRaw10DirectRaw16(
     std::vector<AHardwareBuffer*> hwBuffers = extractHardwareBuffers(env, buffersArray);
     if (hwBuffers.empty()) return nullptr;
     const std::vector<int32_t> blackLevels = extractBlackLevelVector(env, blackLevelArray);
+    const std::vector<int32_t> developedBlackLevels = extractBlackLevelVector(env, developedBlackLevelArray);
     if (sourceCropArray == nullptr || env->GetArrayLength(sourceCropArray) < 4) {
         releaseHardwareBuffers(hwBuffers);
         return nullptr;
@@ -2987,6 +2990,8 @@ Java_com_bncam_core_engine_ImageUtils_mergeNativeRaw10DirectRaw16(
             cfaPattern,
             whiteLevel,
             blackLevels,
+            developedWhiteLevel,
+            developedBlackLevels,
             maxFramesCap,
             maxShiftPixels,
             alignmentStrictness,
@@ -3023,6 +3028,8 @@ Java_com_bncam_core_engine_ImageUtils_mergeNativeRawSensorDirectRaw16(
         jint cfaPattern,
         jint whiteLevel,
         jintArray blackLevelArray,
+        jint developedWhiteLevel,
+        jintArray developedBlackLevelArray,
         jintArray sourceCropArray,
         jint maxFramesCap,
         jint maxShiftPixels,
@@ -3035,6 +3042,7 @@ Java_com_bncam_core_engine_ImageUtils_mergeNativeRawSensorDirectRaw16(
     std::vector<AHardwareBuffer*> hwBuffers = extractHardwareBuffers(env, buffersArray);
     if (hwBuffers.empty()) return nullptr;
     const std::vector<int32_t> blackLevels = extractBlackLevelVector(env, blackLevelArray);
+    const std::vector<int32_t> developedBlackLevels = extractBlackLevelVector(env, developedBlackLevelArray);
     if (sourceCropArray == nullptr || env->GetArrayLength(sourceCropArray) < 4) {
         releaseHardwareBuffers(hwBuffers);
         return nullptr;
@@ -3054,6 +3062,8 @@ Java_com_bncam_core_engine_ImageUtils_mergeNativeRawSensorDirectRaw16(
             cfaPattern,
             whiteLevel,
             blackLevels,
+            developedWhiteLevel,
+            developedBlackLevels,
             maxFramesCap,
             maxShiftPixels,
             alignmentStrictness,

@@ -433,6 +433,30 @@ object DngSemanticRules {
         )
     }
 
+    fun validateDevelopedWhiteIsolation(
+        snapshot: DngTagSnapshot,
+        payloadWhiteLevel: Int?,
+        developedWhiteLevel: Int?,
+        manualDevelopedOverrideUsed: Boolean
+    ): DngAuditItem {
+        if (payloadWhiteLevel == null) {
+            return DngAuditItem(
+                "Developed White isolation",
+                false,
+                "payload_white_unavailable"
+            )
+        }
+        val payloadMatch = snapshot.whiteLevels.any { it == payloadWhiteLevel.toLong() }
+        val overrideDiffers = developedWhiteLevel != null && developedWhiteLevel != payloadWhiteLevel
+        return DngAuditItem(
+            "Developed White isolation",
+            payloadMatch,
+            "payloadWhite=$payloadWhiteLevel;developedWhite=${developedWhiteLevel ?: "unavailable"};" +
+                "manualDevelopedOverride=$manualDevelopedOverrideUsed;overrideDiffers=$overrideDiffers;" +
+                "dngWhite=${snapshot.whiteLevels.ifEmpty { listOf(-1L) }}"
+        )
+    }
+
     private fun validateVersion(name: String, version: List<Long>): DngAuditItem {
         val valid = version.size == 4 && version[0] == 1L &&
             version.all { it in 0L..255L }

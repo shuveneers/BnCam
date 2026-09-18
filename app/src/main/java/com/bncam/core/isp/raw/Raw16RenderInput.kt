@@ -158,14 +158,17 @@ object SingleRaw16FrameBuilder {
         (captureResult as? TotalCaptureResult)?.let {
             BlackLevelLockController.observeResult(lensId, it)
         }
-        val initialContract = RawBlackDomainBinding.bindForQualityConfig(
-            contract = RawDomainContractResolver.resolve(
-                lensId = lensId,
-                sourceFormat = sourceFormat,
-                width = width,
-                height = height,
-                characteristics = characteristics,
-                captureResult = captureResult,
+        val initialContract = RawWhiteDomainBinding.bindForQualityConfig(
+            contract = RawBlackDomainBinding.bindForQualityConfig(
+                contract = RawDomainContractResolver.resolve(
+                    lensId = lensId,
+                    sourceFormat = sourceFormat,
+                    width = width,
+                    height = height,
+                    characteristics = characteristics,
+                    captureResult = captureResult,
+                    qualityConfig = qualityConfig
+                ),
                 qualityConfig = qualityConfig
             ),
             qualityConfig = qualityConfig
@@ -190,6 +193,8 @@ object SingleRaw16FrameBuilder {
                 characteristics = characteristics,
                 payloadWhiteLevel = initialContract.payloadWhiteLevel,
                 payloadBlackLevels = initialContract.payloadBlackLevelsIntArray(),
+                developedWhiteLevel = initialContract.developedRawWhiteLevel,
+                developedBlackLevels = RawBlackDomainBinding.developedMosaicRounded(initialContract).toIntArray(),
                 maxFramesCap = sourceBuffers.size,
                 maxShiftPixels = if (sourceBuffers.size > 1) 32 else 0,
                 alignmentStrictness = 0.9f,
@@ -202,6 +207,8 @@ object SingleRaw16FrameBuilder {
                 characteristics = characteristics,
                 payloadWhiteLevel = initialContract.payloadWhiteLevel,
                 payloadBlackLevels = initialContract.payloadBlackLevelsIntArray(),
+                developedWhiteLevel = initialContract.developedRawWhiteLevel,
+                developedBlackLevels = RawBlackDomainBinding.developedMosaicRounded(initialContract).toIntArray(),
                 maxFramesCap = sourceBuffers.size,
                 maxShiftPixels = if (sourceBuffers.size > 1) 32 else 0,
                 alignmentStrictness = 0.9f,
@@ -223,8 +230,9 @@ object SingleRaw16FrameBuilder {
             val stats = ImageUtils.lastDngMergeStats()
             val physicalNoiseCalibration = shutterCalibration
                 ?.withPhysicalMergeStats(stats)
-            val finalContract = RawBlackDomainBinding.bindForQualityConfig(
-                contract = RawDomainContractResolver.resolve(
+            val finalContract = RawWhiteDomainBinding.bindForQualityConfig(
+                contract = RawBlackDomainBinding.bindForQualityConfig(
+                    contract = RawDomainContractResolver.resolve(
                     lensId = lensId,
                     sourceFormat = sourceFormat,
                     width = outputWidth,
@@ -233,6 +241,8 @@ object SingleRaw16FrameBuilder {
                     captureResult = captureResult,
                     qualityConfig = qualityConfig,
                     dngMergeStats = stats
+                    ),
+                    qualityConfig = qualityConfig
                 ),
                 qualityConfig = qualityConfig
             )

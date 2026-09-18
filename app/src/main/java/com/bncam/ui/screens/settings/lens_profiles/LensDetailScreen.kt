@@ -27,6 +27,8 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
+import androidx.compose.material3.RadioButton
+import androidx.compose.material3.RadioButtonDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -53,6 +55,10 @@ import com.bncam.data.settings.LensPhysicalNoiseModelSettings
 import com.bncam.data.settings.PhysicalNoiseModelSettingsStore
 import com.bncam.data.settings.PhysicalNoiseModelUiPolicy
 import com.bncam.data.settings.SettingsRepository
+import com.bncam.data.settings.LensWhiteLevelSettings
+import com.bncam.data.settings.WhiteLevelModes
+import com.bncam.data.settings.WhiteLevelPresets
+import com.bncam.data.settings.WhiteLevelSettingsStore
 import com.bncam.ui.components.AccentPistachio
 import com.bncam.ui.components.SettingValueRow
 import com.bncam.ui.screens.settings.SettingsCard
@@ -77,6 +83,7 @@ fun LensDetailScreen(
     val settingsRepo = remember(context) { SettingsRepository(context) }
     val physicalNoiseStore = remember(context) { PhysicalNoiseModelSettingsStore(context) }
     val blackLevelStore = remember(context) { BlackLevelSettingsStore(context) }
+    val whiteLevelStore = remember(context) { WhiteLevelSettingsStore(context) }
     val coroutineScope = rememberCoroutineScope()
     val hardwareSummary by produceState(
         initialValue = unavailableLensHardwareSummary(),
@@ -88,14 +95,16 @@ fun LensDetailScreen(
 
     var showAmountDialog by remember { mutableStateOf(false) }
     var showResetConfirm by remember { mutableStateOf(false) }
+    var showWhiteLevelDialog by remember { mutableStateOf(false) }
 
     // Preview orientation is no longer a user calibration. Retire any previously persisted
     // per-lens rotation as soon as this hardware page is opened. At the same time materialize
     // the current v2 Noise Model / Black Level state so this overview never reports legacy UI state.
-    LaunchedEffect(lensId, physicalNoiseStore, blackLevelStore) {
+    LaunchedEffect(lensId, physicalNoiseStore, blackLevelStore, whiteLevelStore) {
         settingsRepo.setLensPreviewOrientationCorrection(lensId, "Auto")
         physicalNoiseStore.ensureMigrated(lensId)
         blackLevelStore.ensureMigrated(lensId)
+        whiteLevelStore.ensureInitialized(lensId)
     }
 
     // Use the same authoritative profile-count value as the viewfinder and ProfileManager.
@@ -109,6 +118,8 @@ fun LensDetailScreen(
         .collectAsStateWithLifecycle(initialValue = LensPhysicalNoiseModelSettings())
     val blackLevelSettings by blackLevelStore.settingsFlow(lensId)
         .collectAsStateWithLifecycle(initialValue = LensBlackLevelControlSettings())
+    val whiteLevelSettings by whiteLevelStore.settingsFlow(lensId)
+        .collectAsStateWithLifecycle(initialValue = LensWhiteLevelSettings())
 
     val colorMatrixMode by settingsRepo.getColorMatrixModeFlow(lensId)
         .collectAsStateWithLifecycle(initialValue = "System")
@@ -189,6 +200,13 @@ fun LensDetailScreen(
             )
 
             SettingValueRow(
+                title = "White level",
+                description = "RAW sensor saturation authority for developed RAW processing. Auto uses Camera2 metadata.",
+                value = whiteLevelSettings.summary(),
+                onClick = { showWhiteLevelDialog = true }
+            )
+
+            SettingValueRow(
                 title = "Color matrix",
                 description = "Sensor-to-RGB color transformation for this Lens ID.",
                 value = colorMatrixMode,
@@ -202,6 +220,34 @@ fun LensDetailScreen(
             onClick = { showResetConfirm = true }
         )
         Spacer(Modifier.height(20.dp))
+    }
+
+    if (showWhiteLevelDialog) {
+        WhiteLevelSelectionDialog(
+            settings = whiteLevelSettings,
+            onDismiss = { showWhiteLevelDialog = false },
+            onSelectAuto = {
+                coroutineScope.launch {
+                    whiteLevelStore.set(
+                        lensId,
+                        whiteLevelSettings.copy(mode = WhiteLevelModes.AUTO)
+                    )
+                }
+                showWhiteLevelDialog = false
+            },
+            onSelectManual = { whiteLevel ->
+                coroutineScope.launch {
+                    whiteLevelStore.set(
+                        lensId,
+                        LensWhiteLevelSettings(
+                            mode = WhiteLevelModes.MANUAL,
+                            manualWhiteLevel = whiteLevel
+                        )
+                    )
+                }
+                showWhiteLevelDialog = false
+            }
+        )
     }
 
     if (showAmountDialog) {
@@ -230,7 +276,7 @@ fun LensDetailScreen(
             title = { Text("Reset lens hardware settings?", color = Color.White) },
             text = {
                 Text(
-                    text = "Noise model, Black Level and other per-lens hardware calibration settings will return to their defaults. Future White Level and Stream Configuration settings use this same reset scope.",
+                    text = "Noise model, Black Level, White Level and other per-lens hardware calibration settings will return to their defaults.",
                     color = Color.Gray,
                     lineHeight = 18.sp
                 )
@@ -253,6 +299,80 @@ fun LensDetailScreen(
                     Text("Cancel", color = Color.Gray)
                 }
             }
+        )
+    }
+}
+
+@Composable
+private fun WhiteLevelSelectionDialog(
+    settings: LensWhiteLevelSettings,
+    onDismiss: () -> Unit,
+    onSelectAuto: () -> Unit,
+    onSelectManual: (Int) -> Unit
+) {
+    val safe = settings.sanitized()
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = Color(0xFF1E1E1E),
+        title = { Text("White Level", color = Color.White) },
+        text = {
+            Column {
+                Text(
+                    text = "Auto uses valid same-frame Camera2 dynamic white metadata when available, otherwise static sensor white metadata. Manual presets affect developed RAW processing only.",
+                    color = Color.Gray,
+                    fontSize = 13.sp,
+                    lineHeight = 18.sp,
+                    modifier = Modifier.padding(bottom = 10.dp)
+                )
+                WhiteLevelOptionRow(
+                    label = "Auto",
+                    selected = safe.mode == WhiteLevelModes.AUTO,
+                    onClick = onSelectAuto
+                )
+                WhiteLevelPresets.values.forEach { preset ->
+                    WhiteLevelOptionRow(
+                        label = preset.label,
+                        selected = safe.mode == WhiteLevelModes.MANUAL &&
+                            safe.manualWhiteLevel == preset.value,
+                        onClick = { onSelectManual(preset.value) }
+                    )
+                }
+            }
+        },
+        confirmButton = {},
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancel", color = Color.Gray)
+            }
+        }
+    )
+}
+
+@Composable
+private fun WhiteLevelOptionRow(
+    label: String,
+    selected: Boolean,
+    onClick: () -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        RadioButton(
+            selected = selected,
+            onClick = onClick,
+            colors = RadioButtonDefaults.colors(
+                selectedColor = AccentPistachio,
+                unselectedColor = Color(0xFF777777)
+            )
+        )
+        Text(
+            text = label,
+            color = Color.White,
+            fontSize = 15.sp
         )
     }
 }

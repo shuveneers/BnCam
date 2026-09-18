@@ -64,6 +64,13 @@ data class RawDomainContract(
     /** Sensor-origin positional [00,10,01,11] black levels in DNG/master payload units. */
     val payloadBlackLevels: List<Int>,
     val payloadWhiteLevel: Int,
+    /** White level used only by developed RAW JPEG/noise processing, in payload/master units. */
+    val developedRawWhiteLevel: Int = payloadWhiteLevel,
+    val developedRawWhiteLevelSource: String = "physical payload white",
+    val developedWhiteMetadataAuthoritative: Boolean = false,
+    val developedWhiteFallbackReason: String = "not_recorded",
+    val developedWhiteManualOverrideUsed: Boolean = false,
+    val developedWhiteScaleFactor: Float = 1f,
     /** Canonical [R, Gr, Gb, B] black levels used by developed RAW JPEG/noise processing. */
     val developedRawBlackLevels: List<Float> = List(4) { 0f },
     val developedRawBlackLevelSource: String = "sensor metadata",
@@ -108,6 +115,7 @@ data class RawDomainContract(
         require(nativeBitDepth in 1..16) { "nativeBitDepth must be in 1..16" }
         require(nativeWhiteLevel in 1..65535) { "nativeWhiteLevel must be in 1..65535" }
         require(payloadWhiteLevel in 1..65535) { "payloadWhiteLevel must be in 1..65535" }
+        require(developedRawWhiteLevel in 1..65535) { "developedRawWhiteLevel must be in 1..65535" }
     }
 
     val bufferOriginCfaOffsetX: Int get() = cfaOriginX
@@ -116,7 +124,7 @@ data class RawDomainContract(
     val sensorCfaName: String get() = cfaName
     val sourceBitDepth: Int get() = nativeBitDepth
     val effectiveSourceRange: Int get() = nativeWhiteLevel
-    val effectiveWhiteLevelInMasterUnits: Float get() = payloadWhiteLevel.toFloat() * masterStorageScale
+    val effectiveWhiteLevelInMasterUnits: Float get() = developedRawWhiteLevel.toFloat() * masterStorageScale
     val developedRawBlackLevelsCanonicalInMasterUnits: List<Float>
         get() = developedRawBlackLevels.map { it * masterStorageScale }
     val effectiveBlackLevelPatternInMasterUnits: List<Float>
@@ -128,6 +136,31 @@ data class RawDomainContract(
     val sensorDynamicBlackLevel: FloatArray? get() = sensorDynamicBlackLevelValues?.toFloatArray()
 
     fun payloadBlackLevelsIntArray(): IntArray = IntArray(4) { payloadBlackLevels[it] }
+
+    /**
+     * Compact provenance block for shot diagnostics. Physical/DNG white and developed/JPEG white
+     * are intentionally reported side-by-side so a manual developed override can never be
+     * mistaken for a mutation of the RAW16/DNG payload contract.
+     */
+    fun whiteAuthorityDebugPairs(): List<Pair<String, String>> = listOf(
+        "Lens ID" to lensId,
+        "Physical Camera ID" to (physicalCameraId ?: "not_reported"),
+        "Source Format" to sourceFormat.name,
+        "Sensor Dynamic White" to (sensorDynamicWhiteLevel?.toString() ?: "unavailable"),
+        "Sensor Static White" to (sensorInfoWhiteLevel?.toString() ?: "unavailable"),
+        "Native White" to nativeWhiteLevel.toString(),
+        "DNG/Payload White" to payloadWhiteLevel.toString(),
+        "DNG/Payload White Source" to chosenWhiteLevelSource,
+        "Developed White" to developedRawWhiteLevel.toString(),
+        "Developed White Source" to developedRawWhiteLevelSource,
+        "Developed Metadata Authoritative" to developedWhiteMetadataAuthoritative.toString(),
+        "Developed Manual Override" to developedWhiteManualOverrideUsed.toString(),
+        "Developed Fallback" to developedWhiteFallbackReason,
+        "Developed Scale" to developedWhiteScaleFactor.toString(),
+        "Developed/Payload White Differ" to
+            (payloadWhiteLevel != developedRawWhiteLevel).toString(),
+        "DNG White Contract" to "physical payload white only"
+    )
 
     fun dump(): String {
         return buildString {
@@ -144,6 +177,12 @@ data class RawDomainContract(
             append(";developedBlackMetadataAuthoritative=$developedBlackMetadataAuthoritative")
             append(";developedBlackFallbackReason=$developedBlackFallbackReason")
             append(";payloadWhiteLevel=$payloadWhiteLevel")
+            append(";developedRawWhiteLevel=$developedRawWhiteLevel")
+            append(";developedRawWhiteLevelSource=$developedRawWhiteLevelSource")
+            append(";developedWhiteMetadataAuthoritative=$developedWhiteMetadataAuthoritative")
+            append(";developedWhiteFallbackReason=$developedWhiteFallbackReason")
+            append(";developedWhiteManualOverrideUsed=$developedWhiteManualOverrideUsed")
+            append(";developedWhiteScaleFactor=$developedWhiteScaleFactor")
             append(";cfa=$cfaName/$cfaPattern")
             append(";cfaOrigin=$cfaOriginX,$cfaOriginY")
             append(";activeArray=$activeArray")
@@ -200,16 +239,12 @@ object RawDomainContractResolver {
             listOf(0f, 0f, 0f, 0f)
         }
         val dynamicBlack = dynamicBlackPattern?.let { List(4) { index -> it[index] } }
-        val rawMetadataWhite = finalCal?.base?.baseWhiteLevelRawMetadata ?: dynamicWhite ?: staticWhite
-        val fallbackPayloadWhite = when (source) {
-            RawInputSource.RAW10 -> 1023
-            RawInputSource.RAW_SENSOR -> 65535
-            RawInputSource.RAW16_MASTER -> 65535
-        }
-        if (rawMetadataWhite == null) {
-            warnings.add("White level metadata missing; using formal ${source.name} fallback=$fallbackPayloadWhite")
-        }
-        val payloadWhite = (rawMetadataWhite ?: fallbackPayloadWhite).coerceIn(1, 65535)
+        val rawMetadataWhite = (finalCal?.base?.baseWhiteLevelRawMetadata ?: dynamicWhite ?: staticWhite)
+            ?.takeIf { it > 0 }
+            ?: throw com.bncam.core.quality.SensorAuthorityUnavailableException(
+                "UNSAFE_TO_PROCESS:WHITE_LEVEL_METADATA_UNAVAILABLE:${source.name}"
+            )
+        val payloadWhite = rawMetadataWhite.coerceIn(1, 65535)
         val nativeWhite = when (source) {
             RawInputSource.RAW10 -> 1023
             RawInputSource.RAW_SENSOR -> payloadWhite
@@ -219,7 +254,7 @@ object RawDomainContractResolver {
             finalCal?.base?.baseWhiteLevelRawMetadata != null -> "RawDomainContract payload white from ${finalCal.base.baseWhiteLevelSource}"
             dynamicWhite != null -> "RawDomainContract payload white from CaptureResult.SENSOR_DYNAMIC_WHITE_LEVEL"
             staticWhite != null -> "RawDomainContract payload white from CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL"
-            else -> "RawDomainContract formal fallback for ${source.name}"
+            else -> "RawDomainContract metadata authority"
         }
 
         val cfa = finalCal?.base?.cfaPattern

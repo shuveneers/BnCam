@@ -514,29 +514,6 @@ void applySampleDomainTransformInPlace(cv::Mat& bayer16, const SampleDomainTrans
     });
 }
 
-int inferRawSensorNativeWhite(const Raw16SampleStats& stats, int payloadWhite, std::string& reason) {
-    reason = "not_needed";
-    const int safeWhite = std::clamp(payloadWhite, 1, 65535);
-    if (safeWhite < 65535 || stats.p99 == 0 || stats.maxValue == 0) return safeWhite;
-
-    // RAW_SENSOR should normally already be in the metadata white-level domain. This inference is
-    // only for HALs that expose RAW_SENSOR in a 16-bit container while right-justifying lower-bit
-    // samples. It is deliberately based on the actual payload ceiling, not on exposure lifting.
-    struct Candidate { int white; int softMax; };
-    const Candidate candidates[] = {
-            {1023, 2048},
-            {4095, 8192},
-            {16383, 24576}
-    };
-    for (const Candidate& c : candidates) {
-        if (stats.p99 <= c.white && stats.maxValue <= c.softMax) {
-            reason = "RAW_SENSOR_16BIT_CONTAINER_WITH_RIGHT_JUSTIFIED_" + std::to_string(c.white + 1) + "_LEVEL_SAMPLES";
-            return c.white;
-        }
-    }
-    return safeWhite;
-}
-
 jbyteArray createJavaByteArray(JNIEnv *env, const std::vector<uint8_t>& cppBuffer) {
     if (cppBuffer.empty()) return nullptr;
     auto size = static_cast<jsize>(cppBuffer.size());
@@ -1787,6 +1764,8 @@ jobject mergeRawToDngRaw16Internal(
         jint cfaPattern,
         jint whiteLevel,
         const std::vector<int32_t>& blackLevels,
+        jint developedWhiteLevel,
+        const std::vector<int32_t>& developedBlackLevels,
         jint maxFramesCap,
         jint maxShiftPixels,
         jfloat alignmentStrictness,
@@ -1827,6 +1806,12 @@ jobject mergeRawToDngRaw16Internal(
     localStats.inputNativeWhiteLevel = inputTransform.nativeWhite;
     localStats.inputNativeBlackLevels = blackLevelsToString(inputTransform.nativeBlack);
     localStats.payloadBlackLevels = blackLevelsToString(inputTransform.payloadBlack);
+    localStats.developedWhiteLevel = std::clamp(static_cast<int>(developedWhiteLevel), 1, 65535);
+    const std::array<int, 4> developedBlack = normalizedBlackLevels(
+            developedBlackLevels.empty() ? blackLevels : developedBlackLevels,
+            localStats.developedWhiteLevel
+    );
+    localStats.developedBlackLevels = blackLevelsToString(developedBlack);
     localStats.payloadScaleFactor = inputTransform.nominalScale;
     localStats.sampleScaleContract = inputTransform.contract;
     localStats.sampleTransformApplied = !inputTransform.identity;
@@ -2062,9 +2047,11 @@ jobject mergeRawToDngRaw16Internal(
             gpuRequest.cropHeight = static_cast<uint32_t>(sourceCropHeight);
             gpuRequest.nativeWhite = static_cast<uint32_t>(inputTransform.nativeWhite);
             gpuRequest.payloadWhite = static_cast<uint32_t>(inputTransform.payloadWhite);
+            gpuRequest.developedWhite = static_cast<uint32_t>(localStats.developedWhiteLevel);
             for (size_t ch = 0; ch < 4u; ++ch) {
                 gpuRequest.nativeBlack[ch] = static_cast<uint32_t>(inputTransform.nativeBlack[ch]);
                 gpuRequest.payloadBlack[ch] = static_cast<uint32_t>(inputTransform.payloadBlack[ch]);
+                gpuRequest.developedBlack[ch] = static_cast<uint32_t>(developedBlack[ch]);
                 gpuRequest.spectra.effectiveS[ch] = spectraModel.effectiveS[ch];
                 gpuRequest.spectra.effectiveO[ch] = spectraModel.effectiveO[ch];
             }
@@ -2344,8 +2331,8 @@ jobject mergeRawToDngRaw16Internal(
                                     anchorRow[x],
                                     x,
                                     y,
-                                    localStats.payloadWhiteLevel,
-                                    inputTransform.payloadBlack
+                                    localStats.developedWhiteLevel,
+                                    developedBlack
                             );
                             const double variance = std::max(
                                     1.0e-12,
@@ -2485,8 +2472,8 @@ jobject mergeRawToDngRaw16Internal(
                         supportBayer16,
                         decision,
                         localStats.alignmentStrictness,
-                        localStats.payloadWhiteLevel,
-                        inputTransform.payloadBlack,
+                        localStats.developedWhiteLevel,
+                        developedBlack,
                         cfaPattern,
                         spectraModel
                 );
@@ -2541,8 +2528,8 @@ jobject mergeRawToDngRaw16Internal(
                                 supportBayer16,
                                 decision,
                                 localStats.alignmentStrictness,
-                                localStats.payloadWhiteLevel,
-                                inputTransform.payloadBlack,
+                                localStats.developedWhiteLevel,
+                                developedBlack,
                                 cfaPattern,
                                 spectraModel,
                                 spectraObservation,
@@ -2793,8 +2780,8 @@ jobject mergeRawToDngRaw16Internal(
                                     anchorRow[x],
                                     x,
                                     y,
-                                    localStats.payloadWhiteLevel,
-                                    inputTransform.payloadBlack
+                                    localStats.developedWhiteLevel,
+                                    developedBlack
                             );
                             const double variance = std::max(
                                     1.0e-12,
@@ -3041,6 +3028,8 @@ jobject mergeRaw10DngToRaw16(
         jint cfaPattern,
         jint whiteLevel,
         const std::vector<int32_t>& blackLevels,
+        jint developedWhiteLevel,
+        const std::vector<int32_t>& developedBlackLevels,
         jint maxFramesCap,
         jint maxShiftPixels,
         jfloat alignmentStrictness,
@@ -3063,6 +3052,8 @@ jobject mergeRaw10DngToRaw16(
             cfaPattern,
             whiteLevel,
             blackLevels,
+            developedWhiteLevel,
+            developedBlackLevels,
             maxFramesCap,
             maxShiftPixels,
             alignmentStrictness,
@@ -3090,6 +3081,8 @@ jobject mergeRawSensorDngToRaw16(
         jint cfaPattern,
         jint whiteLevel,
         const std::vector<int32_t>& blackLevels,
+        jint developedWhiteLevel,
+        const std::vector<int32_t>& developedBlackLevels,
         jint maxFramesCap,
         jint maxShiftPixels,
         jfloat alignmentStrictness,
@@ -3112,6 +3105,8 @@ jobject mergeRawSensorDngToRaw16(
             cfaPattern,
             whiteLevel,
             blackLevels,
+            developedWhiteLevel,
+            developedBlackLevels,
             maxFramesCap,
             maxShiftPixels,
             alignmentStrictness,
@@ -3160,8 +3155,10 @@ std::string formatDngMergeStats(const DngMergeStats& stats) {
         << ";whiteLevel=" << stats.whiteLevel
         << ";inputNativeWhiteLevel=" << stats.inputNativeWhiteLevel
         << ";payloadWhiteLevel=" << stats.payloadWhiteLevel
+        << ";developedWhiteLevel=" << stats.developedWhiteLevel
         << ";inputNativeBlackLevels=" << stats.inputNativeBlackLevels
         << ";payloadBlackLevels=" << stats.payloadBlackLevels
+        << ";developedBlackLevels=" << stats.developedBlackLevels
         << ";payloadScaleFactor=" << stats.payloadScaleFactor
         << ";sampleScaleContract=" << stats.sampleScaleContract
         << ";sampleTransformApplied=" << stats.sampleTransformApplied
