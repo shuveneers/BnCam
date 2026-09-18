@@ -7,9 +7,11 @@ const val LENS_AWB_CALIBRATION_SCHEMA_VERSION = 1
 
 object LensAwbCalibrationModes {
     const val SENSOR_AUTO = "Sensor Auto"
+    const val AGC_PRESET = "AGC Preset"
     const val CUSTOM_GCAM = "Custom GCam"
 
     fun sanitize(value: String?): String = when {
+        value.equals(AGC_PRESET, ignoreCase = true) -> AGC_PRESET
         value.equals(CUSTOM_GCAM, ignoreCase = true) -> CUSTOM_GCAM
         else -> SENSOR_AUTO
     }
@@ -40,6 +42,8 @@ data class LensAwbCalibrationSettings(
     val rgCoefficient: Float = 1.0f,
     val bgCoefficient: Float = 1.0f,
     val greenSplitMode: String = LensAwbGreenSplitModes.AUTO,
+    /** AGC 8.8.224 V12 built-in AWB preset id (0..55), used only in AGC_PRESET mode. */
+    val agcPresetId: Int = 0,
     /** GCam QcColorCalibration semantic Gr/Gb calibration ratio; mapped to G_even/G_odd by CFA at runtime. */
     val manualGrGbRatio: Float = 1.0f,
     val importedName: String = "",
@@ -55,9 +59,10 @@ data class LensAwbCalibrationSettings(
         return copy(
             schemaVersion = LENS_AWB_CALIBRATION_SCHEMA_VERSION,
             mode = LensAwbCalibrationModes.sanitize(mode),
-            rgCoefficient = rgCoefficient.takeIf(Float::isFinite)?.coerceIn(0.50f, 2.0f) ?: 1.0f,
-            bgCoefficient = bgCoefficient.takeIf(Float::isFinite)?.coerceIn(0.50f, 2.0f) ?: 1.0f,
+            rgCoefficient = rgCoefficient.takeIf(Float::isFinite)?.coerceIn(0.25f, 5.0f) ?: 1.0f,
+            bgCoefficient = bgCoefficient.takeIf(Float::isFinite)?.coerceIn(0.25f, 5.0f) ?: 1.0f,
             greenSplitMode = LensAwbGreenSplitModes.sanitize(greenSplitMode),
+            agcPresetId = agcPresetId.coerceIn(0, AgcAwbPresetCatalog.all.lastIndex),
             manualGrGbRatio = manualGrGbRatio.takeIf(Float::isFinite)?.coerceIn(0.50f, 2.0f) ?: 1.0f,
             importedName = importedName.trim().take(120),
             importedFormat = importedFormat.trim().take(32),
@@ -80,6 +85,10 @@ data class LensAwbCalibrationSettings(
     fun summary(): String {
         val safe = sanitized()
         return when (safe.mode) {
+            LensAwbCalibrationModes.AGC_PRESET -> {
+                val preset = AgcAwbPresetCatalog.byId(safe.agcPresetId)
+                "AGC · ${preset?.name ?: "Preset ${safe.agcPresetId}"}"
+            }
             LensAwbCalibrationModes.CUSTOM_GCAM -> if (safe.customPoints.size >= 2) {
                 "Custom GCam · ${safe.importedName.ifBlank { "import" }} · ${safe.customPoints.size} pts"
             } else {
@@ -97,6 +106,7 @@ data class LensAwbCalibrationSettings(
             append(";rg=").append(String.format(Locale.US, "%.8f", safe.rgCoefficient))
             append(";bg=").append(String.format(Locale.US, "%.8f", safe.bgCoefficient))
             append(";green=").append(safe.greenSplitMode)
+            append(";agcPreset=").append(safe.agcPresetId)
             append(";grgb=").append(String.format(Locale.US, "%.8f", safe.manualGrGbRatio))
             append(";igrgb=").append(safe.importedGrGbRatio?.let { String.format(Locale.US, "%.8f", it) } ?: "none")
             safe.customPoints.forEach { point ->

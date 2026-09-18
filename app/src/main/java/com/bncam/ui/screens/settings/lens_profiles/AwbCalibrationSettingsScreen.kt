@@ -24,6 +24,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.bncam.core.quality.GcamAwbCalibrationParser
+import com.bncam.data.settings.AgcAwbPresetCatalog
 import com.bncam.data.settings.LensAwbCalibrationModes
 import com.bncam.data.settings.LensAwbCalibrationSettings
 import com.bncam.data.settings.LensAwbCalibrationSettingsStore
@@ -107,9 +108,13 @@ fun AwbCalibrationSettingsScreen(
         ) {
             ChoiceSettingRow(
                 title = "Calibration source",
-                description = "Sensor Auto derives a sensor-specific locus from Camera2 calibration. Custom GCam imports AGC/GCam RG/BG calibration.",
+                description = "Sensor Auto derives a sensor-specific locus from Camera2 calibration. AGC Preset uses an original AGC V12 built-in sensor calibration. Custom GCam imports .gawb/.txt.",
                 value = settings.mode,
-                options = listOf(LensAwbCalibrationModes.SENSOR_AUTO, LensAwbCalibrationModes.CUSTOM_GCAM),
+                options = listOf(
+                    LensAwbCalibrationModes.SENSOR_AUTO,
+                    LensAwbCalibrationModes.AGC_PRESET,
+                    LensAwbCalibrationModes.CUSTOM_GCAM
+                ),
                 onSelected = { binding.update(settings.copy(mode = it)) }
             )
 
@@ -117,7 +122,7 @@ fun AwbCalibrationSettingsScreen(
                 title = "RG coefficient",
                 description = "Multiplicative calibration trim for the sensor RG locus.",
                 value = settings.rgCoefficient,
-                valueRange = 0.50f..2.00f,
+                valueRange = 0.25f..5.00f,
                 valueFormatter = { String.format(Locale.US, "%.3f", it) },
                 onValueChange = { binding.update(settings.copy(rgCoefficient = it)) }
             )
@@ -125,10 +130,42 @@ fun AwbCalibrationSettingsScreen(
                 title = "BG coefficient",
                 description = "Multiplicative calibration trim for the sensor BG locus.",
                 value = settings.bgCoefficient,
-                valueRange = 0.50f..2.00f,
+                valueRange = 0.25f..5.00f,
                 valueFormatter = { String.format(Locale.US, "%.3f", it) },
                 onValueChange = { binding.update(settings.copy(bgCoefficient = it)) }
             )
+        }
+
+        if (settings.mode == LensAwbCalibrationModes.AGC_PRESET) {
+            val selectedPreset = AgcAwbPresetCatalog.byId(settings.agcPresetId) ?: AgcAwbPresetCatalog.all.first()
+            SettingsCard(
+                title = "AGC V12 built-in preset",
+                description = "Original AGC 8.8.224 V12 PreComputedAWB sensor tables. Presets contain their native RG/BG calibration locus and, where AGC supplies it, GR/GB calibration."
+            ) {
+                ChoiceSettingRow(
+                    title = "AWB preset",
+                    description = "Select one of the 56 presets exposed by AGC V12.",
+                    value = selectedPreset.selectionLabel,
+                    options = AgcAwbPresetCatalog.all.map { it.selectionLabel },
+                    onSelected = { label ->
+                        AgcAwbPresetCatalog.bySelectionLabel(label)?.let { preset ->
+                            binding.update(settings.copy(agcPresetId = preset.id))
+                        }
+                    }
+                )
+                SettingValueRow(
+                    title = "Calibration points",
+                    description = "Native RG/BG points in this AGC preset.",
+                    value = selectedPreset.points.size.toString(),
+                    onClick = {}
+                )
+                SettingValueRow(
+                    title = "Preset Gr/Gb",
+                    description = "Native AGC GR/GB value when the preset contains one.",
+                    value = selectedPreset.grGbRatio?.let { String.format(Locale.US, "%.6f", it) } ?: "Not supplied",
+                    onClick = {}
+                )
+            }
         }
 
         if (settings.mode == LensAwbCalibrationModes.CUSTOM_GCAM) {
@@ -167,7 +204,7 @@ fun AwbCalibrationSettingsScreen(
 
         SettingsCard(
             title = "Green split calibration",
-            description = "Controls GCam semantic Gr/Gb sensor calibration. BnCam maps it to Camera2 G_even/G_odd for the active CFA. Auto uses imported BGRG/GRGB when available; otherwise exact-frame Camera2 green gains remain authoritative."
+            description = "Controls GCam semantic Gr/Gb sensor calibration. BnCam maps it to Camera2 G_even/G_odd for the active CFA. Auto uses the selected AGC/imported GR/GB when supplied; otherwise exact-frame Camera2 green gains remain authoritative."
         ) {
             ChoiceSettingRow(
                 title = "GR/GB authority",
@@ -189,7 +226,14 @@ fun AwbCalibrationSettingsScreen(
                 SettingValueRow(
                     title = "Imported Gr/Gb",
                     description = "AGC/GCam BGRG/GRGB calibration value when present.",
-                    value = settings.importedGrGbRatio?.let { String.format(Locale.US, "%.4f", it) } ?: "Frame metadata",
+                    value = when (settings.mode) {
+                        LensAwbCalibrationModes.AGC_PRESET ->
+                            AgcAwbPresetCatalog.byId(settings.agcPresetId)?.grGbRatio
+                                ?.let { String.format(Locale.US, "%.4f", it) } ?: "Frame metadata"
+                        LensAwbCalibrationModes.CUSTOM_GCAM ->
+                            settings.importedGrGbRatio?.let { String.format(Locale.US, "%.4f", it) } ?: "Frame metadata"
+                        else -> "Frame metadata"
+                    },
                     onClick = {}
                 )
             }

@@ -42,6 +42,9 @@ struct SpectraRawFinalizeRequest {
     // Relative Camera2/GCam-calibrated green-even/green-odd WB ratio. The shader applies
     // this prior before sampling the residual green split, then applies only the measured residual.
     float greenCalibrationRatio = 1.0f;
+    // Automatic residual G-even/G-odd correction is useful for Sensor Auto, but an explicit
+    // Manual GR/GB calibration is authoritative and must not be compensated back toward 1.0.
+    bool allowGreenResidualCorrection = true;
 
     const float* lensShadingMap = nullptr;
     std::uint32_t lensShadingColumns = 0;

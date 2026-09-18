@@ -778,6 +778,10 @@ object ImageUtils {
                 masterStorageContract = domainInfo.masterStorageContract,
                 wbGains = nativeWb,
                 wbFromMetadata = nativeWbFromMetadata,
+                awbCalibrationAuthority = finalCal?.awbCalibrationAuthority ?: 0f,
+                awbExplicitDevelopedAuthority = finalCal?.awbExplicitDevelopedAuthority == true,
+                awbManualGreenSplitAuthority = finalCal?.awbExplicitDevelopedAuthority == true &&
+                    finalCal.awbRequestedGreenSplitMode.equals("Manual", ignoreCase = true),
                 colorMatrix = nativeColorMatrix,
                 colorMatrixFromMetadata = finalCal?.effectiveColorMatrixSource?.let { source ->
                     source.contains("CaptureResult", ignoreCase = true) || source.contains("CameraCharacteristics", ignoreCase = true)
@@ -1552,6 +1556,9 @@ object ImageUtils {
         masterStorageContract: String,
         wbGains: FloatArray,
         wbFromMetadata: Boolean,
+        awbCalibrationAuthority: Float,
+        awbExplicitDevelopedAuthority: Boolean,
+        awbManualGreenSplitAuthority: Boolean,
         colorMatrix: FloatArray,
         colorMatrixFromMetadata: Boolean,
         spectraProcessingEnabled: Boolean,

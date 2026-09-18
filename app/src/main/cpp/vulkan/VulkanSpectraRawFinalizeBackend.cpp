@@ -694,7 +694,14 @@ SpectraRawFinalizeResult VulkanSpectraRawFinalizeBackend::executeInternal(
         result.greenSplitRelativeMad = evidence.relativeMad;
         result.greenSplitSignConsensus = evidence.signConsensus;
         result.greenSplitReason = bncam::raw_green_split::reasonName(evidence.reason);
-        if (evidence.apply) {
+        if (!request.allowGreenResidualCorrection) {
+            // Manual Lens-ID GR/GB is the declared physical calibration authority.
+            // Keep residual evidence for diagnostics, but do not let it cancel the requested prior.
+            result.greenEvenScale = 1.0f;
+            result.greenOddScale = 1.0f;
+            result.greenSplitApplied = std::abs(request.greenCalibrationRatio - 1.0f) > 1.0e-4f;
+            result.greenSplitReason = "manual_lens_awb_green_prior_authoritative_residual_observer_only";
+        } else if (evidence.apply) {
             result.greenEvenScale = evidence.evenScale;
             result.greenOddScale = evidence.oddScale;
             result.greenSplitApplied = true;

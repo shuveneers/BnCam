@@ -1166,6 +1166,7 @@ class ShotLogger(
             "Renderer Pipeline",
             "Sensor Calibration",
             "Sensor Calibration Detail",
+            "White Level Authority",
             "Native Calibration",
             "RAW10 Native Merge",
             "RAW_SENSOR Native Merge",

@@ -29,15 +29,20 @@ class LensAwbCalibrationSettingsStore(private val context: Context) {
             if (current == null) write(preferences, keys, value)
             resolved = value
         }
-        return resolved ?: settingsFlow(lensId).first()
+        val value = resolved ?: settingsFlow(lensId).first()
+        LensAwbCalibrationRuntimeRegistry.publish(lensId, value)
+        return value
     }
 
     suspend fun get(lensId: String): LensAwbCalibrationSettings = ensureInitialized(lensId)
 
     suspend fun set(lensId: String, settings: LensAwbCalibrationSettings) {
+        val safe = settings.sanitized()
         val keys = keys(lensId)
-        context.dataStore.edit { preferences -> write(preferences, keys, settings.sanitized()) }
-        LensAwbCalibrationRuntimeRegistry.invalidate(lensId)
+        context.dataStore.edit { preferences -> write(preferences, keys, safe) }
+        // Capture must see the same value the UI just committed, immediately. Do not invalidate
+        // after DataStore emits: that can erase the freshly observed cache value until a later read.
+        LensAwbCalibrationRuntimeRegistry.publish(lensId, safe)
     }
 
     suspend fun reset(lensId: String) = set(lensId, LensAwbCalibrationSettings())
@@ -51,6 +56,7 @@ class LensAwbCalibrationSettingsStore(private val context: Context) {
             rgCoefficient = preferences[keys.rgCoeff] ?: 1.0f,
             bgCoefficient = preferences[keys.bgCoeff] ?: 1.0f,
             greenSplitMode = preferences[keys.greenMode] ?: LensAwbGreenSplitModes.AUTO,
+            agcPresetId = preferences[keys.agcPresetId] ?: 0,
             manualGrGbRatio = preferences[keys.manualGrGb] ?: 1.0f,
             importedName = preferences[keys.importedName] ?: "",
             importedFormat = preferences[keys.importedFormat] ?: "",
@@ -66,6 +72,7 @@ class LensAwbCalibrationSettingsStore(private val context: Context) {
         preferences[keys.rgCoeff] = safe.rgCoefficient
         preferences[keys.bgCoeff] = safe.bgCoefficient
         preferences[keys.greenMode] = safe.greenSplitMode
+        preferences[keys.agcPresetId] = safe.agcPresetId
         preferences[keys.manualGrGb] = safe.manualGrGbRatio
         preferences[keys.importedName] = safe.importedName
         preferences[keys.importedFormat] = safe.importedFormat
@@ -81,6 +88,7 @@ class LensAwbCalibrationSettingsStore(private val context: Context) {
             rgCoeff = floatPreferencesKey("${base}rg_coeff"),
             bgCoeff = floatPreferencesKey("${base}bg_coeff"),
             greenMode = stringPreferencesKey("${base}green_mode"),
+            agcPresetId = intPreferencesKey("${base}agc_preset_id"),
             manualGrGb = floatPreferencesKey("${base}manual_grgb"),
             importedName = stringPreferencesKey("${base}import_name"),
             importedFormat = stringPreferencesKey("${base}import_format"),
@@ -109,6 +117,7 @@ class LensAwbCalibrationSettingsStore(private val context: Context) {
         val rgCoeff: Preferences.Key<Float>,
         val bgCoeff: Preferences.Key<Float>,
         val greenMode: Preferences.Key<String>,
+        val agcPresetId: Preferences.Key<Int>,
         val manualGrGb: Preferences.Key<Float>,
         val importedName: Preferences.Key<String>,
         val importedFormat: Preferences.Key<String>,

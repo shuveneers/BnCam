@@ -98,7 +98,12 @@ class WhiteBalanceStateEngine {
         gains: FloatArray,
         convergence: WhiteBalanceConvergence,
         colorMatrix: FloatArray? = null,
-        sensorTimestampNs: Long = 0L
+        sensorTimestampNs: Long = 0L,
+        calibrationSource: String = "CAMERA2_EXACT_FRAME",
+        calibrationFingerprint: String = "UNAVAILABLE",
+        calibrationAuthority: Float = 0f,
+        grGbRatio: Float? = null,
+        greenEvenOddRatio: Float? = null
     ): StableWhiteBalanceSnapshot? = synchronized(lock) {
         val safe = sanitizeGains(gains) ?: return@synchronized snapshotLocked()
         val safeMatrix = sanitizeColorMatrix(colorMatrix)
@@ -133,11 +138,13 @@ class WhiteBalanceStateEngine {
             priorDisagreement = 0f,
             validTileCount = 0,
             sensorTimestampNs = sensorTimestampNs,
-            calibrationSource = "CAMERA2_EXACT_FRAME",
-            calibrationFingerprint = "UNAVAILABLE",
-            calibrationAuthority = 0f,
-            grGbRatio = null,
-            greenEvenOddRatio = (safe[1] / max(1.0e-4f, safe[2])).coerceIn(0.50f, 2.0f)
+            calibrationSource = calibrationSource,
+            calibrationFingerprint = calibrationFingerprint,
+            calibrationAuthority = calibrationAuthority.takeIf(Float::isFinite)?.coerceIn(0f, 1f) ?: 0f,
+            grGbRatio = grGbRatio?.takeIf { it.isFinite() && it in 0.50f..2.0f },
+            greenEvenOddRatio = greenEvenOddRatio
+                ?.takeIf { it.isFinite() && it in 0.50f..2.0f }
+                ?: (safe[1] / max(1.0e-4f, safe[2])).coerceIn(0.50f, 2.0f)
         )
     }
 

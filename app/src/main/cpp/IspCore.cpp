@@ -1920,7 +1920,11 @@ std::string computeRawShadowDiagnostics(
     const int startY = std::max(0, marginY);
     const int endY = std::min(height, height - marginY);
 
-    const float whiteLevel = static_cast<float>(std::max(1, raw.info.payloadWhiteLevel));
+    const float whiteLevel =
+            std::isfinite(raw.info.effectiveWhiteLevelInMasterUnits) &&
+                    raw.info.effectiveWhiteLevelInMasterUnits > 0.0f
+            ? raw.info.effectiveWhiteLevelInMasterUnits
+            : static_cast<float>(std::max(1, raw.info.payloadWhiteLevel));
     const float nearBlackThreshold = 0.15f;
 
     // Tile grid setup (16x16)
@@ -2397,7 +2401,10 @@ DefectCorrectionDebug applyDefectCorrectionToJpegRaw(LinearFloatRaw& raw, const 
     return debug;
 }
 
-GreenSplitDebug applyGreenSplitCorrectionToJpegRaw(LinearFloatRaw& raw, float greenCalibrationRatio) {
+GreenSplitDebug applyGreenSplitCorrectionToJpegRaw(
+        LinearFloatRaw& raw,
+        float greenCalibrationRatio,
+        bool allowResidualCorrection) {
     GreenSplitDebug debug{};
     const auto start = IspClock::now();
     if (raw.mosaic.empty() || raw.mosaic.type() != CV_32FC1) {
@@ -2452,8 +2459,10 @@ GreenSplitDebug applyGreenSplitCorrectionToJpegRaw(LinearFloatRaw& raw, float gr
     debug.relativeMad = evidence.relativeMad;
     debug.signConsensus = evidence.signConsensus;
     debug.reason = bncam::raw_green_split::reasonName(evidence.reason);
-    const float residualEvenScale = evidence.apply ? evidence.evenScale : 1.0f;
-    const float residualOddScale = evidence.apply ? evidence.oddScale : 1.0f;
+    const float residualEvenScale =
+            allowResidualCorrection && evidence.apply ? evidence.evenScale : 1.0f;
+    const float residualOddScale =
+            allowResidualCorrection && evidence.apply ? evidence.oddScale : 1.0f;
     debug.greenEvenScale = greenEvenPriorScale * residualEvenScale;
     debug.greenOddScale = greenOddPriorScale * residualOddScale;
     cv::parallel_for_(cv::Range(0, raw.mosaic.rows), [&](const cv::Range& range) {
@@ -2467,10 +2476,13 @@ GreenSplitDebug applyGreenSplitCorrectionToJpegRaw(LinearFloatRaw& raw, float gr
         }
     });
 
-    debug.applied = evidence.apply || std::abs(safeGreenRatio - 1.0f) > 1.0e-4f;
-    debug.reason = evidence.apply
-            ? "lens_awb_green_prior_plus_residual_consensus_applied_in_jpeg_clone"
-            : (debug.applied ? "lens_awb_green_prior_applied_no_residual" : debug.reason);
+    debug.applied = (allowResidualCorrection && evidence.apply) ||
+            std::abs(safeGreenRatio - 1.0f) > 1.0e-4f;
+    debug.reason = !allowResidualCorrection && std::abs(safeGreenRatio - 1.0f) > 1.0e-4f
+            ? "manual_lens_awb_green_prior_authoritative_residual_observer_only"
+            : ((allowResidualCorrection && evidence.apply)
+                    ? "lens_awb_green_prior_plus_residual_consensus_applied_in_jpeg_clone"
+                    : (debug.applied ? "lens_awb_green_prior_applied_no_residual" : debug.reason));
     debug.elapsedMs = elapsedMs(start);
     return debug;
 }
@@ -2667,7 +2679,11 @@ std::string computeRawShadowDiagnosticsCompact(
         return "rawShadowDiagnostics=unavailable_compact_region_too_small";
     }
 
-    const float whiteLevel = static_cast<float>(std::max(1, raw.info.payloadWhiteLevel));
+    const float whiteLevel =
+            std::isfinite(raw.info.effectiveWhiteLevelInMasterUnits) &&
+                    raw.info.effectiveWhiteLevelInMasterUnits > 0.0f
+            ? raw.info.effectiveWhiteLevelInMasterUnits
+            : static_cast<float>(std::max(1, raw.info.payloadWhiteLevel));
     constexpr float nearBlackThreshold = 0.15f;
     constexpr int gridCols = 16;
     constexpr int gridRows = 16;
@@ -3758,7 +3774,11 @@ SpectraPass0State IspCore::computePass0State(
     const int startY = std::max(0, marginY);
     const int endY = std::min(height, height - marginY);
 
-    const float whiteLevel = static_cast<float>(std::max(1, raw.info.payloadWhiteLevel));
+    const float whiteLevel =
+            std::isfinite(raw.info.effectiveWhiteLevelInMasterUnits) &&
+                    raw.info.effectiveWhiteLevelInMasterUnits > 0.0f
+            ? raw.info.effectiveWhiteLevelInMasterUnits
+            : static_cast<float>(std::max(1, raw.info.payloadWhiteLevel));
     const float nearBlackThreshold = 0.15f;
 
     const int gridCols = 16;
@@ -3979,7 +3999,11 @@ SpectraPass0State IspCore::computePass0StateCompact(
     const int endX = std::min(width, width - marginX);
     const int startY = std::max(0, marginY);
     const int endY = std::min(height, height - marginY);
-    const float whiteLevel = static_cast<float>(std::max(1, raw.info.payloadWhiteLevel));
+    const float whiteLevel =
+            std::isfinite(raw.info.effectiveWhiteLevelInMasterUnits) &&
+                    raw.info.effectiveWhiteLevelInMasterUnits > 0.0f
+            ? raw.info.effectiveWhiteLevelInMasterUnits
+            : static_cast<float>(std::max(1, raw.info.payloadWhiteLevel));
     constexpr float nearBlackThreshold = 0.15f;
     constexpr int gridCols = 16;
     constexpr int gridRows = 16;
@@ -5556,7 +5580,10 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         const float greenWbEven = safeWbGain(meta.calibration.effectiveWbGains[1]);
         const float greenWbOdd = safeWbGain(meta.calibration.effectiveWbGains[2]);
         const float greenCalibrationRatio = std::clamp(greenWbEven / std::max(1.0e-4f, greenWbOdd), 0.50f, 2.0f);
-        greenSplitDebug = applyGreenSplitCorrectionToJpegRaw(jpegRaw, greenCalibrationRatio);
+        greenSplitDebug = applyGreenSplitCorrectionToJpegRaw(
+                jpegRaw,
+                greenCalibrationRatio,
+                !meta.calibration.awbManualGreenSplitAuthority);
         lensDebug = applyLensShadingToJpegRaw(jpegRaw, meta);
         // Automatic software exposure is intentionally neutral. Local FLLF tone mapping owns
         // automatic brightness/DR placement after calibrated scene-linear colour.
@@ -5600,6 +5627,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         const float greenWbOdd = safeWbGain(meta.calibration.effectiveWbGains[2]);
         request.greenCalibrationRatio = std::clamp(
                 greenWbEven / std::max(1.0e-4f, greenWbOdd), 0.50f, 2.0f);
+        request.allowGreenResidualCorrection = !meta.calibration.awbManualGreenSplitAuthority;
         if (lensShadingMapValid(meta)) {
             request.lensShadingMap = meta.lensShadingMap.data();
             request.lensShadingColumns = static_cast<std::uint32_t>(meta.lensShadingColumns);
@@ -5826,8 +5854,12 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             greenSplitDebug.applied = vulkanRawFinalize.greenSplitApplied;
             greenSplitDebug.greenEvenMedian = vulkanRawFinalize.greenEvenMedian;
             greenSplitDebug.greenOddMedian = vulkanRawFinalize.greenOddMedian;
-            greenSplitDebug.greenEvenScale = vulkanRawFinalize.greenEvenScale;
-            greenSplitDebug.greenOddScale = vulkanRawFinalize.greenOddScale;
+            const float debugGreenRatio = std::clamp(request.greenCalibrationRatio, 0.50f, 2.0f);
+            const float debugGreenEvenPrior = (2.0f * debugGreenRatio) / (debugGreenRatio + 1.0f);
+            const float debugGreenOddPrior = 2.0f / (debugGreenRatio + 1.0f);
+            // Report the effective scale that the shader applied, not only the residual multiplier.
+            greenSplitDebug.greenEvenScale = debugGreenEvenPrior * vulkanRawFinalize.greenEvenScale;
+            greenSplitDebug.greenOddScale = debugGreenOddPrior * vulkanRawFinalize.greenOddScale;
             greenSplitDebug.pairedSampleCount = vulkanRawFinalize.greenPairSampleCount;
             greenSplitDebug.relativeMedian = vulkanRawFinalize.greenSplitRelativeMedian;
             greenSplitDebug.relativeMad = vulkanRawFinalize.greenSplitRelativeMad;
@@ -6441,16 +6473,23 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     };
     // ImageUtils sets wbFromMetadata only when the selected frame supplies both the exact
     // COLOR_CORRECTION_GAINS and exact COLOR_CORRECTION_TRANSFORM. Keep that coupled solution
-    // as the strong System-AWB anchor; sufficiently supported physical scene evidence may only
-    // apply a bounded gain refinement while the exact Camera2 colour transform remains intact.
+    // as the strong System-AWB anchor for Sensor Auto.
     const bool exactCamera2ColorPair = uiConfig.wbFromMetadata && uiConfig.colorMatrixFromMetadata;
+
+    // User-selected Lens-ID AWB is a developed-image authority, not a weak prior.  The Kotlin
+    // calibration layer has already resolved the requested AGC preset / Custom GCam / RG-BG trim
+    // into effectiveWbGains.  Once this flag is true, no native scene estimator, auxiliary sensor
+    // or temporal/gray-world stage may pull those gains back toward Auto.  Sensor Auto keeps the
+    // physical refinement path below.
+    const bool explicitLensAwbAuthority = meta.calibration.awbExplicitDevelopedAuthority;
 
     float nativeAppliedContributionWeight = 0.0f;
     std::string nativeAdjustmentType = "none";
     float nativeAdjustmentMagnitude = 0.0f;
 
     const float rawContributionWeight = std::clamp(meta.auxContributionWeight, 0.0f, 0.15f);
-    if (!exactCamera2ColorPair && meta.phoneAssistanceSensorsEnabled && meta.auxSensorValid &&
+    if (!explicitLensAwbAuthority && !exactCamera2ColorPair &&
+        meta.phoneAssistanceSensorsEnabled && meta.auxSensorValid &&
         rawContributionWeight > 0.001f && meta.auxCctKelvin >= 1500.0f && meta.auxCctKelvin <= 12000.0f) {
         const float cctRatio = std::clamp(5500.0f / meta.auxCctKelvin, 0.60f, 1.80f);
         const float sensorWbRScale = 1.0f + (cctRatio - 1.0f) * 0.15f * rawContributionWeight;
@@ -6483,11 +6522,29 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     if (!vulkanDemosaicResident) {
         phase7AwbEstimate.method = "PHYSICAL_AWB_CPU_FAILURE_REFERENCE_GRAY_WORLD_V1";
     }
-    if (exactCamera2ColorPair) {
-        // Exact Camera2 System-AWB remains the anchor, but must not permanently suppress the
-        // physical estimator when compact scene evidence is genuinely supported. The estimator's
-        // own confidence/mixed-light gates remain authoritative and are capped again here because
-        // the Camera2 gain+matrix pair is already a coherent per-frame colour solution.
+    if (explicitLensAwbAuthority) {
+        // Hard ownership boundary: Auto is the only mode allowed to run physical/gray-world AWB.
+        // Any explicit Lens-ID choice must appear in the developed JPEG exactly as resolved by the
+        // Kotlin GCam calibration layer.  This branch intentionally does NOT depend on
+        // exactCamera2ColorPair: many RAW routes have exact gains but no per-frame CCM, and that
+        // was the bypass that made presets look like no-ops.
+        phase7AwbEstimate.finalGainsRgb[0] = std::clamp(
+                static_cast<double>(wbPriorRgb[0]), 0.20, 8.00);
+        phase7AwbEstimate.finalGainsRgb[1] = 1.0;
+        phase7AwbEstimate.finalGainsRgb[2] = std::clamp(
+                static_cast<double>(wbPriorRgb[2]), 0.20, 8.00);
+        phase7AwbEstimate.priorGainsRgb[0] = phase7AwbEstimate.finalGainsRgb[0];
+        phase7AwbEstimate.priorGainsRgb[1] = 1.0;
+        phase7AwbEstimate.priorGainsRgb[2] = phase7AwbEstimate.finalGainsRgb[2];
+        phase7AwbEstimate.dataAuthority = 0.0;
+        phase7AwbEstimate.method = "LENS_AWB_EXPLICIT_HARD_AUTHORITY";
+        phase7AwbEstimate.status = "READY_EXPLICIT_LENS_AWB_HARD_AUTHORITY";
+        nativeAppliedContributionWeight = 0.0f;
+        nativeAdjustmentType = "none_explicit_lens_awb_hard_authority";
+        nativeAdjustmentMagnitude = 0.0f;
+    } else if (exactCamera2ColorPair) {
+        // Sensor Auto may use a bounded physical scene refinement while the exact Camera2 colour
+        // transform remains intact.
         const bool physicalRefinementSupported =
                 phase7AwbEstimate.dataReady &&
                 std::isfinite(phase7AwbEstimate.confidence) &&
@@ -9813,6 +9870,11 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; phase7AwbSampleSource=" << phase7AwbSampleSource
             << "; phase7AwbStatus=" << phase7AwbEstimate.status
             << "; phase7AwbMethod=" << phase7AwbEstimate.method
+            << "; phase7LensCalibrationAuthority=" << meta.calibration.awbCalibrationAuthority
+            << "; phase7ExplicitLensAwbAuthority="
+            << (meta.calibration.awbExplicitDevelopedAuthority ? "true" : "false")
+            << "; phase7ManualGreenSplitAuthority="
+            << (meta.calibration.awbManualGreenSplitAuthority ? "true" : "false")
             << "; phase7AwbPriorValid=" << (phase7AwbEstimate.priorValid ? "true" : "false")
             << "; phase7AwbDataReady=" << (phase7AwbEstimate.dataReady ? "true" : "false")
             << "; phase7AwbMixedIllumination="

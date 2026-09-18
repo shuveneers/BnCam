@@ -20,6 +20,14 @@ object LensAwbCalibrationRuntimeRegistry {
     private val observed = ConcurrentHashMap.newKeySet<String>()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
+    /**
+     * Publishes a successfully persisted Lens-ID AWB state directly to capture runtime.
+     * This removes the DataStore-observer timing window between the settings UI and shutter.
+     */
+    fun publish(lensId: String, settings: LensAwbCalibrationSettings) {
+        cache[SettingsRepository.safeLensKeyPart(lensId)] = settings.sanitized()
+    }
+
     fun invalidate(lensId: String) {
         cache.remove(SettingsRepository.safeLensKeyPart(lensId))
     }

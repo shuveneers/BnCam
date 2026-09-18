@@ -4,6 +4,7 @@ import android.graphics.ImageFormat
 import android.util.Log
 import android.hardware.camera2.CameraCharacteristics
 import com.bncam.data.settings.ResolvedLensHardwareSettings
+import com.bncam.data.settings.LensAwbCalibrationRuntimeRegistry
 import java.util.Locale
 import kotlin.math.abs
 
@@ -170,6 +171,16 @@ data class FinalSensorCalibration(
     val awbCalibrationAuthority: Float = 0f,
     val awbGrGbRatio: Float? = null,
     val awbGreenEvenOddRatio: Float = 1f,
+    val awbRuntimeSettingsReady: Boolean = false,
+    val awbRequestedMode: String = "UNAVAILABLE",
+    val awbRequestedPresetId: Int = -1,
+    val awbRequestedPresetName: String = "UNAVAILABLE",
+    val awbRequestedRgCoefficient: Float = 1f,
+    val awbRequestedBgCoefficient: Float = 1f,
+    val awbRequestedGreenSplitMode: String = "UNAVAILABLE",
+    val awbRequestedManualGrGbRatio: Float = 1f,
+    val awbRequestedFingerprint: String = "UNAVAILABLE",
+    val awbExplicitDevelopedAuthority: Boolean = false,
 
     val effectiveColorMatrix: FloatArray?,
     val effectiveColorMatrixSource: String,
@@ -269,6 +280,16 @@ data class FinalSensorCalibration(
         pairs.add("AWB Calibration Authority" to awbCalibrationAuthority.format6())
         pairs.add("AWB Calibration GR/GB Ratio" to (awbGrGbRatio?.format6() ?: "not supplied"))
         pairs.add("AWB Applied G_even/G_odd Ratio" to awbGreenEvenOddRatio.format6())
+        pairs.add("AWB Runtime Settings Ready" to awbRuntimeSettingsReady.toString())
+        pairs.add("AWB Requested Mode" to awbRequestedMode)
+        pairs.add("AWB Requested Preset ID" to awbRequestedPresetId.toString())
+        pairs.add("AWB Requested Preset" to awbRequestedPresetName)
+        pairs.add("AWB Requested RG Coefficient" to awbRequestedRgCoefficient.format6())
+        pairs.add("AWB Requested BG Coefficient" to awbRequestedBgCoefficient.format6())
+        pairs.add("AWB Requested Green Split Mode" to awbRequestedGreenSplitMode)
+        pairs.add("AWB Requested Manual GR/GB" to awbRequestedManualGrGbRatio.format6())
+        pairs.add("AWB Requested Fingerprint" to awbRequestedFingerprint)
+        pairs.add("AWB Explicit Developed Authority" to awbExplicitDevelopedAuthority.toString())
         pairs.add("AWB Profile-owned State" to "none")
         pairs.add("DNG Developed AWB Override" to "false")
 
@@ -738,6 +759,45 @@ object SensorCalibrationResolver {
             base.baseColorMatrixSource.contains("CaptureResult.COLOR_CORRECTION_TRANSFORM", ignoreCase = true)
         val exactFrameCamera2ColorPair = systemAwbRequested && exactFrameCamera2Wb && exactFrameCamera2Ccm
 
+        // P0 AWB authority fix: Lens ID AWB calibration must constrain the exact-frame Camera2
+        // prior directly. Previously it only participated in the optional physical-scene observer,
+        // while this resolver normally selected base.baseWbGains first; that made extreme lens
+        // calibration values a complete no-op in captured JPEGs.
+        val lensAwbRuntime = if (systemAwbRequested && exactFrameCamera2Wb) {
+            LensAwbCalibrationRuntimeRegistry.resolve(base.lensId)
+        } else {
+            null
+        }
+        val resolvedLensAwbCalibration = lensAwbRuntime?.let { runtime ->
+            runCatching { GcamAwbCalibrationEngine.resolve(runtime.settings, characteristics) }.getOrNull()
+        }
+        val calibratedExactFrameAwb = if (
+            systemAwbRequested && exactFrameCamera2Wb && resolvedLensAwbCalibration?.valid == true && lensAwbRuntime != null
+        ) {
+            GcamAwbCalibrationEngine.applyToCamera2Prior(
+                camera2Gains = base.baseWbGains,
+                calibration = resolvedLensAwbCalibration,
+                settings = lensAwbRuntime.settings,
+                cfaPattern = base.cfaPattern
+            )
+        } else {
+            null
+        }
+        if (systemAwbRequested && exactFrameCamera2Wb && lensAwbRuntime?.settingsReady == true && calibratedExactFrameAwb == null) {
+            warnings.add(
+                "Lens ID AWB calibration could not be applied to exact-frame Camera2 WB; " +
+                    "source=${resolvedLensAwbCalibration?.source ?: "unavailable"} " +
+                    "reason=${resolvedLensAwbCalibration?.warning ?: "unavailable"}."
+            )
+        }
+        val requestedAwbSettings = lensAwbRuntime?.settings?.sanitized()
+        val explicitLensAwbAuthority = requestedAwbSettings?.let(
+            GcamAwbCalibrationEngine::hasExplicitDevelopedAuthority
+        ) == true
+        val requestedAwbPreset = requestedAwbSettings
+            ?.takeIf { it.mode == com.bncam.data.settings.LensAwbCalibrationModes.AGC_PRESET }
+            ?.let { com.bncam.data.settings.AgcAwbPresetCatalog.byId(it.agcPresetId) }
+
         // Lens Auto uses the single temporal owner's recent physical scene solution only when it
         // carries a coherent WB+CCM pair. Camera2 remains the exact-frame prior/fallback whenever
         // physical evidence is unavailable, weak, stale or incomplete; no gain-only history is
@@ -773,7 +833,9 @@ object SensorCalibrationResolver {
 
         val wb = when {
             liveManualWhiteBalance != null -> liveManualWhiteBalance.bayerWbGains.copyOf()
+            explicitLensAwbAuthority && calibratedExactFrameAwb != null -> calibratedExactFrameAwb.gains.copyOf()
             stablePhysicalSystemAutoPair != null -> stablePhysicalSystemAutoPair.copyGains()
+            calibratedExactFrameAwb != null -> calibratedExactFrameAwb.gains.copyOf()
             exactFrameCamera2Wb -> base.baseWbGains.copyOf()
             stableSystemAutoWbFallback != null -> stableSystemAutoWbFallback.copyGains()
             else -> base.baseWbGains.copyOf()
@@ -781,10 +843,16 @@ object SensorCalibrationResolver {
         val wbSource = when {
             liveManualWhiteBalance != null ->
                 "Live manual WB ${liveManualWhiteBalance.targetKelvin}K / ${liveManualWhiteBalance.illuminantModel} / Camera2 calibration matrices"
+            explicitLensAwbAuthority && calibratedExactFrameAwb != null ->
+                "Lens ID explicit GCam AWB calibration ${calibratedExactFrameAwb.calibrationSource} " +
+                    "authority=${String.format(Locale.US, "%.3f", calibratedExactFrameAwb.calibrationAuthority)} + Camera2 exact-frame CCM"
             stablePhysicalSystemAutoPair != null ->
                 "BnCam Lens AWB physical scene confidence=${String.format(Locale.US, "%.3f", stablePhysicalSystemAutoPair.confidence)} " +
                     "dataAuthority=${String.format(Locale.US, "%.3f", stablePhysicalSystemAutoPair.dataAuthority)} " +
                     "mixedLight=${String.format(Locale.US, "%.3f", stablePhysicalSystemAutoPair.mixedLightScore)}"
+            calibratedExactFrameAwb != null ->
+                "Lens ID GCam AWB calibration ${calibratedExactFrameAwb.calibrationSource} " +
+                    "authority=${String.format(Locale.US, "%.3f", calibratedExactFrameAwb.calibrationAuthority)} + Camera2 exact-frame CCM"
             exactFrameCamera2ColorPair ->
                 "CaptureResult exact-frame color pair: COLOR_CORRECTION_GAINS + COLOR_CORRECTION_TRANSFORM"
             exactFrameCamera2Wb ->
@@ -796,25 +864,37 @@ object SensorCalibrationResolver {
 
         val awbCalibrationSource = when {
             liveManualWhiteBalance != null -> "LIVE_MANUAL_KELVIN_TRANSIENT_OVERRIDE"
+            explicitLensAwbAuthority && calibratedExactFrameAwb != null -> calibratedExactFrameAwb.calibrationSource
             stablePhysicalSystemAutoPair != null -> stablePhysicalSystemAutoPair.calibrationSource
+            calibratedExactFrameAwb != null -> calibratedExactFrameAwb.calibrationSource
             exactFrameCamera2Wb -> "CAMERA2_EXACT_FRAME"
             stableSystemAutoWbFallback != null -> stableSystemAutoWbFallback.calibrationSource
             else -> "CAMERA2_BASE_METADATA"
         }
         val awbCalibrationFingerprint = when {
             liveManualWhiteBalance != null -> "transient:${liveManualWhiteBalance.targetKelvin}K:${liveManualWhiteBalance.illuminantModel}"
+            explicitLensAwbAuthority && calibratedExactFrameAwb != null -> calibratedExactFrameAwb.calibrationFingerprint
             stablePhysicalSystemAutoPair != null -> stablePhysicalSystemAutoPair.calibrationFingerprint
+            calibratedExactFrameAwb != null -> calibratedExactFrameAwb.calibrationFingerprint
             stableSystemAutoWbFallback != null -> stableSystemAutoWbFallback.calibrationFingerprint
             else -> "UNAVAILABLE"
         }
         val awbCalibrationAuthority = when {
             liveManualWhiteBalance != null -> 1f
+            explicitLensAwbAuthority && calibratedExactFrameAwb != null -> calibratedExactFrameAwb.calibrationAuthority
             stablePhysicalSystemAutoPair != null -> stablePhysicalSystemAutoPair.calibrationAuthority
+            calibratedExactFrameAwb != null -> calibratedExactFrameAwb.calibrationAuthority
             else -> 0f
         }
-        val awbGrGbRatio = stablePhysicalSystemAutoPair?.grGbRatio
+        val awbGrGbRatio = when {
+            explicitLensAwbAuthority && calibratedExactFrameAwb != null -> calibratedExactFrameAwb.grGbRatio
+            stablePhysicalSystemAutoPair != null -> stablePhysicalSystemAutoPair.grGbRatio
+            else -> calibratedExactFrameAwb?.grGbRatio
+        }
         val awbGreenEvenOddRatio = when {
+            explicitLensAwbAuthority && calibratedExactFrameAwb != null -> calibratedExactFrameAwb.greenEvenOddRatio
             stablePhysicalSystemAutoPair != null -> stablePhysicalSystemAutoPair.greenEvenOddRatio
+            calibratedExactFrameAwb != null -> calibratedExactFrameAwb.greenEvenOddRatio
             wb.size >= 3 && wb[1].isFinite() && wb[2].isFinite() && wb[1] > 1.0e-4f && wb[2] > 1.0e-4f ->
                 (wb[1] / wb[2]).coerceIn(0.50f, 2.0f)
             else -> 1f
@@ -829,6 +909,7 @@ object SensorCalibrationResolver {
         val colorMatrix = when {
             manualColorOverrideActive -> override.manualColorMatrix
             liveManualWhiteBalance != null && liveManualColorMatrix != null -> liveManualColorMatrix
+            explicitLensAwbAuthority && calibratedExactFrameAwb != null -> base.baseColorMatrix
             stablePhysicalSystemAutoPair != null -> stablePhysicalSystemAutoPair.copyColorMatrix()
             else -> base.baseColorMatrix
         }
@@ -836,8 +917,12 @@ object SensorCalibrationResolver {
             manualColorOverrideActive -> "Lens ID Manual color matrix override"
             liveManualWhiteBalance != null && liveManualColorMatrix != null ->
                 "Live manual WB ${liveManualWhiteBalance.targetKelvin}K paired post-WB sensor->linear-sRGB matrix"
+            explicitLensAwbAuthority && calibratedExactFrameAwb != null && exactFrameCamera2Ccm ->
+                "Camera2 exact-frame CCM + explicit Lens ID calibrated exact-frame WB gains"
             stablePhysicalSystemAutoPair != null ->
                 "BnCam Lens AWB temporally paired Camera2 CCM"
+            calibratedExactFrameAwb != null && exactFrameCamera2Ccm ->
+                "Camera2 exact-frame CCM + Lens ID calibrated exact-frame WB gains"
             exactFrameCamera2ColorPair ->
                 "CaptureResult exact-frame color pair: COLOR_CORRECTION_TRANSFORM + COLOR_CORRECTION_GAINS"
             else -> base.baseColorMatrixSource
@@ -939,6 +1024,16 @@ object SensorCalibrationResolver {
             awbCalibrationAuthority = awbCalibrationAuthority,
             awbGrGbRatio = awbGrGbRatio,
             awbGreenEvenOddRatio = awbGreenEvenOddRatio,
+            awbRuntimeSettingsReady = lensAwbRuntime?.settingsReady == true,
+            awbRequestedMode = requestedAwbSettings?.mode ?: "UNAVAILABLE",
+            awbRequestedPresetId = requestedAwbSettings?.agcPresetId ?: -1,
+            awbRequestedPresetName = requestedAwbPreset?.name ?: "UNAVAILABLE",
+            awbRequestedRgCoefficient = requestedAwbSettings?.rgCoefficient ?: 1f,
+            awbRequestedBgCoefficient = requestedAwbSettings?.bgCoefficient ?: 1f,
+            awbRequestedGreenSplitMode = requestedAwbSettings?.greenSplitMode ?: "UNAVAILABLE",
+            awbRequestedManualGrGbRatio = requestedAwbSettings?.manualGrGbRatio ?: 1f,
+            awbRequestedFingerprint = requestedAwbSettings?.fingerprint() ?: "UNAVAILABLE",
+            awbExplicitDevelopedAuthority = explicitLensAwbAuthority,
             effectiveColorMatrix = colorMatrix,
             effectiveColorMatrixSource = colorSource,
             effectiveColorMatrixApplied = colorApplied,

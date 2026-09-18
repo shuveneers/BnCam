@@ -50,6 +50,11 @@ struct FinalSensorCalibrationNative {
     std::string calibrationWarnings = "none";
 
     float effectiveWbGains[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    // Lens-ID AWB authority transported explicitly into native RAW processing.
+    // Explicit presets/custom/trim must not be silently re-neutralized by Phase 7 scene AWB.
+    float awbCalibrationAuthority = 0.0f;
+    bool awbExplicitDevelopedAuthority = false;
+    bool awbManualGreenSplitAuthority = false;
 
     float effectiveColorMatrix[9] = {1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f};
     bool hasColorMatrix = false;

@@ -3357,6 +3357,9 @@ Java_com_bncam_core_engine_ImageUtils_renderJpegFromMasterNative(
         jstring masterStorageContractString,
         jfloatArray wbGainsArray,
         jboolean wbFromMetadata,
+        jfloat awbCalibrationAuthority,
+        jboolean awbExplicitDevelopedAuthority,
+        jboolean awbManualGreenSplitAuthority,
         jfloatArray colorMatrixArray,
         jboolean colorMatrixFromMetadata,
         jboolean spectraProcessingEnabled,
@@ -3705,6 +3708,13 @@ Java_com_bncam_core_engine_ImageUtils_renderJpegFromMasterNative(
         meta.calibration.effectiveWbGains[3] = wb[3];
         meta.calibration.hasWbGains = true;
     }
+    meta.calibration.awbCalibrationAuthority =
+            std::isfinite(static_cast<float>(awbCalibrationAuthority))
+                    ? std::clamp(static_cast<float>(awbCalibrationAuthority), 0.0f, 1.0f)
+                    : 0.0f;
+    meta.calibration.awbExplicitDevelopedAuthority = awbExplicitDevelopedAuthority == JNI_TRUE;
+    meta.calibration.awbManualGreenSplitAuthority = awbManualGreenSplitAuthority == JNI_TRUE;
+
     meta.calibration.calibrationApplied = meta.calibration.hasBlackLevel || meta.calibration.hasWhiteLevel ||
             meta.calibration.hasWbGains || meta.calibration.hasColorMatrix ||
             meta.calibration.physicalNoiseModelAvailable();

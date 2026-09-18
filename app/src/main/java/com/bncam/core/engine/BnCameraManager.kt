@@ -12070,11 +12070,7 @@ class BnCameraManager(private val context: Context) {
             // QcColorCalibration GR/GB is semantic Gr/Gb. Camera2 RGGB vectors use
             // greenEven/greenOdd, so GBRG/BGGR require the reciprocal mapping.
             val calibratedEvenOddRatio = importedGrGbRatio?.let { grGb ->
-                when (cfaPattern) {
-                    CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT_GBRG,
-                    CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT_BGGR -> 1.0f / grGb
-                    else -> grGb
-                }
+                GcamAwbCalibrationEngine.semanticGrGbToCamera2EvenOdd(grGb, cfaPattern ?: -1)
             }
             val greenEvenOddRatio = calibratedEvenOddRatio ?: priorGrGb
             val greenRoot = sqrt(greenEvenOddRatio.coerceAtLeast(1.0e-6f))
@@ -12085,8 +12081,12 @@ class BnCameraManager(private val context: Context) {
                 finalRgb[2]
             )
             val calibrationAuthority = if (resolvedCalibration?.valid == true) {
-                (0.55f * frame.physicalAwbConfidence.coerceIn(0f, 1f) *
-                    (0.50f + 0.50f * frame.physicalAwbDataAuthority.coerceIn(0f, 1f))).coerceIn(0f, 0.55f)
+                val staticAuthority = GcamAwbCalibrationEngine.staticPriorAuthority(runtimeCalibration.settings)
+                val evidenceAuthority = frame.physicalAwbConfidence.coerceIn(0f, 1f) *
+                    (0.50f + 0.50f * frame.physicalAwbDataAuthority.coerceIn(0f, 1f))
+                // Explicit Custom/trim calibration must remain visible when the physical observer is accepted;
+                // Sensor Auto stays evidence-weighted to avoid over-constraining weak scenes.
+                if (staticAuthority >= 0.999f) 1.0f else (staticAuthority * evidenceAuthority).coerceIn(0f, staticAuthority)
             } else 0f
             val finalGains = if (resolvedCalibration != null) {
                 GcamAwbCalibrationEngine.constrainPhysicalGains(
@@ -12189,15 +12189,41 @@ class BnCameraManager(private val context: Context) {
             val camera2Gains = floatArrayOf(gains.red, gains.greenEven, gains.greenOdd, gains.blue)
             val transform = calibrationResult.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)
             val camera2Matrix = transform?.let(RawColorTransformEngine::colorSpaceTransformToArray)
+
+            // Developed preview uses the same Lens ID GCam calibration as capture. Keep the raw
+            // exact-frame Camera2 pair separately below as the physical estimator prior so the
+            // calibrated render path can never feed itself back into scene observation.
+            val runtimeAwb = LensAwbCalibrationRuntimeRegistry.resolve(scopeKey)
+            val awbCharacteristics = liveWhiteBalanceCharacteristics(scopeKey)
+                ?: identity.logicalCameraId.takeIf { it != scopeKey }?.let(::liveWhiteBalanceCharacteristics)
+            val resolvedAwb = awbCharacteristics?.let {
+                runCatching { GcamAwbCalibrationEngine.resolve(runtimeAwb.settings, it) }.getOrNull()
+            }
+            val calibratedCamera2Prior = if (resolvedAwb?.valid == true && awbCharacteristics != null) {
+                GcamAwbCalibrationEngine.applyToCamera2Prior(
+                    camera2Gains = camera2Gains,
+                    calibration = resolvedAwb,
+                    settings = runtimeAwb.settings,
+                    cfaPattern = awbCharacteristics.get(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT)
+                        ?: CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT_RGGB
+                )
+            } else {
+                null
+            }
+            val developedCamera2Gains = calibratedCamera2Prior?.gains ?: camera2Gains
             val before = whiteBalanceStateEngine.snapshot(scopeKey)
             val after = whiteBalanceStateEngine.observe(
                 scopeKey = scopeKey,
                 pipelineGeneration = generation,
-                gains = camera2Gains,
+                gains = developedCamera2Gains,
                 convergence = convergence,
                 colorMatrix = camera2Matrix,
-                sensorTimestampNs = calibrationResult.get(CaptureResult.SENSOR_TIMESTAMP)
-                    ?: 0L
+                sensorTimestampNs = calibrationResult.get(CaptureResult.SENSOR_TIMESTAMP) ?: 0L,
+                calibrationSource = calibratedCamera2Prior?.calibrationSource ?: "CAMERA2_EXACT_FRAME",
+                calibrationFingerprint = calibratedCamera2Prior?.calibrationFingerprint ?: "UNAVAILABLE",
+                calibrationAuthority = calibratedCamera2Prior?.calibrationAuthority ?: 0f,
+                grGbRatio = calibratedCamera2Prior?.grGbRatio,
+                greenEvenOddRatio = calibratedCamera2Prior?.greenEvenOddRatio
             )
             if (liveWhiteBalanceTargetSensorGains == null) {
                 val timestampNs = calibrationResult.get(CaptureResult.SENSOR_TIMESTAMP)
