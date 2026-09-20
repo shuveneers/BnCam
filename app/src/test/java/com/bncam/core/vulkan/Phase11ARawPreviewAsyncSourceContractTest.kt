@@ -74,17 +74,18 @@ class Phase11ARawPreviewAsyncSourceContractTest {
     }
 
     @Test
-    fun `Kotlin owns pending Vulkan submissions until a non blocking completion probe resolves them`() {
+    fun `P0 worker serializes async native submission before publishing a frame`() {
         val renderer = source("src/main/java/com/bncam/ui/screens/capture/RawPreviewRenderer.kt")
         val imageUtils = source("src/main/java/com/bncam/core/engine/ImageUtils.kt")
         val native = source("src/main/cpp/native-lib.cpp")
 
-        assertTrue(renderer.contains("pendingVulkanFrames"))
-        assertTrue(renderer.contains("pollVulkanCompletions()"))
+        // Native keeps the non-blocking submit/poll ABI, but P0 deliberately resolves that
+        // completion on BnCamRawPreview before the Kotlin request/output slot can be reused.
         assertTrue(renderer.contains("RAW_PREVIEW_ASYNC_SUBMITTED_MAGIC"))
         assertTrue(renderer.contains("RAW_PREVIEW_ASYNC_PENDING_MAGIC"))
-        assertTrue(renderer.contains("COMPLETION_POLL_INTERVAL_MS = 1L"))
-        assertTrue(renderer.contains("else if (pendingVulkanFrames.isNotEmpty()) scheduleDrain(COMPLETION_POLL_INTERVAL_MS)"))
+        assertTrue(renderer.contains("awaitSubmittedVulkanCompletionOnWorker("))
+        assertTrue(renderer.contains("P0_VULKAN_COMPLETION_TIMEOUT_MS = 250L"))
+        assertTrue(renderer.contains("frameSlotIndex = P0_NATIVE_VULKAN_SLOT_ID"))
         assertTrue(imageUtils.contains("fun pollRawPreview("))
         assertTrue(imageUtils.contains("pollRawPreviewNative("))
         assertTrue(native.contains("Java_com_bncam_core_engine_ImageUtils_pollRawPreviewNative"))
