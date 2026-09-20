@@ -1142,18 +1142,39 @@ class RawPreviewRenderer(
                     recordDrop(RawPreviewDropReason.NATIVE_RENDER_FAILED, request)
                     return
                 }
-                val pending = PendingVulkanFrame(
-                    context = completionContext,
+
+                // P0 stability recovery:
+                // Phase 11A detached Vulkan completion from this already-dedicated preview worker
+                // and allowed several Camera/HardwareBuffer/Vulkan/EGL ownership transactions to
+                // overlap. The regression appears on real hardware as an immediate frozen/black
+                // RAW viewfinder and can coincide with a Single RAW capture process crash.
+                //
+                // Keep the new Vulkan shaders and GPU-resident output, but temporarily make the
+                // worker own one complete submit -> fence -> publish transaction. The UI thread is
+                // never blocked: BnCamRawPreview is a private worker. This also provides a clean
+                // bisect boundary before re-introducing multiple GPU submissions in flight.
+                vulkanSubmittedFrames++
+                if (analysisReadbackRequested) lastAnalysisSubmitElapsedNs = analysisNowNs
+                val completed = awaitSubmittedVulkanCompletionOnWorker(
+                    slotId = slot.id,
                     submissionId = submissionId,
                     previewWidth = result.getOrElse(4) { expectedOutput.first },
                     previewHeight = result.getOrElse(5) { expectedOutput.second },
-                    cfaCellDecimation = result.getOrElse(6) { 1 }.coerceAtLeast(1)
+                    cfaCellDecimation = result.getOrElse(6) { 1 }.coerceAtLeast(1),
+                    camera2PriorWbGains = completionContext.camera2PriorWbGains
                 )
-                pendingVulkanFrames[slot.id] = pending
-                vulkanSubmittedFrames++
-                if (analysisReadbackRequested) lastAnalysisSubmitElapsedNs = analysisNowNs
-                ownershipTransferredToGpu = true
-                scheduleDrain(if (hasPendingRequest()) 0L else COMPLETION_POLL_INTERVAL_MS)
+                if (completed == null) {
+                    renderFailures++
+                    recordDrop(RawPreviewDropReason.NATIVE_RENDER_FAILED, request)
+                    Log.e(
+                        TAG,
+                        "RAW_PREVIEW_P0_COMPLETION_FAILED slot=${slot.id} submissionId=$submissionId " +
+                            "generation=${request.config.pipelineGeneration} timestamp=${request.sensorTimestampNs}"
+                    )
+                    return
+                }
+                vulkanCompletedFrames++
+                delivered = publishCompletedFrame(completionContext, completed)
                 return
             }
             delivered = publishCompletedFrame(completionContext, result)
@@ -1478,6 +1499,48 @@ class RawPreviewRenderer(
         val low = result.getOrElse(2) { 0 }.toLong() and 0xffffffffL
         val high = result.getOrElse(3) { 0 }.toLong() and 0xffffffffL
         return low or (high shl 32)
+    }
+
+    /**
+     * P0 device-stability bridge. Vulkan completion is awaited only on the dedicated RAW-preview
+     * worker, never on the UI/camera callback thread. A hard deadline converts a bad fence/device
+     * state into a dropped preview frame instead of allowing an unbounded black/frozen pipeline.
+     */
+    private fun awaitSubmittedVulkanCompletionOnWorker(
+        slotId: Int,
+        submissionId: Long,
+        previewWidth: Int,
+        previewHeight: Int,
+        cfaCellDecimation: Int,
+        camera2PriorWbGains: FloatArray
+    ): IntArray? {
+        val deadlineNs =
+            SystemClock.elapsedRealtimeNanos() + P0_VULKAN_COMPLETION_TIMEOUT_MS * 1_000_000L
+        while (!closed && SystemClock.elapsedRealtimeNanos() < deadlineNs) {
+            val result = ImageUtils.pollRawPreview(
+                frameSlotIndex = slotId,
+                submissionId = submissionId,
+                previewWidth = previewWidth,
+                previewHeight = previewHeight,
+                cfaCellDecimation = cfaCellDecimation,
+                camera2PriorWbGains = camera2PriorWbGains
+            ) ?: return null
+            if (result.getOrNull(0) != RAW_PREVIEW_ASYNC_PENDING_MAGIC) {
+                return result
+            }
+            try {
+                Thread.sleep(P0_VULKAN_COMPLETION_POLL_MS)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return null
+            }
+        }
+        Log.e(
+            TAG,
+            "RAW_PREVIEW_P0_COMPLETION_TIMEOUT slot=$slotId submissionId=$submissionId " +
+                "timeoutMs=$P0_VULKAN_COMPLETION_TIMEOUT_MS"
+        )
+        return null
     }
 
     private fun pollVulkanCompletions() {
@@ -1962,14 +2025,16 @@ class RawPreviewRenderer(
         const val PREVIEW_MAX_WIDTH = RawPreviewResolutionPolicy.QUALITY_MAX_WIDTH
         const val PREVIEW_MAX_HEIGHT = RawPreviewResolutionPolicy.QUALITY_MAX_HEIGHT
         const val RGBA_BYTES_PER_PIXEL = 4
-        const val OUTPUT_SLOT_COUNT = 3
+        const val OUTPUT_SLOT_COUNT = 2
         const val MAX_QUARANTINED_GPU_BACKINGS_PER_SLOT = 2
-        const val MAX_PENDING_REQUESTS = 2
+        const val MAX_PENDING_REQUESTS = 1
         const val MAX_OUTPUT_BYTES = PREVIEW_MAX_WIDTH * PREVIEW_MAX_HEIGHT * RGBA_BYTES_PER_PIXEL
         const val MAX_ANALYSIS_NV21_BYTES = ((PREVIEW_MAX_WIDTH / 4) * (PREVIEW_MAX_HEIGHT / 4) * 3) / 2
         const val DIAGNOSTIC_INTERVAL_MS = 2_000L
         const val CONFIG_DIAGNOSTIC_INTERVAL_MS = 5_000L
         const val COMPLETION_POLL_INTERVAL_MS = 1L
+        const val P0_VULKAN_COMPLETION_POLL_MS = 1L
+        const val P0_VULKAN_COMPLETION_TIMEOUT_MS = 250L
         const val ANALYSIS_SIDECAR_INTERVAL_NS = 100_000_000L // 10 Hz, independent of display cadence.
         const val RAW_PREVIEW_ASYNC_SUBMITTED_MAGIC = 0x42505253
         const val RAW_PREVIEW_ASYNC_PENDING_MAGIC = 0x42505250
