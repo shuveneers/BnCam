@@ -1,0 +1,152 @@
+name: P0 RAW Stability Delta
+
+on:
+  push:
+    branches:
+      - 'chatgpt/p0-raw-stability-20260920'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate-and-package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Make Gradle executable
+        run: chmod +x gradlew
+
+      - name: Run P0 focused unit tests
+        id: focused_tests
+        continue-on-error: true
+        run: |
+          ./gradlew :app:testDebugUnitTest \
+            --tests com.bncam.core.vulkan.P0RawPreviewStabilitySourceContractTest \
+            --tests com.bncam.core.vulkan.Phase11ARawPreviewAsyncSourceContractTest
+
+      - name: Build delta directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/DELTA_P0_RAW_STABILITY"
+          mkdir -p "$ROOT/app/src/main/java/com/bncam/ui/screens/capture"
+          mkdir -p "$ROOT/app/src/main/cpp/vulkan"
+          mkdir -p "$ROOT/app/src/test/java/com/bncam/core/vulkan"
+
+          cp app/src/main/java/com/bncam/ui/screens/capture/RawPreviewRenderer.kt \
+            "$ROOT/app/src/main/java/com/bncam/ui/screens/capture/RawPreviewRenderer.kt"
+          cp app/src/main/cpp/vulkan/VulkanRuntime.cpp \
+            "$ROOT/app/src/main/cpp/vulkan/VulkanRuntime.cpp"
+          cp app/src/test/java/com/bncam/core/vulkan/Phase11ARawPreviewAsyncSourceContractTest.kt \
+            "$ROOT/app/src/test/java/com/bncam/core/vulkan/Phase11ARawPreviewAsyncSourceContractTest.kt"
+          cp app/src/test/java/com/bncam/core/vulkan/P0RawPreviewStabilitySourceContractTest.kt \
+            "$ROOT/app/src/test/java/com/bncam/core/vulkan/P0RawPreviewStabilitySourceContractTest.kt"
+
+          cat > "$ROOT/DELTA_MANIFEST.md" <<'EOF'
+          # DELTA P0 — RAW Stability
+
+          Base commit: 3946a46f9c4ccdd738313e833854128bc953202a
+
+          ## Scope
+
+          This is a deliberately narrow P0 stability/bisect delta. It does not redesign the
+          stream-role architecture and does not change JPEG detail/tone algorithms.
+
+          ## Production changes
+
+          ### RawPreviewRenderer.kt
+          - Keeps the Phase-11A native submit/poll ABI and current Vulkan shaders.
+          - Resolves each submitted Vulkan preview frame to completion on the dedicated
+            BnCamRawPreview worker before the request/output ownership transaction is reused.
+          - Adds a 250 ms bounded completion deadline so a bad fence/device state becomes a
+            dropped preview frame instead of an unbounded black/frozen renderer.
+          - Uses one native Vulkan preview slot during P0 to avoid allocating three full
+            slot-local RAW-preview working sets.
+          - Reduces display output slots from 3 to 2 and pending input requests from 2 to 1.
+            This keeps one previous GL-owned output plus one renderable output while reducing
+            resident memory/backlog.
+
+          ### VulkanRuntime.cpp
+          - Temporarily disables the dedicated RAW-preview Vulkan queue.
+          - RAW preview remains Vulkan/GPU and keeps its isolated command pool.
+          - Preview submissions use the production compute queue/submission mutex during P0,
+            removing independent preview/capture GPU queue overlap while Single RAW stability
+            is verified.
+
+          ## Why
+
+          The SingleFrameRunner and SingleRaw16FrameBuilder are byte-identical between the
+          pre-regression commit 51a6306 and failing HEAD 3946a46. The regression instead added
+          detached RAW-preview GPU submissions, three slot-local preview working sets and a
+          dedicated preview queue. The observed failures are an immediate RAW-viewfinder freeze/
+          black frame and process failure during a Single capture that consumes one selected
+          warm-buffer frame.
+
+          This delta establishes a conservative device-stability baseline without rolling back
+          the newer RAW preview shaders, highlight handling, exposure placement, GTM/FLLF work,
+          or final JPEG quality changes.
+
+          ## Test on device
+
+          1. Cold start with YUV viewfinder; switch once to RAW viewfinder.
+          2. Confirm whether a first RAW frame is presented and remains live for at least 30 s.
+          3. With RAW viewfinder active, take a normal SINGLE capture from the warm buffer.
+          4. Repeat 10 SINGLE captures for RAW10.
+          5. Repeat for RAW_SENSOR if that profile/session config opens successfully.
+          6. Switch RAW -> YUV -> RAW and repeat one SINGLE capture.
+          7. Return diagnostics if any freeze/crash remains.
+
+          ## Diagnostics to return
+
+          Search the debug package/logs for:
+          - RAW_PREVIEW_P0_COMPLETION_TIMEOUT
+          - RAW_PREVIEW_P0_COMPLETION_FAILED
+          - RENDER_FAILED
+          - CAPTURE_EXCEPTION
+          - ASYNC_RAW_PROCESSING_WORKER
+          - VULKAN
+          - device lost / VK_ERROR_DEVICE_LOST
+          - OutOfMemoryError / allocation failures
+          - STREAM_RUNTIME_TELEMETRY
+          - CAMERA2_CAPTURE_FAILED / CAMERA2_CAPTURE_BUFFER_LOST
+
+          ## Explicitly not fixed in P0
+
+          - RAW_SENSOR capture-history + independent RAW10 viewfinder role separation.
+          - Camera2-owned Image lifetime versus BnCam-owned long warm-history storage.
+          - Stream minFrameDuration/stallDuration telemetry.
+          - RAW viewfinder resolution/detail tuning.
+          - JPEG microdetail work.
+          - Multi-frame capture/fusion.
+
+          Those remain P1+ after this stability boundary is verified.
+
+          ## Deletions
+
+          None.
+          EOF
+
+      - name: Create delta ZIP
+        run: |
+          cd "$RUNNER_TEMP"
+          zip -r DELTA_P0_RAW_STABILITY.zip DELTA_P0_RAW_STABILITY
+
+      - name: Upload delta artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DELTA_P0_RAW_STABILITY
+          path: ${{ runner.temp }}/DELTA_P0_RAW_STABILITY.zip
+          if-no-files-found: error
+          retention-days: 7
