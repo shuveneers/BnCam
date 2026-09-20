@@ -1886,11 +1886,15 @@ RawPreviewGpuResult VulkanRuntime::executeRawPreview(
         inFlightSubmissionCount_.fetch_add(1, std::memory_order_acq_rel);
         physicalDevice = handles_.physicalDevice;
         device = handles_.device;
-        dedicatedPreviewQueue =
-            handles_.previewQueue != VK_NULL_HANDLE &&
-            handles_.previewCommandPool != VK_NULL_HANDLE;
+        // P0 stability recovery: keep RAW preview on the production compute queue until the
+        // Phase-11A multi-queue regression is proven safe on-device. The preview still owns its
+        // isolated command pool, so host command-buffer access remains independently synchronized,
+        // but GPU submissions are ordered on the same queue as Single RAW capture processing.
+        // Re-enable the dedicated preview queue only after the RAW viewfinder + Single-capture
+        // device acceptance matrix is stable.
+        dedicatedPreviewQueue = false;
         const bool isolatedPreviewCommandPool = handles_.previewCommandPool != VK_NULL_HANDLE;
-        queue = dedicatedPreviewQueue ? handles_.previewQueue : handles_.computeQueue;
+        queue = handles_.computeQueue;
         queueFamilyIndex = handles_.computeQueueFamilyIndex;
         commandPool = isolatedPreviewCommandPool ? handles_.previewCommandPool : handles_.commandPool;
         foreignQueueFamilyEnabled = std::find(
