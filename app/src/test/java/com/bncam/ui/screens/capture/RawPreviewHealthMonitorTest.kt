@@ -1,20 +1,55 @@
 package com.bncam.ui.screens.capture
 
+import com.bncam.core.runtime.RawPreviewProducerKind
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class RawPreviewHealthMonitorTest {
-    private fun startHealthy(generation: Int, now: Long, present: Boolean = false) {
+    private val canonical = RawPreviewProducerKind.CANONICAL_RING
+    private val support = RawPreviewProducerKind.CUSTOM_IMAGE_READER
+
+    private fun startHealthy(
+        generation: Int,
+        now: Long,
+        present: Boolean = false,
+        producerKind: RawPreviewProducerKind = canonical,
+        timestampNs: Long = 1L
+    ) {
         RawPreviewHealthMonitor.route("RAW_SENSOR", generation, 33_333_333L, now)
-        RawPreviewHealthMonitor.captureResultProgress(generation, 1L, 33_333_333L, 10_000_000L, now + 1)
-        RawPreviewHealthMonitor.imageReaderProgress(generation, 1L, now + 2)
-        RawPreviewHealthMonitor.rendererOffer(generation, now + 3)
-        RawPreviewHealthMonitor.rendererPublication(generation, 4, 0.01f, 0.8f, 0.2f, "available=3", now + 4)
-        RawPreviewHealthMonitor.glAccepted(generation, 4, now + 5)
-        RawPreviewHealthMonitor.glDraw(generation, 4, now + 6)
-        if (present) RawPreviewHealthMonitor.displayPresented(generation, now + 7)
+        RawPreviewHealthMonitor.captureResultProgress(
+            generation, timestampNs, 33_333_333L, 10_000_000L, now + 1
+        )
+        RawPreviewHealthMonitor.imageReaderProgress(
+            generation, timestampNs, producerKind, now + 2
+        )
+        RawPreviewHealthMonitor.rendererOffer(
+            generation, timestampNs, producerKind, now + 3
+        )
+        RawPreviewHealthMonitor.rendererPublication(
+            generation = generation,
+            sensorTimestampNs = timestampNs,
+            producerKind = producerKind,
+            frameEglGeneration = 4,
+            rgbMin = 0.01f,
+            rgbMax = 0.8f,
+            rgbMean = 0.2f,
+            slotHealth = "available=3",
+            nowElapsedNs = now + 4
+        )
+        RawPreviewHealthMonitor.glAccepted(
+            generation, timestampNs, producerKind, 4, now + 5
+        )
+        RawPreviewHealthMonitor.glDraw(
+            generation, timestampNs, producerKind, 4, now + 6
+        )
+        if (present) {
+            RawPreviewHealthMonitor.displayPresented(
+                generation, timestampNs, producerKind, now + 7
+            )
+        }
     }
 
     @Test
@@ -29,37 +64,41 @@ class RawPreviewHealthMonitorTest {
     }
 
     @Test
-    fun firstStaleStageWins() {
+    fun firstStaleStageWinsAndAggregateImageReaderStageDoesNotGuessProducer() {
         val g = 102
         val start = 2_000_000_000L
         startHealthy(g, start)
         val threshold = RawPreviewHealthMonitor.snapshot(start + 10).stallThresholdNs
         val staleNow = start + threshold + 100L
-        // Keep Camera2 metadata alive but let ImageReader and everything downstream age out.
         RawPreviewHealthMonitor.captureResultProgress(g, 2L, 33_333_333L, 10_000_000L, staleNow)
-        assertEquals(RawPreviewHealthStage.RAW_IMAGE_READER, RawPreviewHealthMonitor.snapshot(staleNow).stage)
+        val snapshot = RawPreviewHealthMonitor.snapshot(staleNow)
+        assertEquals(RawPreviewHealthStage.RAW_IMAGE_READER, snapshot.stage)
+        assertNull(snapshot.stageFrameHint)
     }
 
     @Test
-    fun firstPresentationIsRequiredAfterBoundedGlGraceWindow() {
+    fun firstPresentationIsRequiredAfterBoundedGlGraceWindowAndCarriesExactProducer() {
         val g = 103
         val start = 3_000_000_000L
-        startHealthy(g, start, present = false)
+        startHealthy(g, start, present = false, producerKind = support, timestampNs = 11L)
         val initial = RawPreviewHealthMonitor.snapshot(start + 10)
         assertFalse(initial.actualPresentationObserved)
         assertTrue(initial.firstGlDrawElapsedNs > 0L)
         assertEquals(RawPreviewHealthStage.HEALTHY, initial.stage)
 
         val now = initial.firstGlDrawElapsedNs + initial.stallThresholdNs + 1
-        // Keep every upstream stage and GL draw alive. Absence of any actual presentation must now
-        // be attributed to EGL/presentation instead of being mislabelled HEALTHY forever.
-        RawPreviewHealthMonitor.captureResultProgress(g, 2L, 33_333_333L, 10_000_000L, now)
-        RawPreviewHealthMonitor.imageReaderProgress(g, 2L, now)
-        RawPreviewHealthMonitor.rendererOffer(g, now)
-        RawPreviewHealthMonitor.rendererPublication(g, 4, 0.01f, 0.8f, 0.2f, "available=3", now)
-        RawPreviewHealthMonitor.glAccepted(g, 4, now)
-        RawPreviewHealthMonitor.glDraw(g, 4, now)
-        assertEquals(RawPreviewHealthStage.EGL_PRESENTATION, RawPreviewHealthMonitor.snapshot(now).stage)
+        RawPreviewHealthMonitor.captureResultProgress(g, 12L, 33_333_333L, 10_000_000L, now)
+        RawPreviewHealthMonitor.imageReaderProgress(g, 12L, support, now)
+        RawPreviewHealthMonitor.rendererOffer(g, 12L, support, now)
+        RawPreviewHealthMonitor.rendererPublication(
+            g, 12L, support, 4, 0.01f, 0.8f, 0.2f, "available=3", now
+        )
+        RawPreviewHealthMonitor.glAccepted(g, 12L, support, 4, now)
+        RawPreviewHealthMonitor.glDraw(g, 12L, support, 4, now)
+        val stalled = RawPreviewHealthMonitor.snapshot(now)
+        assertEquals(RawPreviewHealthStage.EGL_PRESENTATION, stalled.stage)
+        assertEquals(support, stalled.stageFrameHint?.producerKind)
+        assertEquals(12L, stalled.stageFrameHint?.sensorTimestampNs)
     }
 
     @Test
@@ -67,18 +106,21 @@ class RawPreviewHealthMonitorTest {
         val g = 109
         val start = 8_000_000_000L
         startHealthy(g, start, present = false)
-        RawPreviewHealthMonitor.displayPresented(g, start + 20)
+        RawPreviewHealthMonitor.displayPresented(g, 1L, canonical, start + 20)
         val healthy = RawPreviewHealthMonitor.snapshot(start + 21)
         assertTrue(healthy.actualPresentationObserved)
         assertEquals(RawPreviewHealthStage.HEALTHY, healthy.stage)
+        assertEquals(canonical, healthy.lastDisplayPresentedFrame?.producerKind)
 
         val now = start + 20 + healthy.stallThresholdNs + 1
         RawPreviewHealthMonitor.captureResultProgress(g, 2L, 33_333_333L, 10_000_000L, now)
-        RawPreviewHealthMonitor.imageReaderProgress(g, 2L, now)
-        RawPreviewHealthMonitor.rendererOffer(g, now)
-        RawPreviewHealthMonitor.rendererPublication(g, 4, 0.01f, 0.8f, 0.2f, "available=3", now)
-        RawPreviewHealthMonitor.glAccepted(g, 4, now)
-        RawPreviewHealthMonitor.glDraw(g, 4, now)
+        RawPreviewHealthMonitor.imageReaderProgress(g, 2L, canonical, now)
+        RawPreviewHealthMonitor.rendererOffer(g, 2L, canonical, now)
+        RawPreviewHealthMonitor.rendererPublication(
+            g, 2L, canonical, 4, 0.01f, 0.8f, 0.2f, "available=3", now
+        )
+        RawPreviewHealthMonitor.glAccepted(g, 2L, canonical, 4, now)
+        RawPreviewHealthMonitor.glDraw(g, 2L, canonical, 4, now)
         assertEquals(RawPreviewHealthStage.EGL_PRESENTATION, RawPreviewHealthMonitor.snapshot(now).stage)
     }
 
@@ -87,10 +129,11 @@ class RawPreviewHealthMonitorTest {
         val start = 4_000_000_000L
         startHealthy(104, start)
         RawPreviewHealthMonitor.route("RAW_SENSOR", 105, 33_333_333L, start + 100)
-        RawPreviewHealthMonitor.imageReaderProgress(104, 99L, start + 200)
+        RawPreviewHealthMonitor.imageReaderProgress(104, 99L, support, start + 200)
         val snapshot = RawPreviewHealthMonitor.snapshot(start + 201)
         assertEquals(105, snapshot.pipelineGeneration)
         assertEquals(0L, snapshot.lastImageReaderElapsedNs)
+        assertNull(snapshot.lastImageReaderFrame)
     }
 
     @Test
@@ -101,7 +144,7 @@ class RawPreviewHealthMonitorTest {
 
         repeat(2) { index ->
             RawPreviewHealthMonitor.rendererPublication(
-                g, 4, 0f, 0f, 0f, "available=3", start + 20 + index,
+                g, 20L + index, canonical, 4, 0f, 0f, 0f, "available=3", start + 20 + index,
                 normalizedRawMax = 0.25f,
                 sceneP50 = 0.05f
             )
@@ -109,7 +152,7 @@ class RawPreviewHealthMonitorTest {
         assertEquals(RawPreviewHealthStage.HEALTHY, RawPreviewHealthMonitor.snapshot(start + 23).stage)
 
         RawPreviewHealthMonitor.rendererPublication(
-            g, 4, 0f, 0f, 0f, "available=3", start + 24,
+            g, 22L, canonical, 4, 0f, 0f, 0f, "available=3", start + 24,
             normalizedRawMax = 0.25f,
             sceneP50 = 0.05f
         )
@@ -117,6 +160,7 @@ class RawPreviewHealthMonitorTest {
         assertEquals(RawPreviewHealthStage.RGB_OUTPUT, snapshot.stage)
         assertTrue(snapshot.impossibleBlackConfirmed)
         assertEquals(3, snapshot.consecutiveImpossibleBlackFrames)
+        assertEquals(canonical, snapshot.stageFrameHint?.producerKind)
     }
 
     @Test
@@ -127,7 +171,7 @@ class RawPreviewHealthMonitorTest {
 
         repeat(6) { index ->
             RawPreviewHealthMonitor.rendererPublication(
-                g, 4, 0f, 0f, 0f, "available=3", start + 20 + index,
+                g, 30L + index, canonical, 4, 0f, 0f, 0f, "available=3", start + 20 + index,
                 normalizedRawMax = 0.001f,
                 sceneP50 = 0.0001f
             )
@@ -146,13 +190,13 @@ class RawPreviewHealthMonitorTest {
 
         repeat(2) { index ->
             RawPreviewHealthMonitor.rendererPublication(
-                g, 4, 0f, 0f, 0f, "available=3", start + 20 + index,
+                g, 40L + index, canonical, 4, 0f, 0f, 0f, "available=3", start + 20 + index,
                 normalizedRawMax = 0.2f,
                 sceneP50 = 0.04f
             )
         }
         RawPreviewHealthMonitor.rendererPublication(
-            g, 4, 0.01f, 0.2f, 0.05f, "available=3", start + 30,
+            g, 42L, canonical, 4, 0.01f, 0.2f, 0.05f, "available=3", start + 30,
             normalizedRawMax = 0.2f,
             sceneP50 = 0.04f
         )
@@ -160,4 +204,58 @@ class RawPreviewHealthMonitorTest {
         assertEquals(RawPreviewHealthStage.HEALTHY, snapshot.stage)
         assertEquals(0, snapshot.consecutiveImpossibleBlackFrames)
     }
+
+    @Test
+    fun sameTimestampFromDifferentProducersRemainsDistinctAcrossDownstreamStages() {
+        val g = 110
+        val start = 9_000_000_000L
+        RawPreviewHealthMonitor.route("RAW_SENSOR", g, 33_333_333L, start)
+        RawPreviewHealthMonitor.captureResultProgress(g, 55L, 33_333_333L, 10_000_000L, start + 1)
+        RawPreviewHealthMonitor.imageReaderProgress(g, 55L, canonical, start + 2)
+        RawPreviewHealthMonitor.rendererOffer(g, 55L, canonical, start + 3)
+        RawPreviewHealthMonitor.rendererPublication(
+            g, 55L, canonical, 4, 0.01f, 0.5f, 0.1f, "available=3", start + 4
+        )
+        RawPreviewHealthMonitor.glAccepted(g, 55L, canonical, 4, start + 5)
+        RawPreviewHealthMonitor.glDraw(g, 55L, canonical, 4, start + 6)
+        RawPreviewHealthMonitor.displayPresented(g, 55L, canonical, start + 7)
+
+        // A support copy of the exact same sensor timestamp may legitimately enter later.
+        RawPreviewHealthMonitor.imageReaderProgress(g, 55L, support, start + 8)
+        RawPreviewHealthMonitor.rendererOffer(g, 55L, support, start + 9)
+        RawPreviewHealthMonitor.rendererPublication(
+            g, 55L, support, 4, 0.01f, 0.5f, 0.1f, "available=3", start + 10
+        )
+        val snapshot = RawPreviewHealthMonitor.snapshot(start + 11)
+        assertEquals(support, snapshot.lastRendererPublicationFrame?.producerKind)
+        assertEquals(canonical, snapshot.lastDisplayPresentedFrame?.producerKind)
+        assertFalse(snapshot.exactDownstreamChainCoherent)
+    }
+    @Test
+    fun sameSensorTimestampFromTwoProducersCountsOnceForBlackFaultQuorum() {
+        val g = 111
+        val start = 10_000_000_000L
+        startHealthy(g, start)
+
+        RawPreviewHealthMonitor.rendererPublication(
+            g, 70L, canonical, 4, 0f, 0f, 0f, "available=3", start + 20,
+            normalizedRawMax = 0.25f, sceneP50 = 0.05f
+        )
+        RawPreviewHealthMonitor.rendererPublication(
+            g, 70L, support, 4, 0f, 0f, 0f, "available=3", start + 21,
+            normalizedRawMax = 0.25f, sceneP50 = 0.05f
+        )
+        var snapshot = RawPreviewHealthMonitor.snapshot(start + 22)
+        assertEquals(1, snapshot.consecutiveImpossibleBlackFrames)
+        assertFalse(snapshot.impossibleBlackConfirmed)
+
+        RawPreviewHealthMonitor.rendererPublication(
+            g, 71L, canonical, 4, 0f, 0f, 0f, "available=3", start + 23,
+            normalizedRawMax = 0.25f, sceneP50 = 0.05f
+        )
+        snapshot = RawPreviewHealthMonitor.snapshot(start + 24)
+        assertEquals(2, snapshot.consecutiveImpossibleBlackFrames)
+        assertFalse(snapshot.impossibleBlackConfirmed)
+    }
+
 }

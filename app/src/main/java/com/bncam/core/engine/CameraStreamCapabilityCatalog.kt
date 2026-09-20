@@ -11,13 +11,12 @@ import android.hardware.camera2.params.SessionConfiguration
 import android.os.Build
 import android.util.Range
 import android.util.Size
-import com.bncam.data.settings.StreamConfigurationClass
 import java.util.concurrent.Executor
-import kotlin.math.abs
 
 /**
- * Immutable Camera2/HAL facts used by the Stream Configuration UI and, in the next integration
- * phase, by the runtime StreamConfigResolver. Nothing in this file changes camera state.
+ * Android-shaped diagnostic projection used by the Stream Configuration screen.
+ * CameraCapabilityInventory is the authoritative Camera2/HAL fact model.
+ * Nothing in this projection changes camera state or selects a stream combination.
  */
 data class CameraStreamSizeCapability(
     val size: Size,
@@ -31,52 +30,160 @@ data class CameraStreamFormatCapability(
     val sizes: List<CameraStreamSizeCapability>
 )
 
+
 enum class StreamCandidateValidationStatus {
     SESSION_VALIDATED,
     CAMERA2_REPORTED,
     REJECTED
 }
 
-data class CameraStreamCandidate(
-    val id: String,
-    val streamClass: StreamConfigurationClass,
-    val captureFormatCode: Int,
-    val captureFormatName: String,
-    val captureSize: Size,
-    val previewSize: Size?,
-    val fpsRange: Range<Int>?,
-    val validationStatus: StreamCandidateValidationStatus,
-    val validationReason: String
-)
-
-enum class CameraStreamCatalogSource {
-    DIRECT_CAMERA,
-    PHYSICAL_CAMERA,
-    LOGICAL_PARENT_FALLBACK,
-    UNAVAILABLE
-}
 
 data class CameraStreamCapabilityCatalog(
-    val requestedLensId: String,
-    val logicalCameraId: String?,
-    val physicalCameraId: String?,
-    val source: CameraStreamCatalogSource,
-    val hardwareLevel: Int?,
-    val requestCapabilities: Set<Int>,
-    val aeFpsRanges: List<Range<Int>>,
-    val formats: List<CameraStreamFormatCapability>,
-    val candidates: List<CameraStreamCandidate>,
-    val sessionQuerySupported: Boolean,
-    val warnings: List<String>
+    val inventory: CameraCapabilityInventory,
+    val sessionQuerySupported: Boolean
 ) {
-    fun candidatesFor(streamClass: StreamConfigurationClass): List<CameraStreamCandidate> =
-        candidates.filter { it.streamClass == streamClass && it.validationStatus != StreamCandidateValidationStatus.REJECTED }
-
-    fun validatedCandidatesFor(streamClass: StreamConfigurationClass): List<CameraStreamCandidate> =
-        candidates.filter {
-            it.streamClass == streamClass &&
-                it.validationStatus == StreamCandidateValidationStatus.SESSION_VALIDATED
+    // Read-only views for the settings UI. CameraCapabilityInventory is the
+    // single source of Camera2/HAL facts; these Android-shaped objects are derived from it.
+    val requestedLensId: String get() = inventory.requestedLensId
+    val logicalCameraId: String? get() = inventory.logicalCameraId
+    val physicalCameraId: String? get() = inventory.physicalCameraId
+    val source: CameraStreamCatalogSource get() = inventory.source
+    val hardwareLevel: Int? get() = inventory.hardwareLevel
+    val requestCapabilities: Set<Int> get() = inventory.requestCapabilities
+    val warnings: List<String> get() = inventory.warnings
+    val aeFpsRanges: List<Range<Int>> = inventory.aeFpsRanges.map { Range(it.lower, it.upper) }
+    val formats: List<CameraStreamFormatCapability> = inventory.formats
+        .map { capability ->
+            CameraStreamFormatCapability(
+                formatCode = capability.formatCode,
+                formatName = capability.formatName,
+                sizes = capability.sizes.map { size ->
+                    CameraStreamSizeCapability(
+                        size = Size(size.extent.width, size.extent.height),
+                        minFrameDurationNs = size.minFrameDurationNs,
+                        maxFpsFromDuration = size.maxFpsFromDuration
+                    )
+                }
+            )
         }
+        .sortedWith(compareBy<CameraStreamFormatCapability> { it.formatName }.thenBy { it.formatCode })
+
+}
+
+
+/**
+ * Lightweight CameraCharacteristics -> CameraCapabilityInventory conversion.
+ *
+ * Runtime pipeline selection and the settings diagnostics use the same fact inventory.
+ * Capability discovery never enumerates synthetic stream candidates and never validates a
+ * speculative session combination.
+ */
+internal object CameraCapabilityInventoryFactory {
+    fun fromCharacteristics(
+        requestedLensId: String,
+        logicalCameraId: String?,
+        physicalCameraId: String?,
+        source: CameraStreamCatalogSource,
+        characteristics: CameraCharacteristics,
+        warnings: List<String> = emptyList()
+    ): CameraCapabilityInventory {
+        val requestCapabilities =
+            characteristics.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)?.toSet().orEmpty()
+        val rawCapabilityAdvertised =
+            CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_RAW in requestCapabilities
+        val fpsFacts = characteristics
+            .get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+            ?.asSequence()
+            ?.filter { it.lower > 0 && it.upper >= it.lower }
+            ?.map { CameraCapabilityFpsRange(it.lower, it.upper) }
+            ?.distinct()
+            ?.sortedWith(compareBy<CameraCapabilityFpsRange> { it.upper }.thenBy { it.lower })
+            ?.toList()
+            .orEmpty()
+
+        val sensorRect =
+            characteristics.get(CameraCharacteristics.SENSOR_INFO_PRE_CORRECTION_ACTIVE_ARRAY_SIZE)
+                ?: characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+        val sensorExtent = sensorRect
+            ?.takeIf { it.width() > 0 && it.height() > 0 }
+            ?.let { CameraCapabilityExtent(it.width(), it.height()) }
+
+        val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            ?: return CameraCapabilityInventory(
+                requestedLensId = requestedLensId,
+                logicalCameraId = logicalCameraId,
+                physicalCameraId = physicalCameraId,
+                source = source,
+                hardwareLevel = characteristics.get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL),
+                requestCapabilities = requestCapabilities,
+                aeFpsRanges = fpsFacts,
+                sensorExtent = sensorExtent,
+                viewfinderExtents = emptyList(),
+                formats = emptyList(),
+                warnings = warnings + "SCALER_STREAM_CONFIGURATION_MAP is unavailable."
+            )
+
+        val inventoryFormats = map.outputFormats
+            .distinct()
+            .map { format ->
+                val sizes = runCatching { map.getOutputSizes(format)?.toList().orEmpty() }
+                    .getOrDefault(emptyList())
+                    .filter { it.width > 0 && it.height > 0 }
+                    // Preserve Camera2's active format-size list order. GCam's specific RAW
+                    // resolution preference addresses this list by index; downstream policies
+                    // may sort/select without mutating the discovery order stored in inventory.
+                    .distinctBy { it.width to it.height }
+                    .map { size ->
+                        val durationNs = runCatching { map.getOutputMinFrameDuration(format, size) }
+                            .getOrNull()
+                            ?.takeIf { it > 0L }
+                        CameraCapabilitySize(
+                            extent = CameraCapabilityExtent(size.width, size.height),
+                            minFrameDurationNs = durationNs
+                        )
+                    }
+                val kind = cameraCapabilityFormatKind(format)
+                val defaultAvailability = CameraPhotoFormatPolicy.defaultRuntimeAvailability(kind)
+                val runtimeAvailability = if (
+                    !rawCapabilityAdvertised &&
+                    (kind == CameraCapabilityFormatKind.RAW10 ||
+                        kind == CameraCapabilityFormatKind.RAW_SENSOR)
+                ) {
+                    CameraCapabilityRuntimeAvailability.DISCOVERY_ONLY
+                } else {
+                    defaultAvailability
+                }
+                CameraCapabilityFormat(
+                    formatCode = format,
+                    formatName = cameraFormatName(format),
+                    kind = kind,
+                    runtimeAvailability = runtimeAvailability,
+                    sizes = sizes
+                )
+            }
+            .sortedWith(compareBy<CameraCapabilityFormat> { it.formatName }.thenBy { it.formatCode })
+
+        val previewExtents = runCatching {
+            map.getOutputSizes(SurfaceTexture::class.java)?.toList().orEmpty()
+        }.getOrDefault(emptyList())
+            .filter { it.width > 0 && it.height > 0 }
+            .distinctBy { it.width to it.height }
+            .map { CameraCapabilityExtent(it.width, it.height) }
+
+        return CameraCapabilityInventory(
+            requestedLensId = requestedLensId,
+            logicalCameraId = logicalCameraId,
+            physicalCameraId = physicalCameraId,
+            source = source,
+            hardwareLevel = characteristics.get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL),
+            requestCapabilities = requestCapabilities,
+            aeFpsRanges = fpsFacts,
+            sensorExtent = sensorExtent,
+            viewfinderExtents = previewExtents,
+            formats = inventoryFormats,
+            warnings = warnings
+        )
+    }
 }
 
 object CameraStreamCapabilityScanner {
@@ -86,17 +193,20 @@ object CameraStreamCapabilityScanner {
         val publicIds = runCatching { manager.cameraIdList.toSet() }.getOrDefault(emptySet())
         val resolved = resolveCharacteristics(manager, publicIds, lensId)
             ?: return CameraStreamCapabilityCatalog(
-                requestedLensId = lensId,
-                logicalCameraId = null,
-                physicalCameraId = null,
-                source = CameraStreamCatalogSource.UNAVAILABLE,
-                hardwareLevel = null,
-                requestCapabilities = emptySet(),
-                aeFpsRanges = emptyList(),
-                formats = emptyList(),
-                candidates = emptyList(),
-                sessionQuerySupported = false,
-                warnings = listOf("CameraCharacteristics are unavailable for Lens ID $lensId.")
+                inventory = CameraCapabilityInventory(
+                    requestedLensId = lensId,
+                    logicalCameraId = null,
+                    physicalCameraId = null,
+                    source = CameraStreamCatalogSource.UNAVAILABLE,
+                    hardwareLevel = null,
+                    requestCapabilities = emptySet(),
+                    aeFpsRanges = emptyList(),
+                    sensorExtent = null,
+                    viewfinderExtents = emptyList(),
+                    formats = emptyList(),
+                    warnings = listOf("CameraCharacteristics are unavailable for Lens ID $lensId.")
+                ),
+                sessionQuerySupported = false
             )
 
         if (resolved.source == CameraStreamCatalogSource.LOGICAL_PARENT_FALLBACK) {
@@ -104,284 +214,35 @@ object CameraStreamCapabilityScanner {
         }
 
         val chars = resolved.characteristics
-        val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-        if (map == null) {
-            return CameraStreamCapabilityCatalog(
-                requestedLensId = lensId,
-                logicalCameraId = resolved.logicalCameraId,
-                physicalCameraId = resolved.physicalCameraId,
-                source = resolved.source,
-                hardwareLevel = chars.get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL),
-                requestCapabilities = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)?.toSet().orEmpty(),
-                aeFpsRanges = chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)?.toList().orEmpty(),
-                formats = emptyList(),
-                candidates = emptyList(),
-                sessionQuerySupported = false,
-                warnings = warnings + "SCALER_STREAM_CONFIGURATION_MAP is unavailable."
-            )
-        }
-
-        val fpsRanges = chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
-            ?.filter { it.lower > 0 && it.upper >= it.lower }
-            ?.sortedWith(compareBy<Range<Int>> { it.upper }.thenBy { it.lower })
-            .orEmpty()
-
-        val formats = map.outputFormats.distinct().map { format ->
-            val sizes = runCatching { map.getOutputSizes(format)?.toList().orEmpty() }
-                .getOrDefault(emptyList())
-                .filter { it.width > 0 && it.height > 0 }
-                .distinctBy { it.width to it.height }
-                .sortedByDescending { it.width.toLong() * it.height.toLong() }
-                .map { size ->
-                    val durationNs = runCatching { map.getOutputMinFrameDuration(format, size) }
-                        .getOrNull()
-                        ?.takeIf { it > 0L }
-                    CameraStreamSizeCapability(
-                        size = size,
-                        minFrameDurationNs = durationNs,
-                        maxFpsFromDuration = durationNs?.let {
-                            (1_000_000_000.0 / it.toDouble()).toInt().coerceAtLeast(1)
-                        }
-                    )
-                }
-            CameraStreamFormatCapability(
-                formatCode = format,
-                formatName = cameraFormatName(format),
-                sizes = sizes
-            )
-        }.sortedWith(compareBy<CameraStreamFormatCapability> { it.formatName }.thenBy { it.formatCode })
-
-        val previewSizes = runCatching {
-            map.getOutputSizes(SurfaceTexture::class.java)?.toList().orEmpty()
-        }.getOrDefault(emptyList())
-            .filter { it.width > 0 && it.height > 0 }
-            .distinctBy { it.width to it.height }
-
+        val mapAvailable = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) != null
         val sessionQueryCameraId = resolved.logicalCameraId.takeIf { it in publicIds }
-        val sessionQuerySupported = Build.VERSION.SDK_INT >= 35 &&
+        val sessionQuerySupported = mapAvailable &&
+            Build.VERSION.SDK_INT >= 35 &&
             sessionQueryCameraId != null &&
             CameraSessionPreflight.isSetupSupported(manager, sessionQueryCameraId)
-        if (Build.VERSION.SDK_INT >= 35 && !sessionQuerySupported) {
-            warnings += "CameraDeviceSetup session preflight is not available for this camera route; candidates remain Camera2-reported until runtime validation."
+        if (mapAvailable && Build.VERSION.SDK_INT >= 35 && !sessionQuerySupported) {
+            warnings += "CameraDeviceSetup session preflight is not available for this camera route; runtime combination checks remain unavailable until session creation."
         }
 
-        val sensorRect = chars.get(CameraCharacteristics.SENSOR_INFO_PRE_CORRECTION_ACTIVE_ARRAY_SIZE)
-            ?: chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
-        val scannedPhotoCandidates = buildPhotoCandidates(
-            manager = manager,
-            logicalCameraId = sessionQueryCameraId,
-            formats = formats,
-            previewSizes = previewSizes,
-            fpsRanges = fpsRanges,
-            sessionQuerySupported = sessionQuerySupported,
-            physicalCameraId = resolved.physicalCameraId,
-            sensorWidth = sensorRect?.width() ?: 0,
-            sensorHeight = sensorRect?.height() ?: 0
-        )
-        val photoCandidates = if (resolved.source == CameraStreamCatalogSource.LOGICAL_PARENT_FALLBACK) {
-            // A parent StreamConfigurationMap is not sensor-exclusive truth. Only keep candidates
-            // whose physical-ID-bound complete session was explicitly accepted by the HAL.
-            scannedPhotoCandidates.filter {
-                it.validationStatus == StreamCandidateValidationStatus.SESSION_VALIDATED
-            }
-        } else {
-            scannedPhotoCandidates
-        }
-        val videoCandidates = if (resolved.source == CameraStreamCatalogSource.LOGICAL_PARENT_FALLBACK) {
-            // Video preflight is not implemented yet, so do not present parent YUV sizes as if
-            // they were reported by this hidden physical sensor.
-            emptyList()
-        } else {
-            buildVideoCandidates(
-                formats = formats,
-                fpsRanges = fpsRanges
-            )
-        }
-
-        return CameraStreamCapabilityCatalog(
+        val inventory = CameraCapabilityInventoryFactory.fromCharacteristics(
             requestedLensId = lensId,
             logicalCameraId = resolved.logicalCameraId,
             physicalCameraId = resolved.physicalCameraId,
             source = resolved.source,
-            hardwareLevel = chars.get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL),
-            requestCapabilities = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)?.toSet().orEmpty(),
-            aeFpsRanges = fpsRanges,
-            formats = formats,
-            candidates = photoCandidates + videoCandidates,
-            sessionQuerySupported = sessionQuerySupported,
+            characteristics = chars,
             warnings = warnings
         )
-    }
-
-    private fun buildPhotoCandidates(
-        manager: CameraManager,
-        logicalCameraId: String?,
-        formats: List<CameraStreamFormatCapability>,
-        previewSizes: List<Size>,
-        fpsRanges: List<Range<Int>>,
-        sessionQuerySupported: Boolean,
-        physicalCameraId: String?,
-        sensorWidth: Int,
-        sensorHeight: Int
-    ): List<CameraStreamCandidate> {
-        val preferredFormats = listOf(ImageFormat.RAW_SENSOR, ImageFormat.RAW10, ImageFormat.YUV_420_888)
-        val candidates = mutableListOf<CameraStreamCandidate>()
-        preferredFormats.forEach { formatCode ->
-            val capability = formats.firstOrNull { it.formatCode == formatCode } ?: return@forEach
-            val allSizes = capability.sizes.map { it.size }
-            val fullFovExtents = CameraStreamGeometryPolicy.fullFovCandidates(
-                candidates = allSizes.map { CameraStreamGeometryPolicy.Extent(it.width, it.height) },
-                sensorWidth = sensorWidth,
-                sensorHeight = sensorHeight,
-                aspectTolerance = if (formatCode == ImageFormat.RAW10 || formatCode == ImageFormat.RAW_SENSOR) {
-                    0.025
-                } else {
-                    CameraStreamGeometryPolicy.DEFAULT_ASPECT_TOLERANCE
-                }
-            )
-            val fullFovKeys = fullFovExtents.mapTo(hashSetOf()) { it.width to it.height }
-            val photoSizes = allSizes.filter { (it.width to it.height) in fullFovKeys }.ifEmpty { allSizes }
-            val captureSizes = representativeSizes(photoSizes, maxCount = 3)
-            captureSizes.forEach { captureSize ->
-                val previewSize = selectPreviewSize(previewSizes, captureSize)
-                val captureCapability = capability.sizes.firstOrNull { it.size == captureSize }
-                // The capture stream remains the conservative cadence authority here. Preview
-                // SurfaceTexture duration is not consistently reported by every HAL. Runtime FPS
-                // policy will still intersect the resolved range with the actual preview contract.
-                val sustainable = captureCapability?.maxFpsFromDuration
-                val fpsRange = chooseFpsRange(fpsRanges, sustainable)
-                val preflight = preflightRegularSession(
-                    manager = manager,
-                    logicalCameraId = logicalCameraId,
-                    sessionQuerySupported = sessionQuerySupported,
-                    previewSize = previewSize,
-                    captureFormat = formatCode,
-                    captureSize = captureSize,
-                    physicalCameraId = physicalCameraId
-                )
-                val id = buildCandidateId(
-                    StreamConfigurationClass.PHOTO,
-                    formatCode,
-                    captureSize,
-                    previewSize,
-                    fpsRange
-                )
-                candidates += CameraStreamCandidate(
-                    id = id,
-                    streamClass = StreamConfigurationClass.PHOTO,
-                    captureFormatCode = formatCode,
-                    captureFormatName = capability.formatName,
-                    captureSize = captureSize,
-                    previewSize = previewSize,
-                    fpsRange = fpsRange,
-                    validationStatus = preflight.first,
-                    validationReason = preflight.second
-                )
-            }
-        }
-        return candidates
-    }
-
-    private fun buildVideoCandidates(
-        formats: List<CameraStreamFormatCapability>,
-        fpsRanges: List<Range<Int>>
-    ): List<CameraStreamCandidate> {
-        val capability = formats.firstOrNull { it.formatCode == ImageFormat.YUV_420_888 } ?: return emptyList()
-        return representativeSizes(
-            capability.sizes.map { it.size }.filter { it.width <= 3840 && it.height <= 2160 },
-            maxCount = 4
-        ).map { size ->
-            val sizeCapability = capability.sizes.firstOrNull { it.size == size }
-            val fpsRange = chooseFpsRange(fpsRanges, sizeCapability?.maxFpsFromDuration)
-            CameraStreamCandidate(
-                id = buildCandidateId(StreamConfigurationClass.VIDEO, capability.formatCode, size, null, fpsRange),
-                streamClass = StreamConfigurationClass.VIDEO,
-                captureFormatCode = capability.formatCode,
-                captureFormatName = capability.formatName,
-                captureSize = size,
-                previewSize = null,
-                fpsRange = fpsRange,
-                validationStatus = StreamCandidateValidationStatus.CAMERA2_REPORTED,
-                validationReason = "Camera2 reports this YUV size. Video encoder/MediaCodec session validation is deferred to the video runtime."
+        if (!mapAvailable) {
+            return CameraStreamCapabilityCatalog(
+                inventory = inventory,
+                sessionQuerySupported = false
             )
         }
-    }
 
-    private fun representativeSizes(sizes: List<Size>, maxCount: Int): List<Size> {
-        if (sizes.isEmpty()) return emptyList()
-        val ordered = sizes.distinctBy { it.width to it.height }
-            .sortedByDescending { it.width.toLong() * it.height.toLong() }
-        if (ordered.size <= maxCount) return ordered
-        val indexes = when (maxCount) {
-            1 -> listOf(0)
-            2 -> listOf(0, ordered.lastIndex)
-            3 -> listOf(0, ordered.lastIndex / 2, ordered.lastIndex)
-            else -> List(maxCount) { index ->
-                ((ordered.lastIndex.toDouble() * index) / (maxCount - 1).coerceAtLeast(1)).toInt()
-            }
-        }
-        return indexes.distinct().map { ordered[it] }
-    }
-
-    private fun selectPreviewSize(previewSizes: List<Size>, captureSize: Size): Size? {
-        if (previewSizes.isEmpty()) return null
-        val targetAspect = normalizedAspect(captureSize)
-        val bounded = previewSizes.filter { size ->
-            size.width.toLong() * size.height.toLong() <= 1920L * 1080L
-        }.ifEmpty { previewSizes }
-        return bounded.minWithOrNull(
-            compareBy<Size> { size -> abs(normalizedAspect(size) - targetAspect) }
-                .thenByDescending { size -> size.width.toLong() * size.height.toLong() }
+        return CameraStreamCapabilityCatalog(
+            inventory = inventory,
+            sessionQuerySupported = sessionQuerySupported
         )
-    }
-
-    private fun normalizedAspect(size: Size): Double {
-        val longSide = maxOf(size.width, size.height).toDouble()
-        val shortSide = minOf(size.width, size.height).coerceAtLeast(1).toDouble()
-        return longSide / shortSide
-    }
-
-    private fun chooseFpsRange(
-        ranges: List<Range<Int>>,
-        sustainableUpperFps: Int?
-    ): Range<Int>? {
-        if (ranges.isEmpty()) return null
-        val compatible = sustainableUpperFps?.let { maxFps -> ranges.filter { it.upper <= maxFps } }.orEmpty()
-        val pool = compatible.ifEmpty { ranges }
-        return pool.sortedWith(
-            compareByDescending<Range<Int>> { it.upper }
-                .thenByDescending { it.lower <= 30 }
-                .thenBy { it.lower }
-        ).firstOrNull()
-    }
-
-    private fun preflightRegularSession(
-        manager: CameraManager,
-        logicalCameraId: String?,
-        sessionQuerySupported: Boolean,
-        previewSize: Size?,
-        captureFormat: Int,
-        captureSize: Size,
-        physicalCameraId: String?
-    ): Pair<StreamCandidateValidationStatus, String> {
-        if (!sessionQuerySupported || logicalCameraId == null || Build.VERSION.SDK_INT < 35) {
-            return StreamCandidateValidationStatus.CAMERA2_REPORTED to
-                "Reported by StreamConfigurationMap; CameraDeviceSetup preflight is unavailable."
-        }
-        if (previewSize == null) {
-            return StreamCandidateValidationStatus.CAMERA2_REPORTED to
-                "Capture stream is reported, but no SurfaceTexture preview size was available for full-session preflight."
-        }
-
-        val result = CameraSessionPreflight.validateRegularSession(
-            manager = manager,
-            logicalCameraId = logicalCameraId,
-            previewSize = previewSize,
-            captureFormat = captureFormat,
-            captureSize = captureSize,
-            physicalCameraId = physicalCameraId
-        )
-        return result.status to result.reason
     }
 
     private data class ResolvedCharacteristics(
@@ -437,19 +298,7 @@ object CameraStreamCapabilityScanner {
         }.getOrDefault(false)
     }
 
-    private fun buildCandidateId(
-        streamClass: StreamConfigurationClass,
-        formatCode: Int,
-        captureSize: Size,
-        previewSize: Size?,
-        fpsRange: Range<Int>?
-    ): String = buildString {
-        append(streamClass.name)
-        append(':').append(formatCode)
-        append(':').append(captureSize.width).append('x').append(captureSize.height)
-        previewSize?.let { append(":P").append(it.width).append('x').append(it.height) }
-        fpsRange?.let { append(":F").append(it.lower).append('-').append(it.upper) }
-    }
+
 }
 
 
@@ -460,8 +309,9 @@ internal data class CameraSessionPreflightResult(
 )
 
 /**
- * Single Camera2/HAL session-preflight authority shared by the catalog and runtime resolver.
- * It never opens a CameraDevice and never mutates the active BnCam session.
+ * Single Camera2/HAL session-preflight authority for runtime session diagnostics/recovery.
+ * Capability discovery never invokes this validation path. It never opens a CameraDevice and
+ * never mutates the active BnCam session.
  */
 @android.annotation.TargetApi(35)
 internal object CameraSessionPreflight {
@@ -599,6 +449,14 @@ internal object CameraSessionPreflight {
         }
     }
 
+}
+
+private fun cameraCapabilityFormatKind(format: Int): CameraCapabilityFormatKind = when (format) {
+    ImageFormat.RAW10 -> CameraCapabilityFormatKind.RAW10
+    ImageFormat.RAW12 -> CameraCapabilityFormatKind.RAW12
+    ImageFormat.RAW_SENSOR -> CameraCapabilityFormatKind.RAW_SENSOR
+    ImageFormat.YUV_420_888 -> CameraCapabilityFormatKind.YUV_420_888
+    else -> CameraCapabilityFormatKind.OTHER
 }
 
 fun cameraFormatName(format: Int): String = when (format) {

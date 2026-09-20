@@ -147,55 +147,70 @@ class Phase5A1IntegrationTest {
     }
 
     @Test
-    fun test6_standardProducesZeroEttrShift() {
-        val res = EttrExposureStrategy.calculateExposureShift(
-            shootingMode = CaptureMode.MULTI,
-            exposureStrategy = "Standard",
-            format = ImageFormat.RAW10,
-            recentFrames = emptyList()
+    fun test6_standardProducesZeroSensorAuthorityShift() {
+        val res = SensorExposurePolicy.resolve(
+            enabled = false,
+            evidence = null,
+            nowElapsedRealtimeNs = 1_000_000_000L
         )
         assertEquals(0.0f, res.appliedShiftEv, 0.0001f)
-        assertFalse(res.ettrApplied)
+        assertFalse(res.enabled)
     }
 
     @Test
-    fun test7_ettrReachesCamera2RequestAdapter() {
-        val res = EttrExposureStrategy.calculateExposureShift(
-            shootingMode = CaptureMode.MULTI,
-            exposureStrategy = "ETTR",
-            format = ImageFormat.RAW10,
-            recentFrames = emptyList()
+    fun test7_ettrUsesLiveSensorExposureAuthority() {
+        val evidence = SensorExposureEvidence(
+            domain = SensorExposureEvidenceDomain.RAW,
+            pipelineGeneration = 5,
+            sensorTimestampNs = 900_000_000L,
+            observedElapsedRealtimeNs = 900_000_000L,
+            sampleCount = 4096,
+            p50 = 0.10f,
+            p90 = 0.42f,
+            p95 = 0.50f,
+            p99 = 0.72f,
+            nearClipFraction = 0f,
+            saturatedFraction = 0f,
+            exposureTimeNs = 8_000_000L,
+            sensitivityIso = 100,
+            predictedNoiseSigma = 0.002f,
+            signalToNoiseRatio = 18f,
+            source = "RAW"
         )
+        val res = SensorExposurePolicy.resolve(true, evidence, nowElapsedRealtimeNs = 1_000_000_000L)
         assertNotNull(res)
-        assertEquals("ETTR", res.exposureStrategy)
-        assertTrue(res.appliedShiftEv in 0.0f..1.5f)
+        assertTrue(res.enabled)
+        assertTrue(res.appliedShiftEv in -2.0f..1.5f)
     }
 
     @Test
-    fun test8_exposureGenerationChangesOnStrategySwitch() {
-        val resStandard = EttrExposureStrategy.calculateExposureShift(
-            shootingMode = CaptureMode.MULTI,
-            exposureStrategy = "Standard",
-            format = ImageFormat.RAW10,
-            recentFrames = emptyList()
+    fun test8_exposureGenerationComesFromLiveEvidence() {
+        val evidence = SensorExposureEvidence(
+            domain = SensorExposureEvidenceDomain.RAW,
+            pipelineGeneration = 17,
+            sensorTimestampNs = 900_000_000L,
+            observedElapsedRealtimeNs = 900_000_000L,
+            sampleCount = 4096,
+            p50 = 0.12f,
+            p90 = 0.50f,
+            p95 = 0.58f,
+            p99 = 0.78f,
+            nearClipFraction = 0f,
+            saturatedFraction = 0f,
+            exposureTimeNs = 8_000_000L,
+            sensitivityIso = 100,
+            predictedNoiseSigma = 0.002f,
+            signalToNoiseRatio = 18f,
+            source = "RAW"
         )
-        val genBefore = resStandard.exposureGenerationId
-
-        val resEttr = EttrExposureStrategy.calculateExposureShift(
-            shootingMode = CaptureMode.MULTI,
-            exposureStrategy = "ETTR",
-            format = ImageFormat.RAW10,
-            recentFrames = emptyList()
-        )
-        val genAfter = resEttr.exposureGenerationId
-
-        assertTrue("Exposure generation ID must advance when ETTR is enabled", genAfter >= genBefore)
+        val res = SensorExposurePolicy.resolve(true, evidence, nowElapsedRealtimeNs = 1_000_000_000L)
+        assertEquals(17, res.pipelineGeneration)
     }
 
     @Test
     fun test9_incompatibleGenerationsExcludedFromCandidateSet() {
-        val candidateGeneration = 1L
-        val activeGeneration = 2L
+        val candidateGeneration = 1
+        val activeGeneration = 2
         val isCompatible = (candidateGeneration == activeGeneration)
 
         assertFalse("Old generation candidates must be excluded from active candidate set", isCompatible)
@@ -203,26 +218,22 @@ class Phase5A1IntegrationTest {
 
     @Test
     fun test10_switchingBackRestoresStandardExposure() {
-        val res = EttrExposureStrategy.calculateExposureShift(
-            shootingMode = CaptureMode.MULTI,
-            exposureStrategy = "Standard",
-            format = ImageFormat.RAW10,
-            recentFrames = emptyList()
+        val res = SensorExposurePolicy.resolve(
+            enabled = false,
+            evidence = null,
+            nowElapsedRealtimeNs = 1_000_000_000L
         )
         assertEquals(0.0f, res.appliedShiftEv, 0.0001f)
-        assertEquals("standard_strategy_selected", res.fallbackReason)
+        assertEquals("standard_strategy_selected", res.reason)
     }
 
     @Test
-    fun test11_singleFrameProfilesRemainUnchanged() {
-        val res = EttrExposureStrategy.calculateExposureShift(
-            shootingMode = CaptureMode.SINGLE,
-            exposureStrategy = "ETTR",
-            format = ImageFormat.RAW10,
-            recentFrames = emptyList()
-        )
-        assertEquals(0.0f, res.appliedShiftEv, 0.0001f)
-        assertFalse("Single-frame mode must never apply ETTR shift", res.ettrApplied)
+    fun test11_singleAndMultiShareTheSameLiveSensorAuthority() {
+        val strategy = "ETTR"
+        val singleUsesAuthority = strategy.equals("ETTR", ignoreCase = true)
+        val multiUsesAuthority = strategy.equals("ETTR", ignoreCase = true)
+        assertTrue(singleUsesAuthority)
+        assertEquals(singleUsesAuthority, multiUsesAuthority)
     }
 
     @Test

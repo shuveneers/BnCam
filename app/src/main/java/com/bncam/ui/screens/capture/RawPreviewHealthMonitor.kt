@@ -1,5 +1,7 @@
 package com.bncam.ui.screens.capture
 
+import com.bncam.core.runtime.RawPreviewProducerFrameIdentity
+import com.bncam.core.runtime.RawPreviewProducerKind
 import kotlin.math.max
 
 enum class RawPreviewHealthStage {
@@ -36,6 +38,14 @@ data class RawPreviewHealthSnapshot(
     val latestSensorFrameDurationNs: Long,
     val latestExposureTimeNs: Long,
     val advertisedMinFrameDurationNs: Long,
+    val lastImageReaderFrame: RawPreviewProducerFrameIdentity?,
+    val lastRendererOfferFrame: RawPreviewProducerFrameIdentity?,
+    val lastRendererPublicationFrame: RawPreviewProducerFrameIdentity?,
+    val lastGlAcceptedFrame: RawPreviewProducerFrameIdentity?,
+    val lastGlDrawFrame: RawPreviewProducerFrameIdentity?,
+    val lastDisplayPresentedFrame: RawPreviewProducerFrameIdentity?,
+    val stageFrameHint: RawPreviewProducerFrameIdentity?,
+    val exactDownstreamChainCoherent: Boolean,
     val outputRgbMin: Float,
     val outputRgbMax: Float,
     val outputRgbMean: Float,
@@ -50,12 +60,22 @@ data class RawPreviewHealthSnapshot(
     val lastRecoveryElapsedNs: Long
 ) {
     fun report(nowElapsedNs: Long): String = buildString {
-        fun age(last: Long): String = if (last <= 0L) "none" else "${((nowElapsedNs - last).coerceAtLeast(0L)) / 1_000_000.0}"
+        fun age(last: Long): String =
+            if (last <= 0L) "none" else "${((nowElapsedNs - last).coerceAtLeast(0L)) / 1_000_000.0}"
+        fun frame(value: RawPreviewProducerFrameIdentity?): String = value?.summary() ?: "none"
+
         appendLine("RAW_PREVIEW_HEALTH source=$source generation=$pipelineGeneration eglGeneration=$eglGeneration stage=$stage")
         appendLine("expectedIntervalMs=${expectedIntervalNs / 1_000_000.0} stallThresholdMs=${stallThresholdNs / 1_000_000.0}")
         appendLine("ageCaptureResultMs=${age(lastCaptureResultElapsedNs)} ageImageReaderMs=${age(lastImageReaderElapsedNs)} ageRendererOfferMs=${age(lastRendererOfferElapsedNs)}")
         appendLine("ageRendererPublicationMs=${age(lastRendererPublicationElapsedNs)} ageGlAcceptedMs=${age(lastGlAcceptedElapsedNs)} firstGlDrawAgeMs=${age(firstGlDrawElapsedNs)} ageGlDrawMs=${age(lastGlDrawElapsedNs)} ageDisplayPresentMs=${age(lastDisplayPresentElapsedNs)}")
         appendLine("latestSensorTimestampNs=$latestSensorTimestampNs frameDurationNs=$latestSensorFrameDurationNs exposureTimeNs=$latestExposureTimeNs advertisedMinFrameDurationNs=$advertisedMinFrameDurationNs")
+        appendLine("imageReaderFrame={${frame(lastImageReaderFrame)}}")
+        appendLine("rendererOfferFrame={${frame(lastRendererOfferFrame)}}")
+        appendLine("rendererPublicationFrame={${frame(lastRendererPublicationFrame)}}")
+        appendLine("glAcceptedFrame={${frame(lastGlAcceptedFrame)}}")
+        appendLine("glDrawFrame={${frame(lastGlDrawFrame)}}")
+        appendLine("displayPresentedFrame={${frame(lastDisplayPresentedFrame)}}")
+        appendLine("stageFrameHint={${frame(stageFrameHint)}} exactDownstreamChainCoherent=$exactDownstreamChainCoherent")
         appendLine(
             "rgbMin=$outputRgbMin rgbMax=$outputRgbMax rgbMean=$outputRgbMean " +
                 "inputRawMax=$inputRawMax inputSceneP50=$inputSceneP50 " +
@@ -72,9 +92,15 @@ data class RawPreviewHealthSnapshot(
 /**
  * Low-overhead, always-on RAW viewfinder liveness owner.
  *
- * This intentionally does not recover anything itself. It only records monotonic progress at each
- * stage and classifies the first stale stage. Recovery remains with the owner of that layer so a
- * renderer/EGL problem can never silently become a full Camera2 restart.
+ * This intentionally does not recover anything itself. It records monotonic progress at each
+ * stage and classifies the first stale stage. Every RAW frame-bearing stage also records exact
+ * producer provenance so renderer/GL/EGL failures can be attributed without guessing whether the
+ * frame came from PRIMARY_BUFFER or RAW_PREVIEW_SUPPORT.
+ *
+ * RAW_IMAGE_READER remains an aggregate transport stage by design. PRIMARY_BUFFER liveness is
+ * owned by the canonical warm-buffer watchdog and optional support liveness by
+ * RawViewfinderProducerHealthPolicy; this monitor must not infer a failed producer from aggregate
+ * ImageReader freshness alone.
  */
 object RawPreviewHealthMonitor {
     private var source: String = "YUV"
@@ -96,6 +122,13 @@ object RawPreviewHealthMonitor {
     private var lastDisplayPresentElapsedNs: Long = 0L
     private var actualPresentationObserved: Boolean = false
 
+    private var lastImageReaderFrame: RawPreviewProducerFrameIdentity? = null
+    private var lastRendererOfferFrame: RawPreviewProducerFrameIdentity? = null
+    private var lastRendererPublicationFrame: RawPreviewProducerFrameIdentity? = null
+    private var lastGlAcceptedFrame: RawPreviewProducerFrameIdentity? = null
+    private var lastGlDrawFrame: RawPreviewProducerFrameIdentity? = null
+    private var lastDisplayPresentedFrame: RawPreviewProducerFrameIdentity? = null
+
     private var outputRgbMin: Float = Float.NaN
     private var outputRgbMax: Float = Float.NaN
     private var outputRgbMean: Float = Float.NaN
@@ -103,6 +136,7 @@ object RawPreviewHealthMonitor {
     private var inputSceneP50: Float = Float.NaN
     private var consecutiveImpossibleBlackFrames: Int = 0
     private var impossibleBlackConfirmed: Boolean = false
+    private var lastBlackEvidenceSensorTimestampNs: Long = Long.MIN_VALUE
     private var outputSlotHealth: String = "unavailable"
     private var ringPressure: String = "unavailable"
     private var lastRecoveryReason: String = "none"
@@ -137,6 +171,12 @@ object RawPreviewHealthMonitor {
         lastGlDrawElapsedNs = 0L
         lastDisplayPresentElapsedNs = 0L
         actualPresentationObserved = false
+        lastImageReaderFrame = null
+        lastRendererOfferFrame = null
+        lastRendererPublicationFrame = null
+        lastGlAcceptedFrame = null
+        lastGlDrawFrame = null
+        lastDisplayPresentedFrame = null
         outputRgbMin = Float.NaN
         outputRgbMax = Float.NaN
         outputRgbMean = Float.NaN
@@ -144,6 +184,7 @@ object RawPreviewHealthMonitor {
         inputSceneP50 = Float.NaN
         consecutiveImpossibleBlackFrames = 0
         impossibleBlackConfirmed = false
+        lastBlackEvidenceSensorTimestampNs = Long.MIN_VALUE
         outputSlotHealth = "unavailable"
         ringPressure = "unavailable"
         lastRecoveryReason = "none"
@@ -166,21 +207,35 @@ object RawPreviewHealthMonitor {
     }
 
     @Synchronized
-    fun imageReaderProgress(generation: Int, sensorTimestampNs: Long, nowElapsedNs: Long) {
+    fun imageReaderProgress(
+        generation: Int,
+        sensorTimestampNs: Long,
+        producerKind: RawPreviewProducerKind,
+        nowElapsedNs: Long
+    ) {
         if (!matches(generation)) return
         lastImageReaderElapsedNs = nowElapsedNs
+        frameIdentity(generation, sensorTimestampNs, producerKind)?.let { lastImageReaderFrame = it }
         if (sensorTimestampNs > 0L) latestSensorTimestampNs = max(latestSensorTimestampNs, sensorTimestampNs)
     }
 
     @Synchronized
-    fun rendererOffer(generation: Int, nowElapsedNs: Long) {
+    fun rendererOffer(
+        generation: Int,
+        sensorTimestampNs: Long,
+        producerKind: RawPreviewProducerKind,
+        nowElapsedNs: Long
+    ) {
         if (!matches(generation)) return
         lastRendererOfferElapsedNs = nowElapsedNs
+        frameIdentity(generation, sensorTimestampNs, producerKind)?.let { lastRendererOfferFrame = it }
     }
 
     @Synchronized
     fun rendererPublication(
         generation: Int,
+        sensorTimestampNs: Long,
+        producerKind: RawPreviewProducerKind,
         frameEglGeneration: Int,
         rgbMin: Float,
         rgbMax: Float,
@@ -192,6 +247,7 @@ object RawPreviewHealthMonitor {
     ) {
         if (!matches(generation)) return
         lastRendererPublicationElapsedNs = nowElapsedNs
+        frameIdentity(generation, sensorTimestampNs, producerKind)?.let { lastRendererPublicationFrame = it }
         if (frameEglGeneration > 0) eglGeneration = frameEglGeneration
         outputRgbMin = rgbMin
         outputRgbMax = rgbMax
@@ -207,12 +263,18 @@ object RawPreviewHealthMonitor {
             normalizedRawMax.isFinite() && sceneP50.isFinite() &&
                 normalizedRawMax >= MIN_RAW_SIGNAL_FOR_BLACK_FAULT &&
                 sceneP50 >= MIN_SCENE_P50_FOR_BLACK_FAULT
-        if (outputExactlyBlack && rawSignalProven) {
-            consecutiveImpossibleBlackFrames =
-                (consecutiveImpossibleBlackFrames + 1)
-                    .coerceAtMost(BLACK_FAULT_CONFIRMATION_FRAMES)
+        if (outputExactlyBlack && rawSignalProven && sensorTimestampNs > 0L) {
+            // Canonical + support may render the same sensor frame. Count that physical frame once
+            // so two Camera2 outputs cannot satisfy the multi-frame black-fault quorum early.
+            if (sensorTimestampNs != lastBlackEvidenceSensorTimestampNs) {
+                lastBlackEvidenceSensorTimestampNs = sensorTimestampNs
+                consecutiveImpossibleBlackFrames =
+                    (consecutiveImpossibleBlackFrames + 1)
+                        .coerceAtMost(BLACK_FAULT_CONFIRMATION_FRAMES)
+            }
         } else {
             consecutiveImpossibleBlackFrames = 0
+            lastBlackEvidenceSensorTimestampNs = Long.MIN_VALUE
         }
         impossibleBlackConfirmed =
             consecutiveImpossibleBlackFrames >= BLACK_FAULT_CONFIRMATION_FRAMES
@@ -221,25 +283,45 @@ object RawPreviewHealthMonitor {
     }
 
     @Synchronized
-    fun glAccepted(generation: Int, currentEglGeneration: Int, nowElapsedNs: Long) {
+    fun glAccepted(
+        generation: Int,
+        sensorTimestampNs: Long,
+        producerKind: RawPreviewProducerKind,
+        currentEglGeneration: Int,
+        nowElapsedNs: Long
+    ) {
         if (!matches(generation)) return
         lastGlAcceptedElapsedNs = nowElapsedNs
+        frameIdentity(generation, sensorTimestampNs, producerKind)?.let { lastGlAcceptedFrame = it }
         if (currentEglGeneration > 0) eglGeneration = currentEglGeneration
     }
 
     @Synchronized
-    fun glDraw(generation: Int, currentEglGeneration: Int, nowElapsedNs: Long) {
+    fun glDraw(
+        generation: Int,
+        sensorTimestampNs: Long,
+        producerKind: RawPreviewProducerKind,
+        currentEglGeneration: Int,
+        nowElapsedNs: Long
+    ) {
         if (!matches(generation)) return
         if (firstGlDrawElapsedNs == 0L) firstGlDrawElapsedNs = nowElapsedNs
         lastGlDrawElapsedNs = nowElapsedNs
+        frameIdentity(generation, sensorTimestampNs, producerKind)?.let { lastGlDrawFrame = it }
         if (currentEglGeneration > 0) eglGeneration = currentEglGeneration
     }
 
     @Synchronized
-    fun displayPresented(generation: Int, nowElapsedNs: Long) {
+    fun displayPresented(
+        generation: Int,
+        sensorTimestampNs: Long,
+        producerKind: RawPreviewProducerKind,
+        nowElapsedNs: Long
+    ) {
         if (!matches(generation)) return
         lastDisplayPresentElapsedNs = nowElapsedNs
         actualPresentationObserved = true
+        frameIdentity(generation, sensorTimestampNs, producerKind)?.let { lastDisplayPresentedFrame = it }
     }
 
     @Synchronized
@@ -277,6 +359,7 @@ object RawPreviewHealthMonitor {
         )
         val threshold = max(MIN_STALL_THRESHOLD_NS, expected * STALL_INTERVAL_MULTIPLIER)
         val stage = classify(nowElapsedNs, threshold)
+        val stageFrame = stageFrameHint(stage)
         return RawPreviewHealthSnapshot(
             source = source,
             pipelineGeneration = pipelineGeneration,
@@ -297,6 +380,14 @@ object RawPreviewHealthMonitor {
             latestSensorFrameDurationNs = latestSensorFrameDurationNs,
             latestExposureTimeNs = latestExposureTimeNs,
             advertisedMinFrameDurationNs = advertisedMinFrameDurationNs,
+            lastImageReaderFrame = lastImageReaderFrame,
+            lastRendererOfferFrame = lastRendererOfferFrame,
+            lastRendererPublicationFrame = lastRendererPublicationFrame,
+            lastGlAcceptedFrame = lastGlAcceptedFrame,
+            lastGlDrawFrame = lastGlDrawFrame,
+            lastDisplayPresentedFrame = lastDisplayPresentedFrame,
+            stageFrameHint = stageFrame,
+            exactDownstreamChainCoherent = exactDownstreamChainCoherent(),
             outputRgbMin = outputRgbMin,
             outputRgbMax = outputRgbMax,
             outputRgbMean = outputRgbMean,
@@ -327,10 +418,6 @@ object RawPreviewHealthMonitor {
         if (!recent(lastRendererPublicationElapsedNs)) return RawPreviewHealthStage.RENDERER_PUBLICATION
         if (!recent(lastGlAcceptedElapsedNs)) return RawPreviewHealthStage.GL_ACCEPT
         if (!recent(lastGlDrawElapsedNs)) return RawPreviewHealthStage.GL_DRAW
-        // A route is not healthy merely because GL keeps drawing. The first actual presentation
-        // must also arrive within one bounded liveness window after the first successful GL draw.
-        // This closes the startup hole where a broken EGL/presentation bridge could be labelled
-        // HEALTHY forever simply because no presentation had ever been observed.
         if (!actualPresentationObserved && firstGlDrawElapsedNs > 0L &&
             nowElapsedNs - firstGlDrawElapsedNs > thresholdNs
         ) {
@@ -344,6 +431,49 @@ object RawPreviewHealthMonitor {
         }
         return RawPreviewHealthStage.HEALTHY
     }
+
+    /**
+     * Returns exact producer/frame evidence for downstream stages only. RAW_IMAGE_READER is
+     * deliberately left unattributed because aggregate arrival freshness cannot decide which
+     * configured Camera2 producer is the failed one.
+     */
+    private fun stageFrameHint(stage: RawPreviewHealthStage): RawPreviewProducerFrameIdentity? = when (stage) {
+        RawPreviewHealthStage.RENDERER_OFFER -> lastImageReaderFrame
+        RawPreviewHealthStage.RENDERER_PUBLICATION -> lastRendererOfferFrame
+        RawPreviewHealthStage.GL_ACCEPT -> lastRendererPublicationFrame
+        RawPreviewHealthStage.GL_DRAW -> lastGlAcceptedFrame
+        RawPreviewHealthStage.EGL_PRESENTATION -> lastGlDrawFrame
+        RawPreviewHealthStage.RGB_OUTPUT -> lastRendererPublicationFrame
+        RawPreviewHealthStage.HEALTHY -> lastDisplayPresentedFrame
+        else -> null
+    }
+
+    private fun exactDownstreamChainCoherent(): Boolean {
+        val chain = listOfNotNull(
+            lastRendererPublicationFrame,
+            lastGlAcceptedFrame,
+            lastGlDrawFrame,
+            lastDisplayPresentedFrame
+        )
+        if (chain.size <= 1) return true
+        // Only compare stages referring to the same or newer chronology. A latest publication may
+        // legitimately be newer than the most recently presented frame, so coherence means no
+        // stage reports a *different producer for the exact same SENSOR_TIMESTAMP*.
+        return chain.groupBy { it.sensorTimestampNs }.values.all { sameTimestamp ->
+            sameTimestamp.map { it.producerKind }.distinct().size <= 1
+        }
+    }
+
+    private fun frameIdentity(
+        generation: Int,
+        sensorTimestampNs: Long,
+        producerKind: RawPreviewProducerKind
+    ): RawPreviewProducerFrameIdentity? =
+        if (generation >= 0 && sensorTimestampNs > 0L) {
+            RawPreviewProducerFrameIdentity(generation, sensorTimestampNs, producerKind)
+        } else {
+            null
+        }
 
     private fun matches(generation: Int): Boolean = generation == pipelineGeneration
 

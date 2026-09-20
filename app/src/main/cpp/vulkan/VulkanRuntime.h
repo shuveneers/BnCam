@@ -277,8 +277,13 @@ public:
             std::uint32_t frameHeight
     ) noexcept;
 
-    /** Fused preview-only RAW demosaic/colour/tone/RGBA path. */
+    /** Submit one fused preview-only RAW demosaic/colour/tone/RGBA job without waiting. */
     RawPreviewGpuResult executeRawPreview(const RawPreviewGpuRequest& request) noexcept;
+
+    /** Non-blocking completion probe for one exact RAW-preview slot/submission. */
+    RawPreviewGpuResult pollRawPreview(
+            std::uint32_t frameSlotIndex,
+            std::uint64_t submissionId) noexcept;
 
     /**
      * Exact Android HardwareBuffer usage mask required for an RGBA8 storage+sampled preview image.

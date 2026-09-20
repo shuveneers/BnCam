@@ -233,8 +233,8 @@ fun VendorTagsScreen(onNavigateBack: () -> Unit) {
                                         source = VendorTagSource.RECIPE,
                                         recipeId = feature.id,
                                         valueOrigin = VendorValueOrigin.RECIPE_DEFAULT,
-                                        requiresSessionRebuild = target == VendorTagTarget.SESSION || looksLikeFeatureThatMayNeedOperationModeProbe(discovered.name),
-                                        notes = "Enabled from ${feature.displayName}. If a vendor operation mode must be discovered, BnCam performs the one-time probe after this explicit enable action and learns the working mapping per lens."
+                                        requiresSessionRebuild = target == VendorTagTarget.SESSION || looksLikeFeatureThatRequiresSessionRebuild(discovered.name),
+                                        notes = "Enabled from ${feature.displayName}. Session-scoped vendor tags rebuild the current Camera2 session. A custom Camera2 operation mode is used only when an explicit operation-mode SESSION tag is configured."
                                     )
                                 }
 
@@ -243,9 +243,6 @@ fun VendorTagsScreen(onNavigateBack: () -> Unit) {
                                     recipeId = feature.id,
                                     tags = recipeTags
                                 )
-                                if (recipeTags.any { it.requiresSessionRebuild }) {
-                                    settingsRepo.setVendorOperationModeProbeActive(activeLensId, true)
-                                }
                             }
                         },
 
@@ -256,7 +253,6 @@ fun VendorTagsScreen(onNavigateBack: () -> Unit) {
                                     recipeId = feature.id,
                                     enabled = false
                                 )
-                                settingsRepo.setVendorOperationModeProbeActive(activeLensId, false)
                             }
                         }
                     )
@@ -1023,7 +1019,6 @@ private fun selectRecipeTagsForFeature(
                         "EnableHDRDCGMode",
                         "sessionParameters.DCGMode",
                         "stats_control.DCGMode",
-                        "ReprocessableSessionModeTag",
                         "sensorHdrMode"
                     )
         }
@@ -1033,9 +1028,6 @@ private fun selectRecipeTagsForFeature(
             !looksLikeReadOnlyOrCapabilityKey(key) &&
                     hasAny(
                         key,
-                        "ReprocessableSessionModeTag",
-                        "sessionoperationmode",
-                        "operationmode",
                         "professionalMode",
                         "professionalFocusMode",
                         "profFocusAssistFlashMode",
@@ -1078,7 +1070,7 @@ private fun looksLikeSessionRebuildKey(keyName: String): Boolean {
             key.contains("reprocessablesessionmodetag")
 }
 
-private fun looksLikeFeatureThatMayNeedOperationModeProbe(keyName: String): Boolean {
+private fun looksLikeFeatureThatRequiresSessionRebuild(keyName: String): Boolean {
     val key = keyName.lowercase()
     return key.contains("dcg") ||
             key.contains("dualconversion") ||
@@ -1122,17 +1114,6 @@ private fun inferTargetForKey(
     }
 }
 
-private fun looksLikeSessionOperationModeKey(keyName: String): Boolean {
-    val key = keyName.lowercase()
-    return key.contains("reprocessablesessionmodetag") ||
-            key.contains("sessionoperationmode") ||
-            key.contains("session.operation.mode") ||
-            key.contains("session_operation_mode") ||
-            key.contains("operationmode") ||
-            key.contains("operation.mode") ||
-            key.contains("operation_mode")
-}
-
 private fun valueForFeatureTag(
     feature: com.bncam.vendor.CameraFeature,
     discovered: DynamicVendorTag
@@ -1142,13 +1123,6 @@ private fun valueForFeatureTag(
     }
 
     val key = discovered.name.lowercase()
-
-    // 32772 is the Camera2 vendor session operation mode.
-    // It belongs in SessionConfiguration(sessionType = 32772), and only the matching
-    // session-operation tag is stored with 32772 so BnCameraManager can resolve it.
-    if (looksLikeSessionOperationModeKey(discovered.name)) {
-        return intArrayOf(0x8004)
-    }
 
     // The debug already showed Honor pro-mode request tags echoing hardware=[4] after a bad
     // requested value of 32772. Keep request-level pro-mode tags at the real pro-mode enum.

@@ -47,10 +47,10 @@ class RawPreviewLocalToneSourceContractTest {
         assertTrue(backend.contains("imageDescriptorInfo.bindingCount = 5u"))
         assertTrue(backend.contains("9u * RAW_PREVIEW_FRAMES_IN_FLIGHT"))
         assertTrue(backend.contains("kPreviewLocalToneDecimation = 8u"))
-        assertTrue(backend.contains("localToneBaseReady.buffer = localToneBase_.buffer"))
+        assertTrue(backend.contains("localToneInfo.buffer = slot.localToneBase.buffer"))
         assertTrue(backend.contains("(3u << 8u) | packedDemosaic"))
         assertTrue(backend.contains("(2u << 8u) | packedDemosaic"))
-        assertTrue(header.contains("PersistentBuffer localToneBase_"))
+        assertTrue(header.contains("PersistentBuffer localToneBase;"))
         assertFalse(backend.contains("CPU_LOCAL_TONE"))
         assertFalse(backend.contains("localToneCpu"))
     }

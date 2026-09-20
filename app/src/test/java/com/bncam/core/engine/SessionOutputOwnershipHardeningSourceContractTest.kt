@@ -33,11 +33,13 @@ class SessionOutputOwnershipHardeningSourceContractTest {
         assertTrue(createStart >= 0 && createEnd > createStart)
         val create = source.substring(createStart, createEnd)
 
-        assertTrue(create.contains("sessionNamedSurfaces.forEach { (surface, _) -> requestBuilder.addTarget(surface) }"))
-        assertTrue(create.contains("sessionNamedSurfaces.forEach { (surface, name) ->"))
-        assertTrue(create.contains("val output = OutputConfiguration(surface)"))
+        assertTrue(create.contains("val sessionNamedSurfaces = buildList<Pair<Surface, String>>"))
+        assertTrue(create.contains("val streamSurfaceBindings = sessionNamedSurfaces.map"))
+        assertTrue(create.contains("boundStreamConfiguration.repeatingBindings().forEach"))
+        assertTrue(create.contains("boundStreamConfiguration.sessionBindings().forEach"))
+        assertTrue(create.contains("val output = OutputConfiguration(binding.surface)"))
+        assertFalse(create.contains("sessionNamedSurfaces.forEach { (surface, _) -> requestBuilder.addTarget(surface) }"))
         assertFalse(create.contains("if (imageReader?.surface != null) outputBindings.add"))
-        assertFalse(create.contains("imageReader?.surface?.let {\n                    val readerOutput"))
     }
 
     @Test

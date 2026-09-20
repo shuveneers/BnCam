@@ -18,6 +18,7 @@
 #include "VulkanRuntime.h"
 #include "../SrgbByteLut.h"
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -93,6 +94,61 @@ static_assert(kSceneObserverStripeRows % kSceneObserverWorkgroupRows == 0u,
               "scene observer stripes must preserve 16-row workgroup alignment");
 
 constexpr std::uint32_t kFllfMaxLevels = 6u;
+
+struct DisplayPublicationStatistics {
+    float p50 = 0.0f;
+    float p95 = 0.0f;
+    float clippingFraction = 0.0f;
+    std::uint32_t samples = 0u;
+};
+
+DisplayPublicationStatistics sampleDisplayPublicationStatistics(
+        const std::uint8_t* bgr,
+        std::uint32_t width,
+        std::uint32_t height,
+        std::uint32_t rowStrideBytes) noexcept {
+    DisplayPublicationStatistics out{};
+    if (bgr == nullptr || width == 0u || height == 0u || rowStrideBytes < width * 3u) return out;
+
+    std::array<std::uint32_t, 256> histogram{};
+    const std::uint64_t pixelCount = static_cast<std::uint64_t>(width) * height;
+    const std::uint32_t step = static_cast<std::uint32_t>(std::max<std::uint64_t>(
+            1u, static_cast<std::uint64_t>(std::sqrt(
+                    static_cast<double>(std::max<std::uint64_t>(1u, pixelCount / 16384u))))));
+    std::uint64_t clipped = 0u;
+    for (std::uint32_t y = step / 2u; y < height; y += step) {
+        const auto* row = bgr + static_cast<std::size_t>(y) * rowStrideBytes;
+        for (std::uint32_t x = step / 2u; x < width; x += step) {
+            const auto* p = row + static_cast<std::size_t>(x) * 3u;
+            const float b = static_cast<float>(p[0]);
+            const float g = static_cast<float>(p[1]);
+            const float r = static_cast<float>(p[2]);
+            const float yDisplay = std::clamp(
+                    (0.2126f * r + 0.7152f * g + 0.0722f * b) / 255.0f,
+                    0.0f, 1.0f);
+            const std::uint32_t bin = static_cast<std::uint32_t>(std::lround(yDisplay * 255.0f));
+            ++histogram[std::min(255u, bin)];
+            if (p[0] == 255u || p[1] == 255u || p[2] == 255u) ++clipped;
+            ++out.samples;
+        }
+    }
+    if (out.samples == 0u) return out;
+    const auto percentile = [&](float fraction) noexcept -> float {
+        const std::uint32_t target = static_cast<std::uint32_t>(std::floor(
+                fraction * static_cast<float>(out.samples - 1u)));
+        std::uint32_t cumulative = 0u;
+        for (std::uint32_t i = 0u; i < histogram.size(); ++i) {
+            cumulative += histogram[i];
+            if (cumulative > target) return static_cast<float>(i) / 255.0f;
+        }
+        return 1.0f;
+    };
+    out.p50 = percentile(0.50f);
+    out.p95 = percentile(0.95f);
+    out.clippingFraction = static_cast<float>(clipped) / static_cast<float>(out.samples);
+    return out;
+}
+
 struct FllfLevelLayout {
     std::uint32_t width = 1u;
     std::uint32_t height = 1u;
@@ -1114,9 +1170,12 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
     push.frameHeight = request.frameHeight;
     push.isRawBayer = request.isRawBayer ? 1u : 0u;
     push.exposureGain = request.exposureGain;
+    push.presenceReserved1 = std::clamp(request.profileExposureGain, 0.025f, 32.0f);
     push.rawJpegBaseVibrance = request.rawJpegBaseVibrance;
-    push.shoulderStart = std::clamp(request.shoulderStart, 0.50f, 0.85f);
-    push.shoulderStrength = std::clamp(request.shoulderStrength, 0.50f, 2.50f);
+    push.shoulderStart = std::clamp(request.shoulderStart, 0.50f, 0.86f);
+    push.shoulderStrength = request.isRawBayer
+            ? (request.gtmEnabled ? std::clamp(request.shoulderStrength, 0.50f, 2.50f) : 0.0f)
+            : std::clamp(request.shoulderStrength, 0.50f, 2.50f);
     push.profileSaturation = sanitizeProfileCreativeCarrier(request.profileColorSaturation);
     push.profileContrast = std::clamp(request.profileColorContrast, -1.0f, 1.0f);
     push.profileVibrance = std::clamp(request.profilePresenceVibrance, -1.0f, 1.0f);
@@ -1718,6 +1777,13 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
                 std::memcpy(result.outputBgr8.data(), publicationPacked_.mapped,
                             static_cast<std::size_t>(bgr8Bytes));
             }
+            const auto displayStats = sampleDisplayPublicationStatistics(
+                    static_cast<const std::uint8_t*>(publicationPacked_.mapped),
+                    bgr8Width, bgr8Height, bgr8RowStrideBytes);
+            result.displayP50 = displayStats.p50;
+            result.displayP95 = displayStats.p95;
+            result.displayClippingFraction = displayStats.clippingFraction;
+            result.displayStatisticSamples = displayStats.samples;
             result.bgr8PublicationGenerated = true;
         }
         result.bgr8PublicationReadbackMs = elapsedMs(publicationReadStart);

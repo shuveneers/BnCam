@@ -385,6 +385,20 @@ RuntimeSnapshot VulkanRuntime::shutdown() noexcept {
         return snapshotLocked();
     }
 
+    // RAW preview submissions are intentionally detached from the submitting CPU call in Phase
+    // 11A. Drain their slot fences explicitly before destroying any device child resources.
+    if (!rawPreviewBackend_.waitForIdle(handles_.device, 500'000'000ull)) {
+        lastFailure_ = {
+            "RAW_PREVIEW_SHUTDOWN_IN_FLIGHT_TIMEOUT",
+            "Timed out waiting for asynchronous RAW preview GPU submissions; handles were not destroyed.",
+            true,
+        };
+        state_ = RuntimeState::FAILED;
+        recordLifecycleEventLocked("shutdown_failed", lastFailure_.code);
+        stateChanged_.notify_all();
+        return snapshotLocked();
+    }
+
     // Milestone 8E: the production-connected SPECTRA pipeline owns device objects and
     // must be destroyed before the authoritative device/pipeline-cache ownership moves.
     spectraTemporalObserverBackend_.destroy(handles_.device);
@@ -1892,6 +1906,33 @@ RawPreviewGpuResult VulkanRuntime::executeRawPreview(
     completeSubmission();
     return result;
 }
+
+RawPreviewGpuResult VulkanRuntime::pollRawPreview(
+        std::uint32_t frameSlotIndex,
+        std::uint64_t submissionId
+) noexcept {
+    RawPreviewGpuResult rejected{};
+    rejected.attempted = true;
+    VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
+    VkDevice device = VK_NULL_HANDLE;
+    VulkanAllocatorOwner* allocator = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_ != RuntimeState::READY || !handles_.complete()) {
+            rejected.failureReason = "VULKAN_RUNTIME_NOT_READY";
+            return rejected;
+        }
+        inFlightSubmissionCount_.fetch_add(1, std::memory_order_acq_rel);
+        physicalDevice = handles_.physicalDevice;
+        device = handles_.device;
+        allocator = &handles_.allocator;
+    }
+    RawPreviewGpuResult result = rawPreviewBackend_.pollCompletion(
+            physicalDevice, device, *allocator, frameSlotIndex, submissionId);
+    completeSubmission();
+    return result;
+}
+
 
 SpectraResidentSceneObserverResult VulkanRuntime::executeSpectraResidentSceneObserverFromAwbCcm(
         const SpectraResidentSceneObserverRequest& request,

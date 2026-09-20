@@ -2,8 +2,8 @@ package com.bncam.ui.screens.settings.lens_profiles
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
@@ -28,24 +28,20 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.bncam.core.engine.CameraStreamCandidate
+import com.bncam.core.engine.CameraCapabilityFormatKind
+import com.bncam.core.engine.CameraCapabilityRuntimeAvailability
 import com.bncam.core.engine.CameraStreamCapabilityCatalog
 import com.bncam.core.engine.CameraStreamCapabilityScanner
 import com.bncam.core.engine.CameraStreamFormatCapability
-import com.bncam.core.engine.StreamCandidateValidationStatus
 import com.bncam.core.engine.cameraHardwareLevelName
-import com.bncam.data.settings.LensStreamConfigurationSettings
+import com.bncam.data.settings.PhotoStreamSettings
+import com.bncam.data.settings.PhotoStreamSettingsStore
 import com.bncam.data.settings.RawPreviewFormatCompatibility
 import com.bncam.data.settings.SettingsRepository
-import com.bncam.data.settings.StreamClassConfiguration
-import com.bncam.data.settings.StreamConfigurationClass
-import com.bncam.data.settings.StreamConfigurationMode
-import com.bncam.data.settings.StreamConfigurationSettingsStore
 import com.bncam.data.settings.parseCameraFormatCode
 import com.bncam.data.settings.rawPreviewFormatCompatibility
 import com.bncam.ui.components.AccentPistachio
@@ -56,58 +52,71 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /**
- * Compatibility route name retained so existing navigation/deep links keep working.
+ * Per-lens stream controls backed only by settings that currently affect runtime behavior.
  *
- * This screen is now the per-lens Stream Configuration authority. The old experimental RAW format
- * code override survives only inside Manual as an advanced control. Photo Auto/Validated runtime
- * resolution is now owned by StreamConfigResolver; wider Manual/Video session controls remain staged.
+ * The former Auto / Validated / Manual candidate selector was removed. PRIMARY_BUFFER format is
+ * resolved from the profile constraint plus CameraCapabilityInventory. Resolution and optional RAW
+ * preview support remain independently configurable here.
  */
 @Composable
 fun RawStreamBindingSettingsScreen(lensId: String, onNavigateBack: () -> Unit) {
     val context = LocalContext.current
-    val settingsStore = remember(context) { StreamConfigurationSettingsStore(context) }
-    val legacySettingsRepo = remember(context) { SettingsRepository(context) }
+    val photoSettingsStore = remember(context) { PhotoStreamSettingsStore(context) }
+    val settingsRepo = remember(context) { SettingsRepository(context) }
     val scope = rememberCoroutineScope()
 
-    val settings by settingsStore.settingsFlow(lensId).collectAsStateWithLifecycle(
-        initialValue = LensStreamConfigurationSettings()
+    val photoSettings by photoSettingsStore.settingsFlow(lensId).collectAsStateWithLifecycle(
+        initialValue = PhotoStreamSettings()
     )
     val catalog by produceState<CameraStreamCapabilityCatalog?>(null, context, lensId) {
         value = withContext(Dispatchers.IO) {
             CameraStreamCapabilityScanner.scan(context, lensId)
         }
     }
-    val raw10Binding by legacySettingsRepo.getRawPreviewFormatCodeFlow(lensId, "RAW10")
+    val raw10Binding by settingsRepo.getRawPreviewFormatCodeFlow(lensId, "RAW10")
         .collectAsStateWithLifecycle(initialValue = "AUTO")
-    val rawSensorBinding by legacySettingsRepo.getRawPreviewFormatCodeFlow(lensId, "RAW_SENSOR")
+    val rawSensorBinding by settingsRepo.getRawPreviewFormatCodeFlow(lensId, "RAW_SENSOR")
         .collectAsStateWithLifecycle(initialValue = "AUTO")
 
-    var editingClass by remember { mutableStateOf<StreamConfigurationClass?>(null) }
+    var editingRawSizeIndex by remember { mutableStateOf(false) }
+    var editingResolutionFix by remember { mutableStateOf(false) }
     var editingRawBinding by remember { mutableStateOf<String?>(null) }
 
     SettingsTopicScaffold("Stream Configuration", onNavigateBack) {
         SettingsCard(
-            title = "Lens stream policy",
-            description = "Stream choices are stored for Lens ID $lensId. Auto is the safe default; Validated exposes sensor/HAL-derived candidates; Manual is for controlled overrides."
+            title = "Photo stream policy",
+            description = "PRIMARY_BUFFER format is resolved automatically from the active profile and this sensor's Camera2 capabilities. Only controls with a direct runtime effect are exposed."
         ) {
-            StreamClassRow(
-                streamClass = StreamConfigurationClass.PHOTO,
-                configuration = settings.photo,
-                catalog = catalog,
-                onClick = { editingClass = StreamConfigurationClass.PHOTO }
+            StreamInfoRow("Format selection", "Profile constraint + capability policy")
+            StreamInfoRow("FPS ownership", "CaptureRequest policy")
+            StreamInfoRow("Operation mode", "Session policy")
+
+            SettingValueRow(
+                title = "Specific RAW resolution",
+                description = "Optional index into the active RAW format's native Camera2 size list. A valid full-FOV selection bypasses Resolution Fix. If the index does not exist for the active RAW format it is ignored.",
+                value = specificRawSizeLabel(photoSettings.specificRawSizeIndex, catalog),
+                onClick = { editingRawSizeIndex = true }
             )
-            StreamClassRow(
-                streamClass = StreamConfigurationClass.VIDEO,
-                configuration = settings.video,
-                catalog = catalog,
-                onClick = { editingClass = StreamConfigurationClass.VIDEO }
+            SettingValueRow(
+                title = "Resolution Fix reference",
+                description = "Uses another reported ImageFormat only as a reference size list, then remaps onto a legal native size of the actual PRIMARY_BUFFER format. It never changes the output format.",
+                value = resolutionFixLabel(photoSettings.resolutionFixReferenceFormatCode, catalog),
+                onClick = { editingResolutionFix = true }
             )
         }
 
         catalog?.let { currentCatalog ->
+            RawPreviewSupportSection(
+                catalog = currentCatalog,
+                raw10Binding = raw10Binding,
+                rawSensorBinding = rawSensorBinding,
+                onEditRaw10 = { editingRawBinding = "RAW10" },
+                onEditRawSensor = { editingRawBinding = "RAW_SENSOR" }
+            )
+
             SettingsCard(
                 title = "Camera2 capability source",
-                description = "Read-only facts for this Lens ID. These are not copied between sensors."
+                description = "Read-only facts for this Lens ID. These facts are discovery input, not user-selectable stream candidates."
             ) {
                 StreamInfoRow("Requested Lens ID", currentCatalog.requestedLensId)
                 StreamInfoRow("Logical camera", currentCatalog.logicalCameraId ?: "Unavailable")
@@ -117,8 +126,8 @@ fun RawStreamBindingSettingsScreen(lensId: String, onNavigateBack: () -> Unit) {
                 StreamInfoRow("Formats", currentCatalog.formats.size.toString())
                 StreamInfoRow("AE FPS ranges", currentCatalog.aeFpsRanges.joinToString().ifBlank { "Unavailable" })
                 StreamInfoRow(
-                    "Session preflight",
-                    if (currentCatalog.sessionQuerySupported) "CameraDeviceSetup available" else "Reported capabilities only"
+                    "Session preflight API",
+                    if (currentCatalog.sessionQuerySupported) "Available" else "Unavailable"
                 )
             }
 
@@ -137,66 +146,47 @@ fun RawStreamBindingSettingsScreen(lensId: String, onNavigateBack: () -> Unit) {
                 }
             }
 
-            ValidatedCandidateSection(
-                streamClass = StreamConfigurationClass.PHOTO,
-                configuration = settings.photo,
-                catalog = currentCatalog,
-                onSelected = { candidate ->
-                    scope.launch {
-                        settingsStore.setValidatedCandidate(lensId, StreamConfigurationClass.PHOTO, candidate.id)
-                    }
-                }
-            )
-            ValidatedCandidateSection(
-                streamClass = StreamConfigurationClass.VIDEO,
-                configuration = settings.video,
-                catalog = currentCatalog,
-                onSelected = { candidate ->
-                    scope.launch {
-                        settingsStore.setValidatedCandidate(lensId, StreamConfigurationClass.VIDEO, candidate.id)
-                    }
-                }
-            )
-
-            if (settings.photo.mode == StreamConfigurationMode.MANUAL ||
-                settings.video.mode == StreamConfigurationMode.MANUAL
-            ) {
-                ManualStreamSection(
-                    catalog = currentCatalog,
-                    raw10Binding = raw10Binding,
-                    rawSensorBinding = rawSensorBinding,
-                    onEditRaw10 = { editingRawBinding = "RAW10" },
-                    onEditRawSensor = { editingRawBinding = "RAW_SENSOR" }
-                )
-            }
-
             Camera2ReportedFormatsSection(currentCatalog)
         } ?: SettingsCard(
             title = "Reading camera capabilities",
-            description = "The Camera2 capability catalog for Lens ID $lensId is being built."
+            description = "The Camera2 capability inventory for Lens ID $lensId is being built."
         ) {
             Text("Scanning…", color = Color.Gray)
         }
 
         SettingsCard(
-            title = "Runtime status",
-            description = "Phase 0003 live-apply boundary."
+            title = "Runtime behavior",
+            description = "Changes are reconciled through BnCam's existing serialized soft-reset owner."
         ) {
             Text(
-                text = "Photo Stream Configuration is live-connected to the active Lens ID. Runtime-relevant Photo changes are reconciled through BnCam's existing serialized soft-reset owner: unchanged plans remain warm, validated size changes rebuild the producer atomically, and Manual custom RAW bindings refresh only the session outputs they actually require. Video remains catalog-only in this phase.",
+                text = "Specific RAW resolution and Resolution Fix can change PRIMARY_BUFFER geometry. Custom RAW preview codes can add or remove the optional RAW_PREVIEW_SUPPORT output when Selected buffer viewfinder is active. Runtime recovery is temporary and never rewrites these saved settings.",
                 color = Color.Gray
             )
         }
     }
 
-    editingClass?.let { streamClass ->
-        StreamModeDialog(
-            streamClass = streamClass,
-            current = settings.forClass(streamClass).mode,
-            onDismiss = { editingClass = null },
-            onSelected = { mode ->
-                scope.launch { settingsStore.setMode(lensId, streamClass, mode) }
-                editingClass = null
+    if (editingRawSizeIndex) {
+        SpecificRawSizeDialog(
+            current = photoSettings.specificRawSizeIndex,
+            catalog = catalog,
+            onDismiss = { editingRawSizeIndex = false },
+            onSelected = { index ->
+                scope.launch { photoSettingsStore.setSpecificRawSizeIndex(lensId, index) }
+                editingRawSizeIndex = false
+            }
+        )
+    }
+
+    if (editingResolutionFix) {
+        ResolutionFixDialog(
+            current = photoSettings.resolutionFixReferenceFormatCode,
+            catalog = catalog,
+            onDismiss = { editingResolutionFix = false },
+            onSelected = { formatCode ->
+                scope.launch {
+                    photoSettingsStore.setResolutionFixReferenceFormatCode(lensId, formatCode)
+                }
+                editingResolutionFix = false
             }
         )
     }
@@ -208,7 +198,7 @@ fun RawStreamBindingSettingsScreen(lensId: String, onNavigateBack: () -> Unit) {
             formats = catalog?.formats.orEmpty(),
             onDismiss = { editingRawBinding = null },
             onSelected = { encoded ->
-                scope.launch { legacySettingsRepo.setRawPreviewFormatCode(lensId, source, encoded) }
+                scope.launch { settingsRepo.setRawPreviewFormatCode(lensId, source, encoded) }
                 editingRawBinding = null
             }
         )
@@ -216,172 +206,7 @@ fun RawStreamBindingSettingsScreen(lensId: String, onNavigateBack: () -> Unit) {
 }
 
 @Composable
-private fun StreamClassRow(
-    streamClass: StreamConfigurationClass,
-    configuration: StreamClassConfiguration,
-    catalog: CameraStreamCapabilityCatalog?,
-    onClick: () -> Unit
-) {
-    val selectedCandidate = configuration.validatedCandidateId?.let { id ->
-        catalog?.candidates?.firstOrNull { it.id == id }
-    }
-    val value = when (configuration.mode) {
-        StreamConfigurationMode.AUTO -> "Auto"
-        StreamConfigurationMode.MANUAL -> "Manual"
-        StreamConfigurationMode.VALIDATED -> selectedCandidate?.let {
-            "Validated · ${it.captureFormatName} ${it.captureSize.width}×${it.captureSize.height}"
-        } ?: "Validated · Auto candidate"
-    }
-    SettingValueRow(
-        title = streamClass.displayName,
-        description = when (streamClass) {
-            StreamConfigurationClass.PHOTO -> "Still capture, warm buffer and viewfinder session policy."
-            StreamConfigurationClass.VIDEO -> "Video-oriented stream policy kept separate from Photo."
-        },
-        value = value,
-        onClick = onClick
-    )
-}
-
-@Composable
-private fun StreamModeDialog(
-    streamClass: StreamConfigurationClass,
-    current: StreamConfigurationMode,
-    onDismiss: () -> Unit,
-    onSelected: (StreamConfigurationMode) -> Unit
-) {
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        containerColor = Color(0xFF1E1E1E),
-        title = { Text("${streamClass.displayName} stream mode", color = Color.White) },
-        text = {
-            Column {
-                StreamConfigurationMode.values().forEach { mode ->
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clickable { onSelected(mode) }
-                            .padding(vertical = 6.dp)
-                    ) {
-                        RadioButton(
-                            selected = current == mode,
-                            onClick = null,
-                            colors = RadioButtonDefaults.colors(selectedColor = AccentPistachio)
-                        )
-                        Column(modifier = Modifier.padding(start = 8.dp, top = 8.dp)) {
-                            Text(mode.displayName, color = Color.White, fontWeight = FontWeight.Medium)
-                            Text(modeDescription(mode), color = Color.Gray)
-                        }
-                    }
-                }
-            }
-        },
-        confirmButton = {},
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel", color = Color.Gray) } }
-    )
-}
-
-private fun modeDescription(mode: StreamConfigurationMode): String = when (mode) {
-    StreamConfigurationMode.AUTO -> "BnCam resolves a safe sensor-specific plan automatically."
-    StreamConfigurationMode.VALIDATED -> "Choose a HAL-preflighted candidate. Runtime revalidates it against the exact active viewfinder before applying it."
-    StreamConfigurationMode.MANUAL -> "Expose controlled format overrides. Runtime validation remains mandatory."
-}
-
-@Composable
-private fun ValidatedCandidateSection(
-    streamClass: StreamConfigurationClass,
-    configuration: StreamClassConfiguration,
-    catalog: CameraStreamCapabilityCatalog,
-    onSelected: (CameraStreamCandidate) -> Unit
-) {
-    if (configuration.mode != StreamConfigurationMode.VALIDATED) return
-    val candidates = catalog.candidatesFor(streamClass)
-        .sortedWith(
-            compareBy<CameraStreamCandidate> {
-                when (it.validationStatus) {
-                    StreamCandidateValidationStatus.SESSION_VALIDATED -> 0
-                    StreamCandidateValidationStatus.CAMERA2_REPORTED -> 1
-                    StreamCandidateValidationStatus.REJECTED -> 2
-                }
-            }.thenByDescending { it.captureSize.width.toLong() * it.captureSize.height.toLong() }
-        )
-
-    SettingsCard(
-        title = "${streamClass.displayName} validated configurations",
-        description = if (catalog.sessionQuerySupported && streamClass == StreamConfigurationClass.PHOTO) {
-            "Candidates are generated from this Lens ID and preflighted as complete preview + capture sessions when Android exposes CameraDeviceSetup."
-        } else {
-            "Candidates are generated only from this Lens ID's Camera2 stream properties. Items not fully preflightable are explicitly marked Reported."
-        }
-    ) {
-        if (candidates.isEmpty()) {
-            Text("No usable candidates were reported for this class.", color = Color.Gray)
-        } else {
-            candidates.forEach { candidate ->
-                CandidateRow(
-                    candidate = candidate,
-                    selected = configuration.validatedCandidateId == candidate.id,
-                    enabled = candidate.validationStatus == StreamCandidateValidationStatus.SESSION_VALIDATED,
-                    onClick = { onSelected(candidate) }
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun CandidateRow(
-    candidate: CameraStreamCandidate,
-    selected: Boolean,
-    enabled: Boolean,
-    onClick: () -> Unit
-) {
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(vertical = 5.dp)
-            .background(
-                if (selected) Color(0xFF263126) else Color(0xFF222222),
-                RoundedCornerShape(14.dp)
-            )
-            .clickable(enabled = enabled, onClick = onClick)
-            .padding(horizontal = 14.dp, vertical = 12.dp)
-    ) {
-        Row(modifier = Modifier.fillMaxWidth()) {
-            RadioButton(
-                selected = selected,
-                onClick = null,
-                colors = RadioButtonDefaults.colors(selectedColor = AccentPistachio)
-            )
-            Column(modifier = Modifier.padding(start = 8.dp, top = 6.dp)) {
-                Text(
-                    "${candidate.captureFormatName} · ${candidate.captureSize.width}×${candidate.captureSize.height}",
-                    color = if (enabled) Color.White else Color.Gray,
-                    fontWeight = FontWeight.Medium
-                )
-                candidate.previewSize?.let {
-                    Text("Preview ${it.width}×${it.height}", color = Color.Gray)
-                }
-                candidate.fpsRange?.let {
-                    Text("FPS ${it.lower}–${it.upper}", color = Color.Gray)
-                }
-            }
-        }
-        val status = when (candidate.validationStatus) {
-            StreamCandidateValidationStatus.SESSION_VALIDATED -> "HAL session validated"
-            StreamCandidateValidationStatus.CAMERA2_REPORTED -> "Camera2 reported"
-            StreamCandidateValidationStatus.REJECTED -> "Rejected"
-        }
-        Text(
-            text = "$status · ${candidate.validationReason}",
-            color = if (enabled) AccentPistachio else Color.Gray,
-            modifier = Modifier.padding(start = 52.dp, top = 4.dp)
-        )
-    }
-}
-
-@Composable
-private fun ManualStreamSection(
+private fun RawPreviewSupportSection(
     catalog: CameraStreamCapabilityCatalog,
     raw10Binding: String,
     rawSensorBinding: String,
@@ -389,8 +214,8 @@ private fun ManualStreamSection(
     onEditRawSensor: () -> Unit
 ) {
     SettingsCard(
-        title = "Manual / advanced",
-        description = "Existing experimental RAW preview format binding is retained here temporarily. Standard incompatible Android layouts are blocked; vendor codes still require runtime validation."
+        title = "RAW viewfinder support",
+        description = "Advanced optional RAW_PREVIEW_SUPPORT format binding. Auto uses only the canonical RAW producer. A vendor code is runtime-validated and falls back to PRIMARY_BUFFER if support fails."
     ) {
         SettingValueRow(
             title = "RAW10 preview format code",
@@ -404,19 +229,88 @@ private fun ManualStreamSection(
             value = manualBindingLabel("RAW_SENSOR", rawSensorBinding),
             onClick = onEditRawSensor
         )
-        Text(
-            text = "Manual resolution/FPS/session overrides are intentionally not exposed yet. The existing custom RAW preview-code experiment is the only Manual runtime override in phase 0002, and it retains its configure-failure fallback to the canonical RAW path.",
-            color = Color.Gray,
-            modifier = Modifier.padding(horizontal = 8.dp, vertical = 8.dp)
-        )
     }
+}
+
+@Composable
+private fun SpecificRawSizeDialog(
+    current: Int?,
+    catalog: CameraStreamCapabilityCatalog?,
+    onDismiss: () -> Unit,
+    onSelected: (Int?) -> Unit
+) {
+    val rawFormats = catalog?.inventory?.formats.orEmpty().filter {
+        it.runtimeAvailability == CameraCapabilityRuntimeAvailability.BNCAM_RUNTIME_READY &&
+            (it.kind == CameraCapabilityFormatKind.RAW10 || it.kind == CameraCapabilityFormatKind.RAW_SENSOR) &&
+            it.sizes.isNotEmpty()
+    }
+    val maxCount = rawFormats.maxOfOrNull { it.sizes.size } ?: 0
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = Color(0xFF1E1E1E),
+        title = { Text("Specific RAW resolution", color = Color.White) },
+        text = {
+            Column(modifier = Modifier.heightIn(max = 460.dp).verticalScroll(rememberScrollState())) {
+                ManualCodeChoice("Auto", current == null) { onSelected(null) }
+                repeat(maxCount) { index ->
+                    val mappings = rawFormats.mapNotNull { format ->
+                        format.sizes.getOrNull(index)?.let { size ->
+                            "${format.formatName} ${size.extent.width}×${size.extent.height}"
+                        }
+                    }
+                    ManualCodeChoice(
+                        label = "Index $index · ${mappings.joinToString(" · ")}",
+                        selected = current == index
+                    ) { onSelected(index) }
+                }
+                if (maxCount == 0) {
+                    Text(
+                        "No runtime-ready RAW size lists are reported for this Lens ID.",
+                        color = Color.Gray,
+                        modifier = Modifier.padding(12.dp)
+                    )
+                }
+            }
+        },
+        confirmButton = {},
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel", color = Color.Gray) } }
+    )
+}
+
+@Composable
+private fun ResolutionFixDialog(
+    current: Int?,
+    catalog: CameraStreamCapabilityCatalog?,
+    onDismiss: () -> Unit,
+    onSelected: (Int?) -> Unit
+) {
+    val formats = catalog?.formats.orEmpty().filter { it.sizes.isNotEmpty() }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = Color(0xFF1E1E1E),
+        title = { Text("Resolution Fix reference", color = Color.White) },
+        text = {
+            Column(modifier = Modifier.heightIn(max = 460.dp).verticalScroll(rememberScrollState())) {
+                ManualCodeChoice("Off", current == null) { onSelected(null) }
+                formats.forEach { capability ->
+                    ManualCodeChoice(
+                        label = "${capability.formatName} · ${capability.formatCode} · ${capability.sizes.size} sizes",
+                        selected = current == capability.formatCode
+                    ) { onSelected(capability.formatCode) }
+                }
+            }
+        },
+        confirmButton = {},
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel", color = Color.Gray) } }
+    )
 }
 
 @Composable
 private fun Camera2ReportedFormatsSection(catalog: CameraStreamCapabilityCatalog) {
     SettingsCard(
         title = "Reported output formats",
-        description = "Raw StreamConfigurationMap inventory for this Lens ID. A reported format/size is not automatically a valid multi-output session."
+        description = "Read-only StreamConfigurationMap inventory for this Lens ID. A reported format/size is not automatically a valid multi-output session."
     ) {
         if (catalog.formats.isEmpty()) {
             Text("No output formats reported.", color = Color.Gray)
@@ -554,6 +448,25 @@ private fun ManualCodeChoice(
             modifier = Modifier.padding(start = 8.dp, top = 11.dp)
         )
     }
+}
+
+private fun specificRawSizeLabel(index: Int?, catalog: CameraStreamCapabilityCatalog?): String {
+    if (index == null) return "Auto"
+    val mappings = catalog?.inventory?.formats.orEmpty().mapNotNull { format ->
+        if (format.runtimeAvailability != CameraCapabilityRuntimeAvailability.BNCAM_RUNTIME_READY ||
+            (format.kind != CameraCapabilityFormatKind.RAW10 && format.kind != CameraCapabilityFormatKind.RAW_SENSOR)
+        ) return@mapNotNull null
+        format.sizes.getOrNull(index)?.let { size ->
+            "${format.formatName} ${size.extent.width}×${size.extent.height}"
+        }
+    }
+    return if (mappings.isEmpty()) "Index $index" else "Index $index · ${mappings.joinToString(" / ")}"
+}
+
+private fun resolutionFixLabel(formatCode: Int?, catalog: CameraStreamCapabilityCatalog?): String {
+    if (formatCode == null) return "Off"
+    val capability = catalog?.formats?.firstOrNull { it.formatCode == formatCode }
+    return capability?.let { "${it.formatName} · $formatCode" } ?: "Format $formatCode"
 }
 
 private fun manualBindingLabel(source: String, encoded: String): String {

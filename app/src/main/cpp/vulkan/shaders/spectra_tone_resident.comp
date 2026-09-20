@@ -93,6 +93,29 @@ float lumaOf(vec3 v) {
     return 0.2126 * v.r + 0.7152 * v.g + 0.0722 * v.b;
 }
 
+// Phase 11F — global scene placement and GTM are the only pre-FLLF global tone owners.
+// GTM is a strict upper-range luma shoulder: below the evidence-derived knee it is identity and
+// therefore cannot become a second hidden midtone/global-exposure correction.
+float rawGtmMapLuma(float y) {
+    float luma = max(0.0, y);
+    // RAW backend transports gtmEnabled as shoulderStrength=0 so a disabled GTM is exact identity.
+    if (pc.shoulderStrength <= 1.0e-5) return luma;
+    float shoulderStart = clamp(pc.shoulderStart, 0.67, 0.86);
+    if (luma <= shoulderStart) return luma;
+    float shoulderStrength = clamp(pc.shoulderStrength, 0.55, 0.93);
+    float headroom = max(0.05, 1.0 - shoulderStart);
+    float normalized = (luma - shoulderStart) / headroom;
+    return shoulderStart + headroom * normalized /
+            (1.0 + shoulderStrength * normalized);
+}
+
+vec3 applyRawGlobalSceneExposureAndGtm(vec3 sceneRgb) {
+    vec3 exposed = max(sceneRgb, vec3(0.0)) * max(0.0, pc.exposureGain);
+    float yOld = max(1.0e-7, lumaOf(exposed));
+    float yNew = rawGtmMapLuma(yOld);
+    return exposed * (yNew / yOld);
+}
+
 float smoothstepFast(float edge0, float invRange, float value) {
     float u = clamp((value - edge0) * invRange, 0.0, 1.0);
     return u * u * (3.0 - 2.0 * u);
@@ -378,7 +401,7 @@ uint fllfDestinationWidth() { return max(1u, pc.ultraHdrSourceMapWidth); }
 uint fllfDestinationHeight() { return max(1u, pc.ultraHdrSourceMapHeight); }
 
 float fllfSceneLogLumaAt(int x, int y) {
-    vec3 rgb = workingAt(x, y);
+    vec3 rgb = applyRawGlobalSceneExposureAndGtm(workingAt(x, y));
     return log2(max(1.0e-6, lumaOf(rgb)));
 }
 
@@ -799,32 +822,14 @@ vec3 applyLocalTone(uvec2 gid, vec3 exposedRgb) {
     return exposedRgb * exp2(appliedEv);
 }
 
-// DELTA 0207 — bounded broad-shadow placement.
-// FLLF keeps its coarse/DC base at identity. Device validation shows that in dark interiors its
-// nominal lift envelope can be high while the mean correction stays near zero. This stage owns
-// broad dark tonal placement without becoming global EV: RGB ratios are preserved, true black is
-// pinned, and authority fades to identity before mids/highlights.
-vec3 applyBroadShadowPlacement(vec3 color) {
-    // Reuse only the already-authoritative adaptive FLLF envelope. When FLLF is bypassed these
-    // telemetry-backed parameters are zero, so this stage is exact identity as well.
-    float localLift = clamp(fllfParam(10u, 0.0), 0.0, 1.35);
-    float localStrength = clamp(fllfParam(8u, 0.0), 0.0, 0.92);
-    float maxLiftEv = clamp(0.70 * localLift + 0.15 * localStrength - 0.05, 0.0, 0.95);
-    if (maxLiftEv <= 1.0e-5) return color;
-    float y = max(0.0, lumaOf(color));
-    if (y <= 1.0e-8) return color;
-    float blackGuard = smoothstep(0.006, 0.032, y);
-    float shadowWindow = 1.0 - smoothstep(0.105, 0.340, y);
-    return color * exp2(maxLiftEv * blackGuard * shadowWindow);
-}
-
 // Shadow-neutral Khronos PBR Neutral display mapper.
-// The reference minimum-channel offset is retained as shoulder preparation, but no longer
-// re-crushes the entire shadow range. It fades in only as the highlight shoulder approaches.
+// Phase 11F moves the primary scene-linear shoulder to GTM before FLLF. PBR Neutral therefore
+// keeps only a late, gentle display-boundary shoulder so GTM + display mapping do not perform two
+// consecutive full-strength highlight compressions.
 vec3 pbrNeutralToneMapping(vec3 color) {
-    const float startCompression = 0.76;
+    const float startCompression = 0.88;
     const float desaturation = 0.15;
-    const float shoulderPrepStart = 0.60;
+    const float shoulderPrepStart = 0.72;
     color = max(color, vec3(0.0));
 
     float inputPeak = max(color.r, max(color.g, color.b));
@@ -871,13 +876,12 @@ void runTone(uvec2 gid) {
     vec3 rgb = vec3(workingRgb[base + 0u], workingRgb[base + 1u], workingRgb[base + 2u]);
     if (pc.isRawBayer != 0u) {
         // RAW production order:
-        // calibrated scene-linear -> log2(Y) FLLF -> bounded broad-shadow placement ->
-        // explicit profile Exposure -> shadow-neutral PBR Neutral -> explicit tonal ranges/curves ->
-        // explicit profile colour -> one final gamut owner.
+        // calibrated scene-linear -> Global Scene Exposure -> GTM -> log2(Y) FLLF ->
+        // shadow-neutral display mapping -> explicit profile Exposure/tone/colour -> final gamut.
+        rgb = applyRawGlobalSceneExposureAndGtm(rgb);
         if (pc.presenceReserved0 != 0u) rgb = applyFllfLocalExposure(gid, rgb);
-        rgb = applyBroadShadowPlacement(rgb);
-        rgb *= max(0.0, pc.exposureGain);
         rgb = pbrNeutralToneMapping(rgb);
+        rgb *= max(0.0, pc.presenceReserved1);
         rgb = applyToneLookLut(rgb);
         rgb = applyExplicitProfileToneContrast(rgb);
         rgb = applyProfileColor(rgb, ivec2(gid));

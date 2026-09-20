@@ -215,7 +215,7 @@ fun LensDetailScreen(
 
             SettingValueRow(
                 title = "Stream configuration",
-                description = "Per-lens Camera2 stream/session policy for Photo and Video.",
+                description = "Per-lens Photo resolution policy, RAW viewfinder support and Camera2 capability inventory.",
                 value = "Open",
                 onClick = onNavigateToRawStreamBinding
             )

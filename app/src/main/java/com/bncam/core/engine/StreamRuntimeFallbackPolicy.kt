@@ -1,13 +1,10 @@
 package com.bncam.core.engine
 
-import com.bncam.data.settings.StreamConfigurationMode
-
 /**
  * Transient, non-persistent recovery tiers for one active Lens ID.
  *
- * This state is deliberately separate from the user's saved Stream Configuration. A runtime
- * failure may quarantine a candidate for the current process/session, but it never rewrites the
- * user's preference behind their back.
+ * Saved stream settings are never rewritten. AUTO_GEOMETRY only exists when an explicit Photo
+ * resolution override was actually active; the final conservative tier is bounded and terminal.
  */
 enum class StreamRuntimeFallbackTier {
     NONE,
@@ -17,32 +14,29 @@ enum class StreamRuntimeFallbackTier {
 
 data class StreamRuntimeFallbackOverride(
     val tier: StreamRuntimeFallbackTier,
-    val configuredMode: StreamConfigurationMode,
-    val candidateId: String?,
+    val authorityFingerprint: String,
     val settingsFingerprint: String?,
     val failureReason: String,
     val failureCount: Int
 ) {
-    fun appliesTo(mode: StreamConfigurationMode, activeCandidateId: String?): Boolean {
-        if (mode != configuredMode) return false
-        if (mode != StreamConfigurationMode.VALIDATED) return true
-        return normalizeCandidate(candidateId) == normalizeCandidate(activeCandidateId)
+    init {
+        require(authorityFingerprint.isNotBlank()) { "authorityFingerprint must not be blank" }
     }
 
-    private fun normalizeCandidate(value: String?): String =
-        value?.trim()?.takeIf { it.isNotEmpty() } ?: "AUTO_CANDIDATE"
+    fun appliesTo(activeAuthorityFingerprint: String): Boolean =
+        authorityFingerprint == activeAuthorityFingerprint
 }
 
 /** Bounded deterministic escalation. There is no retry loop beyond the final conservative tier. */
 object StreamRuntimeFallbackPolicy {
     fun nextTier(
-        mode: StreamConfigurationMode,
+        explicitResolutionOverrideApplied: Boolean,
         currentTier: StreamRuntimeFallbackTier
     ): StreamRuntimeFallbackTier? = when (currentTier) {
-        StreamRuntimeFallbackTier.NONE -> when (mode) {
-            StreamConfigurationMode.AUTO -> StreamRuntimeFallbackTier.CONSERVATIVE_FULL_FOV
-            StreamConfigurationMode.VALIDATED,
-            StreamConfigurationMode.MANUAL -> StreamRuntimeFallbackTier.AUTO_GEOMETRY
+        StreamRuntimeFallbackTier.NONE -> if (explicitResolutionOverrideApplied) {
+            StreamRuntimeFallbackTier.AUTO_GEOMETRY
+        } else {
+            StreamRuntimeFallbackTier.CONSERVATIVE_FULL_FOV
         }
         StreamRuntimeFallbackTier.AUTO_GEOMETRY -> StreamRuntimeFallbackTier.CONSERVATIVE_FULL_FOV
         StreamRuntimeFallbackTier.CONSERVATIVE_FULL_FOV -> null

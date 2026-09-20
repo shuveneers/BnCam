@@ -1707,6 +1707,251 @@ Java_com_bncam_core_engine_ImageUtils_destroyRawPreviewGlFenceNative(
     }
 }
 
+
+namespace {
+constexpr jint RAW_PREVIEW_ASYNC_SUBMITTED_MAGIC = 0x42505253; // BPRS
+constexpr jint RAW_PREVIEW_ASYNC_PENDING_MAGIC = 0x42505250;   // BPRP
+
+jintArray packRawPreviewAsyncStatus(
+        JNIEnv* env,
+        jint magic,
+        const RawPreviewResult& rendered) {
+    jint values[10] = {
+            magic,
+            rendered.frameSlotIndex,
+            static_cast<jint>(rendered.submissionId & 0xffffffffull),
+            static_cast<jint>((rendered.submissionId >> 32u) & 0xffffffffull),
+            rendered.width,
+            rendered.height,
+            rendered.cfaCellDecimation,
+            rendered.gpuResidentOutputUsed ? 1 : 0,
+            rendered.directHardwareBufferInputUsed ? 1 : 0,
+            rendered.analysisReadbackPerformed ? 1 : 0};
+    jintArray result = env->NewIntArray(10);
+    if (result != nullptr) env->SetIntArrayRegion(result, 0, 10, values);
+    return result;
+}
+
+jintArray packRawPreviewCompletedResult(JNIEnv* env, const RawPreviewResult& rendered) {
+    jint values[43] = {
+            rendered.width,
+            rendered.height,
+            rendered.renderMicroseconds,
+            rendered.vulkanStagesUsed ? 1 : 0,
+            rendered.cfaCellDecimation,
+            static_cast<jint>(std::lround(rendered.normalizedRawMin * 1000000.0f)),
+            static_cast<jint>(std::lround(rendered.normalizedRawMax * 1000000.0f)),
+            static_cast<jint>(std::lround(rendered.outputRgbMin * 1000000.0f)),
+            static_cast<jint>(std::lround(rendered.outputRgbMax * 1000000.0f)),
+            static_cast<jint>(std::lround(rendered.outputRgbMean * 1000000.0f)),
+            255,
+            rendered.rawUnpackMicroseconds,
+            rendered.demosaicMicroseconds,
+            rendered.colorMicroseconds,
+            rendered.tonePackMicroseconds,
+            static_cast<jint>(std::lround(rendered.targetExposureGain * 1000000.0f)),
+            static_cast<jint>(std::lround(rendered.appliedExposureGain * 1000000.0f)),
+            static_cast<jint>(std::lround(rendered.sceneMidtone * 1000000.0f)),
+            static_cast<jint>(std::min<std::uint64_t>(
+                    rendered.commonHighlightScalePixels,
+                    static_cast<std::uint64_t>(std::numeric_limits<jint>::max()))),
+            rendered.directHostInputUsed ? 1 : 0,
+            rendered.directHardwareBufferInputUsed ? 1 : 0,
+            rendered.gpuResidentOutputUsed ? 1 : 0
+    };
+    for (int index = 0; index < 16; ++index) {
+        values[22 + index] = static_cast<jint>(std::min<std::uint32_t>(
+                rendered.displayLumaHistogram[index],
+                static_cast<std::uint32_t>(std::numeric_limits<jint>::max())));
+    }
+    values[38] = static_cast<jint>(std::min<std::uint32_t>(
+            rendered.displayShadowSampleCount, static_cast<std::uint32_t>(std::numeric_limits<jint>::max())));
+    values[39] = static_cast<jint>(std::min<std::uint32_t>(
+            rendered.displayHighlightSampleCount, static_cast<std::uint32_t>(std::numeric_limits<jint>::max())));
+    values[40] = static_cast<jint>(std::min<std::uint32_t>(
+            rendered.displaySampleCount, static_cast<std::uint32_t>(std::numeric_limits<jint>::max())));
+    values[41] = rendered.displayHighlightX >= 0.0f
+            ? static_cast<jint>(std::lround(rendered.displayHighlightX * 1000000.0f)) : -1;
+    values[42] = rendered.displayHighlightY >= 0.0f
+            ? static_cast<jint>(std::lround(rendered.displayHighlightY * 1000000.0f)) : -1;
+    constexpr int BASE_RESULT_SIZE = 49;
+    constexpr int LINEAR_LUMA_START = BASE_RESULT_SIZE;
+    constexpr int DISPLAY_LUMA64_START = LINEAR_LUMA_START + 256;
+    constexpr int DISPLAY_R64_START = DISPLAY_LUMA64_START + 64;
+    constexpr int DISPLAY_G64_START = DISPLAY_R64_START + 64;
+    constexpr int DISPLAY_B64_START = DISPLAY_G64_START + 64;
+    constexpr int RAW_NEAR_CLIP_INDEX = DISPLAY_B64_START + 64;
+    constexpr int RAW_SAMPLE_INDEX = RAW_NEAR_CLIP_INDEX + 1;
+    constexpr int DISPLAY_R_CLIP_INDEX = RAW_SAMPLE_INDEX + 1;
+    constexpr int DISPLAY_G_CLIP_INDEX = DISPLAY_R_CLIP_INDEX + 1;
+    constexpr int DISPLAY_B_CLIP_INDEX = DISPLAY_G_CLIP_INDEX + 1;
+    constexpr int TONE_TRUTH_START_INDEX = DISPLAY_B_CLIP_INDEX + 1;
+    constexpr int FIRST_ACTIVATION_DIAGNOSTICS_START_INDEX = TONE_TRUTH_START_INDEX + 10;
+    constexpr int FIRST_ACTIVATION_DIAGNOSTICS_COUNT = 20;
+    constexpr int PHYSICAL_AWB_DIAGNOSTICS_START_INDEX =
+            FIRST_ACTIVATION_DIAGNOSTICS_START_INDEX + FIRST_ACTIVATION_DIAGNOSTICS_COUNT;
+    constexpr int PHYSICAL_AWB_DIAGNOSTICS_COUNT = 17;
+    constexpr int SPATIAL_EXPOSURE_DIAGNOSTICS_START_INDEX =
+            PHYSICAL_AWB_DIAGNOSTICS_START_INDEX + PHYSICAL_AWB_DIAGNOSTICS_COUNT;
+    constexpr int SPATIAL_EXPOSURE_DIAGNOSTICS_COUNT = 12;
+    constexpr int ASYNC_ANALYSIS_READBACK_INDEX =
+            SPATIAL_EXPOSURE_DIAGNOSTICS_START_INDEX + SPATIAL_EXPOSURE_DIAGNOSTICS_COUNT;
+    constexpr int HIGHLIGHT_RECON_DIAGNOSTICS_START_INDEX = ASYNC_ANALYSIS_READBACK_INDEX + 1;
+    constexpr int HIGHLIGHT_RECON_DIAGNOSTICS_COUNT = 6;
+    constexpr int PREVIEW_SCENE_EXPOSURE_DIAGNOSTICS_START_INDEX =
+            HIGHLIGHT_RECON_DIAGNOSTICS_START_INDEX + HIGHLIGHT_RECON_DIAGNOSTICS_COUNT;
+    constexpr int PREVIEW_SCENE_EXPOSURE_DIAGNOSTICS_COUNT = 6;
+    constexpr int SENSOR_EXPOSURE_DIAGNOSTICS_START_INDEX =
+            PREVIEW_SCENE_EXPOSURE_DIAGNOSTICS_START_INDEX + PREVIEW_SCENE_EXPOSURE_DIAGNOSTICS_COUNT;
+    constexpr int SENSOR_EXPOSURE_DIAGNOSTICS_COUNT = 1;
+    constexpr int EXPANDED_RESULT_SIZE = SENSOR_EXPOSURE_DIAGNOSTICS_START_INDEX +
+            SENSOR_EXPOSURE_DIAGNOSTICS_COUNT;
+    jint expandedValues[EXPANDED_RESULT_SIZE]{};
+    std::copy(std::begin(values), std::end(values), std::begin(expandedValues));
+    expandedValues[43] = rendered.analysisNv21Width;
+    expandedValues[44] = rendered.analysisNv21Height;
+    expandedValues[45] = static_cast<jint>(rendered.inputAhbFormat);
+    expandedValues[46] = static_cast<jint>(rendered.inputAhbUsage & 0xffffffffull);
+    expandedValues[47] = static_cast<jint>((rendered.inputAhbUsage >> 32u) & 0xffffffffull);
+    expandedValues[48] = static_cast<jint>(rendered.inputInteropStatus);
+    for (int index = 0; index < 256; ++index) {
+        expandedValues[LINEAR_LUMA_START + index] = static_cast<jint>(std::min<std::uint32_t>(
+                rendered.linearLumaHistogram[index],
+                static_cast<std::uint32_t>(std::numeric_limits<jint>::max())));
+    }
+    for (int index = 0; index < 64; ++index) {
+        expandedValues[DISPLAY_LUMA64_START + index] = static_cast<jint>(std::min<std::uint32_t>(
+                rendered.displayLumaHistogram64[index],
+                static_cast<std::uint32_t>(std::numeric_limits<jint>::max())));
+        expandedValues[DISPLAY_R64_START + index] = static_cast<jint>(std::min<std::uint32_t>(
+                rendered.displayRHistogram64[index],
+                static_cast<std::uint32_t>(std::numeric_limits<jint>::max())));
+        expandedValues[DISPLAY_G64_START + index] = static_cast<jint>(std::min<std::uint32_t>(
+                rendered.displayGHistogram64[index],
+                static_cast<std::uint32_t>(std::numeric_limits<jint>::max())));
+        expandedValues[DISPLAY_B64_START + index] = static_cast<jint>(std::min<std::uint32_t>(
+                rendered.displayBHistogram64[index],
+                static_cast<std::uint32_t>(std::numeric_limits<jint>::max())));
+    }
+    expandedValues[RAW_NEAR_CLIP_INDEX] = static_cast<jint>(std::min<std::uint32_t>(
+            rendered.rawNearClipSampleCount, static_cast<std::uint32_t>(std::numeric_limits<jint>::max())));
+    expandedValues[RAW_SAMPLE_INDEX] = static_cast<jint>(std::min<std::uint32_t>(
+            rendered.rawSampleCount, static_cast<std::uint32_t>(std::numeric_limits<jint>::max())));
+    expandedValues[DISPLAY_R_CLIP_INDEX] = static_cast<jint>(std::min<std::uint32_t>(
+            rendered.displayRClipSampleCount, static_cast<std::uint32_t>(std::numeric_limits<jint>::max())));
+    expandedValues[DISPLAY_G_CLIP_INDEX] = static_cast<jint>(std::min<std::uint32_t>(
+            rendered.displayGClipSampleCount, static_cast<std::uint32_t>(std::numeric_limits<jint>::max())));
+    expandedValues[DISPLAY_B_CLIP_INDEX] = static_cast<jint>(std::min<std::uint32_t>(
+            rendered.displayBClipSampleCount, static_cast<std::uint32_t>(std::numeric_limits<jint>::max())));
+    const float toneTruth[10] = {
+            rendered.sceneMidtoneTarget,
+            rendered.gtmShoulderStart,
+            rendered.gtmShoulderStrength,
+            rendered.gtmHighlightPressure,
+            rendered.gtmP95CompressionEv,
+            rendered.gtmP99CompressionEv,
+            rendered.gtmDynamicRangePressure,
+            rendered.ltmStrength,
+            rendered.ltmMaxLiftEv,
+            rendered.ltmMaxCompressEv};
+    for (int index = 0; index < 10; ++index) {
+        expandedValues[TONE_TRUTH_START_INDEX + index] = static_cast<jint>(
+                std::lround(toneTruth[index] * 1000000.0f));
+    }
+    const jint firstActivationDiagnostics[FIRST_ACTIVATION_DIAGNOSTICS_COUNT] = {
+            rendered.backendMutexWaitMicroseconds,
+            rendered.backendInitializationPerformed ? 1 : 0,
+            rendered.backendInitializationMicroseconds,
+            rendered.spirvLookupMicroseconds,
+            rendered.descriptorLayoutMicroseconds,
+            rendered.pipelineLayoutMicroseconds,
+            rendered.shaderModuleMicroseconds,
+            rendered.pipelineCacheMutexWaitMicroseconds,
+            rendered.pipelineCachePresent ? 1 : 0,
+            rendered.computePipelineMicroseconds,
+            rendered.imageSpirvLookupMicroseconds,
+            rendered.imageShaderModuleMicroseconds,
+            rendered.imageComputePipelineMicroseconds,
+            rendered.descriptorCommandResourcesMicroseconds,
+            rendered.inputAhbProbeMicroseconds,
+            rendered.outputAhbImportMicroseconds,
+            rendered.commandRecordMicroseconds,
+            rendered.queueMutexWaitMicroseconds,
+            rendered.queueSubmitCallMicroseconds,
+            rendered.fenceWaitMicroseconds
+    };
+    for (int index = 0; index < FIRST_ACTIVATION_DIAGNOSTICS_COUNT; ++index) {
+        expandedValues[FIRST_ACTIVATION_DIAGNOSTICS_START_INDEX + index] =
+                firstActivationDiagnostics[index];
+    }
+    int awbIndex = PHYSICAL_AWB_DIAGNOSTICS_START_INDEX;
+    for (int channel = 0; channel < 3; ++channel) {
+        expandedValues[awbIndex++] = static_cast<jint>(
+                std::lround(rendered.awbPriorGainsRgb[channel] * 1000000.0f));
+    }
+    for (int channel = 0; channel < 3; ++channel) {
+        expandedValues[awbIndex++] = static_cast<jint>(
+                std::lround(rendered.awbDataGainsRgb[channel] * 1000000.0f));
+    }
+    for (int channel = 0; channel < 3; ++channel) {
+        expandedValues[awbIndex++] = static_cast<jint>(
+                std::lround(rendered.awbFinalGainsRgb[channel] * 1000000.0f));
+    }
+    expandedValues[awbIndex++] = static_cast<jint>(std::lround(rendered.awbConfidence * 1000000.0f));
+    expandedValues[awbIndex++] = static_cast<jint>(std::lround(rendered.awbDataAuthority * 1000000.0f));
+    expandedValues[awbIndex++] = static_cast<jint>(std::lround(rendered.awbNeutralSupport * 1000000.0f));
+    expandedValues[awbIndex++] = static_cast<jint>(std::lround(rendered.awbMixedLightScore * 1000000.0f));
+    expandedValues[awbIndex++] = static_cast<jint>(std::lround(rendered.awbPriorDisagreement * 1000000.0f));
+    expandedValues[awbIndex++] = rendered.awbValidTileCount;
+    expandedValues[awbIndex++] = rendered.awbAcceptedSampleCount;
+    expandedValues[awbIndex++] = rendered.awbDataReady ? 1 : 0;
+    int exposureIndex = SPATIAL_EXPOSURE_DIAGNOSTICS_START_INDEX;
+    expandedValues[exposureIndex++] = static_cast<jint>(std::min<std::uint32_t>(
+            rendered.exposureTileCount, static_cast<std::uint32_t>(std::numeric_limits<jint>::max())));
+    const float exposureDiagnostics[11] = {
+            rendered.exposureSceneP10, rendered.exposureSceneP25, rendered.exposureSceneP50,
+            rendered.exposureSceneP75, rendered.exposureSceneP90, rendered.exposureSceneP95,
+            rendered.exposureSceneP99, rendered.exposureMeasuredSceneDrEv,
+            rendered.exposureLowerNeutralBoundaryEv, rendered.exposureUpperNeutralBoundaryEv,
+            rendered.exposureSpatialAuthority};
+    for (float value : exposureDiagnostics) {
+        expandedValues[exposureIndex++] = static_cast<jint>(
+                std::lround((std::isfinite(value) ? value : 0.0f) * 1000000.0f));
+    }
+    expandedValues[ASYNC_ANALYSIS_READBACK_INDEX] =
+            rendered.analysisReadbackPerformed ? 1 : 0;
+    expandedValues[HIGHLIGHT_RECON_DIAGNOSTICS_START_INDEX + 0] = static_cast<jint>(
+            std::min<std::uint32_t>(rendered.rawRClipSampleCount, std::numeric_limits<jint>::max()));
+    expandedValues[HIGHLIGHT_RECON_DIAGNOSTICS_START_INDEX + 1] = static_cast<jint>(
+            std::min<std::uint32_t>(rendered.rawGClipSampleCount, std::numeric_limits<jint>::max()));
+    expandedValues[HIGHLIGHT_RECON_DIAGNOSTICS_START_INDEX + 2] = static_cast<jint>(
+            std::min<std::uint32_t>(rendered.rawBClipSampleCount, std::numeric_limits<jint>::max()));
+    expandedValues[HIGHLIGHT_RECON_DIAGNOSTICS_START_INDEX + 3] = static_cast<jint>(
+            std::min<std::uint32_t>(rendered.highlightReconstructedSampleCount, std::numeric_limits<jint>::max()));
+    expandedValues[HIGHLIGHT_RECON_DIAGNOSTICS_START_INDEX + 4] = static_cast<jint>(
+            std::min<std::uint32_t>(rendered.postWbClipSampleCount, std::numeric_limits<jint>::max()));
+    expandedValues[HIGHLIGHT_RECON_DIAGNOSTICS_START_INDEX + 5] = static_cast<jint>(
+            std::min<std::uint32_t>(rendered.postCcmClipSampleCount, std::numeric_limits<jint>::max()));
+    const float previewSceneExposureDiagnostics[PREVIEW_SCENE_EXPOSURE_DIAGNOSTICS_COUNT] = {
+            rendered.previewRequestedEv,
+            rendered.previewHighlightLimitedEv,
+            rendered.previewAppliedEv,
+            rendered.previewSceneKey,
+            rendered.previewHighlightHeadroomEv,
+            rendered.previewSceneRangeEv};
+    for (int index = 0; index < PREVIEW_SCENE_EXPOSURE_DIAGNOSTICS_COUNT; ++index) {
+        const float value = previewSceneExposureDiagnostics[index];
+        expandedValues[PREVIEW_SCENE_EXPOSURE_DIAGNOSTICS_START_INDEX + index] = static_cast<jint>(
+                std::lround((std::isfinite(value) ? value : 0.0f) * 1000000.0f));
+    }
+    expandedValues[SENSOR_EXPOSURE_DIAGNOSTICS_START_INDEX] = static_cast<jint>(
+            std::min<std::uint32_t>(rendered.rawTrueSaturatedSampleCount, std::numeric_limits<jint>::max()));
+    jintArray result = env->NewIntArray(EXPANDED_RESULT_SIZE);
+    if (result != nullptr) env->SetIntArrayRegion(result, 0, EXPANDED_RESULT_SIZE, expandedValues);
+    return result;
+}
+}  // namespace
+
 extern "C"
 JNIEXPORT jintArray JNICALL
 Java_com_bncam_core_engine_ImageUtils_renderRawPreviewNative(
@@ -1763,7 +2008,8 @@ Java_com_bncam_core_engine_ImageUtils_renderRawPreviewNative(
         jobject analysisNv21Buffer,
         jint frameSlotIndex,
         jint maxWidth,
-        jint maxHeight
+        jint maxHeight,
+        jboolean analysisReadbackRequested
 ) {
     auto* buffer = reinterpret_cast<AHardwareBuffer*>(
             static_cast<std::uintptr_t>(retainedHardwareBuffer));
@@ -1898,186 +2144,48 @@ Java_com_bncam_core_engine_ImageUtils_renderRawPreviewNative(
 
     const RawPreviewResult rendered = renderRawPreviewRgba(
             buffer, parameters, outputHardwareBuffer, output, static_cast<std::size_t>(outputCapacity),
-            analysisNv21, static_cast<std::size_t>(std::max<jlong>(0, analysisNv21Capacity)));
+            analysisNv21, static_cast<std::size_t>(std::max<jlong>(0, analysisNv21Capacity)),
+            analysisReadbackRequested == JNI_TRUE);
+    if (rendered.completionPending) {
+        return packRawPreviewAsyncStatus(env, RAW_PREVIEW_ASYNC_SUBMITTED_MAGIC, rendered);
+    }
     if (!rendered.success) return nullptr;
-    jint values[43] = {
-            rendered.width,
-            rendered.height,
-            rendered.renderMicroseconds,
-            rendered.vulkanStagesUsed ? 1 : 0,
-            rendered.cfaCellDecimation,
-            static_cast<jint>(std::lround(rendered.normalizedRawMin * 1000000.0f)),
-            static_cast<jint>(std::lround(rendered.normalizedRawMax * 1000000.0f)),
-            static_cast<jint>(std::lround(rendered.outputRgbMin * 1000000.0f)),
-            static_cast<jint>(std::lround(rendered.outputRgbMax * 1000000.0f)),
-            static_cast<jint>(std::lround(rendered.outputRgbMean * 1000000.0f)),
-            255,
-            rendered.rawUnpackMicroseconds,
-            rendered.demosaicMicroseconds,
-            rendered.colorMicroseconds,
-            rendered.tonePackMicroseconds,
-            static_cast<jint>(std::lround(rendered.targetExposureGain * 1000000.0f)),
-            static_cast<jint>(std::lround(rendered.appliedExposureGain * 1000000.0f)),
-            static_cast<jint>(std::lround(rendered.sceneMidtone * 1000000.0f)),
-            static_cast<jint>(std::min<std::uint64_t>(
-                    rendered.commonHighlightScalePixels,
-                    static_cast<std::uint64_t>(std::numeric_limits<jint>::max()))),
-            rendered.directHostInputUsed ? 1 : 0,
-            rendered.directHardwareBufferInputUsed ? 1 : 0,
-            rendered.gpuResidentOutputUsed ? 1 : 0
-    };
-    for (int index = 0; index < 16; ++index) {
-        values[22 + index] = static_cast<jint>(std::min<std::uint32_t>(
-                rendered.displayLumaHistogram[index],
-                static_cast<std::uint32_t>(std::numeric_limits<jint>::max())));
+    return packRawPreviewCompletedResult(env, rendered);
+}
+
+
+extern "C"
+JNIEXPORT jintArray JNICALL
+Java_com_bncam_core_engine_ImageUtils_pollRawPreviewNative(
+        JNIEnv* env,
+        jobject /* thiz */,
+        jint frameSlotIndex,
+        jint submissionIdLow,
+        jint submissionIdHigh,
+        jint previewWidth,
+        jint previewHeight,
+        jint cfaCellDecimation,
+        jfloatArray camera2PriorWbGainsArray
+) {
+    const std::uint64_t submissionId =
+            (static_cast<std::uint64_t>(static_cast<std::uint32_t>(submissionIdHigh)) << 32u) |
+            static_cast<std::uint32_t>(submissionIdLow);
+    float priorWb[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    if (camera2PriorWbGainsArray != nullptr &&
+        env->GetArrayLength(camera2PriorWbGainsArray) >= 4) {
+        env->GetFloatArrayRegion(camera2PriorWbGainsArray, 0, 4, priorWb);
+        for (float& value : priorWb) {
+            if (!std::isfinite(value) || value <= 0.0f) value = 1.0f;
+        }
     }
-    values[38] = static_cast<jint>(std::min<std::uint32_t>(
-            rendered.displayShadowSampleCount, static_cast<std::uint32_t>(std::numeric_limits<jint>::max())));
-    values[39] = static_cast<jint>(std::min<std::uint32_t>(
-            rendered.displayHighlightSampleCount, static_cast<std::uint32_t>(std::numeric_limits<jint>::max())));
-    values[40] = static_cast<jint>(std::min<std::uint32_t>(
-            rendered.displaySampleCount, static_cast<std::uint32_t>(std::numeric_limits<jint>::max())));
-    values[41] = rendered.displayHighlightX >= 0.0f
-            ? static_cast<jint>(std::lround(rendered.displayHighlightX * 1000000.0f)) : -1;
-    values[42] = rendered.displayHighlightY >= 0.0f
-            ? static_cast<jint>(std::lround(rendered.displayHighlightY * 1000000.0f)) : -1;
-    constexpr int BASE_RESULT_SIZE = 49;
-    constexpr int LINEAR_LUMA_START = BASE_RESULT_SIZE;
-    constexpr int DISPLAY_LUMA64_START = LINEAR_LUMA_START + 256;
-    constexpr int DISPLAY_R64_START = DISPLAY_LUMA64_START + 64;
-    constexpr int DISPLAY_G64_START = DISPLAY_R64_START + 64;
-    constexpr int DISPLAY_B64_START = DISPLAY_G64_START + 64;
-    constexpr int RAW_NEAR_CLIP_INDEX = DISPLAY_B64_START + 64;
-    constexpr int RAW_SAMPLE_INDEX = RAW_NEAR_CLIP_INDEX + 1;
-    constexpr int DISPLAY_R_CLIP_INDEX = RAW_SAMPLE_INDEX + 1;
-    constexpr int DISPLAY_G_CLIP_INDEX = DISPLAY_R_CLIP_INDEX + 1;
-    constexpr int DISPLAY_B_CLIP_INDEX = DISPLAY_G_CLIP_INDEX + 1;
-    constexpr int TONE_TRUTH_START_INDEX = DISPLAY_B_CLIP_INDEX + 1;
-    constexpr int FIRST_ACTIVATION_DIAGNOSTICS_START_INDEX = TONE_TRUTH_START_INDEX + 10;
-    constexpr int FIRST_ACTIVATION_DIAGNOSTICS_COUNT = 20;
-    constexpr int PHYSICAL_AWB_DIAGNOSTICS_START_INDEX =
-            FIRST_ACTIVATION_DIAGNOSTICS_START_INDEX + FIRST_ACTIVATION_DIAGNOSTICS_COUNT;
-    constexpr int PHYSICAL_AWB_DIAGNOSTICS_COUNT = 17;
-    constexpr int SPATIAL_EXPOSURE_DIAGNOSTICS_START_INDEX =
-            PHYSICAL_AWB_DIAGNOSTICS_START_INDEX + PHYSICAL_AWB_DIAGNOSTICS_COUNT;
-    constexpr int SPATIAL_EXPOSURE_DIAGNOSTICS_COUNT = 12;
-    constexpr int EXPANDED_RESULT_SIZE =
-            SPATIAL_EXPOSURE_DIAGNOSTICS_START_INDEX + SPATIAL_EXPOSURE_DIAGNOSTICS_COUNT;
-    jint expandedValues[EXPANDED_RESULT_SIZE]{};
-    std::copy(std::begin(values), std::end(values), std::begin(expandedValues));
-    expandedValues[43] = rendered.analysisNv21Width;
-    expandedValues[44] = rendered.analysisNv21Height;
-    expandedValues[45] = static_cast<jint>(rendered.inputAhbFormat);
-    expandedValues[46] = static_cast<jint>(rendered.inputAhbUsage & 0xffffffffull);
-    expandedValues[47] = static_cast<jint>((rendered.inputAhbUsage >> 32u) & 0xffffffffull);
-    expandedValues[48] = static_cast<jint>(rendered.inputInteropStatus);
-    for (int index = 0; index < 256; ++index) {
-        expandedValues[LINEAR_LUMA_START + index] = static_cast<jint>(std::min<std::uint32_t>(
-                rendered.linearLumaHistogram[index],
-                static_cast<std::uint32_t>(std::numeric_limits<jint>::max())));
+    const RawPreviewResult rendered = pollRawPreviewRgba(
+            frameSlotIndex, submissionId, previewWidth, previewHeight,
+            cfaCellDecimation, priorWb);
+    if (rendered.completionPending) {
+        return packRawPreviewAsyncStatus(env, RAW_PREVIEW_ASYNC_PENDING_MAGIC, rendered);
     }
-    for (int index = 0; index < 64; ++index) {
-        expandedValues[DISPLAY_LUMA64_START + index] = static_cast<jint>(std::min<std::uint32_t>(
-                rendered.displayLumaHistogram64[index],
-                static_cast<std::uint32_t>(std::numeric_limits<jint>::max())));
-        expandedValues[DISPLAY_R64_START + index] = static_cast<jint>(std::min<std::uint32_t>(
-                rendered.displayRHistogram64[index],
-                static_cast<std::uint32_t>(std::numeric_limits<jint>::max())));
-        expandedValues[DISPLAY_G64_START + index] = static_cast<jint>(std::min<std::uint32_t>(
-                rendered.displayGHistogram64[index],
-                static_cast<std::uint32_t>(std::numeric_limits<jint>::max())));
-        expandedValues[DISPLAY_B64_START + index] = static_cast<jint>(std::min<std::uint32_t>(
-                rendered.displayBHistogram64[index],
-                static_cast<std::uint32_t>(std::numeric_limits<jint>::max())));
-    }
-    expandedValues[RAW_NEAR_CLIP_INDEX] = static_cast<jint>(std::min<std::uint32_t>(
-            rendered.rawNearClipSampleCount, static_cast<std::uint32_t>(std::numeric_limits<jint>::max())));
-    expandedValues[RAW_SAMPLE_INDEX] = static_cast<jint>(std::min<std::uint32_t>(
-            rendered.rawSampleCount, static_cast<std::uint32_t>(std::numeric_limits<jint>::max())));
-    expandedValues[DISPLAY_R_CLIP_INDEX] = static_cast<jint>(std::min<std::uint32_t>(
-            rendered.displayRClipSampleCount, static_cast<std::uint32_t>(std::numeric_limits<jint>::max())));
-    expandedValues[DISPLAY_G_CLIP_INDEX] = static_cast<jint>(std::min<std::uint32_t>(
-            rendered.displayGClipSampleCount, static_cast<std::uint32_t>(std::numeric_limits<jint>::max())));
-    expandedValues[DISPLAY_B_CLIP_INDEX] = static_cast<jint>(std::min<std::uint32_t>(
-            rendered.displayBClipSampleCount, static_cast<std::uint32_t>(std::numeric_limits<jint>::max())));
-    const float toneTruth[10] = {
-            rendered.sceneMidtoneTarget,
-            rendered.gtmShoulderStart,
-            rendered.gtmShoulderStrength,
-            rendered.gtmBlackAnchor,
-            rendered.gtmLowerMidLift,
-            rendered.gtmContrastStrength,
-            rendered.gtmDynamicRangePressure,
-            rendered.ltmStrength,
-            rendered.ltmMaxLiftEv,
-            rendered.ltmMaxCompressEv};
-    for (int index = 0; index < 10; ++index) {
-        expandedValues[TONE_TRUTH_START_INDEX + index] = static_cast<jint>(
-                std::lround(toneTruth[index] * 1000000.0f));
-    }
-    const jint firstActivationDiagnostics[FIRST_ACTIVATION_DIAGNOSTICS_COUNT] = {
-            rendered.backendMutexWaitMicroseconds,
-            rendered.backendInitializationPerformed ? 1 : 0,
-            rendered.backendInitializationMicroseconds,
-            rendered.spirvLookupMicroseconds,
-            rendered.descriptorLayoutMicroseconds,
-            rendered.pipelineLayoutMicroseconds,
-            rendered.shaderModuleMicroseconds,
-            rendered.pipelineCacheMutexWaitMicroseconds,
-            rendered.pipelineCachePresent ? 1 : 0,
-            rendered.computePipelineMicroseconds,
-            rendered.imageSpirvLookupMicroseconds,
-            rendered.imageShaderModuleMicroseconds,
-            rendered.imageComputePipelineMicroseconds,
-            rendered.descriptorCommandResourcesMicroseconds,
-            rendered.inputAhbProbeMicroseconds,
-            rendered.outputAhbImportMicroseconds,
-            rendered.commandRecordMicroseconds,
-            rendered.queueMutexWaitMicroseconds,
-            rendered.queueSubmitCallMicroseconds,
-            rendered.fenceWaitMicroseconds
-    };
-    for (int index = 0; index < FIRST_ACTIVATION_DIAGNOSTICS_COUNT; ++index) {
-        expandedValues[FIRST_ACTIVATION_DIAGNOSTICS_START_INDEX + index] =
-                firstActivationDiagnostics[index];
-    }
-    int awbIndex = PHYSICAL_AWB_DIAGNOSTICS_START_INDEX;
-    for (int channel = 0; channel < 3; ++channel) {
-        expandedValues[awbIndex++] = static_cast<jint>(
-                std::lround(rendered.awbPriorGainsRgb[channel] * 1000000.0f));
-    }
-    for (int channel = 0; channel < 3; ++channel) {
-        expandedValues[awbIndex++] = static_cast<jint>(
-                std::lround(rendered.awbDataGainsRgb[channel] * 1000000.0f));
-    }
-    for (int channel = 0; channel < 3; ++channel) {
-        expandedValues[awbIndex++] = static_cast<jint>(
-                std::lround(rendered.awbFinalGainsRgb[channel] * 1000000.0f));
-    }
-    expandedValues[awbIndex++] = static_cast<jint>(std::lround(rendered.awbConfidence * 1000000.0f));
-    expandedValues[awbIndex++] = static_cast<jint>(std::lround(rendered.awbDataAuthority * 1000000.0f));
-    expandedValues[awbIndex++] = static_cast<jint>(std::lround(rendered.awbNeutralSupport * 1000000.0f));
-    expandedValues[awbIndex++] = static_cast<jint>(std::lround(rendered.awbMixedLightScore * 1000000.0f));
-    expandedValues[awbIndex++] = static_cast<jint>(std::lround(rendered.awbPriorDisagreement * 1000000.0f));
-    expandedValues[awbIndex++] = rendered.awbValidTileCount;
-    expandedValues[awbIndex++] = rendered.awbAcceptedSampleCount;
-    expandedValues[awbIndex++] = rendered.awbDataReady ? 1 : 0;
-    int exposureIndex = SPATIAL_EXPOSURE_DIAGNOSTICS_START_INDEX;
-    expandedValues[exposureIndex++] = static_cast<jint>(std::min<std::uint32_t>(
-            rendered.exposureTileCount, static_cast<std::uint32_t>(std::numeric_limits<jint>::max())));
-    const float exposureDiagnostics[11] = {
-            rendered.exposureSceneP10, rendered.exposureSceneP25, rendered.exposureSceneP50,
-            rendered.exposureSceneP75, rendered.exposureSceneP90, rendered.exposureSceneP95,
-            rendered.exposureSceneP99, rendered.exposureMeasuredSceneDrEv,
-            rendered.exposureLowerNeutralBoundaryEv, rendered.exposureUpperNeutralBoundaryEv,
-            rendered.exposureSpatialAuthority};
-    for (float value : exposureDiagnostics) {
-        expandedValues[exposureIndex++] = static_cast<jint>(
-                std::lround((std::isfinite(value) ? value : 0.0f) * 1000000.0f));
-    }
-    jintArray result = env->NewIntArray(EXPANDED_RESULT_SIZE);
-    if (result != nullptr) env->SetIntArrayRegion(result, 0, EXPANDED_RESULT_SIZE, expandedValues);
-    return result;
+    if (!rendered.success) return nullptr;
+    return packRawPreviewCompletedResult(env, rendered);
 }
 
 

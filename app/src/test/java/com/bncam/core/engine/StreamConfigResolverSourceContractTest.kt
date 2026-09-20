@@ -5,7 +5,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
-class StreamConfigResolverSourceContractTest {
+class PhotoStreamConfigurationResolverSourceContractTest {
     private fun appRoot(): File = sequenceOf(File("."), File("app"))
         .firstOrNull { File(it, "src/main/java/com/bncam/core/engine/BnCameraManager.kt").isFile }
         ?: error("Cannot locate app module from ${File(".").absolutePath}")
@@ -13,51 +13,75 @@ class StreamConfigResolverSourceContractTest {
     private fun source(path: String): String = File(appRoot(), path).readText()
 
     @Test
-    fun `runtime resolves stream plan after existing full fov auto geometry and before buffer budget`() {
+    fun `runtime resolves capability format then persisted resolution request before final selection`() {
         val manager = source("src/main/java/com/bncam/core/engine/BnCameraManager.kt")
-        val geometry = manager.indexOf("val autoBestSize = availableSizes.maxByOrNull")
-        val resolver = manager.indexOf("StreamConfigResolver.resolvePhoto(", geometry)
+        val inventory = manager.indexOf("CameraCapabilityInventoryFactory.fromCharacteristics(")
+        val format = manager.indexOf("CameraPhotoFormatPolicy.resolveRuntimePrimary(", inventory)
+        val settings = manager.indexOf("PhotoStreamSettingsStore(context).get(cameraId)", format)
+        val resolution = manager.indexOf("CameraPhotoResolutionPolicy.resolve(", settings)
+        val resolver = manager.indexOf("PhotoStreamConfigurationResolver.resolvePhoto(", resolution)
         val budget = manager.indexOf("CaptureBufferBudget.resolve(", resolver)
 
-        assertTrue(geometry >= 0)
-        assertTrue(resolver > geometry)
+        assertTrue(inventory >= 0)
+        assertTrue(format > inventory)
+        assertTrue(settings > format)
+        assertTrue(resolution > settings)
+        assertTrue(resolver > resolution)
         assertTrue(budget > resolver)
-        assertTrue(manager.contains("event = \"STREAM_CONFIGURATION_RESOLVED\""))
+        assertTrue(manager.contains("specificRawSizeIndex = photoStreamSettings.specificRawSizeIndex"))
+        assertTrue(manager.contains("resolutionFixReferenceFormatCode = photoStreamSettings.resolutionFixReferenceFormatCode"))
     }
 
     @Test
-    fun `auto remains the pre stream configuration geometry`() {
+    fun `legacy candidate and mode compatibility authority are removed`() {
         val resolver = source("src/main/java/com/bncam/core/engine/StreamConfigResolver.kt")
+        val manager = source("src/main/java/com/bncam/core/engine/BnCameraManager.kt")
 
-        assertTrue(resolver.contains("StreamConfigurationMode.AUTO -> autoPlan("))
-        assertTrue(resolver.contains("captureSize = autoCaptureSize"))
-        assertTrue(resolver.contains("Auto retained the existing BnCam full-FOV stream geometry."))
+        assertFalse(resolver.contains("legacyValidatedCandidateId"))
+        assertFalse(resolver.contains("StreamCandidateIdCodec"))
+        assertFalse(resolver.contains("StreamConfigurationMode"))
+        assertFalse(resolver.contains("CameraSessionPreflight"))
+        assertFalse(manager.contains("StreamConfigurationMode"))
+        assertFalse(manager.contains("validatedCandidateId"))
     }
 
     @Test
-    fun `validated mode cannot silently change the profile buffer format`() {
+    fun `explicit resolution recovery uses native auto then conservative geometry`() {
         val resolver = source("src/main/java/com/bncam/core/engine/StreamConfigResolver.kt")
+        val manager = source("src/main/java/com/bncam/core/engine/BnCameraManager.kt")
 
-        assertTrue(resolver.contains("if (parsed.formatCode != requestedFormatCode)"))
-        assertTrue(resolver.contains("profile buffer ownership is preserved"))
-        assertTrue(resolver.contains("effectiveFormatCode = requestedFormatCode"))
+        assertTrue(manager.contains("val autoResolution = if (photoStreamSettings.hasExplicitResolutionOverride)"))
+        assertTrue(resolver.contains("StreamRuntimeFallbackTier.AUTO_GEOMETRY,\n            StreamRuntimeFallbackTier.CONSERVATIVE_FULL_FOV -> autoResolution"))
+        assertTrue(resolver.contains("autoResolution.conservativeSize?.extent"))
+        assertTrue(resolver.contains("without rewriting saved settings"))
     }
 
     @Test
-    fun `validated photo runtime requires exact active preview hal preflight`() {
-        val resolver = source("src/main/java/com/bncam/core/engine/StreamConfigResolver.kt")
-        val catalog = source("src/main/java/com/bncam/core/engine/CameraStreamCapabilityCatalog.kt")
+    fun `final session contract carries the same primary authority into the role graph`() {
+        val manager = source("src/main/java/com/bncam/core/engine/BnCameraManager.kt")
+        val graph = source("src/main/java/com/bncam/core/engine/CurrentBnCamStreamGraph.kt")
+        val model = source("src/main/java/com/bncam/core/engine/StreamArchitectureModel.kt")
 
-        assertTrue(resolver.contains("configuredPreviewSize == null"))
-        assertTrue(catalog.contains("manager.isCameraDeviceSetupSupported(cameraId)"))
-        assertTrue(catalog.contains("setup.isSessionConfigurationSupported(config)"))
-        assertTrue(catalog.contains("OutputConfiguration(previewSize, SurfaceTexture::class.java)"))
-        assertTrue(catalog.contains("OutputConfiguration(captureFormat, captureSize)"))
-        assertTrue(resolver.contains("fallbackToAuto = true"))
+        assertTrue(manager.contains("primaryStreamContract = photoStreamSelection.toPrimaryStreamContract("))
+        assertTrue(manager.contains("primaryContract = activeStreamRoute?.primaryStreamContract"))
+        assertTrue(graph.contains("val primaryContract: ResolvedPrimaryStreamContract?"))
+        assertTrue(graph.contains("formatCode = contract.effectiveFormatCode"))
+        assertTrue(graph.contains("extent = contract.extent"))
+        assertTrue(graph.contains("primaryStream = input.primaryContract"))
+        assertTrue(model.contains("val primaryStream: ResolvedPrimaryStreamContract? = null"))
     }
 
     @Test
-    fun `phase two does not create a second session lifecycle or vendor operation mode authority`() {
+    fun `concrete ImageReader bindings are checked against resolved role format and extent`() {
+        val bindings = source("src/main/java/com/bncam/core/engine/StreamSurfaceBindings.kt")
+
+        assertTrue(bindings.contains("reader.imageFormat == role.formatCode"))
+        assertTrue(bindings.contains("reader.width == role.extent.width && reader.height == role.extent.height"))
+        assertTrue(bindings.contains("reader.maxImages == expectedMaxImages"))
+    }
+
+    @Test
+    fun `resolver remains outside lifecycle operation mode and fps ownership`() {
         val resolver = source("src/main/java/com/bncam/core/engine/StreamConfigResolver.kt")
         val manager = source("src/main/java/com/bncam/core/engine/BnCameraManager.kt")
 
@@ -65,30 +89,18 @@ class StreamConfigResolverSourceContractTest {
         assertFalse(resolver.contains("pipelineGeneration"))
         assertFalse(resolver.contains("sessionConfigurationEpoch"))
         assertFalse(resolver.contains("vendorSessionType"))
+        assertFalse(resolver.contains("CONTROL_AE_TARGET_FPS_RANGE"))
         assertTrue(manager.contains("private var pipelineGeneration"))
         assertTrue(manager.contains("private var sessionConfigurationEpoch"))
     }
 
     @Test
-    fun `validated catalog exposes only full fov photo candidates and ui only enables hal validated choices`() {
-        val catalog = source("src/main/java/com/bncam/core/engine/CameraStreamCapabilityCatalog.kt")
-        val screen = source("src/main/java/com/bncam/ui/screens/settings/lens_profiles/RawStreamBindingSettingsScreen.kt")
-
-        assertTrue(catalog.contains("CameraStreamGeometryPolicy.fullFovCandidates("))
-        assertTrue(catalog.contains("val photoSizes = allSizes.filter"))
-        assertTrue(screen.contains("enabled = candidate.validationStatus == StreamCandidateValidationStatus.SESSION_VALIDATED"))
-        assertTrue(screen.contains(".clickable(enabled = enabled"))
-    }
-    @Test
-    fun `validated mode refuses mismatched vendor session contracts and auto cannot inherit manual raw binding`() {
-        val resolver = source("src/main/java/com/bncam/core/engine/StreamConfigResolver.kt")
+    fun `custom raw preview support is controlled directly by binding plus recovery`() {
         val manager = source("src/main/java/com/bncam/core/engine/BnCameraManager.kt")
 
-        assertTrue(resolver.contains("if (sessionHasVendorOverrides)"))
-        assertTrue(resolver.contains("vendor/session override is active"))
-        assertTrue(manager.contains("manualStreamConfigurationActive: Boolean"))
-        assertTrue(manager.contains("if (!manualStreamConfigurationActive || viewfinderStreamSetting != ViewfinderStream.SELECTED_BUFFER)"))
-        assertTrue(manager.contains("resolvedStreamPlan.configuredMode == StreamConfigurationMode.MANUAL"))
+        assertTrue(manager.contains("raw10Binding = raw10BindingSetting"))
+        assertTrue(manager.contains("rawSensorBinding = rawSensorBindingSetting"))
+        assertTrue(manager.contains("customBindingAllowed = photoStreamSelection.runtimeFallbackTier == StreamRuntimeFallbackTier.NONE"))
+        assertFalse(manager.contains("manualStreamConfigurationActive"))
     }
-
 }

@@ -7,7 +7,7 @@ import java.io.File
 
 class ProfileToneNativeConsumptionSourceContractTest {
     @Test
-    fun profileToneCrossesJniAndIsConsumedAfterPbrNeutral() {
+    fun profileToneCrossesJniAndIsConsumedAfterGlobalToneAndDisplayMapping() {
         val imageUtils = source("app/src/main/java/com/bncam/core/engine/ImageUtils.kt")
         val nativeLib = source("app/src/main/cpp/native-lib.cpp")
         val nativeConfig = source("app/src/main/cpp/NativeRenderQualityConfig.h")
@@ -25,21 +25,30 @@ class ProfileToneNativeConsumptionSourceContractTest {
         }
 
         assertTrue(ispCore.contains("profileTonePlan.exposureMultiplier"))
-        assertTrue(ispCore.contains("lookLuma * profileExposureGain"))
+        assertTrue(ispCore.contains("explicitProfileExposureGain"))
+        assertTrue(ispCore.contains("request.profileExposureGain = explicitProfileExposureGain"))
         assertTrue(ispCore.contains("applyProfileTonalRanges(curvedLuma, profileTonePlan)"))
+        assertTrue(ispCore.contains("profileToneExposureStage=POST_DISPLAY_EXPLICIT_PROFILE_LOOK"))
         assertTrue(toneShader.contains("rgb = pbrNeutralToneMapping(rgb);"))
+        assertTrue(toneShader.contains("rgb *= max(0.0, pc.presenceReserved1);"))
         assertTrue(toneShader.contains("rgb = applyToneLookLut(rgb);"))
-        assertTrue(toneShader.contains("rgb = applyProfileColor(rgb);"))
-        assertTrue(
-            "Explicit profile tone must remain after Khronos PBR Neutral",
-            toneShader.indexOf("rgb = applyToneLookLut(rgb);") >
-                toneShader.indexOf("rgb = pbrNeutralToneMapping(rgb);")
-        )
-        assertTrue(ispCore.contains("toneMapperRequested=KHRONOS_PBR_NEUTRAL") ||
-            ispCore.contains("toneMapperRequested=\" << \"KHRONOS_PBR_NEUTRAL"))
-        assertTrue(ispCore.contains("POST_PBR_NEUTRAL_DISPLAY_LINEAR"))
+        assertTrue(toneShader.contains("rgb = applyProfileColor(rgb, ivec2(gid));"))
+
+        val rawBranch = toneShader.substringAfter("void runTone")
+            .substringAfter("if (pc.isRawBayer != 0u) {")
+            .substringBefore("} else {")
+        val display = rawBranch.indexOf("pbrNeutralToneMapping(rgb)")
+        val exposure = rawBranch.indexOf("pc.presenceReserved1")
+        val tone = rawBranch.indexOf("applyToneLookLut(rgb)")
+        val color = rawBranch.indexOf("applyProfileColor(rgb")
+        assertTrue("Explicit profile look must remain after display mapping",
+            display >= 0 && exposure > display && tone > exposure && color > tone)
+
+        assertTrue(ispCore.contains("resolveGlobalSceneExposurePlan"))
+        assertTrue(ispCore.contains("resolveGlobalToneMappingPlan"))
+        assertTrue(ispCore.contains("toneMapperRequested=") && ispCore.contains("KHRONOS_PBR_NEUTRAL"))
         assertFalse(toneShader.contains("applyAgXTonemap"))
-        assertFalse(ispCore.contains("GTM_SCENE_PLACEMENT"))
+        assertFalse(ispCore.contains("dynamicRangeTonePlan"))
     }
 
     private fun source(path: String): String {

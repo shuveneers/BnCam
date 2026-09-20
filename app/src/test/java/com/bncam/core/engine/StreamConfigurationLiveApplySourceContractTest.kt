@@ -16,23 +16,23 @@ class StreamConfigurationLiveApplySourceContractTest {
     fun `stream settings use existing serialized soft reset authority`() {
         val manager = source("src/main/java/com/bncam/core/engine/BnCameraManager.kt")
 
-        assertTrue(manager.contains("bindActiveStreamConfigurationObserver(cameraId)"))
-        assertTrue(manager.contains("StreamConfigurationSettingsStore(appContext)"))
-        assertTrue(manager.contains("StreamConfigurationRuntimeFingerprint.photo("))
-        assertTrue(manager.contains("requestActiveStreamConfigurationRefresh("))
+        assertTrue(manager.contains("bindActivePhotoStreamSettingsObserver(cameraId)"))
+        assertTrue(manager.contains("PhotoStreamSettingsStore(appContext)"))
+        assertTrue(manager.contains("PhotoStreamRuntimeFingerprint.create("))
+        assertTrue(manager.contains("requestActivePhotoStreamSettingsRefresh("))
         assertTrue(manager.contains("softResetPipeline("))
         assertTrue(manager.contains("forceSessionRebuild = false"))
-        assertTrue(manager.contains("STREAM_CONFIGURATION_PREFERENCE_CHANGED"))
-        assertTrue(manager.contains("STREAM_CONFIGURATION_REFRESH_REQUEST"))
-        assertTrue(manager.contains("stopActiveStreamConfigurationObserver(\"camera_close:\$reason\")"))
+        assertTrue(manager.contains("PHOTO_STREAM_SETTINGS_CHANGED"))
+        assertTrue(manager.contains("PHOTO_STREAM_SETTINGS_REFRESH_REQUEST"))
+        assertTrue(manager.contains("stopActivePhotoStreamSettingsObserver(\"camera_close:\$reason\")"))
     }
 
     @Test
     fun `first observer emission is baseline only and video is not a live photo owner`() {
         val manager = source("src/main/java/com/bncam/core/engine/BnCameraManager.kt")
         val model = source("src/main/java/com/bncam/data/settings/StreamConfigurationSettings.kt")
-        val observer = manager.substringAfter("private fun bindActiveStreamConfigurationObserver")
-            .substringBefore("private fun stopActiveStreamConfigurationObserver")
+        val observer = manager.substringAfter("private fun bindActivePhotoStreamSettingsObserver")
+            .substringBefore("private fun stopActivePhotoStreamSettingsObserver")
 
         assertTrue(observer.contains("var previousSignature: String? = null"))
         assertTrue(observer.contains("if (previous == null)"))
@@ -42,13 +42,14 @@ class StreamConfigurationLiveApplySourceContractTest {
     }
 
     @Test
-    fun `manual custom raw surface refresh is isolated from normal viewfinder switches`() {
+    fun `custom raw support refresh is isolated from normal request graph viewfinder switches`() {
         val manager = source("src/main/java/com/bncam/core/engine/BnCameraManager.kt")
         val configure = manager.substringAfter("fun configureViewfinderStream(")
             .substringBefore("fun setViewfinderStreamDirect")
 
-        assertTrue(configure.contains("manualCustomRawPreviewBindingConfigured || customBindingWasActive"))
-        assertTrue(configure.contains("MANUAL_RAW_BINDING_VIEWFINDER_"))
+        assertTrue(configure.contains("customRawPreviewBindingConfigured || customBindingWasActive"))
+        assertTrue(configure.contains("CUSTOM_RAW_BINDING_VIEWFINDER_"))
+        assertTrue(configure.contains("requestActivePhotoStreamSettingsRefresh("))
         assertFalse(configure.contains("forceSessionRebuild = true"))
     }
 }

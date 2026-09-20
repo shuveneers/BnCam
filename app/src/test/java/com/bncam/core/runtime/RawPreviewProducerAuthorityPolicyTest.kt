@@ -30,6 +30,32 @@ class RawPreviewProducerAuthorityPolicyTest {
     }
 
     @Test
+    fun `downstream revocation restores canonical and blocks late failed frame from regranting`() {
+        val tracker = RawPreviewProducerAuthorityTracker()
+        tracker.reset(7)
+        tracker.customRendererPublished(7)
+        assertTrue(tracker.customFramePresented(7, 100L))
+        assertTrue(tracker.maySuppressCanonical(7, customInputFresh = true))
+
+        assertTrue(tracker.revokeCustomPresentation(7, throughSensorTimestampNs = 120L))
+        assertFalse(tracker.maySuppressCanonical(7, customInputFresh = true))
+        assertTrue(tracker.diagnosticSummary(7).contains("customAuthorityRevocations=1"))
+
+        assertFalse(tracker.customFramePresented(7, 120L))
+        assertFalse(tracker.maySuppressCanonical(7, customInputFresh = true))
+        assertTrue(tracker.customFramePresented(7, 121L))
+        assertTrue(tracker.maySuppressCanonical(7, customInputFresh = true))
+    }
+
+    @Test
+    fun `revoking absent authority is a no-op`() {
+        val tracker = RawPreviewProducerAuthorityTracker()
+        tracker.reset(7)
+        assertFalse(tracker.revokeCustomPresentation(7))
+        assertTrue(tracker.diagnosticSummary(7).contains("customAuthorityRevocations=0"))
+    }
+
+    @Test
     fun `stale custom input never suppresses canonical even after presentation`() {
         val tracker = RawPreviewProducerAuthorityTracker()
         tracker.reset(7)

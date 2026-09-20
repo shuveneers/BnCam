@@ -13,16 +13,18 @@ class Phase5SpatialExposureSourceContractTest {
     private fun source(relative: String): String = File(appDir, relative).readText()
 
     @Test
-    fun `raw capture exposure has one Vulkan spatial owner`() {
+    fun `raw finalize spatial exposure is retired while phase11f owns global development placement`() {
         val isp = source("src/main/cpp/IspCore.cpp")
         val backend = source("src/main/cpp/vulkan/VulkanSpectraRawFinalizeBackend.cpp")
         val shader = source("src/main/cpp/vulkan/shaders/spectra_raw_finalize.comp")
+        val globalPolicy = source("src/main/cpp/GlobalSceneExposurePolicy.h")
 
-        assertTrue(isp.contains("const float automaticExposureGain = isRawBayer ? 1.0f"))
-        assertTrue(isp.contains("DISABLED_PHASE5_EXPOSURE_SINGLE_OWNER"))
-        assertTrue(backend.contains("push.mode = 3u;"))
-        assertTrue(backend.contains("push.mode = 4u;"))
-        assertTrue(backend.contains("push.mode = 5u;"))
+        // Compatibility implementation remains buildable, but production IspCore does not enable it.
+        assertTrue(isp.contains("request.adaptiveExposureEnabled = false"))
+        assertTrue(isp.contains("automaticPostDemosaicExposureOwner=GLOBAL_SCENE_EXPOSURE_PLAN_PHASE11F"))
+        assertTrue(isp.contains("automaticGlobalSceneEv=") && isp.contains("globalSceneExposurePlan.appliedEv"))
+        assertTrue(globalPolicy.contains("single automatic JPEG-development exposure owner"))
+        assertTrue(backend.contains("if (request.adaptiveExposureEnabled)"))
         assertTrue(shader.contains("outputMosaic[index] = sceneClamp(value * exp2(ev));"))
         assertTrue(shader.contains("EXP_SUMMARY_POS_FRAC"))
         assertTrue(shader.contains("EXP_SUMMARY_NEU_FRAC"))
@@ -30,21 +32,31 @@ class Phase5SpatialExposureSourceContractTest {
     }
 
     @Test
-    fun `raw preview shares physical signed exposure ownership`() {
+    fun `raw preview retires duplicate spatial exposure and uses lightweight FLLF`() {
         val manager = source("src/main/java/com/bncam/core/engine/BnCameraManager.kt")
         val backend = source("src/main/cpp/vulkan/VulkanRawPreviewBackend.cpp")
-        val shader = source("src/main/cpp/vulkan/shaders/raw_preview.comp")
+        val full = source("src/main/cpp/vulkan/shaders/raw_preview.comp")
+        val fast = source("src/main/cpp/vulkan/shaders/raw_preview_image.comp")
+        val renderer = source("src/main/java/com/bncam/ui/screens/capture/RawPreviewRenderer.kt")
 
         assertTrue(manager.contains("val previewExposureGain = 1.0f"))
-        assertFalse(manager.contains("1.2f + 0.8f * (sensitivityIso.coerceAtMost(1600)"))
         assertTrue(manager.contains("physicalGreenNoiseSo"))
         assertTrue(manager.contains("CaptureResult.SENSOR_NOISE_PROFILE"))
-        assertTrue(backend.contains("(5u << 8u)"))
-        assertTrue(backend.contains("(6u << 8u)"))
-        assertFalse(backend.contains("(3u << 8u)"))
-        assertTrue(shader.contains("sensorRgb *= exp2(spatialExposureEvAtPreview(gid));"))
-        assertTrue(shader.indexOf("sensorRgb *= exp2(spatialExposureEvAtPreview(gid));") <
-            shader.indexOf("vec3 rgb = colorTransform(sensorRgb);"))
+
+        assertTrue(backend.contains("push.cfaAndMode = packedMode(3u)"))
+        assertFalse(backend.contains("push.cfaAndMode = packedMode(5u)"))
+        assertFalse(backend.contains("push.cfaAndMode = packedMode(6u)"))
+        assertTrue(backend.contains("VkBufferMemoryBarrier localToneBarrier"))
+
+        listOf(full, fast).forEach { shader ->
+            assertTrue(shader.contains("else if (mode == 3u) buildPreviewFllfBase"))
+            assertFalse(shader.contains("mode == 5u"))
+            assertFalse(shader.contains("mode == 6u"))
+            assertFalse(shader.contains("sensorRgb *= exp2(spatialExposureEvAtPreview(gid));"))
+        }
+        assertFalse(full.contains("applyPreviewBroadShadowPlacement("))
+        assertFalse(fast.contains("logSceneShape("))
+        assertTrue(renderer.contains("legacySpatialExposure=RETIRED_PHASE11G"))
     }
 
     @Test
@@ -53,17 +65,20 @@ class Phase5SpatialExposureSourceContractTest {
         val native = source("src/main/cpp/native-lib.cpp")
         val renderer = source("src/main/java/com/bncam/ui/screens/capture/RawPreviewRenderer.kt")
 
-        assertTrue(backend.contains("PREVIEW_ANALYSIS_NV21_START_WORD == 31499u"))
+        assertTrue(backend.contains("PREVIEW_HIGHLIGHT_TELEMETRY_START_WORD == 31499u"))
+        assertTrue(backend.contains("PREVIEW_ANALYSIS_NV21_START_WORD == 31512u"))
         assertTrue(native.contains("SPATIAL_EXPOSURE_DIAGNOSTICS_COUNT = 12"))
         assertTrue(renderer.contains("result.getOrElse(613)"))
         assertTrue(renderer.contains("result.getOrElse(624)"))
     }
 
     @Test
-    fun `cpu adaptive exposure is failure reference only`() {
-        val isp = source("src/main/cpp/IspCore.cpp")
-        assertTrue(isp.contains("Failure/reference only"))
-        assertTrue(isp.countSubstring("bncam::raw_exposure::resolve(") == 1)
+    fun `cpu adaptive preview exposure remains compile guarded fallback only`() {
+        val preview = source("src/main/cpp/RawPreview.cpp")
+        assertTrue(preview.contains("#if defined(BNCAM_ENABLE_RAW_PREVIEW_CPU_REFERENCE)"))
+        assertTrue(preview.contains("PreviewExposureResult resolvePreviewExposure("))
+        assertTrue(preview.countSubstring("resolvePreviewExposure(") == 2)
+        assertTrue(preview.contains("#endif  // BNCAM_ENABLE_RAW_PREVIEW_CPU_REFERENCE"))
     }
 
     private fun String.countSubstring(needle: String): Int {

@@ -6,6 +6,7 @@
 #include <vulkan/vulkan.h>
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
@@ -111,6 +112,9 @@ struct RawPreviewGpuRequest {
     // Optional compact 4x-decimated luma plane for QR/tracking. Heavy RGB->luma work stays on GPU.
     std::uint8_t* analysisNv21 = nullptr;
     std::size_t analysisNv21CapacityBytes = 0;
+    // Phase 11A: CPU statistics/readback is a low-cadence sidecar. Display submissions may skip
+    // the statistics copy while the shader keeps all image-domain work on the GPU.
+    bool analysisReadbackRequested = true;
     std::uint32_t frameSlotIndex = 0;
 };
 
@@ -121,6 +125,12 @@ struct RawPreviewGpuResult {
     bool directHostInputUsed = false;
     bool directHardwareBufferInputUsed = false;
     bool gpuResidentOutputUsed = false;
+    // Async preview protocol: execute() only submits. pollCompletion() resolves the exact slot
+    // without a host-side fence wait. success=true is reserved for completed/presentable output.
+    bool submitted = false;
+    bool completionPending = false;
+    bool analysisReadbackPerformed = false;
+    std::uint64_t submissionId = 0u;
     std::uint32_t inputAhbFormat = 0;
     std::uint64_t inputAhbUsage = 0;
     // 0=not probed, 1=direct imported, 2=AHB contract not byte-addressable,
@@ -152,14 +162,21 @@ struct RawPreviewGpuResult {
     float queueMutexWaitMs = 0.0f;
     float queueSubmitCallMs = 0.0f;
     float fenceWaitMs = 0.0f;
+    float targetExposureGain = 1.0f;
     float exposureGain = 1.0f;
+    float previewRequestedEv = 0.0f;
+    float previewHighlightLimitedEv = 0.0f;
+    float previewAppliedEv = 0.0f;
+    float previewSceneKey = 0.148f;
+    float previewHighlightHeadroomEv = 0.0f;
+    float previewSceneRangeEv = 0.0f;
     float sceneMidtone = 0.0f;
-    float sceneMidtoneTarget = 0.155f;
+    float sceneMidtoneTarget = 0.148f;
     float gtmShoulderStart = 0.72f;
     float gtmShoulderStrength = 0.90f;
-    float gtmBlackAnchor = 0.0065f;
-    float gtmLowerMidLift = 0.0f;
-    float gtmContrastStrength = 0.10f;
+    float gtmHighlightPressure = 0.0f;
+    float gtmP95CompressionEv = 0.0f;
+    float gtmP99CompressionEv = 0.0f;
     float gtmDynamicRangePressure = 0.0f;
     float ltmStrength = 0.05f;
     float ltmMaxLiftEv = 0.18f;
@@ -175,6 +192,13 @@ struct RawPreviewGpuResult {
     std::array<std::uint32_t, 64> displayBHistogram64{};
     std::uint32_t rawNearClipSampleCount = 0;
     std::uint32_t rawSampleCount = 0;
+    std::uint32_t rawTrueSaturatedSampleCount = 0;
+    std::uint32_t rawRClipSampleCount = 0;
+    std::uint32_t rawGClipSampleCount = 0;
+    std::uint32_t rawBClipSampleCount = 0;
+    std::uint32_t highlightReconstructedSampleCount = 0;
+    std::uint32_t postWbClipSampleCount = 0;
+    std::uint32_t postCcmClipSampleCount = 0;
     std::uint32_t displayRClipSampleCount = 0;
     std::uint32_t displayGClipSampleCount = 0;
     std::uint32_t displayBClipSampleCount = 0;
@@ -227,6 +251,17 @@ public:
             std::mutex* queueSubmissionMutex,
             const RawPreviewGpuRequest& request) noexcept;
 
+    /** Non-blocking completion probe for one previously submitted preview slot. */
+    RawPreviewGpuResult pollCompletion(
+            VkPhysicalDevice physicalDevice,
+            VkDevice device,
+            VulkanAllocatorOwner& allocatorOwner,
+            std::uint32_t frameSlotIndex,
+            std::uint64_t submissionId) noexcept;
+
+    /** Bounded teardown-only drain for submitted preview slots. Never used by the display path. */
+    bool waitForIdle(VkDevice device, std::uint64_t timeoutNs) noexcept;
+
     void destroy(VkDevice device) noexcept;
 
 private:
@@ -262,12 +297,39 @@ private:
         VkFence fence = VK_NULL_HANDLE;
         VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
         VkDescriptorSet imageDescriptorSet = VK_NULL_HANDLE;
+        // Every mutable resource is slot-local. A second preview submission may therefore execute
+        // while an older slot is still owned by the GPU without buffer/descriptor aliasing.
+        PersistentBuffer inputStaging;
+        PersistentBuffer deviceInput;
+        PersistentBuffer toneLutBuffer;
+        PersistentBuffer deviceStatistics;
+        PersistentBuffer localToneBase;
+        PersistentBuffer hueSatProfile;
         PersistentBuffer deviceOutput;
         PersistentBuffer outputReadback;
         ImportedInputBuffer importedInput;
         ImportedOutputImage importedOutput;
         bool fenceSubmitted = false;
         AHardwareBuffer* boundHardwareBuffer = nullptr;
+
+        std::uint64_t submissionId = 0u;
+        bool gpuResidentOutput = false;
+        bool analysisReadbackRequested = false;
+        bool compactAnalysisRequested = false;
+        std::uint64_t rgbaBytes = 0u;
+        std::uint64_t statisticsBytes = 0u;
+        std::uint64_t readbackBytes = 0u;
+        std::uint32_t previewWidth = 0u;
+        std::uint32_t previewHeight = 0u;
+        std::uint32_t analysisWidth = 0u;
+        std::uint32_t analysisHeight = 0u;
+        std::uint8_t* outputRgba = nullptr;
+        std::uint8_t* analysisNv21 = nullptr;
+        std::size_t outputCapacityBytes = 0u;
+        std::size_t analysisNv21CapacityBytes = 0u;
+        float profileToneExposure = 0.0f;
+        std::chrono::steady_clock::time_point submittedAt{};
+        RawPreviewGpuResult submittedDiagnostics{};
     };
 
     bool initializeLocked(VkDevice device, VkCommandPool commandPool,
@@ -306,20 +368,16 @@ private:
     VkPipeline imagePipeline_ = VK_NULL_HANDLE;
     VkDescriptorPool descriptorPool_ = VK_NULL_HANDLE;
     VkQueryPool queryPool_ = VK_NULL_HANDLE;
-    // Scalar temporal state only. The statistics buffer is cleared every frame, so the previous
-    // implementation's shader-side EMA always re-read zero and never actually smoothed.
-    float previousExposureGain_ = 0.0f;
+    // Phase 11C: one tiny GPU-resident scalar shared across submissions. The compute queue is
+    // ordered and a shader-write -> shader-read barrier protects it, so temporal exposure smoothing
+    // never depends on the 10 Hz CPU analysis sidecar. Full-frame mutable resources remain slot-local.
+    PersistentBuffer previewExposureState_;
     VmaAllocator allocator_ = nullptr;
     std::uint32_t currentFrameSlot_ = 0u;
     std::array<FrameSlot, RAW_PREVIEW_FRAMES_IN_FLIGHT> slots_;
-    PersistentBuffer inputStaging_;
-    PersistentBuffer deviceInput_;
-    PersistentBuffer toneLutBuffer_;
-    PersistentBuffer deviceStatistics_;
-    PersistentBuffer localToneBase_;
-    // Header (16 floats) + one or two validated dense DNG HSM tables. Kept resident/reused across
-    // preview frames; the CPU only uploads compact immutable profile data when executing a frame.
-    PersistentBuffer hueSatProfile_;
+    std::uint64_t nextSubmissionId_ = 1u;
+    RawPreviewGpuResult lastAnalysisResult_{};
+    bool hasLastAnalysisResult_ = false;
 };
 
 }  // namespace bncam::vulkan

@@ -9,7 +9,7 @@ package com.bncam.core.engine
 enum class SessionOutputFailureKind {
     NONE,
     OPTIONAL_CUSTOM_RAW_OUTPUT,
-    VENDOR_SESSION_MODE,
+    NON_REGULAR_OPERATION_MODE,
     PREVIEW_OUTPUT_REJECTED,
     CAPTURE_OUTPUT_REJECTED,
     CORE_OUTPUT_COMBINATION_REJECTED,
@@ -23,7 +23,7 @@ enum class SessionOutputRecoveryAction {
     NONE,
     RETRY_WITHOUT_OPTIONAL_CUSTOM_RAW,
     ADVANCE_CAPTURE_GEOMETRY,
-    DEFER_TO_VENDOR_SESSION_AUTHORITY,
+    DEFER_TO_OPERATION_MODE_AUTHORITY,
     FAIL_WITHOUT_GEOMETRY_RETRY
 }
 
@@ -57,8 +57,8 @@ object SessionOutputCombinationRecoveryPolicy {
         SessionOutputFailureKind.NONE -> SessionOutputRecoveryAction.NONE
         SessionOutputFailureKind.OPTIONAL_CUSTOM_RAW_OUTPUT ->
             SessionOutputRecoveryAction.RETRY_WITHOUT_OPTIONAL_CUSTOM_RAW
-        SessionOutputFailureKind.VENDOR_SESSION_MODE ->
-            SessionOutputRecoveryAction.DEFER_TO_VENDOR_SESSION_AUTHORITY
+        SessionOutputFailureKind.NON_REGULAR_OPERATION_MODE ->
+            SessionOutputRecoveryAction.DEFER_TO_OPERATION_MODE_AUTHORITY
         SessionOutputFailureKind.CAPTURE_OUTPUT_REJECTED,
         SessionOutputFailureKind.CORE_OUTPUT_COMBINATION_REJECTED,
         SessionOutputFailureKind.RUNTIME_REJECTED_DESPITE_PREFLIGHT,

@@ -1,6 +1,7 @@
 package com.bncam.ui.screens.capture
 
 import java.io.File
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -26,6 +27,26 @@ class RawPreviewCadenceLayerSeparationSourceContractTest {
         assertTrue(cadence.contains("rendererPublicationNs"))
         assertTrue(cadence.contains("fun rendererPublished("))
         assertTrue(renderer.contains("RawPreviewCadenceDiagnostics.rendererPublished("))
+    }
+
+    @Test
+    fun cadenceFrameKeyIncludesProducerAndCsvPublishesProvenance() {
+        assertTrue(cadence.contains("private data class FrameKey("))
+        assertTrue(cadence.contains("val producerKind: RawPreviewProducerKind"))
+        assertTrue(cadence.contains("FrameKey(sensorTimestampNs, producerKind)"))
+        assertTrue(cadence.contains("sensorTimestampNs,producerKind,sourceArrivalNs"))
+        assertTrue(cadence.contains("producerCadence="))
+    }
+
+    @Test
+    fun rendererDuplicateSuppressionIsPerProducerNotGlobal() {
+        assertTrue(renderer.contains("RawPreviewProducerTimestampGate()"))
+        assertTrue(renderer.contains("producerTimestampGate.accept(producerKind, sensorTimestampNs)"))
+        assertTrue(renderer.contains("producerTimestampGate.reset()"))
+        assertFalse(renderer.contains("private val latestOfferedSensorTimestampNs"))
+        assertTrue(renderer.contains("exactFrameColorPairs[request.sensorTimestampNs]"))
+        assertFalse(renderer.contains("exactFrameColorPairs.remove(request.sensorTimestampNs)"))
+        assertFalse(renderer.contains("exactFrameColorPairs.remove(dropped.sensorTimestampNs)"))
     }
 
     @Test

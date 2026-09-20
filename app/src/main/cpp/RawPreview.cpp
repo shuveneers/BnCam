@@ -375,6 +375,196 @@ void toneAndPackPreview(
 
 }  // namespace
 
+
+static RawPreviewResult finalizeGpuPreviewResult(
+        const bncam::vulkan::RawPreviewGpuResult& previewGpu,
+        const float camera2PriorWbGains[4],
+        int previewWidth,
+        int previewHeight,
+        std::size_t previewPixelCount,
+        std::uint8_t* outputRgba,
+        const std::chrono::steady_clock::time_point& started) {
+    RawPreviewResult result{};
+    result.submitted = previewGpu.submitted;
+    result.completionPending = previewGpu.completionPending;
+    result.analysisReadbackPerformed = previewGpu.analysisReadbackPerformed;
+    result.submissionId = previewGpu.submissionId;
+    result.frameSlotIndex = static_cast<int>(previewGpu.activeSlotIndex);
+
+        std::vector<bncam::awb::LinearOpponentSample> awbSamples;
+        awbSamples.reserve(previewGpu.awbSampleCount);
+        for (const auto& sample : previewGpu.awbSamples) {
+            if (!sample.valid) continue;
+            awbSamples.push_back({
+                    static_cast<double>(sample.luma),
+                    static_cast<double>(sample.redMinusGreen),
+                    static_cast<double>(sample.blueMinusGreen),
+                    static_cast<double>(sample.structure),
+                    static_cast<int>(sample.tileIndex)});
+        }
+        const float priorGreen = std::max(1.0e-4f, 0.5f *
+                (camera2PriorWbGains[1] + camera2PriorWbGains[2]));
+        const std::array<double, 3> camera2PriorRgb{
+                static_cast<double>(camera2PriorWbGains[0] / priorGreen),
+                1.0,
+                static_cast<double>(camera2PriorWbGains[3] / priorGreen)};
+        // No calibrated preview-domain sigma is available at this boundary yet. Pass zero rather
+        // than pretending an ISO heuristic is sensor calibration; the estimator then uses its
+        // conservative absolute dark floor. Cross-device noise-model coupling remains a later phase.
+        const auto awbEstimate = bncam::awb::resolve(awbSamples, camera2PriorRgb, 0.0);
+        for (int channel = 0; channel < 3; ++channel) {
+            result.awbPriorGainsRgb[channel] = static_cast<float>(awbEstimate.priorGainsRgb[channel]);
+            result.awbDataGainsRgb[channel] = static_cast<float>(awbEstimate.dataGainsRgb[channel]);
+            result.awbFinalGainsRgb[channel] = static_cast<float>(awbEstimate.finalGainsRgb[channel]);
+        }
+        result.awbConfidence = static_cast<float>(awbEstimate.confidence);
+        result.awbDataAuthority = static_cast<float>(awbEstimate.dataAuthority);
+        result.awbNeutralSupport = static_cast<float>(awbEstimate.neutralSupport);
+        result.awbMixedLightScore = static_cast<float>(awbEstimate.mixedLightScore);
+        result.awbPriorDisagreement = static_cast<float>(awbEstimate.priorDisagreement);
+        result.awbValidTileCount = static_cast<int>(awbEstimate.validTileCount);
+        result.awbAcceptedSampleCount = static_cast<int>(awbEstimate.acceptedSampleCount);
+        // Phase 11A decouples display cadence from CPU statistics readback. Cached AWB samples are
+        // intentionally exposed on intervening frames for diagnostics, but they must not look like
+        // fresh estimator evidence or they would advance the temporal AWB owner at display rate.
+        result.awbDataReady = previewGpu.analysisReadbackPerformed && awbEstimate.dataReady;
+
+        result.normalizedRawMin = previewGpu.normalizedRawMin;
+        result.normalizedRawMax = previewGpu.normalizedRawMax;
+        result.targetExposureGain = previewGpu.targetExposureGain;
+        result.appliedExposureGain = previewGpu.exposureGain;
+        result.previewRequestedEv = previewGpu.previewRequestedEv;
+        result.previewHighlightLimitedEv = previewGpu.previewHighlightLimitedEv;
+        result.previewAppliedEv = previewGpu.previewAppliedEv;
+        result.previewSceneKey = previewGpu.previewSceneKey;
+        result.previewHighlightHeadroomEv = previewGpu.previewHighlightHeadroomEv;
+        result.previewSceneRangeEv = previewGpu.previewSceneRangeEv;
+        result.sceneMidtone = previewGpu.sceneMidtone;
+        result.sceneMidtoneTarget = previewGpu.sceneMidtoneTarget;
+        result.gtmShoulderStart = previewGpu.gtmShoulderStart;
+        result.gtmShoulderStrength = previewGpu.gtmShoulderStrength;
+        result.gtmHighlightPressure = previewGpu.gtmHighlightPressure;
+        result.gtmP95CompressionEv = previewGpu.gtmP95CompressionEv;
+        result.gtmP99CompressionEv = previewGpu.gtmP99CompressionEv;
+        result.gtmDynamicRangePressure = previewGpu.gtmDynamicRangePressure;
+        result.ltmStrength = previewGpu.ltmStrength;
+        result.ltmMaxLiftEv = previewGpu.ltmMaxLiftEv;
+        result.ltmMaxCompressEv = previewGpu.ltmMaxCompressEv;
+        result.commonHighlightScalePixels = previewGpu.commonHighlightScalePixels;
+        std::copy(previewGpu.linearLumaHistogram.begin(), previewGpu.linearLumaHistogram.end(),
+                  std::begin(result.linearLumaHistogram));
+        std::copy(previewGpu.displayLumaHistogram.begin(), previewGpu.displayLumaHistogram.end(),
+                  std::begin(result.displayLumaHistogram));
+        std::copy(previewGpu.displayLumaHistogram64.begin(), previewGpu.displayLumaHistogram64.end(),
+                  std::begin(result.displayLumaHistogram64));
+        std::copy(previewGpu.displayRHistogram64.begin(), previewGpu.displayRHistogram64.end(),
+                  std::begin(result.displayRHistogram64));
+        std::copy(previewGpu.displayGHistogram64.begin(), previewGpu.displayGHistogram64.end(),
+                  std::begin(result.displayGHistogram64));
+        std::copy(previewGpu.displayBHistogram64.begin(), previewGpu.displayBHistogram64.end(),
+                  std::begin(result.displayBHistogram64));
+        result.rawNearClipSampleCount = previewGpu.rawNearClipSampleCount;
+        result.rawSampleCount = previewGpu.rawSampleCount;
+        result.rawTrueSaturatedSampleCount = previewGpu.rawTrueSaturatedSampleCount;
+        result.rawRClipSampleCount = previewGpu.rawRClipSampleCount;
+        result.rawGClipSampleCount = previewGpu.rawGClipSampleCount;
+        result.rawBClipSampleCount = previewGpu.rawBClipSampleCount;
+        result.highlightReconstructedSampleCount = previewGpu.highlightReconstructedSampleCount;
+        result.postWbClipSampleCount = previewGpu.postWbClipSampleCount;
+        result.postCcmClipSampleCount = previewGpu.postCcmClipSampleCount;
+        result.displayRClipSampleCount = previewGpu.displayRClipSampleCount;
+        result.displayGClipSampleCount = previewGpu.displayGClipSampleCount;
+        result.displayBClipSampleCount = previewGpu.displayBClipSampleCount;
+        result.displayShadowSampleCount = previewGpu.displayShadowSampleCount;
+        result.displayHighlightSampleCount = previewGpu.displayHighlightSampleCount;
+        result.displaySampleCount = previewGpu.displaySampleCount;
+        result.displayHighlightX = previewGpu.displayHighlightX;
+        result.displayHighlightY = previewGpu.displayHighlightY;
+        result.exposureTileCount = previewGpu.exposureTileCount;
+        result.exposureSceneP10 = previewGpu.exposureSceneP10;
+        result.exposureSceneP25 = previewGpu.exposureSceneP25;
+        result.exposureSceneP50 = previewGpu.exposureSceneP50;
+        result.exposureSceneP75 = previewGpu.exposureSceneP75;
+        result.exposureSceneP90 = previewGpu.exposureSceneP90;
+        result.exposureSceneP95 = previewGpu.exposureSceneP95;
+        result.exposureSceneP99 = previewGpu.exposureSceneP99;
+        result.exposureMeasuredSceneDrEv = previewGpu.exposureMeasuredSceneDrEv;
+        result.exposureLowerNeutralBoundaryEv = previewGpu.exposureLowerNeutralBoundaryEv;
+        result.exposureUpperNeutralBoundaryEv = previewGpu.exposureUpperNeutralBoundaryEv;
+        result.exposureSpatialAuthority = previewGpu.exposureSpatialAuthority;
+        result.analysisNv21Width = static_cast<int>(previewGpu.analysisNv21Width);
+        result.analysisNv21Height = static_cast<int>(previewGpu.analysisNv21Height);
+        result.rawUnpackMicroseconds = static_cast<int>(previewGpu.inputPackingMs * 1000.0f);
+        result.demosaicMicroseconds = static_cast<int>(previewGpu.kernelMs * 1000.0f);
+        result.colorMicroseconds = static_cast<int>(
+                std::max(0.0f, previewGpu.synchronizationMs - previewGpu.kernelMs) * 1000.0f);
+        result.tonePackMicroseconds = static_cast<int>(
+                previewGpu.readbackMs * 1000.0f);
+        result.backendMutexWaitMicroseconds = static_cast<int>(std::lround(previewGpu.backendMutexWaitMs * 1000.0f));
+        result.backendInitializationPerformed = previewGpu.backendInitializationPerformed;
+        result.backendInitializationMicroseconds = static_cast<int>(std::lround(previewGpu.backendInitializationMs * 1000.0f));
+        result.spirvLookupMicroseconds = static_cast<int>(std::lround(previewGpu.spirvLookupMs * 1000.0f));
+        result.descriptorLayoutMicroseconds = static_cast<int>(std::lround(previewGpu.descriptorLayoutMs * 1000.0f));
+        result.pipelineLayoutMicroseconds = static_cast<int>(std::lround(previewGpu.pipelineLayoutMs * 1000.0f));
+        result.shaderModuleMicroseconds = static_cast<int>(std::lround(previewGpu.shaderModuleMs * 1000.0f));
+        result.pipelineCacheMutexWaitMicroseconds = static_cast<int>(std::lround(previewGpu.pipelineCacheMutexWaitMs * 1000.0f));
+        result.pipelineCachePresent = previewGpu.pipelineCachePresent;
+        result.computePipelineMicroseconds = static_cast<int>(std::lround(previewGpu.computePipelineMs * 1000.0f));
+        result.imageSpirvLookupMicroseconds = static_cast<int>(std::lround(previewGpu.imageSpirvLookupMs * 1000.0f));
+        result.imageShaderModuleMicroseconds = static_cast<int>(std::lround(previewGpu.imageShaderModuleMs * 1000.0f));
+        result.imageComputePipelineMicroseconds = static_cast<int>(std::lround(previewGpu.imageComputePipelineMs * 1000.0f));
+        result.descriptorCommandResourcesMicroseconds = static_cast<int>(std::lround(previewGpu.descriptorCommandResourcesMs * 1000.0f));
+        result.inputAhbProbeMicroseconds = static_cast<int>(std::lround(previewGpu.inputAhbProbeMs * 1000.0f));
+        result.outputAhbImportMicroseconds = static_cast<int>(std::lround(previewGpu.outputAhbImportMs * 1000.0f));
+        result.commandRecordMicroseconds = static_cast<int>(std::lround(previewGpu.commandRecordMs * 1000.0f));
+        result.queueMutexWaitMicroseconds = static_cast<int>(std::lround(previewGpu.queueMutexWaitMs * 1000.0f));
+        result.queueSubmitCallMicroseconds = static_cast<int>(std::lround(previewGpu.queueSubmitCallMs * 1000.0f));
+        result.fenceWaitMicroseconds = static_cast<int>(std::lround(previewGpu.fenceWaitMs * 1000.0f));
+
+        if (!previewGpu.gpuResidentOutputUsed && outputRgba != nullptr) {
+            int minimum = 255;
+            int maximum = 0;
+            std::uint64_t sum = 0u;
+            std::uint64_t count = 0u;
+            const std::size_t pixelCount = previewPixelCount;
+            const std::size_t diagnosticStep = std::max<std::size_t>(1u, pixelCount / 4096u);
+            for (std::size_t pixel = 0u; pixel < pixelCount; pixel += diagnosticStep) {
+                const std::uint8_t* rgba = outputRgba + pixel * 4u;
+                for (int channel = 0; channel < 3; ++channel) {
+                    const int value = rgba[channel];
+                    minimum = std::min(minimum, value);
+                    maximum = std::max(maximum, value);
+                    sum += static_cast<std::uint64_t>(value);
+                    ++count;
+                }
+            }
+            result.outputRgbMin = static_cast<float>(minimum) / 255.0f;
+            result.outputRgbMax = static_cast<float>(maximum) / 255.0f;
+            result.outputRgbMean = count > 0u
+                    ? static_cast<float>(sum) / static_cast<float>(count * 255u) : 0.0f;
+        } else {
+            // Full-frame RGB diagnostics must not force a GPU->CPU readback. Keep the image plane
+            // resident and expose compact shader statistics separately when needed.
+            result.outputRgbMin = -1.0f;
+            result.outputRgbMax = -1.0f;
+            result.outputRgbMean = -1.0f;
+        }
+        result.vulkanStagesUsed = true;
+        result.directHostInputUsed = previewGpu.directHostInputUsed;
+        result.directHardwareBufferInputUsed = previewGpu.directHardwareBufferInputUsed;
+        result.gpuResidentOutputUsed = previewGpu.gpuResidentOutputUsed;
+        result.inputAhbFormat = previewGpu.inputAhbFormat;
+        result.inputAhbUsage = previewGpu.inputAhbUsage;
+        result.inputInteropStatus = previewGpu.inputInteropStatus;
+        result.success = true;
+        result.width = previewWidth;
+        result.height = previewHeight;
+        result.renderMicroseconds = static_cast<int>(std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - started).count());
+        return result;
+    
+}
+
 RawPreviewResult renderRawPreviewRgba(
         AHardwareBuffer* buffer,
         const RawPreviewParameters& parameters,
@@ -382,7 +572,8 @@ RawPreviewResult renderRawPreviewRgba(
         std::uint8_t* outputRgba,
         std::size_t outputCapacityBytes,
         std::uint8_t* analysisNv21,
-        std::size_t analysisNv21CapacityBytes
+        std::size_t analysisNv21CapacityBytes,
+        bool analysisReadbackRequested
 ) {
     const auto started = std::chrono::steady_clock::now();
     RawPreviewResult result{};
@@ -591,8 +782,36 @@ RawPreviewResult renderRawPreviewRgba(
     previewRequest.outputCapacityBytes = outputCapacityBytes;
     previewRequest.analysisNv21 = analysisNv21;
     previewRequest.analysisNv21CapacityBytes = analysisNv21CapacityBytes;
+    previewRequest.analysisReadbackRequested = analysisReadbackRequested;
     auto& runtime = bncam::vulkan::VulkanRuntime::instance();
     const auto previewGpu = runtime.executeRawPreview(previewRequest);
+    if (previewGpu.submitted && previewGpu.completionPending) {
+        result.submitted = true;
+        result.completionPending = true;
+        result.analysisReadbackPerformed = false;
+        result.submissionId = previewGpu.submissionId;
+        result.frameSlotIndex = static_cast<int>(previewGpu.activeSlotIndex);
+        result.width = previewWidth;
+        result.height = previewHeight;
+        result.cfaCellDecimation = cellDecimation;
+        result.vulkanStagesUsed = true;
+        result.directHostInputUsed = previewGpu.directHostInputUsed;
+        result.directHardwareBufferInputUsed = previewGpu.directHardwareBufferInputUsed;
+        result.gpuResidentOutputUsed = previewGpu.gpuResidentOutputUsed;
+        result.inputAhbFormat = previewGpu.inputAhbFormat;
+        result.inputAhbUsage = previewGpu.inputAhbUsage;
+        result.inputInteropStatus = previewGpu.inputInteropStatus;
+        result.commandRecordMicroseconds = static_cast<int>(
+                std::lround(previewGpu.commandRecordMs * 1000.0f));
+        result.queueMutexWaitMicroseconds = static_cast<int>(
+                std::lround(previewGpu.queueMutexWaitMs * 1000.0f));
+        result.queueSubmitCallMicroseconds = static_cast<int>(
+                std::lround(previewGpu.queueSubmitCallMs * 1000.0f));
+        result.renderMicroseconds = static_cast<int>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - started).count());
+        return result;
+    }
     if (!previewGpu.success) {
         __android_log_print(
                 ANDROID_LOG_ERROR, "BnCamRawPreview",
@@ -607,161 +826,9 @@ RawPreviewResult renderRawPreviewRgba(
         return result;
     }
     if (previewGpu.success) {
-        std::vector<bncam::awb::LinearOpponentSample> awbSamples;
-        awbSamples.reserve(previewGpu.awbSampleCount);
-        for (const auto& sample : previewGpu.awbSamples) {
-            if (!sample.valid) continue;
-            awbSamples.push_back({
-                    static_cast<double>(sample.luma),
-                    static_cast<double>(sample.redMinusGreen),
-                    static_cast<double>(sample.blueMinusGreen),
-                    static_cast<double>(sample.structure),
-                    static_cast<int>(sample.tileIndex)});
-        }
-        const float priorGreen = std::max(1.0e-4f, 0.5f *
-                (parameters.camera2PriorWbGains[1] + parameters.camera2PriorWbGains[2]));
-        const std::array<double, 3> camera2PriorRgb{
-                static_cast<double>(parameters.camera2PriorWbGains[0] / priorGreen),
-                1.0,
-                static_cast<double>(parameters.camera2PriorWbGains[3] / priorGreen)};
-        // No calibrated preview-domain sigma is available at this boundary yet. Pass zero rather
-        // than pretending an ISO heuristic is sensor calibration; the estimator then uses its
-        // conservative absolute dark floor. Cross-device noise-model coupling remains a later phase.
-        const auto awbEstimate = bncam::awb::resolve(awbSamples, camera2PriorRgb, 0.0);
-        for (int channel = 0; channel < 3; ++channel) {
-            result.awbPriorGainsRgb[channel] = static_cast<float>(awbEstimate.priorGainsRgb[channel]);
-            result.awbDataGainsRgb[channel] = static_cast<float>(awbEstimate.dataGainsRgb[channel]);
-            result.awbFinalGainsRgb[channel] = static_cast<float>(awbEstimate.finalGainsRgb[channel]);
-        }
-        result.awbConfidence = static_cast<float>(awbEstimate.confidence);
-        result.awbDataAuthority = static_cast<float>(awbEstimate.dataAuthority);
-        result.awbNeutralSupport = static_cast<float>(awbEstimate.neutralSupport);
-        result.awbMixedLightScore = static_cast<float>(awbEstimate.mixedLightScore);
-        result.awbPriorDisagreement = static_cast<float>(awbEstimate.priorDisagreement);
-        result.awbValidTileCount = static_cast<int>(awbEstimate.validTileCount);
-        result.awbAcceptedSampleCount = static_cast<int>(awbEstimate.acceptedSampleCount);
-        result.awbDataReady = awbEstimate.dataReady;
-
-        result.normalizedRawMin = previewGpu.normalizedRawMin;
-        result.normalizedRawMax = previewGpu.normalizedRawMax;
-        result.targetExposureGain = previewGpu.exposureGain;
-        result.appliedExposureGain = previewGpu.exposureGain;
-        result.sceneMidtone = previewGpu.sceneMidtone;
-        result.sceneMidtoneTarget = previewGpu.sceneMidtoneTarget;
-        result.gtmShoulderStart = previewGpu.gtmShoulderStart;
-        result.gtmShoulderStrength = previewGpu.gtmShoulderStrength;
-        result.gtmBlackAnchor = previewGpu.gtmBlackAnchor;
-        result.gtmLowerMidLift = previewGpu.gtmLowerMidLift;
-        result.gtmContrastStrength = previewGpu.gtmContrastStrength;
-        result.gtmDynamicRangePressure = previewGpu.gtmDynamicRangePressure;
-        result.ltmStrength = previewGpu.ltmStrength;
-        result.ltmMaxLiftEv = previewGpu.ltmMaxLiftEv;
-        result.ltmMaxCompressEv = previewGpu.ltmMaxCompressEv;
-        result.commonHighlightScalePixels = previewGpu.commonHighlightScalePixels;
-        std::copy(previewGpu.linearLumaHistogram.begin(), previewGpu.linearLumaHistogram.end(),
-                  std::begin(result.linearLumaHistogram));
-        std::copy(previewGpu.displayLumaHistogram.begin(), previewGpu.displayLumaHistogram.end(),
-                  std::begin(result.displayLumaHistogram));
-        std::copy(previewGpu.displayLumaHistogram64.begin(), previewGpu.displayLumaHistogram64.end(),
-                  std::begin(result.displayLumaHistogram64));
-        std::copy(previewGpu.displayRHistogram64.begin(), previewGpu.displayRHistogram64.end(),
-                  std::begin(result.displayRHistogram64));
-        std::copy(previewGpu.displayGHistogram64.begin(), previewGpu.displayGHistogram64.end(),
-                  std::begin(result.displayGHistogram64));
-        std::copy(previewGpu.displayBHistogram64.begin(), previewGpu.displayBHistogram64.end(),
-                  std::begin(result.displayBHistogram64));
-        result.rawNearClipSampleCount = previewGpu.rawNearClipSampleCount;
-        result.rawSampleCount = previewGpu.rawSampleCount;
-        result.displayRClipSampleCount = previewGpu.displayRClipSampleCount;
-        result.displayGClipSampleCount = previewGpu.displayGClipSampleCount;
-        result.displayBClipSampleCount = previewGpu.displayBClipSampleCount;
-        result.displayShadowSampleCount = previewGpu.displayShadowSampleCount;
-        result.displayHighlightSampleCount = previewGpu.displayHighlightSampleCount;
-        result.displaySampleCount = previewGpu.displaySampleCount;
-        result.displayHighlightX = previewGpu.displayHighlightX;
-        result.displayHighlightY = previewGpu.displayHighlightY;
-        result.exposureTileCount = previewGpu.exposureTileCount;
-        result.exposureSceneP10 = previewGpu.exposureSceneP10;
-        result.exposureSceneP25 = previewGpu.exposureSceneP25;
-        result.exposureSceneP50 = previewGpu.exposureSceneP50;
-        result.exposureSceneP75 = previewGpu.exposureSceneP75;
-        result.exposureSceneP90 = previewGpu.exposureSceneP90;
-        result.exposureSceneP95 = previewGpu.exposureSceneP95;
-        result.exposureSceneP99 = previewGpu.exposureSceneP99;
-        result.exposureMeasuredSceneDrEv = previewGpu.exposureMeasuredSceneDrEv;
-        result.exposureLowerNeutralBoundaryEv = previewGpu.exposureLowerNeutralBoundaryEv;
-        result.exposureUpperNeutralBoundaryEv = previewGpu.exposureUpperNeutralBoundaryEv;
-        result.exposureSpatialAuthority = previewGpu.exposureSpatialAuthority;
-        result.analysisNv21Width = static_cast<int>(previewGpu.analysisNv21Width);
-        result.analysisNv21Height = static_cast<int>(previewGpu.analysisNv21Height);
-        result.rawUnpackMicroseconds = static_cast<int>(previewGpu.inputPackingMs * 1000.0f);
-        result.demosaicMicroseconds = static_cast<int>(previewGpu.kernelMs * 1000.0f);
-        result.colorMicroseconds = static_cast<int>(
-                std::max(0.0f, previewGpu.synchronizationMs - previewGpu.kernelMs) * 1000.0f);
-        result.tonePackMicroseconds = static_cast<int>(
-                previewGpu.readbackMs * 1000.0f);
-        result.backendMutexWaitMicroseconds = static_cast<int>(std::lround(previewGpu.backendMutexWaitMs * 1000.0f));
-        result.backendInitializationPerformed = previewGpu.backendInitializationPerformed;
-        result.backendInitializationMicroseconds = static_cast<int>(std::lround(previewGpu.backendInitializationMs * 1000.0f));
-        result.spirvLookupMicroseconds = static_cast<int>(std::lround(previewGpu.spirvLookupMs * 1000.0f));
-        result.descriptorLayoutMicroseconds = static_cast<int>(std::lround(previewGpu.descriptorLayoutMs * 1000.0f));
-        result.pipelineLayoutMicroseconds = static_cast<int>(std::lround(previewGpu.pipelineLayoutMs * 1000.0f));
-        result.shaderModuleMicroseconds = static_cast<int>(std::lround(previewGpu.shaderModuleMs * 1000.0f));
-        result.pipelineCacheMutexWaitMicroseconds = static_cast<int>(std::lround(previewGpu.pipelineCacheMutexWaitMs * 1000.0f));
-        result.pipelineCachePresent = previewGpu.pipelineCachePresent;
-        result.computePipelineMicroseconds = static_cast<int>(std::lround(previewGpu.computePipelineMs * 1000.0f));
-        result.imageSpirvLookupMicroseconds = static_cast<int>(std::lround(previewGpu.imageSpirvLookupMs * 1000.0f));
-        result.imageShaderModuleMicroseconds = static_cast<int>(std::lround(previewGpu.imageShaderModuleMs * 1000.0f));
-        result.imageComputePipelineMicroseconds = static_cast<int>(std::lround(previewGpu.imageComputePipelineMs * 1000.0f));
-        result.descriptorCommandResourcesMicroseconds = static_cast<int>(std::lround(previewGpu.descriptorCommandResourcesMs * 1000.0f));
-        result.inputAhbProbeMicroseconds = static_cast<int>(std::lround(previewGpu.inputAhbProbeMs * 1000.0f));
-        result.outputAhbImportMicroseconds = static_cast<int>(std::lround(previewGpu.outputAhbImportMs * 1000.0f));
-        result.commandRecordMicroseconds = static_cast<int>(std::lround(previewGpu.commandRecordMs * 1000.0f));
-        result.queueMutexWaitMicroseconds = static_cast<int>(std::lround(previewGpu.queueMutexWaitMs * 1000.0f));
-        result.queueSubmitCallMicroseconds = static_cast<int>(std::lround(previewGpu.queueSubmitCallMs * 1000.0f));
-        result.fenceWaitMicroseconds = static_cast<int>(std::lround(previewGpu.fenceWaitMs * 1000.0f));
-
-        if (!previewGpu.gpuResidentOutputUsed && outputRgba != nullptr) {
-            int minimum = 255;
-            int maximum = 0;
-            std::uint64_t sum = 0u;
-            std::uint64_t count = 0u;
-            const std::size_t pixelCount = previewPixelCount;
-            const std::size_t diagnosticStep = std::max<std::size_t>(1u, pixelCount / 4096u);
-            for (std::size_t pixel = 0u; pixel < pixelCount; pixel += diagnosticStep) {
-                const std::uint8_t* rgba = outputRgba + pixel * 4u;
-                for (int channel = 0; channel < 3; ++channel) {
-                    const int value = rgba[channel];
-                    minimum = std::min(minimum, value);
-                    maximum = std::max(maximum, value);
-                    sum += static_cast<std::uint64_t>(value);
-                    ++count;
-                }
-            }
-            result.outputRgbMin = static_cast<float>(minimum) / 255.0f;
-            result.outputRgbMax = static_cast<float>(maximum) / 255.0f;
-            result.outputRgbMean = count > 0u
-                    ? static_cast<float>(sum) / static_cast<float>(count * 255u) : 0.0f;
-        } else {
-            // Full-frame RGB diagnostics must not force a GPU->CPU readback. Keep the image plane
-            // resident and expose compact shader statistics separately when needed.
-            result.outputRgbMin = -1.0f;
-            result.outputRgbMax = -1.0f;
-            result.outputRgbMean = -1.0f;
-        }
-        result.vulkanStagesUsed = true;
-        result.directHostInputUsed = previewGpu.directHostInputUsed;
-        result.directHardwareBufferInputUsed = previewGpu.directHardwareBufferInputUsed;
-        result.gpuResidentOutputUsed = previewGpu.gpuResidentOutputUsed;
-        result.inputAhbFormat = previewGpu.inputAhbFormat;
-        result.inputAhbUsage = previewGpu.inputAhbUsage;
-        result.inputInteropStatus = previewGpu.inputInteropStatus;
-        result.success = true;
-        result.width = previewWidth;
-        result.height = previewHeight;
-        result.renderMicroseconds = static_cast<int>(std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::steady_clock::now() - started).count());
-        return result;
+        return finalizeGpuPreviewResult(
+                previewGpu, parameters.camera2PriorWbGains,
+                previewWidth, previewHeight, previewPixelCount, outputRgba, started);
     }
 
 #if !defined(BNCAM_ENABLE_RAW_PREVIEW_CPU_REFERENCE)
@@ -911,4 +978,42 @@ RawPreviewResult renderRawPreviewRgba(
             std::chrono::steady_clock::now() - started).count());
     return result;
 #endif  // BNCAM_ENABLE_RAW_PREVIEW_CPU_REFERENCE
+}
+
+
+RawPreviewResult pollRawPreviewRgba(
+        int frameSlotIndex,
+        std::uint64_t submissionId,
+        int previewWidth,
+        int previewHeight,
+        int cfaCellDecimation,
+        const float camera2PriorWbGains[4]
+) {
+    RawPreviewResult result{};
+    auto& runtime = bncam::vulkan::VulkanRuntime::instance();
+    const auto previewGpu = runtime.pollRawPreview(
+            static_cast<std::uint32_t>(std::clamp(frameSlotIndex, 0, 2)), submissionId);
+    result.submitted = previewGpu.submitted;
+    result.completionPending = previewGpu.completionPending;
+    result.analysisReadbackPerformed = previewGpu.analysisReadbackPerformed;
+    result.submissionId = previewGpu.submissionId;
+    result.frameSlotIndex = static_cast<int>(previewGpu.activeSlotIndex);
+    result.width = previewWidth;
+    result.height = previewHeight;
+    result.cfaCellDecimation = std::max(1, cfaCellDecimation);
+    if (previewGpu.completionPending) return result;
+    if (!previewGpu.success) return result;
+
+    const auto now = std::chrono::steady_clock::now();
+    const auto elapsedUs = static_cast<long long>(std::max(
+            0.0f, previewGpu.totalMs) * 1000.0f);
+    const auto started = now - std::chrono::microseconds(elapsedUs);
+    const std::size_t previewPixelCount =
+            static_cast<std::size_t>(std::max(0, previewWidth)) *
+            static_cast<std::size_t>(std::max(0, previewHeight));
+    result = finalizeGpuPreviewResult(
+            previewGpu, camera2PriorWbGains, previewWidth, previewHeight,
+            previewPixelCount, nullptr, started);
+    result.cfaCellDecimation = std::max(1, cfaCellDecimation);
+    return result;
 }

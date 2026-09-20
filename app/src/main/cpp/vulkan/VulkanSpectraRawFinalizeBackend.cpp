@@ -57,7 +57,17 @@ constexpr std::uint32_t kExposureSummaryNegFrac = 26u;
 constexpr std::uint32_t kExposureSummaryMeanGain2 = 27u;
 constexpr std::uint32_t kExposureSummaryP90PosGain = 28u;
 constexpr std::uint32_t kExposureSummaryStatus = 29u;
-constexpr std::uint32_t kExposureTelemetryWords = 608u;
+// Phase 11D sampled physical-baseline NR diagnostics begin immediately after the exposure
+// histogram scratch range (words 0..607 remain byte-for-byte stable).
+constexpr std::uint32_t kNrSampleCount = 608u;
+constexpr std::uint32_t kNrSigmaSumQ10 = 609u;
+constexpr std::uint32_t kNrPressureSumQ10 = 610u;
+constexpr std::uint32_t kNrAuthoritySumQ10 = 611u;
+constexpr std::uint32_t kNrDetailGainSumQ10 = 612u;
+constexpr std::uint32_t kNrNearIdentityCount = 613u;
+constexpr std::uint32_t kNrStronglyFilteredCount = 614u;
+constexpr float kNrTelemetryQ = 1024.0f;
+constexpr std::uint32_t kExposureTelemetryWords = 615u;
 
 struct PushConstants {
     std::uint32_t frameWidth = 0u;
@@ -912,6 +922,28 @@ SpectraRawFinalizeResult VulkanSpectraRawFinalizeBackend::executeInternal(
     result.lensMaximumGain = std::isfinite(maxGain) ? std::max(1.0f, maxGain) : 1.0f;
     result.lensShadingApplied = request.lensShadingMap != nullptr && request.lensShadingColumns > 0u &&
             request.lensShadingRows > 0u;
+
+    // Phase 11D diagnostics are sampled 1/64 in the shader and never feed production decisions.
+    const std::uint32_t nrSampleCount = telemetry[kNrSampleCount];
+    result.baselineNrSampleCount = nrSampleCount;
+    if (nrSampleCount > 0u) {
+        const float denom = static_cast<float>(nrSampleCount) * kNrTelemetryQ;
+        result.predictedNoiseSigma = static_cast<float>(telemetry[kNrSigmaSumQ10]) / denom;
+        result.noisePressure = std::clamp(
+                static_cast<float>(telemetry[kNrPressureSumQ10]) / denom, 0.0f, 1.0f);
+        result.baselineNrAuthority = std::clamp(
+                static_cast<float>(telemetry[kNrAuthoritySumQ10]) / denom, 0.0f, 1.0f);
+        result.meanDetailGain = std::clamp(
+                static_cast<float>(telemetry[kNrDetailGainSumQ10]) / denom, 0.0f, 1.0f);
+        result.fractionNearIdentity = std::clamp(
+                static_cast<float>(telemetry[kNrNearIdentityCount]) /
+                    static_cast<float>(nrSampleCount),
+                0.0f, 1.0f);
+        result.fractionStronglyFiltered = std::clamp(
+                static_cast<float>(telemetry[kNrStronglyFilteredCount]) /
+                    static_cast<float>(nrSampleCount),
+                0.0f, 1.0f);
+    }
 
     if (request.adaptiveExposureEnabled) {
         const auto telemetryFloat = [&](std::uint32_t index, float fallback) noexcept {

@@ -119,7 +119,7 @@ object CaptureSettingsSchema {
             "5",
             "2..${com.bncam.core.capture.FrameCapacityPolicy.maximumProcessingFrames(FrameOrigin.RAW_SENSOR)}"
         ),
-        active(CaptureSettingKeys.EXPOSURE_STRATEGY, "Exposure Strategy", CaptureSettingType.ENUM, "ETTR", "ETTR (current)", CaptureSettingVisibility.PRO, modes = multiOnly),
+        active(CaptureSettingKeys.EXPOSURE_STRATEGY, "Exposure Strategy", CaptureSettingType.ENUM, "ETTR", "ETTR (sensor authority)", CaptureSettingVisibility.PRO),
         active(
             CaptureSettingKeys.SHOT_BIAS_EXPOSURE,
             "Shot Bias Exposure",

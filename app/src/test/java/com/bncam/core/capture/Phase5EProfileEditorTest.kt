@@ -159,15 +159,33 @@ class Phase5EProfileEditorTest {
     }
 
     @Test
-    fun test11_exposureStrategyReachesEttrRequestPath() {
+    fun test11_exposureStrategyReachesLiveSensorAuthority() {
         val strategy = "ETTR"
-        val res = EttrExposureStrategy.calculateExposureShift(
-            shootingMode = CaptureMode.MULTI,
-            exposureStrategy = strategy,
-            format = ImageFormat.RAW10,
-            recentFrames = emptyList()
+        val evidence = SensorExposureEvidence(
+            domain = SensorExposureEvidenceDomain.RAW,
+            pipelineGeneration = 9,
+            sensorTimestampNs = 900_000_000L,
+            observedElapsedRealtimeNs = 900_000_000L,
+            sampleCount = 4096,
+            p50 = 0.12f,
+            p90 = 0.50f,
+            p95 = 0.60f,
+            p99 = 0.80f,
+            nearClipFraction = 0f,
+            saturatedFraction = 0f,
+            exposureTimeNs = 8_000_000L,
+            sensitivityIso = 100,
+            predictedNoiseSigma = 0.002f,
+            signalToNoiseRatio = 18f,
+            source = "RAW"
+        )
+        val res = SensorExposurePolicy.resolve(
+            enabled = strategy.equals("ETTR", ignoreCase = true),
+            evidence = evidence,
+            nowElapsedRealtimeNs = 1_000_000_000L
         )
         assertNotNull(res)
+        assertTrue(res.enabled)
     }
 
     @Test

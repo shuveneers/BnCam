@@ -1544,67 +1544,6 @@ class SettingsRepository(private val context: Context) {
 
 
     // ==========================================
-    // 6B. VENDOR OPERATION MODE LEARNING / PROBING
-    // ==========================================
-    private fun safeVendorProbeKeyPart(raw: String): String {
-        return raw.ifBlank { "empty" }
-            .replace(Regex("[^A-Za-z0-9_-]"), "_")
-            .take(96)
-    }
-
-    private fun vendorOpProbeIndexKey(lensId: String, featureSignature: String) =
-        intPreferencesKey("vendor_op_probe_index_${safeVendorProbeKeyPart(lensId)}_${safeVendorProbeKeyPart(featureSignature)}")
-
-    private fun vendorOpLearnedSessionTypeKey(lensId: String, featureSignature: String) =
-        intPreferencesKey("vendor_op_learned_session_type_${safeVendorProbeKeyPart(lensId)}_${safeVendorProbeKeyPart(featureSignature)}")
-
-    private fun vendorOpLearnedEvidenceKey(lensId: String, featureSignature: String) =
-        stringPreferencesKey("vendor_op_learned_evidence_${safeVendorProbeKeyPart(lensId)}_${safeVendorProbeKeyPart(featureSignature)}")
-
-    private fun vendorOpProbeActiveKey(lensId: String) =
-        booleanPreferencesKey("vendor_op_probe_active_${safeVendorProbeKeyPart(lensId)}")
-
-    suspend fun setVendorOperationModeProbeActive(lensId: String, active: Boolean) {
-        context.dataStore.edit { prefs ->
-            prefs[vendorOpProbeActiveKey(lensId)] = active
-        }
-    }
-
-    suspend fun isVendorOperationModeProbeActive(lensId: String): Boolean {
-        val prefs = context.dataStore.data.first()
-        return prefs[vendorOpProbeActiveKey(lensId)] ?: false
-    }
-
-    suspend fun getVendorOperationModeProbeIndex(lensId: String, featureSignature: String): Int {
-        val prefs = context.dataStore.data.first()
-        return prefs[vendorOpProbeIndexKey(lensId, featureSignature)] ?: 0
-    }
-
-    suspend fun setVendorOperationModeProbeIndex(lensId: String, featureSignature: String, index: Int) {
-        context.dataStore.edit { prefs ->
-            prefs[vendorOpProbeIndexKey(lensId, featureSignature)] = index.coerceAtLeast(0)
-        }
-    }
-
-    suspend fun getLearnedVendorSessionType(lensId: String, featureSignature: String): Int? {
-        val prefs = context.dataStore.data.first()
-        return prefs[vendorOpLearnedSessionTypeKey(lensId, featureSignature)]
-    }
-
-    suspend fun saveLearnedVendorSessionType(
-        lensId: String,
-        featureSignature: String,
-        sessionType: Int,
-        evidence: String
-    ) {
-        context.dataStore.edit { prefs ->
-            prefs[vendorOpLearnedSessionTypeKey(lensId, featureSignature)] = sessionType
-            prefs[vendorOpLearnedEvidenceKey(lensId, featureSignature)] = evidence.take(500)
-        }
-    }
-
-
-    // ==========================================
     // 7. WATERMARK & EXIF SETTINGS
     // ==========================================
     private val watermarkEnabledKey = booleanPreferencesKey("watermark_enabled")

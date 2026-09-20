@@ -24,7 +24,8 @@ class Phase6RawPreviewGpuResidencySourceContractTest {
         assertTrue(shader.contains("rgba8"))
         assertTrue(shader.contains("imageStore"))
         assertTrue(backend.contains("ensureImportedOutputLocked"))
-        assertTrue(backend.contains("gpuResidentOutput ? statisticsBytes : rgbaBytes + statisticsBytes"))
+        assertTrue(backend.contains("request.analysisReadbackRequested ? statisticsBytes : 0u"))
+        assertTrue(backend.contains("gpuResidentOutput\n            ? statisticsReadbackBytes"))
         assertTrue(view.contains("bindRawPreviewHardwareBufferToCurrentTexture"))
 
         val handoff = view.substringAfter("val handoffSucceeded =")
@@ -109,9 +110,9 @@ class Phase6RawPreviewGpuResidencySourceContractTest {
         assertTrue(backend.contains("AHardwareBuffer_lockPlanes"))
         assertTrue(backend.contains("RAW_PREVIEW_INPUT_PLANE_ROW_STRIDE_MISMATCH"))
         assertTrue(backend.contains("RAW_PREVIEW_INPUT_PLANE_PIXEL_STRIDE_MISMATCH"))
-        assertTrue(backend.contains("std::memcpy(inputStaging_.mapped, rawSource"))
+        assertTrue(backend.contains("std::memcpy(slot.inputStaging.mapped, rawSource"))
         assertTrue(backend.contains("AHardwareBuffer_unlock"))
-        assertTrue(backend.contains("toneLutBuffer_"))
+        assertTrue(backend.contains("slot.toneLutBuffer"))
         assertTrue(backend.contains("dstBinding = 3u"))
         assertFalse(backend.contains("paddedRawBytes"))
 

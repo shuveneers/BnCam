@@ -38,6 +38,11 @@ struct RawPreviewParameters {
 
 struct RawPreviewResult {
     bool success = false;
+    bool submitted = false;
+    bool completionPending = false;
+    bool analysisReadbackPerformed = false;
+    std::uint64_t submissionId = 0u;
+    int frameSlotIndex = -1;
     int width = 0;
     int height = 0;
     int renderMicroseconds = 0;
@@ -53,13 +58,19 @@ struct RawPreviewResult {
     float outputRgbMean = 0.0f;
     float targetExposureGain = 1.0f;
     float appliedExposureGain = 1.0f;
+    float previewRequestedEv = 0.0f;
+    float previewHighlightLimitedEv = 0.0f;
+    float previewAppliedEv = 0.0f;
+    float previewSceneKey = 0.148f;
+    float previewHighlightHeadroomEv = 0.0f;
+    float previewSceneRangeEv = 0.0f;
     float sceneMidtone = 0.0f;
-    float sceneMidtoneTarget = 0.155f;
+    float sceneMidtoneTarget = 0.148f;
     float gtmShoulderStart = 0.72f;
     float gtmShoulderStrength = 0.90f;
-    float gtmBlackAnchor = 0.0065f;
-    float gtmLowerMidLift = 0.0f;
-    float gtmContrastStrength = 0.10f;
+    float gtmHighlightPressure = 0.0f;
+    float gtmP95CompressionEv = 0.0f;
+    float gtmP99CompressionEv = 0.0f;
     float gtmDynamicRangePressure = 0.0f;
     float ltmStrength = 0.05f;
     float ltmMaxLiftEv = 0.18f;
@@ -73,6 +84,13 @@ struct RawPreviewResult {
     std::uint32_t displayBHistogram64[64] = {};
     std::uint32_t rawNearClipSampleCount = 0;
     std::uint32_t rawSampleCount = 0;
+    std::uint32_t rawTrueSaturatedSampleCount = 0;
+    std::uint32_t rawRClipSampleCount = 0;
+    std::uint32_t rawGClipSampleCount = 0;
+    std::uint32_t rawBClipSampleCount = 0;
+    std::uint32_t highlightReconstructedSampleCount = 0;
+    std::uint32_t postWbClipSampleCount = 0;
+    std::uint32_t postCcmClipSampleCount = 0;
     std::uint32_t displayRClipSampleCount = 0;
     std::uint32_t displayGClipSampleCount = 0;
     std::uint32_t displayBClipSampleCount = 0;
@@ -145,5 +163,15 @@ RawPreviewResult renderRawPreviewRgba(
         std::uint8_t* outputRgba,
         std::size_t outputCapacityBytes,
         std::uint8_t* analysisNv21,
-        std::size_t analysisNv21CapacityBytes
+        std::size_t analysisNv21CapacityBytes,
+        bool analysisReadbackRequested = true
+);
+
+RawPreviewResult pollRawPreviewRgba(
+        int frameSlotIndex,
+        std::uint64_t submissionId,
+        int previewWidth,
+        int previewHeight,
+        int cfaCellDecimation,
+        const float camera2PriorWbGains[4]
 );

@@ -1428,6 +1428,13 @@ class ShotLogger(
                 "nativeRawIsp.absoluteMeanChromaSigma",
                 "nativeRawIsp.effectiveLumaSigma",
                 "nativeRawIsp.effectiveChromaSigma",
+                "nativeRawIsp.predictedNoiseSigma",
+                "nativeRawIsp.noisePressure",
+                "nativeRawIsp.baselineNrAuthority",
+                "nativeRawIsp.meanDetailGain",
+                "nativeRawIsp.fractionNearIdentity",
+                "nativeRawIsp.fractionStronglyFiltered",
+                "nativeRawIsp.spectraOffPixelMutationSemantics",
                 "nativeRawIsp.preDenoiseResidualEstimate",
                 "nativeRawIsp.postDenoiseResidualEstimate",
                 "nativeRawIsp.postSharpenResidualEstimate",
@@ -1562,6 +1569,13 @@ class ShotLogger(
         kv("Absolute mean chroma sigma", metric("nativeRawIsp.absoluteMeanChromaSigma"))
         kv("Effective luma sigma", metric("nativeRawIsp.effectiveLumaSigma"))
         kv("Effective chroma sigma", metric("nativeRawIsp.effectiveChromaSigma"))
+        kv("Baseline predicted noise sigma", metric("nativeRawIsp.predictedNoiseSigma"))
+        kv("Baseline physical noise pressure", metric("nativeRawIsp.noisePressure"))
+        kv("Baseline NR authority", metric("nativeRawIsp.baselineNrAuthority"))
+        kv("Baseline mean detail gain", metric("nativeRawIsp.meanDetailGain"))
+        kv("Baseline near-identity fraction", metric("nativeRawIsp.fractionNearIdentity"))
+        kv("Baseline strongly-filtered fraction", metric("nativeRawIsp.fractionStronglyFiltered"))
+        kv("Spectra Off pixel mutation semantics", metric("nativeRawIsp.spectraOffPixelMutationSemantics"))
         kv("Pre-denoise residual", metric("nativeRawIsp.preDenoiseResidualEstimate"))
         kv("Post-denoise residual", metric("nativeRawIsp.postDenoiseResidualEstimate"))
         kv("Post-sharpen residual", metric("nativeRawIsp.postSharpenResidualEstimate"))

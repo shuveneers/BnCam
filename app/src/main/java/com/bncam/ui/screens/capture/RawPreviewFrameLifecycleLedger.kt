@@ -1,5 +1,7 @@
 package com.bncam.ui.screens.capture
 
+import com.bncam.core.runtime.RawPreviewProducerFrameIdentity
+import com.bncam.core.runtime.RawPreviewProducerKind
 import java.util.LinkedHashMap
 
 internal enum class RawPreviewFrameLifecycleState {
@@ -14,6 +16,7 @@ internal data class RawPreviewFrameLifecycleSnapshot(
     val source: String,
     val pipelineGeneration: Int,
     val sensorTimestampNs: Long,
+    val producerKind: RawPreviewProducerKind,
     val state: RawPreviewFrameLifecycleState,
     val acquiredElapsedNs: Long,
     val gpuImportedElapsedNs: Long,
@@ -27,17 +30,28 @@ internal data class RawPreviewFrameLifecycleSnapshot(
     val inputRetained: Boolean get() = inputReleasedElapsedNs <= 0L
     val outputOwned: Boolean get() = state != RawPreviewFrameLifecycleState.RELEASED
     val presentationObserved: Boolean get() = presentedElapsedNs > 0L
+    val frameIdentity: RawPreviewProducerFrameIdentity
+        get() = RawPreviewProducerFrameIdentity(
+            generation = pipelineGeneration,
+            sensorTimestampNs = sensorTimestampNs,
+            producerKind = producerKind
+        )
 
     fun summary(): String =
         "source=$source;generation=$pipelineGeneration;sensorTimestampNs=$sensorTimestampNs;" +
-            "state=$state;inputRetained=$inputRetained;outputOwned=$outputOwned;" +
-            "presented=$presentationObserved;releaseReason=$releaseReason;" +
+            "producer=${producerKind.name};state=$state;inputRetained=$inputRetained;" +
+            "outputOwned=$outputOwned;presented=$presentationObserved;releaseReason=$releaseReason;" +
             "transitionErrors=$transitionErrorCount"
 }
 
 /**
  * Sensor-frame ownership ledger spanning Camera2 AHB retain, Vulkan import, GLES submission,
  * display presentation and final output-slot release.
+ *
+ * A generation + SENSOR_TIMESTAMP tuple is not unique when both the canonical PRIMARY_BUFFER and
+ * optional RAW_PREVIEW_SUPPORT ImageReader receive the same sensor frame. Producer kind therefore
+ * participates in the ledger key. This prevents a custom support frame from mutating or releasing
+ * the canonical frame's diagnostic ownership record (and vice versa).
  *
  * The input AHardwareBuffer reference may be released as soon as native rendering finishes; that
  * is tracked separately from output ownership, which remains alive until GL/display no longer need
@@ -47,11 +61,17 @@ internal data class RawPreviewFrameLifecycleSnapshot(
 internal class RawPreviewFrameLifecycleLedger(
     private val maxHistory: Int = 96
 ) {
-    private data class Key(val generation: Int, val timestampNs: Long)
+    private data class Key(
+        val generation: Int,
+        val timestampNs: Long,
+        val producerKind: RawPreviewProducerKind
+    )
+
     private data class MutableRecord(
         val source: String,
         val generation: Int,
         val timestampNs: Long,
+        val producerKind: RawPreviewProducerKind,
         var state: RawPreviewFrameLifecycleState,
         var acquiredNs: Long,
         var gpuImportedNs: Long = 0L,
@@ -66,9 +86,15 @@ internal class RawPreviewFrameLifecycleLedger(
     private val records = LinkedHashMap<Key, MutableRecord>()
 
     @Synchronized
-    fun acquired(source: String, generation: Int, timestampNs: Long, nowNs: Long): Boolean {
+    fun acquired(
+        source: String,
+        generation: Int,
+        timestampNs: Long,
+        producerKind: RawPreviewProducerKind,
+        nowNs: Long
+    ): Boolean {
         if (generation < 0 || timestampNs <= 0L) return false
-        val key = Key(generation, timestampNs)
+        val key = Key(generation, timestampNs, producerKind)
         val existing = records[key]
         if (existing != null && existing.state != RawPreviewFrameLifecycleState.RELEASED) {
             existing.transitionErrors++
@@ -78,6 +104,7 @@ internal class RawPreviewFrameLifecycleLedger(
             source = source.ifBlank { "RAW" },
             generation = generation,
             timestampNs = timestampNs,
+            producerKind = producerKind,
             state = RawPreviewFrameLifecycleState.ACQUIRED,
             acquiredNs = nowNs.coerceAtLeast(0L)
         )
@@ -86,21 +113,46 @@ internal class RawPreviewFrameLifecycleLedger(
     }
 
     @Synchronized
-    fun gpuImported(generation: Int, timestampNs: Long, nowNs: Long): Boolean =
-        transition(generation, timestampNs, nowNs, RawPreviewFrameLifecycleState.GPU_IMPORTED) {
-            it.state == RawPreviewFrameLifecycleState.ACQUIRED
-        }
+    fun gpuImported(
+        generation: Int,
+        timestampNs: Long,
+        producerKind: RawPreviewProducerKind,
+        nowNs: Long
+    ): Boolean = transition(
+        generation,
+        timestampNs,
+        producerKind,
+        nowNs,
+        RawPreviewFrameLifecycleState.GPU_IMPORTED
+    ) {
+        it.state == RawPreviewFrameLifecycleState.ACQUIRED
+    }
 
     @Synchronized
-    fun submitted(generation: Int, timestampNs: Long, nowNs: Long): Boolean =
-        transition(generation, timestampNs, nowNs, RawPreviewFrameLifecycleState.SUBMITTED) {
-            it.state == RawPreviewFrameLifecycleState.ACQUIRED ||
-                it.state == RawPreviewFrameLifecycleState.GPU_IMPORTED
-        }
+    fun submitted(
+        generation: Int,
+        timestampNs: Long,
+        producerKind: RawPreviewProducerKind,
+        nowNs: Long
+    ): Boolean = transition(
+        generation,
+        timestampNs,
+        producerKind,
+        nowNs,
+        RawPreviewFrameLifecycleState.SUBMITTED
+    ) {
+        it.state == RawPreviewFrameLifecycleState.ACQUIRED ||
+            it.state == RawPreviewFrameLifecycleState.GPU_IMPORTED
+    }
 
     @Synchronized
-    fun presented(generation: Int, timestampNs: Long, nowNs: Long): Boolean {
-        val record = records[Key(generation, timestampNs)] ?: return false
+    fun presented(
+        generation: Int,
+        timestampNs: Long,
+        producerKind: RawPreviewProducerKind,
+        nowNs: Long
+    ): Boolean {
+        val record = records[Key(generation, timestampNs, producerKind)] ?: return false
         if (record.presentedNs > 0L) return true
         return when (record.state) {
             RawPreviewFrameLifecycleState.SUBMITTED -> {
@@ -122,16 +174,27 @@ internal class RawPreviewFrameLifecycleLedger(
     }
 
     @Synchronized
-    fun inputReleased(generation: Int, timestampNs: Long, nowNs: Long): Boolean {
-        val record = records[Key(generation, timestampNs)] ?: return false
+    fun inputReleased(
+        generation: Int,
+        timestampNs: Long,
+        producerKind: RawPreviewProducerKind,
+        nowNs: Long
+    ): Boolean {
+        val record = records[Key(generation, timestampNs, producerKind)] ?: return false
         if (record.inputReleasedNs > 0L) return false
         record.inputReleasedNs = nowNs.coerceAtLeast(0L)
         return true
     }
 
     @Synchronized
-    fun released(generation: Int, timestampNs: Long, nowNs: Long, reason: String): Boolean {
-        val record = records[Key(generation, timestampNs)] ?: return false
+    fun released(
+        generation: Int,
+        timestampNs: Long,
+        producerKind: RawPreviewProducerKind,
+        nowNs: Long,
+        reason: String
+    ): Boolean {
+        val record = records[Key(generation, timestampNs, producerKind)] ?: return false
         if (record.state == RawPreviewFrameLifecycleState.RELEASED) return false
         record.state = RawPreviewFrameLifecycleState.RELEASED
         record.releasedNs = nowNs.coerceAtLeast(0L)
@@ -141,8 +204,12 @@ internal class RawPreviewFrameLifecycleLedger(
     }
 
     @Synchronized
-    fun snapshot(generation: Int, timestampNs: Long): RawPreviewFrameLifecycleSnapshot? =
-        records[Key(generation, timestampNs)]?.toSnapshot()
+    fun snapshot(
+        generation: Int,
+        timestampNs: Long,
+        producerKind: RawPreviewProducerKind
+    ): RawPreviewFrameLifecycleSnapshot? =
+        records[Key(generation, timestampNs, producerKind)]?.toSnapshot()
 
     @Synchronized
     fun latest(): RawPreviewFrameLifecycleSnapshot? = records.values.lastOrNull()?.toSnapshot()
@@ -168,11 +235,12 @@ internal class RawPreviewFrameLifecycleLedger(
     private fun transition(
         generation: Int,
         timestampNs: Long,
+        producerKind: RawPreviewProducerKind,
         nowNs: Long,
         next: RawPreviewFrameLifecycleState,
         allowed: (MutableRecord) -> Boolean
     ): Boolean {
-        val record = records[Key(generation, timestampNs)] ?: return false
+        val record = records[Key(generation, timestampNs, producerKind)] ?: return false
         if (!allowed(record)) {
             record.transitionErrors++
             return false
@@ -192,6 +260,7 @@ internal class RawPreviewFrameLifecycleLedger(
         source = source,
         pipelineGeneration = generation,
         sensorTimestampNs = timestampNs,
+        producerKind = producerKind,
         state = state,
         acquiredElapsedNs = acquiredNs,
         gpuImportedElapsedNs = gpuImportedNs,
@@ -214,25 +283,63 @@ internal class RawPreviewFrameLifecycleLedger(
     }
 }
 
-/** Process-local bridge so renderer and GL owner report into one generation/timestamp ledger. */
+/** Process-local bridge so renderer and GL owner report into one exact producer-frame ledger. */
 internal object RawPreviewFrameLifecycleRegistry {
     private val ledger = RawPreviewFrameLifecycleLedger()
 
-    fun acquired(source: String, generation: Int, timestampNs: Long, nowNs: Long) =
-        ledger.acquired(source, generation, timestampNs, nowNs)
-    fun gpuImported(generation: Int, timestampNs: Long, nowNs: Long) =
-        ledger.gpuImported(generation, timestampNs, nowNs)
-    fun submitted(generation: Int, timestampNs: Long, nowNs: Long) =
-        ledger.submitted(generation, timestampNs, nowNs)
-    fun presented(generation: Int, timestampNs: Long, nowNs: Long) =
-        ledger.presented(generation, timestampNs, nowNs)
-    fun inputReleased(generation: Int, timestampNs: Long, nowNs: Long) =
-        ledger.inputReleased(generation, timestampNs, nowNs)
-    fun released(generation: Int, timestampNs: Long, nowNs: Long, reason: String) =
-        ledger.released(generation, timestampNs, nowNs, reason)
+    fun acquired(
+        source: String,
+        generation: Int,
+        timestampNs: Long,
+        producerKind: RawPreviewProducerKind,
+        nowNs: Long
+    ) = ledger.acquired(source, generation, timestampNs, producerKind, nowNs)
+
+    fun gpuImported(
+        generation: Int,
+        timestampNs: Long,
+        producerKind: RawPreviewProducerKind,
+        nowNs: Long
+    ) = ledger.gpuImported(generation, timestampNs, producerKind, nowNs)
+
+    fun submitted(
+        generation: Int,
+        timestampNs: Long,
+        producerKind: RawPreviewProducerKind,
+        nowNs: Long
+    ) = ledger.submitted(generation, timestampNs, producerKind, nowNs)
+
+    fun presented(
+        generation: Int,
+        timestampNs: Long,
+        producerKind: RawPreviewProducerKind,
+        nowNs: Long
+    ) = ledger.presented(generation, timestampNs, producerKind, nowNs)
+
+    fun inputReleased(
+        generation: Int,
+        timestampNs: Long,
+        producerKind: RawPreviewProducerKind,
+        nowNs: Long
+    ) = ledger.inputReleased(generation, timestampNs, producerKind, nowNs)
+
+    fun released(
+        generation: Int,
+        timestampNs: Long,
+        producerKind: RawPreviewProducerKind,
+        nowNs: Long,
+        reason: String
+    ) = ledger.released(generation, timestampNs, producerKind, nowNs, reason)
+
     fun releaseGeneration(generation: Int, nowNs: Long, reason: String) =
         ledger.releaseGeneration(generation, nowNs, reason)
-    fun snapshot(generation: Int, timestampNs: Long) = ledger.snapshot(generation, timestampNs)
+
+    fun snapshot(
+        generation: Int,
+        timestampNs: Long,
+        producerKind: RawPreviewProducerKind
+    ) = ledger.snapshot(generation, timestampNs, producerKind)
+
     fun latest() = ledger.latest()
     fun activeCount() = ledger.activeCount()
 }

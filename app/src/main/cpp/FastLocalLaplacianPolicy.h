@@ -58,8 +58,8 @@ inline float fllfSmoothstep(float edge0, float edge1, float x) noexcept {
  *   dark/low-key capture toward middle grey. The coarse/DC base is identity; shadow lift and
  *   highlight compression are produced only by signed local/multiscale Laplacian remapping.
  *
- * The future explicit Adaptive Scene EV owner is allowed to operate in [-0.50, +0.25] EV. That
- * global range is intentionally NOT emulated by increasing this FLLF scene key: positive global
+ * Phase 11F GlobalSceneExposurePlan owns scene-wide development placement before GTM. Its
+ * bounded [-0.50, +1.25] EV policy is intentionally NOT emulated by this FLLF scene key: global
  * exposure and local shadow redistribution are separate responsibilities.
  *
  * Khronos/PBR Neutral remains a separate scene-to-display mapper. Physical noise is supplied in

@@ -64,8 +64,8 @@ class SessionOutputCombinationRecoveryPolicyTest {
             SessionOutputCombinationRecoveryPolicy.actionFor(SessionOutputFailureKind.OPTIONAL_CUSTOM_RAW_OUTPUT)
         )
         assertEquals(
-            SessionOutputRecoveryAction.DEFER_TO_VENDOR_SESSION_AUTHORITY,
-            SessionOutputCombinationRecoveryPolicy.actionFor(SessionOutputFailureKind.VENDOR_SESSION_MODE)
+            SessionOutputRecoveryAction.DEFER_TO_OPERATION_MODE_AUTHORITY,
+            SessionOutputCombinationRecoveryPolicy.actionFor(SessionOutputFailureKind.NON_REGULAR_OPERATION_MODE)
         )
     }
 }

@@ -6,34 +6,63 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class AdaptiveRawToneSourceContractTest {
+    private val appDir: File = sequenceOf(File("."), File("app"))
+        .firstOrNull { File(it, "src/main/cpp/IspCore.cpp").isFile }
+        ?: error("Cannot locate app module")
+
+    private fun source(relative: String): String = File(appDir, relative).readText()
+
     @Test
-    fun `raw tone path uses spatial bidirectional normalization and adaptive display placement`() {
-        val isp = File("src/main/cpp/IspCore.cpp").readText()
-        val policy = File("src/main/cpp/DynamicRangeTonePolicy.h").readText()
-        val fllf = File("src/main/cpp/FastLocalLaplacianPolicy.h").readText()
-        val shader = File("src/main/cpp/vulkan/shaders/spectra_tone_resident.comp").readText()
+    fun `raw tone uses explicit evidence based global placement gtm local fllf and display mapping`() {
+        val isp = source("src/main/cpp/IspCore.cpp")
+        val exposurePolicy = source("src/main/cpp/GlobalSceneExposurePolicy.h")
+        val gtmPolicy = source("src/main/cpp/GlobalToneMappingPolicy.h")
+        val fllf = source("src/main/cpp/FastLocalLaplacianPolicy.h")
+        val shader = source("src/main/cpp/vulkan/shaders/spectra_tone_resident.comp")
 
-        assertTrue(policy.contains("sceneRangeStops"))
-        assertTrue(policy.contains("automaticGlobalGainCap"))
-        assertTrue(isp.contains("maxGain = std::min(maxGain, dynamicRangeTonePlan.automaticGlobalGainCap)"))
-        assertTrue(isp.contains("dynamicRangeTonePlan.displayWhiteExpansionStart"))
-        assertTrue(isp.contains("dynamicRangeTonePlan.displayWhiteExpansionGamma"))
+        listOf("p35", "p50", "p75", "p90", "p95", "p99", "rawClipFraction",
+            "physicalNoiseSigmaY", "highlightHeadroomEv", "sceneRangeEv").forEach {
+            assertTrue("Global scene placement must observe $it", exposurePolicy.contains(it))
+        }
+        assertTrue(exposurePolicy.contains("GlobalSceneExposurePlan"))
+        assertTrue(gtmPolicy.contains("GTM owns only the upper scene-linear range"))
+        assertTrue(gtmPolicy.contains("if (luma <= shoulderStart) return luma;"))
+        assertTrue(fllf.contains("LOCAL redistribution stage"))
+        assertTrue(isp.contains("resolveGlobalSceneExposurePlan"))
+        assertTrue(isp.contains("resolveGlobalToneMappingPlan"))
+        assertTrue(isp.contains("request.adaptiveExposureEnabled = false"))
 
-        assertTrue(fllf.contains("negative highlight compression is safe"))
-        assertTrue(shader.contains("float rawRequestedEv = log2(sceneKey / localLuma);"))
-        assertTrue(shader.contains("float correctionEv = rawRequestedEv * strength * need;"))
-        assertTrue(shader.contains("return sceneRgb * exp2(correctionEv);"))
-        assertTrue(shader.contains("float knee = clamp(pc.shoulderStart"))
-        assertTrue(shader.contains("float exponent = clamp(pc.shoulderStrength"))
-
-        val runTone = shader.substringAfter("void runTone(uvec2 gid)").substringBefore("void captureUltraHdrAuthority")
-        val exposureIndex = runTone.indexOf("rgb *= pc.exposureGain;")
+        val runTone = shader.substringAfter("void runTone(uvec2 gid)")
+            .substringAfter("if (pc.isRawBayer != 0u) {")
+            .substringBefore("} else {")
+        val globalGtm = runTone.indexOf("applyRawGlobalSceneExposureAndGtm(rgb)")
         val fllfIndex = runTone.indexOf("applyFllfLocalExposure")
-        val agxIndex = runTone.indexOf("applyAgXTonemap")
-        assertTrue(exposureIndex >= 0 && fllfIndex > exposureIndex && agxIndex > fllfIndex)
+        val display = runTone.indexOf("pbrNeutralToneMapping")
+        val explicitProfile = runTone.indexOf("pc.presenceReserved1")
+        assertTrue(globalGtm >= 0 && fllfIndex > globalGtm && display > fllfIndex &&
+            explicitProfile > display)
 
-        // These temporary global presentation hacks must not re-enter the RAW path.
+        // Temporary/global presentation hacks and retired alternative tone owners must not return.
         assertFalse(shader.contains("effectiveRawBaseVibrance = max"))
         assertFalse(shader.contains("kRawBlackFloor"))
+        assertFalse(shader.contains("applyBroadShadowPlacement"))
+        assertFalse(shader.contains("applyAgXTonemap"))
+        assertFalse(isp.contains("dynamicRangeTonePlan"))
+    }
+
+    @Test
+    fun `gtm can be exact identity and fllf noise is propagated through global tone derivative`() {
+        val isp = source("src/main/cpp/IspCore.cpp")
+        val backend = source("src/main/cpp/vulkan/VulkanSpectraResidentToneBackend.cpp")
+        val header = source("src/main/cpp/vulkan/VulkanSpectraResidentToneBackend.h")
+        val shader = source("src/main/cpp/vulkan/shaders/spectra_tone_resident.comp")
+
+        assertTrue(header.contains("bool gtmEnabled = false"))
+        assertTrue(backend.contains("request.gtmEnabled ?"))
+        assertTrue(backend.contains(": 0.0f"))
+        assertTrue(shader.contains("if (pc.shoulderStrength <= 1.0e-5) return luma;"))
+        assertTrue(isp.contains("phase11fFllfToneDerivative"))
+        assertTrue(isp.contains("phase11fFllfPhysicalNoiseSigmaY"))
+        assertTrue(isp.contains("phase5FllfPhysicalNoiseSigmaY * phase11fFllfToneDerivative"))
     }
 }

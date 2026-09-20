@@ -108,10 +108,19 @@ struct SpectraResidentToneRequest {
     std::uint32_t frameWidth = 0;
     std::uint32_t frameHeight = 0;
     std::uint64_t residentSceneGeneration = 0u;
+    // Phase 11F: automatic scene-linear development exposure only. For RAW this is the sole
+    // automatic global/DC placement owner and is applied before GTM/FLLF. YUV retains the legacy
+    // direct exposure transport semantics.
     float exposureGain = 1.0f;
+    // Explicit profile Exposure + post-RAW metadata gain. This is not automatic scene placement;
+    // RAW applies it only after the display mapper as part of the explicit profile/look stage.
+    float profileExposureGain = 1.0f;
     // Mode-specific transport slots remain in the 128-byte shader ABI for the scene observer/YUV
     // compatibility path. RAW Phase 5 does not use them for automatic colour or display tone.
     float rawJpegBaseVibrance = 1.0f;
+    // RAW GTM enable is explicit. When false, the shader must be strict identity for the global
+    // tone-mapping stage; YUV keeps its legacy shoulder transport.
+    bool gtmEnabled = false;
     float shoulderStart = 0.68f;
     float shoulderStrength = 1.0f;
     // Legacy YUV local-tone fields are source-compatible only; RAW uses the FLLF contract below.
@@ -127,8 +136,9 @@ struct SpectraResidentToneRequest {
     float fllfMaxCompressEv = 0.20f;
     float fllfEdgeStopEv = 0.62f;
     float fllfRefinement = 0.10f;
-    // Physical post-detail luma sigma propagated through LSC -> spatial exposure -> demosaic ->
-    // AWB -> CCM -> detail. Vulkan converts it to log2-luma sigma for correction coring.
+    // Physical post-detail luma sigma propagated into the actual post-Global-Exposure/GTM domain
+    // seen by FLLF. IspCore applies the local scalar tone derivative before transport; Vulkan then
+    // converts it to log2-luma sigma for correction coring.
     float fllfPhysicalNoiseSigmaY = 0.0f;
     std::uint32_t fllfPyramidLevels = 6u;
     // Phase 11: scene-linear capture detail recovery. The physical S/O-derived luma sigma
@@ -209,8 +219,9 @@ struct SpectraResidentToneResult {
     float fllfPositiveCorrectionFraction = 0.0f;
     float fllfNegativeCorrectionFraction = 0.0f;
     float fllfMaxAbsCorrectionEv = 0.0f;
-    // Physical post-detail luma sigma propagated through LSC -> spatial exposure -> demosaic ->
-    // AWB -> CCM -> detail. Vulkan converts it to log2-luma sigma for correction coring.
+    // Physical post-detail luma sigma propagated into the actual post-Global-Exposure/GTM domain
+    // seen by FLLF. IspCore applies the local scalar tone derivative before transport; Vulkan then
+    // converts it to log2-luma sigma for correction coring.
     float fllfPhysicalNoiseSigmaY = 0.0f;
     float fllfPyramidBuildMs = 0.0f;
     float fllfRemapReconstructMs = 0.0f;
@@ -252,6 +263,12 @@ struct SpectraResidentToneResult {
     std::shared_ptr<ResidentToneBgr8PublicationLease> bgr8PublicationLease;
     std::vector<std::uint8_t> outputBgr8;
     float bgr8PublicationReadbackMs = 0.0f;
+    // Phase 11F compact final-display diagnostics sampled directly from the already-mapped BGR8
+    // publication surface. These do not trigger a second GPU readback.
+    float displayP50 = 0.0f;
+    float displayP95 = 0.0f;
+    float displayClippingFraction = 0.0f;
+    std::uint32_t displayStatisticSamples = 0u;
     float lutUploadMs = 0.0f;
     float kernelMs = 0.0f;
     float readbackMs = 0.0f;

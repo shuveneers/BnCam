@@ -36,11 +36,12 @@ class SessionOutputCombinationRecoverySourceContractTest {
     @Test
     fun `hard start first attempts in-place output recovery before CameraDevice reopen`() {
         val source = manager()
-        val inPlace = source.indexOf("HARD_START_IN_PLACE_OUTPUT_RECOVERY_")
-        val hardClose = source.indexOf("HARD_START_STREAM_FALLBACK_", inPlace)
+        val inPlace = source.indexOf("val recoveredInPlace = performSoftResetPipeline(")
+        val inPlaceReason = source.indexOf("HARD_START_IN_PLACE_OUTPUT_RECOVERY_", inPlace)
+        val hardClose = source.indexOf("closeCameraOwned(\"HARD_START_STREAM_FALLBACK_", inPlaceReason)
         assertTrue(inPlace >= 0)
-        assertTrue(hardClose > inPlace)
-        assertTrue(source.substring(inPlace, hardClose).contains("performSoftResetPipeline("))
+        assertTrue(inPlaceReason > inPlace)
+        assertTrue(hardClose > inPlaceReason)
     }
 
     @Test
@@ -59,8 +60,9 @@ class SessionOutputCombinationRecoverySourceContractTest {
     fun `custom RAW and vendor session authorities remain separate`() {
         val source = manager()
         assertTrue(source.contains("SessionOutputFailureKind.OPTIONAL_CUSTOM_RAW_OUTPUT"))
-        assertTrue(source.contains("SessionOutputFailureKind.VENDOR_SESSION_MODE"))
+        assertTrue(source.contains("SessionOutputFailureKind.NON_REGULAR_OPERATION_MODE"))
         assertTrue(source.contains("CUSTOM_RAW_PREVIEW_RETRY_CANONICAL"))
-        assertTrue(source.contains("VENDOR_OPERATION_MODE_PROBE_CONFIG_FAILED_NEXT"))
+        assertTrue(source.contains("generic stream geometry must not compete with that authority"))
+        assertFalse(source.contains("VENDOR_OPERATION_MODE_PROBE_CONFIG_FAILED_NEXT"))
     }
 }

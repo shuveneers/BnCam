@@ -104,6 +104,16 @@ struct SpectraRawFinalizeResult {
     std::uint64_t overRangePixelCount = 0;
     float lensMaximumGain = 1.0f;
 
+    // Phase 11D: sampled diagnostics for the physical baseline Wiener stage. These values are
+    // read-only telemetry; they never grant denoise authority.
+    std::uint64_t baselineNrSampleCount = 0;
+    float predictedNoiseSigma = 0.0f;
+    float noisePressure = 0.0f;
+    float baselineNrAuthority = 0.0f;
+    float meanDetailGain = 1.0f;
+    float fractionNearIdentity = 1.0f;
+    float fractionStronglyFiltered = 0.0f;
+
     float exposureSceneP10 = 0.0f;
     float exposureSceneP25 = 0.0f;
     float exposureSceneP50 = 0.0f;

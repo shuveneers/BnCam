@@ -4,6 +4,9 @@ import android.content.Context
 import android.content.pm.ApplicationInfo
 import android.os.SystemClock
 import android.util.Log
+import com.bncam.core.engine.BnCamStreamRoleIds
+import com.bncam.core.engine.StreamRuntimeTelemetry
+import com.bncam.core.runtime.RawPreviewProducerKind
 import com.bncam.core.debug.DiagnosticsAggregator
 import java.util.Locale
 import java.util.concurrent.ScheduledThreadPoolExecutor
@@ -12,13 +15,29 @@ import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.sqrt
 
 /**
- * Debug-build cadence probe keyed by SENSOR_TIMESTAMP. It deliberately reports only unique source
- * timestamps, so offering or drawing the same RAW buffer twice can never inflate the FPS number.
+ * Debug-build cadence probe keyed by SENSOR_TIMESTAMP + producer identity. PRIMARY_BUFFER and
+ * RAW_PREVIEW_SUPPORT may legitimately carry the same sensor timestamp, so producer provenance
+ * must remain distinct through renderer/GL/EGL diagnostics. Aggregate source FPS still deduplicates
+ * sensor timestamps to describe sensor cadence rather than Camera2 output count.
  * Per-frame events stay in memory; bounded snapshots are coalesced off-thread into central diagnostics.
  */
 object RawPreviewCadenceDiagnostics {
+    private data class FrameKey(
+        val sensorTimestampNs: Long,
+        val producerKind: RawPreviewProducerKind
+    )
+
+    private data class MetadataRecord(
+        val metadataArrivalNs: Long,
+        val sensorFrameDurationNs: Long,
+        val exposureTimeNs: Long,
+        val requestedFpsLower: Int,
+        val requestedFpsUpper: Int
+    )
+
     private data class FrameRecord(
         val sensorTimestampNs: Long,
+        val producerKind: RawPreviewProducerKind,
         var sourceArrivalNs: Long = 0L,
         var metadataArrivalNs: Long = 0L,
         var sensorFrameDurationNs: Long = 0L,
@@ -67,7 +86,8 @@ object RawPreviewCadenceDiagnostics {
     )
 
     private val lock = Any()
-    private val records = LinkedHashMap<Long, FrameRecord>()
+    private val records = LinkedHashMap<FrameKey, FrameRecord>()
+    private val metadataByTimestamp = LinkedHashMap<Long, MetadataRecord>()
     private val writerQueued = AtomicBoolean(false)
     private val writer = ScheduledThreadPoolExecutor(1) { runnable ->
         Thread(runnable, "BnCamRawCadenceWriter").apply { priority = Thread.MIN_PRIORITY }
@@ -106,6 +126,7 @@ object RawPreviewCadenceDiagnostics {
                 duplicateOffersRejected = 0L
                 dropReasonCounts.fill(0L)
                 records.clear()
+                metadataByTimestamp.clear()
                 latestRenderedReport = null
             } else if (minFrameDurationNs > 0L) {
                 advertisedMinFrameDurationNs = minFrameDurationNs
@@ -118,10 +139,25 @@ object RawPreviewCadenceDiagnostics {
         source: ViewfinderEffectiveSource,
         generation: Int,
         sensorTimestampNs: Long,
+        producerKind: RawPreviewProducerKind,
         arrivalElapsedNs: Long = SystemClock.elapsedRealtimeNanos()
     ) {
-        RawPreviewHealthMonitor.imageReaderProgress(generation, sensorTimestampNs, arrivalElapsedNs)
-        update(source, generation, sensorTimestampNs) { record ->
+        RawPreviewHealthMonitor.imageReaderProgress(
+            generation = generation,
+            sensorTimestampNs = sensorTimestampNs,
+            producerKind = producerKind,
+            nowElapsedNs = arrivalElapsedNs
+        )
+        StreamRuntimeTelemetry.producerFrameArrived(
+            generation = generation,
+            roleId = when (producerKind) {
+                RawPreviewProducerKind.CANONICAL_RING -> BnCamStreamRoleIds.PRIMARY_BUFFER
+                RawPreviewProducerKind.CUSTOM_IMAGE_READER -> BnCamStreamRoleIds.RAW_PREVIEW_SUPPORT
+            },
+            sensorTimestampNs = sensorTimestampNs,
+            arrivalElapsedNs = arrivalElapsedNs
+        )
+        update(source, generation, sensorTimestampNs, producerKind) { record ->
             if (record.sourceArrivalNs == 0L) record.sourceArrivalNs = arrivalElapsedNs
         }
     }
@@ -143,33 +179,57 @@ object RawPreviewCadenceDiagnostics {
             exposureTimeNs = exposureTimeNs,
             nowElapsedNs = nowNs
         )
-        update(source, generation, sensorTimestampNs) { record ->
-            record.metadataArrivalNs = nowNs
-            record.sensorFrameDurationNs = sensorFrameDurationNs
-            record.exposureTimeNs = exposureTimeNs
-            record.requestedFpsLower = requestedFpsLower
-            record.requestedFpsUpper = requestedFpsUpper
+        if (!enabled || sensorTimestampNs <= 0L) return
+        synchronized(lock) {
+            if (activeSource != source.name || activeGeneration != generation) return
+            val metadata = MetadataRecord(
+                metadataArrivalNs = nowNs,
+                sensorFrameDurationNs = sensorFrameDurationNs,
+                exposureTimeNs = exposureTimeNs,
+                requestedFpsLower = requestedFpsLower,
+                requestedFpsUpper = requestedFpsUpper
+            )
+            metadataByTimestamp[sensorTimestampNs] = metadata
+            while (metadataByTimestamp.size > MAX_RECORDS) {
+                metadataByTimestamp.entries.iterator().run { if (hasNext()) { next(); remove() } }
+            }
+            records.values.filter { it.sensorTimestampNs == sensorTimestampNs }.forEach { record ->
+                applyMetadata(record, metadata)
+            }
         }
+        queueWrite()
     }
 
-    fun offered(source: ViewfinderEffectiveSource, generation: Int, sensorTimestampNs: Long) {
-        RawPreviewHealthMonitor.rendererOffer(generation, SystemClock.elapsedRealtimeNanos())
-        update(source, generation, sensorTimestampNs) { it.offerCount++ }
+    fun offered(
+        source: ViewfinderEffectiveSource,
+        generation: Int,
+        sensorTimestampNs: Long,
+        producerKind: RawPreviewProducerKind
+    ) {
+        RawPreviewHealthMonitor.rendererOffer(
+            generation = generation,
+            sensorTimestampNs = sensorTimestampNs,
+            producerKind = producerKind,
+            nowElapsedNs = SystemClock.elapsedRealtimeNanos()
+        )
+        update(source, generation, sensorTimestampNs, producerKind) { it.offerCount++ }
     }
 
     fun duplicateOfferRejected(
         source: ViewfinderEffectiveSource,
         generation: Int,
-        sensorTimestampNs: Long
+        sensorTimestampNs: Long,
+        producerKind: RawPreviewProducerKind
     ) {
         synchronized(lock) { duplicateOffersRejected++ }
-        update(source, generation, sensorTimestampNs) { it.offerCount++ }
+        update(source, generation, sensorTimestampNs, producerKind) { it.offerCount++ }
     }
 
     internal fun dropped(
         source: ViewfinderEffectiveSource,
         generation: Int,
         sensorTimestampNs: Long,
+        producerKind: RawPreviewProducerKind,
         reason: RawPreviewDropReason
     ) {
         if (!enabled) return
@@ -177,17 +237,19 @@ object RawPreviewCadenceDiagnostics {
             if (activeSource != source.name || activeGeneration != generation) return
             dropReasonCounts[reason.ordinal]++
             if (sensorTimestampNs > 0L) {
-                val record = records.getOrPut(sensorTimestampNs) { FrameRecord(sensorTimestampNs) }
-                while (records.size > MAX_RECORDS) {
-                    records.entries.iterator().run { if (hasNext()) { next(); remove() } }
-                }
+                getOrCreateRecordLocked(sensorTimestampNs, producerKind)
+                trimRecordsLocked()
             }
         }
         queueWrite()
     }
 
-    fun processingStarted(source: ViewfinderEffectiveSource, generation: Int, sensorTimestampNs: Long) =
-        update(source, generation, sensorTimestampNs) {
+    fun processingStarted(
+        source: ViewfinderEffectiveSource,
+        generation: Int,
+        sensorTimestampNs: Long,
+        producerKind: RawPreviewProducerKind
+    ) = update(source, generation, sensorTimestampNs, producerKind) {
             if (it.processStartNs == 0L) it.processStartNs = SystemClock.elapsedRealtimeNanos()
         }
 
@@ -195,11 +257,12 @@ object RawPreviewCadenceDiagnostics {
         source: ViewfinderEffectiveSource,
         generation: Int,
         sensorTimestampNs: Long,
+        producerKind: RawPreviewProducerKind,
         inputPackingMs: Float = 0f,
         gpuKernelMs: Float = 0f,
         gpuSyncOverheadMs: Float = 0f,
         gpuHostReadbackMs: Float = 0f
-    ) = update(source, generation, sensorTimestampNs) {
+    ) = update(source, generation, sensorTimestampNs, producerKind) {
         if (it.processCompleteNs == 0L) it.processCompleteNs = SystemClock.elapsedRealtimeNanos()
         if (inputPackingMs.isFinite() && inputPackingMs >= 0f) it.inputPackingMs = inputPackingMs
         if (gpuKernelMs.isFinite() && gpuKernelMs >= 0f) it.gpuKernelMs = gpuKernelMs
@@ -211,6 +274,7 @@ object RawPreviewCadenceDiagnostics {
         source: ViewfinderEffectiveSource,
         generation: Int,
         sensorTimestampNs: Long,
+        producerKind: RawPreviewProducerKind,
         gpuResidentOutputUsed: Boolean,
         interopEglGeneration: Int,
         rgbMin: Float,
@@ -223,6 +287,8 @@ object RawPreviewCadenceDiagnostics {
     ) {
         RawPreviewHealthMonitor.rendererPublication(
             generation = generation,
+            sensorTimestampNs = sensorTimestampNs,
+            producerKind = producerKind,
             frameEglGeneration = interopEglGeneration,
             rgbMin = rgbMin,
             rgbMax = rgbMax,
@@ -232,7 +298,7 @@ object RawPreviewCadenceDiagnostics {
             normalizedRawMax = normalizedRawMax,
             sceneP50 = sceneP50
         )
-        update(source, generation, sensorTimestampNs) { record ->
+        update(source, generation, sensorTimestampNs, producerKind) { record ->
             record.rendererPublicationNs = publicationElapsedNs
             record.gpuResidentOutputUsed = gpuResidentOutputUsed
             record.interopEglGeneration = interopEglGeneration
@@ -243,24 +309,39 @@ object RawPreviewCadenceDiagnostics {
         source: ViewfinderEffectiveSource,
         generation: Int,
         sensorTimestampNs: Long,
+        producerKind: RawPreviewProducerKind,
         rgbaHandoffBytes: Long = 0L,
         eglGeneration: Int = -1
     ) {
         val nowNs = SystemClock.elapsedRealtimeNanos()
-        RawPreviewHealthMonitor.glAccepted(generation, eglGeneration, nowNs)
-        update(source, generation, sensorTimestampNs) {
+        RawPreviewHealthMonitor.glAccepted(
+            generation = generation,
+            sensorTimestampNs = sensorTimestampNs,
+            producerKind = producerKind,
+            currentEglGeneration = eglGeneration,
+            nowElapsedNs = nowNs
+        )
+        update(source, generation, sensorTimestampNs, producerKind) {
             if (it.viewAcceptedNs == 0L) it.viewAcceptedNs = nowNs
             if (rgbaHandoffBytes > 0L) it.rgbaHandoffBytes = rgbaHandoffBytes
         }
     }
 
-    fun glUploadStarted(source: ViewfinderEffectiveSource, generation: Int, sensorTimestampNs: Long) =
-        update(source, generation, sensorTimestampNs) {
+    fun glUploadStarted(
+        source: ViewfinderEffectiveSource,
+        generation: Int,
+        sensorTimestampNs: Long,
+        producerKind: RawPreviewProducerKind
+    ) = update(source, generation, sensorTimestampNs, producerKind) {
             it.glUploadStartNs = SystemClock.elapsedRealtimeNanos()
         }
 
-    fun glUploadCompleted(source: ViewfinderEffectiveSource, generation: Int, sensorTimestampNs: Long) =
-        update(source, generation, sensorTimestampNs) {
+    fun glUploadCompleted(
+        source: ViewfinderEffectiveSource,
+        generation: Int,
+        sensorTimestampNs: Long,
+        producerKind: RawPreviewProducerKind
+    ) = update(source, generation, sensorTimestampNs, producerKind) {
             it.glUploadCompleteNs = SystemClock.elapsedRealtimeNanos()
         }
 
@@ -268,35 +349,52 @@ object RawPreviewCadenceDiagnostics {
         source: ViewfinderEffectiveSource,
         generation: Int,
         sensorTimestampNs: Long,
+        producerKind: RawPreviewProducerKind,
         eglFrameId: Long,
         eglGeneration: Int = -1
     ) {
         val nowNs = SystemClock.elapsedRealtimeNanos()
-        RawPreviewHealthMonitor.glDraw(generation, eglGeneration, nowNs)
-        update(source, generation, sensorTimestampNs) {
+        RawPreviewHealthMonitor.glDraw(
+            generation = generation,
+            sensorTimestampNs = sensorTimestampNs,
+            producerKind = producerKind,
+            currentEglGeneration = eglGeneration,
+            nowElapsedNs = nowNs
+        )
+        update(source, generation, sensorTimestampNs, producerKind) {
             it.drawSubmittedNs = nowNs
             it.eglFrameId = eglFrameId
         }
     }
 
-    fun displayPresented(sensorTimestampNs: Long, eglFrameId: Long, displayPresentNs: Long) {
-        if (!enabled || sensorTimestampNs <= 0L || displayPresentNs <= 0L) return
+    fun displayPresented(
+        source: ViewfinderEffectiveSource,
+        generation: Int,
+        sensorTimestampNs: Long,
+        producerKind: RawPreviewProducerKind,
+        eglFrameId: Long,
+        displayPresentNs: Long
+    ) {
+        if (sensorTimestampNs <= 0L || displayPresentNs <= 0L) return
         // EGL_ANDROID_get_frame_timestamps uses CLOCK_MONOTONIC while Camera2 REALTIME sensor
         // timestamps use CLOCK_BOOTTIME/elapsedRealtimeNanos. Convert before computing frame age.
         val boottimePresentNs = displayPresentNs +
             (SystemClock.elapsedRealtimeNanos() - System.nanoTime())
-        var generation = -1
+        RawPreviewHealthMonitor.displayPresented(
+            generation = generation,
+            sensorTimestampNs = sensorTimestampNs,
+            producerKind = producerKind,
+            nowElapsedNs = boottimePresentNs
+        )
+        if (!enabled) return
         synchronized(lock) {
-            generation = activeGeneration
-            records[sensorTimestampNs]?.let {
+            if (activeSource != source.name || activeGeneration != generation) return
+            records[FrameKey(sensorTimestampNs, producerKind)]?.let {
                 if (it.eglFrameId == 0L || it.eglFrameId == eglFrameId) {
                     it.eglFrameId = eglFrameId
                     it.displayPresentNs = boottimePresentNs
                 }
             }
-        }
-        if (generation >= 0) {
-            RawPreviewHealthMonitor.displayPresented(generation, boottimePresentNs)
         }
         queueWrite()
     }
@@ -305,18 +403,43 @@ object RawPreviewCadenceDiagnostics {
         source: ViewfinderEffectiveSource,
         generation: Int,
         sensorTimestampNs: Long,
+        producerKind: RawPreviewProducerKind,
         crossinline change: (FrameRecord) -> Unit
     ) {
         if (!enabled || sensorTimestampNs <= 0L) return
         synchronized(lock) {
             if (activeSource != source.name || activeGeneration != generation) return
-            val record = records.getOrPut(sensorTimestampNs) { FrameRecord(sensorTimestampNs) }
+            val record = getOrCreateRecordLocked(sensorTimestampNs, producerKind)
             change(record)
-            while (records.size > MAX_RECORDS) {
-                records.entries.iterator().run { if (hasNext()) { next(); remove() } }
-            }
+            trimRecordsLocked()
         }
         queueWrite()
+    }
+
+    private fun getOrCreateRecordLocked(
+        sensorTimestampNs: Long,
+        producerKind: RawPreviewProducerKind
+    ): FrameRecord {
+        val key = FrameKey(sensorTimestampNs, producerKind)
+        return records.getOrPut(key) {
+            FrameRecord(sensorTimestampNs, producerKind).also { record ->
+                metadataByTimestamp[sensorTimestampNs]?.let { metadata -> applyMetadata(record, metadata) }
+            }
+        }
+    }
+
+    private fun applyMetadata(record: FrameRecord, metadata: MetadataRecord) {
+        record.metadataArrivalNs = metadata.metadataArrivalNs
+        record.sensorFrameDurationNs = metadata.sensorFrameDurationNs
+        record.exposureTimeNs = metadata.exposureTimeNs
+        record.requestedFpsLower = metadata.requestedFpsLower
+        record.requestedFpsUpper = metadata.requestedFpsUpper
+    }
+
+    private fun trimRecordsLocked() {
+        while (records.size > MAX_RECORDS) {
+            records.entries.iterator().run { if (hasNext()) { next(); remove() } }
+        }
     }
 
     private fun queueWrite() {
@@ -370,8 +493,10 @@ object RawPreviewCadenceDiagnostics {
     fun latestReport(): String? = latestRenderedReport
 
     private fun renderReport(snapshot: Snapshot): String {
-        val metadataFrames = snapshot.frames.filter { it.metadataArrivalNs > 0L }.sortedBy { it.sensorTimestampNs }
-        val sourceFrames = snapshot.frames.filter { it.sourceArrivalNs > 0L }.sortedBy { it.sensorTimestampNs }
+        val metadataFrames = snapshot.frames.filter { it.metadataArrivalNs > 0L }
+            .sortedBy { it.sensorTimestampNs }.distinctBy { it.sensorTimestampNs }
+        val sourceFramesAll = snapshot.frames.filter { it.sourceArrivalNs > 0L }.sortedBy { it.sensorTimestampNs }
+        val sourceFrames = sourceFramesAll.distinctBy { it.sensorTimestampNs }
         val processedFrames = snapshot.frames.filter { it.processCompleteNs > 0L }.sortedBy { it.processCompleteNs }
         val publishedFrames = snapshot.frames.filter { it.rendererPublicationNs > 0L }.sortedBy { it.rendererPublicationNs }
         val acceptedFrames = snapshot.frames.filter { it.viewAcceptedNs > 0L }.sortedBy { it.viewAcceptedNs }
@@ -428,7 +553,7 @@ object RawPreviewCadenceDiagnostics {
         val sensorToPresentLatencyP50Ms = presentLatencyDist?.p50 ?: 0.0
         val sensorToPresentLatencyP95Ms = presentLatencyDist?.p95 ?: 0.0
 
-        val droppedSource = (sourceFrames.size - publishedFrames.size).coerceAtLeast(0)
+        val droppedSource = (sourceFramesAll.size - publishedFrames.size).coerceAtLeast(0)
         val droppedGpuBusy = snapshot.duplicateOffersRejected
         val gpuPublishedFrames = publishedFrames.count { it.gpuResidentOutputUsed }
         val cpuPublishedFrames = publishedFrames.size - gpuPublishedFrames
@@ -445,7 +570,14 @@ object RawPreviewCadenceDiagnostics {
 
         return buildString {
             appendLine("RAW_CADENCE source=${snapshot.source} generation=${snapshot.generation}")
-            appendLine("captureResultFrames=${metadataFrames.size} imageReaderFrames=${sourceFrames.size} uniqueProcessedFrames=${processedFrames.size} rendererPublishedFrames=${publishedFrames.size} glAcceptedFrames=${acceptedFrames.size} uniqueDrawnFrames=${drawnFrames.size} actualPresentedFrames=${presentedFrames.size}")
+            appendLine("captureResultFrames=${metadataFrames.size} imageReaderFrames=${sourceFrames.size} producerImageReaderFrames=${sourceFramesAll.size} uniqueProcessedFrames=${processedFrames.size} rendererPublishedFrames=${publishedFrames.size} glAcceptedFrames=${acceptedFrames.size} uniqueDrawnFrames=${drawnFrames.size} actualPresentedFrames=${presentedFrames.size}")
+            appendLine("producerCadence=" + RawPreviewProducerKind.values().joinToString(separator = ";") { producer ->
+                val producerFrames = snapshot.frames.filter { it.producerKind == producer }
+                "${producer.name}{source=${producerFrames.count { it.sourceArrivalNs > 0L }}," +
+                    "published=${producerFrames.count { it.rendererPublicationNs > 0L }}," +
+                    "drawn=${producerFrames.count { it.drawSubmittedNs > 0L }}," +
+                    "presented=${producerFrames.count { it.displayPresentNs > 0L }}}"
+            })
             appendLine("captureResultSensorFps=${fpsFromSensorTimestamps(metadataFrames)} imageReaderSensorFps=${fpsFromSensorTimestamps(sourceFrames)} imageReaderArrivalFps=${fpsFromTimes(sourceFrames.map { it.sourceArrivalNs })} rendererPublicationFps=${fpsFromTimes(publishedFrames.map { it.rendererPublicationNs })} glAcceptedFps=${fpsFromTimes(acceptedFrames.map { it.viewAcceptedNs })} drawSubmitFps=${fpsFromTimes(drawnFrames.map { it.drawSubmittedNs })} actualDisplayPresentationFps=${fpsFromTimes(presentedFrames.map { it.displayPresentNs })} legacyPresentationFps=${fpsFromTimes(presentationTimes)} presentationClock=$presentationMode")
             appendLine("advertisedMinFrameDurationMs=${snapshot.advertisedMinFrameDurationNs / 1e6} requestedFpsRanges=$fpsRanges duplicateOffers=${snapshot.frames.sumOf { (it.offerCount - 1).coerceAtLeast(0) }} duplicateOffersRejected=${snapshot.duplicateOffersRejected}")
             appendLine("presentationFrameIntervalMeanMs=$presentationFrameIntervalMeanMs presentationFrameIntervalP95Ms=$presentationFrameIntervalP95Ms presentationFrameIntervalP99Ms=$presentationFrameIntervalP99Ms")
@@ -487,10 +619,10 @@ object RawPreviewCadenceDiagnostics {
     }
 
     private fun renderCsv(snapshot: Snapshot): String = buildString {
-        appendLine("sensorTimestampNs,sourceArrivalNs,metadataArrivalNs,sensorFrameDurationNs,exposureTimeNs,fpsLower,fpsUpper,offerCount,processStartNs,processCompleteNs,rendererPublicationNs,gpuResidentOutputUsed,interopEglGeneration,inputPackingMs,gpuKernelMs,gpuSyncOverheadMs,gpuHostReadbackMs,viewAcceptedNs,glUploadStartNs,glUploadCompleteNs,rgbaHandoffBytes,drawSubmittedNs,eglFrameId,displayPresentNs")
+        appendLine("sensorTimestampNs,producerKind,sourceArrivalNs,metadataArrivalNs,sensorFrameDurationNs,exposureTimeNs,fpsLower,fpsUpper,offerCount,processStartNs,processCompleteNs,rendererPublicationNs,gpuResidentOutputUsed,interopEglGeneration,inputPackingMs,gpuKernelMs,gpuSyncOverheadMs,gpuHostReadbackMs,viewAcceptedNs,glUploadStartNs,glUploadCompleteNs,rgbaHandoffBytes,drawSubmittedNs,eglFrameId,displayPresentNs")
         snapshot.frames.sortedBy { it.sensorTimestampNs }.forEach { f ->
             appendLine(listOf(
-                f.sensorTimestampNs, f.sourceArrivalNs, f.metadataArrivalNs, f.sensorFrameDurationNs, f.exposureTimeNs,
+                f.sensorTimestampNs, f.producerKind.name, f.sourceArrivalNs, f.metadataArrivalNs, f.sensorFrameDurationNs, f.exposureTimeNs,
                 f.requestedFpsLower, f.requestedFpsUpper, f.offerCount, f.processStartNs,
                 f.processCompleteNs, f.rendererPublicationNs, f.gpuResidentOutputUsed, f.interopEglGeneration,
                 f.inputPackingMs, f.gpuKernelMs, f.gpuSyncOverheadMs,

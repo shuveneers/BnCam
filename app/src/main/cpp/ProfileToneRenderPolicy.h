@@ -33,9 +33,10 @@ inline float sanitizeSignedTone(float value) noexcept {
 }
 
 /**
- * Explicit profile controls only. Camera2 acquisition and automatic FLLF never read these values.
- * Exposure is one scene-linear scalar applied after automatic FLLF and before PBR Neutral.
- * The remaining controls are bounded display-linear tonal-range operations after PBR Neutral.
+ * Explicit profile controls only. Camera2 acquisition, GlobalSceneExposurePlan, GTM and FLLF
+ * never read these values. Phase 11F moves profile Exposure into the explicit post-display look
+ * stage so it cannot become a second automatic scene-placement owner. Remaining controls are
+ * bounded display-linear tonal-range operations in that same explicit profile stage.
  */
 inline ProfileToneRenderPlan resolveProfileToneRenderPlan(
         const ProfileToneRenderInput& input) noexcept {

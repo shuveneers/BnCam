@@ -20,6 +20,11 @@ layout(std430, binding = 4) readonly buffer LensBuffer { float lensShading[]; };
 // to at most five operations per 16x16 workgroup.
 shared uvec4 finalizeCounts[256];
 shared uint finalizeMaxGainBits[256];
+// Phase 11D: compact sampled physical-baseline NR diagnostics piggyback on the existing
+// workgroup reduction. Only one of every 8x8 pixels contributes, so telemetry cannot become
+// a new full-frame atomic bottleneck.
+shared uvec4 finalizeNrSums[256];   // sigma, noisePressure, authority, effectiveDetailGain (Q10)
+shared uvec4 finalizeNrCounts[256]; // sampled, nearIdentity, stronglyFiltered, reserved
 
 // Phase 5: one-workgroup scene resolver. All full-frame work stays resident on Vulkan; these
 // shared values only coordinate the 64x48 compact exposure policy within the command buffer.
@@ -195,20 +200,32 @@ float defectCorrectedAt(int x, int y, float center, out bool corrected) {
 // mixed. Dynamic ISO has already been folded into the effective S/O supplied here; this pass
 // must not apply the coefficient again. Neural, when enabled, receives this denoised mosaic
 // and is therefore only a residual/add-on refinement of the physical baseline.
-float baselineNoiseReducedAt(int x, int y, float center) {
+float baselineNoiseReducedAt(
+        int x,
+        int y,
+        float center,
+        out float predictedSigmaOut,
+        out float noisePressureOut,
+        out float authorityOut,
+        out float detailGainOut) {
+    predictedSigmaOut = 0.0;
+    noisePressureOut = 0.0;
+    authorityOut = 0.0;
+    detailGainOut = 1.0;
+
     if (pc.noiseModelEnabled == 0u || !finite1(center)) return center;
-    if (x < 4 || y < 4 || x >= int(pc.frameWidth) - 4 || y >= int(pc.frameHeight) - 4) {
-        return center;
-    }
 
     int channel = noiseChannel4(pc.effectiveCfaPattern, x, y);
     float centerNoiseVariance = predictedNoiseVariance(center, channel);
     if (!(centerNoiseVariance > 1.0e-12) || !finite1(centerNoiseVariance)) return center;
+    predictedSigmaOut = sqrt(centerNoiseVariance);
 
-    // Two same-CFA spatial scales. The near 3x3 Bayer-plane support removes fine grain. The
-    // radius-4 support reduces lower-frequency sensor noise only when the intervening radius-2
-    // sample agrees with the center. This makes high effective S/O materially smoother while a
-    // low Dynamic-ISO model stays crisp, without adding a second strength parameter or mixing CFA.
+    if (x < 4 || y < 4 || x >= int(pc.frameWidth) - 4 || y >= int(pc.frameHeight) - 4) {
+        return center;
+    }
+
+    // Two same-CFA spatial scales. The support itself is unchanged from the physical baseline,
+    // but Phase 11D no longer assumes that a valid S/O model automatically grants mutation.
     const ivec2 nearOffsets[8] = ivec2[8](
         ivec2(-2,  0), ivec2( 2,  0), ivec2( 0, -2), ivec2( 0,  2),
         ivec2(-2, -2), ivec2( 2, -2), ivec2(-2,  2), ivec2( 2,  2));
@@ -251,9 +268,6 @@ float baselineNoiseReducedAt(int x, int y, float center) {
             : 0.0;
         if (!finite1(farRangeWeight) || farRangeWeight < 0.0) farRangeWeight = 0.0;
 
-        // Radius four is exactly twice the spatial distance of the near support, so its base
-        // spatial authority is one half. Multiplication by nearWeight is a continuity gate:
-        // a far sample cannot contribute strongly across an edge that was already rejected at r=2.
         float farWeight = 0.5 * nearWeight * farRangeWeight;
         if (!finite1(farWeight) || farWeight < 0.0) farWeight = 0.0;
         farWeights[i] = farWeight;
@@ -275,16 +289,43 @@ float baselineNoiseReducedAt(int x, int y, float center) {
     float localVariance = localVarianceSum / weightSum;
     if (!finite1(localVariance) || localVariance < 0.0) return center;
 
-    // Local Wiener shrinkage: variance explained by the resolved physical S/O is suppressed;
-    // variance in excess of that prediction is treated as scene structure. Dynamic ISO therefore
-    // controls baseline pixel denoise only through the one upstream-resolved S/O model.
     float noiseVariance = predictedNoiseVariance(localMean, channel);
     if (!finite1(noiseVariance) || noiseVariance < 0.0) return center;
+    float predictedSigma = sqrt(max(noiseVariance, 0.0));
+    predictedSigmaOut = predictedSigma;
+
+    // Phase 11D noise-significance gate.
+    //
+    // 1) Absolute/relative physical pressure: very small predicted noise is identity even in a
+    //    perfectly flat patch. This is what makes clean daylight genuinely mutation-free.
+    // 2) Local dominance: if measured local variance is overwhelmingly scene structure rather
+    //    than the predicted noise floor, preserve it.
+    // 3) Centre-vs-neighbour SNR: coherent local detail further suppresses authority.
+    float relativeSigma = predictedSigma / max(0.025, max(localMean, center));
+    float physicalPressure = smoothstep(0.012, 0.055, relativeSigma);
+    float noiseToMeasured = noiseVariance / max(localVariance, 1.0e-12);
+    float dominance = smoothstep(0.16, 0.72, noiseToMeasured);
+    float centreStructureSnr = abs(center - localMean) / max(predictedSigma, 1.0e-6);
+    float flatness = 1.0 - smoothstep(1.4, 4.0, centreStructureSnr);
+    float authority = clamp(
+            physicalPressure * dominance * (0.25 + 0.75 * flatness),
+            0.0, 1.0);
+
+    noisePressureOut = physicalPressure;
+    authorityOut = authority;
+    if (!(authority > 1.0e-5)) return center;
+
+    // Wiener shrinkage remains the estimator, but its pixel mutation is explicitly gated by
+    // physical significance. The effective detail gain therefore converges to 1.0 as authority
+    // goes to zero instead of making tiny, cumulative low-ISO changes.
     float signalVariance = max(localVariance - noiseVariance, 0.0);
     float denominator = signalVariance + noiseVariance;
-    float detailGain = denominator > 1.0e-12 ? signalVariance / denominator : 1.0;
-    if (!finite1(detailGain)) return center;
-    float filtered = localMean + clamp(detailGain, 0.0, 1.0) * (center - localMean);
+    float rawDetailGain = denominator > 1.0e-12 ? signalVariance / denominator : 1.0;
+    if (!finite1(rawDetailGain)) return center;
+    float effectiveDetailGain = mix(1.0, clamp(rawDetailGain, 0.0, 1.0), authority);
+    detailGainOut = effectiveDetailGain;
+
+    float filtered = localMean + effectiveDetailGain * (center - localMean);
     return finite1(filtered) ? sceneClamp(filtered) : center;
 }
 
@@ -409,6 +450,17 @@ const uint EXP_EV_HIST_BINS = 256u;
 const uint EXP_POS_EV_HIST_START = EXP_EV_HIST_START + EXP_EV_HIST_BINS;
 const uint EXP_POS_EV_HIST_BINS = 128u;
 const uint EXPOSURE_MAP_RECORD_OFFSET = 64u * 48u;
+
+// Phase 11D sampled baseline-NR diagnostics. The exposure histograms occupy words 32..607.
+const uint NR_TELEMETRY_START = EXP_POS_EV_HIST_START + EXP_POS_EV_HIST_BINS; // 608
+const uint NR_SAMPLE_COUNT = NR_TELEMETRY_START + 0u;
+const uint NR_SIGMA_SUM_Q10 = NR_TELEMETRY_START + 1u;
+const uint NR_PRESSURE_SUM_Q10 = NR_TELEMETRY_START + 2u;
+const uint NR_AUTHORITY_SUM_Q10 = NR_TELEMETRY_START + 3u;
+const uint NR_DETAIL_GAIN_SUM_Q10 = NR_TELEMETRY_START + 4u;
+const uint NR_NEAR_IDENTITY_COUNT = NR_TELEMETRY_START + 5u;
+const uint NR_STRONGLY_FILTERED_COUNT = NR_TELEMETRY_START + 6u;
+const float NR_TELEMETRY_Q = 1024.0;
 
 float exposureSafeLog2(float value) { return log2(max(value, 1.0e-6)); }
 float exposureSmoothstep(float e0, float e1, float value) {
@@ -771,6 +823,10 @@ void finalizePixel() {
 
     uvec4 localCounts = uvec4(0u);
     uint localMaxGainBits = floatBitsToUint(1.0);
+    float nrPredictedSigma = 0.0;
+    float nrNoisePressure = 0.0;
+    float nrAuthority = 0.0;
+    float nrDetailGain = 1.0;
 
     if (inFrame) {
         int x = int(gid.x), y = int(gid.y);
@@ -785,10 +841,12 @@ void finalizePixel() {
         float value = defectCorrectedAt(x, y, original, defectCorrected);
         if (defectCorrected) localCounts.y = 1u;
 
-        // Physical baseline NR owns first-pass noise removal. It consumes the already-resolved
-        // effective per-channel S/O and therefore remains active with Neural OFF. Neural ON is
-        // downstream and receives this result; it never replaces this stage.
-        value = baselineNoiseReducedAt(x, y, value);
+        // Physical baseline NR remains SPECTRA/Neural-independent, but Phase 11D requires real
+        // noise significance before it may mutate pixels. Neural OFF therefore still keeps the
+        // physical baseline available while clean daylight can resolve to exact identity.
+        value = baselineNoiseReducedAt(
+                x, y, value,
+                nrPredictedSigma, nrNoisePressure, nrAuthority, nrDetailGain);
 
         int effectiveChannel = cfaChannel4(pc.effectiveCfaPattern, x, y);
         if (effectiveChannel == 1) value = sceneClamp(value * greenCalibrationScale(1) * pc.greenEvenScale);
@@ -806,6 +864,20 @@ void finalizePixel() {
 
     finalizeCounts[lane] = localCounts;
     finalizeMaxGainBits[lane] = localMaxGainBits;
+
+    bool nrSample = inFrame && ((gid.x & 7u) == 0u) && ((gid.y & 7u) == 0u);
+    finalizeNrSums[lane] = nrSample
+            ? uvec4(
+                uint(round(clamp(nrPredictedSigma, 0.0, 1.0) * NR_TELEMETRY_Q)),
+                uint(round(clamp(nrNoisePressure, 0.0, 1.0) * NR_TELEMETRY_Q)),
+                uint(round(clamp(nrAuthority, 0.0, 1.0) * NR_TELEMETRY_Q)),
+                uint(round(clamp(nrDetailGain, 0.0, 1.0) * NR_TELEMETRY_Q)))
+            : uvec4(0u);
+    bool nearIdentity = nrSample && (nrAuthority <= 0.02 || nrDetailGain >= 0.98);
+    bool stronglyFiltered = nrSample && nrAuthority >= 0.55 && nrDetailGain <= 0.70;
+    finalizeNrCounts[lane] = nrSample
+            ? uvec4(1u, nearIdentity ? 1u : 0u, stronglyFiltered ? 1u : 0u, 0u)
+            : uvec4(0u);
     barrier();
 
     for (uint stride = 128u; stride > 0u; stride >>= 1u) {
@@ -813,6 +885,8 @@ void finalizePixel() {
             finalizeCounts[lane] += finalizeCounts[lane + stride];
             finalizeMaxGainBits[lane] = max(
                 finalizeMaxGainBits[lane], finalizeMaxGainBits[lane + stride]);
+            finalizeNrSums[lane] += finalizeNrSums[lane + stride];
+            finalizeNrCounts[lane] += finalizeNrCounts[lane + stride];
         }
         barrier();
     }
@@ -824,6 +898,18 @@ void finalizePixel() {
         if (counts.z != 0u) atomicAdd(telemetry[2], counts.z);
         if (counts.w != 0u) atomicAdd(telemetry[3], counts.w);
         atomicMax(telemetry[4], finalizeMaxGainBits[0]);
+
+        uvec4 nrSums = finalizeNrSums[0];
+        uvec4 nrCounts = finalizeNrCounts[0];
+        if (nrCounts.x != 0u) {
+            atomicAdd(telemetry[NR_SAMPLE_COUNT], nrCounts.x);
+            atomicAdd(telemetry[NR_SIGMA_SUM_Q10], nrSums.x);
+            atomicAdd(telemetry[NR_PRESSURE_SUM_Q10], nrSums.y);
+            atomicAdd(telemetry[NR_AUTHORITY_SUM_Q10], nrSums.z);
+            atomicAdd(telemetry[NR_DETAIL_GAIN_SUM_Q10], nrSums.w);
+            atomicAdd(telemetry[NR_NEAR_IDENTITY_COUNT], nrCounts.y);
+            atomicAdd(telemetry[NR_STRONGLY_FILTERED_COUNT], nrCounts.z);
+        }
     }
 }
 

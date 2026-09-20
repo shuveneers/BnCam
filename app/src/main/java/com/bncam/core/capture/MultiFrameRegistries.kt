@@ -312,19 +312,18 @@ private fun resolveRegistered(
     registered: List<MultiFrameAlgorithmDescriptor>
 ): MethodResolution {
     val requested = registered.firstOrNull { it.matches(requestedId) }
-    val explicitlySelectable = requested?.isSelectableInPhase5A == true &&
-        origin in requested.applicableSources
-    val autoRequested = requested == auto
     return when {
-        autoRequested -> MethodResolution(
+        requested == auto -> MethodResolution(
             requestedId = requestedId,
-            requestedAvailability = requested.availability,
+            requestedAvailability = auto.availability,
             supported = true,
             resolvedId = autoExecuted.id,
             fallback = false,
             reason = "auto_resolved_to_current_native_${autoExecuted.id}"
         )
-        explicitlySelectable -> MethodResolution(
+        requested != null &&
+            requested.isSelectableInPhase5A &&
+            origin in requested.applicableSources -> MethodResolution(
             requestedId = requestedId,
             requestedAvailability = requested.availability,
             supported = true,

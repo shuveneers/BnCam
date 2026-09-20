@@ -11,16 +11,15 @@ class Phase9RawPreviewMemorySourceContractTest {
         ?: error("Unable to locate app module")
 
     @Test
-    fun `raw preview host rgba storage is lazy and shared for resident output`() {
+    fun `raw preview host rgba storage is lazy and slot local for overlapping submissions`() {
         val renderer = File(appDir, "src/main/java/com/bncam/ui/screens/capture/RawPreviewRenderer.kt").readText()
         val slotDeclaration = renderer.substringAfter("private class OutputSlot").substringBefore("private val allOutputSlots")
         assertFalse(slotDeclaration.contains("val rgba: ByteBuffer = ByteBuffer.allocateDirect(MAX_OUTPUT_BYTES)"))
         assertTrue(slotDeclaration.contains("private var cpuRgba: ByteBuffer? = null"))
         assertTrue(slotDeclaration.contains("fun ensureCpuRgbaBuffer(): ByteBuffer"))
-        assertTrue(renderer.contains("private var gpuFallbackScratchRgba: ByteBuffer? = null"))
-        assertTrue(renderer.contains("ensureGpuFallbackScratchRgba().apply { clear() }"))
         assertTrue(renderer.contains("slot.ensureCpuRgbaBuffer().apply { clear() }"))
-        assertTrue(renderer.contains("transitionFrameDropped=true"))
+        assertFalse(renderer.contains("gpuFallbackScratchRgba"))
+        assertTrue(renderer.contains("transitionFrameDropped=false"))
     }
 
     @Test
@@ -29,7 +28,7 @@ class Phase9RawPreviewMemorySourceContractTest {
         assertTrue(renderer.contains("RawPreviewResolutionPolicy.QUALITY_MAX_WIDTH"))
         assertTrue(renderer.contains("RawPreviewResolutionPolicy.QUALITY_MAX_HEIGHT"))
         assertTrue(renderer.contains("allOutputSlots.forEach(OutputSlot::releaseCpuBufferReferences)"))
-        assertTrue(renderer.contains("gpuFallbackScratchRgba = null"))
-        assertTrue(renderer.contains("val analysisBuffer = if (mlAnalysisRequested)"))
+        assertTrue(renderer.contains("val analysisBuffer = if (mlAnalysisRequested && analysisReadbackRequested)"))
+        assertTrue(renderer.contains("ANALYSIS_SIDECAR_INTERVAL_NS = 100_000_000L"))
     }
 }

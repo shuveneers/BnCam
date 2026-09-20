@@ -10,7 +10,9 @@ import com.bncam.core.runtime.RawPreviewResolutionPolicy
 import com.bncam.core.runtime.RawPreviewFastPathKind
 import com.bncam.core.runtime.RawPreviewFastPathPolicy
 import com.bncam.core.runtime.RawPreviewProducerKind
+import com.bncam.core.runtime.RawPreviewProducerTimestampGate
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.Closeable
 import java.nio.ByteBuffer
@@ -86,6 +88,10 @@ class RawPreviewFrame internal constructor(
     val pipelineGeneration: Int,
     val sensorTimestampNs: Long,
     val producerKind: RawPreviewProducerKind,
+    val captureSensitivityIso: Int,
+    val captureExposureTimeNs: Long,
+    val physicalGreenNoiseSo: FloatArray,
+    val analysisReadbackUsed: Boolean,
     val rotationDegrees: Int,
     val cfaCellDecimation: Int,
     val renderTimeMs: Float,
@@ -107,13 +113,19 @@ class RawPreviewFrame internal constructor(
     val tonePackTimeMs: Float,
     val targetExposureGain: Float,
     val appliedExposureGain: Float,
+    val previewRequestedEv: Float,
+    val previewHighlightLimitedEv: Float,
+    val previewAppliedEv: Float,
+    val previewSceneKey: Float,
+    val previewHighlightHeadroomEv: Float,
+    val previewSceneRangeEv: Float,
     val sceneMidtone: Float,
     val sceneMidtoneTarget: Float,
     val gtmShoulderStart: Float,
     val gtmShoulderStrength: Float,
-    val gtmBlackAnchor: Float,
-    val gtmLowerMidLift: Float,
-    val gtmContrastStrength: Float,
+    val gtmHighlightPressure: Float,
+    val gtmP95CompressionEv: Float,
+    val gtmP99CompressionEv: Float,
     val gtmDynamicRangePressure: Float,
     val ltmStrength: Float,
     val ltmMaxLiftEv: Float,
@@ -127,6 +139,14 @@ class RawPreviewFrame internal constructor(
     val displayBHistogram64: IntArray,
     val rawNearClipSampleCount: Int,
     val rawSampleCount: Int,
+    val rawTrueSaturatedSampleCount: Int,
+    val rawRClipSampleCount: Int,
+    val rawGClipSampleCount: Int,
+    val rawBClipSampleCount: Int,
+    val highlightReconstructionActivated: Boolean,
+    val highlightReconstructedSampleCount: Int,
+    val postWbClipSampleCount: Int,
+    val postCcmClipSampleCount: Int,
     val displayRClipSampleCount: Int,
     val displayGClipSampleCount: Int,
     val displayBClipSampleCount: Int,
@@ -208,6 +228,28 @@ class RawPreviewRenderer(
         val sourceHeight: Int
     )
 
+    private data class CompletionContext(
+        val request: Request,
+        val slot: OutputSlot,
+        val outputHardwareBuffer: HardwareBuffer?,
+        val outputRgba: ByteBuffer,
+        val analysisBuffer: ByteBuffer?,
+        val interopEglGeneration: Int,
+        val effectiveWbGains: FloatArray,
+        val effectiveColorMatrix: FloatArray,
+        val camera2PriorWbGains: FloatArray,
+        val camera2PriorColorMatrix: FloatArray,
+        val hasExactFrameColorPair: Boolean
+    )
+
+    private data class PendingVulkanFrame(
+        val context: CompletionContext,
+        val submissionId: Long,
+        val previewWidth: Int,
+        val previewHeight: Int,
+        val cfaCellDecimation: Int
+    )
+
     private val executor = ScheduledThreadPoolExecutor(1) { runnable ->
         Thread(runnable, "BnCamRawPreview").apply { priority = Thread.NORM_PRIORITY }
     }.apply {
@@ -220,7 +262,12 @@ class RawPreviewRenderer(
     }
     private val pendingRequestLock = Any()
     private val pendingRequests = ArrayDeque<Request>(MAX_PENDING_REQUESTS)
+    private val pendingVulkanFrames = ConcurrentHashMap<Int, PendingVulkanFrame>()
     private val drainScheduled = AtomicBoolean(false)
+    private var lastAnalysisSubmitElapsedNs = 0L
+    private var vulkanSubmittedFrames = 0L
+    private var vulkanCompletedFrames = 0L
+    private var analysisReadbackFrames = 0L
     private val configRevision = AtomicLong(0L)
     private val backendPrepareScheduled = AtomicBoolean(false)
     private val backendPrepared = AtomicBoolean(false)
@@ -235,7 +282,10 @@ class RawPreviewRenderer(
     // convergence override can otherwise pair one frame's gains with another frame's matrix.
     private val exactFrameColorPairs = ConcurrentHashMap<Long, ExactFrameColorPair>()
     private val autoWhiteBalanceColorPair = AtomicReference<ExactFrameColorPair?>(null)
-    private val latestOfferedSensorTimestampNs = AtomicLong(Long.MIN_VALUE)
+    // PRIMARY_BUFFER and RAW_PREVIEW_SUPPORT can legitimately carry the same SENSOR_TIMESTAMP.
+    // Keep monotonic duplicate suppression per producer so one stream can never poison the other
+    // stream's fallback path with a newer timestamp.
+    private val producerTimestampGate = RawPreviewProducerTimestampGate()
     private val lastRendererOfferElapsedNs = AtomicLong(0L)
     private val lastRendererPublishElapsedNs = AtomicLong(0L)
     private class OutputSlot(val id: Int) {
@@ -249,6 +299,7 @@ class RawPreviewRenderer(
         var pendingSource: ViewfinderEffectiveSource? = null
         var pendingGeneration: Int = -1
         var pendingSensorTimestampNs: Long = 0L
+        var pendingProducerKind: RawPreviewProducerKind = RawPreviewProducerKind.CANONICAL_RING
         var pendingEglGeneration: Int = -1
         private val quarantinedGpuBuffers = ArrayList<HardwareBuffer>(MAX_QUARANTINED_GPU_BACKINGS_PER_SLOT)
         val quarantined: Boolean get() = quarantinedGpuBuffers.isNotEmpty()
@@ -338,8 +389,6 @@ class RawPreviewRenderer(
     private val pendingGpuOutputSlots = ConcurrentLinkedQueue<OutputSlot>()
     private val outputSlotLedger = RawPreviewOutputSlotLedger(OUTPUT_SLOT_COUNT)
     private val dropCounters = AtomicLongArray(RawPreviewDropReason.values().size)
-    private var gpuFallbackScratchRgba: ByteBuffer? = null
-
     @Volatile private var activeConfig: RawPreviewRenderConfig? = null
     @Volatile private var closed = false
     private var droppedBusy = 0L
@@ -373,8 +422,11 @@ class RawPreviewRenderer(
         val source = request?.config?.source ?: activeConfig?.source
         val generation = request?.config?.pipelineGeneration ?: activeConfig?.pipelineGeneration
         val timestampNs = request?.sensorTimestampNs ?: 0L
+        val producerKind = request?.producerKind ?: RawPreviewProducerKind.CANONICAL_RING
         if (source != null && generation != null) {
-            RawPreviewCadenceDiagnostics.dropped(source, generation, timestampNs, reason)
+            RawPreviewCadenceDiagnostics.dropped(
+                source, generation, timestampNs, producerKind, reason
+            )
         }
     }
 
@@ -436,6 +488,8 @@ class RawPreviewRenderer(
             "pendingFence=${snapshot.pendingFence} closed=${snapshot.closed} " +
             "cpuFallbackAvailable=$cpuFallbackAvailable " +
             "availableQueue=${availableOutputSlots.size} pendingFenceQueue=${pendingGpuOutputSlots.size} " +
+            "pendingVulkan=${pendingVulkanFrames.size} submittedVulkan=$vulkanSubmittedFrames " +
+            "completedVulkan=$vulkanCompletedFrames " +
             "gpuQuarantinedSlots=$quarantinedSlots gpuQuarantinedBackings=$quarantinedBackings " +
             "gpuMode=${gpuState.mode} gpuBoundary=${gpuState.boundary} " +
             "gpuFallbackReason=${gpuState.reason} gpuProbeAttempted=${gpuState.probeAttempted} " +
@@ -488,7 +542,6 @@ class RawPreviewRenderer(
             permanentForBoundary = false
         )
         if (changed) {
-            gpuFallbackScratchRgba = null
             RawPreviewInteropCapabilities.recordActivePath("CPU_VISIBLE_RGBA_TO_GLES_HEALTH_RECOVERY")
             RawPreviewHealthMonitor.updateOutputSlotHealth(config.pipelineGeneration, outputSlotHealth())
             if (hasPendingRequest()) scheduleDrain()
@@ -530,11 +583,15 @@ class RawPreviewRenderer(
         stale?.let { dropped ->
             droppedBusy++
             recordDrop(RawPreviewDropReason.INPUT_QUEUE_OVERFLOW, dropped)
-            exactFrameColorPairs.remove(dropped.sensorTimestampNs)
+            // Camera2 metadata is shared evidence for every producer carrying this sensor timestamp.
+            // Do not consume/delete it when only one producer request is dropped. The bounded
+            // timestamp cache owns eviction so canonical fallback and support can both resolve the
+            // exact WB+CCM pair.
             releaseRequest(dropped)
             RawPreviewFrameLifecycleRegistry.released(
                 dropped.config.pipelineGeneration,
                 dropped.sensorTimestampNs,
+                dropped.producerKind,
                 SystemClock.elapsedRealtimeNanos(),
                 "input_queue_overflow"
             )
@@ -559,21 +616,17 @@ class RawPreviewRenderer(
             while (pendingRequests.isNotEmpty()) stale.add(pendingRequests.removeFirst())
         }
         stale.forEach { request ->
-            exactFrameColorPairs.remove(request.sensorTimestampNs)
+            // Keep exact Camera2 color evidence available to a sibling producer with the same
+            // SENSOR_TIMESTAMP; bounded cache eviction owns lifetime.
             releaseRequest(request)
             RawPreviewFrameLifecycleRegistry.released(
                 request.config.pipelineGeneration,
                 request.sensorTimestampNs,
+                request.producerKind,
                 SystemClock.elapsedRealtimeNanos(),
                 "pending_queue_cleared"
             )
         }
-    }
-
-    private fun ensureGpuFallbackScratchRgba(): ByteBuffer {
-        return gpuFallbackScratchRgba ?: ByteBuffer.allocateDirect(MAX_OUTPUT_BYTES)
-            .order(ByteOrder.nativeOrder())
-            .also { gpuFallbackScratchRgba = it }
     }
 
     private fun RawPreviewRenderConfig.isSafeForNativePreview(): Boolean {
@@ -733,10 +786,9 @@ class RawPreviewRenderer(
             exactFrameColorPairs.clear()
             autoWhiteBalanceColorPair.set(null)
             configRevision.incrementAndGet()
-            latestOfferedSensorTimestampNs.set(Long.MIN_VALUE)
+            producerTimestampGate.reset()
             clearPendingRequests()
             if (config == null || config.source == ViewfinderEffectiveSource.YUV) {
-                gpuFallbackScratchRgba = null
                 allOutputSlots.forEach(OutputSlot::releaseCpuBufferReferences)
             }
             renderCostEmaMs = 0.0f
@@ -778,26 +830,26 @@ class RawPreviewRenderer(
         if (config.pipelineGeneration != pipelineGeneration || config.source == ViewfinderEffectiveSource.YUV) {
             return
         }
-        while (true) {
-            val previous = latestOfferedSensorTimestampNs.get()
-            if (sensorTimestampNs <= previous) {
-                RawPreviewCadenceDiagnostics.duplicateOfferRejected(
-                    config.source,
-                    pipelineGeneration,
-                    sensorTimestampNs
-                )
-                return
-            }
-            if (latestOfferedSensorTimestampNs.compareAndSet(previous, sensorTimestampNs)) break
+        if (!producerTimestampGate.accept(producerKind, sensorTimestampNs)) {
+            RawPreviewCadenceDiagnostics.duplicateOfferRejected(
+                config.source,
+                pipelineGeneration,
+                sensorTimestampNs,
+                producerKind
+            )
+            return
         }
-        RawPreviewCadenceDiagnostics.offered(config.source, pipelineGeneration, sensorTimestampNs)
+        RawPreviewCadenceDiagnostics.offered(
+            config.source, pipelineGeneration, sensorTimestampNs, producerKind
+        )
         lastRendererOfferElapsedNs.set(SystemClock.elapsedRealtimeNanos())
         val retained = ImageUtils.retainRawPreviewHardwareBuffer(buffer)
         if (retained == 0L) {
             retainFailures++
             dropCounters.incrementAndGet(RawPreviewDropReason.RETAIN_FAILED.ordinal)
             RawPreviewCadenceDiagnostics.dropped(
-                config.source, pipelineGeneration, sensorTimestampNs, RawPreviewDropReason.RETAIN_FAILED
+                config.source, pipelineGeneration, sensorTimestampNs, producerKind,
+                RawPreviewDropReason.RETAIN_FAILED
             )
             logDiagnostics()
             return
@@ -806,6 +858,7 @@ class RawPreviewRenderer(
             source = config.source.name,
             generation = pipelineGeneration,
             timestampNs = sensorTimestampNs,
+            producerKind = producerKind,
             nowNs = SystemClock.elapsedRealtimeNanos()
         )
         received++
@@ -847,7 +900,12 @@ class RawPreviewRenderer(
 
     private fun drainLatest() {
         if (closed) return
-        val request = pollPendingRequest() ?: return
+        pollVulkanCompletions()
+        val request = pollPendingRequest()
+        if (request == null) {
+            if (pendingVulkanFrames.isNotEmpty()) scheduleDrain(COMPLETION_POLL_INTERVAL_MS)
+            return
+        }
         reclaimCompletedGpuOutputSlots()
         val slot = acquireOutputSlot()
         if (slot == null) {
@@ -858,15 +916,18 @@ class RawPreviewRenderer(
             RawPreviewFrameLifecycleRegistry.released(
                 request.config.pipelineGeneration,
                 request.sensorTimestampNs,
+                request.producerKind,
                 SystemClock.elapsedRealtimeNanos(),
                 "no_output_slot"
             )
             logDiagnostics()
             if (hasPendingRequest()) scheduleDrain()
+            else if (pendingVulkanFrames.isNotEmpty()) scheduleDrain(COMPLETION_POLL_INTERVAL_MS)
             return
         }
 
         var delivered = false
+        var ownershipTransferredToGpu = false
         try {
             if (!isCurrent(request)) {
                 recordDrop(RawPreviewDropReason.STALE_GENERATION, request)
@@ -875,7 +936,8 @@ class RawPreviewRenderer(
             RawPreviewCadenceDiagnostics.processingStarted(
                 request.config.source,
                 request.config.pipelineGeneration,
-                request.sensorTimestampNs
+                request.sensorTimestampNs,
+                request.producerKind
             )
             val runtimeProfile = com.bncam.core.runtime.RawPipelineRuntimeOwner.getProfile()
             val activeGeometry = runtimeProfile?.geometry
@@ -962,18 +1024,18 @@ class RawPreviewRenderer(
                 }
             }
 
-            val analysisBuffer = if (mlAnalysisRequested) {
+            val analysisNowNs = SystemClock.elapsedRealtimeNanos()
+            val analysisReadbackRequested =
+                lastAnalysisSubmitElapsedNs == 0L ||
+                    analysisNowNs - lastAnalysisSubmitElapsedNs >= ANALYSIS_SIDECAR_INTERVAL_NS
+            val analysisBuffer = if (mlAnalysisRequested && analysisReadbackRequested) {
                 slot.ensureAnalysisNv21Buffer().apply { clear() }
             } else {
                 null
             }
-            val outputRgba = if (outputHardwareBuffer != null) {
-                // JNI keeps a valid CPU fallback target, but the normal AHB->EGLImage path does not
-                // reserve one full RGBA host buffer per GPU output slot. Execution is serialized.
-                ensureGpuFallbackScratchRgba().apply { clear() }
-            } else {
-                slot.ensureCpuRgbaBuffer().apply { clear() }
-            }
+            // Phase 11A: each in-flight Vulkan slot owns its fallback RGBA storage. A shared
+            // scratch buffer is unsafe once submissions overlap, even if the normal path is AHB.
+            val outputRgba = slot.ensureCpuRgbaBuffer().apply { clear() }
 
             val liveColorPair = liveWhiteBalanceColorPair.get()
             val liveWb = liveColorPair?.wbGains?.copyOf() ?: liveWhiteBalanceOverride.get()?.copyOf()
@@ -981,7 +1043,9 @@ class RawPreviewRenderer(
             // render pair is active. This prevents the filtered output from feeding back as its own
             // PhysicalAwbEstimator prior. Live manual WB intentionally clears these pairs.
             val exactFramePair = if (liveWb == null) {
-                exactFrameColorPairs.remove(request.sensorTimestampNs)
+                // PRIMARY_BUFFER and RAW_PREVIEW_SUPPORT may carry the same exact sensor frame.
+                // This pair is immutable metadata evidence, not a single-consumer token.
+                exactFrameColorPairs[request.sensorTimestampNs]
             } else {
                 null
             }
@@ -1052,11 +1116,87 @@ class RawPreviewRenderer(
                 analysisNv21 = analysisBuffer,
                 frameSlotIndex = slot.id,
                     maxWidth = targetMaxWidth,
-                    maxHeight = targetMaxHeight
+                    maxHeight = targetMaxHeight,
+                    analysisReadbackRequested = analysisReadbackRequested
                 )
             } finally {
                 RawPreviewTrace.end(renderTrace)
             }
+            val completionContext = CompletionContext(
+                request = request,
+                slot = slot,
+                outputHardwareBuffer = outputHardwareBuffer,
+                outputRgba = outputRgba,
+                analysisBuffer = analysisBuffer,
+                interopEglGeneration = interopEglGeneration,
+                effectiveWbGains = effectiveWbGains.copyOf(),
+                effectiveColorMatrix = effectiveColorMatrix.copyOf(),
+                camera2PriorWbGains = camera2PriorWbGains.copyOf(),
+                camera2PriorColorMatrix = camera2PriorColorMatrix.copyOf(),
+                hasExactFrameColorPair = exactFramePair != null
+            )
+            if (result != null && result.getOrNull(0) == RAW_PREVIEW_ASYNC_SUBMITTED_MAGIC) {
+                val submissionId = decodeAsyncSubmissionId(result)
+                if (submissionId <= 0L || result.getOrElse(1) { -1 } != slot.id) {
+                    renderFailures++
+                    recordDrop(RawPreviewDropReason.NATIVE_RENDER_FAILED, request)
+                    return
+                }
+                val pending = PendingVulkanFrame(
+                    context = completionContext,
+                    submissionId = submissionId,
+                    previewWidth = result.getOrElse(4) { expectedOutput.first },
+                    previewHeight = result.getOrElse(5) { expectedOutput.second },
+                    cfaCellDecimation = result.getOrElse(6) { 1 }.coerceAtLeast(1)
+                )
+                pendingVulkanFrames[slot.id] = pending
+                vulkanSubmittedFrames++
+                if (analysisReadbackRequested) lastAnalysisSubmitElapsedNs = analysisNowNs
+                ownershipTransferredToGpu = true
+                scheduleDrain(if (hasPendingRequest()) 0L else COMPLETION_POLL_INTERVAL_MS)
+                return
+            }
+            delivered = publishCompletedFrame(completionContext, result)
+            return
+        } finally {
+            if (!ownershipTransferredToGpu) {
+                releaseRequest(request)
+                // A delivered frame owns the slot until FocusPeakingView uploads it. Undelivered
+                // paths return it here. Async submissions transfer both request and slot ownership
+                // to pendingVulkanFrames until the non-blocking fence probe completes.
+                if (!delivered) {
+                    slot.clearCpuRgbaBuffer()
+                    RawPreviewFrameLifecycleRegistry.released(
+                        request.config.pipelineGeneration,
+                        request.sensorTimestampNs,
+                        request.producerKind,
+                        SystemClock.elapsedRealtimeNanos(),
+                        "renderer_undelivered"
+                    )
+                    returnOutputSlot(slot, "undelivered")
+                }
+            }
+            if (hasPendingRequest()) scheduleDrain()
+            else if (pendingVulkanFrames.isNotEmpty()) scheduleDrain(COMPLETION_POLL_INTERVAL_MS)
+        }
+    }
+
+    private fun publishCompletedFrame(
+        ctx: CompletionContext,
+        result: IntArray?
+    ): Boolean {
+        val request = ctx.request
+        val slot = ctx.slot
+        val outputHardwareBuffer = ctx.outputHardwareBuffer
+        val outputRgba = ctx.outputRgba
+        val analysisBuffer = ctx.analysisBuffer
+        val interopEglGeneration = ctx.interopEglGeneration
+        val effectiveWbGains = ctx.effectiveWbGains
+        val effectiveColorMatrix = ctx.effectiveColorMatrix
+        val camera2PriorWbGains = ctx.camera2PriorWbGains
+        val camera2PriorColorMatrix = ctx.camera2PriorColorMatrix
+        val hasExactFrameColorPair = ctx.hasExactFrameColorPair
+        if (result?.getOrElse(ASYNC_ANALYSIS_READBACK_INDEX) { 0 } == 1) analysisReadbackFrames++
             if (result == null || result.size < 5 || result[0] <= 0 || result[1] <= 0 || !isCurrent(request)) {
                 val current = isCurrent(request)
                 Log.w(
@@ -1073,12 +1213,13 @@ class RawPreviewRenderer(
                     request
                 )
                 logDiagnostics()
-                return
+                return false
             }
             if (result.getOrElse(20) { 0 } != 0) {
                 RawPreviewFrameLifecycleRegistry.gpuImported(
                     request.config.pipelineGeneration,
                     request.sensorTimestampNs,
+                    request.producerKind,
                     SystemClock.elapsedRealtimeNanos()
                 )
             }
@@ -1119,18 +1260,15 @@ class RawPreviewRenderer(
                     "native_output_import_failed",
                     permanentForBoundary = false
                 )
-                // The shared scratch target may be overwritten by the next render before GLES can
-                // upload it. Drop this one transition frame; the next frame receives a slot-owned
-                // CPU buffer with the exact same resolution/quality contract.
-                gpuFallbackScratchRgba = null
-                recordDrop(RawPreviewDropReason.GPU_OUTPUT_IMPORT_FAILED, request)
+                // Phase 11A keeps a CPU RGBA buffer per in-flight output slot. When AHB import is
+                // unavailable this exact completed frame can therefore fall back to CPU-visible
+                // presentation without being discarded or racing the next Vulkan submission.
                 RawPreviewInteropCapabilities.recordActivePath("CPU_VISIBLE_RGBA_TO_GLES_OUTPUT_IMPORT_FAILED")
                 Log.w(
                     TAG,
                     "RAW_PREVIEW_GPU_OUTPUT_FALLBACK reason=native_output_import_failed " +
-                        "transitionFrameDropped=true failures=$gpuOutputFailures ${outputSlotHealth()}"
+                        "transitionFrameDropped=false failures=$gpuOutputFailures ${outputSlotHealth()}"
                 )
-                return
             } else if (gpuResidentOutputUsed) {
                 gpuInteropController.markGpuActive(request.config.pipelineGeneration, interopEglGeneration)
                 RawPreviewInteropCapabilities.recordActivePath("VULKAN_AHB_RGBA_TO_EGLIMAGE_GLES")
@@ -1161,6 +1299,7 @@ class RawPreviewRenderer(
                 request.config.source,
                 request.config.pipelineGeneration,
                 request.sensorTimestampNs,
+                request.producerKind,
                 inputPackingMs = inputPackingMs,
                 gpuKernelMs = gpuKernelMs,
                 gpuSyncOverheadMs = gpuSyncOverheadMs,
@@ -1194,6 +1333,10 @@ class RawPreviewRenderer(
                 pipelineGeneration = request.config.pipelineGeneration,
                 sensorTimestampNs = request.sensorTimestampNs,
                 producerKind = request.producerKind,
+                captureSensitivityIso = request.config.captureSensitivityIso,
+                captureExposureTimeNs = request.config.captureExposureTimeNs,
+                physicalGreenNoiseSo = request.config.physicalGreenNoiseSo.copyOf(3),
+                analysisReadbackUsed = result.getOrElse(ASYNC_ANALYSIS_READBACK_INDEX) { 0 } == 1,
                 rotationDegrees = request.config.rotationDegrees,
                 cfaCellDecimation = result[4],
                 renderTimeMs = currentRenderTimeMs,
@@ -1220,9 +1363,9 @@ class RawPreviewRenderer(
                 sceneMidtoneTarget = result.getOrElse(566) { 125_000 } / 1_000_000.0f,
                 gtmShoulderStart = result.getOrElse(567) { 720_000 } / 1_000_000.0f,
                 gtmShoulderStrength = result.getOrElse(568) { 900_000 } / 1_000_000.0f,
-                gtmBlackAnchor = result.getOrElse(569) { 6_500 } / 1_000_000.0f,
-                gtmLowerMidLift = result.getOrElse(570) { 0 } / 1_000_000.0f,
-                gtmContrastStrength = result.getOrElse(571) { 100_000 } / 1_000_000.0f,
+                gtmHighlightPressure = result.getOrElse(569) { 0 } / 1_000_000.0f,
+                gtmP95CompressionEv = result.getOrElse(570) { 0 } / 1_000_000.0f,
+                gtmP99CompressionEv = result.getOrElse(571) { 0 } / 1_000_000.0f,
                 gtmDynamicRangePressure = result.getOrElse(572) { 0 } / 1_000_000.0f,
                 ltmStrength = result.getOrElse(573) { 50_000 } / 1_000_000.0f,
                 ltmMaxLiftEv = result.getOrElse(574) { 180_000 } / 1_000_000.0f,
@@ -1236,6 +1379,22 @@ class RawPreviewRenderer(
                 displayBHistogram64 = IntArray(64) { index -> result.getOrElse(497 + index) { 0 } },
                 rawNearClipSampleCount = result.getOrElse(561) { 0 },
                 rawSampleCount = result.getOrElse(562) { 0 },
+                rawTrueSaturatedSampleCount = result.getOrElse(SENSOR_EXPOSURE_DIAGNOSTICS_START_INDEX) { 0 },
+                rawRClipSampleCount = result.getOrElse(HIGHLIGHT_RECON_DIAGNOSTICS_START_INDEX + 0) { 0 },
+                rawGClipSampleCount = result.getOrElse(HIGHLIGHT_RECON_DIAGNOSTICS_START_INDEX + 1) { 0 },
+                rawBClipSampleCount = result.getOrElse(HIGHLIGHT_RECON_DIAGNOSTICS_START_INDEX + 2) { 0 },
+                highlightReconstructionActivated =
+                    result.getOrElse(HIGHLIGHT_RECON_DIAGNOSTICS_START_INDEX + 3) { 0 } > 0,
+                highlightReconstructedSampleCount =
+                    result.getOrElse(HIGHLIGHT_RECON_DIAGNOSTICS_START_INDEX + 3) { 0 },
+                postWbClipSampleCount = result.getOrElse(HIGHLIGHT_RECON_DIAGNOSTICS_START_INDEX + 4) { 0 },
+                postCcmClipSampleCount = result.getOrElse(HIGHLIGHT_RECON_DIAGNOSTICS_START_INDEX + 5) { 0 },
+                previewRequestedEv = result.getOrElse(PREVIEW_SCENE_EXPOSURE_DIAGNOSTICS_START_INDEX + 0) { 0 } / 1_000_000.0f,
+                previewHighlightLimitedEv = result.getOrElse(PREVIEW_SCENE_EXPOSURE_DIAGNOSTICS_START_INDEX + 1) { 0 } / 1_000_000.0f,
+                previewAppliedEv = result.getOrElse(PREVIEW_SCENE_EXPOSURE_DIAGNOSTICS_START_INDEX + 2) { 0 } / 1_000_000.0f,
+                previewSceneKey = result.getOrElse(PREVIEW_SCENE_EXPOSURE_DIAGNOSTICS_START_INDEX + 3) { 148_000 } / 1_000_000.0f,
+                previewHighlightHeadroomEv = result.getOrElse(PREVIEW_SCENE_EXPOSURE_DIAGNOSTICS_START_INDEX + 4) { 0 } / 1_000_000.0f,
+                previewSceneRangeEv = result.getOrElse(PREVIEW_SCENE_EXPOSURE_DIAGNOSTICS_START_INDEX + 5) { 0 } / 1_000_000.0f,
                 displayRClipSampleCount = result.getOrElse(563) { 0 },
                 displayGClipSampleCount = result.getOrElse(564) { 0 },
                 displayBClipSampleCount = result.getOrElse(565) { 0 },
@@ -1267,7 +1426,7 @@ class RawPreviewRenderer(
                 // Physical scene evidence may update the temporal owner only when the RAW frame
                 // carried an exact Camera2 WB+CCM prior from the same sensor timestamp. Missing
                 // metadata never turns the current temporal render pair into its own estimator prior.
-                physicalAwbDataReady = result.getOrElse(612) { 0 } != 0 && exactFramePair != null,
+                physicalAwbDataReady = result.getOrElse(612) { 0 } != 0 && hasExactFrameColorPair,
                 spatialExposureTileCount = result.getOrElse(613) { 0 },
                 spatialExposureSceneP10 = result.getOrElse(614) { 0 } / 1_000_000.0f,
                 spatialExposureSceneP25 = result.getOrElse(615) { 0 } / 1_000_000.0f,
@@ -1288,6 +1447,7 @@ class RawPreviewRenderer(
                         source = request.config.source,
                         generation = request.config.pipelineGeneration,
                         sensorTimestampNs = request.sensorTimestampNs,
+                        producerKind = request.producerKind,
                         eglGeneration = interopEglGeneration
                     )
                 }
@@ -1298,6 +1458,7 @@ class RawPreviewRenderer(
                 source = frame.source,
                 generation = frame.pipelineGeneration,
                 sensorTimestampNs = frame.sensorTimestampNs,
+                producerKind = frame.producerKind,
                 gpuResidentOutputUsed = frame.gpuResidentOutputUsed,
                 interopEglGeneration = frame.interopEglGeneration,
                 rgbMin = frame.outputRgbMin,
@@ -1309,24 +1470,57 @@ class RawPreviewRenderer(
                 sceneP50 = frame.spatialExposureSceneP50
             )
             onFrame(frame)
-            delivered = true
             logDiagnostics(frame)
-            return
-        } finally {
-            releaseRequest(request)
-            // A delivered frame owns the slot until FocusPeakingView uploads it. Undelivered paths
-            // return it here; delivered paths returned above after onFrame.
-            if (!delivered) {
-                slot.clearCpuRgbaBuffer()
-                RawPreviewFrameLifecycleRegistry.released(
-                    request.config.pipelineGeneration,
-                    request.sensorTimestampNs,
-                    SystemClock.elapsedRealtimeNanos(),
-                    "renderer_undelivered"
-                )
-                returnOutputSlot(slot, "undelivered")
+            return true
+    }
+
+    private fun decodeAsyncSubmissionId(result: IntArray): Long {
+        val low = result.getOrElse(2) { 0 }.toLong() and 0xffffffffL
+        val high = result.getOrElse(3) { 0 }.toLong() and 0xffffffffL
+        return low or (high shl 32)
+    }
+
+    private fun pollVulkanCompletions() {
+        if (pendingVulkanFrames.isEmpty()) return
+        val snapshot = pendingVulkanFrames.entries.toList()
+        for ((slotId, pending) in snapshot) {
+            if (closed) return
+            val result = ImageUtils.pollRawPreview(
+                frameSlotIndex = slotId,
+                submissionId = pending.submissionId,
+                previewWidth = pending.previewWidth,
+                previewHeight = pending.previewHeight,
+                cfaCellDecimation = pending.cfaCellDecimation,
+                camera2PriorWbGains = pending.context.camera2PriorWbGains
+            )
+            if (result != null && result.getOrNull(0) == RAW_PREVIEW_ASYNC_PENDING_MAGIC) {
+                continue
             }
-            if (hasPendingRequest()) scheduleDrain()
+            if (!pendingVulkanFrames.remove(slotId, pending)) continue
+            val request = pending.context.request
+            var delivered = false
+            try {
+                if (result == null) {
+                    renderFailures++
+                    recordDrop(RawPreviewDropReason.NATIVE_RENDER_FAILED, request)
+                } else {
+                    vulkanCompletedFrames++
+                    delivered = publishCompletedFrame(pending.context, result)
+                }
+            } finally {
+                releaseRequest(request)
+                if (!delivered) {
+                    pending.context.slot.clearCpuRgbaBuffer()
+                    RawPreviewFrameLifecycleRegistry.released(
+                        request.config.pipelineGeneration,
+                        request.sensorTimestampNs,
+                        request.producerKind,
+                        SystemClock.elapsedRealtimeNanos(),
+                        "vulkan_completion_undelivered"
+                    )
+                    returnOutputSlot(pending.context.slot, "vulkan_completion_undelivered")
+                }
+            }
         }
     }
 
@@ -1336,23 +1530,23 @@ class RawPreviewRenderer(
         source: ViewfinderEffectiveSource,
         generation: Int,
         sensorTimestampNs: Long,
+        producerKind: RawPreviewProducerKind,
         eglGeneration: Int
     ) {
         slot.clearCpuRgbaBuffer()
         when {
             glFenceHandle == RawPreviewFrame.GL_INTEROP_FAILED_HANDLE -> {
                 gpuOutputFailures++
-                recordDropForFrame(source, generation, sensorTimestampNs, RawPreviewDropReason.GL_INTEROP_FAILED)
+                recordDropForFrame(source, generation, sensorTimestampNs, producerKind, RawPreviewDropReason.GL_INTEROP_FAILED)
                 gpuInteropController.markFailure(
                     generation, eglGeneration, "eglimage_bind_failed", permanentForBoundary = false
                 )
-                gpuFallbackScratchRgba = null
                 // EGLImage import/bind never became a valid sampled GL owner, so this backing may
                 // be retired immediately. The enclosing CPU-capable slot remains reusable.
                 slot.releaseGpuBuffer()
                 returnOutputSlot(slot, "gl_interop_failed")
                 RawPreviewFrameLifecycleRegistry.released(
-                    generation, sensorTimestampNs, SystemClock.elapsedRealtimeNanos(), "gl_interop_failed"
+                    generation, sensorTimestampNs, producerKind, SystemClock.elapsedRealtimeNanos(), "gl_interop_failed"
                 )
                 RawPreviewInteropCapabilities.recordActivePath("CPU_VISIBLE_RGBA_TO_GLES_GL_INTEROP_FAILED")
                 Log.e(TAG, "RAW_PREVIEW_GPU_OUTPUT_DISABLED slot=${slot.id} reason=eglimage_bind_failed ${outputSlotHealth()}")
@@ -1360,7 +1554,7 @@ class RawPreviewRenderer(
             glFenceHandle < 0L -> {
                 returnOutputSlot(slot, "gl_not_used")
                 RawPreviewFrameLifecycleRegistry.released(
-                    generation, sensorTimestampNs, SystemClock.elapsedRealtimeNanos(), "gl_not_used_cpu_copy"
+                    generation, sensorTimestampNs, producerKind, SystemClock.elapsedRealtimeNanos(), "gl_not_used_cpu_copy"
                 )
             }
             glFenceHandle > 0L -> {
@@ -1368,6 +1562,7 @@ class RawPreviewRenderer(
                 slot.pendingSource = source
                 slot.pendingGeneration = generation
                 slot.pendingSensorTimestampNs = sensorTimestampNs
+                slot.pendingProducerKind = producerKind
                 slot.pendingEglGeneration = eglGeneration
                 if (markOutputSlotPendingFence(slot)) {
                     pendingGpuOutputSlots.offer(slot)
@@ -1381,7 +1576,7 @@ class RawPreviewRenderer(
                     )
                     returnOutputSlot(slot, "pending_fence_state_mismatch")
                     RawPreviewFrameLifecycleRegistry.released(
-                        generation, sensorTimestampNs, SystemClock.elapsedRealtimeNanos(), "pending_fence_state_mismatch"
+                        generation, sensorTimestampNs, producerKind, SystemClock.elapsedRealtimeNanos(), "pending_fence_state_mismatch"
                     )
                 }
             }
@@ -1395,11 +1590,10 @@ class RawPreviewRenderer(
                 gpuInteropController.markFailure(
                     generation, eglGeneration, "gl_fence_create_failed", permanentForBoundary = false
                 )
-                gpuFallbackScratchRgba = null
-                recordDropForFrame(source, generation, sensorTimestampNs, RawPreviewDropReason.GL_FENCE_CREATE_FAILED)
+                recordDropForFrame(source, generation, sensorTimestampNs, producerKind, RawPreviewDropReason.GL_FENCE_CREATE_FAILED)
                 returnOutputSlot(slot, "gl_fence_create_failed_gpu_backing_quarantined")
                 RawPreviewFrameLifecycleRegistry.released(
-                    generation, sensorTimestampNs, SystemClock.elapsedRealtimeNanos(), "gl_fence_create_failed"
+                    generation, sensorTimestampNs, producerKind, SystemClock.elapsedRealtimeNanos(), "gl_fence_create_failed"
                 )
                 RawPreviewInteropCapabilities.recordActivePath("CPU_VISIBLE_RGBA_TO_GLES_GL_FENCE_FAILED")
                 Log.e(
@@ -1416,10 +1610,13 @@ class RawPreviewRenderer(
         source: ViewfinderEffectiveSource,
         generation: Int,
         sensorTimestampNs: Long,
+        producerKind: RawPreviewProducerKind,
         reason: RawPreviewDropReason
     ) {
         dropCounters.incrementAndGet(reason.ordinal)
-        RawPreviewCadenceDiagnostics.dropped(source, generation, sensorTimestampNs, reason)
+        RawPreviewCadenceDiagnostics.dropped(
+            source, generation, sensorTimestampNs, producerKind, reason
+        )
     }
 
     private fun reclaimCompletedGpuOutputSlots() {
@@ -1432,15 +1629,18 @@ class RawPreviewRenderer(
                 1 -> {
                     val completedGeneration = slot.pendingGeneration
                     val completedTimestampNs = slot.pendingSensorTimestampNs
+                    val completedProducerKind = slot.pendingProducerKind
                     slot.pendingGlFenceHandle = 0L
                     slot.pendingSource = null
                     slot.pendingGeneration = -1
                     slot.pendingSensorTimestampNs = 0L
+                    slot.pendingProducerKind = RawPreviewProducerKind.CANONICAL_RING
                     slot.pendingEglGeneration = -1
                     returnOutputSlot(slot, "gl_fence_signaled")
                     RawPreviewFrameLifecycleRegistry.released(
                         completedGeneration,
                         completedTimestampNs,
+                        completedProducerKind,
                         SystemClock.elapsedRealtimeNanos(),
                         "gl_fence_signaled"
                     )
@@ -1450,6 +1650,7 @@ class RawPreviewRenderer(
                     gpuOutputFailures++
                     val failedGeneration = slot.pendingGeneration
                     val failedTimestampNs = slot.pendingSensorTimestampNs
+                    val failedProducerKind = slot.pendingProducerKind
                     slot.pendingGlFenceHandle = 0L
                     val failedEglGeneration = slot.pendingEglGeneration
                     slot.pendingEglGeneration = -1
@@ -1458,24 +1659,26 @@ class RawPreviewRenderer(
                         slot.pendingGeneration, failedEglGeneration, "gl_fence_poll_failed",
                         permanentForBoundary = false
                     )
-                    gpuFallbackScratchRgba = null
                     slot.pendingSource?.let { source ->
                         recordDropForFrame(
                             source,
                             slot.pendingGeneration,
                             slot.pendingSensorTimestampNs,
+                            failedProducerKind,
                             RawPreviewDropReason.GL_FENCE_POLL_FAILED
                         )
                     }
                     slot.pendingSource = null
                     slot.pendingGeneration = -1
                     slot.pendingSensorTimestampNs = 0L
+                    slot.pendingProducerKind = RawPreviewProducerKind.CANONICAL_RING
                     // Do not destroy or recycle the suspect AHB here: completion is unknown.
                     // The CPU store is independent and is immediately returned to service.
                     returnOutputSlot(slot, "gl_fence_poll_failed_gpu_backing_quarantined")
                     RawPreviewFrameLifecycleRegistry.released(
                         failedGeneration,
                         failedTimestampNs,
+                        failedProducerKind,
                         SystemClock.elapsedRealtimeNanos(),
                         "gl_fence_poll_failed"
                     )
@@ -1580,9 +1783,22 @@ class RawPreviewRenderer(
         RawPreviewFrameLifecycleRegistry.inputReleased(
             request.config.pipelineGeneration,
             request.sensorTimestampNs,
+            request.producerKind,
             SystemClock.elapsedRealtimeNanos()
         )
         ImageUtils.releaseRawPreviewHardwareBuffer(request.retainedHardwareBuffer)
+    }
+
+    private fun histogramPercentile64(histogram: IntArray, quantile: Float): Float {
+        val total = histogram.sum().coerceAtLeast(0)
+        if (total <= 0) return -1f
+        val target = ((total - 1) * quantile.coerceIn(0f, 1f)).toInt()
+        var cumulative = 0
+        histogram.forEachIndexed { index, count ->
+            cumulative += count.coerceAtLeast(0)
+            if (cumulative > target) return (index + 0.5f) / 64.0f
+        }
+        return 1f
     }
 
     private fun logDiagnostics(frame: RawPreviewFrame? = null) {
@@ -1593,6 +1809,16 @@ class RawPreviewRenderer(
         val previewFps = intervalFrames * 1000.0f / intervalMs
         lastDiagnosticsMs = now
         lastDiagnosticsRendered = rendered
+        val displayP50 = frame?.let { histogramPercentile64(it.displayLumaHistogram64, 0.50f) } ?: -1f
+        val displayP95 = frame?.let { histogramPercentile64(it.displayLumaHistogram64, 0.95f) } ?: -1f
+        val displayClipping = frame?.let {
+            if (it.displaySampleCount > 0) {
+                (it.displayRClipSampleCount + it.displayGClipSampleCount + it.displayBClipSampleCount)
+                    .toFloat() / (3.0f * it.displaySampleCount.toFloat())
+            } else {
+                0f
+            }
+        } ?: -1f
         Log.i(
             TAG,
             "RAW_PREVIEW_FRAME source=${frame?.source ?: activeConfig?.source ?: ViewfinderEffectiveSource.YUV} " +
@@ -1608,12 +1834,20 @@ class RawPreviewRenderer(
                 "gpuHostHandoffMs=${frame?.tonePackTimeMs ?: -1f} " +
                 "sceneMidtone=${frame?.sceneMidtone ?: -1f} targetGain=${frame?.targetExposureGain ?: -1f} " +
                 "appliedGain=${frame?.appliedExposureGain ?: -1f} " +
+                "previewRequestedEv=${frame?.previewRequestedEv ?: -1f} " +
+                "previewHighlightLimitedEv=${frame?.previewHighlightLimitedEv ?: -1f} " +
+                "previewAppliedEv=${frame?.previewAppliedEv ?: -1f} " +
+                "previewSceneKey=${frame?.previewSceneKey ?: -1f} " +
+                "previewHighlightHeadroomEv=${frame?.previewHighlightHeadroomEv ?: -1f} " +
+                "previewSceneRangeEv=${frame?.previewSceneRangeEv ?: -1f} " +
+                "displayP50=$displayP50 displayP95=$displayP95 displayClipping=$displayClipping " +
                 "gtmTarget=${frame?.sceneMidtoneTarget ?: -1f} " +
                 "gtmShoulder=${frame?.gtmShoulderStart ?: -1f}/${frame?.gtmShoulderStrength ?: -1f} " +
-                "gtmBlack=${frame?.gtmBlackAnchor ?: -1f} gtmLowerMidLift=${frame?.gtmLowerMidLift ?: -1f} " +
-                "gtmContrast=${frame?.gtmContrastStrength ?: -1f} drPressure=${frame?.gtmDynamicRangePressure ?: -1f} " +
+                "gtmHighlightPressure=${frame?.gtmHighlightPressure ?: -1f} gtmP95CompressionEv=${frame?.gtmP95CompressionEv ?: -1f} " +
+                "gtmP99CompressionEv=${frame?.gtmP99CompressionEv ?: -1f} drPressure=${frame?.gtmDynamicRangePressure ?: -1f} " +
                 "ltmStrength=${frame?.ltmStrength ?: -1f} ltmLiftEv=${frame?.ltmMaxLiftEv ?: -1f} " +
                 "ltmCompressEv=${frame?.ltmMaxCompressEv ?: -1f} " +
+                "legacySpatialExposure=RETIRED_PHASE11G " +
                 "spatialExposureTiles=${frame?.spatialExposureTileCount ?: 0} " +
                 "spatialExposureSceneP10=${frame?.spatialExposureSceneP10 ?: -1f} " +
                 "spatialExposureSceneP50=${frame?.spatialExposureSceneP50 ?: -1f} " +
@@ -1624,6 +1858,14 @@ class RawPreviewRenderer(
                 "${frame?.spatialExposureUpperNeutralEv ?: -1f} " +
                 "spatialExposureAuthority=${frame?.spatialExposureAuthority ?: -1f} " +
                 "commonHighlightScalePixels=${frame?.commonHighlightScalePixels ?: -1} " +
+                "rawClipFraction=${frame?.let { if (it.rawSampleCount > 0) it.rawNearClipSampleCount.toFloat() / it.rawSampleCount else 0f } ?: -1f} " +
+                "rawSaturatedFraction=${frame?.let { if (it.rawSampleCount > 0) it.rawTrueSaturatedSampleCount.toFloat() / it.rawSampleCount else 0f } ?: -1f} " +
+                "sensorExposureNs=${frame?.captureExposureTimeNs ?: -1L} sensorIso=${frame?.captureSensitivityIso ?: -1} " +
+                "rawClipRgb=${frame?.rawRClipSampleCount ?: -1}/${frame?.rawGClipSampleCount ?: -1}/${frame?.rawBClipSampleCount ?: -1} " +
+                "highlightReconstructionActivated=${frame?.highlightReconstructionActivated ?: false} " +
+                "reconstructedRawSamples=${frame?.highlightReconstructedSampleCount ?: -1} " +
+                "postWbClipSamples=${frame?.postWbClipSampleCount ?: -1} " +
+                "postCcmClipSamples=${frame?.postCcmClipSampleCount ?: -1} " +
                 "directHostInput=${frame?.directHostInputUsed ?: false} " +
                 "directAhbInput=${frame?.directHardwareBufferInputUsed ?: false} " +
                 "inputAhbFormat=${frame?.inputAhbFormat ?: 0} " +
@@ -1642,7 +1884,10 @@ class RawPreviewRenderer(
                 "${RawPreviewResolutionPolicy.SHARP_PROTOTYPE_MAX_HEIGHT} sharpPrototypeActive=false " +
                 "settingsConnectivity={${rawPreviewSettingsConnectivitySummary(activeConfig)}} " +
                 "renderEmaMs=$renderCostEmaMs glUploadEmaMs=$glUploadCostEmaMs " +
-                "RAW_PREVIEW_DROPPED_BUSY=$droppedBusy pendingQueue=${pendingRequestCount()}/$MAX_PENDING_REQUESTS rendered=$rendered " +
+                "RAW_PREVIEW_DROPPED_BUSY=$droppedBusy pendingQueue=${pendingRequestCount()}/$MAX_PENDING_REQUESTS " +
+                "vulkanPending=${pendingVulkanFrames.size}/$OUTPUT_SLOT_COUNT " +
+                "vulkanSubmitted=$vulkanSubmittedFrames vulkanCompleted=$vulkanCompletedFrames " +
+                "analysisReadbackFrames=$analysisReadbackFrames rendered=$rendered " +
                 "slotHealth={${outputSlotHealth()}} dropReasons={${dropCountsSummary()}} " +
                 "frameLifecycle={${RawPreviewFrameLifecycleRegistry.latest()?.summary() ?: "unavailable"}} " +
                 "activeLifecycleFrames=${RawPreviewFrameLifecycleRegistry.activeCount()} " +
@@ -1666,6 +1911,10 @@ class RawPreviewRenderer(
 
         val idle = withTimeoutOrNull(timeoutMs) {
             idleBarrier.await()
+            while (pendingVulkanFrames.isNotEmpty()) {
+                if (!closed) scheduleDrain(COMPLETION_POLL_INTERVAL_MS)
+                delay(COMPLETION_POLL_INTERVAL_MS)
+            }
             true
         } ?: false
         if (!idle) {
@@ -1679,9 +1928,22 @@ class RawPreviewRenderer(
         closed = true
         configRevision.incrementAndGet()
         clearPendingRequests()
+        // Native Vulkan owns an independent AHardwareBuffer reference after submission. Release
+        // Kotlin input ownership exactly once while teardown later performs the only bounded fence
+        // wait that remains in the backend.
+        pendingVulkanFrames.values.forEach { pending ->
+            releaseRequest(pending.context.request)
+            RawPreviewFrameLifecycleRegistry.released(
+                pending.context.request.config.pipelineGeneration,
+                pending.context.request.sensorTimestampNs,
+                pending.context.request.producerKind,
+                SystemClock.elapsedRealtimeNanos(),
+                "renderer_close_pending_vulkan"
+            )
+        }
+        pendingVulkanFrames.clear()
         executor.shutdownNow()
         backendWarmupExecutor.shutdownNow()
-        gpuFallbackScratchRgba = null
         allOutputSlots.forEach { slot ->
             slot.releaseCpuBufferReferences()
             if (slot.pendingGlFenceHandle > 0L) {
@@ -1707,5 +1969,13 @@ class RawPreviewRenderer(
         const val MAX_ANALYSIS_NV21_BYTES = ((PREVIEW_MAX_WIDTH / 4) * (PREVIEW_MAX_HEIGHT / 4) * 3) / 2
         const val DIAGNOSTIC_INTERVAL_MS = 2_000L
         const val CONFIG_DIAGNOSTIC_INTERVAL_MS = 5_000L
+        const val COMPLETION_POLL_INTERVAL_MS = 1L
+        const val ANALYSIS_SIDECAR_INTERVAL_NS = 100_000_000L // 10 Hz, independent of display cadence.
+        const val RAW_PREVIEW_ASYNC_SUBMITTED_MAGIC = 0x42505253
+        const val RAW_PREVIEW_ASYNC_PENDING_MAGIC = 0x42505250
+        const val ASYNC_ANALYSIS_READBACK_INDEX = 625
+        const val HIGHLIGHT_RECON_DIAGNOSTICS_START_INDEX = 626
+        const val PREVIEW_SCENE_EXPOSURE_DIAGNOSTICS_START_INDEX = 632
+        const val SENSOR_EXPOSURE_DIAGNOSTICS_START_INDEX = 638
     }
 }

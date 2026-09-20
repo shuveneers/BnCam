@@ -96,17 +96,41 @@ find_program(BNCAM_GLSLC
         "$ENV{ANDROID_NDK_ROOT}/shader-tools/${BNCAM_SHADER_HOST_TAG}"
         "$ENV{ANDROID_NDK_HOME}/shader-tools/${BNCAM_SHADER_HOST_TAG}"
 )
+find_program(BNCAM_SPIRV_OPT
+        NAMES spirv-opt spirv-opt.exe
+        HINTS
+        "${CMAKE_ANDROID_NDK}/shader-tools/${BNCAM_SHADER_HOST_TAG}"
+        "${ANDROID_NDK}/shader-tools/${BNCAM_SHADER_HOST_TAG}"
+        "$ENV{ANDROID_NDK_ROOT}/shader-tools/${BNCAM_SHADER_HOST_TAG}"
+        "$ENV{ANDROID_NDK_HOME}/shader-tools/${BNCAM_SHADER_HOST_TAG}"
+)
 set(BNCAM_GENERATED_SHADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated/shaders")
 # Lightweight fused live RAW viewfinder kernel. This is deliberately separate from the capture
 # resident demosaic backend so preview never runs capture-only residual/statistics passes.
+set(BNCAM_RAW_PREVIEW_UNOPT_SPV "${BNCAM_GENERATED_SHADER_DIR}/raw_preview.unoptimized.spv")
 set(BNCAM_RAW_PREVIEW_SPV "${BNCAM_GENERATED_SHADER_DIR}/raw_preview.spv")
 set(BNCAM_RAW_PREVIEW_HEADER "${BNCAM_GENERATED_SHADER_DIR}/RawPreviewSpirv.h")
-if(BNCAM_GLSLC)
+if(BNCAM_GLSLC AND BNCAM_SPIRV_OPT)
     add_custom_command(
             OUTPUT "${BNCAM_RAW_PREVIEW_HEADER}"
             COMMAND "${CMAKE_COMMAND}" -E make_directory "${BNCAM_GENERATED_SHADER_DIR}"
-            COMMAND "${BNCAM_GLSLC}" --target-env=vulkan1.1 -O
+            # NDK 28 shaderc/SPIRV-Tools can explode the ID graph on these feature-dense
+            # live-preview shaders when the stock -O/-Os recipes run exhaustive inlining,
+            # loop unrolling and scalar expansion. Keep glslc as front-end only and apply a
+            # bounded optimizer recipe that removes dead/redundant work without cloning code.
+            COMMAND "${BNCAM_GLSLC}" --target-env=vulkan1.1
+                    -I "${CMAKE_CURRENT_SOURCE_DIR}/vulkan/shaders"
                     "${CMAKE_CURRENT_SOURCE_DIR}/vulkan/shaders/raw_preview.comp"
+                    -o "${BNCAM_RAW_PREVIEW_UNOPT_SPV}"
+            COMMAND "${BNCAM_SPIRV_OPT}" --target-env=vulkan1.1
+                    --eliminate-dead-functions
+                    --eliminate-dead-branches
+                    --eliminate-dead-code-aggressive
+                    --simplify-instructions
+                    --redundancy-elimination
+                    --cfg-cleanup
+                    --compact-ids
+                    "${BNCAM_RAW_PREVIEW_UNOPT_SPV}"
                     -o "${BNCAM_RAW_PREVIEW_SPV}"
             COMMAND "${CMAKE_COMMAND}"
                     -DINPUT=${BNCAM_RAW_PREVIEW_SPV}
@@ -115,6 +139,7 @@ if(BNCAM_GLSLC)
                     -P "${CMAKE_CURRENT_SOURCE_DIR}/vulkan/cmake/EmbedSpirvConstArray.cmake"
             DEPENDS
                     "${CMAKE_CURRENT_SOURCE_DIR}/vulkan/shaders/raw_preview.comp"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/vulkan/shaders/preview_scene_exposure.glsl"
                     "${CMAKE_CURRENT_SOURCE_DIR}/vulkan/cmake/EmbedSpirvConstArray.cmake"
             VERBATIM
     )
@@ -127,14 +152,26 @@ endif()
 # GPU-resident RAW preview output kernel. Identical image processing to raw_preview.comp,
 # but writes RGBA8 directly into an imported AHardwareBuffer-backed VkImage so the live viewfinder
 # does not perform full-frame Vulkan->host readback followed by GLES upload.
+set(BNCAM_RAW_PREVIEW_IMAGE_UNOPT_SPV "${BNCAM_GENERATED_SHADER_DIR}/raw_preview_image.unoptimized.spv")
 set(BNCAM_RAW_PREVIEW_IMAGE_SPV "${BNCAM_GENERATED_SHADER_DIR}/raw_preview_image.spv")
 set(BNCAM_RAW_PREVIEW_IMAGE_HEADER "${BNCAM_GENERATED_SHADER_DIR}/RawPreviewImageSpirv.h")
-if(BNCAM_GLSLC)
+if(BNCAM_GLSLC AND BNCAM_SPIRV_OPT)
     add_custom_command(
             OUTPUT "${BNCAM_RAW_PREVIEW_IMAGE_HEADER}"
             COMMAND "${CMAKE_COMMAND}" -E make_directory "${BNCAM_GENERATED_SHADER_DIR}"
-            COMMAND "${BNCAM_GLSLC}" --target-env=vulkan1.1 -O
+            COMMAND "${BNCAM_GLSLC}" --target-env=vulkan1.1
+                    -I "${CMAKE_CURRENT_SOURCE_DIR}/vulkan/shaders"
                     "${CMAKE_CURRENT_SOURCE_DIR}/vulkan/shaders/raw_preview_image.comp"
+                    -o "${BNCAM_RAW_PREVIEW_IMAGE_UNOPT_SPV}"
+            COMMAND "${BNCAM_SPIRV_OPT}" --target-env=vulkan1.1
+                    --eliminate-dead-functions
+                    --eliminate-dead-branches
+                    --eliminate-dead-code-aggressive
+                    --simplify-instructions
+                    --redundancy-elimination
+                    --cfg-cleanup
+                    --compact-ids
+                    "${BNCAM_RAW_PREVIEW_IMAGE_UNOPT_SPV}"
                     -o "${BNCAM_RAW_PREVIEW_IMAGE_SPV}"
             COMMAND "${CMAKE_COMMAND}"
                     -DINPUT=${BNCAM_RAW_PREVIEW_IMAGE_SPV}
@@ -143,6 +180,7 @@ if(BNCAM_GLSLC)
                     -P "${CMAKE_CURRENT_SOURCE_DIR}/vulkan/cmake/EmbedSpirvConstArray.cmake"
             DEPENDS
                     "${CMAKE_CURRENT_SOURCE_DIR}/vulkan/shaders/raw_preview_image.comp"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/vulkan/shaders/preview_scene_exposure.glsl"
                     "${CMAKE_CURRENT_SOURCE_DIR}/vulkan/cmake/EmbedSpirvConstArray.cmake"
             VERBATIM
     )

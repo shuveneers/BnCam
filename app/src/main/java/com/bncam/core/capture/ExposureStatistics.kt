@@ -21,6 +21,13 @@ data class ExposureStatistics(
     val greenClipFraction: Float,
     val blueClipFraction: Float,
     val rawNearClipFraction: Float?,
+    val rawSaturatedFraction: Float? = null,
+    val captureExposureTimeNs: Long? = null,
+    val captureSensitivityIso: Int? = null,
+    val predictedNoiseSigma: Float? = null,
+    val signalToNoiseRatio: Float? = null,
+    val sensorTimestampNs: Long? = null,
+    val pipelineGeneration: Int? = null,
     val linearLumaHistogram256: IntArray? = null,
     val highlightPoint: NormalizedPoint? = null
 ) {

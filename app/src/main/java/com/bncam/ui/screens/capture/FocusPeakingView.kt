@@ -694,6 +694,7 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
             frame.source,
             frame.pipelineGeneration,
             frame.sensorTimestampNs,
+            frame.producerKind,
             rgbaHandoffBytes = if (frame.gpuResidentOutputUsed) 0L else
                 frame.width.toLong() * frame.height.toLong() * 4L,
             eglGeneration = currentEglGeneration
@@ -1088,7 +1089,8 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
                         RawPreviewCadenceDiagnostics.glUploadStarted(
                             frame.source,
                             frame.pipelineGeneration,
-                            frame.sensorTimestampNs
+                            frame.sensorTimestampNs,
+                            frame.producerKind
                         )
                         val rawHandoffStartedNs = SystemClock.elapsedRealtimeNanos()
                         val uploadSlot = rawTextureUploadCursor
@@ -1129,6 +1131,7 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
                             RawPreviewFrameLifecycleRegistry.submitted(
                                 frame.pipelineGeneration,
                                 frame.sensorTimestampNs,
+                                frame.producerKind,
                                 SystemClock.elapsedRealtimeNanos()
                             )
                             rawTextureSlotWidths[uploadSlot] = frame.width
@@ -1156,7 +1159,8 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
                             RawPreviewCadenceDiagnostics.glUploadCompleted(
                                 frame.source,
                                 frame.pipelineGeneration,
-                                frame.sensorTimestampNs
+                                frame.sensorTimestampNs,
+                                frame.producerKind
                             )
                             val now = SystemClock.elapsedRealtime()
                             if (now - lastRawUploadLogMs >= 5_000L) {
@@ -1179,7 +1183,8 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
                                     frame.source,
                                     frame.pipelineGeneration,
                                     frame.sensorTimestampNs,
-                                    "GL_IMPORT_FAILURE"
+                                    "GL_IMPORT_FAILURE",
+                                    frame.producerKind
                                 )
                             }
                             Log.e(
@@ -1399,6 +1404,7 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
                 frame.source,
                 frame.pipelineGeneration,
                 frame.sensorTimestampNs,
+                frame.producerKind,
                 eglFrameId,
                 eglGeneration = currentEglGeneration
             )
@@ -1428,7 +1434,8 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
                     source = frame.source,
                     generation = frame.pipelineGeneration,
                     sensorTimestampNs = frame.sensorTimestampNs,
-                    reason = "EGL_PRESENTATION_ID_UNAVAILABLE"
+                    reason = "EGL_PRESENTATION_ID_UNAVAILABLE",
+                    producerKind = frame.producerKind
                 )
             }
         }
@@ -1589,12 +1596,16 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
             RawPreviewFrameLifecycleRegistry.presented(
                 pending.generation,
                 pending.sensorTimestampNs,
+                pending.producerKind,
                 presentTimeNs
             )
             RawPreviewCadenceDiagnostics.displayPresented(
-                pending.sensorTimestampNs,
-                pending.eglFrameId,
-                presentTimeNs
+                source = pending.source,
+                generation = pending.generation,
+                sensorTimestampNs = pending.sensorTimestampNs,
+                producerKind = pending.producerKind,
+                eglFrameId = pending.eglFrameId,
+                displayPresentNs = presentTimeNs
             )
             RawPreviewFirstActivationTrace.displayPresented(
                 sensorTimestampNs = pending.sensorTimestampNs,
@@ -1643,7 +1654,8 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
                     source = pending.source,
                     generation = pending.generation,
                     sensorTimestampNs = pending.sensorTimestampNs,
-                    reason = "PRESENTATION_TIMEOUT"
+                    reason = "PRESENTATION_TIMEOUT",
+                    producerKind = pending.producerKind
                 )
                 // Presentation was not proven, so re-arm the exact staged target for the next fresh
                 // RAW frame instead of leaving the transition permanently stuck after one timeout.

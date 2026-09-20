@@ -182,6 +182,7 @@ object ImageUtils {
         frameSlotIndex: Int,
         maxWidth: Int,
         maxHeight: Int,
+        analysisReadbackRequested: Boolean = true,
         profilePop: Float = 0f,
         profileColorRecovery: Float = 0f
     ): IntArray? {
@@ -257,7 +258,8 @@ object ImageUtils {
                 analysisNv21,
                 frameSlotIndex,
                 maxWidth,
-                maxHeight
+                maxHeight,
+                analysisReadbackRequested
             )
         } catch (t: Throwable) {
             Log.w(TAG, "RAW preview render failed", t)
@@ -1709,6 +1711,30 @@ object ImageUtils {
         return runCatching { pollRawPreviewGlFenceNative(handle) }.getOrDefault(-1)
     }
 
+    fun pollRawPreview(
+        frameSlotIndex: Int,
+        submissionId: Long,
+        previewWidth: Int,
+        previewHeight: Int,
+        cfaCellDecimation: Int,
+        camera2PriorWbGains: FloatArray
+    ): IntArray? {
+        if (!nativeEngineAvailable || submissionId <= 0L) return null
+        return try {
+            pollRawPreviewNative(
+                frameSlotIndex,
+                submissionId.toInt(),
+                (submissionId ushr 32).toInt(),
+                previewWidth,
+                previewHeight,
+                cfaCellDecimation,
+                camera2PriorWbGains
+            )
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
     fun destroyRawPreviewGlFence(handle: Long) {
         if (!nativeEngineAvailable || handle == 0L) return
         runCatching { destroyRawPreviewGlFenceNative(handle) }
@@ -1772,6 +1798,17 @@ object ImageUtils {
         analysisNv21: ByteBuffer?,
         frameSlotIndex: Int,
         maxWidth: Int,
-        maxHeight: Int
+        maxHeight: Int,
+        analysisReadbackRequested: Boolean
+    ): IntArray?
+
+    private external fun pollRawPreviewNative(
+        frameSlotIndex: Int,
+        submissionIdLow: Int,
+        submissionIdHigh: Int,
+        previewWidth: Int,
+        previewHeight: Int,
+        cfaCellDecimation: Int,
+        camera2PriorWbGains: FloatArray
     ): IntArray?
 }
