@@ -1,0 +1,107 @@
+name: P0 Delta Package Only
+
+on:
+  push:
+    branches:
+      - 'chatgpt/p0-raw-stability-20260920'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build delta
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/DELTA_P0_RAW_STABILITY"
+          mkdir -p "$ROOT/app/src/main/java/com/bncam/ui/screens/capture"
+          mkdir -p "$ROOT/app/src/main/cpp/vulkan"
+          mkdir -p "$ROOT/app/src/test/java/com/bncam/core/vulkan"
+
+          cp app/src/main/java/com/bncam/ui/screens/capture/RawPreviewRenderer.kt "$ROOT/app/src/main/java/com/bncam/ui/screens/capture/"
+          cp app/src/main/cpp/vulkan/VulkanRuntime.cpp "$ROOT/app/src/main/cpp/vulkan/"
+          cp app/src/test/java/com/bncam/core/vulkan/Phase11ARawPreviewAsyncSourceContractTest.kt "$ROOT/app/src/test/java/com/bncam/core/vulkan/"
+          cp app/src/test/java/com/bncam/core/vulkan/P0RawPreviewStabilitySourceContractTest.kt "$ROOT/app/src/test/java/com/bncam/core/vulkan/"
+
+          cat > "$ROOT/DELTA_MANIFEST.md" <<'EOF'
+          # DELTA P0 — RAW Stability
+
+          Base commit: 3946a46f9c4ccdd738313e833854128bc953202a
+
+          ## Scope
+          Narrow stability/bisect delta. No stream-role redesign, frame-count policy change,
+          JPEG microdetail tuning, tone rollback, or multi-frame capture change.
+
+          ## Production files
+          - app/src/main/java/com/bncam/ui/screens/capture/RawPreviewRenderer.kt
+          - app/src/main/cpp/vulkan/VulkanRuntime.cpp
+
+          ## Tests
+          - app/src/test/java/com/bncam/core/vulkan/Phase11ARawPreviewAsyncSourceContractTest.kt
+          - app/src/test/java/com/bncam/core/vulkan/P0RawPreviewStabilitySourceContractTest.kt
+
+          ## Changes
+          - Resolve each Phase-11A Vulkan preview submission on BnCamRawPreview before request/
+            native-slot ownership is reused.
+          - Bound completion to 250 ms; timeout becomes a dropped preview frame rather than an
+            unbounded black/frozen path.
+          - Keep two display slots and one queued input request during P0.
+          - Reuse native preview slot 0 during P0 to reduce persistent slot-local GPU working sets.
+          - Temporarily route RAW preview onto the production compute queue instead of the separate
+            preview queue. The isolated preview command pool remains in use.
+
+          ## Evidence behind P0
+          SingleFrameRunner.kt and Raw16RenderInput.kt are byte-identical between 51a6306 and
+          failing 3946a46. Delta 17–26 instead changed RAW-preview execution to detached Vulkan
+          submissions, multiple slot-local resource sets and an independent preview queue while
+          also changing native image processing. This delta isolates the new preview concurrency/
+          residency boundary first, without rolling back the new image-quality work.
+
+          ## Device acceptance
+          1. Cold start in YUV, switch to RAW viewfinder.
+          2. Keep RAW viewfinder live for >=30 s.
+          3. Take one SINGLE RAW10 capture from the warm buffer.
+          4. Repeat 10 SINGLE RAW10 captures.
+          5. Repeat with RAW_SENSOR where the session opens.
+          6. RAW -> YUV -> RAW, then one SINGLE capture.
+          7. Return diagnostics on any freeze/crash.
+
+          ## Diagnostic keys
+          RAW_PREVIEW_P0_COMPLETION_TIMEOUT
+          RAW_PREVIEW_P0_COMPLETION_FAILED
+          RENDER_FAILED
+          CAPTURE_EXCEPTION
+          ASYNC_RAW_PROCESSING_WORKER
+          VK_ERROR_DEVICE_LOST
+          OutOfMemoryError
+          STREAM_RUNTIME_TELEMETRY
+          CAMERA2_CAPTURE_FAILED
+          CAMERA2_CAPTURE_BUFFER_LOST
+
+          ## Deliberately deferred
+          - independent RAW10 viewfinder role for RAW_SENSOR capture-history profiles
+          - app-owned long RAW history instead of Camera2 Image ownership
+          - minFrameDuration/stallDuration telemetry
+          - RAW viewfinder detail/FPS tuning
+          - JPEG microdetail work
+          - multi-frame capture/fusion
+
+          DELETE_THESE.txt is not required: no files are removed.
+          EOF
+
+          cd "$RUNNER_TEMP"
+          zip -r DELTA_P0_RAW_STABILITY.zip DELTA_P0_RAW_STABILITY
+
+      - name: Upload delta
+        uses: actions/upload-artifact@v4
+        with:
+          name: DELTA_P0_RAW_STABILITY_PACKAGE
+          path: ${{ runner.temp }}/DELTA_P0_RAW_STABILITY.zip
+          if-no-files-found: error
+          retention-days: 7
