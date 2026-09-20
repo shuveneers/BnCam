@@ -1114,7 +1114,7 @@ class RawPreviewRenderer(
                 outputHardwareBuffer = outputHardwareBuffer,
                 outputRgba = outputRgba,
                 analysisNv21 = analysisBuffer,
-                frameSlotIndex = slot.id,
+                frameSlotIndex = P0_NATIVE_VULKAN_SLOT_ID,
                     maxWidth = targetMaxWidth,
                     maxHeight = targetMaxHeight,
                     analysisReadbackRequested = analysisReadbackRequested
@@ -1137,7 +1137,7 @@ class RawPreviewRenderer(
             )
             if (result != null && result.getOrNull(0) == RAW_PREVIEW_ASYNC_SUBMITTED_MAGIC) {
                 val submissionId = decodeAsyncSubmissionId(result)
-                if (submissionId <= 0L || result.getOrElse(1) { -1 } != slot.id) {
+                if (submissionId <= 0L || result.getOrElse(1) { -1 } != P0_NATIVE_VULKAN_SLOT_ID) {
                     renderFailures++
                     recordDrop(RawPreviewDropReason.NATIVE_RENDER_FAILED, request)
                     return
@@ -1156,7 +1156,7 @@ class RawPreviewRenderer(
                 vulkanSubmittedFrames++
                 if (analysisReadbackRequested) lastAnalysisSubmitElapsedNs = analysisNowNs
                 val completed = awaitSubmittedVulkanCompletionOnWorker(
-                    slotId = slot.id,
+                    slotId = P0_NATIVE_VULKAN_SLOT_ID,
                     submissionId = submissionId,
                     previewWidth = result.getOrElse(4) { expectedOutput.first },
                     previewHeight = result.getOrElse(5) { expectedOutput.second },
@@ -2035,6 +2035,7 @@ class RawPreviewRenderer(
         const val COMPLETION_POLL_INTERVAL_MS = 1L
         const val P0_VULKAN_COMPLETION_POLL_MS = 1L
         const val P0_VULKAN_COMPLETION_TIMEOUT_MS = 250L
+        const val P0_NATIVE_VULKAN_SLOT_ID = 0
         const val ANALYSIS_SIDECAR_INTERVAL_NS = 100_000_000L // 10 Hz, independent of display cadence.
         const val RAW_PREVIEW_ASYNC_SUBMITTED_MAGIC = 0x42505253
         const val RAW_PREVIEW_ASYNC_PENDING_MAGIC = 0x42505250
