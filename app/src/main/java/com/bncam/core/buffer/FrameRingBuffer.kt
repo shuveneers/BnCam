@@ -13,6 +13,7 @@ import com.bncam.core.capture.FrameSelectionExposurePolicy
 import com.bncam.core.vulkan.RawStillWorkingSetPrewarmer
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.ensureActive
 import java.util.ArrayDeque
 
 data class ZslFrameTimingSnapshot(
@@ -775,7 +776,7 @@ class FrameRingBuffer(private var capacity: Int = 35) {
         lastColdStartWaitMs = null
         lastSelectionFailureReason = null
         val completeAfter = 0
-        Log.w(
+        SafeLog.w(
             "NearZslTiming",
             "event=GENERATION_CHANGED reason=$reason oldGeneration=$oldGen newGeneration=$generationId timestampNs=$nowNs completeFramesBefore=$completeBefore completeFramesAfter=$completeAfter"
         )
@@ -1531,7 +1532,9 @@ class FrameRingBuffer(private var capacity: Int = 35) {
         val deadlineNs = currentElapsedRealtimeNanos() + maxWaitMs.coerceAtLeast(1L) * 1_000_000L
         var sequence = currentEventSequence()
         while (currentElapsedRealtimeNanos() <= deadlineNs) {
+            kotlinx.coroutines.currentCoroutineContext().ensureActive()
             synchronized(this) {
+                if (generationId != activeGeneration) return null
                 val pair = buffer.firstOrNull { candidate ->
                     candidate.timestamp == sensorTimestampNs &&
                         candidate.generationId == generationId &&
@@ -1545,8 +1548,15 @@ class FrameRingBuffer(private var capacity: Int = 35) {
                     return leaseFrameInternal(pair, pair.frameVersion)
                 }
             }
-            kotlinx.coroutines.withTimeoutOrNull(30L) { awaitEventAfter(sequence) }
-            sequence = currentEventSequence()
+            val remainingMs = ((deadlineNs - currentElapsedRealtimeNanos()) / 1_000_000L).coerceAtLeast(1L)
+            val event = kotlinx.coroutines.withTimeoutOrNull(remainingMs) { awaitEventAfter(sequence) }
+                ?: return null
+            // StateFlow may conflate a clear with a following completion. Retirement must win.
+            if (eventsAfter(sequence).any {
+                    it.pipelineGeneration != generationId || it.type == FrameRingEventType.BUFFER_CLEARED
+                }) return null
+            sequence = event.sequence
+            if (event.pipelineGeneration != generationId || event.type == FrameRingEventType.BUFFER_CLEARED) return null
         }
         return synchronized(this) {
             val pair = buffer.firstOrNull { candidate ->

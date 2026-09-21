@@ -44,9 +44,10 @@ class RawPreviewPhase1SourceContractTest {
     @Test
     fun queueRemainsBoundedLatestFrameWinsAndDuplicatesStayRejected() {
         val renderer = source("src/main/java/com/bncam/ui/screens/capture/RawPreviewRenderer.kt")
-        assertTrue(renderer.contains("const val MAX_PENDING_REQUESTS = 2"))
-        assertTrue(renderer.contains("stale = pendingRequests.removeFirst()"))
-        assertTrue(renderer.contains("pendingRequests.addLast(request)"))
+        assertTrue(renderer.contains("const val MAX_PENDING_REQUESTS = 1"))
+        assertTrue(renderer.contains("private var pendingRequest: Request? = null"))
+        assertTrue(renderer.contains("pendingRequest.also { pendingRequest = request }"))
+        assertTrue(renderer.contains("RawPreviewDropReason.PREVIEW_DROP_REPLACED_BY_NEWER"))
         assertTrue(renderer.contains("latestOfferedSensorTimestampNs"))
         assertTrue(renderer.contains("sensorTimestampNs <= previous"))
         assertTrue(renderer.contains("duplicateOfferRejected"))

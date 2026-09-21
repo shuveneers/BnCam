@@ -1763,7 +1763,13 @@ Java_com_bncam_core_engine_ImageUtils_renderRawPreviewNative(
         jobject analysisNv21Buffer,
         jint frameSlotIndex,
         jint maxWidth,
-        jint maxHeight
+        jint maxHeight,
+        jlong sensorTimestampNs,
+        jint pipelineGeneration,
+        jfloatArray lensShadingMapArray,
+        jint lensShadingColumns,
+        jint lensShadingRows,
+        jintArray lensShadingActiveRectArray
 ) {
     auto* buffer = reinterpret_cast<AHardwareBuffer*>(
             static_cast<std::uintptr_t>(retainedHardwareBuffer));
@@ -1834,7 +1840,29 @@ Java_com_bncam_core_engine_ImageUtils_renderRawPreviewNative(
     parameters.sourceCropHeight = std::max(0, static_cast<int>(sourceCropHeight));
     parameters.maxWidth = maxWidth;
     parameters.maxHeight = maxHeight;
-    parameters.frameSlotIndex = std::clamp(static_cast<int>(frameSlotIndex), 0, 2);
+    parameters.frameSlotIndex = std::clamp(static_cast<int>(frameSlotIndex), -3, 2);
+    parameters.sensorTimestampNs = static_cast<std::int64_t>(sensorTimestampNs);
+    parameters.pipelineGeneration = static_cast<int>(pipelineGeneration);
+    if (lensShadingMapArray != nullptr && lensShadingColumns > 0 && lensShadingRows > 0 &&
+        lensShadingColumns <= 128 && lensShadingRows <= 128 &&
+        static_cast<std::int64_t>(lensShadingColumns) * lensShadingRows <= 16'384) {
+        const jsize count = static_cast<jsize>(lensShadingColumns * lensShadingRows * 4);
+        if (env->GetArrayLength(lensShadingMapArray) == count) {
+            parameters.lensShadingMap.resize(static_cast<std::size_t>(count));
+            env->GetFloatArrayRegion(lensShadingMapArray, 0, count, parameters.lensShadingMap.data());
+            if (!env->ExceptionCheck()) {
+                parameters.lensShadingColumns = lensShadingColumns;
+                parameters.lensShadingRows = lensShadingRows;
+            } else {
+                parameters.lensShadingMap.clear();
+                env->ExceptionClear();
+            }
+        }
+    }
+    if (lensShadingActiveRectArray != nullptr && env->GetArrayLength(lensShadingActiveRectArray) >= 4) {
+        env->GetIntArrayRegion(lensShadingActiveRectArray, 0, 4, parameters.lensShadingActiveRect);
+        if (env->ExceptionCheck()) env->ExceptionClear();
+    }
     const auto blackLevels = extractFloat4(env, blackLevelsArray);
     std::copy(blackLevels.begin(), blackLevels.end(), parameters.blackLevels);
     if (camera2PriorWbGainsArray != nullptr && env->GetArrayLength(camera2PriorWbGainsArray) >= 4) {
@@ -1899,6 +1927,12 @@ Java_com_bncam_core_engine_ImageUtils_renderRawPreviewNative(
     const RawPreviewResult rendered = renderRawPreviewRgba(
             buffer, parameters, outputHardwareBuffer, output, static_cast<std::size_t>(outputCapacity),
             analysisNv21, static_cast<std::size_t>(std::max<jlong>(0, analysisNv21Capacity)));
+    if (rendered.gpuPending) {
+        const jint pending = -2;
+        jintArray signal = env->NewIntArray(1);
+        if (signal != nullptr) env->SetIntArrayRegion(signal, 0, 1, &pending);
+        return signal;
+    }
     if (!rendered.success) return nullptr;
     jint values[43] = {
             rendered.width,

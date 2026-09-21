@@ -385,11 +385,19 @@ RuntimeSnapshot VulkanRuntime::shutdown() noexcept {
         return snapshotLocked();
     }
 
+    if (!rawPreviewBackend_.destroy(handles_.device)) {
+        lastFailure_ = {"RAW_PREVIEW_SHUTDOWN_GPU_PENDING",
+            "RAW preview GPU resources remain owned until fence completion.", true};
+        state_ = RuntimeState::FAILED;
+        recordLifecycleEventLocked("shutdown_deferred", lastFailure_.code);
+        stateChanged_.notify_all();
+        return snapshotLocked();
+    }
+
     // Milestone 8E: the production-connected SPECTRA pipeline owns device objects and
     // must be destroyed before the authoritative device/pipeline-cache ownership moves.
     spectraTemporalObserverBackend_.destroy(handles_.device);
     spectraResidentDemosaicBackend_.destroy(handles_.device);
-    rawPreviewBackend_.destroy(handles_.device);
     rawCaptureBackend_.destroy(handles_.device);
     rawJpegNormalizeBackend_.destroy(handles_.device);
     rawMultiFrameBackend_.destroy(handles_.device);

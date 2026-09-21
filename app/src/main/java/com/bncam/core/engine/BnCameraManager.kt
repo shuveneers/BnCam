@@ -127,6 +127,7 @@ import com.bncam.core.quality.SizeSnapshot
 import com.bncam.core.isp.raw.RawBlackDomainBinding
 import com.bncam.core.isp.raw.RawDomainContractResolver
 import com.bncam.core.isp.raw.RawWhiteDomainBinding
+import com.bncam.core.isp.raw.LensShadingGrid
 import com.bncam.core.isp.raw10.RawCameraColorProfileRepository
 import com.bncam.core.quality.RawColorTransformEngine
 import com.bncam.core.quality.AwbCalibrationEngine
@@ -2452,6 +2453,39 @@ class BnCameraManager(private val context: Context) {
         }
     }
 
+    private fun recordExactRawPreviewMetadata(result: TotalCaptureResult, generation: Int) {
+        val identity = synchronized(pipelineLock) { activePipelineIdentity } ?: return
+        if (generation != pipelineGeneration || targetViewfinderSource == ViewfinderEffectiveSource.YUV) return
+        val physicalResult = previewCaptureResult(result, identity.physicalCameraId) ?: return
+        val timestampNs = physicalResult.get(CaptureResult.SENSOR_TIMESTAMP)
+            ?: result.get(CaptureResult.SENSOR_TIMESTAMP) ?: return
+        val map = physicalResult.get(CaptureResult.STATISTICS_LENS_SHADING_CORRECTION_MAP)
+        val columns = map?.columnCount ?: 0
+        val rows = map?.rowCount ?: 0
+        val gains = if (columns in 1..128 && rows in 1..128 && columns * rows <= 16_384) {
+            runCatching {
+                val values = FloatArray(columns * rows * 4)
+                var index = 0
+                for (row in 0 until rows) for (column in 0 until columns) {
+                    for (channel in 0..3) values[index++] = map!!.getGainFactor(channel, column, row)
+                }
+                LensShadingGrid.sanitize(values, columns, rows)
+            }.getOrNull()
+        } else null
+        rawPreviewRenderer.recordRawFrameMetadata(
+            generation = generation,
+            sensorId = identity.physicalCameraId ?: identity.logicalCameraId,
+            source = targetViewfinderSource,
+            sensorTimestampNs = timestampNs,
+            dynamicBlack = physicalResult.get(CaptureResult.SENSOR_DYNAMIC_BLACK_LEVEL)
+                ?.takeIf { it.size >= 4 && it.take(4).all { value -> value.isFinite() && value >= 0f } }
+                ?.copyOf(4),
+            dynamicWhite = physicalResult.get(CaptureResult.SENSOR_DYNAMIC_WHITE_LEVEL)?.takeIf { it > 0 },
+            lensMap = gains, lensColumns = if (gains == null) 0 else columns,
+            lensRows = if (gains == null) 0 else rows
+        )
+    }
+
     private fun ensureRawPreviewConfig(result: TotalCaptureResult?, generation: Int) {
         val nowMs = android.os.SystemClock.elapsedRealtime()
         val identity = synchronized(pipelineLock) { activePipelineIdentity } ?: return
@@ -2511,6 +2545,12 @@ class BnCameraManager(private val context: Context) {
                 val calibrationCameraId = identity.physicalCameraId ?: identity.logicalCameraId
                 val characteristics = cameraManager.getCameraCharacteristics(calibrationCameraId)
                 val calibrationResult = result?.let { previewCaptureResult(it, identity.physicalCameraId) }
+                val staticBlackPattern = characteristics.get(CameraCharacteristics.SENSOR_BLACK_LEVEL_PATTERN)
+                val staticPreviewBlack = staticBlackPattern?.let { pattern -> floatArrayOf(
+                    pattern.getOffsetForIndex(0, 0).toFloat(), pattern.getOffsetForIndex(1, 0).toFloat(),
+                    pattern.getOffsetForIndex(0, 1).toFloat(), pattern.getOffsetForIndex(1, 1).toFloat()
+                ) }
+                val staticPreviewWhite = characteristics.get(CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL) ?: 0
                 val quality = RenderQualityConfig.load(
                     repo = repo,
                     profileId = profileId,
@@ -2617,7 +2657,13 @@ class BnCameraManager(private val context: Context) {
                     toneCurve = quality.curves.toneNodes.toFloatArray(),
                     gammaCurve = quality.curves.gammaNodes.toFloatArray(),
                     sectionCurve = quality.curves.sectionNodes.toFloatArray(),
-                    rotationDegrees = rawPreviewRotationDegrees(characteristics)
+                    rotationDegrees = rawPreviewRotationDegrees(characteristics),
+                    calibrationSensorId = calibrationCameraId,
+                    staticBlackLevels = staticPreviewBlack,
+                    staticWhiteLevel = staticPreviewWhite,
+                    lensShadingAlreadyApplied = characteristics.get(CameraCharacteristics.SENSOR_INFO_LENS_SHADING_APPLIED),
+                    lensMapActiveRect = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+                        ?.let { intArrayOf(it.left, it.top, it.width(), it.height()) }
                 )
                 if (generation == pipelineGeneration && source == targetViewfinderSource &&
                     generation == targetViewfinderGeneration && routeRevision == rawPreviewRouteRevision
@@ -2807,6 +2853,17 @@ class BnCameraManager(private val context: Context) {
             gammaCurve = linearCurve(16),
             sectionCurve = linearCurve(7),
             rotationDegrees = rawPreviewRotationDegrees(characteristics),
+            calibrationSensorId = calibrationCameraId,
+            staticBlackLevels = staticBlack?.let { floatArrayOf(
+                staticBlack?.getOffsetForIndex(0, 0)?.toFloat() ?: 0f,
+                staticBlack?.getOffsetForIndex(1, 0)?.toFloat() ?: 0f,
+                staticBlack?.getOffsetForIndex(0, 1)?.toFloat() ?: 0f,
+                staticBlack?.getOffsetForIndex(1, 1)?.toFloat() ?: 0f
+            ) },
+            staticWhiteLevel = staticWhite ?: 0,
+            lensShadingAlreadyApplied = characteristics.get(CameraCharacteristics.SENSOR_INFO_LENS_SHADING_APPLIED),
+            lensMapActiveRect = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+                ?.let { intArrayOf(it.left, it.top, it.width(), it.height()) },
             isBootstrap = true
         )
     }.onFailure { error ->
@@ -7217,7 +7274,8 @@ class BnCameraManager(private val context: Context) {
         requestedProfileId: String,
         requestedFormat: String,
         cameraId: String,
-        requirement: WarmBufferReadinessRequirement
+        requirement: WarmBufferReadinessRequirement,
+        requireWarmBuffer: Boolean = true
     ): String {
         val expectedSource = expectedEffectiveFrameSourceName(requestedFormat)
         val identity = synchronized(pipelineLock) { activePipelineIdentity }
@@ -7244,6 +7302,9 @@ class BnCameraManager(private val context: Context) {
         if (sessionConfiguredGeneration != pipelineGeneration) {
             return "SESSION_GENERATION_NOT_CONFIGURED expectedGeneration=$pipelineGeneration configuredGeneration=$sessionConfiguredGeneration expected=$expectedSource"
         }
+
+        // A configured producer can take a still before its repeating ring becomes warm.
+        if (!requireWarmBuffer) return "READY"
 
         val chars = cameraManager.getCameraCharacteristics(cameraId)
         val latestRes = lastCaptureResult
@@ -10563,6 +10624,7 @@ class BnCameraManager(private val context: Context) {
                             // processed and presented every SENSOR_TIMESTAMP a second time.
                             if (targetViewfinderSource != ViewfinderEffectiveSource.YUV && !isCapturing) {
                                 ensureRawPreviewConfig(result, sessionGeneration)
+                                recordExactRawPreviewMetadata(result, sessionGeneration)
                             }
                         }
                     }
@@ -11487,6 +11549,7 @@ class BnCameraManager(private val context: Context) {
      */
     fun shutdown(reason: String = "MANAGER_OWNER_DESTROYED") {
         if (!managerShutdownRequested.compareAndSet(false, true)) return
+        coldRawCaptureJob.get()?.cancel(kotlinx.coroutines.CancellationException("Camera manager shutdown"))
 
         // Stop accepting new UI publication immediately. Camera/resource retirement itself stays
         // serialized on sessionTransitionScope and cannot race an in-flight lens/session change.
@@ -12234,6 +12297,9 @@ class BnCameraManager(private val context: Context) {
                     // never feed itself back into PhysicalAwbEstimator.
                     rawPreviewRenderer.updateExactFrameCamera2ColorPair(
                         sensorTimestampNs = timestampNs,
+                        generation = generation,
+                        sensorId = scopeKey,
+                        source = targetViewfinderSource,
                         gains = camera2Gains,
                         colorMatrix = camera2Matrix
                     )
@@ -15665,6 +15731,115 @@ class BnCameraManager(private val context: Context) {
         }
     }
 
+    private val coldRawCaptureJob = java.util.concurrent.atomic.AtomicReference<kotlinx.coroutines.Job?>(null)
+
+    private suspend fun acquireColdRawSingle(
+        recipe: com.bncam.core.capture.CaptureRecipe,
+        activeLens: LensInfo,
+        focus: FocusCaptureContext,
+        expectedGeneration: Int,
+        onAcquired: (com.bncam.core.buffer.FrameLease) -> Unit
+    ): Unit = kotlinx.coroutines.coroutineScope {
+        val acquisitionJob = coroutineContext[kotlinx.coroutines.Job]!!
+        check(coldRawCaptureJob.compareAndSet(null, acquisitionJob))
+        val resultReady = kotlinx.coroutines.CompletableDeferred<TotalCaptureResult>()
+        val lifecycle = launch(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) {
+            var sequence = ringBuffer.currentEventSequence()
+            while (true) {
+                if (pipelineGeneration != expectedGeneration || managerShutdownRequested.get()) {
+                    acquisitionJob.cancel(kotlinx.coroutines.CancellationException("Cold RAW producer retired"))
+                    break
+                }
+                val event = ringBuffer.awaitEventAfter(sequence)
+                if (ringBuffer.eventsAfter(sequence).any {
+                        it.pipelineGeneration != expectedGeneration ||
+                            it.type == com.bncam.core.buffer.FrameRingEventType.BUFFER_CLEARED
+                    }) {
+                    acquisitionJob.cancel(kotlinx.coroutines.CancellationException("Cold RAW ring cleared"))
+                    break
+                }
+                sequence = event.sequence
+            }
+        }
+        try {
+            val session = checkNotNull(captureSession)
+            val device = checkNotNull(cameraDevice)
+            val reader = checkNotNull(imageReader)
+            val format = reader.imageFormat
+            check(format == ImageFormat.RAW10 || format == ImageFormat.RAW_SENSOR)
+            val builder = createPipelineCaptureRequestBuilder(device, CameraDevice.TEMPLATE_STILL_CAPTURE)
+            builder.addTarget(reader.surface)
+            val characteristics = cameraManager.getCameraCharacteristics(device.id)
+            applyViewfinderCam2ApiSettings(
+                requestBuilder = builder, characteristics = characteristics,
+                cameraId = device.id, activeLensId = activeLens.id,
+                opticalStabilization = recipe.executionSettings.opticalStabilization,
+                hotPixelMode = recipe.executionSettings.hotPixelMode,
+                noiseReductionHint = recipe.executionSettings.noiseReductionHint,
+                edgeModeHint = recipe.executionSettings.edgeModeHint,
+                tonemapHint = recipe.executionSettings.tonemapHint,
+                antiBanding = recipe.executionSettings.antiBanding
+            )
+            applyMeteringPolicy(builder)
+            applyExposurePolicy(builder)
+            applyLiveWhiteBalancePolicy(builder)
+            applyAuthoritativeFocusToStillBuilder(builder, checkNotNull(currentCaptureRequest), focus, "COLD_RAW_SINGLE")
+            builder.set(CaptureRequest.CONTROL_CAPTURE_INTENT, CaptureRequest.CONTROL_CAPTURE_INTENT_STILL_CAPTURE)
+            builder.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_OFF)
+            val callback = object : CameraCaptureSession.CaptureCallback() {
+                override fun onCaptureCompleted(s: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
+                    if (!acquisitionJob.isActive || !resultReady.isActive) return
+                    if (s !== session || pipelineGeneration != expectedGeneration || captureSession !== session) return
+                    val provenance = controlRequestEpochTracker.resolveTag(request.tag, expectedGeneration)
+                    val metadata = frameSensorMetadataSnapshot(result, expectedGeneration, device.id)
+                    val timestamp = metadata?.sensorTimestampNs ?: result.get(CaptureResult.SENSOR_TIMESTAMP)
+                    if (!provenance.exact || timestamp == null || timestamp <= 0L) {
+                        resultReady.completeExceptionally(IllegalStateException("Cold RAW still has no exact timestamp/provenance"))
+                        return
+                    }
+                    ringBuffer.addMetadata(timestamp, result, expectedGeneration, provenance.provenance, metadata)
+                    captureAttempts.captureResultReceived()
+                    resultReady.complete(result)
+                }
+
+                override fun onCaptureFailed(s: CameraCaptureSession, request: CaptureRequest, failure: android.hardware.camera2.CaptureFailure) {
+                    resultReady.completeExceptionally(IllegalStateException("Cold RAW still failed: ${failure.reason}"))
+                }
+
+                override fun onCaptureSequenceAborted(s: CameraCaptureSession, sequenceId: Int) {
+                    resultReady.completeExceptionally(IllegalStateException("Cold RAW still aborted: $sequenceId"))
+                }
+            }
+            check(!managerShutdownRequested.get() && pipelineGeneration == expectedGeneration &&
+                sessionConfiguredGeneration == expectedGeneration && captureSession === session && imageReader === reader)
+            val submission = submitOneShotRequestWithProvenance(
+                session, builder, callback, backgroundHandler, "COLD_RAW_SINGLE", expectedGeneration
+            )
+            // Existing still-delivery failure bounds, not a warm-up delay. Success continues on
+            // the first exact pair; no repeating recovery or producer rebuild occurs.
+            val result = withTimeout(2500L) { resultReady.await() }
+            val timestamp = frameSensorMetadataSnapshot(result, expectedGeneration, device.id)?.sensorTimestampNs
+                ?: checkNotNull(result.get(CaptureResult.SENSOR_TIMESTAMP))
+            val lease = checkNotNull(ringBuffer.awaitAndLeaseExactRequestFrame(
+                timestamp, expectedGeneration, submission.prepared.tag.controlRequestEpoch, format, 1600L
+            )) { "Cold RAW still exact Image/result pair unavailable" }
+            if (!acquisitionJob.isActive || managerShutdownRequested.get() || pipelineGeneration != expectedGeneration) {
+                lease.release()
+                throw kotlinx.coroutines.CancellationException("Cold RAW producer retired before handoff")
+            }
+            traceCaptureRuntime("RAW_SINGLE_SOURCE=COLD_DIRECT_STILL generation=$expectedGeneration " +
+                "logicalCamera=${device.id} physicalCamera=${lease.pair.sensorMetadataSnapshot?.route?.physicalCameraId} " +
+                "format=${formatName(format)} imageTimestamp=${lease.pair.timestamp} resultTimestamp=$timestamp " +
+                "epoch=${submission.prepared.tag.controlRequestEpoch}")
+            // Publish ownership before coroutineScope's cancellable return boundary.
+            onAcquired(lease)
+        } finally {
+            lifecycle.cancel()
+            resultReady.cancel()
+            coldRawCaptureJob.compareAndSet(acquisitionJob, null)
+        }
+    }
+
     private suspend fun executeDedicatedFlashCapture(
         activeProfile: CameraProfile,
         activeLens: LensInfo,
@@ -16161,6 +16336,7 @@ class BnCameraManager(private val context: Context) {
         var preleasedNormalMultiAnchor: FrameRingBuffer.LeasedCandidate? = null
         var preleasedProvisionalNearZslAnchor: FrameRingBuffer.LeasedCandidate? = null
         var preleasedSingleAnchor: FrameRingBuffer.LeasedCandidate? = null
+        var coldSingleAnchor: com.bncam.core.buffer.FrameLease? = null
         var singleAnchorTemporalClass = "UNRESOLVED"
         var singleAnchorEffectiveShutterTimestampNs = userShutterTimestampNs
         var singleAnchorEffectiveShutterTimestampDomain = "ELAPSED_REALTIME"
@@ -16328,6 +16504,10 @@ class BnCameraManager(private val context: Context) {
                 else -> authorityResolution.computationalHdrResolutionReason
             }
             val effectiveCaptureStrategy = authorityResolution.effectiveCaptureStrategy
+            val rawSingle = effectiveCaptureStrategy == CaptureStrategy.SINGLE_FRAME_ZSL &&
+                !computationalHdrRouteEnabled && !dedicatedFlashStill &&
+                (frameOrigin == FrameOrigin.RAW10 || frameOrigin == FrameOrigin.RAW_SENSOR)
+            val singleProducerGeneration = pipelineGeneration
             Log.i("BnCameraManager", "AUTHORITY_RESOLUTION: userHdr=$computationalHdrUserRequested liveStrategy=$liveCaptureStrategy resolvedStrategy=$effectiveCaptureStrategy runner=${authorityResolution.actualRunner} routeEnabled=$computationalHdrRouteEnabled")
 
             if (effectiveCaptureStrategy == CaptureStrategy.SINGLE_FRAME_ZSL &&
@@ -16597,7 +16777,17 @@ class BnCameraManager(private val context: Context) {
                     pinnedAnchorReadinessReason.startsWith("READINESS_") ||
                     pinnedAnchorReadinessReason.startsWith("LEASABLE_WARM_BUFFER_NOT_READY") ||
                     pinnedAnchorReadinessReason.startsWith("WARM_BUFFER_STREAM_STALE"))
-            val pipelineReady = if (pinnedAnchorCanOwnAdmission) {
+            val pipelineReady = if (rawSingle) {
+                val reason = pipelineReadinessReason(
+                    activeProfile.id, livePreferredFrameSource, activeLens.id,
+                    warmBufferRequirement, requireWarmBuffer = false
+                )
+                pipelineCaptureGateReady = reason == "READY"
+                pipelineCaptureGateLastReason = reason
+                pipelineCaptureGateWaitMs = 0L
+                pipelineCaptureGateResetTriggered = false
+                reason == "READY"
+            } else if (pinnedAnchorCanOwnAdmission) {
                 // Normal Near-ZSL already owns a complete, exact, pre-shutter source frame. Do not
                 // make that captured moment wait for later 3A/stream-health observations: those can
                 // only describe frames after the user's press and cannot improve the pinned anchor.
@@ -16683,7 +16873,20 @@ class BnCameraManager(private val context: Context) {
                 }
             }
 
-            if (effectiveCaptureStrategy == CaptureStrategy.SINGLE_FRAME_ZSL &&
+            if (rawSingle) {
+                check(pipelineGeneration == singleProducerGeneration) { "RAW single producer changed" }
+                if (preleasedSingleAnchor == null) {
+                    acquireColdRawSingle(recipe, activeLens, focusCaptureContextAtShutter, singleProducerGeneration) {
+                        coldSingleAnchor = it
+                    }
+                    singleAnchorTemporalClass = "COLD_DIRECT_STILL"
+                } else {
+                    traceCaptureRuntime("RAW_SINGLE_SOURCE=NEAR_ZSL_PRE_SHUTTER generation=$singleProducerGeneration " +
+                        "format=${formatName(activeZslFormat)} imageTimestamp=${preleasedSingleAnchor?.timestampNs}")
+                }
+            }
+
+            if (!rawSingle && effectiveCaptureStrategy == CaptureStrategy.SINGLE_FRAME_ZSL &&
                 !computationalHdrRouteEnabled &&
                 !dedicatedFlashStill &&
                 preleasedSingleAnchor == null
@@ -16758,7 +16961,15 @@ class BnCameraManager(private val context: Context) {
             var currentSubmittedControlRequestEpochAtShutter = 0L
             var postShutterStillCaptureUsed = false
 
-            if (dedicatedFlashStill) {
+            if (coldSingleAnchor != null) {
+                postShutterStillCaptureUsed = true
+                shutterTimestampNs = coldSingleAnchor!!.pair.timestamp
+                shutterTimestampDomain = "SENSOR_TIMESTAMP"
+                currentSubmittedControlRequestEpochAtShutter = coldSingleAnchor!!.pair.controlRequestEpoch
+                if (recipe.executionSettings.cameraSoundEnabled && !managerShutdownRequested.get()) {
+                    mediaActionSound.play(MediaActionSound.SHUTTER_CLICK)
+                }
+            } else if (dedicatedFlashStill) {
                 postShutterStillCaptureUsed = true
                 val flashCaptureResult = executeDedicatedFlashCapture(
                     activeProfile = activeProfile,
@@ -16866,7 +17077,8 @@ class BnCameraManager(private val context: Context) {
             val diagnosticsSensorMetadata = if (capturePlan.frameOrigin == FrameOrigin.YUV) {
                 null
             } else {
-                hdrBracket?.anchor?.lease?.pair?.sensorMetadataSnapshot
+                coldSingleAnchor?.pair?.sensorMetadataSnapshot
+                    ?: hdrBracket?.anchor?.lease?.pair?.sensorMetadataSnapshot
                     ?: preleasedSingleAnchor?.lease?.pair?.sensorMetadataSnapshot
                     ?: preleasedNormalMultiAnchor?.lease?.pair?.sensorMetadataSnapshot
             }
@@ -16886,7 +17098,8 @@ class BnCameraManager(private val context: Context) {
                     ";nearZslAnchorIsGenuinePreShutter=${
                         singleAnchorTemporalClass.startsWith("GENUINE_PRE_SHUTTER")
                     }" +
-                    ";nearZslNoDedicatedStillFallback=${!dedicatedFlashStill}" +
+                    ";nearZslNoDedicatedStillFallback=${!postShutterStillCaptureUsed}" +
+                    ";RAW_SINGLE_SOURCE=${if (coldSingleAnchor != null) "COLD_DIRECT_STILL" else if (rawSingle) "NEAR_ZSL_PRE_SHUTTER" else "NOT_APPLICABLE"}" +
                     unifiedRuntimeDiagnosticsSuffix
 
             val submissionResult = try {
@@ -16931,7 +17144,8 @@ class BnCameraManager(private val context: Context) {
                                 userShutterTimestampNs = singleRunnerEligibilityTimestampNs,
                                 stableAutoWhiteBalance = stableAutoWhiteBalanceAtShutter,
                                 focusCaptureContext = focusCaptureContextAtShutter,
-                                portraitCaptureContext = portraitCaptureContextAtShutter
+                                portraitCaptureContext = portraitCaptureContextAtShutter,
+                                reservedAnchor = coldSingleAnchor ?: preleasedSingleAnchor?.lease?.takeIf { rawSingle }
                             )
                         }
 
@@ -17155,6 +17369,8 @@ class BnCameraManager(private val context: Context) {
                 pinned.lease.release()
                 preleasedSingleAnchor = null
             }
+            coldSingleAnchor?.release()
+            coldSingleAnchor = null
             releaseSelectionExposureConstraintAfterCapture(attemptId)
             // Re-apply the live repeating control state only after shutter-time selection authority
             // is unfrozen. This prevents a post-press AE/flicker update from retroactively making

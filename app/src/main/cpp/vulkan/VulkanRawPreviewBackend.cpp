@@ -1,5 +1,7 @@
 #include "VulkanRawPreviewBackend.h"
 #include "VulkanPipelineCacheRegistry.h"
+#include "RawPreviewInputPolicy.h"
+#include <android/log.h>
 
 #include <algorithm>
 #include <chrono>
@@ -41,6 +43,50 @@ static std::atomic<std::uint64_t> gMaxPreviewBuffersInFlight{0u};
 namespace bncam::vulkan {
 namespace {
 using Clock = std::chrono::steady_clock;
+
+struct InputTransportTrace {
+    const RawPreviewGpuResult& result;
+    bool sample = false;
+    explicit InputTransportTrace(const RawPreviewGpuResult& value) : result(value) {
+        static std::atomic<std::int64_t> lastNs{0};
+        const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count();
+        auto previous = lastNs.load(std::memory_order_relaxed);
+        sample = now - previous >= 2'000'000'000ll && lastNs.compare_exchange_strong(previous, now);
+    }
+    ~InputTransportTrace() {
+        if (!sample) return;
+        __android_log_print(ANDROID_LOG_INFO, "RawPreviewInput",
+            "path=%s ahbFormat=%u ahbUsage=0x%llx vkFormat=%d externalFormat=%llu externalFeatures=0x%x "
+            "optimalFeatures=0x%x imageQuery=%d imageExternalFeatures=0x%x rejection=%s "
+            "cpuBytes=%llu gpuCopyBytes=%llu stagingMemory=0x%x lockMs=%.3f layoutMs=%.3f "
+            "memcpyMs=%.3f paddingMs=%.3f rowCopyMs=%.3f unlockMs=%.3f flushMs=%.3f "
+            "handoffMs=%.3f packMs=%.3f "
+            "importRetains=%llu importReleases=%llu failure=%s",
+            result.inputTransport, result.inputAhbFormat, static_cast<unsigned long long>(result.inputAhbUsage),
+            static_cast<int>(result.inputVulkanFormat), static_cast<unsigned long long>(result.inputExternalFormat),
+            result.inputExternalFeatures, result.inputOptimalFeatures,
+            static_cast<int>(result.inputImageFormatQuery), result.inputImageExternalMemoryFeatures,
+            result.inputImportRejection.c_str(),
+            static_cast<unsigned long long>(result.inputBytesCopied), static_cast<unsigned long long>(result.inputGpuCopyBytes),
+            result.inputStagingMemoryFlags, result.inputAhbLockMs, result.inputLayoutMs,
+            result.inputMemcpyMs, result.inputPaddingMs, result.inputRowCopyMs,
+            result.inputAhbUnlockMs, result.inputFlushMs, result.inputHandoffMs,
+            result.inputPackingMs, static_cast<unsigned long long>(gPreviewAcquireCount.load()),
+            static_cast<unsigned long long>(gPreviewReleaseCount.load()), result.failureReason.c_str());
+    }
+};
+
+struct ScopedAhbReadLock {
+    AHardwareBuffer* buffer = nullptr;
+    bool locked = false;
+    int unlock() {
+        if (!locked) return 0;
+        const int status = AHardwareBuffer_unlock(buffer, nullptr);
+        if (status == 0) locked = false;
+        return status;
+    }
+    ~ScopedAhbReadLock() { if (locked) AHardwareBuffer_unlock(buffer, nullptr); }
+};
 
 float elapsedMs(Clock::time_point started) {
     return static_cast<float>(
@@ -192,7 +238,10 @@ void VulkanRawPreviewBackend::destroyImportedInputLocked(
         if (input.buffer != VK_NULL_HANDLE) vkDestroyBuffer(device, input.buffer, nullptr);
         if (input.memory != VK_NULL_HANDLE) vkFreeMemory(device, input.memory, nullptr);
     }
-    if (input.hardwareBuffer != nullptr) AHardwareBuffer_release(input.hardwareBuffer);
+    if (input.hardwareBuffer != nullptr) {
+        AHardwareBuffer_release(input.hardwareBuffer);
+        gPreviewReleaseCount.fetch_add(1u, std::memory_order_relaxed);
+    }
     input = {};
 }
 
@@ -219,10 +268,72 @@ bool VulkanRawPreviewBackend::tryImportInputBufferLocked(
     // Android only defines AHardwareBuffer BLOB allocations carrying GPU_DATA_BUFFER usage as
     // byte-addressable shader storage/uniform buffers. Camera RAW image allocations must not be
     // reinterpreted as VkBuffer memory merely because the AHB extension exists.
-    if (desc.format != AHARDWAREBUFFER_FORMAT_BLOB || desc.height != 1u || desc.layers != 1u ||
-        (desc.usage & AHARDWAREBUFFER_USAGE_GPU_DATA_BUFFER) == 0u ||
-        static_cast<VkDeviceSize>(desc.width) < requiredBytes) {
+    if (!rawPreviewBlobContract(desc.format, desc.width, desc.height, desc.layers, desc.usage, requiredBytes)) {
         result.inputInteropStatus = 2u;
+        failureReason = "CAMERA_RAW_IMAGE_NOT_BYTE_ADDRESSABLE";
+        const auto gpuUsage = AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |
+            AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT | AHARDWAREBUFFER_USAGE_GPU_DATA_BUFFER;
+        // vkGetAHBProperties itself requires GPU usage (VUID 01884). CPU-only camera
+        // allocations must not be probed as if the Vulkan extension made them importable.
+        if ((desc.usage & gpuUsage) == 0) {
+            failureReason = "AHB_HAS_NO_GPU_USAGE";
+            return false;
+        }
+        auto getProperties = reinterpret_cast<PFN_vkGetAndroidHardwareBufferPropertiesANDROID>(
+            vkGetDeviceProcAddr(device, "vkGetAndroidHardwareBufferPropertiesANDROID"));
+        if (!getProperties) {
+            failureReason = "AHB_VULKAN_EXTENSION_UNAVAILABLE";
+            return false;
+        }
+        VkAndroidHardwareBufferFormatPropertiesANDROID formatProperties{};
+        formatProperties.sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_FORMAT_PROPERTIES_ANDROID;
+        VkAndroidHardwareBufferPropertiesANDROID properties{};
+        properties.sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID;
+        properties.pNext = &formatProperties;
+        if (getProperties(device, inputBuffer, &properties) != VK_SUCCESS) {
+            failureReason = "AHB_IMAGE_PROPERTIES_QUERY_FAILED";
+            return false;
+        }
+        result.inputVulkanFormat = formatProperties.format;
+        result.inputExternalFormat = formatProperties.externalFormat;
+        result.inputExternalFeatures = formatProperties.formatFeatures;
+        if (formatProperties.format != VK_FORMAT_UNDEFINED) {
+            VkFormatProperties supported{};
+            vkGetPhysicalDeviceFormatProperties(physicalDevice, formatProperties.format, &supported);
+            result.inputOptimalFeatures = supported.optimalTilingFeatures;
+            VkPhysicalDeviceExternalImageFormatInfo externalInfo{};
+            externalInfo.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO;
+            externalInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
+            VkPhysicalDeviceImageFormatInfo2 imageInfo{};
+            imageInfo.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2;
+            imageInfo.pNext = &externalInfo;
+            imageInfo.format = formatProperties.format;
+            imageInfo.type = VK_IMAGE_TYPE_2D;
+            imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+            imageInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+            imageInfo.flags = 0u;
+            VkExternalImageFormatProperties externalImage{};
+            externalImage.sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES;
+            VkImageFormatProperties2 imageProperties{};
+            imageProperties.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2;
+            imageProperties.pNext = &externalImage;
+            result.inputImageFormatQuery = vkGetPhysicalDeviceImageFormatProperties2(
+                    physicalDevice, &imageInfo, &imageProperties);
+            if (result.inputImageFormatQuery == VK_SUCCESS) {
+                result.inputImageExternalMemoryFeatures =
+                    externalImage.externalMemoryProperties.externalMemoryFeatures;
+            }
+        }
+        // External-format sampling/YCbCr conversion is not proof of original CFA sample
+        // representation. Nor does AHB retention carry a producer Image lease/acquire fence.
+        // Keep the exact byte staging route until both contracts can be proven per frame.
+        failureReason = formatProperties.format == VK_FORMAT_UNDEFINED
+            ? "EXTERNAL_FORMAT_HAS_NO_EXACT_RAW_BYTE_CONTRACT"
+            : result.inputImageFormatQuery != VK_SUCCESS
+                ? "RAW_IMAGE_EXTERNAL_IMPORT_QUERY_REJECTED"
+                : (result.inputImageExternalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT) == 0u
+                    ? "RAW_IMAGE_EXTERNAL_MEMORY_NOT_IMPORTABLE"
+                    : "RAW_IMAGE_PRODUCER_SYNC_AND_SAMPLE_CONTRACT_UNPROVEN";
         return false;
     }
     if (!foreignQueueFamilyEnabled) {
@@ -338,6 +449,7 @@ bool VulkanRawPreviewBackend::tryImportInputBufferLocked(
     }
 
     AHardwareBuffer_acquire(inputBuffer);
+    gPreviewAcquireCount.fetch_add(1u, std::memory_order_relaxed);
     slot.importedInput.hardwareBuffer = inputBuffer;
     slot.importedInput.buffer = importedBuffer;
     slot.importedInput.memory = importedMemory;
@@ -553,8 +665,8 @@ bool VulkanRawPreviewBackend::initializeLocked(
         return false;
     }
     const auto descriptorLayoutStarted = Clock::now();
-    VkDescriptorSetLayoutBinding bindings[6]{};
-    for (std::uint32_t index = 0u; index < 6u; ++index) {
+    VkDescriptorSetLayoutBinding bindings[7]{};
+    for (std::uint32_t index = 0u; index < 7u; ++index) {
         bindings[index].binding = index;
         bindings[index].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         bindings[index].descriptorCount = 1u;
@@ -562,7 +674,7 @@ bool VulkanRawPreviewBackend::initializeLocked(
     }
     VkDescriptorSetLayoutCreateInfo descriptorInfo{};
     descriptorInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    descriptorInfo.bindingCount = 6u;
+    descriptorInfo.bindingCount = 7u;
     descriptorInfo.pBindings = bindings;
     if (vkCreateDescriptorSetLayout(device, &descriptorInfo, nullptr, &descriptorSetLayout_) != VK_SUCCESS) {
         failureReason = "vkCreateDescriptorSetLayout_raw_preview_failed";
@@ -570,7 +682,7 @@ bool VulkanRawPreviewBackend::initializeLocked(
     }
 
 #if BNCAM_RAW_PREVIEW_IMAGE_SHADER_AVAILABLE
-    VkDescriptorSetLayoutBinding imageBindings[6]{};
+    VkDescriptorSetLayoutBinding imageBindings[7]{};
     imageBindings[0] = bindings[0];
     imageBindings[1].binding = 1u;
     imageBindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
@@ -580,9 +692,10 @@ bool VulkanRawPreviewBackend::initializeLocked(
     imageBindings[3] = bindings[3];
     imageBindings[4] = bindings[4];
     imageBindings[5] = bindings[5];
+    imageBindings[6] = bindings[6];
     VkDescriptorSetLayoutCreateInfo imageDescriptorInfo{};
     imageDescriptorInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    imageDescriptorInfo.bindingCount = 6u;
+    imageDescriptorInfo.bindingCount = 7u;
     imageDescriptorInfo.pBindings = imageBindings;
     if (vkCreateDescriptorSetLayout(device, &imageDescriptorInfo, nullptr, &imageDescriptorSetLayout_) != VK_SUCCESS) {
         failureReason = "vkCreateDescriptorSetLayout_raw_preview_image_failed";
@@ -683,7 +796,7 @@ bool VulkanRawPreviewBackend::initializeLocked(
     VkDescriptorPoolSize poolSizes[2]{};
     poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     // Legacy sets: 6 storage buffers each. Image sets: input + statistics + tone + local base + HSM = 5.
-    poolSizes[0].descriptorCount = 11u * RAW_PREVIEW_FRAMES_IN_FLIGHT;
+    poolSizes[0].descriptorCount = 13u * RAW_PREVIEW_FRAMES_IN_FLIGHT;
     poolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     poolSizes[1].descriptorCount = RAW_PREVIEW_FRAMES_IN_FLIGHT;
     VkDescriptorPoolCreateInfo poolInfo{};
@@ -732,14 +845,14 @@ bool VulkanRawPreviewBackend::initializeLocked(
             destroyLocked(device); return false;
         }
         slots_[i].fenceSubmitted = false;
-    }
-
-    VkQueryPoolCreateInfo queryInfo{};
-    queryInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
-    queryInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
-    queryInfo.queryCount = 2u;
-    if (vkCreateQueryPool(device, &queryInfo, nullptr, &queryPool_) != VK_SUCCESS) {
-        queryPool_ = VK_NULL_HANDLE;
+        slots_[i].lifecycle = {};
+        VkQueryPoolCreateInfo queryInfo{};
+        queryInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+        queryInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        queryInfo.queryCount = 2u;
+        if (vkCreateQueryPool(device, &queryInfo, nullptr, &slots_[i].queryPool) != VK_SUCCESS) {
+            slots_[i].queryPool = VK_NULL_HANDLE;
+        }
     }
     diagnostics.descriptorCommandResourcesMs = elapsedMs(descriptorCommandResourcesStarted);
     initialized_ = true;
@@ -766,6 +879,9 @@ bool VulkanRawPreviewBackend::ensureLegacyPipelineLocked(
     stage.pName = "main";
     VkComputePipelineCreateInfo pipelineInfo{};
     pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    // This capture-grade fallback shader is large. On memory-limited mobile drivers the
+    // optimization pass can exhaust process memory during a health recovery transition.
+    pipelineInfo.flags = VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
     pipelineInfo.stage = stage;
     pipelineInfo.layout = pipelineLayout_;
 
@@ -805,8 +921,20 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
         std::mutex* queueSubmissionMutex,
         const RawPreviewGpuRequest& request) noexcept {
     RawPreviewGpuResult result{};
+    InputTransportTrace transportTrace{result};
     result.attempted = true;
     const auto totalStarted = Clock::now();
+    const auto declaredLayout = rawPreviewInputLayout(request.sourceFormat, request.sourceWidth,
+            request.sourceHeight, request.sourceRowStrideBytes, request.sourcePixelStrideBytes,
+            request.sourceRowStrideBytes, request.sourcePixelStrideBytes);
+    if (!declaredLayout.valid()) {
+        result.failureReason = declaredLayout.rejection;
+        return result;
+    }
+    if (request.rawData != nullptr && request.rawDataCapacityBytes < declaredLayout.sourceSpan) {
+        result.failureReason = "RAW_PREVIEW_CPU_SOURCE_CAPACITY_UNKNOWN";
+        return result;
+    }
     const std::uint64_t pixelCount = static_cast<std::uint64_t>(request.previewWidth) * request.previewHeight;
     const std::uint64_t rgbaBytes = pixelCount * 4u;
     const bool hasLegacyOutput = request.outputRgba != nullptr && request.outputCapacityBytes >= rgbaBytes;
@@ -854,30 +982,42 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
     const std::uint32_t slotIdx = request.frameSlotIndex < RAW_PREVIEW_FRAMES_IN_FLIGHT
             ? request.frameSlotIndex
             : currentFrameSlot_;
-    currentFrameSlot_ = (slotIdx + 1u) % RAW_PREVIEW_FRAMES_IN_FLIGHT;
     FrameSlot& slot = slots_[slotIdx];
     result.activeSlotIndex = slotIdx;
-
-    // Check non-blocking GPU fence status for this 3-frames-in-flight slot
-    if (slot.fenceSubmitted) {
-        const VkResult status = vkGetFenceStatus(device, slot.fence);
-        const VkResult waitRes = (status == VK_SUCCESS) ? VK_SUCCESS : vkWaitForFences(device, 1u, &slot.fence, VK_TRUE, 2'000'000ull);
-        if (waitRes == VK_SUCCESS) {
-            slot.fenceSubmitted = false;
-            destroyImportedInputLocked(device, slot.importedInput);
-            if (slot.boundHardwareBuffer != nullptr) {
-                AHardwareBuffer_release(slot.boundHardwareBuffer);
-                gPreviewReleaseCount.fetch_add(1u, std::memory_order_relaxed);
-                gReleaseAfterGpuCompletionCount.fetch_add(1u, std::memory_order_relaxed);
-                slot.boundHardwareBuffer = nullptr;
-            }
-        } else {
-            result.droppedBusy = true;
-            result.failureReason = "GPU_SLOT_BUSY_DROPPED";
-            result.totalMs = elapsedMs(totalStarted);
+    if (request.pollOnly) {
+        if (!slot.fenceSubmitted ||
+            !slot.lifecycle.submittedFor(request.pipelineGeneration, request.sensorTimestampNs) ||
+            slot.pendingInputIdentity != request.inputHardwareBuffer ||
+            slot.pendingOutputIdentity != request.outputHardwareBuffer ||
+            slot.pendingOutputRgba != request.outputRgba ||
+            slot.pendingAnalysisNv21 != request.analysisNv21 ||
+            slot.pendingSensorTimestampNs != request.sensorTimestampNs ||
+            slot.pendingGeneration != request.pipelineGeneration) {
+            result.failureReason = "GPU_PREVIEW_POLL_FRAME_MISMATCH";
             return result;
         }
+        const VkResult status = vkGetFenceStatus(device, slot.fence);
+        if (status == VK_NOT_READY) {
+            result.gpuPending = true;
+            result.failureReason = "GPU_PREVIEW_PENDING";
+            return result;
+        }
+        if (status != VK_SUCCESS) {
+            result.failureReason = "GPU_PREVIEW_FENCE_STATUS_FAILED";
+            return result;
+        }
+        return collectCompletedLocked(physicalDevice, device, allocator, request, slot);
     }
+    if (slot.fenceSubmitted || !slot.lifecycle.begin(request.pipelineGeneration, request.sensorTimestampNs)) {
+        result.droppedBusy = true;
+        result.failureReason = "GPU_SLOT_BUSY_DROPPED";
+        return result;
+    }
+    struct RecordingGuard {
+        FrameSlot& slot;
+        ~RecordingGuard() { slot.lifecycle.cancelRecording(); }
+    } recordingGuard{slot};
+    currentFrameSlot_ = (slotIdx + 1u) % RAW_PREVIEW_FRAMES_IN_FLIGHT;
 
     const std::uint64_t rawBytes = static_cast<std::uint64_t>(request.sourceRowStrideBytes) * request.sourceHeight;
     const std::uint64_t inputBytes = (rawBytes + 3u) & ~std::uint64_t{3u};
@@ -904,6 +1044,14 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
             (hueSatSecondRequested && hueSatMapContractValid ? hueSatTableFloats : 0u);
     const std::uint64_t hueSatProfileBytes = std::max<std::uint64_t>(
             kHueSatHeaderFloats * sizeof(float), hueSatProfileFloats * sizeof(float));
+    const bool lensMapValid = request.lensShadingMap != nullptr &&
+            request.lensShadingColumns > 0u && request.lensShadingColumns <= 128u &&
+            request.lensShadingRows > 0u && request.lensShadingRows <= 128u &&
+            static_cast<std::uint64_t>(request.lensShadingColumns) * request.lensShadingRows <= 16'384u;
+    const std::uint64_t lensFloats = lensMapValid
+            ? 6u + static_cast<std::uint64_t>(request.lensShadingColumns) * request.lensShadingRows * 4u
+            : 6u;
+    const std::uint64_t lensBytes = lensFloats * sizeof(float);
     const std::uint32_t analysisWidth = (request.previewWidth / 4u) & ~1u;
     const std::uint32_t analysisHeight = (request.previewHeight / 4u) & ~1u;
     const std::uint64_t analysisPixels = static_cast<std::uint64_t>(analysisWidth) * analysisHeight;
@@ -931,6 +1079,7 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
             request.inputHardwareBuffer, static_cast<VkDeviceSize>(inputBytes),
             result, inputImportFailure);
     result.inputAhbProbeMs = elapsedMs(inputAhbProbeStarted);
+    result.inputImportRejection = directHardwareInput ? "none" : inputImportFailure;
     const auto releaseUnsubmittedDirectInput = [&]() {
         if (directHardwareInput && !slot.fenceSubmitted) {
             destroyImportedInputLocked(device, slot.importedInput);
@@ -939,17 +1088,18 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
 
     bool directHostInput = false;
     if (!directHardwareInput) {
-        if (!ensureBufferLocked(allocator, inputBytes, writeAccess, inputStaging_, reallocated, failure)) {
+        if (!ensureBufferLocked(allocator, inputBytes, writeAccess, slot.inputStaging, reallocated, failure)) {
             result.failureReason = failure;
             result.totalMs = elapsedMs(totalStarted);
             return result;
         }
+        result.inputStagingMemoryFlags = slot.inputStaging.memoryProperties;
         const VkMemoryPropertyFlags directInputRequired =
                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
         directHostInput =
-                (inputStaging_.memoryProperties & directInputRequired) == directInputRequired;
+                (slot.inputStaging.memoryProperties & directInputRequired) == directInputRequired;
         if (!directHostInput &&
-            !ensureBufferLocked(allocator, inputBytes, 0u, deviceInput_, reallocated, failure)) {
+            !ensureBufferLocked(allocator, inputBytes, 0u, slot.deviceInput, reallocated, failure)) {
             result.failureReason = failure;
             result.totalMs = elapsedMs(totalStarted);
             return result;
@@ -957,25 +1107,31 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
         if (result.inputInteropStatus == 0u) result.inputInteropStatus = 5u;
     }
     result.directHostInputUsed = !directHardwareInput && directHostInput;
-    if (!ensureBufferLocked(allocator, toneLutBytes, writeAccess, toneLutBuffer_, reallocated, failure)) {
+    if (!ensureBufferLocked(allocator, toneLutBytes, writeAccess, slot.toneLutBuffer, reallocated, failure)) {
         releaseUnsubmittedDirectInput();
         result.failureReason = failure;
         result.totalMs = elapsedMs(totalStarted);
         return result;
     }
-    if (!ensureBufferLocked(allocator, statisticsBytes, 0u, deviceStatistics_, reallocated, failure)) {
+    if (!ensureBufferLocked(allocator, statisticsBytes, 0u, slot.deviceStatistics, reallocated, failure)) {
         releaseUnsubmittedDirectInput();
         result.failureReason = failure;
         result.totalMs = elapsedMs(totalStarted);
         return result;
     }
-    if (!ensureBufferLocked(allocator, localToneMapBytes, 0u, localToneBase_, reallocated, failure)) {
+    if (!ensureBufferLocked(allocator, localToneMapBytes, 0u, slot.localToneBase, reallocated, failure)) {
         releaseUnsubmittedDirectInput();
         result.failureReason = failure;
         result.totalMs = elapsedMs(totalStarted);
         return result;
     }
-    if (!ensureBufferLocked(allocator, hueSatProfileBytes, writeAccess, hueSatProfile_, reallocated, failure)) {
+    if (!ensureBufferLocked(allocator, hueSatProfileBytes, writeAccess, slot.hueSatProfile, reallocated, failure)) {
+        releaseUnsubmittedDirectInput();
+        result.failureReason = failure;
+        result.totalMs = elapsedMs(totalStarted);
+        return result;
+    }
+    if (!ensureBufferLocked(allocator, lensBytes, writeAccess, slot.lensShadingBuffer, reallocated, failure)) {
         releaseUnsubmittedDirectInput();
         result.failureReason = failure;
         result.totalMs = elapsedMs(totalStarted);
@@ -1023,22 +1179,25 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
     result.persistentBufferReuseHit = !reallocated;
 
     const VkBuffer inputBuffer = directHardwareInput ? slot.importedInput.buffer :
-            (directHostInput ? inputStaging_.buffer : deviceInput_.buffer);
+            (directHostInput ? slot.inputStaging.buffer : slot.deviceInput.buffer);
     VkDescriptorBufferInfo inputInfo{};
     inputInfo.buffer = inputBuffer;
     inputInfo.range = VK_WHOLE_SIZE;
     VkDescriptorBufferInfo statisticsInfo{};
-    statisticsInfo.buffer = deviceStatistics_.buffer;
+    statisticsInfo.buffer = slot.deviceStatistics.buffer;
     statisticsInfo.range = VK_WHOLE_SIZE;
     VkDescriptorBufferInfo toneInfo{};
-    toneInfo.buffer = toneLutBuffer_.buffer;
+    toneInfo.buffer = slot.toneLutBuffer.buffer;
     toneInfo.range = static_cast<VkDeviceSize>(toneLutBytes);
     VkDescriptorBufferInfo localToneInfo{};
-    localToneInfo.buffer = localToneBase_.buffer;
+    localToneInfo.buffer = slot.localToneBase.buffer;
     localToneInfo.range = static_cast<VkDeviceSize>(localToneMapBytes);
     VkDescriptorBufferInfo hueSatInfo{};
-    hueSatInfo.buffer = hueSatProfile_.buffer;
+    hueSatInfo.buffer = slot.hueSatProfile.buffer;
     hueSatInfo.range = static_cast<VkDeviceSize>(hueSatProfileBytes);
+    VkDescriptorBufferInfo lensInfo{};
+    lensInfo.buffer = slot.lensShadingBuffer.buffer;
+    lensInfo.range = static_cast<VkDeviceSize>(lensBytes);
 
     VkPipeline activePipeline = pipeline_;
     VkPipelineLayout activePipelineLayout = pipelineLayout_;
@@ -1047,7 +1206,7 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
         VkDescriptorImageInfo outputImageInfo{};
         outputImageInfo.imageView = slot.importedOutput.view;
         outputImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-        VkWriteDescriptorSet writes[6]{};
+        VkWriteDescriptorSet writes[7]{};
         writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[0].dstSet = slot.imageDescriptorSet;
         writes[0].dstBinding = 0u;
@@ -1084,7 +1243,13 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
         writes[5].descriptorCount = 1u;
         writes[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         writes[5].pBufferInfo = &hueSatInfo;
-        vkUpdateDescriptorSets(device, 6u, writes, 0u, nullptr);
+        writes[6].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[6].dstSet = slot.imageDescriptorSet;
+        writes[6].dstBinding = 6u;
+        writes[6].descriptorCount = 1u;
+        writes[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[6].pBufferInfo = &lensInfo;
+        vkUpdateDescriptorSets(device, 7u, writes, 0u, nullptr);
         activePipeline = imagePipeline_;
         activePipelineLayout = imagePipelineLayout_;
         activeDescriptorSet = slot.imageDescriptorSet;
@@ -1092,9 +1257,9 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
         VkDescriptorBufferInfo outputInfo{};
         outputInfo.buffer = slot.deviceOutput.buffer;
         outputInfo.range = VK_WHOLE_SIZE;
-        VkDescriptorBufferInfo infos[6]{inputInfo, outputInfo, statisticsInfo, toneInfo, localToneInfo, hueSatInfo};
-        VkWriteDescriptorSet writes[6]{};
-        for (std::uint32_t index = 0u; index < 6u; ++index) {
+        VkDescriptorBufferInfo infos[7]{inputInfo, outputInfo, statisticsInfo, toneInfo, localToneInfo, hueSatInfo, lensInfo};
+        VkWriteDescriptorSet writes[7]{};
+        for (std::uint32_t index = 0u; index < 7u; ++index) {
             writes[index].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             writes[index].dstSet = slot.descriptorSet;
             writes[index].dstBinding = index;
@@ -1102,79 +1267,166 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
             writes[index].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             writes[index].pBufferInfo = &infos[index];
         }
-        vkUpdateDescriptorSets(device, 6u, writes, 0u, nullptr);
+        vkUpdateDescriptorSets(device, 7u, writes, 0u, nullptr);
     }
 
     const auto packingStarted = Clock::now();
     if (!directHardwareInput) {
-        const std::uint8_t* rawSource = request.rawData;
-        void* lockedAddress = nullptr;
-        AHardwareBuffer_Planes lockedPlanes{};
-        bool inputLocked = false;
+        const auto handoffStarted = Clock::now();
+        auto layoutTick = Clock::now();
+        const std::uint8_t *rawSource = request.rawData;
+        std::uint32_t mappedRowStride = request.sourceRowStrideBytes;
+        std::uint32_t mappedPixelStride = request.sourcePixelStrideBytes;
+        std::size_t mappedCapacity = 0u;
+        ScopedAhbReadLock mapped{request.inputHardwareBuffer};
         if (rawSource == nullptr) {
-            if (request.inputHardwareBuffer == nullptr) {
-                result.failureReason = "RAW_PREVIEW_INPUT_STAGING_BUFFER_MISSING";
-                result.totalMs = elapsedMs(totalStarted);
+            AHardwareBuffer_Desc desc{};
+            AHardwareBuffer_describe(request.inputHardwareBuffer, &desc);
+            const bool blobFallback = rawPreviewBlobContract(desc.format, desc.width, desc.height,
+                                                             desc.layers, desc.usage, inputBytes);
+            if (desc.layers != 1u || (desc.usage & AHARDWAREBUFFER_USAGE_PROTECTED_CONTENT) != 0u) {
+                result.failureReason = "RAW_PREVIEW_INPUT_AHB_IDENTITY_MISMATCH";
                 return result;
             }
-
-            // Prefer lockPlanes on API 29+ because it reports the mapper's actual row/pixel
-            // layout. Camera2's Image plane layout is the shader contract. If the mapper reports
-            // a different layout, do not silently memcpy bytes using the wrong row stride: that
-            // can turn padding/optical-black memory into a visible RAW corruption block.
-            const int planesStatus = AHardwareBuffer_lockPlanes(
-                    request.inputHardwareBuffer, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN,
-                    -1, nullptr, &lockedPlanes);
-            if (planesStatus == 0 && lockedPlanes.planeCount == 1u &&
-                lockedPlanes.planes[0].data != nullptr) {
-                inputLocked = true;
-                const std::uint32_t mappedRowStride =
-                        static_cast<std::uint32_t>(lockedPlanes.planes[0].rowStride);
-                const std::uint32_t mappedPixelStride =
-                        static_cast<std::uint32_t>(lockedPlanes.planes[0].pixelStride);
-                if (mappedRowStride > 0u) {
-                    const_cast<RawPreviewGpuRequest&>(request).sourceRowStrideBytes = mappedRowStride;
-                }
-                // RAW_SENSOR is byte-addressed per pixel. RAW10 is packed and Camera2 reports a
-                // pixelStride of zero, so only validate pixel stride for non-packed RAW input.
-                if (request.sourceFormat == 32u && request.sourcePixelStrideBytes > 0u &&
-                    mappedPixelStride > 0u &&
-                    mappedPixelStride != request.sourcePixelStrideBytes) {
-                    AHardwareBuffer_unlock(request.inputHardwareBuffer, nullptr);
-                    result.failureReason = "RAW_PREVIEW_INPUT_PLANE_PIXEL_STRIDE_MISMATCH";
-                    result.totalMs = elapsedMs(totalStarted);
-                    return result;
-                }
-                rawSource = static_cast<const std::uint8_t*>(lockedPlanes.planes[0].data);
-            } else {
-                // Some vendor RAW mappers do not expose lockPlanes even though the same CPU-read
-                // AHB can be flat-locked. Preserve that existing byte-staging compatibility, but
-                // never reinterpret the buffer as a different image layout.
-                if (planesStatus == 0) {
-                    AHardwareBuffer_unlock(request.inputHardwareBuffer, nullptr);
-                }
-                if (AHardwareBuffer_lock(
-                            request.inputHardwareBuffer, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN,
-                            -1, nullptr, &lockedAddress) != 0 || lockedAddress == nullptr) {
+            const auto readUsage = desc.usage & AHARDWAREBUFFER_USAGE_CPU_READ_MASK;
+            if (readUsage == 0u) {
+                result.failureReason = "RAW_PREVIEW_INPUT_CPU_READ_UNAVAILABLE";
+                return result;
+            }
+            if (blobFallback) {
+                // An eligible byte BLOB may still fail Vulkan import. Its linear CPU mapping
+                // remains a valid, bounded fallback for the declared logical RAW row layout.
+                void *address = nullptr;
+                result.inputLayoutMs += elapsedMs(layoutTick);
+                const auto lockStarted = Clock::now();
+                const int status = AHardwareBuffer_lock(request.inputHardwareBuffer, readUsage, -1,
+                                                        nullptr, &address);
+                result.inputAhbLockMs += elapsedMs(lockStarted);
+                layoutTick = Clock::now();
+                mapped.locked = status == 0;
+                if (!mapped.locked || address == nullptr) {
                     result.failureReason = "RAW_PREVIEW_INPUT_STAGING_LOCK_FAILED";
-                    result.totalMs = elapsedMs(totalStarted);
                     return result;
                 }
-                inputLocked = true;
-                rawSource = static_cast<const std::uint8_t*>(lockedAddress);
+                rawSource = static_cast<const std::uint8_t *>(address);
+                mappedCapacity = desc.width;
+                result.inputTransport = "CPU_VISIBLE_COMPATIBILITY_FALLBACK";
+            } else {
+                if (desc.width != request.sourceWidth || desc.height != request.sourceHeight ||
+                    desc.format != request.sourceFormat) {
+                    result.failureReason = "RAW_PREVIEW_INPUT_AHB_IDENTITY_MISMATCH";
+                    return result;
+                }
+                AHardwareBuffer_Planes planes{};
+                result.inputLayoutMs += elapsedMs(layoutTick);
+                const auto lockStarted = Clock::now();
+                const int status = AHardwareBuffer_lockPlanes(request.inputHardwareBuffer,
+                                                              readUsage, -1, nullptr, &planes);
+                result.inputAhbLockMs += elapsedMs(lockStarted);
+                layoutTick = Clock::now();
+                if (status == 0) {
+                    mapped.locked = true;
+                    // A successful but malformed plane description is not
+                    // permission to guess a flat layout. RAII releases the lock on
+                    // every rejection path.
+                    if (planes.planeCount != 1u || planes.planes[0].data == nullptr) {
+                        result.failureReason = "RAW_PREVIEW_INPUT_PLANE_COUNT_INVALID";
+                        return result;
+                    }
+                    if (planes.planes[0].rowStride <= 0 || planes.planes[0].pixelStride < 0) {
+                        result.failureReason = "RAW_PREVIEW_INPUT_PLANE_STRIDE_INVALID";
+                        return result;
+                    }
+                    mappedRowStride = planes.planes[0].rowStride;
+                    mappedPixelStride = planes.planes[0].pixelStride;
+                    rawSource = static_cast<const std::uint8_t *>(planes.planes[0].data);
+                    result.inputTransport = "HOST_MAPPED_AHB_STAGING";
+                } else {
+                    // Only a failed plane API uses the existing flat-lock
+                    // compatibility route. The original Camera2 byte-stride remains
+                    // authoritative; never use desc.stride (pixels) as bytes or
+                    // fabricate an alignment here.
+                    void *address = nullptr;
+                    result.inputLayoutMs += elapsedMs(layoutTick);
+                    const auto flatLockStarted = Clock::now();
+                    const int flatStatus = AHardwareBuffer_lock(request.inputHardwareBuffer,
+                                                                readUsage, -1, nullptr, &address);
+                    result.inputAhbLockMs += elapsedMs(flatLockStarted);
+                    layoutTick = Clock::now();
+                    mapped.locked = flatStatus == 0;
+                    if (!mapped.locked || address == nullptr) {
+                        result.failureReason = "RAW_PREVIEW_INPUT_STAGING_LOCK_FAILED";
+                        return result;
+                    }
+                    const auto flatStride =
+                            request.sourceFormat == 37u
+                                    ? ((static_cast<std::uint64_t>(desc.stride) + 3u) / 4u) * 5u
+                                    : static_cast<std::uint64_t>(desc.stride) * 2u;
+                    if (desc.stride < request.sourceWidth ||
+                        flatStride != request.sourceRowStrideBytes) {
+                        result.failureReason = "RAW_PREVIEW_FLAT_LOCK_LAYOUT_UNPROVEN";
+                        return result;
+                    }
+                    rawSource = static_cast<const std::uint8_t *>(address);
+                    result.inputTransport = "CPU_VISIBLE_COMPATIBILITY_FALLBACK";
+                }
+            }
+        } else {
+            result.inputTransport = "CPU_VISIBLE_COMPATIBILITY_FALLBACK";
+        }
+        const auto layout = rawPreviewInputLayout(request.sourceFormat, request.sourceWidth,
+                request.sourceHeight, mappedRowStride, mappedPixelStride,
+                request.sourceRowStrideBytes, request.sourcePixelStrideBytes);
+        result.inputLayoutMs += elapsedMs(layoutTick);
+        if (!layout.valid()) {
+            result.failureReason = layout.rejection;
+            return result;
+        }
+        // lockPlanes/Camera2 describe a complete image, but the final row's padding is not
+        // guaranteed readable. Copy visible bytes only and initialize destination padding.
+        const auto sourceCapacity = request.rawData != nullptr
+            ? request.rawDataCapacityBytes
+            : mappedCapacity != 0u ? mappedCapacity : static_cast<std::size_t>(layout.sourceSpan);
+        RawPreviewRowCopyTiming rowTiming{};
+        const auto rowCopyStarted = Clock::now();
+        if (!copyRawPreviewRows(slot.inputStaging.mapped, slot.inputStaging.capacityBytes, rawSource,
+                sourceCapacity, request.sourceHeight, mappedRowStride,
+                request.sourceRowStrideBytes, layout, transportTrace.sample ? &rowTiming : nullptr)) {
+            result.failureReason = "RAW_PREVIEW_INPUT_STAGING_CAPACITY_INVALID";
+            return result;
+        }
+        result.inputRowCopyMs = elapsedMs(rowCopyStarted);
+        result.inputMemcpyMs = static_cast<float>(rowTiming.memcpyMs);
+        result.inputPaddingMs = static_cast<float>(rowTiming.paddingMs);
+        result.inputBytesCopied = layout.copiedBytes;
+        if (mapped.locked) {
+            const auto unlockStarted = Clock::now();
+            const int unlockStatus = mapped.unlock();
+            result.inputAhbUnlockMs = elapsedMs(unlockStarted);
+            if (unlockStatus != 0) {
+                result.failureReason = "RAW_PREVIEW_INPUT_AHB_UNLOCK_FAILED";
+                return result;
             }
         }
-        std::memcpy(inputStaging_.mapped, rawSource, static_cast<std::size_t>(rawBytes));
-        if (inputLocked) AHardwareBuffer_unlock(request.inputHardwareBuffer, nullptr);
-        vmaFlushAllocation(allocator, inputStaging_.allocation, 0u, static_cast<VkDeviceSize>(inputBytes));
+        const auto flushStarted = Clock::now();
+        const VkResult flushStatus = vmaFlushAllocation(
+                allocator, slot.inputStaging.allocation, 0u, static_cast<VkDeviceSize>(inputBytes));
+        result.inputFlushMs = elapsedMs(flushStarted);
+        result.inputHandoffMs = elapsedMs(handoffStarted);
+        if (flushStatus != VK_SUCCESS) {
+            result.failureReason = "RAW_PREVIEW_INPUT_STAGING_FLUSH_FAILED";
+            return result;
+        }
         if (result.inputInteropStatus == 0u) result.inputInteropStatus = 5u;
+    } else {
+        result.inputTransport = "DIRECT_BLOB_AHB_VULKAN";
     }
-    std::memcpy(toneLutBuffer_.mapped, request.toneLut, static_cast<std::size_t>(toneLutBytes));
-    vmaFlushAllocation(allocator, toneLutBuffer_.allocation, 0u, static_cast<VkDeviceSize>(toneLutBytes));
+    std::memcpy(slot.toneLutBuffer.mapped, request.toneLut, static_cast<std::size_t>(toneLutBytes));
+    vmaFlushAllocation(allocator, slot.toneLutBuffer.allocation, 0u, static_cast<VkDeviceSize>(toneLutBytes));
 
     // Same 16-float header + dense table ABI as the capture colour backend. Invalid/missing
     // profile data produces an all-zero disabled header rather than a preview-specific fallback.
-    float* hueSatPacked = static_cast<float*>(hueSatProfile_.mapped);
+    float* hueSatPacked = static_cast<float*>(slot.hueSatProfile.mapped);
     std::fill(hueSatPacked,
               hueSatPacked + static_cast<std::ptrdiff_t>(hueSatProfileBytes / sizeof(float)), 0.0f);
     hueSatPacked[0] = hueSatMapContractValid ? 1.0f : 0.0f;
@@ -1194,8 +1446,28 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
                         static_cast<std::size_t>(hueSatTableFloats) * sizeof(float));
         }
     }
-    vmaFlushAllocation(allocator, hueSatProfile_.allocation, 0u,
+    vmaFlushAllocation(allocator, slot.hueSatProfile.allocation, 0u,
                        static_cast<VkDeviceSize>(hueSatProfileBytes));
+    float* lensPacked = static_cast<float*>(slot.lensShadingBuffer.mapped);
+    std::fill(lensPacked, lensPacked + static_cast<std::ptrdiff_t>(lensFloats), 0.0f);
+    if (lensMapValid) {
+        lensPacked[0] = static_cast<float>(request.lensShadingColumns);
+        lensPacked[1] = static_cast<float>(request.lensShadingRows);
+        lensPacked[2] = static_cast<float>(request.lensShadingActiveRect[0]);
+        lensPacked[3] = static_cast<float>(request.lensShadingActiveRect[1]);
+        lensPacked[4] = static_cast<float>(request.lensShadingActiveRect[2] > 0
+                ? request.lensShadingActiveRect[2] : request.sourceWidth);
+        lensPacked[5] = static_cast<float>(request.lensShadingActiveRect[3] > 0
+                ? request.lensShadingActiveRect[3] : request.sourceHeight);
+        std::memcpy(lensPacked + 6u, request.lensShadingMap,
+                    static_cast<std::size_t>(lensBytes - 6u * sizeof(float)));
+    }
+    if (vmaFlushAllocation(allocator, slot.lensShadingBuffer.allocation, 0u,
+                           static_cast<VkDeviceSize>(lensBytes)) != VK_SUCCESS) {
+        releaseUnsubmittedDirectInput();
+        result.failureReason = "RAW_PREVIEW_LENS_MAP_FLUSH_FAILED";
+        return result;
+    }
     result.inputPackingMs = elapsedMs(packingStarted);
 
     vkResetFences(device, 1u, &slot.fence);
@@ -1212,11 +1484,11 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
     if (!directHardwareInput && !directHostInput) {
         VkBufferCopy inputCopy{};
         inputCopy.size = static_cast<VkDeviceSize>(inputBytes);
-        vkCmdCopyBuffer(slot.commandBuffer, inputStaging_.buffer, deviceInput_.buffer, 1u, &inputCopy);
+        vkCmdCopyBuffer(slot.commandBuffer, slot.inputStaging.buffer, slot.deviceInput.buffer, 1u, &inputCopy);
     }
-    vkCmdFillBuffer(slot.commandBuffer, deviceStatistics_.buffer, 0u,
+    vkCmdFillBuffer(slot.commandBuffer, slot.deviceStatistics.buffer, 0u,
                     static_cast<VkDeviceSize>(statisticsBytes), 0u);
-    vkCmdFillBuffer(slot.commandBuffer, deviceStatistics_.buffer,
+    vkCmdFillBuffer(slot.commandBuffer, slot.deviceStatistics.buffer,
                     static_cast<VkDeviceSize>(258u * sizeof(std::uint32_t)),
                     sizeof(std::uint32_t), 0xffffffffu);
     // Seed the two scalar inputs that must survive the per-frame statistics clear. Both are
@@ -1225,7 +1497,7 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
             ? previousExposureGain_ : 0.0f;
     std::uint32_t seededExposureBits = 0u;
     std::memcpy(&seededExposureBits, &seededExposureGain, sizeof(seededExposureBits));
-    vkCmdUpdateBuffer(slot.commandBuffer, deviceStatistics_.buffer,
+    vkCmdUpdateBuffer(slot.commandBuffer, slot.deviceStatistics.buffer,
                       static_cast<VkDeviceSize>(256u * sizeof(std::uint32_t)),
                       sizeof(seededExposureBits), &seededExposureBits);
     const float profileToneSeeds[7] = {
@@ -1239,7 +1511,7 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
     std::uint32_t profileToneBits[7]{};
     static_assert(sizeof(profileToneBits) == sizeof(profileToneSeeds));
     std::memcpy(profileToneBits, profileToneSeeds, sizeof(profileToneSeeds));
-    vkCmdUpdateBuffer(slot.commandBuffer, deviceStatistics_.buffer,
+    vkCmdUpdateBuffer(slot.commandBuffer, slot.deviceStatistics.buffer,
                       static_cast<VkDeviceSize>(552u * sizeof(std::uint32_t)),
                       sizeof(profileToneBits), profileToneBits);
     const float profileDetailSeeds[4] = {
@@ -1250,7 +1522,7 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
     std::uint32_t profileDetailBits[4]{};
     static_assert(sizeof(profileDetailBits) == sizeof(profileDetailSeeds));
     std::memcpy(profileDetailBits, profileDetailSeeds, sizeof(profileDetailSeeds));
-    vkCmdUpdateBuffer(slot.commandBuffer, deviceStatistics_.buffer,
+    vkCmdUpdateBuffer(slot.commandBuffer, slot.deviceStatistics.buffer,
                       static_cast<VkDeviceSize>(562u * sizeof(std::uint32_t)),
                       sizeof(profileDetailBits), profileDetailBits);
     const float profileNrSeeds[6] = {
@@ -1263,7 +1535,7 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
     std::uint32_t profileNrBits[6]{};
     static_assert(sizeof(profileNrBits) == sizeof(profileNrSeeds));
     std::memcpy(profileNrBits, profileNrSeeds, sizeof(profileNrSeeds));
-    vkCmdUpdateBuffer(slot.commandBuffer, deviceStatistics_.buffer,
+    vkCmdUpdateBuffer(slot.commandBuffer, slot.deviceStatistics.buffer,
                       static_cast<VkDeviceSize>(566u * sizeof(std::uint32_t)),
                       sizeof(profileNrBits), profileNrBits);
     const float physicalNoiseSeeds[3] = {
@@ -1274,7 +1546,7 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
     std::uint32_t physicalNoiseBits[3]{};
     static_assert(sizeof(physicalNoiseBits) == sizeof(physicalNoiseSeeds));
     std::memcpy(physicalNoiseBits, physicalNoiseSeeds, sizeof(physicalNoiseSeeds));
-    vkCmdUpdateBuffer(slot.commandBuffer, deviceStatistics_.buffer,
+    vkCmdUpdateBuffer(slot.commandBuffer, slot.deviceStatistics.buffer,
                       static_cast<VkDeviceSize>(PREVIEW_PHYSICAL_NOISE_START_WORD * sizeof(std::uint32_t)),
                       sizeof(physicalNoiseBits), physicalNoiseBits);
 
@@ -1297,7 +1569,7 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
         hostInputBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
         hostInputBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         hostInputBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        hostInputBarrier.buffer = inputStaging_.buffer;
+        hostInputBarrier.buffer = slot.inputStaging.buffer;
         hostInputBarrier.size = VK_WHOLE_SIZE;
         vkCmdPipelineBarrier(slot.commandBuffer, VK_PIPELINE_STAGE_HOST_BIT,
                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr,
@@ -1309,7 +1581,7 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
         deviceInputBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
         deviceInputBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         deviceInputBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        deviceInputBarrier.buffer = deviceInput_.buffer;
+        deviceInputBarrier.buffer = slot.deviceInput.buffer;
         deviceInputBarrier.size = VK_WHOLE_SIZE;
         vkCmdPipelineBarrier(slot.commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr,
@@ -1322,7 +1594,7 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
     toneInputBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
     toneInputBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     toneInputBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    toneInputBarrier.buffer = toneLutBuffer_.buffer;
+    toneInputBarrier.buffer = slot.toneLutBuffer.buffer;
     toneInputBarrier.size = VK_WHOLE_SIZE;
     vkCmdPipelineBarrier(slot.commandBuffer, VK_PIPELINE_STAGE_HOST_BIT,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr,
@@ -1334,11 +1606,18 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
     hueSatInputBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
     hueSatInputBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     hueSatInputBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    hueSatInputBarrier.buffer = hueSatProfile_.buffer;
+    hueSatInputBarrier.buffer = slot.hueSatProfile.buffer;
     hueSatInputBarrier.size = static_cast<VkDeviceSize>(hueSatProfileBytes);
     vkCmdPipelineBarrier(slot.commandBuffer, VK_PIPELINE_STAGE_HOST_BIT,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr,
                          1u, &hueSatInputBarrier, 0u, nullptr);
+
+    VkBufferMemoryBarrier lensInputBarrier = hueSatInputBarrier;
+    lensInputBarrier.buffer = slot.lensShadingBuffer.buffer;
+    lensInputBarrier.size = static_cast<VkDeviceSize>(lensBytes);
+    vkCmdPipelineBarrier(slot.commandBuffer, VK_PIPELINE_STAGE_HOST_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr,
+                         1u, &lensInputBarrier, 0u, nullptr);
 
     VkBufferMemoryBarrier statsInputBarrier{};
     statsInputBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
@@ -1346,7 +1625,7 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
     statsInputBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
     statsInputBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     statsInputBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    statsInputBarrier.buffer = deviceStatistics_.buffer;
+    statsInputBarrier.buffer = slot.deviceStatistics.buffer;
     statsInputBarrier.size = VK_WHOLE_SIZE;
     vkCmdPipelineBarrier(slot.commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr,
@@ -1375,9 +1654,9 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr, 0u, nullptr,
                 1u, &acquireOutput);
     }
-    if (queryPool_ != VK_NULL_HANDLE) {
-        vkCmdResetQueryPool(slot.commandBuffer, queryPool_, 0u, 2u);
-        vkCmdWriteTimestamp(slot.commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 0u);
+    if (slot.queryPool != VK_NULL_HANDLE) {
+        vkCmdResetQueryPool(slot.commandBuffer, slot.queryPool, 0u, 2u);
+        vkCmdWriteTimestamp(slot.commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, slot.queryPool, 0u);
     }
     vkCmdBindPipeline(slot.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, activePipeline);
     vkCmdBindDescriptorSets(slot.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, activePipelineLayout,
@@ -1448,7 +1727,7 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
     statsBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
     statsBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     statsBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    statsBarrier.buffer = deviceStatistics_.buffer;
+    statsBarrier.buffer = slot.deviceStatistics.buffer;
     statsBarrier.size = VK_WHOLE_SIZE;
     vkCmdPipelineBarrier(slot.commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr,
@@ -1491,8 +1770,8 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
                        0u, sizeof(push), &push);
     vkCmdDispatch(slot.commandBuffer, (request.previewWidth + 15u) / 16u,
                   (request.previewHeight + 15u) / 16u, 1u);
-    if (queryPool_ != VK_NULL_HANDLE) {
-        vkCmdWriteTimestamp(slot.commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 1u);
+    if (slot.queryPool != VK_NULL_HANDLE) {
+        vkCmdWriteTimestamp(slot.commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, slot.queryPool, 1u);
     }
     if (directHardwareInput) {
         VkBufferMemoryBarrier releaseInput{};
@@ -1532,14 +1811,14 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
         statisticsTransfer.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
         statisticsTransfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         statisticsTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        statisticsTransfer.buffer = deviceStatistics_.buffer;
+        statisticsTransfer.buffer = slot.deviceStatistics.buffer;
         statisticsTransfer.size = VK_WHOLE_SIZE;
         vkCmdPipelineBarrier(slot.commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                              VK_PIPELINE_STAGE_TRANSFER_BIT, 0u, 0u, nullptr,
                              1u, &statisticsTransfer, 0u, nullptr);
         VkBufferCopy statisticsCopy{};
         statisticsCopy.size = static_cast<VkDeviceSize>(statisticsBytes);
-        vkCmdCopyBuffer(slot.commandBuffer, deviceStatistics_.buffer, slot.outputReadback.buffer,
+        vkCmdCopyBuffer(slot.commandBuffer, slot.deviceStatistics.buffer, slot.outputReadback.buffer,
                         1u, &statisticsCopy);
     } else {
         VkBufferMemoryBarrier outputBarriers[2]{};
@@ -1552,7 +1831,7 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
             barrier.size = VK_WHOLE_SIZE;
         }
         outputBarriers[0].buffer = slot.deviceOutput.buffer;
-        outputBarriers[1].buffer = deviceStatistics_.buffer;
+        outputBarriers[1].buffer = slot.deviceStatistics.buffer;
         vkCmdPipelineBarrier(slot.commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                              VK_PIPELINE_STAGE_TRANSFER_BIT, 0u, 0u, nullptr,
                              2u, outputBarriers, 0u, nullptr);
@@ -1564,7 +1843,7 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
         statisticsCopy.srcOffset = 0u;
         statisticsCopy.dstOffset = static_cast<VkDeviceSize>(rgbaBytes);
         statisticsCopy.size = static_cast<VkDeviceSize>(statisticsBytes);
-        vkCmdCopyBuffer(slot.commandBuffer, deviceStatistics_.buffer, slot.outputReadback.buffer,
+        vkCmdCopyBuffer(slot.commandBuffer, slot.deviceStatistics.buffer, slot.outputReadback.buffer,
                         1u, &statisticsCopy);
     }
     VkBufferMemoryBarrier hostBarrier{};
@@ -1608,36 +1887,60 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
         result.totalMs = elapsedMs(totalStarted); return result;
     }
     slot.fenceSubmitted = true;
-
-    // Host readback is only valid after this exact submission completed. The former path
-    // invalidated and copied slot.outputReadback immediately after vkQueueSubmit(), which is not a
-    // Vulkan completion guarantee and could expose stale/partially-written RGBA to the GL thread.
-    // Keep preview latency bounded: if the GPU cannot finish inside the preview budget, drop this
-    // frame and let the newest pending RAW frame replace it rather than displaying undefined data.
-    constexpr std::uint64_t kPreviewCompletionTimeoutNs = 20'000'000ull;
-    const auto fenceWaitStarted = Clock::now();
-    const VkResult completion = vkWaitForFences(
-            device, 1u, &slot.fence, VK_TRUE, kPreviewCompletionTimeoutNs);
-    result.fenceWaitMs = elapsedMs(fenceWaitStarted);
+    slot.lifecycle.submit();
     result.synchronizationMs = elapsedMs(submitStarted);
-    if (completion != VK_SUCCESS) {
-        result.droppedBusy = completion == VK_TIMEOUT;
-        result.failureReason = completion == VK_TIMEOUT
-                ? "GPU_PREVIEW_COMPLETION_TIMEOUT_DROPPED"
-                : "GPU_PREVIEW_COMPLETION_WAIT_FAILED";
-        result.totalMs = elapsedMs(totalStarted);
-        return result;
-    }
-    slot.fenceSubmitted = false;
-    if (directHardwareInput) destroyImportedInputLocked(device, slot.importedInput);
-    if (gpuResidentOutput) {
-        slot.importedOutput.initializedForShaderWrite = true;
-    }
+    result.inputGpuCopyBytes = directHardwareInput || directHostInput ? 0u : inputBytes;
 
-    if (queryPool_ != VK_NULL_HANDLE) {
+    // Submission is non-blocking. The slot and all mutable resources stay owned until a later
+    // poll observes this exact fence and collects this frame's statistics.
+    slot.pendingResult = result;
+    slot.pendingRgbaBytes = rgbaBytes;
+    slot.pendingReadbackBytes = readbackBytes;
+    slot.pendingAnalysisNv21Bytes = analysisNv21Bytes;
+    slot.pendingAnalysisWidth = analysisWidth;
+    slot.pendingAnalysisHeight = analysisHeight;
+    slot.pendingGpuResidentOutput = gpuResidentOutput;
+    slot.pendingCompactAnalysis = compactAnalysisRequested;
+    slot.pendingInputIdentity = request.inputHardwareBuffer;
+    slot.pendingOutputIdentity = request.outputHardwareBuffer;
+    slot.pendingOutputRgba = request.outputRgba;
+    slot.pendingAnalysisNv21 = request.analysisNv21;
+    slot.pendingSensorTimestampNs = request.sensorTimestampNs;
+    slot.pendingGeneration = request.pipelineGeneration;
+    result.gpuPending = true;
+    result.failureReason = "GPU_PREVIEW_SUBMITTED";
+    result.totalMs = elapsedMs(totalStarted);
+    return result;
+#endif
+}
+
+#if BNCAM_VMA_HEADER_AVAILABLE
+RawPreviewGpuResult VulkanRawPreviewBackend::collectCompletedLocked(
+        VkPhysicalDevice physicalDevice, VkDevice device, VmaAllocator allocator,
+        const RawPreviewGpuRequest& request, FrameSlot& slot) noexcept {
+    const auto collectedStarted = Clock::now();
+    RawPreviewGpuResult result = slot.pendingResult;
+    const bool gpuResidentOutput = slot.pendingGpuResidentOutput;
+    const bool compactAnalysisRequested = slot.pendingCompactAnalysis;
+    const auto rgbaBytes = slot.pendingRgbaBytes;
+    const auto readbackBytes = slot.pendingReadbackBytes;
+    const auto analysisNv21Bytes = slot.pendingAnalysisNv21Bytes;
+    const auto analysisWidth = slot.pendingAnalysisWidth;
+    const auto analysisHeight = slot.pendingAnalysisHeight;
+    slot.fenceSubmitted = false;
+    slot.lifecycle.complete();
+    destroyImportedInputLocked(device, slot.importedInput);
+    if (slot.boundHardwareBuffer != nullptr) {
+        AHardwareBuffer_release(slot.boundHardwareBuffer);
+        gPreviewReleaseCount.fetch_add(1u, std::memory_order_relaxed);
+        gReleaseAfterGpuCompletionCount.fetch_add(1u, std::memory_order_relaxed);
+        slot.boundHardwareBuffer = nullptr;
+    }
+    if (gpuResidentOutput) slot.importedOutput.initializedForShaderWrite = true;
+    if (slot.queryPool != VK_NULL_HANDLE) {
         std::uint64_t timestamps[2]{};
         if (vkGetQueryPoolResults(
-                device, queryPool_, 0u, 2u, sizeof(timestamps), timestamps,
+                device, slot.queryPool, 0u, 2u, sizeof(timestamps), timestamps,
                 sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS &&
             timestamps[1] >= timestamps[0]) {
             VkPhysicalDeviceProperties properties{};
@@ -1665,7 +1968,13 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
     std::memcpy(&exposureGain, statistics + 256u, sizeof(float));
     std::memcpy(&sceneMidtone, statistics + 257u, sizeof(float));
     const float automaticExposureGain = std::isfinite(exposureGain) ? exposureGain : 1.0f;
-    previousExposureGain_ = automaticExposureGain;
+    if (request.pipelineGeneration > lastCompletedGeneration_ ||
+        (request.pipelineGeneration == lastCompletedGeneration_ &&
+         request.sensorTimestampNs >= lastCompletedTimestampNs_)) {
+        previousExposureGain_ = automaticExposureGain;
+        lastCompletedGeneration_ = request.pipelineGeneration;
+        lastCompletedTimestampNs_ = request.sensorTimestampNs;
+    }
     const float profileExposureMultiplier = std::exp2(
             2.0f * std::clamp(request.profileToneExposure, -1.0f, 1.0f));
     result.exposureGain = std::clamp(automaticExposureGain * profileExposureMultiplier, 0.025f, 32.0f);
@@ -1761,10 +2070,18 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
     result.readbackMs = elapsedMs(readbackStarted);
     result.success = true;
     result.failureReason = "none";
-    result.totalMs = elapsedMs(totalStarted);
+    result.totalMs += elapsedMs(collectedStarted);
+    slot.pendingResult = {};
+    slot.pendingInputIdentity = nullptr;
+    slot.pendingOutputIdentity = nullptr;
+    slot.pendingOutputRgba = nullptr;
+    slot.pendingAnalysisNv21 = nullptr;
+    slot.pendingSensorTimestampNs = 0;
+    slot.pendingGeneration = 0;
+    slot.lifecycle.recycle();
     return result;
-#endif
 }
+#endif
 
 void VulkanRawPreviewBackend::destroyLocked(VkDevice device) noexcept {
 #if BNCAM_VMA_HEADER_AVAILABLE
@@ -1782,12 +2099,15 @@ void VulkanRawPreviewBackend::destroyLocked(VkDevice device) noexcept {
             }
             readback = {};
         }
-        for (PersistentBuffer* buffer : {&inputStaging_, &deviceInput_, &toneLutBuffer_,
-                                         &deviceStatistics_, &localToneBase_, &hueSatProfile_}) {
-            if (buffer->buffer != VK_NULL_HANDLE && buffer->allocation != nullptr) {
-                vmaDestroyBuffer(allocator_, buffer->buffer, buffer->allocation);
+        for (auto& slot : slots_) {
+            for (PersistentBuffer* buffer : {&slot.inputStaging, &slot.deviceInput,
+                    &slot.toneLutBuffer, &slot.deviceStatistics, &slot.localToneBase,
+                    &slot.hueSatProfile, &slot.lensShadingBuffer}) {
+                if (buffer->buffer != VK_NULL_HANDLE && buffer->allocation != nullptr) {
+                    vmaDestroyBuffer(allocator_, buffer->buffer, buffer->allocation);
+                }
+                *buffer = {};
             }
-            *buffer = {};
         }
     }
 #endif
@@ -1809,13 +2129,15 @@ void VulkanRawPreviewBackend::destroyLocked(VkDevice device) noexcept {
             }
             destroyImportedInputLocked(device, slots_[i].importedInput);
             destroyImportedOutputLocked(device, slots_[i].importedOutput);
+            if (slots_[i].queryPool != VK_NULL_HANDLE) vkDestroyQueryPool(device, slots_[i].queryPool, nullptr);
+            slots_[i].queryPool = VK_NULL_HANDLE;
             if (slots_[i].fence != VK_NULL_HANDLE) vkDestroyFence(device, slots_[i].fence, nullptr);
             slots_[i].fence = VK_NULL_HANDLE;
+            slots_[i].lifecycle = {};
             slots_[i].commandBuffer = VK_NULL_HANDLE;
             slots_[i].descriptorSet = VK_NULL_HANDLE;
             slots_[i].imageDescriptorSet = VK_NULL_HANDLE;
         }
-        if (queryPool_ != VK_NULL_HANDLE) vkDestroyQueryPool(device, queryPool_, nullptr);
         if (descriptorPool_ != VK_NULL_HANDLE) vkDestroyDescriptorPool(device, descriptorPool_, nullptr);
         if (imagePipeline_ != VK_NULL_HANDLE) vkDestroyPipeline(device, imagePipeline_, nullptr);
         if (pipeline_ != VK_NULL_HANDLE) vkDestroyPipeline(device, pipeline_, nullptr);
@@ -1842,13 +2164,25 @@ void VulkanRawPreviewBackend::destroyLocked(VkDevice device) noexcept {
     pipeline_ = VK_NULL_HANDLE;
     imagePipeline_ = VK_NULL_HANDLE;
     descriptorPool_ = VK_NULL_HANDLE;
-    queryPool_ = VK_NULL_HANDLE;
     previousExposureGain_ = 0.0f;
+    lastCompletedGeneration_ = -1;
+    lastCompletedTimestampNs_ = 0;
 }
 
-void VulkanRawPreviewBackend::destroy(VkDevice device) noexcept {
+bool VulkanRawPreviewBackend::destroy(VkDevice device) noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
+    // Poll before destroying ANY shared storage or imported AHB. A timeout is not completion.
+    // The runtime retains this bounded backend/device ownership and may retry explicit teardown.
+    for (auto& slot : slots_) {
+        if (slot.fenceSubmitted) {
+            if (device == VK_NULL_HANDLE || vkGetFenceStatus(device, slot.fence) != VK_SUCCESS) return false;
+            slot.fenceSubmitted = false;
+            slot.lifecycle.complete();
+            slot.lifecycle.recycle();
+        }
+    }
     destroyLocked(device);
+    return true;
 }
 
 }  // namespace bncam::vulkan

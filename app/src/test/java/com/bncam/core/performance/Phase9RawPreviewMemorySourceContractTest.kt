@@ -11,14 +11,16 @@ class Phase9RawPreviewMemorySourceContractTest {
         ?: error("Unable to locate app module")
 
     @Test
-    fun `raw preview host rgba storage is lazy and shared for resident output`() {
+    fun `raw preview host rgba storage is lazy and slot owned during async output`() {
         val renderer = File(appDir, "src/main/java/com/bncam/ui/screens/capture/RawPreviewRenderer.kt").readText()
         val slotDeclaration = renderer.substringAfter("private class OutputSlot").substringBefore("private val allOutputSlots")
         assertFalse(slotDeclaration.contains("val rgba: ByteBuffer = ByteBuffer.allocateDirect(MAX_OUTPUT_BYTES)"))
         assertTrue(slotDeclaration.contains("private var cpuRgba: ByteBuffer? = null"))
         assertTrue(slotDeclaration.contains("fun ensureCpuRgbaBuffer(): ByteBuffer"))
-        assertTrue(renderer.contains("private var gpuFallbackScratchRgba: ByteBuffer? = null"))
-        assertTrue(renderer.contains("ensureGpuFallbackScratchRgba().apply { clear() }"))
+        assertTrue(slotDeclaration.contains("private var gpuFallbackRgba: ByteBuffer? = null"))
+        assertTrue(slotDeclaration.contains("fun ensureGpuFallbackRgbaBuffer(): ByteBuffer"))
+        assertTrue(renderer.contains("slot.ensureGpuFallbackRgbaBuffer().apply { clear() }"))
+        assertFalse(renderer.contains("gpuFallbackScratchRgba"))
         assertTrue(renderer.contains("slot.ensureCpuRgbaBuffer().apply { clear() }"))
         assertTrue(renderer.contains("transitionFrameDropped=true"))
     }
@@ -28,8 +30,8 @@ class Phase9RawPreviewMemorySourceContractTest {
         val renderer = File(appDir, "src/main/java/com/bncam/ui/screens/capture/RawPreviewRenderer.kt").readText()
         assertTrue(renderer.contains("RawPreviewResolutionPolicy.QUALITY_MAX_WIDTH"))
         assertTrue(renderer.contains("RawPreviewResolutionPolicy.QUALITY_MAX_HEIGHT"))
-        assertTrue(renderer.contains("allOutputSlots.forEach(OutputSlot::releaseCpuBufferReferences)"))
-        assertTrue(renderer.contains("gpuFallbackScratchRgba = null"))
-        assertTrue(renderer.contains("val analysisBuffer = if (mlAnalysisRequested)"))
+        assertTrue(renderer.contains("slot.releaseCpuBufferReferences()"))
+        assertTrue(renderer.contains("outputSlotLedger.state(slot.id) == RawPreviewOutputSlotState.AVAILABLE"))
+        assertTrue(renderer.contains("val analysisBuffer = if (polling) pending?.analysisNv21 else if (mlAnalysisRequested)"))
     }
 }

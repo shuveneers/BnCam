@@ -587,17 +587,25 @@ RawPreviewResult renderRawPreviewRgba(
     previewRequest.toneLutSize = static_cast<std::uint32_t>(toneLut.size());
     previewRequest.outputHardwareBuffer = outputHardwareBuffer;
     previewRequest.outputRgba = outputRgba;
-    previewRequest.frameSlotIndex = static_cast<std::uint32_t>(std::clamp(parameters.frameSlotIndex, 0, 2));
+    previewRequest.pollOnly = parameters.frameSlotIndex < 0;
+    previewRequest.sensorTimestampNs = parameters.sensorTimestampNs;
+    previewRequest.pipelineGeneration = parameters.pipelineGeneration;
+    previewRequest.lensShadingMap = parameters.lensShadingMap.empty()
+            ? nullptr : parameters.lensShadingMap.data();
+    previewRequest.lensShadingColumns = static_cast<std::uint32_t>(parameters.lensShadingColumns);
+    previewRequest.lensShadingRows = static_cast<std::uint32_t>(parameters.lensShadingRows);
+    for (int i = 0; i < 4; ++i) previewRequest.lensShadingActiveRect[i] = parameters.lensShadingActiveRect[i];
+    previewRequest.frameSlotIndex = static_cast<std::uint32_t>(previewRequest.pollOnly
+            ? std::clamp(-parameters.frameSlotIndex - 1, 0, 2)
+            : std::clamp(parameters.frameSlotIndex, 0, 2));
     previewRequest.outputCapacityBytes = outputCapacityBytes;
     previewRequest.analysisNv21 = analysisNv21;
     previewRequest.analysisNv21CapacityBytes = analysisNv21CapacityBytes;
     auto& runtime = bncam::vulkan::VulkanRuntime::instance();
     const auto previewGpu = runtime.executeRawPreview(previewRequest);
-    if (!previewGpu.success) {
-        __android_log_print(
-                ANDROID_LOG_ERROR, "BnCamRawPreview",
-                "RAW_PREVIEW_EXECUTE_GPU_FAILED reason=%s droppedBusy=%d",
-                previewGpu.failureReason.c_str(), previewGpu.droppedBusy ? 1 : 0);
+    if (previewGpu.gpuPending) {
+        result.gpuPending = true;
+        return result;
     }
     if (!previewGpu.success && (
             previewGpu.droppedBusy ||

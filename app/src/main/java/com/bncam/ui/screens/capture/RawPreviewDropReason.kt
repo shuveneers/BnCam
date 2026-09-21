@@ -2,6 +2,8 @@ package com.bncam.ui.screens.capture
 
 internal enum class RawPreviewDropReason {
     INPUT_QUEUE_OVERFLOW,
+    PREVIEW_DROP_REPLACED_BY_NEWER,
+    PREVIEW_DROP_RENDERER_CLOSING,
     NO_OUTPUT_SLOT,
     STALE_GENERATION,
     RETAIN_FAILED,

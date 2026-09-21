@@ -16,6 +16,7 @@ import kotlin.math.abs
 import kotlin.math.ceil
 
 internal enum class ShutterCollectorCloseReason {
+    RESERVED_ANCHOR,
     NEAR_SHUTTER_CANDIDATE_ACQUIRED,
     TEMPORAL_WINDOW_SUFFICIENT,
     NEXT_FRAME_NOT_WORTH_WAITING,
@@ -124,12 +125,31 @@ internal class ShutterCandidateCollector(
         shutterTimestampDomain: String,
         expectedGeneration: Int,
         expectedFormat: Int,
-        requestedInitialCandidateCount: Int
+        requestedInitialCandidateCount: Int,
+        reservedAnchor: com.bncam.core.buffer.FrameLease? = null
     ): ShutterCandidateCollectionResult {
         val collectorStartedElapsedNs = SystemClock.elapsedRealtimeNanos()
         val baselineEventSequence = ringBuffer.currentEventSequence()
         val initialSnapshot = ringBuffer.observabilitySnapshot()
         val timingEstimateAtStart = ringBuffer.streamTimingEstimate()
+        // The caller keeps this lease alive through runner dispatch. Do not reselect a different
+        // moment (or a neighboring repeating frame in place of a requested cold still).
+        if (reservedAnchor != null) {
+            val pair = reservedAnchor.pair
+            check(pair.generationId == expectedGeneration && pair.format == expectedFormat)
+            check(pair.image != null && pair.metadata != null && pair.hardwareBuffer != null)
+            check(pair.image!!.timestamp == pair.timestamp)
+            check((pair.sensorMetadataSnapshot?.sensorTimestampNs
+                ?: pair.metadata!!.get(CaptureResult.SENSOR_TIMESTAMP)) == pair.timestamp)
+            return ShutterCandidateCollectionResult(
+                frames = listOf(pair), initialRingSnapshot = initialSnapshot,
+                considerations = emptyList(), closeReason = ShutterCollectorCloseReason.RESERVED_ANCHOR,
+                collectionDurationMs = 0.0, hardDeadlineMs = 0L, candidateCount = 1,
+                newestCandidateDeltaMs = null, closestCandidateAbsoluteDeltaMs = null,
+                postShutterCompletedPairCount = 0, initialCandidateLimit = 1, maxCandidates = 1,
+                timingEstimateAtStart = timingEstimateAtStart, timingEstimateAtClose = timingEstimateAtStart
+            )
+        }
         val initialCandidateLimit =
             requestedInitialCandidateCount.coerceIn(1, maxCandidates - 1)
         val sensorDeltaClockDomainsComparable =

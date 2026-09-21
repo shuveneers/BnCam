@@ -11,11 +11,11 @@ import com.bncam.core.runtime.RawPreviewFastPathKind
 import com.bncam.core.runtime.RawPreviewFastPathPolicy
 import com.bncam.core.runtime.RawPreviewProducerKind
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.Closeable
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import java.util.ArrayDeque
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledThreadPoolExecutor
@@ -69,7 +69,12 @@ data class RawPreviewRenderConfig(
     val gammaCurve: FloatArray,
     val sectionCurve: FloatArray,
     val rotationDegrees: Int,
-    val isBootstrap: Boolean = false
+    val isBootstrap: Boolean = false,
+    val calibrationSensorId: String = "",
+    val staticBlackLevels: FloatArray? = null,
+    val staticWhiteLevel: Int = 0,
+    val lensShadingAlreadyApplied: Boolean? = null,
+    val lensMapActiveRect: IntArray? = null
 )
 
 class RawPreviewFrame internal constructor(
@@ -190,9 +195,46 @@ class RawPreviewFrame internal constructor(
 /**
  * Bounded-jitter RAW viewfinder renderer. The input handle is an independently retained native
  * AHardwareBuffer reference; neither this class nor native code owns the Image/ring-buffer handle.
- * Two pending frames absorb Camera2 delivery jitter while overflow still drops the oldest queued
- * request, so backlog can never grow without bound or silently trade cadence for latency.
+ * One pending RAW frame is replaced by each newer offer while submitted GPU slots retain their
+ * own frames. The capture warm ring has independent ownership and is never pruned here.
  */
+private object RawPreviewRetiredGpuBackings {
+    private const val MAX_RETAINED = 24
+    private data class Retired(
+        val buffer: HardwareBuffer,
+        var fence: Long,
+        val backend: RawPreviewFenceBackend
+    )
+    private val retained = ArrayList<Retired>()
+    private val poller = ScheduledThreadPoolExecutor(1) { runnable ->
+        Thread(runnable, "BnCamRawPreviewGlRetirement").apply { isDaemon = true }
+    }.apply {
+        removeOnCancelPolicy = true
+        scheduleWithFixedDelay({ poll() }, 10L, 10L, TimeUnit.MILLISECONDS)
+    }
+
+    fun acceptingNewBackings(): Boolean = synchronized(retained) { retained.size < MAX_RETAINED }
+
+    fun retain(buffer: HardwareBuffer, fence: Long, backend: RawPreviewFenceBackend) {
+        synchronized(retained) { retained.add(Retired(buffer, fence, backend)) }
+    }
+
+    private fun poll() {
+        val snapshot = synchronized(retained) { retained.filter { it.fence > 0L }.toList() }
+        snapshot.forEach { item ->
+            when (runCatching { item.backend.pollFence(item.fence) }.getOrDefault(-1)) {
+                1 -> {
+                    synchronized(retained) { retained.remove(item) }
+                    ImageUtils.releaseRawPreviewEglImage(item.buffer)
+                    runCatching { item.buffer.close() }
+                }
+                0 -> Unit
+                else -> item.fence = 0L // No completion proof: retain backing for process lifetime.
+            }
+        }
+    }
+}
+
 class RawPreviewRenderer(
     private val fenceBackend: RawPreviewFenceBackend = PlatformRawPreviewFenceBackend,
     private val onFrame: (RawPreviewFrame) -> Unit
@@ -205,7 +247,26 @@ class RawPreviewRenderer(
         val useRuntimeCrop: Boolean,
         val producerKind: RawPreviewProducerKind,
         val sourceWidth: Int,
-        val sourceHeight: Int
+        val sourceHeight: Int,
+        val offeredElapsedNs: Long
+    ) {
+        var resolvedColors: ResolvedColors? = null
+        var resolvedCalibration: ResolvedCalibration? = null
+        val released = AtomicBoolean(false)
+    }
+
+    private data class ResolvedCalibration(
+        val black: FloatArray, val white: Int, val blackAuthority: String,
+        val whiteAuthority: String, val lensMap: FloatArray?, val lensColumns: Int,
+        val lensRows: Int, val activeRect: IntArray?, val lensAuthority: String
+    )
+
+    private data class ResolvedColors(
+        val renderWb: FloatArray,
+        val renderMatrix: FloatArray,
+        val camera2PriorWb: FloatArray,
+        val camera2PriorMatrix: FloatArray,
+        val exactPair: ExactFrameColorPair?
     )
 
     private val executor = ScheduledThreadPoolExecutor(1) { runnable ->
@@ -219,11 +280,29 @@ class RawPreviewRenderer(
         Thread(runnable, "BnCamRawPreviewWarmup").apply { priority = Thread.NORM_PRIORITY }
     }
     private val pendingRequestLock = Any()
-    private val pendingRequests = ArrayDeque<Request>(MAX_PENDING_REQUESTS)
+    private var pendingRequest: Request? = null
+    private data class NativeGeometry(
+        val width: Int, val height: Int, val rowStride: Int, val pixelStride: Int,
+        val cropLeft: Int, val cropTop: Int, val cropWidth: Int, val cropHeight: Int
+    )
+    private data class PendingGpu(
+        val request: Request,
+        val slot: OutputSlot,
+        val geometry: NativeGeometry,
+        val localCfaPattern: Int,
+        val localBlackLevels: FloatArray,
+        val expectedOutput: Pair<Int, Int>,
+        val outputHardwareBuffer: HardwareBuffer?,
+        val outputRgba: ByteBuffer,
+        val analysisNv21: ByteBuffer?,
+        val interopEglGeneration: Int
+    )
+    private val pendingGpuRequests = ConcurrentLinkedQueue<PendingGpu>()
     private val drainScheduled = AtomicBoolean(false)
     private val configRevision = AtomicLong(0L)
     private val backendPrepareScheduled = AtomicBoolean(false)
     private val backendPrepared = AtomicBoolean(false)
+    private val backendPreparedAtNs = AtomicLong(0L)
     private data class ExactFrameColorPair(
         val wbGains: FloatArray,
         val colorMatrix: FloatArray
@@ -233,13 +312,15 @@ class RawPreviewRenderer(
     private val liveWhiteBalanceColorPair = AtomicReference<ExactFrameColorPair?>(null)
     // System-AWB RAW preview must consume WB + CCM from the same sensor timestamp. A WB-only
     // convergence override can otherwise pair one frame's gains with another frame's matrix.
-    private val exactFrameColorPairs = ConcurrentHashMap<Long, ExactFrameColorPair>()
+    private val exactFrameColorPairs = ConcurrentHashMap<RawPreviewFrameMetadataCache.Key, ExactFrameColorPair>()
+    private val frameMetadata = RawPreviewFrameMetadataCache()
     private val autoWhiteBalanceColorPair = AtomicReference<ExactFrameColorPair?>(null)
     private val latestOfferedSensorTimestampNs = AtomicLong(Long.MIN_VALUE)
     private val lastRendererOfferElapsedNs = AtomicLong(0L)
     private val lastRendererPublishElapsedNs = AtomicLong(0L)
     private class OutputSlot(val id: Int) {
         private var cpuRgba: ByteBuffer? = null
+        private var gpuFallbackRgba: ByteBuffer? = null
         private var analysisNv21Buffer: ByteBuffer? = null
         var hardwareBuffer: HardwareBuffer? = null
         var hardwareBufferWidth: Int = 0
@@ -262,6 +343,12 @@ class RawPreviewRenderer(
                 .also { cpuRgba = it }
         }
 
+        fun ensureGpuFallbackRgbaBuffer(): ByteBuffer {
+            return gpuFallbackRgba ?: ByteBuffer.allocateDirect(MAX_OUTPUT_BYTES)
+                .order(ByteOrder.nativeOrder())
+                .also { gpuFallbackRgba = it }
+        }
+
         fun ensureAnalysisNv21Buffer(): ByteBuffer {
             return analysisNv21Buffer ?: ByteBuffer.allocateDirect(MAX_ANALYSIS_NV21_BYTES)
                 .order(ByteOrder.nativeOrder())
@@ -274,6 +361,7 @@ class RawPreviewRenderer(
 
         fun releaseCpuBufferReferences() {
             cpuRgba = null
+            gpuFallbackRgba = null
             analysisNv21Buffer = null
         }
 
@@ -286,7 +374,7 @@ class RawPreviewRenderer(
                 return current
             }
             releaseGpuBuffer()
-            if (quarantineBudgetExhausted) return null
+            if (quarantineBudgetExhausted || !RawPreviewRetiredGpuBackings.acceptingNewBackings()) return null
             val supported = runCatching {
                 HardwareBuffer.isSupported(width, height, HardwareBuffer.RGBA_8888, 1, usage)
             }.getOrDefault(false)
@@ -331,6 +419,23 @@ class RawPreviewRenderer(
             }
             quarantinedGpuBuffers.clear()
         }
+
+        fun retireForClose(backend: RawPreviewFenceBackend, safeToReleaseCurrent: Boolean) {
+            hardwareBuffer?.let { buffer ->
+                if (safeToReleaseCurrent && pendingGlFenceHandle <= 0L) {
+                    ImageUtils.releaseRawPreviewEglImage(buffer)
+                    runCatching { buffer.close() }
+                } else {
+                    RawPreviewRetiredGpuBackings.retain(buffer, pendingGlFenceHandle, backend)
+                }
+            }
+            hardwareBuffer = null
+            pendingGlFenceHandle = 0L
+            quarantinedGpuBuffers.forEach { buffer ->
+                RawPreviewRetiredGpuBackings.retain(buffer, 0L, backend)
+            }
+            quarantinedGpuBuffers.clear()
+        }
     }
 
     private val allOutputSlots = List(OUTPUT_SLOT_COUNT) { OutputSlot(it) }
@@ -338,7 +443,6 @@ class RawPreviewRenderer(
     private val pendingGpuOutputSlots = ConcurrentLinkedQueue<OutputSlot>()
     private val outputSlotLedger = RawPreviewOutputSlotLedger(OUTPUT_SLOT_COUNT)
     private val dropCounters = AtomicLongArray(RawPreviewDropReason.values().size)
-    private var gpuFallbackScratchRgba: ByteBuffer? = null
 
     @Volatile private var activeConfig: RawPreviewRenderConfig? = null
     @Volatile private var closed = false
@@ -472,6 +576,13 @@ class RawPreviewRenderer(
     fun forceCpuFallbackForHealth(reason: String): Boolean {
         val config = activeConfig ?: return false
         if (config.source == ViewfinderEffectiveSource.YUV || config.pipelineGeneration < 0) return false
+        // A cold Adreno pipeline compile can outlast the normal publication watchdog. Switching
+        // to the legacy path during compilation forces a second large shader compile and can
+        // exhaust the driver's memory before the first GPU-resident frame is submitted.
+        if (backendPrepareScheduled.get()) return false
+        val preparedAtNs = backendPreparedAtNs.get()
+        if (preparedAtNs != 0L && lastRendererPublishElapsedNs.get() == 0L &&
+            SystemClock.elapsedRealtimeNanos() - preparedAtNs < 15_000_000_000L) return false
         val eglGeneration = RawPreviewInteropCapabilities.latest?.eglGeneration ?: -1
         val capabilitySnapshot = RawPreviewInteropCapabilities.latest
         val capabilityReady = capabilitySnapshot?.readyForAhbEglImageInterop == true
@@ -488,7 +599,6 @@ class RawPreviewRenderer(
             permanentForBoundary = false
         )
         if (changed) {
-            gpuFallbackScratchRgba = null
             RawPreviewInteropCapabilities.recordActivePath("CPU_VISIBLE_RGBA_TO_GLES_HEALTH_RECOVERY")
             RawPreviewHealthMonitor.updateOutputSlotHealth(config.pipelineGeneration, outputSlotHealth())
             if (hasPendingRequest()) scheduleDrain()
@@ -520,60 +630,56 @@ class RawPreviewRenderer(
     }
 
     private fun enqueuePendingRequest(request: Request) {
-        var stale: Request? = null
-        synchronized(pendingRequestLock) {
-            if (pendingRequests.size >= MAX_PENDING_REQUESTS) {
-                stale = pendingRequests.removeFirst()
+        val (stale, accepted) = synchronized(pendingRequestLock) {
+            if (closed || !isCurrent(request)) {
+                null to false
+            } else {
+                pendingRequest.also { pendingRequest = request } to true
             }
-            pendingRequests.addLast(request)
+        }
+        if (!accepted) {
+            retireQueuedRequest(request, if (closed) RawPreviewDropReason.PREVIEW_DROP_RENDERER_CLOSING
+                else RawPreviewDropReason.STALE_GENERATION, "offer_after_route_change")
+            return
         }
         stale?.let { dropped ->
             droppedBusy++
-            recordDrop(RawPreviewDropReason.INPUT_QUEUE_OVERFLOW, dropped)
-            exactFrameColorPairs.remove(dropped.sensorTimestampNs)
-            releaseRequest(dropped)
-            RawPreviewFrameLifecycleRegistry.released(
-                dropped.config.pipelineGeneration,
-                dropped.sensorTimestampNs,
-                SystemClock.elapsedRealtimeNanos(),
-                "input_queue_overflow"
-            )
+            retireQueuedRequest(dropped, RawPreviewDropReason.PREVIEW_DROP_REPLACED_BY_NEWER,
+                "preview_replaced_by_newer")
         }
+    }
+
+    private fun retireQueuedRequest(request: Request, reason: RawPreviewDropReason, detail: String) {
+        recordDrop(reason, request)
+        exactFrameColorPairs.remove(metadataKey(request))
+        frameMetadata.discard(metadataKey(request))
+        releaseRequest(request)
+        RawPreviewFrameLifecycleRegistry.released(request.config.pipelineGeneration,
+            request.sensorTimestampNs, SystemClock.elapsedRealtimeNanos(), detail)
     }
 
     private fun pollPendingRequest(): Request? = synchronized(pendingRequestLock) {
-        pendingRequests.pollFirst()
+        pendingRequest.also { pendingRequest = null }
     }
 
     private fun hasPendingRequest(): Boolean = synchronized(pendingRequestLock) {
-        pendingRequests.isNotEmpty()
+        pendingRequest != null
     }
 
     private fun pendingRequestCount(): Int = synchronized(pendingRequestLock) {
-        pendingRequests.size
+        if (pendingRequest == null) 0 else 1
     }
 
     private fun clearPendingRequests() {
-        val stale = ArrayList<Request>(MAX_PENDING_REQUESTS)
-        synchronized(pendingRequestLock) {
-            while (pendingRequests.isNotEmpty()) stale.add(pendingRequests.removeFirst())
+        val stale = synchronized(pendingRequestLock) {
+            pendingRequest.also { pendingRequest = null }
         }
-        stale.forEach { request ->
-            exactFrameColorPairs.remove(request.sensorTimestampNs)
-            releaseRequest(request)
-            RawPreviewFrameLifecycleRegistry.released(
-                request.config.pipelineGeneration,
-                request.sensorTimestampNs,
-                SystemClock.elapsedRealtimeNanos(),
-                "pending_queue_cleared"
-            )
+        stale?.let { request ->
+            val closing = closed
+            retireQueuedRequest(request, if (closing) RawPreviewDropReason.PREVIEW_DROP_RENDERER_CLOSING
+                else RawPreviewDropReason.STALE_GENERATION,
+                if (closing) "renderer_closing" else "generation_stale")
         }
-    }
-
-    private fun ensureGpuFallbackScratchRgba(): ByteBuffer {
-        return gpuFallbackScratchRgba ?: ByteBuffer.allocateDirect(MAX_OUTPUT_BYTES)
-            .order(ByteOrder.nativeOrder())
-            .also { gpuFallbackScratchRgba = it }
     }
 
     private fun RawPreviewRenderConfig.isSafeForNativePreview(): Boolean {
@@ -612,7 +718,10 @@ class RawPreviewRenderer(
                 var prepared = false
                 try {
                     prepared = com.bncam.core.vulkan.VulkanRuntimeOwner.prepareRawPreviewBackend()
-                    if (prepared) backendPrepared.set(true)
+                    if (prepared) {
+                        backendPreparedAtNs.set(SystemClock.elapsedRealtimeNanos())
+                        backendPrepared.set(true)
+                    }
                 } finally {
                     backendPrepareScheduled.set(false)
                     RawPreviewFirstActivationTrace.backendPrepareCompleted(reason, prepared)
@@ -668,23 +777,39 @@ class RawPreviewRenderer(
 
     fun updateExactFrameCamera2ColorPair(
         sensorTimestampNs: Long,
+        generation: Int,
+        sensorId: String,
+        source: ViewfinderEffectiveSource,
         gains: FloatArray,
         colorMatrix: FloatArray
     ) {
-        if (sensorTimestampNs <= 0L || gains.size < 4 || colorMatrix.size < 9 ||
+        if (sensorTimestampNs <= 0L || sensorId.isBlank() || gains.size < 4 || colorMatrix.size < 9 ||
             gains.take(4).any { !it.isFinite() || it !in 0.25f..6.0f } ||
             !RawColorTransformEngine.validateSensorToLinearSrgbMatrix(colorMatrix.copyOf(9)).valid
         ) {
             return
         }
-        exactFrameColorPairs[sensorTimestampNs] = ExactFrameColorPair(
+        val key = RawPreviewFrameMetadataCache.Key(generation, sensorId, source, sensorTimestampNs)
+        exactFrameColorPairs[key] = ExactFrameColorPair(
             wbGains = gains.copyOf(4),
             colorMatrix = colorMatrix.copyOf(9)
         )
         if (exactFrameColorPairs.size > 24) {
-            val oldest = exactFrameColorPairs.keys.minOrNull()
-            if (oldest != null && oldest != sensorTimestampNs) exactFrameColorPairs.remove(oldest)
+            val oldest = exactFrameColorPairs.keys.minByOrNull { it.timestampNs }
+            if (oldest != null && oldest != key) exactFrameColorPairs.remove(oldest)
         }
+    }
+
+    fun recordRawFrameMetadata(
+        generation: Int, sensorId: String, source: ViewfinderEffectiveSource,
+        sensorTimestampNs: Long, dynamicBlack: FloatArray?, dynamicWhite: Int?,
+        lensMap: FloatArray?, lensColumns: Int, lensRows: Int
+    ) {
+        if (closed) return
+        frameMetadata.record(RawPreviewFrameMetadataCache.Key(generation, sensorId, source, sensorTimestampNs),
+            RawPreviewFrameMetadataCache.Entry(dynamicBlack, dynamicWhite, lensMap, lensColumns, lensRows),
+            SystemClock.elapsedRealtimeNanos())
+        if (hasPendingRequest()) scheduleDrain()
     }
 
     fun clearExactFrameCamera2ColorPairs() {
@@ -731,13 +856,17 @@ class RawPreviewRenderer(
         if (routeChanged) {
             liveWhiteBalanceOverride.set(null)
             exactFrameColorPairs.clear()
+            frameMetadata.clear()
             autoWhiteBalanceColorPair.set(null)
             configRevision.incrementAndGet()
             latestOfferedSensorTimestampNs.set(Long.MIN_VALUE)
             clearPendingRequests()
             if (config == null || config.source == ViewfinderEffectiveSource.YUV) {
-                gpuFallbackScratchRgba = null
-                allOutputSlots.forEach(OutputSlot::releaseCpuBufferReferences)
+                allOutputSlots.forEach { slot ->
+                    if (outputSlotLedger.state(slot.id) == RawPreviewOutputSlotState.AVAILABLE) {
+                        slot.releaseCpuBufferReferences()
+                    }
+                }
             }
             renderCostEmaMs = 0.0f
             glUploadCostEmaMs = 0.0f
@@ -831,7 +960,8 @@ class RawPreviewRenderer(
             useRuntimeCrop = useRuntimeCrop,
             producerKind = producerKind,
             sourceWidth = buffer.width,
-            sourceHeight = buffer.height
+            sourceHeight = buffer.height,
+            offeredElapsedNs = SystemClock.elapsedRealtimeNanos()
         )
         enqueuePendingRequest(request)
         scheduleDrain()
@@ -839,17 +969,35 @@ class RawPreviewRenderer(
 
     private fun scheduleDrain(delayMs: Long = 0L) {
         if (closed || !drainScheduled.compareAndSet(false, true)) return
-        executor.schedule({
-            drainScheduled.set(false)
-            drainLatest()
-        }, delayMs.coerceAtLeast(0L), TimeUnit.MILLISECONDS)
+        val accepted = runCatching {
+            executor.schedule({
+                drainScheduled.set(false)
+                drainLatest()
+            }, delayMs.coerceAtLeast(0L), TimeUnit.MILLISECONDS)
+        }.isSuccess
+        if (!accepted) drainScheduled.set(false)
     }
 
     private fun drainLatest() {
         if (closed) return
-        val request = pollPendingRequest() ?: return
         reclaimCompletedGpuOutputSlots()
-        val slot = acquireOutputSlot()
+        // Finish the sole interop probe before considering another fresh frame. A second frame
+        // would otherwise see PROBING as CPU fallback and eagerly compile the legacy pipeline.
+        val probing = gpuInteropController.snapshot().mode == RawPreviewGpuInteropMode.PROBING
+        val pendingFirst = if (probing) pendingGpuRequests.poll() else null
+        val fresh = if (pendingFirst == null && availableOutputSlots.isNotEmpty() &&
+            !(probing && gpuInteropController.snapshot().probeAttempted)) pollPendingRequest() else null
+        val pending = pendingFirst ?: if (fresh == null) pendingGpuRequests.poll() else null
+        val request = fresh ?: pending?.request ?: return
+        val polling = pending != null
+        if (!polling && isCurrent(request) && request.config.calibrationSensorId.isNotBlank() &&
+            !frameMetadata.hasExact(metadataKey(request), SystemClock.elapsedRealtimeNanos()) &&
+            SystemClock.elapsedRealtimeNanos() - request.offeredElapsedNs < METADATA_PAIR_GRACE_NS
+        ) {
+            requeueWaitingForMetadata(request)
+            return
+        }
+        val slot = pending?.slot ?: acquireOutputSlot()
         if (slot == null) {
             droppedBusy++
             recordDrop(RawPreviewDropReason.NO_OUTPUT_SLOT, request)
@@ -867,8 +1015,9 @@ class RawPreviewRenderer(
         }
 
         var delivered = false
+        var gpuPending = false
         try {
-            if (!isCurrent(request)) {
+            if (!polling && !isCurrent(request)) {
                 recordDrop(RawPreviewDropReason.STALE_GENERATION, request)
                 return
             }
@@ -910,33 +1059,52 @@ class RawPreviewRenderer(
             // Camera2's CFA enum is anchored to sensor coordinates. Once the RAW preview starts
             // at an active-array crop origin, shift both the CFA identity and per-site black levels
             // to the local preview mosaic origin instead of assuming buffer (0,0) is sensor (0,0).
-            val localCfaPattern = request.config.cfaPattern xor phaseMask
-            val localBlackLevels = if (phaseMask == 0 || request.config.blackLevels.size < 4) {
-                request.config.blackLevels
+            val localCfaPattern = pending?.localCfaPattern ?: (request.config.cfaPattern xor phaseMask)
+            val calibration = request.resolvedCalibration ?: resolveCalibration(request).also {
+                request.resolvedCalibration = it
+                if (received % 60L == 1L) Log.i(TAG,
+                    "RAW_PREVIEW_CALIBRATION generation=${request.config.pipelineGeneration} " +
+                        "sensor=${request.config.calibrationSensorId} timestampNs=${request.sensorTimestampNs} " +
+                        "BLACK_LEVEL_AUTHORITY=${it.blackAuthority} WHITE_LEVEL_AUTHORITY=${it.whiteAuthority} " +
+                        "LENS_SHADING_AUTHORITY=${it.lensAuthority}")
+            }
+            val localBlackLevels = pending?.localBlackLevels ?: if (phaseMask == 0 || calibration.black.size < 4) {
+                calibration.black
             } else {
                 FloatArray(4) { localSite ->
                     val localX = localSite and 1
                     val localY = (localSite shr 1) and 1
                     val sourceSite = ((localY xor phaseY) shl 1) or (localX xor phaseX)
-                    request.config.blackLevels[sourceSite]
+                    calibration.black[sourceSite]
                 }
             }
 
-            val expectedOutput = computePreviewOutputDimensions(
+            val expectedOutput = pending?.expectedOutput ?: computePreviewOutputDimensions(
                 request = request,
                 geometry = requestGeometry
             )
+            val nativeGeometry = pending?.geometry ?: NativeGeometry(
+                width = requestGeometry?.bufferWidth ?: request.sourceWidth,
+                height = requestGeometry?.bufferHeight ?: request.sourceHeight,
+                rowStride = requestGeometry?.rowStride?.takeIf { it > 0 }
+                    ?: if (request.config.source == ViewfinderEffectiveSource.RAW10) request.sourceWidth * 5 / 4 else request.sourceWidth * 2,
+                pixelStride = requestGeometry?.pixelStride ?: 0,
+                cropLeft = requestGeometry?.cropLeft ?: 0,
+                cropTop = requestGeometry?.cropTop ?: 0,
+                cropWidth = requestGeometry?.cropWidth ?: 0,
+                cropHeight = requestGeometry?.cropHeight ?: 0
+            )
             val interopSnapshot = RawPreviewInteropCapabilities.latest
-            val interopEglGeneration = interopSnapshot?.eglGeneration ?: -1
-            val gpuDecision = gpuInteropController.decision(
+            val interopEglGeneration = pending?.interopEglGeneration ?: (interopSnapshot?.eglGeneration ?: -1)
+            val gpuDecision = if (polling) null else gpuInteropController.decision(
                 pipelineGeneration = request.config.pipelineGeneration,
                 eglGeneration = interopEglGeneration,
                 capabilitiesReady = interopSnapshot?.readyForAhbEglImageInterop == true,
                 capabilityReason = currentInteropCapabilityReason(interopSnapshot)
             )
             val usage = interopSnapshot?.vulkanOutputAhbUsage ?: 0L
-            var outputHardwareBuffer: HardwareBuffer? = null
-            if (gpuDecision != RawPreviewGpuUseDecision.CPU_FALLBACK) {
+            var outputHardwareBuffer: HardwareBuffer? = pending?.outputHardwareBuffer
+            if (!polling && gpuDecision != RawPreviewGpuUseDecision.CPU_FALLBACK) {
                 outputHardwareBuffer = slot.ensureGpuBuffer(expectedOutput.first, expectedOutput.second, usage)
                 if (outputHardwareBuffer != null && gpuDecision == RawPreviewGpuUseDecision.PROBE_ALLOWED) {
                     if (!gpuInteropController.beginProbe(request.config.pipelineGeneration, interopEglGeneration)) {
@@ -962,34 +1130,44 @@ class RawPreviewRenderer(
                 }
             }
 
-            val analysisBuffer = if (mlAnalysisRequested) {
+            val analysisBuffer = if (polling) pending?.analysisNv21 else if (mlAnalysisRequested) {
                 slot.ensureAnalysisNv21Buffer().apply { clear() }
             } else {
                 null
             }
-            val outputRgba = if (outputHardwareBuffer != null) {
-                // JNI keeps a valid CPU fallback target, but the normal AHB->EGLImage path does not
-                // reserve one full RGBA host buffer per GPU output slot. Execution is serialized.
-                ensureGpuFallbackScratchRgba().apply { clear() }
+            val outputRgba = if (polling) {
+                pending!!.outputRgba.apply { clear() }
+            } else if (outputHardwareBuffer != null) {
+                // JNI retains a CPU fallback target for this slot until its Vulkan fence completes.
+                // Separate slot storage permits other RAW submissions while this frame is in flight.
+                slot.ensureGpuFallbackRgbaBuffer().apply { clear() }
             } else {
                 slot.ensureCpuRgbaBuffer().apply { clear() }
             }
 
-            val liveColorPair = liveWhiteBalanceColorPair.get()
-            val liveWb = liveColorPair?.wbGains?.copyOf() ?: liveWhiteBalanceOverride.get()?.copyOf()
-            // Exact Camera2 metadata is consumed for every System-Auto frame even when a temporal
-            // render pair is active. This prevents the filtered output from feeding back as its own
-            // PhysicalAwbEstimator prior. Live manual WB intentionally clears these pairs.
-            val exactFramePair = if (liveWb == null) {
-                exactFrameColorPairs.remove(request.sensorTimestampNs)
-            } else {
-                null
+            val colors = request.resolvedColors ?: run {
+                val liveColorPair = liveWhiteBalanceColorPair.get()
+                val liveWb = liveColorPair?.wbGains?.copyOf() ?: liveWhiteBalanceOverride.get()?.copyOf()
+                // Keep the exact Camera2 prior associated with this submitted sensor frame.
+                val exactFramePair = if (liveWb == null) {
+                    exactFrameColorPairs.remove(metadataKey(request))
+                } else {
+                    null
+                }
+                val autoPair = if (liveWb == null) autoWhiteBalanceColorPair.get() else null
+                ResolvedColors(
+                    renderWb = (liveWb ?: autoPair?.wbGains ?: exactFramePair?.wbGains ?: request.config.wbGains).copyOf(),
+                    renderMatrix = (liveColorPair?.colorMatrix ?: autoPair?.colorMatrix ?: exactFramePair?.colorMatrix ?: request.config.colorMatrix).copyOf(),
+                    camera2PriorWb = (exactFramePair?.wbGains ?: request.config.wbGains).copyOf(),
+                    camera2PriorMatrix = (exactFramePair?.colorMatrix ?: request.config.colorMatrix).copyOf(),
+                    exactPair = exactFramePair
+                ).also { request.resolvedColors = it }
             }
-            val autoPair = if (liveWb == null) autoWhiteBalanceColorPair.get() else null
-            val effectiveWbGains = liveWb ?: autoPair?.wbGains ?: exactFramePair?.wbGains ?: request.config.wbGains
-            val effectiveColorMatrix = liveColorPair?.colorMatrix ?: autoPair?.colorMatrix ?: exactFramePair?.colorMatrix ?: request.config.colorMatrix
-            val camera2PriorWbGains = exactFramePair?.wbGains ?: request.config.wbGains
-            val camera2PriorColorMatrix = exactFramePair?.colorMatrix ?: request.config.colorMatrix
+            val exactFramePair = colors.exactPair
+            val effectiveWbGains = colors.renderWb
+            val effectiveColorMatrix = colors.renderMatrix
+            val camera2PriorWbGains = colors.camera2PriorWb
+            val camera2PriorColorMatrix = colors.camera2PriorMatrix
             RawPreviewFirstActivationTrace.nativeRenderStarted(
                 source = request.config.source.name,
                 generation = request.config.pipelineGeneration,
@@ -1003,7 +1181,7 @@ class RawPreviewRenderer(
                 cfaPattern = localCfaPattern,
                 requestedDemosaicMode = request.config.demosaicMode,
                 blackLevels = localBlackLevels,
-                whiteLevel = request.config.whiteLevel,
+                whiteLevel = calibration.white,
                 wbGains = effectiveWbGains,
                 camera2PriorWbGains = camera2PriorWbGains,
                 colorMatrix = effectiveColorMatrix,
@@ -1038,24 +1216,42 @@ class RawPreviewRenderer(
                 gammaCurve = request.config.gammaCurve,
                 sectionCurve = request.config.sectionCurve,
                 rotationDegrees = request.config.rotationDegrees,
-                sourceWidth = requestGeometry?.bufferWidth ?: request.sourceWidth,
-                sourceHeight = requestGeometry?.bufferHeight ?: request.sourceHeight,
-                sourceRowStrideBytes = requestGeometry?.rowStride?.takeIf { it > 0 }
-                    ?: if (request.config.source == ViewfinderEffectiveSource.RAW10) (request.sourceWidth * 5 / 4) else (request.sourceWidth * 2),
-                sourcePixelStrideBytes = requestGeometry?.pixelStride ?: 0,
-                sourceCropLeft = requestGeometry?.cropLeft ?: 0,
-                sourceCropTop = requestGeometry?.cropTop ?: 0,
-                sourceCropWidth = requestGeometry?.cropWidth ?: 0,
-                sourceCropHeight = requestGeometry?.cropHeight ?: 0,
+                sourceWidth = nativeGeometry.width,
+                sourceHeight = nativeGeometry.height,
+                sourceRowStrideBytes = nativeGeometry.rowStride,
+                sourcePixelStrideBytes = nativeGeometry.pixelStride,
+                sourceCropLeft = nativeGeometry.cropLeft,
+                sourceCropTop = nativeGeometry.cropTop,
+                sourceCropWidth = nativeGeometry.cropWidth,
+                sourceCropHeight = nativeGeometry.cropHeight,
                 outputHardwareBuffer = outputHardwareBuffer,
                 outputRgba = outputRgba,
                 analysisNv21 = analysisBuffer,
-                frameSlotIndex = slot.id,
+                frameSlotIndex = if (polling) -slot.id - 1 else slot.id,
                     maxWidth = targetMaxWidth,
-                    maxHeight = targetMaxHeight
+                    maxHeight = targetMaxHeight,
+                    sensorTimestampNs = request.sensorTimestampNs,
+                    pipelineGeneration = request.config.pipelineGeneration,
+                    lensShadingMap = calibration.lensMap,
+                    lensShadingColumns = calibration.lensColumns,
+                    lensShadingRows = calibration.lensRows,
+                    lensShadingActiveRect = calibration.activeRect
                 )
             } finally {
                 RawPreviewTrace.end(renderTrace)
+            }
+            if (result?.size == 1 && result[0] == -2) {
+                gpuPending = true
+                pendingGpuRequests.offer(pending ?: PendingGpu(request, slot, nativeGeometry,
+                    localCfaPattern, localBlackLevels.copyOf(), expectedOutput,
+                    outputHardwareBuffer, outputRgba, analysisBuffer, interopEglGeneration))
+                return
+            }
+            if (polling && (result == null || result.size < 5)) {
+                // An unresolved device/fence error cannot make a GPU-owned output backing free.
+                gpuPending = true
+                pendingGpuRequests.offer(pending!!)
+                return
             }
             if (result == null || result.size < 5 || result[0] <= 0 || result[1] <= 0 || !isCurrent(request)) {
                 val current = isCurrent(request)
@@ -1122,7 +1318,6 @@ class RawPreviewRenderer(
                 // The shared scratch target may be overwritten by the next render before GLES can
                 // upload it. Drop this one transition frame; the next frame receives a slot-owned
                 // CPU buffer with the exact same resolution/quality contract.
-                gpuFallbackScratchRgba = null
                 recordDrop(RawPreviewDropReason.GPU_OUTPUT_IMPORT_FAILED, request)
                 RawPreviewInteropCapabilities.recordActivePath("CPU_VISIBLE_RGBA_TO_GLES_OUTPUT_IMPORT_FAILED")
                 Log.w(
@@ -1313,10 +1508,10 @@ class RawPreviewRenderer(
             logDiagnostics(frame)
             return
         } finally {
-            releaseRequest(request)
+            if (!gpuPending || closed) releaseRequest(request)
             // A delivered frame owns the slot until FocusPeakingView uploads it. Undelivered paths
             // return it here; delivered paths returned above after onFrame.
-            if (!delivered) {
+            if (!delivered && !gpuPending) {
                 slot.clearCpuRgbaBuffer()
                 RawPreviewFrameLifecycleRegistry.released(
                     request.config.pipelineGeneration,
@@ -1326,7 +1521,9 @@ class RawPreviewRenderer(
                 )
                 returnOutputSlot(slot, "undelivered")
             }
-            if (hasPendingRequest()) scheduleDrain()
+            if (hasPendingRequest() || pendingGpuRequests.isNotEmpty()) {
+                scheduleDrain(if (hasPendingRequest() && availableOutputSlots.isNotEmpty()) 0L else 2L)
+            }
         }
     }
 
@@ -1346,7 +1543,6 @@ class RawPreviewRenderer(
                 gpuInteropController.markFailure(
                     generation, eglGeneration, "eglimage_bind_failed", permanentForBoundary = false
                 )
-                gpuFallbackScratchRgba = null
                 // EGLImage import/bind never became a valid sampled GL owner, so this backing may
                 // be retired immediately. The enclosing CPU-capable slot remains reusable.
                 slot.releaseGpuBuffer()
@@ -1395,7 +1591,6 @@ class RawPreviewRenderer(
                 gpuInteropController.markFailure(
                     generation, eglGeneration, "gl_fence_create_failed", permanentForBoundary = false
                 )
-                gpuFallbackScratchRgba = null
                 recordDropForFrame(source, generation, sensorTimestampNs, RawPreviewDropReason.GL_FENCE_CREATE_FAILED)
                 returnOutputSlot(slot, "gl_fence_create_failed_gpu_backing_quarantined")
                 RawPreviewFrameLifecycleRegistry.released(
@@ -1458,7 +1653,6 @@ class RawPreviewRenderer(
                         slot.pendingGeneration, failedEglGeneration, "gl_fence_poll_failed",
                         permanentForBoundary = false
                     )
-                    gpuFallbackScratchRgba = null
                     slot.pendingSource?.let { source ->
                         recordDropForFrame(
                             source,
@@ -1569,6 +1763,7 @@ class RawPreviewRenderer(
     }
 
     private fun isCurrent(request: Request): Boolean {
+        if (closed) return false
         val current = activeConfig
         return request.configRevision == configRevision.get() &&
             current != null &&
@@ -1577,6 +1772,7 @@ class RawPreviewRenderer(
     }
 
     private fun releaseRequest(request: Request) {
+        if (!request.released.compareAndSet(false, true)) return
         RawPreviewFrameLifecycleRegistry.inputReleased(
             request.config.pipelineGeneration,
             request.sensorTimestampNs,
@@ -1654,19 +1850,19 @@ class RawPreviewRenderer(
     suspend fun pauseAndAwaitIdle(timeoutMs: Long = 750L): Boolean {
         configure(null)
         if (Thread.currentThread().name == "BnCamRawPreview") return true
-
-        val idleBarrier = CompletableDeferred<Unit>()
-        val queued = runCatching {
-            executor.execute { idleBarrier.complete(Unit) }
-        }.isSuccess
-        if (!queued) {
-            Log.w(TAG, "RAW preview worker rejected idle barrier; renderer may already be closing")
-            return false
-        }
-
         val idle = withTimeoutOrNull(timeoutMs) {
-            idleBarrier.await()
-            true
+            while (true) {
+                val idleBarrier = CompletableDeferred<Unit>()
+                val queued = runCatching {
+                    executor.execute { idleBarrier.complete(Unit) }
+                }.isSuccess
+                if (!queued) break
+                idleBarrier.await()
+                if (pendingGpuRequests.isEmpty()) return@withTimeoutOrNull true
+                scheduleDrain()
+                delay(4L)
+            }
+            false
         } ?: false
         if (!idle) {
             Log.w(TAG, "Timed out waiting for RAW preview worker to become idle")
@@ -1674,22 +1870,105 @@ class RawPreviewRenderer(
         return idle
     }
 
-    override fun close() {
+    @Synchronized override fun close() {
         if (closed) return
         closed = true
         configRevision.incrementAndGet()
         clearPendingRequests()
-        executor.shutdownNow()
+        frameMetadata.clear()
+        exactFrameColorPairs.clear()
+        // A native submit may still hold a slot after pauseAndAwaitIdle times out. Let the
+        // single worker finish before touching its output backing or polling queue.
+        executor.shutdown()
         backendWarmupExecutor.shutdownNow()
-        gpuFallbackScratchRgba = null
-        allOutputSlots.forEach { slot ->
-            slot.releaseCpuBufferReferences()
-            if (slot.pendingGlFenceHandle > 0L) {
-                fenceBackend.destroyFence(slot.pendingGlFenceHandle)
-                slot.pendingGlFenceHandle = 0L
+        if (executor.isTerminated) {
+            retireClosedSlots()
+        } else {
+            Thread({
+                while (!executor.awaitTermination(1L, TimeUnit.SECONDS)) Unit
+                retireClosedSlots()
+            }, "BnCamRawPreviewCloseRetirement").apply { isDaemon = true }.start()
+        }
+    }
+
+    private fun metadataKey(request: Request) = RawPreviewFrameMetadataCache.Key(
+        request.config.pipelineGeneration, request.config.calibrationSensorId,
+        request.config.source, request.sensorTimestampNs
+    )
+
+    private fun requeueWaitingForMetadata(request: Request) {
+        val newer = synchronized(pendingRequestLock) {
+            val current = pendingRequest
+            if (!closed && current == null) pendingRequest = request
+            current
+        }
+        if (newer != null || closed) {
+            retireQueuedRequest(request, if (closed) RawPreviewDropReason.PREVIEW_DROP_RENDERER_CLOSING
+                else RawPreviewDropReason.PREVIEW_DROP_REPLACED_BY_NEWER, "metadata_wait_replaced")
+        } else scheduleDrain(2L)
+    }
+
+    private fun resolveCalibration(request: Request): ResolvedCalibration {
+        val config = request.config
+        val match = frameMetadata.match(metadataKey(request), SystemClock.elapsedRealtimeNanos())
+        val exactBlack = match.exact?.black?.takeIf { it.size >= 4 && it.take(4).all { value -> value.isFinite() && value >= 0f } }
+        val rawBlack = exactBlack ?: match.trustedBlack ?: config.staticBlackLevels ?: config.blackLevels
+        val blackAuthority = when {
+            exactBlack != null -> "EXACT_DYNAMIC"
+            match.trustedBlack != null -> "LAST_TRUSTED"
+            config.staticBlackLevels != null -> "STATIC"
+            else -> "UNAVAILABLE"
+        }
+        val exactWhite = match.exact?.white?.takeIf { it > 0 }
+        val rawWhite = exactWhite ?: config.staticWhiteLevel.takeIf { it > 0 }
+        val whiteAuthority = when {
+            exactWhite != null -> "EXACT_DYNAMIC"
+            config.staticWhiteLevel > 0 -> "STATIC"
+            config.source == ViewfinderEffectiveSource.RAW10 -> "RAW10_STRUCTURAL"
+            else -> "UNAVAILABLE"
+        }
+        val sourceWhite = when (config.source) {
+            ViewfinderEffectiveSource.RAW10 -> {
+                if (rawWhite != null && config.staticWhiteLevel > 1023)
+                    (rawWhite * 1023f / config.staticWhiteLevel).toInt().coerceIn(1, 1023)
+                else rawWhite?.coerceIn(1, 1023) ?: 1023
             }
+            else -> rawWhite ?: config.whiteLevel
+        }.coerceIn(1, 65535)
+        val scale = if (rawBlack !== config.blackLevels &&
+            config.source == ViewfinderEffectiveSource.RAW10 && config.staticWhiteLevel > 1023)
+            1023f / config.staticWhiteLevel else 1f
+        val black = FloatArray(4) { index ->
+            ((rawBlack.getOrNull(index) ?: 0f) * scale).coerceIn(0f, sourceWhite.coerceAtLeast(2) - 1f)
+        }
+        val exactMap = match.exact?.takeIf { entry ->
+            entry.lensMap != null && entry.lensColumns in 1..128 && entry.lensRows in 1..128 &&
+                entry.lensMap.size == entry.lensColumns * entry.lensRows * 4
+        }
+        val applyMap = config.lensShadingAlreadyApplied == false && exactMap != null
+        val lensAuthority = when {
+            config.lensShadingAlreadyApplied == true -> "LENS_SHADING_RAW_ALREADY_APPLIED"
+            applyMap -> "LENS_SHADING_EXACT_MAP_APPLIED"
+            config.lensShadingAlreadyApplied == null -> "LENS_SHADING_METADATA_UNAVAILABLE"
+            else -> "LENS_SHADING_NEUTRAL_FALLBACK"
+        }
+        return ResolvedCalibration(black, sourceWhite, blackAuthority, whiteAuthority,
+            if (applyMap) exactMap?.lensMap?.copyOf() else null,
+            if (applyMap) exactMap?.lensColumns ?: 0 else 0,
+            if (applyMap) exactMap?.lensRows ?: 0 else 0,
+            config.lensMapActiveRect?.copyOf(), lensAuthority)
+    }
+
+    private fun retireClosedSlots() {
+        while (true) {
+            val pending = pendingGpuRequests.poll() ?: break
+            releaseRequest(pending.request)
+        }
+        allOutputSlots.forEach { slot ->
+            val safeToReleaseCurrent = outputSlotLedger.state(slot.id) == RawPreviewOutputSlotState.AVAILABLE
+            slot.releaseCpuBufferReferences()
+            slot.retireForClose(fenceBackend, safeToReleaseCurrent)
             outputSlotLedger.close(slot.id)
-            slot.releaseGpuBuffer()
         }
         availableOutputSlots.clear()
         pendingGpuOutputSlots.clear()
@@ -1702,7 +1981,8 @@ class RawPreviewRenderer(
         const val RGBA_BYTES_PER_PIXEL = 4
         const val OUTPUT_SLOT_COUNT = 3
         const val MAX_QUARANTINED_GPU_BACKINGS_PER_SLOT = 2
-        const val MAX_PENDING_REQUESTS = 2
+        const val MAX_PENDING_REQUESTS = 1
+        const val METADATA_PAIR_GRACE_NS = 20_000_000L
         const val MAX_OUTPUT_BYTES = PREVIEW_MAX_WIDTH * PREVIEW_MAX_HEIGHT * RGBA_BYTES_PER_PIXEL
         const val MAX_ANALYSIS_NV21_BYTES = ((PREVIEW_MAX_WIDTH / 4) * (PREVIEW_MAX_HEIGHT / 4) * 3) / 2
         const val DIAGNOSTIC_INTERVAL_MS = 2_000L

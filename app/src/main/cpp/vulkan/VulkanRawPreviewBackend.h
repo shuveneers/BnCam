@@ -1,6 +1,7 @@
 #pragma once
 
 #include "VulkanVmaIntegration.h"
+#include "RawPreviewComputeSlotLifecycle.h"
 
 #include <android/hardware_buffer.h>
 #include <vulkan/vulkan.h>
@@ -35,6 +36,7 @@ struct RawPreviewGpuRequest {
     // Optional already-mapped bytes used only by explicit callers/reference paths. Normal
     // production fallback maps the AHardwareBuffer inside the backend for one staging copy.
     const std::uint8_t* rawData = nullptr;
+    std::size_t rawDataCapacityBytes = 0;
     std::uint32_t sourceWidth = 0;
     std::uint32_t sourceHeight = 0;
     std::uint32_t sourceCropLeft = 0;
@@ -51,6 +53,10 @@ struct RawPreviewGpuRequest {
     std::uint32_t demosaicMode = 3;
     std::array<float, 4> blackLevels{0.0f, 0.0f, 0.0f, 0.0f};
     float whiteLevel = 1.0f;
+    const float* lensShadingMap = nullptr;
+    std::uint32_t lensShadingColumns = 0u;
+    std::uint32_t lensShadingRows = 0u;
+    std::array<std::int32_t, 4> lensShadingActiveRect{0, 0, 0, 0};
     std::uint32_t captureSensitivityIso = 100;
     float captureExposureTimeMs = 0.0f;
     float physicalGreenNoiseS = 0.0f;
@@ -112,6 +118,9 @@ struct RawPreviewGpuRequest {
     std::uint8_t* analysisNv21 = nullptr;
     std::size_t analysisNv21CapacityBytes = 0;
     std::uint32_t frameSlotIndex = 0;
+    bool pollOnly = false;
+    std::int64_t sensorTimestampNs = 0;
+    std::int32_t pipelineGeneration = 0;
 };
 
 struct RawPreviewGpuResult {
@@ -123,6 +132,25 @@ struct RawPreviewGpuResult {
     bool gpuResidentOutputUsed = false;
     std::uint32_t inputAhbFormat = 0;
     std::uint64_t inputAhbUsage = 0;
+    VkFormat inputVulkanFormat = VK_FORMAT_UNDEFINED;
+    std::uint64_t inputExternalFormat = 0;
+    VkFormatFeatureFlags inputExternalFeatures = 0;
+    VkFormatFeatureFlags inputOptimalFeatures = 0;
+    VkResult inputImageFormatQuery = VK_NOT_READY;
+    VkExternalMemoryFeatureFlags inputImageExternalMemoryFeatures = 0;
+    std::uint64_t inputBytesCopied = 0;
+    std::uint64_t inputGpuCopyBytes = 0;
+    VkMemoryPropertyFlags inputStagingMemoryFlags = 0;
+    float inputAhbLockMs = 0.0f;
+    float inputLayoutMs = 0.0f;
+    float inputMemcpyMs = 0.0f;
+    float inputPaddingMs = 0.0f;
+    float inputRowCopyMs = 0.0f;
+    float inputAhbUnlockMs = 0.0f;
+    float inputFlushMs = 0.0f;
+    float inputHandoffMs = 0.0f;
+    const char* inputTransport = "UNRESOLVED";
+    std::string inputImportRejection = "not_probed";
     // 0=not probed, 1=direct imported, 2=AHB contract not byte-addressable,
     // 3=required Vulkan interop unavailable, 4=import failed, 5=CPU byte staging.
     std::uint32_t inputInteropStatus = 0;
@@ -202,6 +230,7 @@ struct RawPreviewGpuResult {
     std::uint32_t awbSampleCount = 0u;
     std::uint32_t activeSlotIndex = 0;
     bool droppedBusy = false;
+    bool gpuPending = false;
     std::string failureReason;
 };
 
@@ -227,7 +256,8 @@ public:
             std::mutex* queueSubmissionMutex,
             const RawPreviewGpuRequest& request) noexcept;
 
-    void destroy(VkDevice device) noexcept;
+    // False retains the whole bounded working set until every submitted fence has completed.
+    bool destroy(VkDevice device) noexcept;
 
 private:
     struct PersistentBuffer {
@@ -258,12 +288,35 @@ private:
     };
 
     struct FrameSlot {
+        RawPreviewComputeSlotLifecycle lifecycle;
         VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
         VkFence fence = VK_NULL_HANDLE;
         VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
         VkDescriptorSet imageDescriptorSet = VK_NULL_HANDLE;
         PersistentBuffer deviceOutput;
         PersistentBuffer outputReadback;
+        PersistentBuffer inputStaging;
+        PersistentBuffer deviceInput;
+        PersistentBuffer toneLutBuffer;
+        PersistentBuffer deviceStatistics;
+        PersistentBuffer localToneBase;
+        PersistentBuffer hueSatProfile;
+        PersistentBuffer lensShadingBuffer;
+        VkQueryPool queryPool = VK_NULL_HANDLE;
+        RawPreviewGpuResult pendingResult;
+        std::uint64_t pendingRgbaBytes = 0u;
+        std::uint64_t pendingReadbackBytes = 0u;
+        std::uint64_t pendingAnalysisNv21Bytes = 0u;
+        std::uint32_t pendingAnalysisWidth = 0u;
+        std::uint32_t pendingAnalysisHeight = 0u;
+        bool pendingGpuResidentOutput = false;
+        bool pendingCompactAnalysis = false;
+        AHardwareBuffer* pendingInputIdentity = nullptr;
+        AHardwareBuffer* pendingOutputIdentity = nullptr;
+        std::uint8_t* pendingOutputRgba = nullptr;
+        std::uint8_t* pendingAnalysisNv21 = nullptr;
+        std::int64_t pendingSensorTimestampNs = 0;
+        std::int32_t pendingGeneration = 0;
         ImportedInputBuffer importedInput;
         ImportedOutputImage importedOutput;
         bool fenceSubmitted = false;
@@ -291,6 +344,8 @@ private:
                                     std::string& failureReason) noexcept;
     void destroyImportedOutputLocked(VkDevice device, ImportedOutputImage& output) noexcept;
     void destroyLocked(VkDevice device) noexcept;
+    RawPreviewGpuResult collectCompletedLocked(VkPhysicalDevice physicalDevice, VkDevice device,
+            VmaAllocator allocator, const RawPreviewGpuRequest& request, FrameSlot& slot) noexcept;
 
     std::mutex mutex_;
     bool initialized_ = false;
@@ -305,21 +360,16 @@ private:
     VkPipeline pipeline_ = VK_NULL_HANDLE;
     VkPipeline imagePipeline_ = VK_NULL_HANDLE;
     VkDescriptorPool descriptorPool_ = VK_NULL_HANDLE;
-    VkQueryPool queryPool_ = VK_NULL_HANDLE;
     // Scalar temporal state only. The statistics buffer is cleared every frame, so the previous
     // implementation's shader-side EMA always re-read zero and never actually smoothed.
     float previousExposureGain_ = 0.0f;
+    std::int32_t lastCompletedGeneration_ = -1;
+    std::int64_t lastCompletedTimestampNs_ = 0;
     VmaAllocator allocator_ = nullptr;
     std::uint32_t currentFrameSlot_ = 0u;
     std::array<FrameSlot, RAW_PREVIEW_FRAMES_IN_FLIGHT> slots_;
-    PersistentBuffer inputStaging_;
-    PersistentBuffer deviceInput_;
-    PersistentBuffer toneLutBuffer_;
-    PersistentBuffer deviceStatistics_;
-    PersistentBuffer localToneBase_;
     // Header (16 floats) + one or two validated dense DNG HSM tables. Kept resident/reused across
     // preview frames; the CPU only uploads compact immutable profile data when executing a frame.
-    PersistentBuffer hueSatProfile_;
 };
 
 }  // namespace bncam::vulkan

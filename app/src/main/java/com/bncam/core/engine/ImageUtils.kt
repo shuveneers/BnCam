@@ -183,7 +183,13 @@ object ImageUtils {
         maxWidth: Int,
         maxHeight: Int,
         profilePop: Float = 0f,
-        profileColorRecovery: Float = 0f
+        profileColorRecovery: Float = 0f,
+        sensorTimestampNs: Long = 0L,
+        pipelineGeneration: Int = 0,
+        lensShadingMap: FloatArray? = null,
+        lensShadingColumns: Int = 0,
+        lensShadingRows: Int = 0,
+        lensShadingActiveRect: IntArray? = null
     ): IntArray? {
         if (!nativeEngineAvailable || retainedHardwareBuffer == 0L || !outputRgba.isDirect) {
             return null
@@ -257,7 +263,13 @@ object ImageUtils {
                 analysisNv21,
                 frameSlotIndex,
                 maxWidth,
-                maxHeight
+                maxHeight,
+                sensorTimestampNs,
+                pipelineGeneration,
+                lensShadingMap,
+                lensShadingColumns,
+                lensShadingRows,
+                lensShadingActiveRect
             )
         } catch (t: Throwable) {
             Log.w(TAG, "RAW preview render failed", t)
@@ -1772,6 +1784,12 @@ object ImageUtils {
         analysisNv21: ByteBuffer?,
         frameSlotIndex: Int,
         maxWidth: Int,
-        maxHeight: Int
+        maxHeight: Int,
+        sensorTimestampNs: Long,
+        pipelineGeneration: Int,
+        lensShadingMap: FloatArray?,
+        lensShadingColumns: Int,
+        lensShadingRows: Int,
+        lensShadingActiveRect: IntArray?
     ): IntArray?
 }

@@ -540,7 +540,8 @@ class SingleFrameRunner(
         onRawProcessingFeedback: (SingleRawProcessingFeedback) -> Unit = {},
         temporaryPreviewPath: String? = null,
         focusCaptureContext: com.bncam.core.engine.FocusCaptureContext = com.bncam.core.engine.FocusCaptureContext(),
-        portraitCaptureContext: com.bncam.core.capture.PortraitCaptureContext = com.bncam.core.capture.PortraitCaptureContext()
+        portraitCaptureContext: com.bncam.core.capture.PortraitCaptureContext = com.bncam.core.capture.PortraitCaptureContext(),
+        reservedAnchor: com.bncam.core.buffer.FrameLease? = null
     ): com.bncam.core.output.CaptureSubmissionResult = withContext(Dispatchers.IO) {
         require(userShutterTimestampNs > 0L) {
             "SingleFrameRunner requires a valid non-zero userShutterTimestampNs from actual shutter press."
@@ -564,7 +565,8 @@ class SingleFrameRunner(
             shutterTimestampDomain = shutterTimestampDomain,
             expectedGeneration = expectedCollectionGeneration,
             expectedFormat = activeZslFormat,
-            requestedInitialCandidateCount = requestedBaseCandidateCount
+            requestedInitialCandidateCount = requestedBaseCandidateCount,
+            reservedAnchor = reservedAnchor
         )
         // Candidate references remain ring-owned. The selected frame gets an explicit FrameLease
         // below; Single YUV transfers that exact lease to CaptureProcessingQueue because the native

@@ -27,6 +27,11 @@ layout(std430, binding = 3) readonly buffer ToneLut { float toneLut[]; };
 // Keep descriptor ABI intact. The fast image kernel intentionally does not consume these tables.
 layout(std430, binding = 4) buffer LocalToneBase { float localToneBase[]; };
 layout(std430, binding = 5) readonly buffer HueSatProfile { float hueSatProfile[]; };
+layout(std430, binding = 6) readonly buffer LensShadingMap { float lensMapData[]; };
+
+const int RENDER_TILE_HALO = 2;
+const int RENDER_TILE_WIDTH = 20;
+shared float renderBayerTile[RENDER_TILE_WIDTH * RENDER_TILE_WIDTH];
 
 layout(push_constant) uniform Params {
     uint sourceWidth;
@@ -148,6 +153,31 @@ float siteBlack(uint site) {
     return pc.black3;
 }
 
+uint lensChannel(uint site, uint sensorY) {
+    uint p = min(cfaPattern(), 3u);
+    uint redSite = p == 0u ? 0u : p == 1u ? 1u : p == 2u ? 2u : 3u;
+    uint blueSite = 3u - redSite;
+    if (site == redSite) return 0u;
+    if (site == blueSite) return 3u;
+    return (sensorY & 1u) == 0u ? 1u : 2u;
+}
+
+float lensGain(uint sx, uint sy, uint site) {
+    uint columns = uint(lensMapData[0]);
+    uint rows = uint(lensMapData[1]);
+    if (columns == 0u || rows == 0u) return 1.0;
+    float u = clamp((float(sx) - lensMapData[2]) / max(1.0, lensMapData[4] - 1.0), 0.0, 1.0) * float(columns - 1u);
+    float v = clamp((float(sy) - lensMapData[3]) / max(1.0, lensMapData[5] - 1.0), 0.0, 1.0) * float(rows - 1u);
+    uint x0 = uint(floor(u)); uint y0 = uint(floor(v));
+    uint x1 = min(x0 + 1u, columns - 1u); uint y1 = min(y0 + 1u, rows - 1u);
+    uint channel = lensChannel(site, sy);
+    float g00 = lensMapData[6u + (y0 * columns + x0) * 4u + channel];
+    float g10 = lensMapData[6u + (y0 * columns + x1) * 4u + channel];
+    float g01 = lensMapData[6u + (y1 * columns + x0) * 4u + channel];
+    float g11 = lensMapData[6u + (y1 * columns + x1) * 4u + channel];
+    return clamp(mix(mix(g00, g10, fract(u)), mix(g01, g11, fract(u)), fract(v)), 0.25, 16.0);
+}
+
 int mirrorCoord(int p, int extent) {
     if (extent <= 1) return 0;
     int period = 2 * (extent - 1);
@@ -179,13 +209,16 @@ float rawNormalizedLocal(int localX, int localY) {
     return normalized;
 }
 
-float normalizedAt(int previewX, int previewY) {
+float normalizedAtUncached(int previewX, int previewY) {
     uint x = uint(mirrorCoord(previewX, int(pc.previewWidth)));
     uint y = uint(mirrorCoord(previewY, int(pc.previewHeight)));
     uint d = max(1u, pc.cfaCellDecimation);
     int baseX = int((x >> 1u) * 2u * d + (x & 1u));
     int baseY = int((y >> 1u) * 2u * d + (y & 1u));
-    if (d <= 1u) return rawNormalizedLocal(baseX, baseY);
+    float sampleValue;
+    if (d <= 1u) {
+        sampleValue = rawNormalizedLocal(baseX, baseY);
+    } else {
 
     // CFA-preserving 5-tap decimation. It removes coarse preview aliasing without mixing colour sites.
     int step = max(2, (int(d) / 2) * 2);
@@ -198,7 +231,44 @@ float normalizedAt(int previewX, int previewY) {
     float detailKeep = (1.0 - smoothstep(0.015, 0.075, spread)) *
             (1.0 - smoothstep(100.0, 1600.0, max(100.0, pc.captureIso)));
     float filtered = (4.0 * c + n + s + w + e) / 8.0;
-    return mix(filtered, c, 0.20 * detailKeep);
+        sampleValue = mix(filtered, c, 0.20 * detailKeep);
+    }
+    // The map is low frequency. Correct the CFA-preserving decimated sample once, before
+    // demosaic, rather than expanding four bilinear map fetches into every 5-tap RAW read.
+    uint localX = uint(clamp(baseX, 0, int(pc.sourceWidth) - 1));
+    uint localY = uint(clamp(baseY, 0, int(pc.sourceHeight) - 1));
+    uint sx = min(pc.sourceWidth - 1u, sourceCropLeft() + localX);
+    uint sy = min(pc.sourceHeight - 1u, sourceCropTop() + localY);
+    uint site = ((y & 1u) << 1u) | (x & 1u);
+    return clamp(sampleValue * lensGain(sx, sy, site), 0.0, 1.0);
+}
+
+void prepareRenderBayerTile() {
+    uint localLinear = gl_LocalInvocationID.y * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+    uint workgroupThreads = gl_WorkGroupSize.x * gl_WorkGroupSize.y;
+    int originX = int(gl_WorkGroupID.x * gl_WorkGroupSize.x) - RENDER_TILE_HALO;
+    int originY = int(gl_WorkGroupID.y * gl_WorkGroupSize.y) - RENDER_TILE_HALO;
+    for (uint index = localLinear; index < uint(RENDER_TILE_WIDTH * RENDER_TILE_WIDTH);
+            index += workgroupThreads) {
+        int tileX = int(index % uint(RENDER_TILE_WIDTH));
+        int tileY = int(index / uint(RENDER_TILE_WIDTH));
+        renderBayerTile[index] = normalizedAtUncached(originX + tileX, originY + tileY);
+    }
+    memoryBarrierShared();
+    barrier();
+}
+
+float normalizedAt(int previewX, int previewY) {
+    if (dispatchMode() == 2u) {
+        int originX = int(gl_WorkGroupID.x * gl_WorkGroupSize.x) - RENDER_TILE_HALO;
+        int originY = int(gl_WorkGroupID.y * gl_WorkGroupSize.y) - RENDER_TILE_HALO;
+        int tileX = previewX - originX;
+        int tileY = previewY - originY;
+        if (tileX >= 0 && tileX < RENDER_TILE_WIDTH && tileY >= 0 && tileY < RENDER_TILE_WIDTH) {
+            return renderBayerTile[tileY * RENDER_TILE_WIDTH + tileX];
+        }
+    }
+    return normalizedAtUncached(previewX, previewY);
 }
 
 uint cfaColorAt(int x, int y) {
@@ -533,6 +603,7 @@ void recordDisplay(uvec2 gid, vec3 rgb) {
 }
 
 void renderPass() {
+    prepareRenderBayerTile();
     uvec2 gid = gl_GlobalInvocationID.xy;
     if (gid.x >= pc.previewWidth || gid.y >= pc.previewHeight) return;
 

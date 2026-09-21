@@ -5,6 +5,7 @@
 #include <android/hardware_buffer.h>
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 struct RawPreviewParameters {
     int sourceFormat = 0;
@@ -30,6 +31,12 @@ struct RawPreviewParameters {
     int maxWidth = 960;
     int maxHeight = 720;
     int frameSlotIndex = 0;
+    std::int64_t sensorTimestampNs = 0;
+    int pipelineGeneration = 0;
+    std::vector<float> lensShadingMap;
+    int lensShadingColumns = 0;
+    int lensShadingRows = 0;
+    int lensShadingActiveRect[4] = {0, 0, 0, 0};
     // Exact Camera2 COLOR_CORRECTION_GAINS for this sensor timestamp. Rendering may use a
     // temporally-filtered pair, but PhysicalAwbEstimator must keep Camera2 as the independent prior.
     float camera2PriorWbGains[4] = {1.0f, 1.0f, 1.0f, 1.0f};
@@ -38,6 +45,7 @@ struct RawPreviewParameters {
 
 struct RawPreviewResult {
     bool success = false;
+    bool gpuPending = false;
     int width = 0;
     int height = 0;
     int renderMicroseconds = 0;

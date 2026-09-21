@@ -8,6 +8,7 @@ layout(std430, binding = 2) buffer Statistics { uint statsBuffer[]; };
 layout(std430, binding = 3) readonly buffer ToneLut { float toneLut[]; };
 layout(std430, binding = 4) buffer LocalToneBase { float localToneBase[]; };
 layout(std430, binding = 5) readonly buffer HueSatProfile { float hueSatProfile[]; };
+layout(std430, binding = 6) readonly buffer LensShadingMap { float lensMapData[]; };
 
 layout(push_constant) uniform Params {
     uint sourceWidth;
@@ -187,6 +188,31 @@ float siteBlack(uint site) {
     return pc.black3;
 }
 
+uint lensChannel(uint site, uint sensorY) {
+    uint p = min(cfaPattern(), 3u);
+    uint redSite = p == 0u ? 0u : p == 1u ? 1u : p == 2u ? 2u : 3u;
+    uint blueSite = 3u - redSite;
+    if (site == redSite) return 0u;
+    if (site == blueSite) return 3u;
+    return (sensorY & 1u) == 0u ? 1u : 2u; // Camera2 G_even/G_odd use sensor row parity.
+}
+
+float lensGain(uint sx, uint sy, uint site) {
+    uint columns = uint(lensMapData[0]);
+    uint rows = uint(lensMapData[1]);
+    if (columns == 0u || rows == 0u) return 1.0;
+    float u = clamp((float(sx) - lensMapData[2]) / max(1.0, lensMapData[4] - 1.0), 0.0, 1.0) * float(columns - 1u);
+    float v = clamp((float(sy) - lensMapData[3]) / max(1.0, lensMapData[5] - 1.0), 0.0, 1.0) * float(rows - 1u);
+    uint x0 = uint(floor(u)); uint y0 = uint(floor(v));
+    uint x1 = min(x0 + 1u, columns - 1u); uint y1 = min(y0 + 1u, rows - 1u);
+    uint channel = lensChannel(site, sy);
+    float g00 = lensMapData[6u + (y0 * columns + x0) * 4u + channel];
+    float g10 = lensMapData[6u + (y0 * columns + x1) * 4u + channel];
+    float g01 = lensMapData[6u + (y1 * columns + x0) * 4u + channel];
+    float g11 = lensMapData[6u + (y1 * columns + x1) * 4u + channel];
+    return clamp(mix(mix(g00, g10, fract(u)), mix(g01, g11, fract(u)), fract(v)), 0.25, 16.0);
+}
+
 bool isGreenSite(uint pattern, uint localX, uint localY) {
     uint p = min(pattern, 3u);
     uint xm = localX & 1u;
@@ -221,7 +247,10 @@ float normalizedAtUncached(int previewX, int previewY) {
     int baseY = int((y >> 1u) * 2u * decimation + (y & 1u));
 
     if (decimation <= 1u) {
-        return rawAtSource(baseX, baseY);
+        uint sx = min(pc.sourceWidth - 1u, sourceCropLeft() + uint(max(baseX, 0)));
+        uint sy = min(pc.sourceHeight - 1u, sourceCropTop() + uint(max(baseY, 0)));
+        uint site = ((y & 1u) << 1u) | (x & 1u);
+        return clamp(rawAtSource(baseX, baseY) * lensGain(sx, sy, site), 0.0, 1.0);
     }
 
     int radius = max(2, (int(decimation) / 2) * 2);
@@ -249,7 +278,10 @@ float normalizedAtUncached(int previewX, int previewY) {
     float structure = smoothstep(0.018, 0.090, localMax - localMin);
     float cleanAuthority = 1.0 - noiseBlend;
     float centreRecovery = 0.24 * structure * cleanAuthority;
-    return mix(filtered, centreSample, centreRecovery);
+    uint sx = min(pc.sourceWidth - 1u, sourceCropLeft() + uint(max(baseX, 0)));
+    uint sy = min(pc.sourceHeight - 1u, sourceCropTop() + uint(max(baseY, 0)));
+    uint site = ((y & 1u) << 1u) | (x & 1u);
+    return clamp(mix(filtered, centreSample, centreRecovery) * lensGain(sx, sy, site), 0.0, 1.0);
 }
 
 void prepareRenderBayerTile() {
