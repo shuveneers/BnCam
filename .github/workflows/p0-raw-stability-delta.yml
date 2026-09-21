@@ -34,7 +34,8 @@ jobs:
         run: |
           ./gradlew :app:testDebugUnitTest \
             --tests com.bncam.core.vulkan.P0RawPreviewStabilitySourceContractTest \
-            --tests com.bncam.core.vulkan.Phase11ARawPreviewAsyncSourceContractTest
+            --tests com.bncam.core.vulkan.Phase11ARawPreviewAsyncSourceContractTest \
+            --tests com.bncam.core.debug.Phase9TerminalFailureDiagnosticsSourceContractTest
 
       - name: Build delta directory
         shell: bash
@@ -44,6 +45,9 @@ jobs:
           mkdir -p "$ROOT/app/src/main/java/com/bncam/ui/screens/capture"
           mkdir -p "$ROOT/app/src/main/cpp/vulkan"
           mkdir -p "$ROOT/app/src/test/java/com/bncam/core/vulkan"
+          mkdir -p "$ROOT/app/src/main/java/com/bncam/core/debug"
+          mkdir -p "$ROOT/app/src/main/java/com/bncam/core/engine"
+          mkdir -p "$ROOT/app/src/test/java/com/bncam/core/debug"
 
           cp app/src/main/java/com/bncam/ui/screens/capture/RawPreviewRenderer.kt \
             "$ROOT/app/src/main/java/com/bncam/ui/screens/capture/RawPreviewRenderer.kt"
@@ -53,6 +57,12 @@ jobs:
             "$ROOT/app/src/test/java/com/bncam/core/vulkan/Phase11ARawPreviewAsyncSourceContractTest.kt"
           cp app/src/test/java/com/bncam/core/vulkan/P0RawPreviewStabilitySourceContractTest.kt \
             "$ROOT/app/src/test/java/com/bncam/core/vulkan/P0RawPreviewStabilitySourceContractTest.kt"
+          cp app/src/main/java/com/bncam/core/debug/ShotLogger.kt \
+            "$ROOT/app/src/main/java/com/bncam/core/debug/ShotLogger.kt"
+          cp app/src/main/java/com/bncam/core/engine/BnCameraManager.kt \
+            "$ROOT/app/src/main/java/com/bncam/core/engine/BnCameraManager.kt"
+          cp app/src/test/java/com/bncam/core/debug/Phase9TerminalFailureDiagnosticsSourceContractTest.kt \
+            "$ROOT/app/src/test/java/com/bncam/core/debug/Phase9TerminalFailureDiagnosticsSourceContractTest.kt"
 
           cat > "$ROOT/DELTA_MANIFEST.md" <<'EOF'
           # DELTA P0 — RAW Stability
@@ -121,6 +131,12 @@ jobs:
           - OutOfMemoryError / allocation failures
           - STREAM_RUNTIME_TELEMETRY
           - CAMERA2_CAPTURE_FAILED / CAMERA2_CAPTURE_BUFFER_LOST
+
+          ### Early-failure diagnostics recovery
+          - Router rejection/exception finalization now targets ShotLogger's actual active attempt
+            instead of reconstructing an ID from the physical shutter timestamp.
+          - On next launch after native/process termination, stale STARTED status plus the last
+            native-stage heartbeat overwrite public "Waiting for capture diagnostics" placeholders.
 
           ## Explicitly not fixed in P0
 
