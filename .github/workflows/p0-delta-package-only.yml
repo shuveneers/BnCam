@@ -23,11 +23,17 @@ jobs:
           mkdir -p "$ROOT/app/src/main/java/com/bncam/ui/screens/capture"
           mkdir -p "$ROOT/app/src/main/cpp/vulkan"
           mkdir -p "$ROOT/app/src/test/java/com/bncam/core/vulkan"
+          mkdir -p "$ROOT/app/src/main/java/com/bncam/core/debug"
+          mkdir -p "$ROOT/app/src/main/java/com/bncam/core/engine"
+          mkdir -p "$ROOT/app/src/test/java/com/bncam/core/debug"
 
           cp app/src/main/java/com/bncam/ui/screens/capture/RawPreviewRenderer.kt "$ROOT/app/src/main/java/com/bncam/ui/screens/capture/"
           cp app/src/main/cpp/vulkan/VulkanRuntime.cpp "$ROOT/app/src/main/cpp/vulkan/"
           cp app/src/test/java/com/bncam/core/vulkan/Phase11ARawPreviewAsyncSourceContractTest.kt "$ROOT/app/src/test/java/com/bncam/core/vulkan/"
           cp app/src/test/java/com/bncam/core/vulkan/P0RawPreviewStabilitySourceContractTest.kt "$ROOT/app/src/test/java/com/bncam/core/vulkan/"
+          cp app/src/main/java/com/bncam/core/debug/ShotLogger.kt "$ROOT/app/src/main/java/com/bncam/core/debug/"
+          cp app/src/main/java/com/bncam/core/engine/BnCameraManager.kt "$ROOT/app/src/main/java/com/bncam/core/engine/"
+          cp app/src/test/java/com/bncam/core/debug/Phase9TerminalFailureDiagnosticsSourceContractTest.kt "$ROOT/app/src/test/java/com/bncam/core/debug/"
 
           cat > "$ROOT/DELTA_MANIFEST.md" <<'EOF'
           # DELTA P0 — RAW Stability
@@ -45,6 +51,9 @@ jobs:
           ## Tests
           - app/src/test/java/com/bncam/core/vulkan/Phase11ARawPreviewAsyncSourceContractTest.kt
           - app/src/test/java/com/bncam/core/vulkan/P0RawPreviewStabilitySourceContractTest.kt
+          - app/src/main/java/com/bncam/core/debug/ShotLogger.kt
+          - app/src/main/java/com/bncam/core/engine/BnCameraManager.kt
+          - app/src/test/java/com/bncam/core/debug/Phase9TerminalFailureDiagnosticsSourceContractTest.kt
 
           ## Changes
           - Resolve each Phase-11A Vulkan preview submission on BnCamRawPreview before request/
@@ -55,6 +64,9 @@ jobs:
           - Reuse native preview slot 0 during P0 to reduce persistent slot-local GPU working sets.
           - Temporarily route RAW preview onto the production compute queue instead of the separate
             preview queue. The isolated preview command pool remains in use.
+          - Finalize the actual active ShotLogger attempt on early router rejection/exception.
+          - On next launch after native/process termination, replace public waiting placeholders
+            with recovered status/native-heartbeat evidence.
 
           ## Evidence behind P0
           SingleFrameRunner.kt and Raw16RenderInput.kt are byte-identical between 51a6306 and
