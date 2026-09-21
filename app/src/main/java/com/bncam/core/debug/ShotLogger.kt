@@ -356,6 +356,26 @@ class ShotLogger(
     }
 
     @Synchronized
+    fun finalizeActiveFailureWithPublicDiagnostics(
+        stage: String,
+        exception: Throwable
+    ): Boolean {
+        val attemptId = activeAttemptId
+        if (attemptId.isNullOrBlank() || activeAttemptState != CaptureStatusState.STARTED) {
+            safeLogW(
+                tag,
+                "Cannot finalize active failure for stage=$stage; activeAttemptId=$activeAttemptId state=$activeAttemptState"
+            )
+            return false
+        }
+        return finalizeFailureWithPublicDiagnostics(
+            attemptId = attemptId,
+            stage = stage,
+            exception = exception
+        )
+    }
+
+    @Synchronized
     fun finalizeFailureWithPublicDiagnostics(
         attemptId: String,
         stage: String,
@@ -473,6 +493,43 @@ class ShotLogger(
                             section = "STALE CAPTURE RECOVERY",
                             content = recovered
                         )
+
+                        // The public per-shot files are initialized before capture processing and
+                        // therefore survive a native abort as "Waiting for capture diagnostics".
+                        // On the next process launch, replace those placeholders with the durable
+                        // status/heartbeat evidence from the transient state directory.
+                        val publicFolderName = dir.name.removePrefix(TRANSIENT_STATE_PREFIX)
+                        if (publicFolderName.isNotBlank() && publicFolderName != dir.name) {
+                            val recoveredPublic = buildString {
+                                header("BNCAM RECOVERED CAPTURE FAILURE")
+                                section("Recovered Process-Termination Evidence")
+                                kv("Folder", publicFolderName)
+                                kv("Attempt ID", json.optString("attemptId", "unknown"))
+                                kv("Capture succeeded", "no")
+                                kv("Terminal state", CaptureStatusState.FAILED.name)
+                                kv("Failure stage", lastStage)
+                                kv("Exception class", json.optString("exceptionClass", "unknown"))
+                                kv("Exception message", json.optString("exceptionMessage", "unknown"))
+                                json.optString("lastNativeStage")
+                                    .takeIf { it.isNotBlank() }
+                                    ?.let { kv("Last native stage", it) }
+                                section("Recovered status.json")
+                                line(recovered)
+                            }
+                            listOf(
+                                SUMMARY_FILE,
+                                CAPTURE_FILE,
+                                ISP_FILE,
+                                WARNINGS_FILE,
+                                FRAME_FILE
+                            ).forEach { fileName ->
+                                PublicShotDiagnosticsStorage.publish(
+                                    publicFolderName,
+                                    fileName,
+                                    recoveredPublic
+                                )
+                            }
+                        }
                         safeLogW(tag, "Recovered stale STARTED status file in ${dir.name} (stageReached=$lastStage)")
                     }
                 }
