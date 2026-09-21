@@ -15,6 +15,7 @@ class Phase9TerminalFailureDiagnosticsSourceContractTest {
         val logger = File(root, "src/main/java/com/bncam/core/debug/ShotLogger.kt").readText()
 
         assertTrue(logger.contains("fun finalizeFailureWithPublicDiagnostics("))
+        assertTrue(logger.contains("fun finalizeActiveFailureWithPublicDiagnostics("))
         assertTrue(logger.contains("activeAttemptId != attemptId"))
         assertTrue(logger.contains("activeAttemptState != CaptureStatusState.STARTED"))
         assertTrue(logger.contains("UNAVAILABLE_BEFORE_TERMINAL_FAILURE"))
@@ -43,6 +44,19 @@ class Phase9TerminalFailureDiagnosticsSourceContractTest {
         assertTrue(manager.contains("stage = \"CAPTURE_SUBMISSION_REJECTED\""))
         assertTrue(manager.contains("Capture submission rejected: "))
         assertTrue(manager.contains("stage = \"CAPTURE_ROUTER_EXCEPTION\""))
-        assertTrue(manager.contains("shotLogger.finalizeFailureWithPublicDiagnostics("))
+        assertTrue(manager.contains("shotLogger.finalizeActiveFailureWithPublicDiagnostics("))
+        assertTrue(!manager.contains("attemptId = \"${activeLens.id}-$userShutterTimestampNs\""))
     }
+    @Test
+    fun staleProcessRecoveryReplacesPublicWaitingPlaceholders() {
+        val root = appDir()
+        val logger = File(root, "src/main/java/com/bncam/core/debug/ShotLogger.kt").readText()
+
+        assertTrue(logger.contains("val publicFolderName = dir.name.removePrefix(TRANSIENT_STATE_PREFIX)"))
+        assertTrue(logger.contains("BNCAM RECOVERED CAPTURE FAILURE"))
+        assertTrue(logger.contains("Recovered Process-Termination Evidence"))
+        assertTrue(logger.contains("PublicShotDiagnosticsStorage.publish("))
+        assertTrue(logger.contains("STALE_PROCESS_TERMINATED_AT_"))
+    }
+
 }
