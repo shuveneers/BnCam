@@ -6,61 +6,91 @@ import org.junit.Test
 
 class ColdRawSingleCaptureContractTest {
     private val manager = File("src/main/java/com/bncam/core/engine/BnCameraManager.kt").readText()
-    private val cold = manager.substringAfter("private suspend fun acquireColdRawSingle(")
-        .substringBefore("private suspend fun executeDedicatedFlashCapture(")
+    private val policy = File("src/main/java/com/bncam/core/capture/NearZslAnchorAdmissionPolicy.kt").readText()
 
-    @Test fun coldSingleUsesExistingRawProducerWithoutRebuildOrGpuWork() {
-        assertTrue(cold.contains("TEMPLATE_STILL_CAPTURE"))
-        assertTrue(cold.contains("builder.addTarget(reader.surface)"))
-        assertTrue(cold.contains("ImageFormat.RAW10 || format == ImageFormat.RAW_SENSOR"))
-        for (forbidden in listOf("createCaptureSession", "ImageReader.newInstance", "waitForPipelineReady",
-            "updatePreviewRepeatingRequest", "prewarm", "rawPreviewRenderer", "delay(", "sleep(")) {
-            assertFalse(forbidden, cold.contains(forbidden))
-        }
+    @Test
+    fun rawSingleUsesExistingRepeatingProducerInsteadOfDedicatedColdStill() {
+        assertFalse(manager.contains("private suspend fun acquireColdRawSingle("))
+        assertFalse(manager.contains("RAW_SINGLE_SOURCE=COLD_DIRECT_STILL"))
+        assertFalse(manager.contains("Cold RAW still failed:"))
+        assertTrue(manager.contains("rawShutterTicket = RawShutterTicket("))
+        assertTrue(manager.contains("rawShutterTicket = rawShutterTicket"))
+        assertTrue(manager.contains("FIRST_VALID_RAW_REPEATING_FRAME"))
     }
 
-    @Test fun rawSingleBypassesWarmReadinessButKeepsProducerValidation() {
+    @Test
+    fun rawSingleBypassesWarmReadinessAndAcceptsEmptyRing() {
         val gate = manager.substringAfter("val pipelineReady = if (rawSingle)")
             .substringBefore("else if (pinnedAnchorCanOwnAdmission)")
         assertTrue(gate.contains("requireWarmBuffer = false"))
         assertFalse(gate.contains("waitForPipelineReadyForCapture"))
-        assertTrue(manager.contains("if (!rawSingle && effectiveCaptureStrategy == CaptureStrategy.SINGLE_FRAME_ZSL"))
-        val readiness = manager.substringAfter("private fun pipelineReadinessReason(")
-            .substringBefore("private suspend fun waitForPipelineReadyForCapture(")
-        assertTrue(readiness.indexOf("sessionConfiguredGeneration != pipelineGeneration") <
-            readiness.indexOf("if (!requireWarmBuffer) return"))
+
+        val rawRoute = manager.substringAfter(
+            "check(pipelineGeneration == singleProducerGeneration) { \"RAW single producer changed\" }"
+        ).substringBefore(
+            "if (!rawSingle && effectiveCaptureStrategy == CaptureStrategy.SINGLE_FRAME_ZSL"
+        )
+        assertTrue(rawRoute.contains("healthAtEntry.completeFrames == 0"))
+        assertTrue(rawRoute.contains("awaitSingleNearZslAnchor("))
+        assertTrue(rawRoute.contains("artificialWarmBufferWaitMs=0"))
+        assertFalse(rawRoute.contains("4200L"))
+        assertFalse(rawRoute.contains("session.capture("))
     }
 
-    @Test fun warmAndColdSourcesRemainExplicitAndOnlySingleGetsFallback() {
-        assertTrue(manager.contains("val rawSingle = effectiveCaptureStrategy == CaptureStrategy.SINGLE_FRAME_ZSL"))
+    @Test
+    fun rawShutterTicketFreezesProducerIdentityWithoutRebuildingTopology() {
+        val ticket = manager.substringAfter("private data class RawShutterTicket(")
+            .substringBefore("private data class VendorOperationModeProbeState")
+        assertTrue(ticket.contains("pipelineGeneration"))
+        assertTrue(ticket.contains("sessionConfiguredGeneration"))
+        assertTrue(ticket.contains("sessionEpoch"))
+        assertTrue(ticket.contains("logicalCameraId"))
+        assertTrue(ticket.contains("physicalCameraId"))
+        assertTrue(ticket.contains("format"))
+        assertTrue(ticket.contains("ringEventSequenceAtShutter"))
+        assertTrue(ticket.contains("controlRequestEpochAtShutter"))
+        assertTrue(ticket.contains("pendingPairsAtShutter"))
+
+        val await = manager.substringAfter("private suspend fun awaitSingleNearZslAnchor(")
+            .substringBefore("private fun shouldRequestDefaultRawShutterMotionAnalysis")
+        assertTrue(await.contains("rawTicketStillValid()"))
+        assertTrue(await.contains("FIRST_VALID_RAW_REPEATING_FRAME"))
+        for (forbidden in listOf("createCaptureSession", "ImageReader.newInstance", "TEMPLATE_STILL_CAPTURE")) {
+            assertFalse(forbidden, await.contains(forbidden))
+        }
+    }
+
+    @Test
+    fun warmAndColdSourcesRemainTruthfullyDistinguished() {
         assertTrue(manager.contains("RAW_SINGLE_SOURCE=NEAR_ZSL_PRE_SHUTTER"))
-        assertTrue(manager.contains("RAW_SINGLE_SOURCE=COLD_DIRECT_STILL"))
-        assertTrue(manager.contains("if (preleasedSingleAnchor == null) {\n                    acquireColdRawSingle") ||
-            manager.replace("\r\n", "\n").contains("if (preleasedSingleAnchor == null) {\n                    acquireColdRawSingle"))
-        assertTrue(manager.contains("reservedAnchor = coldSingleAnchor ?: preleasedSingleAnchor?.lease?.takeIf { rawSingle }"))
+        assertTrue(manager.contains("\"NEAR_ZSL_PRE_SHUTTER_LATE_PAIR\""))
+        assertTrue(manager.contains("\"DEGRADED_PRE_SHUTTER\""))
+        assertTrue(manager.contains("\"FIRST_VALID_RAW_REPEATING_FRAME\""))
+        assertTrue(manager.contains("RAW_SHUTTER_ARTIFICIAL_WARM_BUFFER_WAIT_MS=0"))
     }
 
-    @Test fun cancellationShutdownAndGenerationRetireOwnership() {
-        assertTrue(cold.contains("!acquisitionJob.isActive || !resultReady.isActive"))
-        assertTrue(cold.contains("pipelineGeneration != expectedGeneration"))
-        assertTrue(cold.contains("FrameRingEventType.BUFFER_CLEARED"))
-        assertTrue(cold.contains("lifecycle.cancel()"))
-        assertTrue(cold.contains("resultReady.cancel()"))
-        assertTrue(manager.contains("coldRawCaptureJob.get()?.cancel"))
-        assertTrue(manager.contains("coldSingleAnchor?.release()"))
-        assertTrue(cold.contains("onAcquired(lease)"))
+    @Test
+    fun selectedRawAnchorIsReservedThroughRunnerDispatch() {
+        assertTrue(manager.contains("reservedAnchor = preleasedSingleAnchor?.lease?.takeIf { rawSingle }"))
+        assertTrue(manager.contains("preleasedSingleAnchor!!.frame.controlRequestEpoch"))
+        assertFalse(manager.contains("reservedAnchor = coldSingleAnchor"))
+        assertFalse(manager.contains("coldSingleAnchor?.release()"))
     }
 
-    @Test fun requestedFrameIsExactAndCannotBeReplacedByRepeatingCandidate() {
-        assertTrue(cold.contains("awaitAndLeaseExactRequestFrame"))
-        assertTrue(cold.contains("submission.prepared.tag.controlRequestEpoch"))
-        assertTrue(cold.contains("if (!provenance.exact || timestamp == null || timestamp <= 0L)"))
-        val collector = File("src/main/java/com/bncam/core/capture/ShutterCandidateCollector.kt").readText()
-        assertTrue(collector.contains("frames = listOf(pair)"))
-        assertTrue(collector.contains("pair.image!!.timestamp == pair.timestamp"))
-        val runner = File("src/main/java/com/bncam/core/runners/SingleFrameRunner.kt").readText()
-        assertTrue(runner.contains("reservedAnchor = reservedAnchor"))
-        assertTrue(runner.contains("frame.timestamp == shutterTimestampNs"))
-        assertTrue(runner.contains("frame.controlRequestEpoch == currentSubmittedControlRequestEpochAtShutter"))
+    @Test
+    fun ordinaryColdRawDeadlineIsSubSecondAndLongExposureIsPhysicalNotWarmup() {
+        assertTrue(policy.contains("nominalFirstValidWaitMs"))
+        assertTrue(policy.contains("coerceIn(300L, 900L)"))
+        assertTrue(policy.contains("physicalFrameMs + 900.0"))
+        assertTrue(policy.contains("artificialWarmBufferWaitMs = 0L"))
+    }
+
+    @Test
+    fun rawShutterFeedbackIsAcceptedBeforeFramePairCompletes() {
+        val rawRoute = manager.substringAfter("RAW_SHUTTER_ACCEPTED")
+            .substringBefore("if (!rawSingle && effectiveCaptureStrategy == CaptureStrategy.SINGLE_FRAME_ZSL")
+        assertTrue(rawRoute.contains("mediaActionSound.play(MediaActionSound.SHUTTER_CLICK)"))
+        assertTrue(rawRoute.indexOf("mediaActionSound.play(MediaActionSound.SHUTTER_CLICK)") <
+            rawRoute.indexOf("awaitSingleNearZslAnchor("))
     }
 }

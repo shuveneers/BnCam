@@ -7,14 +7,29 @@ import org.junit.Test
 
 class NearZslAnchorAdmissionPolicyTest {
     @Test
-    fun coldStartSkipsImpossiblePreShutterPairingWait() {
+    fun coldStartWithoutPendingPairSkipsImpossiblePreShutterPairingWait() {
         val budget = NearZslAnchorAdmissionPolicy.resolveBudget(
             frameDurationMedianMs = 50.0,
             pairCompletionLagMedianMs = 40.0,
-            coldStartAtUserShutter = true
+            coldStartAtUserShutter = true,
+            pendingPairAtShutter = false
         )
         assertEquals(0L, budget.preShutterPairingGraceMs)
-        assertTrue(budget.firstValidRepeatingFrameWaitMs >= 300L)
+        assertTrue(budget.firstValidRepeatingFrameWaitMs in 300L..900L)
+        assertEquals(0L, budget.artificialWarmBufferWaitMs)
+    }
+
+    @Test
+    fun coldStartWithPendingPairKeepsOnlyShortTransportGrace() {
+        val budget = NearZslAnchorAdmissionPolicy.resolveBudget(
+            frameDurationMedianMs = 50.0,
+            pairCompletionLagMedianMs = 40.0,
+            coldStartAtUserShutter = true,
+            pendingPairAtShutter = true
+        )
+        assertEquals(70L, budget.preShutterPairingGraceMs)
+        assertTrue(budget.firstValidRepeatingFrameWaitMs in 300L..900L)
+        assertEquals(0L, budget.artificialWarmBufferWaitMs)
     }
 
     @Test
@@ -26,6 +41,22 @@ class NearZslAnchorAdmissionPolicyTest {
         )
         assertEquals(70L, budget.preShutterPairingGraceMs)
         assertTrue(budget.firstValidRepeatingFrameWaitMs in 300L..900L)
+    }
+
+
+    @Test
+    fun longPhysicalExposureExtendsOnlyPhysicalDeadlineNotWarmBufferDelay() {
+        val budget = NearZslAnchorAdmissionPolicy.resolveBudget(
+            frameDurationMedianMs = 100.0,
+            pairCompletionLagMedianMs = 60.0,
+            coldStartAtUserShutter = true,
+            pendingPairAtShutter = false,
+            exposureTimeMs = 1_500.0
+        )
+        assertEquals(1_500.0, budget.expectedPhysicalFrameMs, 0.001)
+        assertTrue(budget.firstValidRepeatingFrameWaitMs >= 1_620L)
+        assertTrue(budget.firstValidRepeatingFrameWaitMs < 2_500L)
+        assertEquals(0L, budget.artificialWarmBufferWaitMs)
     }
 
     @Test

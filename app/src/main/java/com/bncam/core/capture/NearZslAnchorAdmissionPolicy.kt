@@ -10,7 +10,10 @@ data class NearZslAnchorAdmissionBudget(
     val preShutterPairingGraceMs: Long,
     val firstValidRepeatingFrameWaitMs: Long,
     val maximumTransportAgeMs: Double,
-    val maximumDegradedPreShutterAgeMs: Double
+    val maximumDegradedPreShutterAgeMs: Double,
+    val expectedPhysicalFrameMs: Double,
+    val expectedPairCompletionLagMs: Double,
+    val artificialWarmBufferWaitMs: Long = 0L
 )
 
 data class NearZslEffectiveShutter(
@@ -25,7 +28,9 @@ object NearZslAnchorAdmissionPolicy {
     fun resolveBudget(
         frameDurationMedianMs: Double?,
         pairCompletionLagMedianMs: Double?,
-        coldStartAtUserShutter: Boolean
+        coldStartAtUserShutter: Boolean,
+        pendingPairAtShutter: Boolean = false,
+        exposureTimeMs: Double? = null
     ): NearZslAnchorAdmissionBudget {
         val frameDurationMs = frameDurationMedianMs
             ?.takeIf { it.isFinite() && it > 0.0 }
@@ -33,13 +38,34 @@ object NearZslAnchorAdmissionPolicy {
         val pairLagMs = pairCompletionLagMedianMs
             ?.takeIf { it.isFinite() && it >= 0.0 }
             ?: DEFAULT_PAIR_COMPLETION_LAG_MS
-        val preShutterGraceMs = if (coldStartAtUserShutter) {
+        val exposureMs = exposureTimeMs
+            ?.takeIf { it.isFinite() && it > 0.0 }
+            ?: 0.0
+        val physicalFrameMs = maxOf(frameDurationMs, exposureMs)
+
+        // A completely cold producer has no pre-shutter pair to wait for. If Image/metadata for a
+        // frame is already pending at the exact press, however, allow only the measured transport
+        // grace needed to complete that physically pre-shutter pair.
+        val preShutterGraceMs = if (coldStartAtUserShutter && !pendingPairAtShutter) {
             0L
         } else {
             ceil(pairLagMs + 25.0).toLong().coerceIn(70L, 180L)
         }
-        val firstValidWaitMs =
-            ceil(frameDurationMs + pairLagMs + 180.0).toLong().coerceIn(300L, 900L)
+
+        // Shutter admission never waits for ring warm-up. The deadline represents one legitimate
+        // sensor frame/exposure plus observed pair delivery and bounded scheduling margin.
+        // Ordinary short exposures remain sub-second; a genuinely long physical exposure is
+        // allowed to exceed that without being mislabeled as warm-buffer latency.
+        val nominalFirstValidWaitMs =
+            ceil(physicalFrameMs + pairLagMs + 180.0).toLong()
+        val firstValidWaitMs = if (physicalFrameMs <= 500.0) {
+            nominalFirstValidWaitMs.coerceIn(300L, 900L)
+        } else {
+            val physicalFloorMs = ceil(physicalFrameMs + 120.0).toLong()
+            val physicalCeilingMs = ceil(physicalFrameMs + 900.0).toLong()
+            nominalFirstValidWaitMs.coerceIn(physicalFloorMs, physicalCeilingMs)
+        }
+
         val transportAgeMs =
             (frameDurationMs * 2.5 + pairLagMs + 80.0).coerceIn(180.0, 450.0)
         val degradedPreShutterAgeMs =
@@ -48,7 +74,10 @@ object NearZslAnchorAdmissionPolicy {
             preShutterPairingGraceMs = preShutterGraceMs,
             firstValidRepeatingFrameWaitMs = firstValidWaitMs,
             maximumTransportAgeMs = transportAgeMs,
-            maximumDegradedPreShutterAgeMs = degradedPreShutterAgeMs
+            maximumDegradedPreShutterAgeMs = degradedPreShutterAgeMs,
+            expectedPhysicalFrameMs = physicalFrameMs,
+            expectedPairCompletionLagMs = pairLagMs,
+            artificialWarmBufferWaitMs = 0L
         )
     }
 

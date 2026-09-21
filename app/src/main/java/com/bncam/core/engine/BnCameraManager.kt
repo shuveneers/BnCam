@@ -335,6 +335,22 @@ private data class NearZslSingleAnchorReservation(
     val physicalAgeAtUserShutterMs: Double?
 )
 
+private data class RawShutterTicket(
+    val attemptId: Long,
+    val userShutterTimestampNs: Long,
+    val pipelineGeneration: Int,
+    val sessionConfiguredGeneration: Int,
+    val sessionEpoch: Long,
+    val logicalCameraId: String,
+    val physicalCameraId: String?,
+    val format: Int,
+    val ringEventSequenceAtShutter: Long,
+    val controlRequestEpochAtShutter: Long,
+    val completeFramesAtShutter: Int,
+    val pendingPairsAtShutter: Int,
+    val expectedExposureTimeNs: Long?
+)
+
 
 private data class VendorOperationModeProbeState(
     val lensId: String,
@@ -3731,23 +3747,58 @@ class BnCameraManager(private val context: Context) {
         return resolved.timestampNs to resolved.domain
     }
 
+    private fun expectedRawSingleExposureTimeNs(expectedGeneration: Int): Long? {
+        requestedManualExposureNs?.takeIf { it > 0L }?.let { return it }
+        runCatching {
+            currentCaptureRequest?.get(CaptureRequest.SENSOR_EXPOSURE_TIME)
+        }.getOrNull()?.takeIf { it > 0L }?.let { return it }
+        if (lastCaptureResultGeneration == expectedGeneration) {
+            lastCaptureResult?.get(CaptureResult.SENSOR_EXPOSURE_TIME)
+                ?.takeIf { it > 0L }
+                ?.let { return it }
+        }
+        return null
+    }
+
     private suspend fun awaitSingleNearZslAnchor(
         attemptId: Long,
         userShutterTimestampNs: Long,
         expectedGeneration: Int,
         expectedFormat: Int,
-        coldStartAtUserShutter: Boolean
+        coldStartAtUserShutter: Boolean,
+        rawShutterTicket: RawShutterTicket? = null
     ): NearZslSingleAnchorReservation? {
         val startNs = android.os.SystemClock.elapsedRealtimeNanos()
         val timing = ringBuffer.streamTimingEstimate()
         val budget = NearZslAnchorAdmissionPolicy.resolveBudget(
             frameDurationMedianMs = timing.frameDurationMedianMs,
             pairCompletionLagMedianMs = timing.pairCompletionLagMedianMs,
-            coldStartAtUserShutter = coldStartAtUserShutter
+            coldStartAtUserShutter = coldStartAtUserShutter,
+            pendingPairAtShutter = rawShutterTicket?.pendingPairsAtShutter?.let { it > 0 } ?: false,
+            exposureTimeMs = rawShutterTicket?.expectedExposureTimeNs
+                ?.takeIf { it > 0L }
+                ?.div(1_000_000.0)
         )
         val preShutterPairingGraceMs = budget.preShutterPairingGraceMs
         val firstValidWaitMs = budget.firstValidRepeatingFrameWaitMs
         val maximumTransportAgeMs = budget.maximumTransportAgeMs
+
+        fun rawTicketStillValid(): Boolean {
+            val ticket = rawShutterTicket ?: return true
+            if (ticket.userShutterTimestampNs != userShutterTimestampNs ||
+                pipelineGeneration != ticket.pipelineGeneration ||
+                sessionConfiguredGeneration != ticket.sessionConfiguredGeneration ||
+                activeConfiguredSessionEpoch != ticket.sessionEpoch ||
+                activeZslFormat != ticket.format
+            ) {
+                return false
+            }
+            val identity = synchronized(pipelineLock) { activePipelineIdentity } ?: return false
+            return identity.logicalCameraId == ticket.logicalCameraId &&
+                identity.physicalCameraId == ticket.physicalCameraId
+        }
+
+        if (!rawTicketStillValid()) return null
 
         // The strict exposure-product selector was already given one atomic chance at the exact
         // shutter entry. If it yielded no anchor, exposure matching becomes a quality preference:
@@ -3761,7 +3812,8 @@ class BnCameraManager(private val context: Context) {
         fun elapsedMs(): Double =
             (android.os.SystemClock.elapsedRealtimeNanos() - startNs).coerceAtLeast(0L) / 1_000_000.0
 
-        var eventSequence = ringBuffer.currentEventSequence()
+        var eventSequence = rawShutterTicket?.ringEventSequenceAtShutter
+            ?: ringBuffer.currentEventSequence()
         val preShutterDeadlineNs = startNs + preShutterPairingGraceMs * 1_000_000L
         while (preShutterPairingGraceMs > 0L &&
             android.os.SystemClock.elapsedRealtimeNanos() <= preShutterDeadlineNs
@@ -3781,7 +3833,10 @@ class BnCameraManager(private val context: Context) {
                         nearZslPhysicalAgeAtShutterMs(candidate, userShutterTimestampNs)
                 )
             }
-            if (pipelineGeneration != expectedGeneration || ringBuffer.currentGeneration() != expectedGeneration) {
+            if (pipelineGeneration != expectedGeneration ||
+                ringBuffer.currentGeneration() != expectedGeneration ||
+                !rawTicketStillValid()
+            ) {
                 return null
             }
             kotlinx.coroutines.withTimeoutOrNull(25L) { ringBuffer.awaitEventAfter(eventSequence) }
@@ -3827,17 +3882,32 @@ class BnCameraManager(private val context: Context) {
             )?.let { candidate ->
                 val (effectiveTimestamp, domain) =
                     effectiveShutterForRepeatingAnchor(candidate, userShutterTimestampNs)
+                val physicalAgeMs =
+                    nearZslPhysicalAgeAtShutterMs(candidate, userShutterTimestampNs)
+                val temporalClass = when {
+                    physicalAgeMs != null && physicalAgeMs >= 0.0 &&
+                        NearZslAnchorAdmissionPolicy.isGenuinePreShutterAge(physicalAgeMs) ->
+                        "GENUINE_PRE_SHUTTER_LATE_PAIR"
+                    physicalAgeMs != null && physicalAgeMs >= 0.0 ->
+                        "DEGRADED_PRE_SHUTTER_ANCHOR"
+                    rawShutterTicket != null ->
+                        "FIRST_VALID_RAW_REPEATING_FRAME"
+                    else ->
+                        "FIRST_VALID_WARM_REPEATING_FRAME"
+                }
                 return NearZslSingleAnchorReservation(
                     candidate = candidate,
-                    temporalClass = "FIRST_VALID_WARM_REPEATING_FRAME",
+                    temporalClass = temporalClass,
                     effectiveShutterTimestampNs = effectiveTimestamp,
                     effectiveShutterTimestampDomain = domain,
                     waitMs = elapsedMs(),
-                    physicalAgeAtUserShutterMs =
-                        nearZslPhysicalAgeAtShutterMs(candidate, userShutterTimestampNs)
+                    physicalAgeAtUserShutterMs = physicalAgeMs
                 )
             }
-            if (pipelineGeneration != expectedGeneration || ringBuffer.currentGeneration() != expectedGeneration) {
+            if (pipelineGeneration != expectedGeneration ||
+                ringBuffer.currentGeneration() != expectedGeneration ||
+                !rawTicketStillValid()
+            ) {
                 return null
             }
             kotlinx.coroutines.withTimeoutOrNull(30L) { ringBuffer.awaitEventAfter(eventSequence) }
@@ -11549,7 +11619,6 @@ class BnCameraManager(private val context: Context) {
      */
     fun shutdown(reason: String = "MANAGER_OWNER_DESTROYED") {
         if (!managerShutdownRequested.compareAndSet(false, true)) return
-        coldRawCaptureJob.get()?.cancel(kotlinx.coroutines.CancellationException("Camera manager shutdown"))
 
         // Stop accepting new UI publication immediately. Camera/resource retirement itself stays
         // serialized on sessionTransitionScope and cannot race an in-flight lens/session change.
@@ -15731,115 +15800,6 @@ class BnCameraManager(private val context: Context) {
         }
     }
 
-    private val coldRawCaptureJob = java.util.concurrent.atomic.AtomicReference<kotlinx.coroutines.Job?>(null)
-
-    private suspend fun acquireColdRawSingle(
-        recipe: com.bncam.core.capture.CaptureRecipe,
-        activeLens: LensInfo,
-        focus: FocusCaptureContext,
-        expectedGeneration: Int,
-        onAcquired: (com.bncam.core.buffer.FrameLease) -> Unit
-    ): Unit = kotlinx.coroutines.coroutineScope {
-        val acquisitionJob = coroutineContext[kotlinx.coroutines.Job]!!
-        check(coldRawCaptureJob.compareAndSet(null, acquisitionJob))
-        val resultReady = kotlinx.coroutines.CompletableDeferred<TotalCaptureResult>()
-        val lifecycle = launch(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) {
-            var sequence = ringBuffer.currentEventSequence()
-            while (true) {
-                if (pipelineGeneration != expectedGeneration || managerShutdownRequested.get()) {
-                    acquisitionJob.cancel(kotlinx.coroutines.CancellationException("Cold RAW producer retired"))
-                    break
-                }
-                val event = ringBuffer.awaitEventAfter(sequence)
-                if (ringBuffer.eventsAfter(sequence).any {
-                        it.pipelineGeneration != expectedGeneration ||
-                            it.type == com.bncam.core.buffer.FrameRingEventType.BUFFER_CLEARED
-                    }) {
-                    acquisitionJob.cancel(kotlinx.coroutines.CancellationException("Cold RAW ring cleared"))
-                    break
-                }
-                sequence = event.sequence
-            }
-        }
-        try {
-            val session = checkNotNull(captureSession)
-            val device = checkNotNull(cameraDevice)
-            val reader = checkNotNull(imageReader)
-            val format = reader.imageFormat
-            check(format == ImageFormat.RAW10 || format == ImageFormat.RAW_SENSOR)
-            val builder = createPipelineCaptureRequestBuilder(device, CameraDevice.TEMPLATE_STILL_CAPTURE)
-            builder.addTarget(reader.surface)
-            val characteristics = cameraManager.getCameraCharacteristics(device.id)
-            applyViewfinderCam2ApiSettings(
-                requestBuilder = builder, characteristics = characteristics,
-                cameraId = device.id, activeLensId = activeLens.id,
-                opticalStabilization = recipe.executionSettings.opticalStabilization,
-                hotPixelMode = recipe.executionSettings.hotPixelMode,
-                noiseReductionHint = recipe.executionSettings.noiseReductionHint,
-                edgeModeHint = recipe.executionSettings.edgeModeHint,
-                tonemapHint = recipe.executionSettings.tonemapHint,
-                antiBanding = recipe.executionSettings.antiBanding
-            )
-            applyMeteringPolicy(builder)
-            applyExposurePolicy(builder)
-            applyLiveWhiteBalancePolicy(builder)
-            applyAuthoritativeFocusToStillBuilder(builder, checkNotNull(currentCaptureRequest), focus, "COLD_RAW_SINGLE")
-            builder.set(CaptureRequest.CONTROL_CAPTURE_INTENT, CaptureRequest.CONTROL_CAPTURE_INTENT_STILL_CAPTURE)
-            builder.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_OFF)
-            val callback = object : CameraCaptureSession.CaptureCallback() {
-                override fun onCaptureCompleted(s: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
-                    if (!acquisitionJob.isActive || !resultReady.isActive) return
-                    if (s !== session || pipelineGeneration != expectedGeneration || captureSession !== session) return
-                    val provenance = controlRequestEpochTracker.resolveTag(request.tag, expectedGeneration)
-                    val metadata = frameSensorMetadataSnapshot(result, expectedGeneration, device.id)
-                    val timestamp = metadata?.sensorTimestampNs ?: result.get(CaptureResult.SENSOR_TIMESTAMP)
-                    if (!provenance.exact || timestamp == null || timestamp <= 0L) {
-                        resultReady.completeExceptionally(IllegalStateException("Cold RAW still has no exact timestamp/provenance"))
-                        return
-                    }
-                    ringBuffer.addMetadata(timestamp, result, expectedGeneration, provenance.provenance, metadata)
-                    captureAttempts.captureResultReceived()
-                    resultReady.complete(result)
-                }
-
-                override fun onCaptureFailed(s: CameraCaptureSession, request: CaptureRequest, failure: android.hardware.camera2.CaptureFailure) {
-                    resultReady.completeExceptionally(IllegalStateException("Cold RAW still failed: ${failure.reason}"))
-                }
-
-                override fun onCaptureSequenceAborted(s: CameraCaptureSession, sequenceId: Int) {
-                    resultReady.completeExceptionally(IllegalStateException("Cold RAW still aborted: $sequenceId"))
-                }
-            }
-            check(!managerShutdownRequested.get() && pipelineGeneration == expectedGeneration &&
-                sessionConfiguredGeneration == expectedGeneration && captureSession === session && imageReader === reader)
-            val submission = submitOneShotRequestWithProvenance(
-                session, builder, callback, backgroundHandler, "COLD_RAW_SINGLE", expectedGeneration
-            )
-            // Existing still-delivery failure bounds, not a warm-up delay. Success continues on
-            // the first exact pair; no repeating recovery or producer rebuild occurs.
-            val result = withTimeout(2500L) { resultReady.await() }
-            val timestamp = frameSensorMetadataSnapshot(result, expectedGeneration, device.id)?.sensorTimestampNs
-                ?: checkNotNull(result.get(CaptureResult.SENSOR_TIMESTAMP))
-            val lease = checkNotNull(ringBuffer.awaitAndLeaseExactRequestFrame(
-                timestamp, expectedGeneration, submission.prepared.tag.controlRequestEpoch, format, 1600L
-            )) { "Cold RAW still exact Image/result pair unavailable" }
-            if (!acquisitionJob.isActive || managerShutdownRequested.get() || pipelineGeneration != expectedGeneration) {
-                lease.release()
-                throw kotlinx.coroutines.CancellationException("Cold RAW producer retired before handoff")
-            }
-            traceCaptureRuntime("RAW_SINGLE_SOURCE=COLD_DIRECT_STILL generation=$expectedGeneration " +
-                "logicalCamera=${device.id} physicalCamera=${lease.pair.sensorMetadataSnapshot?.route?.physicalCameraId} " +
-                "format=${formatName(format)} imageTimestamp=${lease.pair.timestamp} resultTimestamp=$timestamp " +
-                "epoch=${submission.prepared.tag.controlRequestEpoch}")
-            // Publish ownership before coroutineScope's cancellable return boundary.
-            onAcquired(lease)
-        } finally {
-            lifecycle.cancel()
-            resultReady.cancel()
-            coldRawCaptureJob.compareAndSet(acquisitionJob, null)
-        }
-    }
-
     private suspend fun executeDedicatedFlashCapture(
         activeProfile: CameraProfile,
         activeLens: LensInfo,
@@ -16336,7 +16296,8 @@ class BnCameraManager(private val context: Context) {
         var preleasedNormalMultiAnchor: FrameRingBuffer.LeasedCandidate? = null
         var preleasedProvisionalNearZslAnchor: FrameRingBuffer.LeasedCandidate? = null
         var preleasedSingleAnchor: FrameRingBuffer.LeasedCandidate? = null
-        var coldSingleAnchor: com.bncam.core.buffer.FrameLease? = null
+        var rawShutterTicket: RawShutterTicket? = null
+        var rawShutterSoundPlayedAtAcceptance = false
         var singleAnchorTemporalClass = "UNRESOLVED"
         var singleAnchorEffectiveShutterTimestampNs = userShutterTimestampNs
         var singleAnchorEffectiveShutterTimestampDomain = "ELAPSED_REALTIME"
@@ -16875,14 +16836,105 @@ class BnCameraManager(private val context: Context) {
 
             if (rawSingle) {
                 check(pipelineGeneration == singleProducerGeneration) { "RAW single producer changed" }
+                val identityAtShutter = synchronized(pipelineLock) { activePipelineIdentity }
+                    ?: throw IllegalStateException("RAW producer identity disappeared before shutter admission")
+                rawShutterTicket = RawShutterTicket(
+                    attemptId = attemptId,
+                    userShutterTimestampNs = userShutterTimestampNs,
+                    pipelineGeneration = singleProducerGeneration,
+                    sessionConfiguredGeneration = sessionConfiguredGeneration,
+                    sessionEpoch = activeConfiguredSessionEpoch,
+                    logicalCameraId = identityAtShutter.logicalCameraId,
+                    physicalCameraId = identityAtShutter.physicalCameraId,
+                    format = activeZslFormat,
+                    ringEventSequenceAtShutter = ringBuffer.currentEventSequence(),
+                    controlRequestEpochAtShutter = currentSubmittedControlRequestEpoch(),
+                    completeFramesAtShutter = healthAtEntry.completeFrames,
+                    pendingPairsAtShutter = healthAtEntry.pendingPairs,
+                    expectedExposureTimeNs = expectedRawSingleExposureTimeNs(singleProducerGeneration)
+                )
+                traceCaptureRuntime(
+                    "RAW_SHUTTER_ACCEPTED attemptId=$attemptId generation=$singleProducerGeneration " +
+                        "format=${formatName(activeZslFormat)} logicalCamera=${identityAtShutter.logicalCameraId} " +
+                        "physicalCamera=${identityAtShutter.physicalCameraId ?: "none"} " +
+                        "ringCompleteAtShutter=${rawShutterTicket?.completeFramesAtShutter ?: healthAtEntry.completeFrames} " +
+                        "pendingPairsAtShutter=${rawShutterTicket?.pendingPairsAtShutter ?: healthAtEntry.pendingPairs} " +
+                        "ringEventSequenceAtShutter=${rawShutterTicket?.ringEventSequenceAtShutter ?: -1L} " +
+                        "controlRequestEpochAtShutter=${rawShutterTicket?.controlRequestEpochAtShutter ?: -1L} " +
+                        "producerReady=true bufferWarm=${healthAtEntry.captureReady} " +
+                        "expectedExposureNs=${rawShutterTicket?.expectedExposureTimeNs ?: 0L} artificialWarmBufferWaitMs=0"
+                )
+                if (recipe.executionSettings.cameraSoundEnabled && !managerShutdownRequested.get()) {
+                    mediaActionSound.play(MediaActionSound.SHUTTER_CLICK)
+                    rawShutterSoundPlayedAtAcceptance = true
+                }
+
                 if (preleasedSingleAnchor == null) {
-                    acquireColdRawSingle(recipe, activeLens, focusCaptureContextAtShutter, singleProducerGeneration) {
-                        coldSingleAnchor = it
+                    val reservation = awaitSingleNearZslAnchor(
+                        attemptId = attemptId,
+                        userShutterTimestampNs = userShutterTimestampNs,
+                        expectedGeneration = singleProducerGeneration,
+                        expectedFormat = activeZslFormat,
+                        coldStartAtUserShutter = healthAtEntry.completeFrames == 0,
+                        rawShutterTicket = rawShutterTicket
+                    )
+                    if (reservation == null) {
+                        finishReason = "raw_single_producer_delivery_timeout"
+                        _captureContractError.value = "RAW capture frame was unavailable."
+                        traceCaptureRuntime(
+                            "RAW_SHUTTER_FAILURE attemptId=$attemptId reason=$finishReason " +
+                                "generation=$singleProducerGeneration format=${formatName(activeZslFormat)} " +
+                                "ringCompleteAtShutter=${healthAtEntry.completeFrames} pendingPairsAtShutter=${healthAtEntry.pendingPairs} " +
+                                "artificialWarmBufferWaitMs=0 health=${ringBuffer.healthDiagnostics(userShutterTimestampNs)}"
+                        )
+                        finishCaptureAttempt(attemptId, null, finishReason)
+                        return@withContext null
                     }
-                    singleAnchorTemporalClass = "COLD_DIRECT_STILL"
+                    preleasedSingleAnchor = reservation.candidate
+                    singleAnchorTemporalClass = reservation.temporalClass
+                    singleAnchorEffectiveShutterTimestampNs = reservation.effectiveShutterTimestampNs
+                    singleAnchorEffectiveShutterTimestampDomain = reservation.effectiveShutterTimestampDomain
+                    traceCaptureRuntime(
+                        "RAW_SHUTTER_ANCHOR_RESERVED attemptId=$attemptId source=$singleAnchorTemporalClass " +
+                            "waitMs=${reservation.waitMs} physicalAgeMs=${reservation.physicalAgeAtUserShutterMs ?: Double.NaN} " +
+                            "frameVersion=${reservation.candidate.frameVersion} imageTimestamp=${reservation.candidate.timestampNs} " +
+                            "artificialWarmBufferWaitMs=0"
+                    )
                 } else {
-                    traceCaptureRuntime("RAW_SINGLE_SOURCE=NEAR_ZSL_PRE_SHUTTER generation=$singleProducerGeneration " +
-                        "format=${formatName(activeZslFormat)} imageTimestamp=${preleasedSingleAnchor?.timestampNs}")
+                    singleAnchorTemporalClass = "GENUINE_PRE_SHUTTER_IMMEDIATE"
+                    traceCaptureRuntime(
+                        "RAW_SINGLE_SOURCE=NEAR_ZSL_PRE_SHUTTER generation=$singleProducerGeneration " +
+                            "format=${formatName(activeZslFormat)} imageTimestamp=${preleasedSingleAnchor?.timestampNs} " +
+                            "artificialWarmBufferWaitMs=0"
+                    )
+                }
+
+                preleasedSingleAnchor?.let { selected ->
+                    val frame = selected.frame
+                    val nowNs = android.os.SystemClock.elapsedRealtimeNanos()
+                    val pairCompleteNs = frame.pairCompleteElapsedNs.takeIf { it > 0L }
+                        ?: maxOf(frame.imageArrivalElapsedNs, frame.metadataArrivalElapsedNs)
+                    val fullExposureEndNs = if (frame.sensorTimestampComparableToElapsedRealtime) {
+                        NearZslEligibilityPolicy.calculateFullExposureEndNs(frame)
+                    } else null
+                    val physicalExposureWaitMs = fullExposureEndNs
+                        ?.let { ((it - userShutterTimestampNs).coerceAtLeast(0L) / 1_000_000.0) }
+                    val pairingReferenceNs = fullExposureEndNs
+                        ?.let { maxOf(userShutterTimestampNs, it) }
+                        ?: userShutterTimestampNs
+                    val pairingWaitMs =
+                        ((pairCompleteNs - pairingReferenceNs).coerceAtLeast(0L) / 1_000_000.0)
+                    val totalAcquisitionWaitMs =
+                        ((nowNs - userShutterTimestampNs).coerceAtLeast(0L) / 1_000_000.0)
+                    traceCaptureRuntime(
+                        "RAW_SHUTTER_RESULT ticketId=${rawShutterTicket?.attemptId ?: attemptId} " +
+                            "source=$singleAnchorTemporalClass generation=$singleProducerGeneration " +
+                            "format=${formatName(activeZslFormat)} selectedSensorTimestampNs=${frame.timestamp} " +
+                            "selectedPairCompleteElapsedNs=$pairCompleteNs " +
+                            "physicalExposureWaitMs=${physicalExposureWaitMs ?: Double.NaN} " +
+                            "pairingWaitMs=$pairingWaitMs totalAcquisitionWaitMs=$totalAcquisitionWaitMs " +
+                            "artificialWarmBufferWaitMs=0"
+                    )
                 }
             }
 
@@ -16961,15 +17013,7 @@ class BnCameraManager(private val context: Context) {
             var currentSubmittedControlRequestEpochAtShutter = 0L
             var postShutterStillCaptureUsed = false
 
-            if (coldSingleAnchor != null) {
-                postShutterStillCaptureUsed = true
-                shutterTimestampNs = coldSingleAnchor!!.pair.timestamp
-                shutterTimestampDomain = "SENSOR_TIMESTAMP"
-                currentSubmittedControlRequestEpochAtShutter = coldSingleAnchor!!.pair.controlRequestEpoch
-                if (recipe.executionSettings.cameraSoundEnabled && !managerShutdownRequested.get()) {
-                    mediaActionSound.play(MediaActionSound.SHUTTER_CLICK)
-                }
-            } else if (dedicatedFlashStill) {
+            if (dedicatedFlashStill) {
                 postShutterStillCaptureUsed = true
                 val flashCaptureResult = executeDedicatedFlashCapture(
                     activeProfile = activeProfile,
@@ -16997,7 +17041,10 @@ class BnCameraManager(private val context: Context) {
                 // =======================================================
                 // NORMALE ZSL SEQUENCE (flash is off or Auto AE proved that flash is unnecessary)
                 // =======================================================
-                if (recipe.executionSettings.cameraSoundEnabled && !managerShutdownRequested.get()) {
+                if (!rawShutterSoundPlayedAtAcceptance &&
+                    recipe.executionSettings.cameraSoundEnabled &&
+                    !managerShutdownRequested.get()
+                ) {
                     mediaActionSound.play(MediaActionSound.SHUTTER_CLICK)
                 }
                 if (effectiveCaptureStrategy == CaptureStrategy.SINGLE_FRAME_ZSL &&
@@ -17005,12 +17052,18 @@ class BnCameraManager(private val context: Context) {
                 ) {
                     shutterTimestampNs = singleAnchorEffectiveShutterTimestampNs
                     shutterTimestampDomain = singleAnchorEffectiveShutterTimestampDomain
+                    currentSubmittedControlRequestEpochAtShutter =
+                        if (rawSingle) {
+                            preleasedSingleAnchor!!.frame.controlRequestEpoch
+                        } else {
+                            currentSubmittedControlRequestEpoch()
+                        }
                 } else {
                     shutterTimestampNs = userShutterTimestampNs
                     shutterTimestampDomain = "ELAPSED_REALTIME"
+                    currentSubmittedControlRequestEpochAtShutter =
+                        currentSubmittedControlRequestEpoch()
                 }
-                currentSubmittedControlRequestEpochAtShutter =
-                    currentSubmittedControlRequestEpoch()
                 traceCaptureRuntime(
                     "SHUTTER_TEMPORAL_AUTHORITY attemptId=$attemptId userShutterNs=$userShutterTimestampNs " +
                         "effectiveShutterNs=$shutterTimestampNs domain=$shutterTimestampDomain " +
@@ -17069,7 +17122,9 @@ class BnCameraManager(private val context: Context) {
             // and explicitly in the capture policy telemetry below. Normal warm Near-ZSL and the
             // bounded degraded PRE-shutter tier continue to use the real user shutter unchanged.
             val singleRunnerEligibilityTimestampNs =
-                if (singleAnchorTemporalClass == "FIRST_VALID_WARM_REPEATING_FRAME") {
+                if (singleAnchorTemporalClass == "FIRST_VALID_WARM_REPEATING_FRAME" ||
+                    singleAnchorTemporalClass == "FIRST_VALID_RAW_REPEATING_FRAME"
+                ) {
                     singleAnchorEffectiveShutterTimestampNs
                 } else {
                     userShutterTimestampNs
@@ -17077,8 +17132,7 @@ class BnCameraManager(private val context: Context) {
             val diagnosticsSensorMetadata = if (capturePlan.frameOrigin == FrameOrigin.YUV) {
                 null
             } else {
-                coldSingleAnchor?.pair?.sensorMetadataSnapshot
-                    ?: hdrBracket?.anchor?.lease?.pair?.sensorMetadataSnapshot
+                hdrBracket?.anchor?.lease?.pair?.sensorMetadataSnapshot
                     ?: preleasedSingleAnchor?.lease?.pair?.sensorMetadataSnapshot
                     ?: preleasedNormalMultiAnchor?.lease?.pair?.sensorMetadataSnapshot
             }
@@ -17099,7 +17153,15 @@ class BnCameraManager(private val context: Context) {
                         singleAnchorTemporalClass.startsWith("GENUINE_PRE_SHUTTER")
                     }" +
                     ";nearZslNoDedicatedStillFallback=${!postShutterStillCaptureUsed}" +
-                    ";RAW_SINGLE_SOURCE=${if (coldSingleAnchor != null) "COLD_DIRECT_STILL" else if (rawSingle) "NEAR_ZSL_PRE_SHUTTER" else "NOT_APPLICABLE"}" +
+                    ";RAW_SINGLE_SOURCE=${when {
+                        !rawSingle -> "NOT_APPLICABLE"
+                        singleAnchorTemporalClass == "GENUINE_PRE_SHUTTER_IMMEDIATE" -> "NEAR_ZSL_PRE_SHUTTER"
+                        singleAnchorTemporalClass == "GENUINE_PRE_SHUTTER_LATE_PAIR" -> "NEAR_ZSL_PRE_SHUTTER_LATE_PAIR"
+                        singleAnchorTemporalClass == "DEGRADED_PRE_SHUTTER_ANCHOR" -> "DEGRADED_PRE_SHUTTER"
+                        singleAnchorTemporalClass == "FIRST_VALID_RAW_REPEATING_FRAME" -> "FIRST_VALID_RAW_REPEATING_FRAME"
+                        else -> singleAnchorTemporalClass
+                    }}" +
+                    ";RAW_SHUTTER_ARTIFICIAL_WARM_BUFFER_WAIT_MS=0" +
                     unifiedRuntimeDiagnosticsSuffix
 
             val submissionResult = try {
@@ -17145,7 +17207,7 @@ class BnCameraManager(private val context: Context) {
                                 stableAutoWhiteBalance = stableAutoWhiteBalanceAtShutter,
                                 focusCaptureContext = focusCaptureContextAtShutter,
                                 portraitCaptureContext = portraitCaptureContextAtShutter,
-                                reservedAnchor = coldSingleAnchor ?: preleasedSingleAnchor?.lease?.takeIf { rawSingle }
+                                reservedAnchor = preleasedSingleAnchor?.lease?.takeIf { rawSingle }
                             )
                         }
 
@@ -17369,8 +17431,6 @@ class BnCameraManager(private val context: Context) {
                 pinned.lease.release()
                 preleasedSingleAnchor = null
             }
-            coldSingleAnchor?.release()
-            coldSingleAnchor = null
             releaseSelectionExposureConstraintAfterCapture(attemptId)
             // Re-apply the live repeating control state only after shutter-time selection authority
             // is unfrozen. This prevents a post-press AE/flicker update from retroactively making
