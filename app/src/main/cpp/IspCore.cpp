@@ -9935,6 +9935,10 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; phase7AwbDarkFloor=" << phase7AwbEstimate.darkFloor
             << "; phase7AwbHighlightCeiling=" << phase7AwbEstimate.highlightCeiling
             << "; phase7AwbNeutralSupport=" << phase7AwbEstimate.neutralSupport
+            << "; phase7AwbAcceptedExposureFraction="
+            << phase7AwbEstimate.acceptedExposureFraction
+            << "; phase7AwbRelativeNeutralEvidence="
+            << phase7AwbEstimate.relativeNeutralEvidence
             << "; phase7AwbSampleSupport=" << phase7AwbEstimate.sampleSupport
             << "; phase7AwbTileSupport=" << phase7AwbEstimate.tileSupport
             << "; phase7AwbMixedLightScore=" << phase7AwbEstimate.mixedLightScore
