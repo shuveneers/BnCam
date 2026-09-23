@@ -772,7 +772,11 @@ object SensorCalibrationResolver {
             runCatching { AwbCalibrationEngine.resolve(runtime.settings, characteristics) }.getOrNull()
         }
         val calibratedExactFrameAwb = if (
-            systemAwbRequested && exactFrameCamera2Wb && resolvedLensAwbCalibration?.valid == true && lensAwbRuntime != null
+            systemAwbRequested &&
+            exactFrameCamera2Wb &&
+            resolvedLensAwbCalibration?.valid == true &&
+            lensAwbRuntime != null &&
+            AwbCalibrationEngine.hasExplicitDevelopedAuthority(lensAwbRuntime.settings)
         ) {
             AwbCalibrationEngine.applyToCamera2Prior(
                 camera2Gains = base.baseWbGains,
@@ -783,9 +787,15 @@ object SensorCalibrationResolver {
         } else {
             null
         }
-        if (systemAwbRequested && exactFrameCamera2Wb && lensAwbRuntime?.settingsReady == true && calibratedExactFrameAwb == null) {
+        if (
+            systemAwbRequested &&
+            exactFrameCamera2Wb &&
+            lensAwbRuntime?.settingsReady == true &&
+            AwbCalibrationEngine.hasExplicitDevelopedAuthority(lensAwbRuntime.settings) &&
+            calibratedExactFrameAwb == null
+        ) {
             warnings.add(
-                "Lens ID AWB calibration could not be applied to exact-frame Camera2 WB; " +
+                "Explicit profile AWB calibration could not be applied to exact-frame Camera2 WB; " +
                     "source=${resolvedLensAwbCalibration?.source ?: "unavailable"} " +
                     "reason=${resolvedLensAwbCalibration?.warning ?: "unavailable"}."
             )
