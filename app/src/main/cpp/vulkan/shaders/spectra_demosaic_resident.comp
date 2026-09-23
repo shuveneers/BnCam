@@ -35,10 +35,11 @@ layout(push_constant) uniform Params {
     uint padding4;
     // Delta 25+ evidence contract. Pure Malvar 2004 ignores it; adaptive RCD/AMAZE
     // may consume it in reconstructed R/B chroma paths. Sampled CFA values remain authoritative.
-    // Demosaic modes: immutable CFA evidence contract. Mode 3 (AWB+CCM) reuses
-    // cfaEvidence0.xy for bounded pre-WB R-G/B-G cleanup maxima after demosaic is complete.
-    vec4 cfaEvidence0; // demosaic: available/common/structure/fine; mode3: localBlendR/localBlendB/cloudReady/cloudMaxAbs
-    vec4 cfaEvidence1; // midConfidence, lowConfidence, redOpponentConfidence, blueOpponentConfidence
+    // Demosaic modes: immutable CFA evidence contract. Mode 3 (AWB+CCM) reuses these slots
+    // for the mandatory developed-RAW baseline: blendRG/blendBG/sigmaRG/sigmaBG and
+    // sourceClipMapReady/sigmaY/modelConfidence/planReady. No luma filtering is authorized.
+    vec4 cfaEvidence0;
+    vec4 cfaEvidence1;
 } pc;
 
 shared float sumRawR[256]; shared float sumRawG[256]; shared float sumRawB[256];
@@ -787,10 +788,137 @@ vec3 opponentAtRgb(vec3 pixel) {
             pixel.b - pixel.g);
 }
 
-// Phase 4 physical-noise ownership cleanup: retired Phase-6 residual-chroma, pre-WB
-// opponent stabilization and cloud cleanup have no production pixel implementation.
-// Read-only residual observers below remain valid; Neural RAW denoise owns stochastic
-// noise pixel mutation.
+// Mandatory baseline RAW chroma cleanup is intentionally narrower than SPECTRA: it changes
+// only noise-model-supported R-G/B-G residuals, preserves green/luma, and applies independent
+// local structure gates. SPECTRA remains the optional enhancement owner above this baseline.
+
+bool baselineChromaPlanEnabled() {
+    return pc.cfaEvidence1.w > 0.5 &&
+           (pc.cfaEvidence0.x > 1.0e-6 || pc.cfaEvidence0.y > 1.0e-6);
+}
+
+vec2 baselineOpponent(vec3 pixel) {
+    return vec2(pixel.r - pixel.g, pixel.b - pixel.g);
+}
+
+float baselineNeighbourWeight(vec3 center, vec3 neighbour, float sigmaY, float spatialWeight) {
+    float greenScale = max(0.0020, 2.5 * sigmaY);
+    float z = abs(neighbour.g - center.g) / greenScale;
+    float edgeWeight = 1.0 / (1.0 + z * z);
+    return spatialWeight * edgeWeight;
+}
+
+float baselineDirectionCorrection(
+        float centerOpponent,
+        float localOpponent,
+        float neighbourSpread,
+        float greenStructure,
+        float sigmaChroma,
+        float sigmaY,
+        float globalBlend,
+        float modelConfidence) {
+    if (!(sigmaChroma > 1.0e-7) || !(globalBlend > 1.0e-6) || !(modelConfidence > 1.0e-5)) {
+        return 0.0;
+    }
+
+    float residual = centerOpponent - localOpponent;
+    float sigma = max(1.0e-5, sigmaChroma);
+    float residualZ = abs(residual) / sigma;
+    // Small/medium residuals consistent with the physical noise model are eligible. Strong
+    // chroma transitions are treated as signal even in a flat-green region.
+    float noiseLike = 1.0 - smoothstep(1.65, 3.25, residualZ);
+
+    float safeSigmaY = max(0.0015, sigmaY);
+    float greenZ = greenStructure / safeSigmaY;
+    // Real luminance/green structure is an immediate detail veto. The green sample itself is
+    // never altered by this pass.
+    float greenDetailGate = 1.0 - smoothstep(2.0, 6.0, greenZ);
+
+    float chromaSpreadZ = neighbourSpread / sigma;
+    // Protect pure colour texture/edges even when green carries little contrast.
+    float chromaDetailGate = 1.0 - smoothstep(2.5, 6.0, chromaSpreadZ);
+
+    float localAuthority = clamp(globalBlend, 0.0, 0.60) *
+            clamp(modelConfidence, 0.0, 1.0) *
+            noiseLike * greenDetailGate * chromaDetailGate;
+    float correction = residual * localAuthority;
+    float maximumCorrection = 1.65 * sigma * clamp(globalBlend, 0.0, 0.60);
+    return clamp(correction, -maximumCorrection, maximumCorrection);
+}
+
+vec3 baselineDetailPreservingChromaAt(
+        int x, int y, vec3 center, out vec2 appliedOpponent) {
+    appliedOpponent = vec2(0.0);
+    if (!baselineChromaPlanEnabled()) return center;
+    if (any(isnan(center)) || any(isinf(center))) return center;
+
+    // Preserve very dark numerical-floor pixels and highlight/clipping structure. Baseline
+    // chroma cleanup is for stochastic residuals, not highlight reconstruction.
+    float peak = max(center.r, max(center.g, center.b));
+    if (peak < 0.0020 || peak > 0.94) return center;
+
+    vec3 n0 = residentRgbAt(x - 1, y);
+    vec3 n1 = residentRgbAt(x + 1, y);
+    vec3 n2 = residentRgbAt(x, y - 1);
+    vec3 n3 = residentRgbAt(x, y + 1);
+    vec3 n4 = residentRgbAt(x - 1, y - 1);
+    vec3 n5 = residentRgbAt(x + 1, y - 1);
+    vec3 n6 = residentRgbAt(x - 1, y + 1);
+    vec3 n7 = residentRgbAt(x + 1, y + 1);
+
+    float sigmaY = max(0.0, pc.cfaEvidence1.y);
+    float w0 = baselineNeighbourWeight(center, n0, sigmaY, 1.0);
+    float w1 = baselineNeighbourWeight(center, n1, sigmaY, 1.0);
+    float w2 = baselineNeighbourWeight(center, n2, sigmaY, 1.0);
+    float w3 = baselineNeighbourWeight(center, n3, sigmaY, 1.0);
+    float w4 = baselineNeighbourWeight(center, n4, sigmaY, 0.7071);
+    float w5 = baselineNeighbourWeight(center, n5, sigmaY, 0.7071);
+    float w6 = baselineNeighbourWeight(center, n6, sigmaY, 0.7071);
+    float w7 = baselineNeighbourWeight(center, n7, sigmaY, 0.7071);
+    float weightSum = max(1.0e-6, w0+w1+w2+w3+w4+w5+w6+w7);
+
+    vec2 o0 = baselineOpponent(n0);
+    vec2 o1 = baselineOpponent(n1);
+    vec2 o2 = baselineOpponent(n2);
+    vec2 o3 = baselineOpponent(n3);
+    vec2 o4 = baselineOpponent(n4);
+    vec2 o5 = baselineOpponent(n5);
+    vec2 o6 = baselineOpponent(n6);
+    vec2 o7 = baselineOpponent(n7);
+    vec2 local = (w0*o0+w1*o1+w2*o2+w3*o3+w4*o4+w5*o5+w6*o6+w7*o7) / weightSum;
+
+    float greenStructure = max(
+            max(max(abs(n0.g-center.g), abs(n1.g-center.g)),
+                max(abs(n2.g-center.g), abs(n3.g-center.g))),
+            max(max(abs(n4.g-center.g), abs(n5.g-center.g)),
+                max(abs(n6.g-center.g), abs(n7.g-center.g))));
+
+    float spreadRg = max(
+            max(max(abs(o0.x-local.x), abs(o1.x-local.x)),
+                max(abs(o2.x-local.x), abs(o3.x-local.x))),
+            max(max(abs(o4.x-local.x), abs(o5.x-local.x)),
+                max(abs(o6.x-local.x), abs(o7.x-local.x))));
+    float spreadBg = max(
+            max(max(abs(o0.y-local.y), abs(o1.y-local.y)),
+                max(abs(o2.y-local.y), abs(o3.y-local.y))),
+            max(max(abs(o4.y-local.y), abs(o5.y-local.y)),
+                max(abs(o6.y-local.y), abs(o7.y-local.y))));
+
+    vec2 centerOpponent = baselineOpponent(center);
+    float confidence = clamp(pc.cfaEvidence1.z, 0.0, 1.0);
+    float correctionRg = baselineDirectionCorrection(
+            centerOpponent.x, local.x, spreadRg, greenStructure,
+            max(0.0, pc.cfaEvidence0.z), sigmaY,
+            max(0.0, pc.cfaEvidence0.x), confidence);
+    float correctionBg = baselineDirectionCorrection(
+            centerOpponent.y, local.y, spreadBg, greenStructure,
+            max(0.0, pc.cfaEvidence0.w), sigmaY,
+            max(0.0, pc.cfaEvidence0.y), confidence);
+
+    appliedOpponent = vec2(correctionRg, correctionBg);
+    // Green is copied bit-for-bit. Only stochastic opponent residual authority can move R/B.
+    return vec3(center.r - correctionRg, center.g, center.b - correctionBg);
+}
 
 bool finiteBoundedRgb(vec3 pixel) {
     return all(not(isnan(pixel))) && all(not(isinf(pixel))) &&
@@ -950,10 +1078,11 @@ void main() {
                 ? sourceColorConfidence
                 : legacyDemosaicConfidence;
 
-        // Phase 4: no classical SPECTRA denoise may alter post-demosaic RGB before WB.
-        // The demosaiced sample is passed through exactly; Neural already owns noise mutation.
-        vec3 rawForWb = rawInput;
-        cloudAppliedOpponent = vec2(0.0);
+        // Always-on developed-RAW baseline. This is independent of SPECTRA and does not
+        // filter green/luma. The global plan came from physical S/O + compact residual evidence;
+        // this shader makes a second local signal-vs-noise decision before touching R-G/B-G.
+        vec3 rawForWb = baselineDetailPreservingChromaAt(
+                int(gid.x), int(gid.y), rawInput, cloudAppliedOpponent);
 
         // Counterfactual only: distinguishes WB-induced over-unity and old post-CCM magenta risk
         // from actual sensor-domain clipping. Neither condition is treated as lost sensor data.
