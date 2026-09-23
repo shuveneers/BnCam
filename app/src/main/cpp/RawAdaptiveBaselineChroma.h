@@ -63,11 +63,14 @@ inline double safeRmsRatio(double measuredVariance, double predictedVariance) no
 
 inline double measurementAgreement(double rmsRatio) noexcept {
     if (!(rmsRatio > 0.0) || !std::isfinite(rmsRatio)) return 0.82;
-    const double logDistance = std::abs(std::log2(std::clamp(rmsRatio, 1.0 / 16.0, 16.0)));
-    // A compact residual scan is allowed to calibrate the physical prediction, but scene
-    // structure must never be mistaken for permission to blur. Large disagreement therefore
-    // lowers authority instead of increasing it.
-    return 1.0 - 0.65 * smoothstep(0.65, 1.70, logDistance);
+    // Asymmetric evidence rule:
+    // - measured <= physical prediction is not evidence of texture and must not suppress the
+    //   trusted SENSOR_NOISE_PROFILE baseline;
+    // - measured >> prediction can contain scene structure/model mismatch, so only that side
+    //   reduces global authority. Local shader gates still make the final pixel decision.
+    if (rmsRatio <= 1.0) return 1.0;
+    const double logExcess = std::log2(std::clamp(rmsRatio, 1.0, 16.0));
+    return 1.0 - 0.65 * smoothstep(0.65, 1.70, logExcess);
 }
 
 inline double calibratedPreWbSigma(
