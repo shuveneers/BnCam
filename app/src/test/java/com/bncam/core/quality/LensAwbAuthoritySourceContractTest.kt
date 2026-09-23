@@ -72,4 +72,17 @@ class LensAwbAuthoritySourceContractTest {
         assertFalse(dng.contains("setColorCorrectionTransform"))
         assertTrue(calibration.contains("\"DNG Developed AWB Override\" to \"false\""))
     }
+    @Test
+    fun `default auto keeps exact camera2 pair and native awb confidence is frame relative`() {
+        val engine = source("src/main/java/com/bncam/core/quality/AwbCalibration.kt")
+        val estimator = source("src/main/cpp/PhysicalAwbEstimator.h")
+        val calibration = source("src/main/java/com/bncam/core/quality/SensorCalibration.kt")
+
+        assertTrue(engine.contains("if (hasExplicitDevelopedAuthority(settings)) 1.0f else 0.0f"))
+        assertTrue(calibration.contains("AwbCalibrationEngine.hasExplicitDevelopedAuthority(lensAwbRuntime.settings)"))
+        assertFalse(estimator.contains("smoothstep(0.10, 0.48, out.neutralSupport)"))
+        assertTrue(estimator.contains("acceptedExposureFraction"))
+        assertTrue(estimator.contains("relativeNeutralEvidence"))
+    }
+
 }
