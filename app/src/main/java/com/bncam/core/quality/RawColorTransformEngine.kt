@@ -51,6 +51,16 @@ data class SensorColorMatrixValidation(
     val maxAbs: Float,
     val negativeEnergy: Float
 )
+data class ExactFrameColorTrustEvaluation(
+    val trusted: Boolean,
+    val reason: String,
+    val exactOpponentGain: Float,
+    val referenceOpponentGain: Float,
+    val amplificationRatio: Float,
+    val matrixShapeDistance: Float,
+    val staticCalibrationSpread: Float
+)
+
 data class ResolvedColorTransformResult(
     val targetKelvin: Int,
     val illuminantModel: String,
@@ -200,6 +210,147 @@ object RawColorTransformEngine {
         }
 
         return shared.copy(reason = "valid_exact_frame_camera2_direct")
+    }
+
+    /**
+     * Compares an exact-frame Camera2 CCM with standards-complete static characterization from
+     * the same physical sensor. This is deliberately relative: no camera id, lens role or device
+     * model participates. When the HAL matrix is materially less coherent and amplifies opponent
+     * noise much more strongly than the sensor's own ForwardMatrix route, the exact-frame matrix
+     * loses authority and the caller can continue to the calibrated static candidate.
+     */
+    fun evaluateExactFrameAgainstStaticCalibration(
+        exactFrame: FloatArray,
+        wbRggb: FloatArray?,
+        staticCandidates: List<FloatArray>
+    ): ExactFrameColorTrustEvaluation {
+        val exactValidation = validateExactFrameCamera2ColorTransform(exactFrame)
+        if (!exactValidation.valid) {
+            return ExactFrameColorTrustEvaluation(
+                trusted = false,
+                reason = exactValidation.reason,
+                exactOpponentGain = Float.NaN,
+                referenceOpponentGain = Float.NaN,
+                amplificationRatio = Float.NaN,
+                matrixShapeDistance = Float.NaN,
+                staticCalibrationSpread = Float.NaN
+            )
+        }
+
+        val validStatic = staticCandidates
+            .filter { validateSensorToLinearSrgbMatrix(it).valid }
+            .map { it.copyOf() }
+        if (validStatic.isEmpty()) {
+            return ExactFrameColorTrustEvaluation(
+                trusted = true,
+                reason = "trusted_no_standards_complete_static_reference",
+                exactOpponentGain = opponentChromaAmplification(exactFrame, wbRggb),
+                referenceOpponentGain = Float.NaN,
+                amplificationRatio = 1.0f,
+                matrixShapeDistance = Float.NaN,
+                staticCalibrationSpread = 0.0f
+            )
+        }
+
+        val distances = validStatic.map { normalizedMatrixShapeDistance(exactFrame, it) }
+        val bestIndex = distances.indices.minByOrNull { distances[it] } ?: 0
+        val bestDistance = distances[bestIndex]
+        val reference = validStatic[bestIndex]
+        val exactGain = opponentChromaAmplification(exactFrame, wbRggb)
+        val referenceGain = opponentChromaAmplification(reference, wbRggb)
+        val gainRatio = if (exactGain.isFinite() && referenceGain.isFinite() && referenceGain > 1.0e-4f) {
+            exactGain / referenceGain
+        } else {
+            1.0f
+        }
+
+        var staticSpread = 0.0f
+        if (validStatic.size > 1) {
+            for (i in 0 until validStatic.lastIndex) {
+                for (j in i + 1 until validStatic.size) {
+                    staticSpread = maxOf(
+                        staticSpread,
+                        normalizedMatrixShapeDistance(validStatic[i], validStatic[j])
+                    )
+                }
+            }
+        }
+
+        // The sensor's own dual-illuminant spread expands the accepted envelope automatically.
+        // A single-illuminant sensor therefore gets a tighter comparison than a sensor whose
+        // standards-complete matrices genuinely vary strongly across illuminants.
+        val materialShapeDistance = maxOf(0.040f, 0.020f + 1.25f * staticSpread)
+        val grossShapeDistance = maxOf(0.085f, 0.040f + 2.25f * staticSpread)
+        val materiallyOverAmplified = gainRatio > 1.35f && bestDistance > materialShapeDistance
+        val grosslyIncoherent = bestDistance > grossShapeDistance && gainRatio > 1.08f
+        val trusted = !(materiallyOverAmplified || grosslyIncoherent)
+        val reason = when {
+            materiallyOverAmplified ->
+                "exact_frame_rejected_relative_chroma_amplification_and_shape"
+            grosslyIncoherent ->
+                "exact_frame_rejected_static_calibration_incoherence"
+            else ->
+                "trusted_relative_to_same_sensor_static_calibration"
+        }
+        return ExactFrameColorTrustEvaluation(
+            trusted = trusted,
+            reason = reason,
+            exactOpponentGain = exactGain,
+            referenceOpponentGain = referenceGain,
+            amplificationRatio = gainRatio,
+            matrixShapeDistance = bestDistance,
+            staticCalibrationSpread = staticSpread
+        )
+    }
+
+    internal fun normalizedMatrixShapeDistance(a: FloatArray, b: FloatArray): Float {
+        if (a.size != 9 || b.size != 9 || a.any { !it.isFinite() } || b.any { !it.isFinite() }) {
+            return Float.POSITIVE_INFINITY
+        }
+        var normA2 = 0.0
+        var normB2 = 0.0
+        for (i in 0..8) {
+            normA2 += a[i].toDouble() * a[i]
+            normB2 += b[i].toDouble() * b[i]
+        }
+        if (normA2 <= 1.0e-12 || normB2 <= 1.0e-12) return Float.POSITIVE_INFINITY
+        val normA = kotlin.math.sqrt(normA2)
+        val normB = kotlin.math.sqrt(normB2)
+        var distance2 = 0.0
+        for (i in 0..8) {
+            val d = a[i] / normA - b[i] / normB
+            distance2 += d * d
+        }
+        return kotlin.math.sqrt(distance2 / 9.0).toFloat()
+    }
+
+    internal fun opponentChromaAmplification(values: FloatArray, wbRggb: FloatArray?): Float {
+        if (values.size != 9 || values.any { !it.isFinite() }) return Float.NaN
+        val green = wbRggb
+            ?.takeIf { it.size >= 4 }
+            ?.let { 0.5f * (it[1] + it[2]) }
+            ?.takeIf { it.isFinite() && it > 1.0e-4f }
+            ?: 1.0f
+        val redGain = wbRggb?.getOrNull(0)
+            ?.takeIf { it.isFinite() && it > 0.0f }
+            ?.div(green)
+            ?: 1.0f
+        val blueGain = wbRggb?.getOrNull(3)
+            ?.takeIf { it.isFinite() && it > 0.0f }
+            ?.div(green)
+            ?: 1.0f
+
+        val redOpponent = redGain * kotlin.math.sqrt(
+            (values[0] - values[3]) * (values[0] - values[3]) +
+                (values[6] - values[3]) * (values[6] - values[3])
+        )
+        val blueOpponent = blueGain * kotlin.math.sqrt(
+            (values[2] - values[5]) * (values[2] - values[5]) +
+                (values[8] - values[5]) * (values[8] - values[5])
+        )
+        return kotlin.math.sqrt(
+            0.5f * (redOpponent * redOpponent + blueOpponent * blueOpponent)
+        )
     }
 
     fun resolveActualSensorForwardMatrixToLinearSrgb(
