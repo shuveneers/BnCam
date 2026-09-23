@@ -130,9 +130,14 @@ struct SpectraResidentColorTransformRequest {
     std::size_t rowStrideFloats = 0;
     std::uint64_t residentDemosaicGeneration = 0;
     std::array<float, 3> wbRgb{1.0f, 1.0f, 1.0f};
-    // Delta 35: bounded linear-RGB opponent stabilization fused immediately before WB.
-    // Values are global maximum blends; the shader applies additional local structure/color-edge gates.
-    std::array<float, 2> preWbOpponentCleanupBlend{0.0f, 0.0f}; // R-G, B-G; each <= 0.12
+    // Mandatory developed-RAW baseline chroma stabilization, independent of SPECTRA.
+    // The CPU policy derives these values from physical S/O covariance, the compact residual
+    // observer and downstream WB/CCM amplification. The shader still owns local detail gates.
+    std::array<float, 2> preWbOpponentCleanupBlend{0.0f, 0.0f}; // R-G, B-G; each <= 0.60
+    float baselineChromaSigmaRg = 0.0f;
+    float baselineChromaSigmaBg = 0.0f;
+    float baselineLumaSigma = 0.0f;
+    float baselineNoiseConfidence = 0.0f;
     // Optional coarse cloud-correction map consumed by the resident pre-WB shader. Pointers
     // remain valid for the synchronous executeAwbCcm() call and refer to a median-centred
     // 16x12 opponent field.
@@ -180,6 +185,11 @@ struct SpectraResidentColorTransformResult {
     double cloudMeanAbsCorrectionRG = 0.0;
     double cloudMeanAbsCorrectionBG = 0.0;
     double cloudAffectedPixelFraction = 0.0;
+    // Baseline RAW chroma cleanup telemetry. Green/luma is never filtered by this owner.
+    bool baselineChromaCleanupApplied = false;
+    double baselineMeanAbsCorrectionRG = 0.0;
+    double baselineMeanAbsCorrectionBG = 0.0;
+    double baselineAffectedPixelFraction = 0.0;
     bool calibratedHueSatMapRequested = false;
     bool calibratedHueSatMapApplied = false;
     std::uint64_t calibratedHueSatMapAppliedPixels = 0u;
