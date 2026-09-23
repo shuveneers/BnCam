@@ -39,6 +39,8 @@ struct Estimate {
     double darkFloor = 0.012;
     double highlightCeiling = 0.86;
     double neutralSupport = 0.0;
+    double acceptedExposureFraction = 0.0;
+    double relativeNeutralEvidence = 0.0;
     double tileSupport = 0.0;
     double sampleSupport = 0.0;
     double mixedLightScore = 0.0;
@@ -336,14 +338,30 @@ inline Estimate resolve(
     const double priorLogB = std::log(std::max(kAwbEpsilon, out.priorGainsRgb[2]));
     out.priorDisagreement = std::hypot(dataLogR - priorLogR, dataLogB - priorLogB);
 
-    const double neutralConfidence = detail::smoothstep(0.10, 0.48, out.neutralSupport);
+    // Sensor-adaptive evidence: do not use an absolute neutralSupport cliff. The previous
+    // smoothstep(0.10, 0.48, ...) made a sensor with 63k coherent accepted samples and 176 tiles
+    // collapse to exactly zero confidence solely because its scene-normalized neutral support was
+    // 0.092. Instead compare neutral evidence against the same frame's chromatic rejection and
+    // require that a meaningful fraction of exposure-valid samples actually survived all gates.
+    out.acceptedExposureFraction = out.exposureValidSampleCount > 0u
+            ? std::clamp(
+                    static_cast<double>(out.acceptedSampleCount) /
+                            static_cast<double>(out.exposureValidSampleCount),
+                    0.0, 1.0)
+            : 0.0;
+    out.relativeNeutralEvidence = std::clamp(
+            out.neutralSupport /
+                    std::max(kAwbEpsilon, out.neutralSupport + out.chromaticRejectedFraction),
+            0.0, 1.0);
+    const double neutralConfidence = std::sqrt(std::max(
+            0.0, out.relativeNeutralEvidence * out.acceptedExposureFraction));
     const double mixedPenalty = 1.0 - 0.78 * out.mixedLightScore;
     const double disagreementPenalty = 1.0 - 0.30 * detail::smoothstep(
             0.30, 0.95, out.priorDisagreement);
-    const double evidenceProduct = std::max(0.0,
-            out.sampleSupport * out.tileSupport * neutralConfidence);
+    const double supportConfidence = std::sqrt(std::max(
+            0.0, out.sampleSupport * out.tileSupport));
     out.confidence = std::clamp(
-            std::pow(evidenceProduct, 1.0 / 3.0) * mixedPenalty * disagreementPenalty,
+            supportConfidence * neutralConfidence * mixedPenalty * disagreementPenalty,
             0.0, 1.0);
     out.dataAuthority = std::clamp(0.88 * out.confidence, 0.0,
             out.mixedIllumination ? 0.48 : 0.88);
