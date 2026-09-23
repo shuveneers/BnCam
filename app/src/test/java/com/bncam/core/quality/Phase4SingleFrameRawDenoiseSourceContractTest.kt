@@ -9,7 +9,7 @@ class Phase4SingleFrameRawDenoiseSourceContractTest {
     private fun source(path: String): String = File(path).readText()
 
     @Test
-    fun `neural is sole stochastic RAW noise pixel owner`() {
+    fun `neural remains optional enhancement while baseline chroma owner stays narrow`() {
         val demosaicShader = source("src/main/cpp/vulkan/shaders/spectra_demosaic_resident.comp")
         val toneShader = source("src/main/cpp/vulkan/shaders/spectra_tone_resident.comp")
         val demosaicBackend = source("src/main/cpp/vulkan/VulkanSpectraResidentDemosaicBackend.cpp")
@@ -18,8 +18,9 @@ class Phase4SingleFrameRawDenoiseSourceContractTest {
 
         assertFalse(demosaicShader.contains("phase6ClassifyAndStore"))
         assertFalse(demosaicShader.contains("phase6ApplyCorrection"))
-        assertFalse(demosaicShader.contains("preWbOpponentStabilize"))
         assertFalse(demosaicShader.contains("preWbCloudCorrect"))
+        assertTrue(demosaicShader.contains("baselineDetailPreservingChromaAt"))
+        assertTrue(demosaicShader.contains("Green is copied bit-for-bit"))
         assertFalse(demosaicShader.contains("neuralJddAt"))
         assertFalse(demosaicShader.contains("JDD_W1"))
 
@@ -62,10 +63,22 @@ class Phase4SingleFrameRawDenoiseSourceContractTest {
     }
 
     @Test
-    fun `post demosaic pre WB path is exact pass through`() {
+    fun `post demosaic baseline chroma is physical adaptive and detail protected`() {
         val shader = source("src/main/cpp/vulkan/shaders/spectra_demosaic_resident.comp")
-        assertTrue(shader.contains("vec3 rawForWb = rawInput;"))
-        assertTrue(shader.contains("cloudAppliedOpponent = vec2(0.0);"))
+        val isp = source("src/main/cpp/IspCore.cpp")
+        val policy = source("src/main/cpp/RawAdaptiveBaselineChroma.h")
+
+        assertTrue(shader.contains("baselineDetailPreservingChromaAt"))
+        assertTrue(shader.contains("return vec3(center.r - correctionRg, center.g, center.b - correctionBg);"))
+        assertTrue(shader.contains("greenDetailGate"))
+        assertTrue(shader.contains("chromaDetailGate"))
+        assertTrue(isp.contains("resolveAdaptiveChromaPlan"))
+        assertTrue(isp.contains("wbCcmRedOpponentDirectionalGain"))
+        assertTrue(isp.contains("demosaicMeasuredPostVarianceRg"))
+        assertTrue(policy.contains("physicalNoiseModelAvailable"))
+        assertFalse(policy.contains("front"))
+        assertFalse(policy.contains("ultrawide"))
+        assertFalse(policy.contains("tele"))
     }
 
     @Test
