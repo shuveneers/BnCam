@@ -15,6 +15,7 @@
 #include "PhysicalAwbEstimator.h"
 #include "SensorColorScienceV2.h"
 #include "RawCameraColorCharacterizationOwnership.h"
+#include "RawCameraAdaptiveColorAuthority.h"
 #include "RawCameraColorProfileRegistry.h"
 #include "RawCameraColorProfileResolver.h"
 #include "RawCameraDngForwardTransform.h"
@@ -6645,7 +6646,18 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             });
     const bool calibratedMatrixProfileActive = cameraCharacterizationPlan.calibratedMatrixApply;
     const bool calibratedHueSatMapActive = cameraCharacterizationPlan.calibratedHueSatMapApply;
-    if (calibratedMatrixProfileActive) {
+    const bncam::color::RawAdaptiveColorAuthorityPlan adaptiveColorAuthority =
+            bncam::color::resolveRawAdaptiveColorAuthority({
+                    exactCamera2ColorPair,
+                    calibratedMatrixProfileActive && calibratedForwardTransform.ready,
+                    calibratedHueSatMapActive,
+                    activeColorMatrix,
+                    calibratedForwardTransform.postWbToLinearSrgb,
+                    calibratedProfileResolution.wbFitLogRmse
+            });
+    if (calibratedMatrixProfileActive && adaptiveColorAuthority.ready) {
+        activeColorMatrix = adaptiveColorAuthority.effectivePostWbMatrix;
+    } else if (calibratedMatrixProfileActive) {
         activeColorMatrix = calibratedForwardTransform.postWbToLinearSrgb;
     }
     const bncam::color::RawCameraHueSatMapTelemetrySummary hueSatMapTelemetry =
@@ -6658,7 +6670,9 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             calibratedProfileResolution.hueSatWeightFirst > 1.0e-5f &&
             calibratedProfileResolution.hueSatWeightSecond > 1.0e-5f;
     const char* phase2CameraMatrixSource = calibratedMatrixProfileActive
-            ? "PAIRED_DNG_FORWARD_MATRIX_XYZ_D50"
+            ? (adaptiveColorAuthority.exactFrameWeight >= 0.01f
+                    ? "ADAPTIVE_DNG_EXACT_FRAME_MATRIX_COHERENCE"
+                    : "PAIRED_DNG_FORWARD_MATRIX_XYZ_D50")
             : (exactCamera2ColorPair
                     ? "CAMERA2_EXACT_FRAME_COLOR_CORRECTION_TRANSFORM"
                     : "RESOLVED_SENSOR_COLOR_MATRIX_FALLBACK");
@@ -10350,6 +10364,12 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; rawColorDngForwardNeutralD50Error=" << calibratedForwardTransform.neutralD50Error
             << "; rawColorCalibratedMatrixApplied="
             << (cameraCharacterizationPlan.calibratedMatrixApply ? "true" : "false")
+            << "; rawColorAdaptiveAuthorityStatus=" << adaptiveColorAuthority.status
+            << "; rawColorAdaptiveMatrixShapeDistance=" << adaptiveColorAuthority.matrixShapeDistance
+            << "; rawColorAdaptiveExpectedShapeDistance=" << adaptiveColorAuthority.expectedShapeDistance
+            << "; rawColorAdaptiveProfileWeight=" << adaptiveColorAuthority.profileWeight
+            << "; rawColorAdaptiveExactFrameWeight=" << adaptiveColorAuthority.exactFrameWeight
+            << "; rawColorAdaptiveExactNeutralScale=" << adaptiveColorAuthority.exactToProfileNeutralScale
             << "; rawColorHueSatMapContract=OPTIONAL_GENUINE_PROFILE_AUGMENTATION"
             << "; rawColorHueSatMapRequested="
             << (phase9ColorDebug.calibratedHueSatMapRequested ? "true" : "false")
