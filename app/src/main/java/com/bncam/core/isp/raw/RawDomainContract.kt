@@ -3,7 +3,6 @@ package com.bncam.core.isp.raw
 import android.graphics.ImageFormat
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CaptureResult
-import android.hardware.camera2.TotalCaptureResult
 import com.bncam.core.quality.FinalSensorCalibration
 import com.bncam.core.quality.RenderQualityConfig
 import kotlin.math.roundToInt
@@ -382,10 +381,11 @@ object RawDomainContractResolver {
             ?.let {
                 RawContractRect(it.left, it.top, it.right, it.bottom)
             } ?: activeArray
-        val physicalCameraId = (captureResult as? TotalCaptureResult)
-            ?.physicalCameraResults
-            ?.keys
-            ?.firstOrNull()
+        // RenderQualityConfig already froze the exact physical sensor authority for this frame.
+        // The RAW materialization path intentionally passes the physical child CaptureResult, which
+        // is not a TotalCaptureResult; re-discovering a child id from result keys therefore loses
+        // truthful provenance on UW/tele routes. Keep the resolver's exact authority instead.
+        val physicalCameraId = finalCal?.base?.physicalCameraId
         val lensShadingState = resolveLensShadingState(captureResult)
         val sourceRowStride = dngMergeStats.intValue("rowStrideBytes")
             ?: if (source == RawInputSource.RAW10) ((width + 3) / 4) * 5 else width * 2

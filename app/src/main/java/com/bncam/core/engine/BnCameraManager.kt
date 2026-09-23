@@ -41,6 +41,8 @@ import com.bncam.core.capture.ExposurePlan
 import com.bncam.core.capture.CaptureExposurePreferences
 import com.bncam.core.capture.ProfileExposurePriorityPlan
 import com.bncam.core.capture.ProfileExposurePriorityPlanner
+import com.bncam.core.capture.PhysicalSensorExposureAuthorityPolicy
+import com.bncam.core.capture.PhysicalSensorExposureOwner
 import com.bncam.core.capture.DefaultRawShutterPriorityPlan
 import com.bncam.core.capture.DefaultRawShutterPriorityPolicy
 import com.bncam.core.capture.DefaultRawManualFallbackPlan
@@ -477,38 +479,42 @@ class BnCameraManager(private val context: Context) {
     ): UnifiedRuntimeDiagnosticsSnapshot {
         val rawCapture = capturePlan.frameOrigin != FrameOrigin.YUV
 
-        val aeDomain = if (!rawCapture) {
-            RuntimeDiagnosticDomain.of(
+        val exposureOwner = activePhysicalExposureOwner.takeIf {
+            activePhysicalExposureOwnerGeneration == pipelineGeneration
+        } ?: PhysicalSensorExposureOwner.CAMERA2_HAL_AE
+
+        val aeDomain = when (exposureOwner) {
+            PhysicalSensorExposureOwner.CAMERA2_HAL_AE -> RuntimeDiagnosticDomain.of(
                 "CAMERA2_HAL_OWNED",
                 "owner" to "CAMERA2_HAL",
+                "sensorAuthorityId" to activePhysicalExposureOwnerSensorId,
                 "cameraAeState" to (lastAeState ?: "unavailable"),
                 "rawControllerActive" to false,
-                "policy" to "STANDARD_CAMERA2_AE_NO_BNCAM_RAW_FEEDBACK"
+                "policy" to "STANDARD_AUTO_SINGLE_OWNER_CAMERA2_AE",
+                "reason" to activePhysicalExposureOwnerReason
             )
-        } else {
-            val convergence = latestDefaultRawPhotometricConvergence
-                ?.takeIf { it.generation == pipelineGeneration }
-            val status = when {
-                convergence == null -> "RAW_CONVERGENCE_UNAVAILABLE"
-                convergence.photometricConverged -> "PHOTOMETRIC_CONVERGED"
-                convergence.allocationReady -> "ALLOCATED_SETTLING"
-                else -> "ALLOCATION_NOT_READY"
-            }
-            RuntimeDiagnosticDomain.of(
-                status,
-                "owner" to "BNCAM_RAW_EXPOSURE_POLICY",
-                "route" to (convergence?.route ?: "unavailable"),
-                "allocationReady" to (convergence?.allocationReady ?: defaultRawAllocationReady),
-                "photometricConverged" to (convergence?.photometricConverged ?: false),
-                "targetLuma" to convergence?.targetLuma,
-                "observedLuma" to convergence?.observedLuma,
-                "exposureErrorEv" to convergence?.exposureErrorEv,
-                "realizationStatus" to convergence?.realizationStatus,
-                "aeStable" to convergence?.aeStable,
-                "reason" to (convergence?.reason ?: "no_generation_matched_convergence"),
-                "framesSinceExposureRequest" to defaultRawFramesSinceExposureRequest
+
+            PhysicalSensorExposureOwner.PROFILE_EXPLICIT_PRIORITY -> RuntimeDiagnosticDomain.of(
+                "PROFILE_EXPLICIT_PRIORITY",
+                "owner" to "PROFILE_EXPLICIT_PRIORITY",
+                "sensorAuthorityId" to activePhysicalExposureOwnerSensorId,
+                "cameraAeState" to (lastAeState ?: "unavailable"),
+                "rawControllerActive" to false,
+                "policy" to lastExposurePlanSummary,
+                "reason" to activePhysicalExposureOwnerReason
+            )
+
+            PhysicalSensorExposureOwner.USER_MANUAL_SENSOR -> RuntimeDiagnosticDomain.of(
+                "USER_MANUAL_SENSOR",
+                "owner" to "USER_MANUAL_SENSOR",
+                "sensorAuthorityId" to activePhysicalExposureOwnerSensorId,
+                "cameraAeState" to (lastAeState ?: "unavailable"),
+                "rawControllerActive" to false,
+                "policy" to lastExposurePlanSummary,
+                "reason" to activePhysicalExposureOwnerReason
             )
         }
+
 
         val rawPreviewDomain = if (!rawCapture) {
             RuntimeDiagnosticDomain.of(
@@ -1168,6 +1174,19 @@ class BnCameraManager(private val context: Context) {
 
     private val profileExposureAdaptationLock = Any()
     private val profileExposurePreferencesRevision = java.util.concurrent.atomic.AtomicLong(0L)
+
+    @Volatile
+    private var activePhysicalExposureOwner: PhysicalSensorExposureOwner =
+        PhysicalSensorExposureOwner.CAMERA2_HAL_AE
+
+    @Volatile
+    private var activePhysicalExposureOwnerGeneration: Int = -1
+
+    @Volatile
+    private var activePhysicalExposureOwnerSensorId: String = "unavailable"
+
+    @Volatile
+    private var activePhysicalExposureOwnerReason: String = "not_applied"
 
     // Phase 1 default RAW acquisition owner. Camera2 AE remains the brightness meter; this state
     // only determines a motion-safe exposure-time priority for the repeating RAW producer.
@@ -1869,6 +1888,56 @@ class BnCameraManager(private val context: Context) {
 
     private fun activeProfileExposureTotalEv(): Float =
         (activeProfileExposurePreferences.captureEvBias + currentEvOffset).coerceIn(-4f, 4f)
+
+    private fun recordPhysicalExposureOwner(
+        owner: PhysicalSensorExposureOwner,
+        sensorId: String,
+        reason: String
+    ) {
+        activePhysicalExposureOwner = owner
+        activePhysicalExposureOwnerGeneration = pipelineGeneration
+        activePhysicalExposureOwnerSensorId = sensorId
+        activePhysicalExposureOwnerReason = reason
+    }
+
+    /**
+     * Every physical sensor starts a fresh adaptive state epoch. No exposure observation, motion
+     * ceiling, luma statistic or Camera2 result from the previous lens may influence the next one.
+     */
+    private fun resetExposureAdaptationForPipeline(
+        reason: String,
+        sensorId: String
+    ) {
+        clearDefaultRawShutterPriorityState(resetMotion = true)
+        latestExposureStatistics = null
+        liveHighDrRisk = false
+        lastAeState = null
+        lastCaptureResult = null
+        lastCaptureResultGeneration = -1
+
+        activeProfileExposurePlan = null
+        activeProfileExposurePlanGeneration = -1
+        activeProfileExposureBounds = null
+        clearProfileExposureAeBaseline()
+        profileExposureAwaitingAeBaseline = activeProfileExposurePreferences.requiresAeBaseline()
+        profileExposureBootstrapMinControlEpoch = if (profileExposureAwaitingAeBaseline) {
+            controlRequestEpochTracker.currentSubmittedEpoch() + 1L
+        } else {
+            -1L
+        }
+
+        resetRawFlickerAuthority(reason = reason, generation = pipelineGeneration)
+        recordPhysicalExposureOwner(
+            owner = PhysicalSensorExposureOwner.CAMERA2_HAL_AE,
+            sensorId = sensorId,
+            reason = "pipeline_epoch_reset:$reason"
+        )
+        Log.i(
+            tag,
+            "PHYSICAL_EXPOSURE_EPOCH_RESET generation=$pipelineGeneration sensor=$sensorId " +
+                "profileBootstrap=$profileExposureAwaitingAeBaseline reason=$reason"
+        )
+    }
 
     /** Invalidate only the RAW preview calibration snapshot after a live creative control changes. */
     fun notifyViewfinderLiveTuningChanged() {
@@ -3916,11 +3985,14 @@ class BnCameraManager(private val context: Context) {
         return null
     }
 
-    private fun shouldRequestDefaultRawShutterMotionAnalysis(): Boolean =
-        isActiveRawWarmProducer() &&
-            requestedManualIso == null && requestedManualExposureNs == null &&
-            !activeProfileExposurePreferences.requiresAeBaseline() &&
-            currentFlashMode == "Off"
+    /**
+     * Retired as an exposure owner.
+     *
+     * Standard Auto must behave identically for YUV, RAW10 and RAW_SENSOR on every lens: Camera2
+     * AE owns exposure time + sensitivity + frame duration. Motion remains useful for frame
+     * selection/diagnostics elsewhere, but may not silently activate a second RAW AE controller.
+     */
+    private fun shouldRequestDefaultRawShutterMotionAnalysis(): Boolean = false
 
     private fun clearDefaultRawShutterPriorityState(resetMotion: Boolean) {
         updateDefaultRawFrameSelectionExposureConstraint(
@@ -4750,11 +4822,33 @@ class BnCameraManager(private val context: Context) {
         cameraId: String
     ) {
         runCatching {
-            val chars = cameraManager.getCameraCharacteristics(cameraId)
-            val availableRanges = chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES) ?: return
-            if (availableRanges.isEmpty()) return
-
+            val deviceCharacteristics = cameraManager.getCameraCharacteristics(cameraId)
             val identity = synchronized(pipelineLock) { activePipelineIdentity }
+            val physicalSensorId = identity?.physicalCameraId
+            val sensorCharacteristics = physicalSensorId?.let { id ->
+                runCatching { cameraManager.getCameraCharacteristics(id) }.getOrNull()
+            } ?: deviceCharacteristics
+
+            // A logical multi-camera may advertise a superset of FPS ranges. Select only a range
+            // that is valid for both the opened device and the exact active physical sensor so a
+            // tele/UW producer cannot inherit a main-sensor cadence assumption.
+            val deviceRanges = deviceCharacteristics
+                .get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+                ?.toList().orEmpty()
+            val sensorRanges = sensorCharacteristics
+                .get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+                ?.toList().orEmpty()
+            val physicalCompatibleRanges = if (physicalSensorId != null && sensorRanges.isNotEmpty()) {
+                sensorRanges.filter { sensorRange -> deviceRanges.any { it == sensorRange } }
+            } else {
+                emptyList()
+            }
+            val availableRanges = when {
+                physicalCompatibleRanges.isNotEmpty() -> physicalCompatibleRanges.toTypedArray()
+                deviceRanges.isNotEmpty() -> deviceRanges.toTypedArray()
+                else -> return
+            }
+
             val rawIdentity = identity?.takeIf { candidate ->
                 candidate.bufferFormat == ImageFormat.RAW10 ||
                     candidate.bufferFormat == ImageFormat.RAW_SENSOR
@@ -4791,7 +4885,7 @@ class BnCameraManager(private val context: Context) {
                 val streamCharacteristicsId = rawIdentity.physicalCameraId ?: rawIdentity.logicalCameraId
                 val streamCharacteristics = runCatching {
                     cameraManager.getCameraCharacteristics(streamCharacteristicsId)
-                }.getOrNull() ?: chars
+                }.getOrNull() ?: sensorCharacteristics
                 val streamMap = streamCharacteristics.get(
                     CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP
                 )
@@ -4851,8 +4945,9 @@ class BnCameraManager(private val context: Context) {
                             "flicker=${flickerConstraint.frequency} flickerSource=${flickerConstraint.source} " +
                             "fallback=${flickerConstraint.fallbackActive} " +
                             "format=${formatName(rawIdentity.bufferFormat)} size=${rawIdentity.width}x${rawIdentity.height} " +
-                            "streamCamera=$streamCharacteristicsId minFrameDurationNs=$minimumFrameDurationNs " +
-                            "sustainableUpperFps=$sustainableUpperFps"
+                            "streamCamera=$streamCharacteristicsId physicalSensor=${physicalSensorId ?: "STANDALONE"} " +
+                            "fpsAuthority=${if (physicalCompatibleRanges.isNotEmpty()) "PHYSICAL_INTERSECTION" else "DEVICE"} " +
+                            "minFrameDurationNs=$minimumFrameDurationNs sustainableUpperFps=$sustainableUpperFps"
                     )
                     return
                 }
@@ -4868,7 +4963,7 @@ class BnCameraManager(private val context: Context) {
                 val streamCharacteristicsId = identity.physicalCameraId ?: identity.logicalCameraId
                 val streamCharacteristics = runCatching {
                     cameraManager.getCameraCharacteristics(streamCharacteristicsId)
-                }.getOrNull() ?: chars
+                }.getOrNull() ?: sensorCharacteristics
                 val streamMap = streamCharacteristics.get(
                     CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP
                 )
@@ -8370,6 +8465,10 @@ class BnCameraManager(private val context: Context) {
                 activePipelineIdentity = requestedIdentity
                 activeZslFormat = requestedIdentity.bufferFormat
             }
+            resetExposureAdaptationForPipeline(
+                reason = "HARD_START_SENSOR_EPOCH",
+                sensorId = requestedIdentity.physicalCameraId ?: requestedIdentity.logicalCameraId
+            )
             logPreviewDiagnostics(
                 event = "LENS_SWITCH",
                 extra = "previousSelectedLensId=${previousLensId ?: "none"} requestedFrameSource=$preferredFormat"
@@ -9056,6 +9155,10 @@ class BnCameraManager(private val context: Context) {
                 activeZslFormat = requestedIdentity.bufferFormat
                 staleFramesDropped = 0
                 refreshEffectiveViewfinderSource()
+                resetExposureAdaptationForPipeline(
+                    reason = "PHYSICAL_PIPELINE_RESET",
+                    sensorId = requestedIdentity.physicalCameraId ?: requestedIdentity.logicalCameraId
+                )
 
                 ringBuffer.clear()
                 configureNearZslTimestampObservability(cameraId)
@@ -10080,44 +10183,82 @@ class BnCameraManager(private val context: Context) {
                     "SESSION_INITIAL_AF_AND_FOCUS_DISTANCE_WRITES"
                 )
 
-                // RAW JPEG rendering needs lens shading metadata when the HAL can provide it.
-                // Keep this scoped to RAW pipelines so the working YUV route remains unchanged.
+                // RAW metadata support belongs to the exact active sensor, not automatically to
+                // CameraDevice.id. A logical CameraDevice may be driving a physical UW/tele output;
+                // querying the logical/main characteristics here can silently disable metadata that
+                // the selected physical sensor actually supports.
                 if (sessionBufferFormat == ImageFormat.RAW10 || sessionBufferFormat == ImageFormat.RAW_SENSOR) {
+                    val rawMetadataCharacteristicsId = synchronized(pipelineLock) {
+                        activePipelineIdentity?.let { identity ->
+                            identity.physicalCameraId ?: identity.logicalCameraId
+                        }
+                    } ?: camera.id
+                    val rawMetadataCharacteristics = runCatching {
+                        getCachedCameraCharacteristics(rawMetadataCharacteristicsId)
+                    }.onFailure { failure ->
+                        Log.w(
+                            tag,
+                            "RAW metadata characteristics unavailable activeSensor=$rawMetadataCharacteristicsId " +
+                                "cameraDevice=${camera.id} format=${formatName(sessionBufferFormat)}",
+                            failure
+                        )
+                    }.getOrNull()
+
                     try {
-                        val chars = cameraManager.getCameraCharacteristics(camera.id)
+                        val chars = rawMetadataCharacteristics
+                            ?: throw IllegalStateException("RAW metadata characteristics unavailable")
+                        val shadingAlreadyApplied =
+                            chars.get(CameraCharacteristics.SENSOR_INFO_LENS_SHADING_APPLIED) == true
                         val modes =
                             chars.get(CameraCharacteristics.STATISTICS_INFO_AVAILABLE_LENS_SHADING_MAP_MODES)
-                        if (modes?.contains(CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE_ON) == true) {
-                            requestBuilder.set(
-                                CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE,
-                                CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE_ON
-                            )
-                            Log.i(
-                                tag,
-                                "LensShadingMap requested for RAW pipeline format=${
-                                    formatName(sessionBufferFormat)
-                                }"
-                            )
-                        } else {
-                            Log.i(
-                                tag,
-                                "LensShadingMap unavailable for RAW pipeline format=${
-                                    formatName(sessionBufferFormat)
-                                }"
-                            )
+
+                        when {
+                            shadingAlreadyApplied -> {
+                                Log.i(
+                                    tag,
+                                    "LensShadingMap not requested because HAL reports RAW shading already applied " +
+                                        "activeSensor=$rawMetadataCharacteristicsId " +
+                                        "format=${formatName(sessionBufferFormat)}"
+                                )
+                            }
+                            modes?.contains(CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE_ON) == true -> {
+                                requestBuilder.set(
+                                    CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE,
+                                    CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE_ON
+                                )
+                                Log.i(
+                                    tag,
+                                    "LensShadingMap requested for RAW pipeline activeSensor=$rawMetadataCharacteristicsId " +
+                                        "cameraDevice=${camera.id} format=${formatName(sessionBufferFormat)}"
+                                )
+                            }
+                            else -> {
+                                Log.i(
+                                    tag,
+                                    "LensShadingMap unavailable for RAW pipeline activeSensor=$rawMetadataCharacteristicsId " +
+                                        "cameraDevice=${camera.id} format=${formatName(sessionBufferFormat)}"
+                                )
+                            }
                         }
                     } catch (t: Throwable) {
-                        Log.w(tag, "LensShadingMap request setup failed for RAW pipeline", t)
+                        Log.w(
+                            tag,
+                            "LensShadingMap request setup failed for RAW pipeline " +
+                                "activeSensor=$rawMetadataCharacteristicsId",
+                            t
+                        )
                     }
 
                     // P0 RAW defect truth: request the Camera2 sensor hot-pixel map independently
-                    // from HOT_PIXEL_MODE. The map is metadata only; BnCam remains the owner of
-                    // pre-demosaic RAW correction. Missing optional metadata is a clean fallback.
+                    // from HOT_PIXEL_MODE. Support is resolved from the same exact physical sensor
+                    // authority as lens shading, never from the logical/main parent by accident.
                     try {
+                        val chars = rawMetadataCharacteristics
+                            ?: throw IllegalStateException("RAW metadata characteristics unavailable")
                         val hotPixelMapDecision =
                             com.bncam.core.isp.raw.RawMetadataCaptureRequestPolicy.applyHotPixelMapRequest(
                                 builder = requestBuilder,
-                                characteristics = cameraManager.getCameraCharacteristics(camera.id),
+                                characteristics = chars,
                                 frameSourceFormat = sessionBufferFormat
                             )
                         Log.i(
@@ -10125,10 +10266,16 @@ class BnCameraManager(private val context: Context) {
                             "RawHotPixelMap request requested=${hotPixelMapDecision.requested} " +
                                 "supported=${hotPixelMapDecision.mapModeSupported} " +
                                 "reason=${hotPixelMapDecision.reason} " +
+                                "activeSensor=$rawMetadataCharacteristicsId " +
                                 "format=${formatName(sessionBufferFormat)}"
                         )
                     } catch (t: Throwable) {
-                        Log.w(tag, "RawHotPixelMap request setup failed for RAW pipeline", t)
+                        Log.w(
+                            tag,
+                            "RawHotPixelMap request setup failed for RAW pipeline " +
+                                "activeSensor=$rawMetadataCharacteristicsId",
+                            t
+                        )
                     }
                 }
 
@@ -12611,8 +12758,14 @@ class BnCameraManager(private val context: Context) {
             val plan = CameraExposurePolicy.resolve(
                 requestedIso = requestedManualIso,
                 requestedExposureNs = requestedManualExposureNs,
-                measuredIso = lastCaptureResult?.get(CaptureResult.SENSOR_SENSITIVITY)?.takeIf { it > 0 },
-                measuredExposureNs = lastCaptureResult?.get(CaptureResult.SENSOR_EXPOSURE_TIME)?.takeIf { it > 0L },
+                measuredIso = lastCaptureResult
+                    ?.takeIf { lastCaptureResultGeneration == pipelineGeneration }
+                    ?.get(CaptureResult.SENSOR_SENSITIVITY)
+                    ?.takeIf { it > 0 },
+                measuredExposureNs = lastCaptureResult
+                    ?.takeIf { lastCaptureResultGeneration == pipelineGeneration }
+                    ?.get(CaptureResult.SENSOR_EXPOSURE_TIME)
+                    ?.takeIf { it > 0L },
                 bounds = bounds
             )
             if (requestedManualIso != null && requestedManualExposureNs == null && plan.exposureTimeNs != null) {
@@ -12775,19 +12928,92 @@ class BnCameraManager(private val context: Context) {
 
         private fun applyExposurePolicy(builder: CaptureRequest.Builder) {
             val deviceId = cameraDevice?.id ?: return
-            // Cadence and shutter are one acquisition contract. Resolve FPS first so the exposure
-            // planner sees the same frame timing that the repeating request will actually submit.
+            // Cadence is allowed to adapt to the exact stream, but Standard Auto exposure itself
+            // has one owner on every lens and format: Camera2 AE.
             applyOptimalAeTargetFpsRange(builder, deviceId)
-            val characteristics = runCatching { cameraManager.getCameraCharacteristics(deviceId) }.getOrNull() ?: return
+
+            val deviceCharacteristics = runCatching {
+                cameraManager.getCameraCharacteristics(deviceId)
+            }.getOrNull() ?: return
+            val identity = synchronized(pipelineLock) { activePipelineIdentity }
+            val physicalSensorId = identity?.physicalCameraId ?: deviceId
+            val sensorCharacteristics = if (physicalSensorId == deviceId) {
+                deviceCharacteristics
+            } else {
+                runCatching { cameraManager.getCameraCharacteristics(physicalSensorId) }
+                    .getOrNull() ?: deviceCharacteristics
+            }
+
             val explicitManual = requestedManualIso != null || requestedManualExposureNs != null
-            val profilePlan = if (!explicitManual) resolveProfileExposurePriorityPlan(characteristics) else null
+            val authorityDecision = PhysicalSensorExposureAuthorityPolicy.resolve(
+                explicitManualSensorRequest = explicitManual,
+                profileRequiresExplicitExposurePriority =
+                    activeProfileExposurePreferences.requiresAeBaseline()
+            )
+
+            if (authorityDecision.camera2OwnsCompleteExposure) {
+                // Retire every hidden RAW exposure owner. Observers may still read physical
+                // metadata, but none may write SENSOR_EXPOSURE_TIME / SENSOR_SENSITIVITY /
+                // SENSOR_FRAME_DURATION in Standard Auto.
+                if (defaultRawShutterAeBaselineGeneration != -1 ||
+                    defaultRawShutterAwaitingAeBaseline ||
+                    defaultRawShutterManualFallbackActive ||
+                    defaultRawAllocationReady ||
+                    latestDefaultRawExposureAllocation != null
+                ) {
+                    clearDefaultRawShutterPriorityState(resetMotion = false)
+                }
+                activeProfileExposurePlan = null
+                activeProfileExposurePlanGeneration = -1
+                activeProfileExposureBounds = null
+                profileExposureAwaitingAeBaseline = false
+                manualExposureAwaitingMetadata = false
+                updateDefaultRawFrameSelectionExposureConstraint(
+                    exposureTargetNs = null,
+                    source = "STANDARD_AUTO_CAMERA2_AE",
+                    isoTarget = null
+                )
+
+                val flashControlPlan = resolveFlashControlPlan(deviceCharacteristics, currentFlashMode)
+                setAePriorityModeOff(builder)
+                builder.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
+                builder.set(
+                    CaptureRequest.CONTROL_AE_MODE,
+                    flashControlPlan?.aeMode ?: CaptureRequest.CONTROL_AE_MODE_ON
+                )
+                builder.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_OFF)
+                builder.set(CaptureRequest.SENSOR_SENSITIVITY, null)
+                builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, null)
+                builder.set(CaptureRequest.SENSOR_FRAME_DURATION, null)
+
+                recordPhysicalExposureOwner(
+                    owner = PhysicalSensorExposureOwner.CAMERA2_HAL_AE,
+                    sensorId = physicalSensorId,
+                    reason = authorityDecision.reason
+                )
+                lastExposurePlanSummary =
+                    "standardAuto=true;owner=CAMERA2_HAL;physicalSensorId=$physicalSensorId;" +
+                        "format=${formatName(activeZslFormat)};defaultRawPriority=false;" +
+                        "policy=${authorityDecision.reason}"
+                return
+            }
+
+            val characteristics = sensorCharacteristics
+            val profilePlan = if (
+                authorityDecision.owner == PhysicalSensorExposureOwner.PROFILE_EXPLICIT_PRIORITY
+            ) {
+                resolveProfileExposurePriorityPlan(characteristics)
+            } else {
+                null
+            }
 
             if (profilePlan != null) {
                 updateDefaultRawFrameSelectionExposureConstraint(null, "PROFILE_EXPOSURE_AUTHORITY")
                 if (profilePlan.autoExposure || !profilePlan.ready) {
                     manualExposureAwaitingMetadata = false
                     profileExposureAwaitingAeBaseline = !profilePlan.ready
-                    val flashControlPlan = resolveFlashControlPlan(characteristics, currentFlashMode)
+                    val flashControlPlan = resolveFlashControlPlan(deviceCharacteristics, currentFlashMode)
+                    builder.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
                     builder.set(
                         CaptureRequest.CONTROL_AE_MODE,
                         flashControlPlan?.aeMode ?: CaptureRequest.CONTROL_AE_MODE_ON
@@ -12797,7 +13023,14 @@ class BnCameraManager(private val context: Context) {
                     builder.set(CaptureRequest.SENSOR_SENSITIVITY, null)
                     builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, null)
                     builder.set(CaptureRequest.SENSOR_FRAME_DURATION, null)
-                    lastExposurePlanSummary = "profilePriority=true;${profilePlan.summary()}"
+                    recordPhysicalExposureOwner(
+                        owner = PhysicalSensorExposureOwner.CAMERA2_HAL_AE,
+                        sensorId = physicalSensorId,
+                        reason = "profile_priority_camera2_ae_bootstrap"
+                    )
+                    lastExposurePlanSummary =
+                        "profilePriority=true;owner=CAMERA2_HAL;physicalSensorId=$physicalSensorId;" +
+                            profilePlan.summary()
                     Log.d(tag, "Camera2 profile exposure bootstrap $lastExposurePlanSummary")
                     return
                 }
@@ -12811,8 +13044,14 @@ class BnCameraManager(private val context: Context) {
                 builder.set(CaptureRequest.SENSOR_SENSITIVITY, profilePlan.sensitivityIso!!)
                 builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, profilePlan.exposureTimeNs!!)
                 builder.set(CaptureRequest.SENSOR_FRAME_DURATION, profilePlan.frameDurationNs!!)
+                recordPhysicalExposureOwner(
+                    owner = PhysicalSensorExposureOwner.PROFILE_EXPLICIT_PRIORITY,
+                    sensorId = physicalSensorId,
+                    reason = authorityDecision.reason
+                )
                 lastExposurePlanSummary =
-                    "profilePriority=true;${profilePlan.summary()};flashSuppressed=${currentFlashMode != "Off"}"
+                    "profilePriority=true;owner=PROFILE_EXPLICIT_PRIORITY;physicalSensorId=$physicalSensorId;" +
+                        "${profilePlan.summary()};flashSuppressed=${currentFlashMode != "Off"}"
                 Log.d(tag, "Camera2 profile exposure plan $lastExposurePlanSummary")
                 return
             }
@@ -13031,8 +13270,9 @@ class BnCameraManager(private val context: Context) {
             val plan = resolveExposurePlan(characteristics)
             if (plan == null || plan.autoExposure || !plan.ready) {
                 manualExposureAwaitingMetadata = plan?.ready == false
-                val flashControlPlan = resolveFlashControlPlan(characteristics, currentFlashMode)
+                val flashControlPlan = resolveFlashControlPlan(deviceCharacteristics, currentFlashMode)
                 setAePriorityModeOff(builder)
+                builder.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
                 builder.set(
                     CaptureRequest.CONTROL_AE_MODE,
                     flashControlPlan?.aeMode ?: CaptureRequest.CONTROL_AE_MODE_ON
@@ -13044,7 +13284,21 @@ class BnCameraManager(private val context: Context) {
                 builder.set(CaptureRequest.SENSOR_SENSITIVITY, plan?.sensitivityIso)
                 builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, plan?.exposureTimeNs)
                 builder.set(CaptureRequest.SENSOR_FRAME_DURATION, plan?.frameDurationNs)
-                lastExposurePlanSummary = plan?.summary() ?: lastExposurePlanSummary
+                recordPhysicalExposureOwner(
+                    owner = PhysicalSensorExposureOwner.CAMERA2_HAL_AE,
+                    sensorId = physicalSensorId,
+                    reason = when (authorityDecision.owner) {
+                        PhysicalSensorExposureOwner.USER_MANUAL_SENSOR ->
+                            "manual_sensor_bootstrap_waiting_for_current_generation_metadata"
+                        PhysicalSensorExposureOwner.PROFILE_EXPLICIT_PRIORITY ->
+                            "profile_priority_fallback_camera2_ae"
+                        PhysicalSensorExposureOwner.CAMERA2_HAL_AE ->
+                            authorityDecision.reason
+                    }
+                )
+                lastExposurePlanSummary =
+                    "owner=CAMERA2_HAL;physicalSensorId=$physicalSensorId;" +
+                        (plan?.summary() ?: "mode=AUTO;reason=no_manual_plan")
                 if (plan?.ready == false) {
                     Log.w(tag, "Manual exposure pending without guessed fallback: ${plan.summary()}")
                 }
@@ -13059,7 +13313,14 @@ class BnCameraManager(private val context: Context) {
             builder.set(CaptureRequest.SENSOR_SENSITIVITY, plan.sensitivityIso!!)
             builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, plan.exposureTimeNs!!)
             builder.set(CaptureRequest.SENSOR_FRAME_DURATION, plan.frameDurationNs!!)
-            lastExposurePlanSummary = plan.summary() + ";flashSuppressedForManual=${currentFlashMode != "Off"}"
+            recordPhysicalExposureOwner(
+                owner = PhysicalSensorExposureOwner.USER_MANUAL_SENSOR,
+                sensorId = physicalSensorId,
+                reason = authorityDecision.reason
+            )
+            lastExposurePlanSummary =
+                "owner=USER_MANUAL_SENSOR;physicalSensorId=$physicalSensorId;" +
+                    plan.summary() + ";flashSuppressedForManual=${currentFlashMode != "Off"}"
             Log.d(tag, "Camera2 exposure plan $lastExposurePlanSummary")
         }
 

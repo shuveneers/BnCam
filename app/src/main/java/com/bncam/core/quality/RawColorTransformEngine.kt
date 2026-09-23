@@ -142,6 +142,66 @@ object RawColorTransformEngine {
         )
     }
 
+    /**
+     * Extra sanity contract for CaptureResult.COLOR_CORRECTION_TRANSFORM only.
+     *
+     * The generic sensor-matrix validator intentionally accepts a very broad device-dependent
+     * range. That is appropriate for static characterization math, but it is too permissive for a
+     * direct exact-frame transform that claims to map the already white-balanced sensor RGB into
+     * linear sRGB. On some logical multi-camera routes a physical child may expose a finite,
+     * non-singular matrix in a different vendor domain; blindly accepting it produces extreme
+     * ("nuclear") colour. Reject only clear direct-transform outliers so the caller can fall back
+     * to the same physical sensor's ForwardMatrix + CalibrationTransform path.
+     */
+    fun validateExactFrameCamera2ColorTransform(values: FloatArray): SensorColorMatrixValidation {
+        val shared = validateSensorToLinearSrgbMatrix(values)
+        if (!shared.valid) return shared
+
+        val rowSums = shared.rowSums
+        val meanNeutral = rowSums.average().toFloat()
+        if (!meanNeutral.isFinite() || meanNeutral <= 0.02f ||
+            rowSums.any { !it.isFinite() || it <= 0.02f }
+        ) {
+            return shared.copy(
+                valid = false,
+                reason = "camera2_direct_non_positive_neutral_response"
+            )
+        }
+
+        // Camera2 defines the direct transform after WB. A neutral sensor vector therefore must
+        // stay broadly neutral in the declared linear-sRGB output. The envelope is intentionally
+        // generous; normal sensor calibration is preserved while obvious domain mismatches fail.
+        if (!shared.neutralAxisDeviation.isFinite() || shared.neutralAxisDeviation > 0.50f) {
+            return shared.copy(
+                valid = false,
+                reason = "camera2_direct_neutral_axis_outlier"
+            )
+        }
+
+        if (!shared.maxAbs.isFinite() || shared.maxAbs > 8.0f) {
+            return shared.copy(
+                valid = false,
+                reason = "camera2_direct_coefficient_outlier"
+            )
+        }
+
+        for (row in 0..2) {
+            val base = row * 3
+            val absoluteEnergy =
+                abs(values[base]) + abs(values[base + 1]) + abs(values[base + 2])
+            val neutralResponse = abs(rowSums[row]).coerceAtLeast(1.0e-4f)
+            val cancellationRatio = absoluteEnergy / neutralResponse
+            if (!cancellationRatio.isFinite() || cancellationRatio > 12.0f) {
+                return shared.copy(
+                    valid = false,
+                    reason = "camera2_direct_excessive_row_cancellation"
+                )
+            }
+        }
+
+        return shared.copy(reason = "valid_exact_frame_camera2_direct")
+    }
+
     fun resolveActualSensorForwardMatrixToLinearSrgb(
         forwardMatrix: FloatArray?,
         calibrationTransform: FloatArray?

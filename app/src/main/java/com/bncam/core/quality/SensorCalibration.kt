@@ -1331,7 +1331,21 @@ object SensorCalibrationResolver {
                 continue
             }
 
-            val validation = validateColorMatrix(values)
+            val validation = if (candidate.source.contains("COLOR_CORRECTION_TRANSFORM")) {
+                val direct = RawColorTransformEngine.validateExactFrameCamera2ColorTransform(values)
+                Triple(
+                    direct.valid,
+                    direct.score,
+                    if (direct.valid) {
+                        "valid; ${direct.reason}; neutralAxisDeviation=" +
+                            String.format(Locale.US, "%.5f", direct.neutralAxisDeviation)
+                    } else {
+                        direct.reason
+                    }
+                )
+            } else {
+                validateColorMatrix(values)
+            }
             if (validation.first) {
                 val legacyCounterfactual = legacyNeutralNormalizedMatrix(values)
                 return MatrixResolution(
