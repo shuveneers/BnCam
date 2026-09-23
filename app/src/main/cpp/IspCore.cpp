@@ -6679,7 +6679,9 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     const char* phase2ColorWorkingSpace = calibratedHueSatMapActive
             ? "DNG_XYZ_D50_TO_LINEAR_RIMM_HSV_TO_SCENE_LINEAR_SRGB"
             : (calibratedMatrixProfileActive
-                    ? "SCENE_LINEAR_SRGB_DNG_FORWARD_MATRIX_NO_HUESATMAP"
+                    ? (adaptiveColorAuthority.exactFrameWeight >= 0.01f
+                            ? "SCENE_LINEAR_SRGB_ADAPTIVE_DNG_EXACT_FRAME_COHERENCE"
+                            : "SCENE_LINEAR_SRGB_DNG_FORWARD_MATRIX_NO_HUESATMAP")
                     : "SCENE_LINEAR_SRGB_NO_CALIBRATED_PROFILE");
     const float* ccm = activeColorMatrix.data();
 
