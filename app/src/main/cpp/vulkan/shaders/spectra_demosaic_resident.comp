@@ -838,8 +838,9 @@ float baselineDirectionCorrection(
     // Protect pure colour texture/edges even when green carries little contrast.
     float chromaDetailGate = 1.0 - smoothstep(2.5, 6.0, chromaSpreadZ);
 
+    // Global blend already contains the physical-model confidence. Do not multiply the same
+    // confidence twice; local authority is reserved for image-content evidence only.
     float localAuthority = clamp(globalBlend, 0.0, 0.60) *
-            clamp(modelConfidence, 0.0, 1.0) *
             noiseLike * greenDetailGate * chromaDetailGate;
     float correction = residual * localAuthority;
     float maximumCorrection = 1.65 * sigma * clamp(globalBlend, 0.0, 0.60);
