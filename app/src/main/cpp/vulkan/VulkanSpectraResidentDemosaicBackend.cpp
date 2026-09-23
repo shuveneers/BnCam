@@ -1218,17 +1218,19 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
     push.wbG = request.wbRgb[1];
     push.wbB = request.wbRgb[2];
     // The 128-byte push layout is already at Vulkan's minimum guaranteed limit. During mode 3
-    // the demosaic evidence slots are no longer needed, so reuse two of them for the pre-WB
-    // opponent cleanup maxima rather than growing the push-constant block.
-    push.cfaEvidence0[0] = 0.0f; // retired classical pre-WB chroma cleanup
-    push.cfaEvidence0[1] = 0.0f; // retired classical pre-WB chroma cleanup
-    push.cfaEvidence0[2] = cloudMapContractValid ? 1.0f : 0.0f;
-    push.cfaEvidence0[3] = cloudMapContractValid
-            ? std::clamp(request.preWbCloudMaxAbsoluteCorrection, 0.0f, 0.010f)
-            : 0.0f;
-    // cfaEvidence1 is unused by mode 3 reconstruction; slot 0 is an exact generation-scoped
-    // source-RAW confidence-map availability flag without growing the 128-byte push block.
+    // demosaic evidence is no longer consumed, so reuse these slots for the mandatory RAW
+    // baseline plan. This remains sensor-role agnostic and independent of SPECTRA controls.
+    push.cfaEvidence0[0] = std::clamp(request.preWbOpponentCleanupBlend[0], 0.0f, 0.60f);
+    push.cfaEvidence0[1] = std::clamp(request.preWbOpponentCleanupBlend[1], 0.0f, 0.60f);
+    push.cfaEvidence0[2] = std::clamp(request.baselineChromaSigmaRg, 0.0f, 0.25f);
+    push.cfaEvidence0[3] = std::clamp(request.baselineChromaSigmaBg, 0.0f, 0.25f);
+    // cfaEvidence1.x retains the exact generation-scoped source-RAW confidence-map flag.
+    // y/z/w carry baseline luma sigma, model confidence and an explicit plan-enabled bit.
     push.cfaEvidence1[0] = sourceClipConfidenceReady ? 1.0f : 0.0f;
+    push.cfaEvidence1[1] = std::clamp(request.baselineLumaSigma, 0.0f, 0.25f);
+    push.cfaEvidence1[2] = std::clamp(request.baselineNoiseConfidence, 0.0f, 1.0f);
+    push.cfaEvidence1[3] =
+            (push.cfaEvidence0[0] > 1.0e-5f || push.cfaEvidence0[1] > 1.0e-5f) ? 1.0f : 0.0f;
     push.ccm[0] = request.colorMatrix[0];
     push.ccm[1] = request.colorMatrix[1];
     push.ccm[2] = request.colorMatrix[2];
@@ -1387,9 +1389,18 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
         result.wbMean[c] = sums[3 + c] * inversePixels;
         result.ccmMean[c] = sums[6 + c] * inversePixels;
     }
-    result.cloudMeanAbsCorrectionRG = sums[9] * inversePixels;
-    result.cloudMeanAbsCorrectionBG = sums[10] * inversePixels;
-    result.cloudAffectedPixelFraction = std::clamp(sums[11] * inversePixels, 0.0, 1.0);
+    // Statistics slots 9..11 are the generic pre-WB opponent-correction reduction.
+    // Legacy cloud-map transport remains disabled; expose the active owner separately.
+    result.cloudMeanAbsCorrectionRG = 0.0;
+    result.cloudMeanAbsCorrectionBG = 0.0;
+    result.cloudAffectedPixelFraction = 0.0;
+    result.baselineMeanAbsCorrectionRG = sums[9] * inversePixels;
+    result.baselineMeanAbsCorrectionBG = sums[10] * inversePixels;
+    result.baselineAffectedPixelFraction = std::clamp(sums[11] * inversePixels, 0.0, 1.0);
+    result.baselineChromaCleanupApplied =
+            result.baselineAffectedPixelFraction > 0.0 &&
+            (result.baselineMeanAbsCorrectionRG > 0.0 ||
+             result.baselineMeanAbsCorrectionBG > 0.0);
     const auto* phase9 = static_cast<const std::uint32_t*>(colorTelemetry_.mapped);
     result.phase9SensorClipCandidatePixels = phase9[0];
     result.phase9SingleChannelSensorClipPixels = phase9[1];
