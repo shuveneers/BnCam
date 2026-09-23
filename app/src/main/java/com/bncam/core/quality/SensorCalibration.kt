@@ -1290,6 +1290,17 @@ object SensorCalibrationResolver {
             sourcePriority = 3
         ))
 
+        // Comparative exact-frame trust uses only standards-complete static candidates from
+        // this same immutable SensorMetadata snapshot. No camera id or lens role participates.
+        val staticColorReferences = candidates
+            .filter { it.source.contains("SENSOR_FORWARD_MATRIX") }
+            .mapNotNull { it.values }
+            .filter { RawColorTransformEngine.validateSensorToLinearSrgbMatrix(it).valid }
+        val exactFrameWbForTrust = sensorMetadata.colorCorrectionGainsField.value
+            ?.takeIf { sensorMetadata.colorCorrectionGainsField.isValid && it.size >= 4 }
+            ?.take(4)
+            ?.toFloatArray()
+
         // The old inverse(SENSOR_COLOR_TRANSFORM) fallbacks were not complete actual-sensor
         // transforms: ColorTransform maps XYZ -> reference sensor, so using its inverse without
         // the device calibration transform and illuminant adaptation is not a truthful substitute.
@@ -1333,14 +1344,46 @@ object SensorCalibrationResolver {
 
             val validation = if (candidate.source.contains("COLOR_CORRECTION_TRANSFORM")) {
                 val direct = RawColorTransformEngine.validateExactFrameCamera2ColorTransform(values)
+                val trust = if (direct.valid) {
+                    RawColorTransformEngine.evaluateExactFrameAgainstStaticCalibration(
+                        exactFrame = values,
+                        wbRggb = exactFrameWbForTrust,
+                        staticCandidates = staticColorReferences
+                    )
+                } else {
+                    null
+                }
+                val accepted = direct.valid && (trust?.trusted != false)
                 Triple(
-                    direct.valid,
+                    accepted,
                     direct.score,
-                    if (direct.valid) {
-                        "valid; ${direct.reason}; neutralAxisDeviation=" +
-                            String.format(Locale.US, "%.5f", direct.neutralAxisDeviation)
+                    if (accepted) {
+                        "valid; ${direct.reason}; comparativeTrust=${trust?.reason ?: "not_run"}; " +
+                            "neutralAxisDeviation=" +
+                            String.format(Locale.US, "%.5f", direct.neutralAxisDeviation) +
+                            "; opponentGain=" +
+                            String.format(Locale.US, "%.4f", trust?.exactOpponentGain ?: Float.NaN) +
+                            "; staticOpponentGain=" +
+                            String.format(Locale.US, "%.4f", trust?.referenceOpponentGain ?: Float.NaN) +
+                            "; amplificationRatio=" +
+                            String.format(Locale.US, "%.4f", trust?.amplificationRatio ?: Float.NaN) +
+                            "; matrixShapeDistance=" +
+                            String.format(Locale.US, "%.5f", trust?.matrixShapeDistance ?: Float.NaN) +
+                            "; staticSpread=" +
+                            String.format(Locale.US, "%.5f", trust?.staticCalibrationSpread ?: Float.NaN)
                     } else {
-                        direct.reason
+                        trust?.let {
+                            "${it.reason}; opponentGain=" +
+                                String.format(Locale.US, "%.4f", it.exactOpponentGain) +
+                                "; staticOpponentGain=" +
+                                String.format(Locale.US, "%.4f", it.referenceOpponentGain) +
+                                "; amplificationRatio=" +
+                                String.format(Locale.US, "%.4f", it.amplificationRatio) +
+                                "; matrixShapeDistance=" +
+                                String.format(Locale.US, "%.5f", it.matrixShapeDistance) +
+                                "; staticSpread=" +
+                                String.format(Locale.US, "%.5f", it.staticCalibrationSpread)
+                        } ?: direct.reason
                     }
                 )
             } else {
