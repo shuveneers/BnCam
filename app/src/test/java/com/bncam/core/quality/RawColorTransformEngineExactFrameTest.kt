@@ -73,6 +73,12 @@ class RawColorTransformEngineExactFrameTest {
         )
         val wb = floatArrayOf(2.0f, 1.0f, 1.0f, 1.5f)
 
+        // This is the important regression: the matrix is numerically valid under the old
+        // standalone gate, so only the same-sensor comparative trust check catches the problem.
+        assertTrue(
+            RawColorTransformEngine.validateExactFrameCamera2ColorTransform(exact).valid
+        )
+
         val result = RawColorTransformEngine.evaluateExactFrameAgainstStaticCalibration(
             exactFrame = exact,
             wbRggb = wb,
