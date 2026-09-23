@@ -1391,6 +1391,10 @@ object SensorCalibrationResolver {
             }
             if (validation.first) {
                 val legacyCounterfactual = legacyNeutralNormalizedMatrix(values)
+                val priorRejectionContext = rejected
+                    .takeIf { it.isNotEmpty() }
+                    ?.joinToString(separator = " || ", prefix = "; priorRejectedCandidates=")
+                    .orEmpty()
                 return MatrixResolution(
                     values = values.copyOf(),
                     source = candidate.source,
@@ -1398,10 +1402,17 @@ object SensorCalibrationResolver {
                     identityFallbackUsed = false,
                     rejectReason = "none",
                     note = "Phase8 validated matrix accepted without row normalization; ${candidate.note}; " +
-                            "validationScore=${validation.second.format5()}",
+                            "validationScore=${validation.second.format5()}$priorRejectionContext",
                     preNormalizationValues = values.copyOf(),
                     neutralNormalizationApplied = false,
                     legacyNeutralNormalizedValues = legacyCounterfactual
+                )
+            }
+            if (candidate.source.contains("COLOR_CORRECTION_TRANSFORM")) {
+                Log.i(
+                    "SensorCalibration",
+                    "ADAPTIVE_RAW_COLOR_AUTHORITY rejected exact-frame Camera2 CCM; " +
+                        "reason=${validation.third}; trying same-sensor standards-complete static calibration"
                 )
             }
             rejected.add("${candidate.source}: ${validation.third}")
