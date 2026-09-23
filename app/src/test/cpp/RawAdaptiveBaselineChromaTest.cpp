@@ -29,6 +29,21 @@ int main() {
     assert(noisyAmplifiedRaw.blendBlueGreen > 0.40f);
     assert(noisyAmplifiedRaw.blendRedGreen > cleanMain.blendRedGreen + 0.30f);
 
+
+    // A compact observer below the physical prediction is not evidence of scene structure.
+    // It must therefore keep full physical-model agreement instead of suppressing the baseline.
+    const AdaptiveChromaPlan measuredBelowPrediction = resolveAdaptiveChromaPlan({
+            true,
+            true,
+            0.85,
+            1.6e-4,
+            {8.35e-4, 8.35e-6, 3.94},
+            {8.35e-4, 8.35e-6, 3.94}
+    });
+    assert(measuredBelowPrediction.ready);
+    assert(measuredBelowPrediction.blendRedGreen > 0.40f);
+    assert(measuredBelowPrediction.blendBlueGreen > 0.40f);
+
     // Scene residuals far above the physical prediction are not permission to denoise harder.
     const AdaptiveChromaPlan disagreement = resolveAdaptiveChromaPlan({
             true,
