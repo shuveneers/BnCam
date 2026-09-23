@@ -10,6 +10,7 @@
 #include "RawSpatialNoiseCalibrationPolicy.h"
 #include "RawGreenSplitPolicy.h"
 #include "RawAdaptiveExposurePolicy.h"
+#include "RawAdaptiveBaselineChroma.h"
 #include "SpectraResidualSeedConfidence.h"
 #include "PhysicalAwbEstimator.h"
 #include "SensorColorScienceV2.h"
@@ -6727,27 +6728,45 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     const double ccmOnlyBlueOpponentDirectionalGain = wbRgb[2] > 1.0e-6f
             ? wbCcmBlueOpponentDirectionalGain / static_cast<double>(wbRgb[2]) : 1.0;
 
-    // N006B: pre-WB ChromaCloud and neighbour-opponent correction ownership is retired.
-    // Keep only compact read-only diagnostics so downstream telemetry can distinguish
-    // measurement from mutation while the future neural owner is not yet connected.
-    const double preWbMeasuredToPredictedRmsRatioRg = demosaicChromaAuditReady
-            ? demosaicSafeRmsRatio(
-                    demosaicMeasuredPostVarianceRg, demosaicPredictedPostVarianceRg)
-            : -1.0;
-    const double preWbMeasuredToPredictedRmsRatioBg = demosaicChromaAuditReady
-            ? demosaicSafeRmsRatio(
-                    demosaicMeasuredPostVarianceBg, demosaicPredictedPostVarianceBg)
-            : -1.0;
-    constexpr float preWbGainRiskR = 0.0f;
-    constexpr float preWbGainRiskB = 0.0f;
-    constexpr float spectraPreWbNoiseAuthority = 0.0f;
-    constexpr bool spectraCleanSceneCloudBypass = true;
-    constexpr float preWbChromaCleanupRiskR = 0.0f;
-    constexpr float preWbChromaCleanupRiskB = 0.0f;
-    constexpr float preWbChromaCleanupProposedBlendR = 0.0f;
-    constexpr float preWbChromaCleanupProposedBlendB = 0.0f;
-    constexpr bool preWbChromaCleanupPlanReady = false;
+    // Mandatory developed-RAW baseline chroma plan. This is deliberately independent from
+    // SPECTRA/user controls: physical S/O predicts stochastic residual energy, the compact
+    // post-demosaic scan checks model agreement, and the actual WB/CCM quantifies how visible
+    // each opponent direction will become. No lens id/role participates in this decision.
+    const bncam::raw_baseline::AdaptiveChromaPlan baselineChromaPlan =
+            bncam::raw_baseline::resolveAdaptiveChromaPlan({
+                    preDemosaicPhysicalNoiseModelAvailable,
+                    demosaicChromaAuditReady,
+                    residualNoiseState.postDemosaic.confidence,
+                    residualNoiseState.postDemosaic.varianceY,
+                    {
+                            demosaicPredictedPostVarianceRg,
+                            demosaicMeasuredPostVarianceRg,
+                            wbCcmRedOpponentDirectionalGain
+                    },
+                    {
+                            demosaicPredictedPostVarianceBg,
+                            demosaicMeasuredPostVarianceBg,
+                            wbCcmBlueOpponentDirectionalGain
+                    }
+            });
+    const double preWbMeasuredToPredictedRmsRatioRg =
+            baselineChromaPlan.measuredToPredictedRmsRedGreen;
+    const double preWbMeasuredToPredictedRmsRatioBg =
+            baselineChromaPlan.measuredToPredictedRmsBlueGreen;
+    const float preWbGainRiskR = static_cast<float>(bncam::raw_baseline::smoothstep(
+            1.15, 2.80, wbCcmRedOpponentDirectionalGain));
+    const float preWbGainRiskB = static_cast<float>(bncam::raw_baseline::smoothstep(
+            1.15, 2.80, wbCcmBlueOpponentDirectionalGain));
+    const float spectraPreWbNoiseAuthority = baselineChromaPlan.confidence;
+    const bool spectraCleanSceneCloudBypass = !baselineChromaPlan.ready;
+    const float preWbChromaCleanupRiskR = baselineChromaPlan.riskRedGreen;
+    const float preWbChromaCleanupRiskB = baselineChromaPlan.riskBlueGreen;
+    const float preWbChromaCleanupProposedBlendR = baselineChromaPlan.blendRedGreen;
+    const float preWbChromaCleanupProposedBlendB = baselineChromaPlan.blendBlueGreen;
+    const bool preWbChromaCleanupPlanReady = baselineChromaPlan.ready;
 
+    // Retired Phase-6 owner stays retired. The new baseline owner is intentionally narrow:
+    // only R-G/B-G stochastic residuals before WB; never a generic RGB/luma denoiser.
     constexpr bool phase6ResidualChromaUsedForOutput = false;
     constexpr bool phase6ResidualChromaGpuUsed = false;
     constexpr std::uint64_t phase6ProcessedPixels = 0u;
@@ -6761,17 +6780,17 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     constexpr float phase6MaximumAbsoluteCorrection = 0.0f;
     constexpr double phase6CandidateFraction = 0.0;
     constexpr const char* phase6ExecutionBackend =
-            "RETIRED_CLASSICAL_PIXEL_OWNER_NEURAL_PENDING";
+            "RETIRED_PHASE6_REPLACED_BY_NARROW_RAW_BASELINE_CHROMA_OWNER";
 
-    constexpr bool preWbChromaCleanupExecutionReady = false;
-    constexpr float preWbChromaCleanupAppliedBlendR = 0.0f;
-    constexpr float preWbChromaCleanupAppliedBlendB = 0.0f;
-    constexpr float preWbNoiseModelEffectiveBlendR = 0.0f;
-    constexpr float preWbNoiseModelEffectiveBlendB = 0.0f;
+    // Propagation remains conservative: the local shader is content-gated, so subtracting a
+    // guessed global variance reduction here would overstate precision. Downstream covariance
+    // therefore stays at the pre-cleanup upper bound until the post-colour compact observer.
     bncam::spectra2::NoiseState preWbNoiseState = residualNoiseState.postDemosaic;
-    preWbNoiseState.stage = "POST_DEMOSAIC_PRE_AWB_IDENTITY";
-    preWbNoiseState.method = "NO_CLASSICAL_PRE_WB_PIXEL_CORRECTION";
-    preWbNoiseState.status = "PROPAGATED_IDENTITY";
+    preWbNoiseState.stage = "POST_DEMOSAIC_PRE_AWB_BASELINE_CHROMA_CONSERVATIVE";
+    preWbNoiseState.method = baselineChromaPlan.ready
+            ? "ADAPTIVE_RAW_BASELINE_CHROMA_LOCAL_GATED_CONSERVATIVE_COVARIANCE"
+            : "ADAPTIVE_RAW_BASELINE_CHROMA_BYPASS";
+    preWbNoiseState.status = baselineChromaPlan.reason;
 
     const auto awbPropagationStart = IspClock::now();
     residualNoiseState.postAwb = bncam::spectra2::propagateAwb(
@@ -6892,7 +6911,13 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         // scene observer consumes this generation directly and only returns compact samples.
         request.deferFullReadback = true;
         request.wbRgb = {wbRgb[0], wbRgb[1], wbRgb[2]};
-        request.preWbOpponentCleanupBlend = {0.0f, 0.0f};
+        request.preWbOpponentCleanupBlend = {
+                preWbChromaCleanupProposedBlendR,
+                preWbChromaCleanupProposedBlendB};
+        request.baselineChromaSigmaRg = baselineChromaPlan.sigmaRedGreen;
+        request.baselineChromaSigmaBg = baselineChromaPlan.sigmaBlueGreen;
+        request.baselineLumaSigma = baselineChromaPlan.sigmaLuma;
+        request.baselineNoiseConfidence = baselineChromaPlan.confidence;
         request.preWbCloudCorrectionReady = false;
         for (size_t i = 0; i < request.colorMatrix.size(); ++i) {
             request.colorMatrix[i] = ccm[i];
@@ -6944,8 +6969,10 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             linearRgb = runCpuDemosaicFallback();
             vulkanDemosaicResident = false;
         }
-        // N006B: failure recovery follows the same neutral contract as Vulkan: direct
-        // demosaic -> WB/CCM, with no hidden neighbour/cloud denoise correction.
+        // Failure recovery remains deliberately simple. The mandatory adaptive chroma owner is
+        // Vulkan-resident; if that pass fails we do not introduce a second unverified CPU filter.
+        // The fallback therefore performs direct demosaic -> WB/CCM and telemetry marks the
+        // baseline plan as planned-but-not-applied.
         std::mutex colorStatsMutex;
         cv::parallel_for_(cv::Range(0, linearRgb.rows), [&](const cv::Range& range) {
             double localRawR = 0.0, localRawG = 0.0, localRawB = 0.0;
@@ -7011,6 +7038,21 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         });
         cpuColorTransformApplied = true;
     }
+    const bool preWbChromaCleanupExecutionReady =
+            baselineChromaPlan.ready && vulkanColorTransform.success;
+    const float preWbChromaCleanupAppliedBlendR = preWbChromaCleanupExecutionReady
+            ? baselineChromaPlan.blendRedGreen : 0.0f;
+    const float preWbChromaCleanupAppliedBlendB = preWbChromaCleanupExecutionReady
+            ? baselineChromaPlan.blendBlueGreen : 0.0f;
+    const float preWbNoiseModelEffectiveBlendR = preWbChromaCleanupAppliedBlendR;
+    const float preWbNoiseModelEffectiveBlendB = preWbChromaCleanupAppliedBlendB;
+    const double preWbBaselineMeanAbsCorrectionRg =
+            vulkanColorTransform.baselineMeanAbsCorrectionRG;
+    const double preWbBaselineMeanAbsCorrectionBg =
+            vulkanColorTransform.baselineMeanAbsCorrectionBG;
+    const double preWbBaselineAffectedPixelFraction =
+            vulkanColorTransform.baselineAffectedPixelFraction;
+
     const float awbColourTransformMs = elapsedMs(awbColourTransformStart);
     if (physicalNoiseStatisticsActive) {
         const auto measuredPostColourTransformStart = IspClock::now();
@@ -9364,6 +9406,13 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << preWbNoiseModelEffectiveBlendR
             << "; spectraPreWbNoiseModelEffectiveBlendB="
             << preWbNoiseModelEffectiveBlendB
+            << "; rawBaselineChromaPolicyReason=" << baselineChromaPlan.reason
+            << "; rawBaselineChromaSigmaRG=" << baselineChromaPlan.sigmaRedGreen
+            << "; rawBaselineChromaSigmaBG=" << baselineChromaPlan.sigmaBlueGreen
+            << "; rawBaselineLumaSigmaForDetailGate=" << baselineChromaPlan.sigmaLuma
+            << "; rawBaselineChromaMeanAbsCorrectionRG=" << preWbBaselineMeanAbsCorrectionRg
+            << "; rawBaselineChromaMeanAbsCorrectionBG=" << preWbBaselineMeanAbsCorrectionBg
+            << "; rawBaselineChromaAffectedPixelFraction=" << preWbBaselineAffectedPixelFraction
             << "; spectraPreWbChromaCleanupApplied="
             << (preWbChromaCleanupExecutionReady ? "true" : "false")
             << "; spectraPreWbChromaCleanupExecution="
