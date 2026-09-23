@@ -182,9 +182,10 @@ object AwbCalibrationEngine {
     }
 
     /**
-     * Static lens calibration authority for the exact-frame Camera2 prior. The default Auto
-     * locus is intentionally a moderate constraint; an explicit RG/BG trim, manual Gr/Gb or Custom
-     * BnCam calibration is a deliberate calibration request and therefore owns the developed WB.
+     * Static lens calibration is a validation/constraint model in Auto, not a default pixel owner.
+     * Camera2's exact-frame gains and transform are one coupled current-scene color solution; the
+     * default path must preserve that pair. Only an explicit user AWB choice is allowed to mutate
+     * the developed gains before native physical-scene refinement.
      */
     fun hasExplicitDevelopedAuthority(settings: LensAwbCalibrationSettings): Boolean {
         val safe = settings.sanitized()
@@ -198,7 +199,7 @@ object AwbCalibrationEngine {
     }
 
     fun staticPriorAuthority(settings: LensAwbCalibrationSettings): Float =
-        if (hasExplicitDevelopedAuthority(settings)) 1.0f else 0.65f
+        if (hasExplicitDevelopedAuthority(settings)) 1.0f else 0.0f
 
     /**
      * Applies the selected per-lens calibration directly to the exact-frame Camera2 WB prior.
