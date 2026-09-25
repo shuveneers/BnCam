@@ -190,103 +190,8 @@ float defectCorrectedAt(int x, int y, float center, out bool corrected) {
     return center;
 }
 
-// Baseline SPECTRA denoise is a physical-model owner, not a Neural feature.
-// It operates on one Bayer plane at a time (all offsets are even), so R/Gr/Gb/B are never
-// mixed. Dynamic ISO has already been folded into the effective S/O supplied here; this pass
-// must not apply the coefficient again. Neural, when enabled, receives this denoised mosaic
-// and is therefore only a residual/add-on refinement of the physical baseline.
-float baselineNoiseReducedAt(int x, int y, float center) {
-    if (pc.noiseModelEnabled == 0u || !finite1(center)) return center;
-    if (x < 4 || y < 4 || x >= int(pc.frameWidth) - 4 || y >= int(pc.frameHeight) - 4) {
-        return center;
-    }
-
-    int channel = noiseChannel4(pc.effectiveCfaPattern, x, y);
-    float centerNoiseVariance = predictedNoiseVariance(center, channel);
-    if (!(centerNoiseVariance > 1.0e-12) || !finite1(centerNoiseVariance)) return center;
-
-    // Two same-CFA spatial scales. The near 3x3 Bayer-plane support removes fine grain. The
-    // radius-4 support reduces lower-frequency sensor noise only when the intervening radius-2
-    // sample agrees with the center. This makes high effective S/O materially smoother while a
-    // low Dynamic-ISO model stays crisp, without adding a second strength parameter or mixing CFA.
-    const ivec2 nearOffsets[8] = ivec2[8](
-        ivec2(-2,  0), ivec2( 2,  0), ivec2( 0, -2), ivec2( 0,  2),
-        ivec2(-2, -2), ivec2( 2, -2), ivec2(-2,  2), ivec2( 2,  2));
-    const ivec2 farOffsets[8] = ivec2[8](
-        ivec2(-4,  0), ivec2( 4,  0), ivec2( 0, -4), ivec2( 0,  4),
-        ivec2(-4, -4), ivec2( 4, -4), ivec2(-4,  4), ivec2( 4,  4));
-    float nearSamples[8];
-    float nearWeights[8];
-    float farSamples[8];
-    float farWeights[8];
-
-    float nearRangeVariance = max(4.0 * centerNoiseVariance, 1.0e-12);
-    float farRangeVariance = max(6.0 * centerNoiseVariance, 1.0e-12);
-    float weightSum = 1.0;
-    float weightedSum = center;
-
-    for (int i = 0; i < 8; ++i) {
-        float rawNear = sourceAt(x + nearOffsets[i].x, y + nearOffsets[i].y);
-        bool nearFinite = finite1(rawNear);
-        float nearValue = nearFinite ? rawNear : center;
-        nearSamples[i] = nearValue;
-        float nearDelta = nearValue - center;
-        float nearDistance = (nearDelta * nearDelta) / nearRangeVariance;
-        float nearWeight = nearFinite && finite1(nearDistance)
-            ? 1.0 / (1.0 + max(nearDistance, 0.0))
-            : 0.0;
-        if (!finite1(nearWeight) || nearWeight < 0.0) nearWeight = 0.0;
-        nearWeights[i] = nearWeight;
-        weightSum += nearWeight;
-        weightedSum += nearWeight * nearValue;
-
-        float rawFar = sourceAt(x + farOffsets[i].x, y + farOffsets[i].y);
-        bool farFinite = finite1(rawFar);
-        float farValue = farFinite ? rawFar : center;
-        farSamples[i] = farValue;
-        float farDelta = farValue - center;
-        float farDistance = (farDelta * farDelta) / farRangeVariance;
-        float farRangeWeight = farFinite && finite1(farDistance)
-            ? 1.0 / (1.0 + max(farDistance, 0.0))
-            : 0.0;
-        if (!finite1(farRangeWeight) || farRangeWeight < 0.0) farRangeWeight = 0.0;
-
-        // Radius four is exactly twice the spatial distance of the near support, so its base
-        // spatial authority is one half. Multiplication by nearWeight is a continuity gate:
-        // a far sample cannot contribute strongly across an edge that was already rejected at r=2.
-        float farWeight = 0.5 * nearWeight * farRangeWeight;
-        if (!finite1(farWeight) || farWeight < 0.0) farWeight = 0.0;
-        farWeights[i] = farWeight;
-        weightSum += farWeight;
-        weightedSum += farWeight * farValue;
-    }
-    if (!finite1(weightSum) || !finite1(weightedSum) || !(weightSum > 1.0e-12)) return center;
-
-    float localMean = weightedSum / weightSum;
-    if (!finite1(localMean)) return center;
-    float localVarianceSum = (center - localMean) * (center - localMean);
-    for (int i = 0; i < 8; ++i) {
-        float nearDelta = nearSamples[i] - localMean;
-        float farDelta = farSamples[i] - localMean;
-        localVarianceSum += nearWeights[i] * nearDelta * nearDelta;
-        localVarianceSum += farWeights[i] * farDelta * farDelta;
-    }
-    if (!finite1(localVarianceSum)) return center;
-    float localVariance = localVarianceSum / weightSum;
-    if (!finite1(localVariance) || localVariance < 0.0) return center;
-
-    // Local Wiener shrinkage: variance explained by the resolved physical S/O is suppressed;
-    // variance in excess of that prediction is treated as scene structure. Dynamic ISO therefore
-    // controls baseline pixel denoise only through the one upstream-resolved S/O model.
-    float noiseVariance = predictedNoiseVariance(localMean, channel);
-    if (!finite1(noiseVariance) || noiseVariance < 0.0) return center;
-    float signalVariance = max(localVariance - noiseVariance, 0.0);
-    float denominator = signalVariance + noiseVariance;
-    float detailGain = denominator > 1.0e-12 ? signalVariance / denominator : 1.0;
-    if (!finite1(detailGain)) return center;
-    float filtered = localMean + clamp(detailGain, 0.0, 1.0) * (center - localMean);
-    return finite1(filtered) ? sceneClamp(filtered) : center;
-}
+// RAW zero-denoise baseline: physical S/O remains available for diagnostics,
+// exposure confidence and covariance propagation, but it has no Bayer-pixel smoothing authority.
 
 float safeLensGain(float value) {
     return finite1(value) ? clamp(value, 0.25, 3.5) : 1.0;
@@ -784,11 +689,6 @@ void finalizePixel() {
         bool defectCorrected = false;
         float value = defectCorrectedAt(x, y, original, defectCorrected);
         if (defectCorrected) localCounts.y = 1u;
-
-        // Physical baseline NR owns first-pass noise removal. It consumes the already-resolved
-        // effective per-channel S/O and therefore remains active with Neural OFF. Neural ON is
-        // downstream and receives this result; it never replaces this stage.
-        value = baselineNoiseReducedAt(x, y, value);
 
         int effectiveChannel = cfaChannel4(pc.effectiveCfaPattern, x, y);
         if (effectiveChannel == 1) value = sceneClamp(value * greenCalibrationScale(1) * pc.greenEvenScale);
