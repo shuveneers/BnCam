@@ -1525,19 +1525,6 @@ RawPreviewGpuResult VulkanRawPreviewBackend::execute(
     vkCmdUpdateBuffer(slot.commandBuffer, slot.deviceStatistics.buffer,
                       static_cast<VkDeviceSize>(562u * sizeof(std::uint32_t)),
                       sizeof(profileDetailBits), profileDetailBits);
-    const float profileNrSeeds[6] = {
-            std::clamp(request.profileNrLuminance, 0.0f, 1.0f),
-            std::clamp(request.profileNrLuminanceDetail, 0.0f, 1.0f),
-            std::clamp(request.profileNrLuminanceContrast, 0.0f, 1.0f),
-            std::clamp(request.profileNrColor, 0.0f, 1.0f),
-            std::clamp(request.profileNrColorDetail, 0.0f, 1.0f),
-            std::clamp(request.profileNrColorSmoothness, 0.0f, 1.0f)};
-    std::uint32_t profileNrBits[6]{};
-    static_assert(sizeof(profileNrBits) == sizeof(profileNrSeeds));
-    std::memcpy(profileNrBits, profileNrSeeds, sizeof(profileNrSeeds));
-    vkCmdUpdateBuffer(slot.commandBuffer, slot.deviceStatistics.buffer,
-                      static_cast<VkDeviceSize>(566u * sizeof(std::uint32_t)),
-                      sizeof(profileNrBits), profileNrBits);
     const float physicalNoiseSeeds[3] = {
             std::isfinite(request.physicalGreenNoiseS) ? std::max(0.0f, request.physicalGreenNoiseS) : 0.0f,
             std::isfinite(request.physicalGreenNoiseO) ? std::max(0.0f, request.physicalGreenNoiseO) : 0.0f,
