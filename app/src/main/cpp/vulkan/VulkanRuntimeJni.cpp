@@ -50,6 +50,21 @@ Java_com_bncam_core_vulkan_VulkanNativeBridge_nativeInitialize(
     return static_cast<jint>(VulkanRuntime::instance().initialize(config).state);
 }
 
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_bncam_core_vulkan_VulkanNativeBridge_nativeConfigureSpectraNeuralModel(
+    JNIEnv* env, jobject, jbyteArray packageBytes
+) {
+    if (env == nullptr || packageBytes == nullptr) return JNI_FALSE;
+    const jsize size = env->GetArrayLength(packageBytes);
+    if (size <= 0) return JNI_FALSE;
+    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(size));
+    env->GetByteArrayRegion(packageBytes, 0, size, reinterpret_cast<jbyte*>(bytes.data()));
+    if (env->ExceptionCheck()) return JNI_FALSE;
+    return VulkanRuntime::instance().configureSpectraNeuralModel(
+        bytes.data(), bytes.size(), true, 1u
+    ) ? JNI_TRUE : JNI_FALSE;
+}
+
 extern "C" JNIEXPORT jint JNICALL
 Java_com_bncam_core_vulkan_VulkanNativeBridge_nativeShutdown(JNIEnv*, jobject) {
     return static_cast<jint>(VulkanRuntime::instance().shutdown().state);
