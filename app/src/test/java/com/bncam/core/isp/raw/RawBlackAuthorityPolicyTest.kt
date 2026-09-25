@@ -7,7 +7,7 @@ import org.junit.Test
 
 class RawBlackAuthorityPolicyTest {
     @Test
-    fun `system uses static black pattern even when dynamic metadata exists`() {
+    fun `system prefers exact frame dynamic black when available`() {
         val decision = RawBlackAuthorityPolicy.resolveSystemDynamic(
             systemMosaicLevels = listOf(64f, 65f, 66f, 67f),
             systemSource = "CameraCharacteristics.SENSOR_BLACK_LEVEL_PATTERN",
@@ -19,10 +19,10 @@ class RawBlackAuthorityPolicyTest {
             requestedMode = RawBlackAuthorityMode.SYSTEM
         )
 
-        assertEquals(listOf(64f, 65f, 66f, 67f), decision.canonicalLevels)
+        assertEquals(listOf(60f, 61f, 62f, 63f), decision.canonicalLevels)
         assertTrue(decision.systemMetadataAvailable)
         assertTrue(decision.dynamicMetadataAvailable)
-        assertTrue(decision.source.startsWith("SYSTEM_METADATA:"))
+        assertTrue(decision.source.startsWith("SYSTEM_EXACT_FRAME_DYNAMIC:"))
     }
 
     @Test
