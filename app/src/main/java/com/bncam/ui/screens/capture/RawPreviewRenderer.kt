@@ -59,12 +59,6 @@ data class RawPreviewRenderConfig(
     val profileDetailRadius: Float,
     val profileDetailDetail: Float,
     val profileDetailMasking: Float,
-    val profileNrLuminance: Float,
-    val profileNrLuminanceDetail: Float,
-    val profileNrLuminanceContrast: Float,
-    val profileNrColor: Float,
-    val profileNrColorDetail: Float,
-    val profileNrColorSmoothness: Float,
     val toneCurve: FloatArray,
     val gammaCurve: FloatArray,
     val sectionCurve: FloatArray,
@@ -1206,12 +1200,6 @@ class RawPreviewRenderer(
                 profileDetailRadius = request.config.profileDetailRadius,
                 profileDetailDetail = request.config.profileDetailDetail,
                 profileDetailMasking = request.config.profileDetailMasking,
-                profileNrLuminance = request.config.profileNrLuminance,
-                profileNrLuminanceDetail = request.config.profileNrLuminanceDetail,
-                profileNrLuminanceContrast = request.config.profileNrLuminanceContrast,
-                profileNrColor = request.config.profileNrColor,
-                profileNrColorDetail = request.config.profileNrColorDetail,
-                profileNrColorSmoothness = request.config.profileNrColorSmoothness,
                 toneCurve = request.config.toneCurve,
                 gammaCurve = request.config.gammaCurve,
                 sectionCurve = request.config.sectionCurve,
@@ -1725,8 +1713,7 @@ class RawPreviewRenderer(
             config.sectionCurve.isNotEmpty()
         val calibrationConnected = config.blackLevels.size >= 4 && config.whiteLevel > 1 &&
             config.wbGains.size >= 4 && config.colorMatrix.size >= 9
-        val captureDetailNeutral = config.profileDetailAmount == 0f && config.profileNrLuminance == 0f &&
-            config.profileNrColor == 0f
+        val captureDetailNeutral = config.profileDetailAmount == 0f
         return buildString {
             append("cfa=connected")
             append(",blackWhite=").append(if (calibrationConnected) "connected" else "invalid")
@@ -1736,7 +1723,8 @@ class RawPreviewRenderer(
             append(",profileTone=connected")
             append(",profileColor=connected")
             append(",curves=").append(if (curvesConnected) "connected" else "missing")
-            append(",captureDetailNr=").append(if (captureDetailNeutral) "intentionally_preview_neutral" else "active")
+            append(",captureDetail=").append(if (captureDetailNeutral) "intentionally_preview_neutral" else "active")
+            append(",rawDenoise=removed")
             append(",cropZoom=runtime_geometry")
             append(",source=").append(config.source.name)
             append(",bootstrap=").append(config.isBootstrap)
