@@ -10,7 +10,6 @@
 #include "RawSpatialNoiseCalibrationPolicy.h"
 #include "RawGreenSplitPolicy.h"
 #include "RawAdaptiveExposurePolicy.h"
-#include "RawAdaptiveBaselineChroma.h"
 #include "SpectraResidualSeedConfidence.h"
 #include "PhysicalAwbEstimator.h"
 #include "SensorColorScienceV2.h"
@@ -28,7 +27,6 @@
 #include "ProfileToneRenderPolicy.h"
 #include "PerceptualDetailPolicy.h"
 #include "SpectraCfaChromaConfidence.h"
-#include "SpectraNeuralProductionPolicy.h"
 #include "SpectraNoiseAuthorityPolicy.h"
 #include "vulkan/VulkanRuntime.h"
 #include "vulkan/NativeStageHeartbeat.h"
@@ -66,107 +64,8 @@ constexpr int CFA_GBRG = 2;
 constexpr int CFA_BGGR = 3;
 
 
-std::string sanitizeNeuralDumpToken(const std::string& value) {
-    std::string out;
-    out.reserve(value.size());
-    for (const unsigned char ch : value) {
-        if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
-            (ch >= '0' && ch <= '9') || ch == '-' || ch == '_') {
-            out.push_back(static_cast<char>(ch));
-        } else {
-            out.push_back('_');
-        }
-    }
-    return out.empty() ? "capture" : out;
-}
-
-bool writeNeuralStageRawF32(
-        const std::filesystem::path& directory,
-        const std::string& basename,
-        const std::vector<float>& pixels,
-        std::uint32_t width,
-        std::uint32_t height) {
-    const std::uint64_t expected = static_cast<std::uint64_t>(width) * height;
-    if (width == 0u || height == 0u || pixels.size() != expected) return false;
-    std::ofstream stream(directory / (basename + ".rawf32"), std::ios::binary | std::ios::trunc);
-    if (!stream.is_open()) return false;
-    stream.write(
-            reinterpret_cast<const char*>(pixels.data()),
-            static_cast<std::streamsize>(pixels.size() * sizeof(float)));
-    return stream.good();
-}
-
-std::uint32_t writeNeuralStageDumps(
-        const IspFrameMetadata& meta,
-        std::uint64_t generation,
-        const bncam::vulkan::neural::SpectraNeuralStageDumps& dumps,
-        float& elapsedOutMs) {
-    const auto started = std::chrono::steady_clock::now();
-    elapsedOutMs = 0.0f;
-    if (!meta.rawJpegDebugDumpsEnabled || meta.rawJpegDebugDumpDirectory.empty() ||
-        !dumps.requested || dumps.width == 0u || dumps.height == 0u) {
-        return 0u;
-    }
-
-    std::error_code error;
-    const std::filesystem::path directory(meta.rawJpegDebugDumpDirectory);
-    std::filesystem::create_directories(directory, error);
-    if (error) return 0u;
-
-    const std::string prefix = "spectra_neural_" +
-            sanitizeNeuralDumpToken(meta.captureAttemptId) + "_" + std::to_string(generation);
-    std::uint32_t written = 0u;
-    if (dumps.preNeuralHardPhysicalReady &&
-        writeNeuralStageRawF32(
-                directory, prefix + "_01_pre_neural_hard_physical",
-                dumps.preNeuralHardPhysicalMosaic, dumps.width, dumps.height)) {
-        ++written;
-    }
-    if (dumps.postNeuralReady &&
-        writeNeuralStageRawF32(
-                directory, prefix + "_02_post_neural",
-                dumps.postNeuralMosaic, dumps.width, dumps.height)) {
-        ++written;
-    }
-    if (dumps.postRemainingLscReady &&
-        writeNeuralStageRawF32(
-                directory, prefix + "_03_post_remaining_lsc",
-                dumps.postRemainingLscMosaic, dumps.width, dumps.height)) {
-        ++written;
-    }
-
-    std::ofstream manifest(directory / (prefix + "_manifest.json"), std::ios::trunc);
-    if (manifest.is_open()) {
-        manifest
-                << "{\n"
-                << "  \"schema\": \"bncam.spectra_neural.stage_dump.v1\",\n"
-                << "  \"generation\": " << generation << ",\n"
-                << "  \"width\": " << dumps.width << ",\n"
-                << "  \"height\": " << dumps.height << ",\n"
-                << "  \"channels\": 1,\n"
-                << "  \"element_type\": \"float32\",\n"
-                << "  \"byte_order\": \"little_endian_android_arm64\",\n"
-                << "  \"row_order\": \"top_to_bottom\",\n"
-                << "  \"runtime_status\": \"" << dumps.status << "\",\n"
-                << "  \"requested_stage_count\": 3,\n"
-                << "  \"runtime_stage_count\": " << dumps.stageCount << ",\n"
-                << "  \"written_stage_count\": " << written << ",\n"
-                << "  \"debug_readback_bytes\": " << dumps.debugReadbackBytes << ",\n"
-                << "  \"debug_readback_ms\": " << dumps.debugReadbackMs << "\n"
-                << "}\n";
-    }
-
-    elapsedOutMs = std::chrono::duration<float, std::milli>(
-            std::chrono::steady_clock::now() - started).count();
-    return written;
-}
-
-// SPECTRA pre-neural boundary. Temporal observation, S/O adaptation and fusion evidence
-// live upstream. IspCore observes physical RAW/residual/CFA evidence only; no classical
-// SPECTRA denoiser owns or modifies RAW pixels here. The next denoise pixel owner is neural.
-
-
-
+// RAW zero-denoise baseline: neural denoise and its stage-dump production path are not
+// connected to IspCore. Physical noise intelligence remains measurement-only.
 
 struct ThreadLocalIspStats {
     double meanSensorNoiseVariance = 0.0;
@@ -5524,29 +5423,6 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     bool rawFinalizeFailureResidentInputMaterialized = false;
     bool demosaicFailureRawFinalizeMaterialized = false;
     bncam::vulkan::SpectraRawFinalizeResult vulkanRawFinalize{};
-    bncam::vulkan::neural::SpectraNeuralProductionTrace neuralProductionTrace{};
-    // Phase 9 debug-only truth flags. They describe the actual one-way authority chain and
-    // never participate in the processing decision.
-    bool neuralConditioningValid = false;
-    bool physicalNoiseUsedForNeuralConditioning = false;
-    if (meta.calibration.spectraProcessingMode == 0) {
-        // FASE 8: make user-disabled identity explicit even when the capture later selects
-        // a CPU/failure-recovery RAW-finalize route and never enters the resident Neural path.
-        neuralProductionTrace.exactPreflightBypass = true;
-        neuralProductionTrace.originalPublished = true;
-        neuralProductionTrace.neuralPublished = false;
-        neuralProductionTrace.attempted = false;
-        neuralProductionTrace.bypassReason =
-                bncam::spectra::neural::NeuralBypassReason::UserDisabled;
-        neuralProductionTrace.status = "EXACT_USER_DISABLED_IDENTITY";
-    }
-    bool neuralPosteriorSeedApplied = false;
-    bool neuralPosteriorLscPropagationReady = false;
-    std::array<float, 4> neuralPosteriorPostLscVarianceCfa{{0.0f, 0.0f, 0.0f, 0.0f}};
-    float neuralPosteriorSeedConfidence = 0.0f;
-    bncam::vulkan::neural::SpectraNeuralStageDumps neuralStageDumps{};
-    std::uint32_t neuralStageDumpFilesWritten = 0u;
-    float neuralStageDumpWriteMs = 0.0f;
     bncam::raw_exposure::Plan cpuAdaptiveExposurePlan{};
     cpuAdaptiveExposurePlan.status = "DISABLED_LOCAL_FLLF_OWNS_BRIGHTNESS";
     bool cpuAdaptiveExposureApplied = false;
@@ -5636,201 +5512,12 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             request.lensShadingRows = static_cast<std::uint32_t>(meta.lensShadingRows);
             request.lensShadingGenerationId = spectraLensMapGenerationId(meta);
         }
-        if (residentEntry && !residentCpuFallbackUsed &&
-            meta.calibration.spectraProcessingMode == 0) {
-            // FASE 8: user-disabled Neural is an exact resident identity path. Do not enter
-            // Neural preparation/model readiness/backend code at all. The frozen Physical
-            // Noise Model remains attached to the baseline RAW finalizer for read-only
-            // statistics/propagation, but no neural pixel mutation is attempted.
+        if (residentEntry && !residentCpuFallbackUsed) {
+            // RAW zero-denoise baseline: normalized Bayer goes directly into RAW finalization.
+            // No neural preparation/model/backend can mutate pixels in this route.
             vulkanRawFinalize = bncam::vulkan::VulkanRuntime::instance()
                     .executeSpectraRawFinalizeFromRawNormalize(
                             request, residentInput->rawNormalizeGeneration);
-        } else if (residentEntry && !residentCpuFallbackUsed) {
-            // Phase 5 production neural integration. The request is evidence-only until the
-            // runtime preflight grants mutation authority. Missing explicit analog gain is an
-            // intentional structural OOD condition: ISO is never substituted for sensor gain.
-            bncam::spectra::neural::NeuralProductionFrameEvidence neuralEvidence{};
-            neuralEvidence.frameId = residentInput->rawNormalizeGeneration;
-            neuralEvidence.rawWidth = static_cast<std::uint32_t>(rawWidth);
-            neuralEvidence.rawHeight = static_cast<std::uint32_t>(rawHeight);
-            neuralEvidence.sensorArrangement = jpegRaw.info.sensorCfaPattern;
-            neuralEvidence.cfaOffsetX = jpegRaw.info.cfaOffsetX;
-            neuralEvidence.cfaOffsetY = jpegRaw.info.cfaOffsetY;
-            const auto neuralCfaPack = bncam::spectra::neural::resolveCanonicalBayerPack(
-                    jpegRaw.info.sensorCfaPattern, jpegRaw.info.cfaOffsetX, jpegRaw.info.cfaOffsetY);
-            neuralEvidence.rawLevelsValid = neuralCfaPack.valid() &&
-                    std::isfinite(jpegRaw.info.effectiveWhiteLevelInMasterUnits) &&
-                    jpegRaw.info.effectiveWhiteLevelInMasterUnits > 0.0f;
-            for (std::size_t ch = 0u; ch < 4u; ++ch) {
-                std::size_t sensorBlackSlot = ch;
-                if (neuralCfaPack.valid()) {
-                    const auto offset = neuralCfaPack.sourceOffsets[ch];
-                    sensorBlackSlot = static_cast<std::size_t>(
-                            (((static_cast<int>(offset.y) + jpegRaw.info.cfaOffsetY) & 1) << 1) |
-                            ((static_cast<int>(offset.x) + jpegRaw.info.cfaOffsetX) & 1));
-                }
-                neuralEvidence.blackLevelRaw[ch] =
-                        jpegRaw.info.effectiveBlackLevelPatternInMasterUnits[sensorBlackSlot];
-                neuralEvidence.whiteLevelRaw[ch] = jpegRaw.info.effectiveWhiteLevelInMasterUnits;
-                neuralEvidence.rawLevelsValid = neuralEvidence.rawLevelsValid &&
-                        std::isfinite(neuralEvidence.blackLevelRaw[ch]) &&
-                        neuralEvidence.whiteLevelRaw[ch] > neuralEvidence.blackLevelRaw[ch];
-            }
-            // Exact Phase-3 bridge: shot/read conditioning is copied from the one frozen native
-            // physical-noise export above. No second lookup, fallback or coefficient transform.
-            neuralEvidence.effectiveS = frozenPhysicalNoise.shotS;
-            neuralEvidence.effectiveO = frozenPhysicalNoise.readO;
-            neuralEvidence.noiseModelTrust = frozenPhysicalNoise.available ? 1.0f : 0.0f;
-
-            neuralEvidence.metadataTrust.noiseProfile = neuralEvidence.noiseModelTrust;
-            neuralEvidence.metadataTrust.blackLevel = meta.calibration.hasBlackLevel ? 1.0f : 0.0f;
-            neuralEvidence.metadataTrust.whiteLevel = meta.calibration.hasWhiteLevel ? 1.0f : 0.0f;
-            neuralEvidence.metadataTrust.lensShading =
-                    lensShadingMapValid(meta) && meta.lensShadingFromMetadata ? 1.0f : 0.0f;
-            neuralEvidence.metadataTrust.sensorDomain =
-                    jpegRaw.info.sourceBitDepth > 0 ? 1.0f : 0.0f;
-
-            // Pass-0 common-green residual is real read-only sensor evidence. Only the two
-            // measured green channels receive it; unsupported R/B residual semantics remain zero.
-            const float meanGreenBlack = 0.5f * (
-                    neuralEvidence.blackLevelRaw[1] + neuralEvidence.blackLevelRaw[2]);
-            const float greenCodeRange = std::max(1.0f,
-                    jpegRaw.info.effectiveWhiteLevelInMasterUnits - meanGreenBlack);
-            const float normalizedGreenResidual = std::clamp(
-                    pass0State.commonGreenResidualBefore / greenCodeRange, -1.0f, 1.0f);
-            neuralEvidence.blackResidual.residualNormalized =
-                    {{0.0f, normalizedGreenResidual, normalizedGreenResidual, 0.0f}};
-            neuralEvidence.blackResidual.maxAbsResidualNormalized =
-                    std::abs(normalizedGreenResidual);
-            neuralEvidence.blackResidual.trust = std::clamp(
-                    pass0State.commonGreenResidualConfidence, 0.0f, 1.0f);
-            neuralEvidence.blackResidual.dynamicBlackPriorUsed = jpegRaw.info.dynamicBlackLevelUsed;
-
-            neuralEvidence.structuredNoise.rowPeriodicity =
-                    std::clamp(pass0State.rowPatternConfidence, 0.0f, 1.0f);
-            neuralEvidence.structuredNoise.columnPeriodicity =
-                    std::clamp(pass0State.columnPatternConfidence, 0.0f, 1.0f);
-            neuralEvidence.structuredNoise.lowFrequencyChroma =
-                    std::clamp(lowBandEvidence.residualPressure, 0.0f, 1.0f);
-            neuralEvidence.structuredNoise.channelImbalance =
-                    std::clamp(pass0State.channelBiasConfidence, 0.0f, 1.0f);
-            neuralEvidence.structuredNoise.confidence = std::max({
-                    neuralEvidence.structuredNoise.rowPeriodicity,
-                    neuralEvidence.structuredNoise.columnPeriodicity,
-                    neuralEvidence.structuredNoise.channelImbalance,
-                    std::clamp(lowBandEvidence.modelConfidence, 0.0f, 1.0f)});
-
-            if (lensShadingMapValid(meta)) {
-                std::vector<float> gains;
-                gains.reserve(meta.lensShadingMap.size());
-                for (float gain : meta.lensShadingMap) {
-                    if (std::isfinite(gain) && gain > 0.0f) gains.push_back(gain);
-                }
-                if (!gains.empty()) {
-                    std::sort(gains.begin(), gains.end());
-                    neuralEvidence.remainingLsc.remainingCorrectionExpected = true;
-                    neuralEvidence.remainingLsc.hasSpatialGainMap = true;
-                    neuralEvidence.remainingLsc.mapWidth =
-                            static_cast<std::uint32_t>(meta.lensShadingColumns);
-                    neuralEvidence.remainingLsc.mapHeight =
-                            static_cast<std::uint32_t>(meta.lensShadingRows);
-                    neuralEvidence.remainingLsc.mapChannels = 4u;
-                    neuralEvidence.remainingLsc.minGain = gains.front();
-                    neuralEvidence.remainingLsc.medianGain = gains[gains.size() / 2u];
-                    neuralEvidence.remainingLsc.maxGain = gains.back();
-                    neuralEvidence.remainingLsc.mapTrust = meta.lensShadingFromMetadata ? 1.0f : 0.0f;
-                }
-            }
-            // When no metadata LSC exists, the conditioning contract uses exact identity.
-            neuralEvidence.remainingLsc.lensShadingAlreadyApplied = false;
-
-            neuralEvidence.framePhysics.captureDomain = meta.isRaw10
-                    ? bncam::spectra::neural::RawCaptureDomain::Raw10
-                    : bncam::spectra::neural::RawCaptureDomain::RawSensor;
-            neuralEvidence.framePhysics.exposureTimeSeconds = meta.captureExposureTimeNs > 0
-                    ? static_cast<double>(meta.captureExposureTimeNs) / 1.0e9 : 0.0;
-            const int neuralBitDepth = jpegRaw.info.nativeBitDepth > 0
-                    ? jpegRaw.info.nativeBitDepth : jpegRaw.info.sourceBitDepth;
-            neuralEvidence.framePhysics.bitDepth = neuralBitDepth > 0
-                    ? static_cast<std::uint32_t>(neuralBitDepth) : 0u;
-            // RAW_SENSOR/RAW10 sensitivity is SENSOR_SENSITIVITY. Camera2's post-RAW
-            // sensitivity boost applies only to processed YUV/JPEG and must never enter this
-            // pre-demosaic RAW neural condition. BnCam currently has no reliable per-frame
-            // analog/digital split. Student-v1's frozen FiLM projections are release-gated to
-            // exact zero, so both gain compatibility slots are neutral 1.0 rather than guessed
-            // from ISO. The explicit split flag stays false for truthful telemetry.
-            neuralEvidence.framePhysics.analogGain = 1.0f;
-            neuralEvidence.framePhysics.digitalGain = 1.0f;
-            neuralEvidence.explicitGainMetadataValid = false;
-            // The current model has no active gain-conditioning authority; do not collapse the
-            // spatial metadata-trust channel merely because an unused split is unavailable.
-            neuralEvidence.metadataTrust.exposureGain = 1.0f;
-
-            switch (meta.calibration.spectraProcessingMode) {
-                case 1:
-                    neuralEvidence.mutationMode =
-                            bncam::spectra::neural::NeuralProductionMutationMode::Auto;
-                    break;
-                case 2:
-                    neuralEvidence.mutationMode =
-                            bncam::spectra::neural::NeuralProductionMutationMode::Manual;
-                    break;
-                case 0:
-                default:
-                    neuralEvidence.mutationMode =
-                            bncam::spectra::neural::NeuralProductionMutationMode::Off;
-                    break;
-            }
-
-            // The profile shapes the one neural Student residual. Global authority is binary:
-            // mutationMode Off => 0%, enabled => 100%. Luma/Chroma/Detail/Low-frequency/Adaptive
-            // controls may only shape or protect that residual; they cannot create a second master.
-            // Lens Dynamic ISO remains a separate physical-noise policy and never enters this call.
-            neuralEvidence.userControls = bncam::spectra::neural::projectVisibleProfileControlsToNeural(
-                    neuralEvidence.mutationMode,
-                    uiConfig.profileSpectraLuma,
-                    uiConfig.profileSpectraChroma,
-                    uiConfig.profileSpectraDetailProtection,
-                    uiConfig.profileSpectraLowFrequency,
-                    uiConfig.profileNeuralAdaptiveResponse);
-            neuralEvidence.userControlsPresent = true;
-
-            bncam::vulkan::neural::SpectraNeuralProductionRequest neuralRequest{};
-            neuralRequest.prepared =
-                    bncam::spectra::neural::prepareNeuralProductionContext(neuralEvidence);
-            neuralConditioningValid =
-                    neuralRequest.prepared.structuralOodSafe &&
-                    neuralRequest.prepared.structuralBypassReason ==
-                            bncam::spectra::neural::NeuralBypassReason::None;
-            physicalNoiseUsedForNeuralConditioning =
-                    neuralConditioningValid &&
-                    frozenPhysicalNoise.available &&
-                    neuralRequest.prepared.core.noise.valid();
-            neuralRequest.conditioningConfig.logSigmaFloor = 1.0e-8f;
-            neuralRequest.conditioningConfig.headroomSpan = 0.08f;
-            neuralRequest.conditioningConfig.clippingEpsilon = 0.0f;
-            // Runtime augments these fields with release-package/schema/hash/backend truth.
-            neuralRequest.runtimeReadiness.oodSafe = true;
-            neuralRequest.remainingLscMap = request.lensShadingMap;
-            neuralRequest.remainingLscWidth = request.lensShadingColumns;
-            neuralRequest.remainingLscHeight = request.lensShadingRows;
-            neuralRequest.remainingLscChannels = request.lensShadingMap != nullptr ? 4u : 0u;
-            neuralRequest.remainingLscGeneration = request.lensShadingGenerationId;
-            neuralRequest.collectAutoSceneMetrics = autoDemosaicRequested;
-            neuralRequest.collectStageDumps =
-                    meta.rawJpegDebugDumpsEnabled && !meta.rawJpegDebugDumpDirectory.empty();
-            neuralRequest.generationId = residentInput->rawNormalizeGeneration;
-
-            vulkanRawFinalize = bncam::vulkan::VulkanRuntime::instance()
-                    .executeSpectraNeuralThenRawFinalizeFromRawNormalize(
-                            request, neuralRequest, residentInput->rawNormalizeGeneration,
-                            &neuralProductionTrace,
-                            neuralRequest.collectStageDumps ? &neuralStageDumps : nullptr);
-            if (neuralRequest.collectStageDumps && neuralStageDumps.stageCount > 0u) {
-                neuralStageDumpFilesWritten = writeNeuralStageDumps(
-                        meta, residentInput->rawNormalizeGeneration,
-                        neuralStageDumps, neuralStageDumpWriteMs);
-            }
         } else {
             vulkanRawFinalize =
                     bncam::vulkan::VulkanRuntime::instance().executeSpectraRawFinalize(request);
@@ -5895,83 +5582,8 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         }
     }
 
-    // Phase 6: when neural pixels were actually published, replace the pre-demosaic observer
-    // covariance with the Student posterior. The full posterior remains GPU resident; N012D
-    // exposes only its compact R/G1/G2/B mean variance. Remaining software LSC is a real
-    // multiplicative transform, therefore posterior variance is scaled by the existing
-    // capture-local visible/raw S/O variance ratio (equivalent to a variance-weighted E[g^2]).
-    if (neuralProductionTrace.neuralPublished &&
-        neuralProductionTrace.posteriorSummaryReady &&
-        rawFinalizeResident) {
-        const std::array<double, 4> rawVarianceByChannel =
-                meanPredictedRawVarianceByChannel(finalProvenance);
-        const std::array<double, 4> visibleVarianceByChannel =
-                meanPredictedVisibleVarianceByChannel(finalProvenance);
-        bool posteriorFinite = true;
-        bool lscRatioReady = true;
-        for (std::size_t channel = 0u; channel < 4u; ++channel) {
-            const double posterior = static_cast<double>(
-                    neuralProductionTrace.posteriorMeanVarianceCfa[channel]);
-            if (!std::isfinite(posterior) || posterior < 0.0) {
-                posteriorFinite = false;
-                break;
-            }
-            double varianceGain = 1.0;
-            if (rawVarianceByChannel[channel] > 1.0e-16 &&
-                std::isfinite(rawVarianceByChannel[channel]) &&
-                std::isfinite(visibleVarianceByChannel[channel]) &&
-                visibleVarianceByChannel[channel] >= 0.0) {
-                varianceGain = std::clamp(
-                        visibleVarianceByChannel[channel] / rawVarianceByChannel[channel],
-                        0.0625, 16.0);
-            } else if (neuralProductionTrace.remainingLscApplied) {
-                lscRatioReady = false;
-            }
-            neuralPosteriorPostLscVarianceCfa[channel] = static_cast<float>(
-                    posterior * varianceGain);
-        }
-        neuralPosteriorLscPropagationReady = posteriorFinite &&
-                (!neuralProductionTrace.remainingLscApplied || lscRatioReady);
-        if (posteriorFinite) {
-            const double redVariance = std::max(0.0, static_cast<double>(
-                    neuralPosteriorPostLscVarianceCfa[0]));
-            const double greenVariance = 0.5 * (
-                    std::max(0.0, static_cast<double>(neuralPosteriorPostLscVarianceCfa[1])) +
-                    std::max(0.0, static_cast<double>(neuralPosteriorPostLscVarianceCfa[2])));
-            const double blueVariance = std::max(0.0, static_cast<double>(
-                    neuralPosteriorPostLscVarianceCfa[3]));
-            if (std::isfinite(redVariance) && std::isfinite(greenVariance) &&
-                std::isfinite(blueVariance)) {
-                neuralPosteriorSeedConfidence = static_cast<float>(std::clamp(
-                        residualSeedConfidence.confidence *
-                                (neuralPosteriorLscPropagationReady ? 0.99 : 0.72),
-                        0.0, 1.0));
-                residualNoiseState.preDemosaic = bncam::spectra2::makeState(
-                        "POST_NEURAL_POST_LSC_PRE_DEMOSAIC",
-                        "STUDENT_POSTERIOR_GPU_REDUCED_PLUS_LSC_VARIANCE_GAIN",
-                        neuralPosteriorLscPropagationReady
-                                ? "NEURAL_POSTERIOR_PROPAGATED"
-                                : "NEURAL_POSTERIOR_LSC_RATIO_PARTIAL",
-                        neuralPosteriorSeedConfidence,
-                        bncam::spectra2::diagonalCovariance(
-                                redVariance, greenVariance, blueVariance));
-                residualNoiseState.varianceY = static_cast<float>(
-                        residualNoiseState.preDemosaic.varianceY);
-                residualNoiseState.varianceRG = static_cast<float>(
-                        residualNoiseState.preDemosaic.varianceRG);
-                residualNoiseState.varianceBG = static_cast<float>(
-                        residualNoiseState.preDemosaic.varianceBG);
-                residualNoiseState.covarianceRgBg = static_cast<float>(
-                        residualNoiseState.preDemosaic.covarianceRgBg);
-                for (std::size_t index = 0u; index < residualNoiseState.covarianceRgb.size(); ++index) {
-                    residualNoiseState.covarianceRgb[index] = static_cast<float>(
-                            residualNoiseState.preDemosaic.covariance.values[index]);
-                }
-                residualNoiseState.modelConfidence = neuralPosteriorSeedConfidence;
-                neuralPosteriorSeedApplied = true;
-            }
-        }
-    }
+    // RAW zero-denoise baseline: no denoised posterior may replace the physical pre-demosaic
+    // covariance. The frozen sensor S/O state remains the measurement/propagation authority.
 
     // Spatial exposure is a real multiplicative RAW transform. Its global covariance effect is
     // E[g^2], so the equivalent RMS gain is sqrt(E[g^2]). Do not use ISO, exposure time or P90
@@ -6285,7 +5897,6 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     // FASE 8: physical-noise observability and propagation are independent from Neural Denoise.
     // A user-disabled Neural engine must never make the frozen Physical Noise Model appear absent.
     // Conversely, enabling Neural must not be required to keep physical noise statistics alive.
-    const bool neuralDenoiseActive = meta.calibration.spectraProcessingMode != 0;
     const bool physicalNoiseStatisticsActive = frozenPhysicalNoise.available;
     // profileDetailRadius is a retired legacy ABI slot. Phase 12 decodes active Legibility
     // from the packed profileDetailDetail carrier, so the production gate mirrors the resolver.
