@@ -245,35 +245,13 @@ float normalizedAtUncached(int previewX, int previewY) {
         return clamp(rawAtSource(baseX, baseY) * lensGain(sx, sy, site), 0.0, 1.0);
     }
 
-    int radius = max(2, (int(decimation) / 2) * 2);
-    float noiseBlend = smoothstep(800.0, 3200.0, max(0.0, pc.captureIso));
-    float centreAxisWeight = mix(6.5, 1.6, noiseBlend);
-    float sum = 0.0;
-    float weightSum = 0.0;
-    float localMin = 1.0;
-    float localMax = 0.0;
-    float centreSample = 0.0;
-    for (int iy = -1; iy <= 1; ++iy) {
-        float wy = iy == 0 ? centreAxisWeight : 1.0;
-        for (int ix = -1; ix <= 1; ++ix) {
-            float wx = ix == 0 ? centreAxisWeight : 1.0;
-            float weight = wx * wy;
-            float sampleValue = rawAtSource(baseX + ix * radius, baseY + iy * radius);
-            if (ix == 0 && iy == 0) centreSample = sampleValue;
-            localMin = min(localMin, sampleValue);
-            localMax = max(localMax, sampleValue);
-            sum += sampleValue * weight;
-            weightSum += weight;
-        }
-    }
-    float filtered = sum / max(weightSum, 1.0);
-    float structure = smoothstep(0.018, 0.090, localMax - localMin);
-    float cleanAuthority = 1.0 - noiseBlend;
-    float centreRecovery = 0.24 * structure * cleanAuthority;
+    // RAW zero-denoise preview contract: keep the selected CFA sensel exact at decimated
+    // resolution. No ISO-dependent 3x3 averaging or centre-recovery blend is permitted.
+    float centreSample = rawAtSource(baseX, baseY);
     uint sx = min(pc.sourceWidth - 1u, sourceCropLeft() + uint(max(baseX, 0)));
     uint sy = min(pc.sourceHeight - 1u, sourceCropTop() + uint(max(baseY, 0)));
     uint site = ((y & 1u) << 1u) | (x & 1u);
-    return clamp(mix(filtered, centreSample, centreRecovery) * lensGain(sx, sy, site), 0.0, 1.0);
+    return clamp(centreSample * lensGain(sx, sy, site), 0.0, 1.0);
 }
 
 void prepareRenderBayerTile() {
