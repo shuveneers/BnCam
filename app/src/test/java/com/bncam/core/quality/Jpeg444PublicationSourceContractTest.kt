@@ -20,7 +20,7 @@ class Jpeg444PublicationSourceContractTest {
 
         assertTrue(policy.contains("cv::IMWRITE_JPEG_SAMPLING_FACTOR"))
         assertTrue(policy.contains("cv::IMWRITE_JPEG_SAMPLING_FACTOR_444"))
-        assertTrue(policy.contains("cv::IMWRITE_JPEG_OPTIMIZE, 1"))
+        assertTrue(policy.contains("cv::IMWRITE_JPEG_OPTIMIZE, 0"))
         assertTrue(isp.contains("bncam::jpeg444EncodingParameters"))
         assertEquals(2, "bncam::jpeg444EncodingParameters".toRegex().findAll(native).count())
 
