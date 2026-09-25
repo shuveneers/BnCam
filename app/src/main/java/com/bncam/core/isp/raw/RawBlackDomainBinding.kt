@@ -38,7 +38,7 @@ object RawBlackDomainBinding {
         val fallbackSource = when {
             manualRuntimeSelected -> "Black Level v2 Manual mosaic override"
             runtime?.type == BlackLevelTypes.DYNAMIC -> "Black Level v2 System baseline fallback"
-            runtime?.type == BlackLevelTypes.SYSTEM -> "Black Level v2 System baseline fallback"
+            runtime?.type == BlackLevelTypes.SYSTEM -> "Black Level v2 exact-frame Camera2 black fallback"
             else -> calibration?.base?.baseBlackLevelSource
                 ?: "Black Level v2 state unavailable; System safety fallback (${qualityConfig.blackLevelSource})"
         }
@@ -149,8 +149,12 @@ object RawBlackDomainBinding {
                 "Dynamic black requested but same-frame SENSOR_DYNAMIC_BLACK_LEVEL unavailable; ${decision.fallbackReason}"
             decision.mode == RawBlackAuthorityMode.DYNAMIC && !decision.systemMetadataAvailable -> cleanedWarnings +=
                 "Dynamic black blend uses controlled System fallback base because SENSOR_BLACK_LEVEL_PATTERN is unavailable"
-            decision.mode == RawBlackAuthorityMode.SYSTEM && !decision.systemMetadataAvailable -> cleanedWarnings +=
-                "System black pattern unavailable; ${decision.fallbackReason}"
+            decision.mode == RawBlackAuthorityMode.SYSTEM &&
+                !decision.dynamicMetadataAvailable && !decision.systemMetadataAvailable -> cleanedWarnings +=
+                "Same-frame dynamic and static System black metadata unavailable; ${decision.fallbackReason}"
+            decision.mode == RawBlackAuthorityMode.SYSTEM &&
+                !decision.dynamicMetadataAvailable && decision.systemMetadataAvailable -> cleanedWarnings +=
+                "Same-frame SENSOR_DYNAMIC_BLACK_LEVEL unavailable; static SENSOR_BLACK_LEVEL_PATTERN used"
         }
 
         return contract.copy(
