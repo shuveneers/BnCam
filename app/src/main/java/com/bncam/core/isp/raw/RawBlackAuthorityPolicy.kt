@@ -29,8 +29,9 @@ data class RawBlackAuthorityDecision(
  * canonical [R, Gr, Gb, B].
  *
  * SYSTEM:
- *   use the camera's static SENSOR_BLACK_LEVEL_PATTERN baseline. If it is unavailable, a valid
- *   same-frame dynamic value is a technical fallback before the final controlled fallback.
+ *   use the camera's exact-frame SENSOR_DYNAMIC_BLACK_LEVEL when available. This is the
+ *   physically preferred zero-light reference for developed RAW because sensor black can move
+ *   with capture state/ISO. Fall back to SENSOR_BLACK_LEVEL_PATTERN, then the controlled fallback.
  *
  * DYNAMIC:
  *   linearly blend each CFA site from the SYSTEM baseline toward the same-frame
@@ -125,27 +126,29 @@ object RawBlackAuthorityPolicy {
         }
 
         if (mode == RawBlackAuthorityMode.SYSTEM) {
-            if (systemCanonical != null) {
-                return RawBlackAuthorityDecision(
-                    canonicalLevels = systemCanonical,
-                    source = "SYSTEM_METADATA: $systemSource",
-                    metadataAuthoritative = true,
-                    fallbackReason = "none",
-                    mode = mode,
-                    systemMetadataAvailable = true,
-                    dynamicMetadataAvailable = dynamicCanonical != null,
-                    dynamicStrength = strength
-                )
-            }
+            // Exact-frame dynamic black is preferred for developed RAW. The static pattern is a
+            // characteristics-level baseline and can be stale for the actual sensor/ISO state.
             if (dynamicCanonical != null) {
                 return RawBlackAuthorityDecision(
                     canonicalLevels = dynamicCanonical,
-                    source = "SYSTEM_DYNAMIC_METADATA_FALLBACK: $dynamicSource",
+                    source = "SYSTEM_EXACT_FRAME_DYNAMIC: $dynamicSource",
                     metadataAuthoritative = true,
-                    fallbackReason = "system_black_pattern_unavailable_dynamic_metadata_used",
+                    fallbackReason = "none",
                     mode = mode,
-                    systemMetadataAvailable = false,
+                    systemMetadataAvailable = systemCanonical != null,
                     dynamicMetadataAvailable = true,
+                    dynamicStrength = 1.0f
+                )
+            }
+            if (systemCanonical != null) {
+                return RawBlackAuthorityDecision(
+                    canonicalLevels = systemCanonical,
+                    source = "SYSTEM_STATIC_METADATA_FALLBACK: $systemSource",
+                    metadataAuthoritative = true,
+                    fallbackReason = "same_frame_dynamic_black_unavailable_static_pattern_used",
+                    mode = mode,
+                    systemMetadataAvailable = true,
+                    dynamicMetadataAvailable = false,
                     dynamicStrength = strength
                 )
             }
