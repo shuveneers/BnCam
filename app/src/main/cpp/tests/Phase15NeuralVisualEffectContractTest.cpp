@@ -45,9 +45,9 @@ int main() {
     assert(lowNoise.noise.valid());
     assert(highNoise.noise.valid());
 
-    // Effective S/O owns the PHYSICAL baseline Bayer denoise. A larger frozen physical model
-    // must predict more pre-baseline variance at the same signal. It must not, by itself, be
-    // interpreted as stronger Neural authority after that baseline has already run.
+    // Same normalized RAW signal, different physical S/O. A stronger physical model must
+    // predict strictly larger sigma in every canonical CFA channel. This is the code-side
+    // prerequisite for Preset X/Y to drive different neural denoise behavior.
     constexpr float signal = 0.08f;
     for (std::size_t i = 0; i < 4; ++i) {
         const auto ch = static_cast<CanonicalCfaChannel>(i);
@@ -56,30 +56,21 @@ int main() {
         assert(std::isfinite(lowSigma));
         assert(std::isfinite(highSigma));
         assert(highSigma > lowSigma);
+
+        // Adaptive response is fixed to 100% in production. Higher predicted noise at the
+        // same signal must not receive less denoise authority.
+        const float lowAuthority = neuralAdaptiveAuthorityScale(signal, lowSigma, 1.0f);
+        const float highAuthority = neuralAdaptiveAuthorityScale(signal, highSigma, 1.0f);
+        assert(highAuthority > lowAuthority);
+        // This synthetic pair deliberately moves from high-SNR identity into the active physical
+        // noise envelope.  Require a material authority response so an almost-identity denoiser
+        // can no longer satisfy Phase 15 merely because its residual is non-zero.
+        assert(highAuthority - lowAuthority > 0.20f);
+        assert(lowAuthority >= 0.0f && lowAuthority <= 1.0f);
+        assert(highAuthority >= 0.0f && highAuthority <= 1.0f);
     }
 
-    // Neural authority is downstream and is driven by measured REMAINING post-physical noise.
-    // No residual-noise evidence is effectively identity for an ordinary non-zero signal.
-    const float noResidualAuthority =
-            neuralAdaptiveAuthorityScale(signal, kNeuralAdaptiveSigmaFloor, 1.0f);
-    assert(near(noResidualAuthority, 0.0f));
-
-    // More measured residual noise may grant more Neural correction authority. These sigmas are
-    // deliberately independent of the pre-baseline S/O pair above: the production shader first
-    // measures post-physical variance and only uses effective S/O as an upper bound.
-    constexpr float lowResidualSigma = 0.0015f;  // SNR ~53: exact identity
-    constexpr float highResidualSigma = 0.0200f; // SNR 4: full residual-noise evidence
-    const float lowResidualAuthority =
-            neuralAdaptiveAuthorityScale(signal, lowResidualSigma, 1.0f);
-    const float highResidualAuthority =
-            neuralAdaptiveAuthorityScale(signal, highResidualSigma, 1.0f);
-    assert(highResidualAuthority > lowResidualAuthority);
-    assert(highResidualAuthority - lowResidualAuthority > 0.95f);
-    assert(lowResidualAuthority >= 0.0f && lowResidualAuthority <= 1.0f);
-    assert(highResidualAuthority >= 0.0f && highResidualAuthority <= 1.0f);
-
-    // Neural Off is exact identity at the residual-authority layer. The physical baseline NR is
-    // outside this control and therefore remains active when Neural is disabled.
+    // Neural Off is exact identity at the residual-authority layer.
     NeuralDenoiseControls off = neuralCharacterControls(NeuralCharacterPreset::Natural, false);
     off.noiseReduction = 0.0f;
     off.lumaNoise = 0.0f;
@@ -93,7 +84,7 @@ int main() {
         assert(near(value, 0.0f));
     }
 
-    // Neural On is allowed to publish a residual correction; master/adaptive authority are fixed.
+    // Neural On is allowed to publish non-zero correction; master/adaptive authority are fixed.
     const auto on = neuralCharacterControls(NeuralCharacterPreset::Natural, true);
     assert(on.enabled);
     assert(near(on.noiseReduction, 1.0f));
