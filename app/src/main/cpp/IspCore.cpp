@@ -8892,8 +8892,6 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; spectraDemosaicPreFineChromaEnergy=" << postPass2ChromaBands.fineEnergy
             << "; spectraDemosaicPreMidChromaEnergy=" << postPass2ChromaBands.midEnergy
             << "; spectraDemosaicPreLowChromaEnergy=" << postPass2ChromaBands.lowEnergy
-            << "; spectraPreWbChromaCleanupPlanReady="
-            << (preWbChromaCleanupPlanReady ? "true" : "false")
             << "; rawZeroDenoiseContract=true"
             << "; rawZeroDenoisePreDemosaicSpatialNr=false"
             << "; rawZeroDenoisePostDemosaicChromaNr=false"
