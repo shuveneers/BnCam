@@ -101,12 +101,6 @@ struct RawPreviewGpuRequest {
     float profileDetailRadius = 1.00f;
     float profileDetailDetail = 0.25f;
     float profileDetailMasking = 0.00f;
-    float profileNrLuminance = 0.0f;
-    float profileNrLuminanceDetail = 0.5f;
-    float profileNrLuminanceContrast = 0.0f;
-    float profileNrColor = 0.0f;
-    float profileNrColorDetail = 0.5f;
-    float profileNrColorSmoothness = 0.5f;
     const float* toneLut = nullptr;
     std::uint32_t toneLutSize = 0;
     // Optional GPU-resident display target. When non-null the backend imports this RGBA_8888
