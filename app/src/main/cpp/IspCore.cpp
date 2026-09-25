@@ -9036,20 +9036,12 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; physicalNoiseModelAvailable=" << (physicalNoiseModelAvailable ? "true" : "false")
             << "; physicalNoiseJniPayloadReceived="
             << (meta.calibration.physicalNoiseJniPayloadReceived ? "true" : "false")
-            << "; physicalNoiseUsedForNeuralConditioning="
-            << (physicalNoiseUsedForNeuralConditioning ? "true" : "false")
-            << "; spectraNeuralConditioningValid="
-            << (neuralConditioningValid ? "true" : "false")
             << "; phase8PhysicalNoiseStatisticsActive="
             << (physicalNoiseStatisticsActive ? "true" : "false")
             << "; phase8NoisePropagationActive="
             << (toneNoisePropagationRequired ? "true" : "false")
-            << "; phase8NeuralDenoiseEnabled="
-            << (neuralDenoiseActive ? "true" : "false")
-            << "; phase8NeuralPixelMutation="
-            << (neuralProductionTrace.neuralPublished ? "true" : "false")
-            << "; phase8NeuralBypassReason="
-            << bncam::spectra::neural::neuralBypassReasonName(neuralProductionTrace.bypassReason)
+            << "; rawZeroDenoiseNeuralProductionPath=false"
+            << "; rawZeroDenoiseNeuralPixelMutation=false"
             << "; residualSeedConfidence=" << residualSeedConfidence.confidence
             << "; residualSeedConfidenceStatus=" << residualSeedConfidence.status
             << "; residualSeedConfidenceMethod=" << residualSeedConfidence.method
@@ -9063,7 +9055,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; phase4PlannerInputModelConfidence=" << postToneResidualModelConfidence
             << "; phase4PhysicalNoiseModelAvailable="
             << (physicalNoiseModelAvailable ? "true" : "false")
-            << "; phase4SpectraContextFusionActive=" << (neuralDenoiseActive ? "true" : "false")
+            << "; phase4SpectraContextFusionActive=false"
             << "; phase4ResidualBudgetActive=false"
             << "; phase4ResidualAuthoritySource=RETIRED_N003"
             << "; phase4ResidualCovarianceAuthoritative=true"
@@ -9079,7 +9071,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; phase4AppliedLumaSigma=0.0000"
             << "; phase4AppliedChromaSigma=0.0000"
             << "; phase4ResidualChromaStrengthScale=" << 0.0f
-            << "; phase4DynamicIsoChromaSpectraGate=" << (neuralDenoiseActive ? "ACTIVE" : "IDENTITY_OFF")
+            << "; phase4DynamicIsoChromaSpectraGate=NO_PIXEL_AUTHORITY"
             << "; effectiveLumaSigma=" << g_threadLocalIspStats.effectiveLumaSigma
             << "; effectiveChromaSigma=" << g_threadLocalIspStats.effectiveChromaSigma
             << "; rawBlackAnchorOwner=PREDEMOSAIC_CALIBRATED_SENSOR_BLACK_LEVEL"
