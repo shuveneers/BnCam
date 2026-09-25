@@ -84,12 +84,6 @@ const uint PROFILE_DETAIL_AMOUNT_INDEX = 562u;
 const uint PROFILE_DETAIL_RADIUS_INDEX = 563u;
 const uint PROFILE_DETAIL_VALUE_INDEX = 564u;
 const uint PROFILE_DETAIL_MASKING_INDEX = 565u;
-const uint PROFILE_NR_LUMINANCE_INDEX = 566u;
-const uint PROFILE_NR_LUMINANCE_DETAIL_INDEX = 567u;
-const uint PROFILE_NR_LUMINANCE_CONTRAST_INDEX = 568u;
-const uint PROFILE_NR_COLOR_INDEX = 569u;
-const uint PROFILE_NR_COLOR_DETAIL_INDEX = 570u;
-const uint PROFILE_NR_COLOR_SMOOTHNESS_INDEX = 571u;
 const uint PHYSICAL_AWB_START_INDEX = 572u;
 const uint PHYSICAL_AWB_GRID_COLUMNS = 64u;
 const uint PHYSICAL_AWB_GRID_ROWS = 48u;
@@ -115,8 +109,6 @@ const int RENDER_TILE_HALO = 2;
 const int RENDER_TILE_WIDTH = 20;
 const int RENDER_TILE_PIXELS = RENDER_TILE_WIDTH * RENDER_TILE_WIDTH;
 shared float renderBayerTile[RENDER_TILE_PIXELS];
-shared vec2 sharedChroma[256];
-shared float sharedGreen[256];
 shared float exposureP10;
 shared float exposureP25;
 shared float exposureP35;
@@ -409,7 +401,7 @@ float estimatePreviewNoiseSigma(float localSignal) {
     return max(0.0010, readNoise + shotNoise);
 }
 
-float previewLumaDetail(int x, int y, float denoisedLuma) {
+float previewLumaDetail(int x, int y, float sceneLuma) {
     float centre = previewGreenStructureAt(x, y);
     float cross = 0.25 * (previewGreenStructureAt(x - 1, y) +
                           previewGreenStructureAt(x + 1, y) +
@@ -417,7 +409,7 @@ float previewLumaDetail(int x, int y, float denoisedLuma) {
                           previewGreenStructureAt(x, y + 1));
     float detail = centre - cross;
 
-    float sigmaN = estimatePreviewNoiseSigma(denoisedLuma);
+    float sigmaN = estimatePreviewNoiseSigma(sceneLuma);
     float localGrad = 0.25 * (abs(previewGreenStructureAt(x, y - 1) - centre) +
                               abs(previewGreenStructureAt(x, y + 1) - centre) +
                               abs(previewGreenStructureAt(x - 1, y) - centre) +
@@ -1152,43 +1144,7 @@ vec3 applyPreviewBroadShadowPlacement(vec3 color) {
     return color * exp2(broadLiftEv * blackGuard * shadowWindow);
 }
 
-vec3 applyPreviewProfileNoiseReduction(int x, int y, vec3 sensorRgb) {
-    float luminanceAmount = clamp(uintBitsToFloat(statsBuffer[PROFILE_NR_LUMINANCE_INDEX]), 0.0, 1.0);
-    float colorAmount = clamp(uintBitsToFloat(statsBuffer[PROFILE_NR_COLOR_INDEX]), 0.0, 1.0);
-    if (luminanceAmount <= 1.0e-6 && colorAmount <= 1.0e-6) return sensorRgb;
-
-    float centerGreen = previewGreenStructureAt(x, y);
-    float nGreen = previewGreenStructureAt(x, y - 1);
-    float sGreen = previewGreenStructureAt(x, y + 1);
-    float wGreen = previewGreenStructureAt(x - 1, y);
-    float eGreen = previewGreenStructureAt(x + 1, y);
-    float localGreen = 0.20 * (centerGreen + nGreen + sGreen + wGreen + eGreen);
-    float structure = 0.25 * (abs(centerGreen - nGreen) + abs(centerGreen - sGreen) +
-                              abs(centerGreen - wGreen) + abs(centerGreen - eGreen));
-
-    if (luminanceAmount > 1.0e-6) {
-        float detail = clamp(uintBitsToFloat(statsBuffer[PROFILE_NR_LUMINANCE_DETAIL_INDEX]), 0.0, 1.0);
-        float contrast = clamp(uintBitsToFloat(statsBuffer[PROFILE_NR_LUMINANCE_CONTRAST_INDEX]), 0.0, 1.0);
-        float protection = clamp(0.45 + 0.40 * detail + 0.20 * contrast, 0.0, 1.0);
-        float gate = 1.0 - protection * smoothstep(0.0035, 0.032, structure);
-        float delta = (localGreen - centerGreen) * luminanceAmount * 0.32 * gate;
-        sensorRgb = max(vec3(0.0), sensorRgb + vec3(delta));
-    }
-
-    if (colorAmount > 1.0e-6) {
-        float colorDetail = clamp(uintBitsToFloat(statsBuffer[PROFILE_NR_COLOR_DETAIL_INDEX]), 0.0, 1.0);
-        float smoothness = clamp(uintBitsToFloat(statsBuffer[PROFILE_NR_COLOR_SMOOTHNESS_INDEX]), 0.0, 1.0);
-        vec2 centerChroma = vec2(sensorRgb.r - sensorRgb.g, sensorRgb.b - sensorRgb.g);
-        float protection = clamp(0.35 + 0.50 * colorDetail, 0.0, 1.0);
-        float gate = 1.0 - protection * smoothstep(0.004, 0.040, structure);
-        float blend = colorAmount * (0.18 + 0.22 * smoothness) * gate;
-        vec2 chroma = mix(centerChroma, vec2(0.0), blend * 0.5);
-        sensorRgb.r = max(0.0, sensorRgb.g + chroma.x);
-        sensorRgb.b = max(0.0, sensorRgb.g + chroma.y);
-    }
-    return sensorRgb;
-}
-
+// RAW preview zero-denoise baseline: no profile luma/chroma NR stage.
 
 float previewPhysicalNoiseSigma(float signal) {
     float s = uintBitsToFloat(statsBuffer[PHYSICAL_NOISE_GREEN_S_INDEX]);
@@ -1451,72 +1407,20 @@ void renderPass() {
     bool inBounds = (gid.x < pc.previewWidth && gid.y < pc.previewHeight);
 
     vec3 sensorRgb = inBounds ? malvarAt(int(gid.x), int(gid.y)) : vec3(0.0);
-
-    uint localIndex = gl_LocalInvocationID.y * 16u + gl_LocalInvocationID.x;
-    sharedChroma[localIndex] = vec2(sensorRgb.r - sensorRgb.g, sensorRgb.b - sensorRgb.g);
-    sharedGreen[localIndex] = sensorRgb.g;
-    memoryBarrierShared();
-    barrier();
-
     if (!inBounds) return;
 
-    int lx = int(gl_LocalInvocationID.x);
-    int ly = int(gl_LocalInvocationID.y);
-    int lxN = clamp(lx, 0, 15);
-    int lyN = clamp(ly - 1, 0, 15);
-    int lyS = clamp(ly + 1, 0, 15);
-    int lxW = clamp(lx - 1, 0, 15);
-    int lxE = clamp(lx + 1, 0, 15);
-
-    vec2 cd0 = sharedChroma[localIndex];
-    float g0 = sharedGreen[localIndex];
-    vec2 cdN = sharedChroma[lyN * 16 + lx];
-    vec2 cdS = sharedChroma[lyS * 16 + lx];
-    vec2 cdW = sharedChroma[ly * 16 + lxW];
-    vec2 cdE = sharedChroma[ly * 16 + lxE];
-    float gN = sharedGreen[lyN * 16 + lx];
-    float gS = sharedGreen[lyS * 16 + lx];
-    float gW = sharedGreen[ly * 16 + lxW];
-    float gE = sharedGreen[ly * 16 + lxE];
-
-    float sigmaN = estimatePreviewNoiseSigma(g0);
-    float invSigma2 = 1.0 / max(1.0e-6, 4.0 * sigmaN * sigmaN);
-    float wN = 1.0 / (1.0 + (gN - g0) * (gN - g0) * invSigma2);
-    float wS = 1.0 / (1.0 + (gS - g0) * (gS - g0) * invSigma2);
-    float wW = 1.0 / (1.0 + (gW - g0) * (gW - g0) * invSigma2);
-    float wE = 1.0 / (1.0 + (gE - g0) * (gE - g0) * invSigma2);
-    float wCenter = 1.5;
-    float totalWeight = wCenter + wN + wS + wW + wE;
-
-    vec2 filteredChroma = (cd0 * wCenter + cdN * wN + cdS * wS + cdW * wW + cdE * wE) / totalWeight;
-    float isoNoise = smoothstep(100.0, 1600.0, max(0.0, pc.captureIso));
-    float shadowNoise = 1.0 - smoothstep(0.04, 0.25, g0);
-    float chromaStrength = clamp(0.35 + 0.55 * max(isoNoise, shadowNoise), 0.0, 0.92);
-    vec2 resultChroma = mix(cd0, filteredChroma, chromaStrength);
-
-    float localGreenGrad = 0.25 * (abs(gN - g0) + abs(gS - g0) + abs(gW - g0) + abs(gE - g0));
-    float flatShadowArea = 1.0 - smoothstep(sigmaN * 0.8, sigmaN * 2.5, localGreenGrad);
-    float lumaDenoiseStrength = clamp(0.40 * isoNoise * flatShadowArea, 0.0, 0.40);
-    float filteredGreen = (g0 * wCenter + gN * wN + gS * wS + gW * wW + gE * wE) / totalWeight;
-    float resultGreen = mix(g0, filteredGreen, lumaDenoiseStrength);
-
-    sensorRgb = max(vec3(0.0), vec3(
-        resultGreen + resultChroma.x,
-        resultGreen,
-        resultGreen + resultChroma.y
-    ));
-
+    // RAW preview zero-denoise baseline: demosaic output is carried directly into the
+    // development exposure/color path. No luma/chroma neighborhood smoothing is applied.
     // Keep the physical/development exposure field upstream of colour/tone, as in capture.
     sensorRgb *= exp2(spatialExposureEvAtPreview(gid));
-    sensorRgb = applyPreviewProfileNoiseReduction(int(gid.x), int(gid.y), sensorRgb);
     vec3 rgb = colorTransform(sensorRgb);
-    float denoisedLuma = max(1.0e-5, dot(rgb, vec3(0.2126, 0.7152, 0.0722)));
+    float sceneLuma = max(1.0e-5, dot(rgb, vec3(0.2126, 0.7152, 0.0722)));
     float sharpeningScale = 1.0;
     float previewDetailDelta =
-            (previewLumaDetail(int(gid.x), int(gid.y), denoisedLuma) +
+            (previewLumaDetail(int(gid.x), int(gid.y), sceneLuma) +
              previewProfileLumaDetail(int(gid.x), int(gid.y))) * sharpeningScale;
-    float sharpenedLuma = max(0.0, denoisedLuma + previewDetailDelta);
-    rgb *= sharpenedLuma / max(denoisedLuma, 1.0e-6);
+    float sharpenedLuma = max(0.0, sceneLuma + previewDetailDelta);
+    rgb *= sharpenedLuma / max(sceneLuma, 1.0e-6);
     // Automatic preview exposure is display-only and remains separate from explicit profile
     // Exposure. It runs after physical NR/detail but before local/global tone shaping.
     rgb *= previewAutomaticExposureMultiplier();
@@ -1529,7 +1433,7 @@ void renderPass() {
     rgb = applyPreviewToneLook(rgb);
     rgb = applyExplicitLiveToneContrast(rgb);
     // Pop reuses the resident FLLF mid-scale base. Avoid even those four buffer reads when Pop=0.
-    float popSourceLuma = denoisedLuma * previewAutomaticExposureMultiplier();
+    float popSourceLuma = sceneLuma * previewAutomaticExposureMultiplier();
     float popControl = profileDecodedPop(pc.profileSaturation);
     float popLocalBase = popControl > 1.0e-4 ? samplePreviewFllfBase(gid) : popSourceLuma;
     rgb = applyProfile(rgb, popSourceLuma, popLocalBase);
