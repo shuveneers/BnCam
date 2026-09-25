@@ -558,7 +558,6 @@ SpectraResidentDemosaicResult VulkanSpectraResidentDemosaicBackend::executeInter
             effectiveAlgorithm == SpectraGpuDemosaicAlgorithm::AUTO_HYBRID;
     const std::uint64_t requiredScratchBytes =
             reconstructionScratchRequired ? outputBytes : 0u;
-    result.phase6ResidualChromaRequested = false;
     result.residualSampleStride = residualSampling.stride;
     result.residualSampleColumns = residualSampling.columns;
     result.residualSampleRows = residualSampling.rows;
@@ -891,7 +890,6 @@ SpectraResidentDemosaicResult VulkanSpectraResidentDemosaicBackend::executeInter
             result.phase6ClassifyPassMs - result.phase6CorrectPassMs - result.residualKernelMs);
     result.success = true;
     result.gpuUsedForOutput = true;
-    result.phase6ResidualChromaUsedForOutput = false;
     result.cpuFallbackRequired = false;
     result.fullReadbackDeferred = true;
     residentDemosaicGeneration_++;
