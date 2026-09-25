@@ -29,7 +29,7 @@ class RawBlackDomainBindingTest {
     }
 
     @Test
-    fun `system uses static metadata and leaves dng payload untouched`() {
+    fun `system uses exact frame dynamic metadata and leaves dng payload untouched`() {
         val base = contract(
             payloadBlack = listOf(64, 64, 64, 64),
             dynamic = listOf(10f, 20f, 30f, 40f),
@@ -44,8 +44,8 @@ class RawBlackDomainBindingTest {
         )
 
         assertEquals(listOf(64, 64, 64, 64), bound.payloadBlackLevels)
-        assertEquals(listOf(64f, 65f, 66f, 67f), bound.developedRawBlackLevels)
-        assertTrue(bound.developedRawBlackLevelSource.startsWith("SYSTEM_METADATA:"))
+        assertEquals(listOf(10f, 20f, 30f, 40f), bound.developedRawBlackLevels)
+        assertTrue(bound.developedRawBlackLevelSource.startsWith("SYSTEM_EXACT_FRAME_DYNAMIC:"))
     }
 
     @Test
