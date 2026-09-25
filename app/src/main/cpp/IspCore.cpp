@@ -5759,12 +5759,8 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             demosaicPhysicalSigmaChroma,
             demosaicPhysicalNoisePressure
     };
-    // N006B: the legacy Phase-6 residual-chroma pixel owner is physically retired.
-    // Physical sigma remains available only as read-only demosaic context.
-    constexpr bool phase6ResidualChromaPlanEnabled = false;
-    constexpr const char* phase6ResidualChromaPlanStatus =
-            "RETIRED_CLASSICAL_PIXEL_OWNER_NEURAL_PENDING";
-    constexpr bool phase6CpuFallbackApplied = false;
+    // RAW zero-denoise baseline: demosaic receives physical noise only as reconstruction/telemetry
+    // context. No separate residual-chroma denoise owner exists.
 
 
     const auto runCpuDemosaicFallback = [&]() -> cv::Mat {
@@ -5823,9 +5819,6 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         request.noiseSigmaY = demosaicNoiseContext.sigmaY;
         request.noiseSigmaChroma = demosaicNoiseContext.sigmaChroma;
         request.noisePressure = demosaicNoiseContext.pressure;
-        request.phase6ResidualChromaEnabled = false;
-        request.phase6MaximumBlend = 0.0f;
-        request.phase6MaximumCorrection = 0.0f;
         request.autoMalvarPrior = demosaicResolution.autoMalvarPrior;
         request.autoNeuralJddPrior = demosaicResolution.autoNeuralJddPrior;
         request.autoAmazePrior = demosaicResolution.autoAmazePrior;
@@ -8611,30 +8604,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; demosaicNoiseSigmaY=" << demosaicNoiseContext.sigmaY
             << "; demosaicNoiseSigmaChroma=" << demosaicNoiseContext.sigmaChroma
             << "; demosaicNoisePressure=" << demosaicNoiseContext.pressure
-            << "; phase6ResidualChromaPlanEnabled=" << (phase6ResidualChromaPlanEnabled ? "true" : "false")
-            << "; phase6ResidualChromaPlanStatus=" << phase6ResidualChromaPlanStatus
-            << "; phase6ResidualChromaAuthority=RETIRED_NO_PIXEL_AUTHORITY"
-            << "; phase6ResidualChromaLumaMutation=false"
-            << "; phase6ResidualChromaBandOwner=NONE"
-            << "; phase6ResidualChromaLowFrequencyCloudOwner=NONE"
-            << "; phase6ResidualChromaNoisePropagation=IDENTITY"
-            << "; phase6ResidualChromaRequested=" << (phase6ResidualChromaPlanEnabled ? "true" : "false")
-            << "; phase6ResidualChromaUsedForOutput=" << (phase6ResidualChromaUsedForOutput ? "true" : "false")
-            << "; phase6ResidualChromaExecutionBackend=" << phase6ExecutionBackend
-            << "; phase6ResidualChromaGpuUsed=" << (phase6ResidualChromaGpuUsed ? "true" : "false")
-            << "; phase6ResidualChromaCpuFallbackUsed=" << (phase6CpuFallbackApplied ? "true" : "false")
-            << "; phase6ClassifyPassMs=" << vulkanDemosaic.phase6ClassifyPassMs
-            << "; phase6CorrectPassMs=" << vulkanDemosaic.phase6CorrectPassMs
-            << "; phase6ProcessedPixels=" << phase6ProcessedPixels
-            << "; phase6CandidatePixels=" << phase6CandidatePixels
-            << "; phase6CandidateFraction=" << phase6CandidateFraction
-            << "; phase6IsolatedOutlierPixels=" << phase6IsolatedOutlierPixels
-            << "; phase6ZipperPixels=" << phase6ZipperPixels
-            << "; phase6EdgeProtectedPixels=" << phase6EdgeProtectedPixels
-            << "; phase6SaturatedDetailProtectedPixels=" << phase6SaturatedDetailProtectedPixels
-            << "; phase6MeanAbsCorrectionRG=" << phase6MeanAbsCorrectionRG
-            << "; phase6MeanAbsCorrectionBG=" << phase6MeanAbsCorrectionBG
-            << "; phase6MaximumAbsoluteCorrection=" << phase6MaximumAbsoluteCorrection
+            << "; rawZeroDenoiseLegacyPhase6Present=false"
             << "; demosaicCfaStructureProtection=" << demosaicCfaEvidence.structureProtection
             << "; demosaicCfaRedOpponentConfidence="
             << demosaicCfaEvidence.redOpponentCorrectionConfidence
