@@ -536,8 +536,6 @@ else()
     set(BNCAM_SPECTRA_DEMOSAIC_SHADER_AVAILABLE 0)
 endif()
 
-include("${CMAKE_CURRENT_SOURCE_DIR}/vulkan/cmake/SpectraNeuralBackend.cmake")
-
 add_library(bncam SHARED
         native-lib.cpp
         RawPreview.cpp
@@ -551,8 +549,6 @@ add_library(bncam SHARED
         VulkanBenchmarkKernels.cpp
         ${BNCAM_VULKAN_PREP_SOURCES}
 )
-
-bncam_attach_spectra_neural_backend(bncam)
 
 
 if(TARGET bncam_spectra_temporal_observer_shader)
