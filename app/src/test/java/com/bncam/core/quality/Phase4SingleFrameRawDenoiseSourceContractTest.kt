@@ -30,15 +30,20 @@ class Phase4SingleFrameRawDenoiseSourceContractTest {
     }
 
     @Test
-    fun `neural denoise is disconnected from raw production`() {
+    fun `spectra off is zero denoise while spectra on owns the trained neural path`() {
         val isp = source("src/main/cpp/IspCore.cpp")
+        val runtime = source("src/main/cpp/vulkan/VulkanRuntime.cpp")
+        val cmake = source("src/main/cpp/CMakeLists.txt")
 
-        assertFalse(isp.contains("executeSpectraNeuralThenRawFinalizeFromRawNormalize"))
-        assertFalse(isp.contains("SpectraNeuralProductionTrace"))
-        assertFalse(isp.contains("prepareNeuralProductionContext"))
-        assertFalse(isp.contains("neuralProductionTrace"))
-        assertTrue(isp.contains("rawZeroDenoiseNeuralProductionPath=false"))
-        assertTrue(isp.contains("rawZeroDenoiseNeuralSubsystemConnected=false"))
+        assertTrue(isp.contains("meta.calibration.spectraProcessingMode == 0"))
+        assertTrue(isp.contains("EXACT_USER_DISABLED_IDENTITY"))
+        assertTrue(isp.contains("executeSpectraRawFinalizeFromRawNormalize"))
+        assertTrue(isp.contains("executeSpectraNeuralThenRawFinalizeFromRawNormalize"))
+        assertTrue(isp.contains("prepareNeuralProductionContext(neuralEvidence)"))
+        assertTrue(isp.contains("rawZeroDenoiseNeuralProductionPath=PROFILE_GATED"))
+        assertTrue(isp.contains("rawZeroDenoiseNeuralSubsystemConnected=true"))
+        assertTrue(runtime.contains("configureSpectraNeuralModel"))
+        assertTrue(cmake.contains("bncam_attach_spectra_neural_backend(bncam)"))
     }
 
     @Test
