@@ -5,15 +5,13 @@
 
 namespace bncam::spectra::neural {
 
-// Post-physical Neural authority contract.
+// Trained Neural authority contract.
 //
-// Neural receives an already denoised Bayer image. Its sigma is therefore the measured remaining
-// post-physical noise budget, not the original sensor noise prediction. The former 2..8 SNR
-// envelope classified almost every normal post-physical sample as exact identity (device telemetry
-// showed ~98% at SNR>=8), so the add-on could not materially clean residual shadow/chroma noise.
-// Keep the gate sensor-independent and dimensionless, but move it to the residual-noise regime:
-// full authority through SNR 4, smooth attenuation to exact identity at SNR 48. Student residual,
-// confidence/posterior protection and user Luma/Chroma/Detail controls remain independent gates.
+// SPECTRA is the sole general RAW denoise owner when enabled. Its sigma is the same physical
+// per-CFA S/O sigma used during training: sqrt(S*x + O). There is no classical baseline denoiser
+// ahead of the network. Keep the gate sensor-independent and dimensionless: full authority through
+// SNR 4, smooth attenuation to exact identity at SNR 48. Student residual, confidence/posterior
+// protection and user Luma/Chroma/Detail controls remain independent gates.
 constexpr float kNeuralAdaptiveFullEvidenceSnr = 4.0f;
 constexpr float kNeuralAdaptiveIdentitySnr = 48.0f;
 constexpr float kNeuralAdaptiveSigmaFloor = 1.0e-8f;
@@ -44,9 +42,9 @@ inline float neuralAdaptiveNoiseEvidence(float normalizedSignal, float sigma) no
     return neuralAdaptiveNoiseEvidenceFromSnr(snr);
 }
 
-// Use the residual SNR envelope exactly once. Adaptive Response is production-fixed at 100% and
-// retained only for ABI/source compatibility. No inverse-SNR multiplier or Dynamic-ISO coefficient
-// is applied here; Dynamic ISO already affected the physical baseline through effective S/O.
+// Use the physical S/O SNR envelope exactly once. Adaptive Response is production-fixed at 100%
+ // and retained only for ABI/source compatibility. No inverse-SNR multiplier or Dynamic-ISO
+ // coefficient is applied here; Dynamic ISO, when selected, has already resolved effective S/O.
 inline float neuralAdaptiveAuthorityScale(
         float normalizedSignal,
         float sigma,
