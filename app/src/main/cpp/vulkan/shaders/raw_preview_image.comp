@@ -216,23 +216,10 @@ float normalizedAtUncached(int previewX, int previewY) {
     int baseX = int((x >> 1u) * 2u * d + (x & 1u));
     int baseY = int((y >> 1u) * 2u * d + (y & 1u));
     float sampleValue;
-    if (d <= 1u) {
-        sampleValue = rawNormalizedLocal(baseX, baseY);
-    } else {
-
-    // CFA-preserving 5-tap decimation. It removes coarse preview aliasing without mixing colour sites.
-    int step = max(2, (int(d) / 2) * 2);
-    float c = rawNormalizedLocal(baseX, baseY);
-    float n = rawNormalizedLocal(baseX, baseY - step);
-    float s = rawNormalizedLocal(baseX, baseY + step);
-    float w = rawNormalizedLocal(baseX - step, baseY);
-    float e = rawNormalizedLocal(baseX + step, baseY);
-    float spread = max(max(abs(c - n), abs(c - s)), max(abs(c - w), abs(c - e)));
-    float detailKeep = (1.0 - smoothstep(0.015, 0.075, spread)) *
-            (1.0 - smoothstep(100.0, 1600.0, max(100.0, pc.captureIso)));
-    float filtered = (4.0 * c + n + s + w + e) / 8.0;
-        sampleValue = mix(filtered, c, 0.20 * detailKeep);
-    }
+    // RAW zero-denoise preview contract: decimation is point-sampled on the same CFA site.
+    // Do not prefilter or average neighbouring sensels here; aliasing is preferable to silently
+    // destroying sensor grain/detail while the denoise baseline is being rebuilt from zero.
+    sampleValue = rawNormalizedLocal(baseX, baseY);
     // The map is low frequency. Correct the CFA-preserving decimated sample once, before
     // demosaic, rather than expanding four bilinear map fetches into every 5-tap RAW read.
     uint localX = uint(clamp(baseX, 0, int(pc.sourceWidth) - 1));
