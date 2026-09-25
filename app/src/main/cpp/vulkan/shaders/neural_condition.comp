@@ -1,0 +1,73 @@
+#version 450
+
+// Runtime-sized SSBO arrays cannot be passed as unsized GLSL function parameters on
+// the Android NDK glslc Vulkan 1.1 path. Keep the exact C4 packing semantics but
+// expand accesses at the call site instead.
+#define loadC4(WORDS, VEC_INDEX) \
+    vec4(unpackHalf2x16(WORDS[(VEC_INDEX) * 2u]), \
+         unpackHalf2x16(WORDS[(VEC_INDEX) * 2u + 1u]))
+#define loadHalf(WORDS, HALF_INDEX) \
+    ((((HALF_INDEX) & 1u) == 0u) \
+        ? unpackHalf2x16(WORDS[(HALF_INDEX) >> 1u]).x \
+        : unpackHalf2x16(WORDS[(HALF_INDEX) >> 1u]).y)
+#define storeC4(WORDS, VEC_INDEX, VALUE) \
+    do { \
+        uint _bncamStoreIndex = (VEC_INDEX); \
+        vec4 _bncamStoreValue = (VALUE); \
+        WORDS[_bncamStoreIndex * 2u] = packHalf2x16(_bncamStoreValue.xy); \
+        WORDS[_bncamStoreIndex * 2u + 1u] = packHalf2x16(_bncamStoreValue.zw); \
+    } while (false)
+
+layout(local_size_x=8, local_size_y=8, local_size_z=1) in;
+layout(set=0,binding=0,std430) readonly buffer RawInput { float raw[]; } src;
+layout(set=0,binding=1,std430) readonly buffer LscInput { float lsc[]; } lscSrc;
+layout(set=0,binding=2,std430) readonly buffer Physics { float c[]; } phys;
+layout(set=0,binding=3,std430) writeonly buffer Conditioning { uint data[]; } dst;
+layout(push_constant) uniform PC { int tileX; int tileY; uint tileW; uint tileH; uint fullW; uint fullH; uint paddedW; uint paddedH; uint lscW; uint lscH; uint lscChannels; uint hasLsc; } pc;
+
+bool finite4(vec4 v) { return !(any(isnan(v)) || any(isinf(v))); }
+vec4 rawAt(uint x,uint y){uint p=(y*pc.fullW+x)*4u;return vec4(src.raw[p],src.raw[p+1u],src.raw[p+2u],src.raw[p+3u]);}
+vec4 lscAt(uint x,uint y){
+ if(pc.hasLsc==0u||pc.lscW==0u||pc.lscH==0u)return vec4(1.0);
+ vec2 uv=(vec2(x,y)+vec2(0.5))/vec2(pc.fullW,pc.fullH);vec2 q=uv*vec2(pc.lscW,pc.lscH)-vec2(0.5);ivec2 b=ivec2(floor(q));vec2 f=fract(q);ivec2 a=clamp(b,ivec2(0),ivec2(pc.lscW-1u,pc.lscH-1u));ivec2 d=clamp(b+ivec2(1),ivec2(0),ivec2(pc.lscW-1u,pc.lscH-1u));
+ uint ch=max(pc.lscChannels,1u);uint p00=(uint(a.y)*pc.lscW+uint(a.x))*ch,p10=(uint(a.y)*pc.lscW+uint(d.x))*ch,p01=(uint(d.y)*pc.lscW+uint(a.x))*ch,p11=(uint(d.y)*pc.lscW+uint(d.x))*ch;
+ vec4 v00=(ch==1u)?vec4(lscSrc.lsc[p00]):vec4(lscSrc.lsc[p00],lscSrc.lsc[p00+1],lscSrc.lsc[p00+2],lscSrc.lsc[p00+3]);vec4 v10=(ch==1u)?vec4(lscSrc.lsc[p10]):vec4(lscSrc.lsc[p10],lscSrc.lsc[p10+1],lscSrc.lsc[p10+2],lscSrc.lsc[p10+3]);vec4 v01=(ch==1u)?vec4(lscSrc.lsc[p01]):vec4(lscSrc.lsc[p01],lscSrc.lsc[p01+1],lscSrc.lsc[p01+2],lscSrc.lsc[p01+3]);vec4 v11=(ch==1u)?vec4(lscSrc.lsc[p11]):vec4(lscSrc.lsc[p11],lscSrc.lsc[p11+1],lscSrc.lsc[p11+2],lscSrc.lsc[p11+3]);return mix(mix(v00,v10,f.x),mix(v01,v11,f.x),f.y);
+}
+
+vec4 sampleVariance3(vec4 a, vec4 b, vec4 c) {
+    vec4 mean = (a + b + c) * (1.0 / 3.0);
+    vec4 da = a - mean;
+    vec4 db = b - mean;
+    vec4 dc = c - mean;
+    // Unbiased n=3 sample variance: sum squared deviations / (n-1).
+    return 0.5 * (da * da + db * db + dc * dc);
+}
+
+vec4 postPhysicalResidualVariance(uint x, uint y, vec4 center, vec4 modelVariance) {
+    // Production Neural receives the hard-physical RAW-finalize output. Effective S/O is the
+    // physical pre-baseline budget after the upstream Dynamic-ISO resolver has already done its
+    // one permitted coefficient application. Neural must only act on noise that remains after
+    // physical baseline NR, with effective S/O used strictly as an upper bound.
+    //
+    // Missing spatial evidence is fail-closed: do not resurrect the complete pre-baseline S/O
+    // budget at borders or after invalid samples. Zero residual variance maps to the numerical
+    // sigma floor and therefore to effectively identity correction authority.
+    if (x == 0u || y == 0u || x + 1u >= pc.fullW || y + 1u >= pc.fullH) {
+        return vec4(0.0);
+    }
+    vec4 left = rawAt(x - 1u, y);
+    vec4 right = rawAt(x + 1u, y);
+    vec4 up = rawAt(x, y - 1u);
+    vec4 down = rawAt(x, y + 1u);
+    if (!finite4(center) || !finite4(left) || !finite4(right) || !finite4(up) || !finite4(down)) {
+        return vec4(0.0);
+    }
+    vec4 horizontal = sampleVariance3(left, center, right);
+    vec4 vertical = sampleVariance3(up, center, down);
+    vec4 observed = max(min(horizontal, vertical), vec4(0.0));
+    return min(modelVariance, observed);
+}
+
+void main(){uint lx=gl_GlobalInvocationID.x,ly=gl_GlobalInvocationID.y;if(lx>=pc.tileW||ly>=pc.tileH)return;int gx=pc.tileX+int(lx),gy=pc.tileY+int(ly);uint base=(ly*pc.tileW+lx)*4u;
+ if(gx<0||gy<0||gx>=int(pc.paddedW)||gy>=int(pc.paddedH)){storeC4(dst.data,base+0u,vec4(0));storeC4(dst.data,base+1u,vec4(0));storeC4(dst.data,base+2u,vec4(0));storeC4(dst.data,base+3u,vec4(0));return;}
+ uint sx=min(uint(gx),pc.fullW-1u),sy=min(uint(gy),pc.fullH-1u);vec4 rawValue=rawAt(sx,sy);if(!finite4(rawValue))rawValue=vec4(0.0);vec4 x=clamp(rawValue,vec4(0),vec4(1));vec4 S=max(vec4(phys.c[0],phys.c[1],phys.c[2],phys.c[3]),vec4(0));vec4 O=max(vec4(phys.c[4],phys.c[5],phys.c[6],phys.c[7]),vec4(0));vec4 modelVariance=max(S*x+O,vec4(0));vec4 remainingVariance=postPhysicalResidualVariance(sx,sy,x,modelVariance);vec4 sigma=sqrt(max(remainingVariance,vec4(0)));vec4 logs=log(max(sigma,vec4(max(phys.c[8],1e-12))));vec4 lg=lscAt(sx,sy);float hspan=max(phys.c[9],1e-6);float head=min(min((1.0-x.r)/hspan,(1.0-x.g)/hspan),min((1.0-x.b)/hspan,(1.0-x.a)/hspan));head=clamp(head,0.0,1.0);storeC4(dst.data,base+0u,x);storeC4(dst.data,base+1u,logs);storeC4(dst.data,base+2u,lg);storeC4(dst.data,base+3u,vec4(clamp(phys.c[10],0.0,1.0),head,0,0));}
