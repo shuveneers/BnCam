@@ -2726,19 +2726,12 @@ class BnCameraManager(private val context: Context) {
                     profileVibrance = quality.profileColorTuning.vibrance,
                     profilePop = quality.profileColorTuning.pop,
                     profileColorRecovery = quality.profileColorTuning.colorRecovery,
-                    // Capture sharpening/NR are not live-viewfinder stages. The RAW preview has
-                    // its own conservative base-detail pass for focus readability; stacking profile
-                    // detail/NR here made cadence and appearance depend on capture processing.
+                    // Capture sharpening remains separate from the RAW live view. RAW preview
+                    // denoise has been removed; only a neutral focus-detail transport remains.
                     profileDetailAmount = 0f,
                     profileDetailRadius = 1f,
                     profileDetailDetail = 0.25f,
                     profileDetailMasking = 0f,
-                    profileNrLuminance = 0f,
-                    profileNrLuminanceDetail = 0.5f,
-                    profileNrLuminanceContrast = 0f,
-                    profileNrColor = 0f,
-                    profileNrColorDetail = 0.5f,
-                    profileNrColorSmoothness = 0.5f,
                     toneCurve = quality.curves.toneNodes.toFloatArray(),
                     gammaCurve = quality.curves.gammaNodes.toFloatArray(),
                     sectionCurve = quality.curves.sectionNodes.toFloatArray(),
@@ -2928,12 +2921,6 @@ class BnCameraManager(private val context: Context) {
             profileDetailRadius = 1f,
             profileDetailDetail = 0.25f,
             profileDetailMasking = 0f,
-            profileNrLuminance = 0f,
-            profileNrLuminanceDetail = 0.5f,
-            profileNrLuminanceContrast = 0f,
-            profileNrColor = 0f,
-            profileNrColorDetail = 0.5f,
-            profileNrColorSmoothness = 0.5f,
             toneCurve = linearCurve(16),
             gammaCurve = linearCurve(16),
             sectionCurve = linearCurve(7),
