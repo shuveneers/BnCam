@@ -577,12 +577,6 @@ RawPreviewResult renderRawPreviewRgba(
     previewRequest.profileDetailRadius = parameters.quality.profileDetailRadius;
     previewRequest.profileDetailDetail = parameters.quality.profileDetailDetail;
     previewRequest.profileDetailMasking = parameters.quality.profileDetailMasking;
-    previewRequest.profileNrLuminance = parameters.quality.profileNrLuminance;
-    previewRequest.profileNrLuminanceDetail = parameters.quality.profileNrLuminanceDetail;
-    previewRequest.profileNrLuminanceContrast = parameters.quality.profileNrLuminanceContrast;
-    previewRequest.profileNrColor = parameters.quality.profileNrColor;
-    previewRequest.profileNrColorDetail = parameters.quality.profileNrColorDetail;
-    previewRequest.profileNrColorSmoothness = parameters.quality.profileNrColorSmoothness;
     previewRequest.toneLut = toneLut.data();
     previewRequest.toneLutSize = static_cast<std::uint32_t>(toneLut.size());
     previewRequest.outputHardwareBuffer = outputHardwareBuffer;
