@@ -7818,16 +7818,6 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     const float postToneResidualChromaSigma = static_cast<float>(std::sqrt(std::max(
             postToneVarianceRg, postToneVarianceBg)));
 
-    const bool profileNoiseReductionRequested = false;
-    const bool physicalChromaNoiseRequested = false;
-    float requestedLumaSigma = 0.0f;
-    float requestedChromaSigma = 0.0f;
-    float appliedLumaSigma = 0.0f;
-    float appliedChromaSigma = 0.0f;
-    float effectiveOuterRingAuthority = 0.0f;
-    const float lumaRangeThresholdMean = 0.0f;
-    const float chromaRangeThresholdMean = 0.0f;
-
     g_threadLocalIspStats.absoluteMeanLumaSigma = postToneResidualLumaSigma;
     g_threadLocalIspStats.absoluteMeanChromaSigma = postToneResidualChromaSigma;
     g_threadLocalIspStats.effectiveLumaSigma = 0.0f;
@@ -8681,7 +8671,6 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; maxNormalizedNoiseSignal=" << g_threadLocalIspStats.maxNormalizedNoiseSignal
             << "; physicalNoiseModelAvailable=" << (meta.calibration.physicalNoiseModelAvailable() ? "true" : "false")
             << "; spectraProcessingMode=" << spectraProcessingModeName(meta.calibration.spectraProcessingMode)
-            << "; physicalChromaNoiseRequested=" << (physicalChromaNoiseRequested ? "true" : "false")
             << "; noiseModelSoReceivedByCpp=" << nativeNoiseSo.str()
             << "; noiseModelApplied=" << (g_threadLocalIspStats.noiseModelApplied ? "yes" : "no")
             << "; noiseModelReason=" << g_threadLocalIspStats.noiseModelReason
