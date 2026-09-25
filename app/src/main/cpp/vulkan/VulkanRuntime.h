@@ -216,6 +216,10 @@ private:
     VulkanSpectraPass3PlannerBackend spectraPass3PlannerBackend_;
     VulkanSpectraRawFinalizeBackend spectraRawFinalizeBackend_;
     VulkanSpectraResidentToneBackend spectraResidentToneBackend_;
+    // Serializes resident RAW/SPECTRA orchestration across finalize/readback and the optional Neural path.
+    // Kept independent from submissionMutex_: this guards multi-stage resource-generation ownership,
+    // while submissionMutex_ provides Vulkan queue external synchronization.
+    std::mutex neuralOrchestrationMutex_;
     std::mutex submissionMutex_;
     // RAW preview uses this independent external-synchronization domain only when bootstrap
     // provides a dedicated second queue and command pool. Single-queue devices keep using
