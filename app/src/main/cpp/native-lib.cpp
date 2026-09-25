@@ -1740,12 +1740,6 @@ Java_com_bncam_core_engine_ImageUtils_renderRawPreviewNative(
         jfloat profileDetailRadius,
         jfloat profileDetailDetail,
         jfloat profileDetailMasking,
-        jfloat profileNrLuminance,
-        jfloat profileNrLuminanceDetail,
-        jfloat profileNrLuminanceContrast,
-        jfloat profileNrColor,
-        jfloat profileNrColorDetail,
-        jfloat profileNrColorSmoothness,
         jfloatArray toneCurveArray,
         jfloatArray gammaCurveArray,
         jfloatArray sectionCurveArray,
@@ -1901,14 +1895,7 @@ Java_com_bncam_core_engine_ImageUtils_renderRawPreviewNative(
     quality.profileDetailMasking = std::isfinite(profileDetailMasking)
             ? std::clamp(static_cast<float>(profileDetailMasking), -1.0f, 1.0f)
             : bncam::profile_defaults::kDetailMasking;
-    // N005: RAW preview must not inherit the retired classical Profile-NR controls. Keep the
-    // existing JNI parameters until the Neural controls replace this ABI, but do not store them.
-    (void)profileNrLuminance;
-    (void)profileNrLuminanceDetail;
-    (void)profileNrLuminanceContrast;
-    (void)profileNrColor;
-    (void)profileNrColorDetail;
-    (void)profileNrColorSmoothness;
+    // RAW zero-denoise preview: no profile noise-reduction transport exists.
     quality.toneCurve = extractCurveVector(env, toneCurveArray, 2, 64);
     quality.gammaCurve = extractCurveVector(env, gammaCurveArray, 2, 64);
     quality.sectionCurve = extractCurveVector(env, sectionCurveArray, 2, 64);
