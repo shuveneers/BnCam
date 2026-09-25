@@ -509,9 +509,8 @@ vec3 autoHybridAt(int x, int y) {
     float center = clamp(sampleClamped(x, y), 0.0, 1.0);
     float lowSignal = 1.0 - smoothstep(0.035, 0.18, center);
 
-    // Phase 3: Auto Hybrid is reconstruction-only. Malvar is the stable/noise-robust
-    // interpolation anchor and AMaZE receives authority on coherent high-frequency/Nyquist
-    // structure. Neural JDD is deliberately absent: Neural Denoise already owns RAW denoise.
+    // Auto Hybrid is reconstruction-only. Malvar is the stable interpolation anchor and AMaZE
+    // receives authority on coherent high-frequency/Nyquist structure. No denoise owner follows.
     float malvar = priorMalvar * (0.86 + 0.30 * noise + 0.16 * chromaRisk +
                                   0.10 * lowSignal + 0.08 * (1.0 - structure));
     float amaze = priorAmaze * (0.74 + 0.58 * structure + 0.72 * nyquist -
