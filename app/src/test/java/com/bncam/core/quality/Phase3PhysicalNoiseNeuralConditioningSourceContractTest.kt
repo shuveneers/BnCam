@@ -56,17 +56,17 @@ class Phase3PhysicalNoiseNeuralConditioningSourceContractTest {
         assertFalse("Neural path must not use OEM Camera2 S as fallback", conditioningBlock.contains("meta.calibration.cameraS"))
         assertFalse("Neural path must not use OEM Camera2 O as fallback", conditioningBlock.contains("meta.calibration.cameraO"))
 
-        // The physical model owns first-pass Bayer denoise even with Neural OFF.
-        assertTrue(physicalFinalize.contains("value = baselineNoiseReducedAt(x, y, value)"))
-        assertTrue(physicalFinalize.contains("float noiseVariance = predictedNoiseVariance(localMean, channel)"))
+        // SPECTRA Off has no classical Bayer denoiser. Physical S/O remains measurement and
+        // conditioning truth; only isolated defect correction may mutate a pathological pixel.
+        assertFalse(physicalFinalize.contains("baselineNoiseReducedAt"))
+        assertFalse(physicalFinalize.contains("Local Wiener shrinkage"))
 
-        // Neural is only a post-physical residual refinement. Effective S/O is an upper bound;
-        // no/invalid residual evidence fails closed to zero instead of restoring pre-baseline noise.
-        assertTrue(neuralCondition.contains("vec4 remainingVariance=postPhysicalResidualVariance"))
-        assertTrue(neuralCondition.contains("return min(modelVariance, observed)"))
-        assertTrue(neuralCondition.contains("return vec4(0.0)"))
-        assertTrue(neuralBridge.contains("return min(modelVariance, max(min(horizontal, vertical), vec4(0.0)))"))
-        assertTrue(neuralBridge.contains("return vec4(0.0)"))
+        // The deployed Neural conditioning must match the frozen training contract exactly:
+        // sigma = sqrt(S*x + O). Do not re-estimate a local post-filter residual variance here.
+        assertTrue(neuralCondition.contains("vec4 sigma=sqrt(max(S*x+O,vec4(0)))"))
+        assertFalse(neuralCondition.contains("postPhysicalResidualVariance"))
+        assertTrue(neuralBridge.contains("const vec4 variance = max(shotS() * clamp(x, vec4(0.0), vec4(1.0)) + readO(), vec4(1.0e-12));"))
+        assertFalse(neuralBridge.contains("postPhysicalResidualVariance"))
 
         assertTrue(policy.contains("out.core.noise.shotS = input.effectiveS"))
         assertTrue(policy.contains("out.core.noise.readO = input.effectiveO"))
