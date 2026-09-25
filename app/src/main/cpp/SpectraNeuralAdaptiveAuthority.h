@@ -43,8 +43,8 @@ inline float neuralAdaptiveNoiseEvidence(float normalizedSignal, float sigma) no
 }
 
 // Use the physical S/O SNR envelope exactly once. Adaptive Response is production-fixed at 100%
- // and retained only for ABI/source compatibility. No inverse-SNR multiplier or Dynamic-ISO
- // coefficient is applied here; Dynamic ISO, when selected, has already resolved effective S/O.
+// and retained only for ABI/source compatibility. No inverse-SNR multiplier or Dynamic-ISO
+// coefficient is applied here; Dynamic ISO, when selected, has already resolved effective S/O.
 inline float neuralAdaptiveAuthorityScale(
         float normalizedSignal,
         float sigma,
