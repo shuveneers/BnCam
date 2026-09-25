@@ -303,9 +303,8 @@ vec3 applyProfileColor(vec3 rgb, ivec2 pixel) {
     return compressToUnitGamutPreserveLuma(rgb);
 }
 
-// Phase 4 physical-noise ownership cleanup: classical post-CCM/pre-tone denoise is retired.
-// Mode 0 remains only the resident hand-off that copies immutable scene-linear RGB into
-// workingRgb for downstream observers/tone. Neural RAW denoise is the sole noise pixel owner.
+// RAW zero-denoise baseline: mode 0 is only a resident hand-off that copies immutable
+// scene-linear RGB into workingRgb for downstream observers/tone. No denoise pixel owner exists.
 void runPreTonePreparation(uvec2 gid) {
     if (gid.x >= pc.frameWidth || gid.y >= pc.frameHeight) return;
     writeWorking(gid, inputAt(int(gid.x), int(gid.y)));
