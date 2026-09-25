@@ -95,10 +95,10 @@ void main(){
     vec4 controlled=componentControlled(fine,clamp(pc.lumaAuthority,0.0,1.0),clamp(pc.chromaAuthority,0.0,1.0));
     controlled+=clamp(pc.lowFrequencyCleanup,0.0,1.0)*componentControlled(coarse,clamp(pc.lumaAuthority,0.0,1.0),clamp(pc.chromaAuthority,0.0,1.0));
 
-    // Neural is downstream of the physical baseline. The conditioning sigma is measured remaining
-    // post-physical noise, so this residual-SNR envelope may only gate the ONE Student residual.
-    // Dynamic ISO is deliberately absent here: it has already changed effective S/O and therefore
-    // the physical baseline. Detail confidence/posterior risk below remains the texture-protection gate.
+    // SPECTRA is the sole general RAW denoise owner when enabled. Conditioning sigma is the
+    // trained physical per-CFA sqrt(S*x+O) budget; there is no upstream classical denoiser.
+    // Dynamic ISO is deliberately absent here because it has already resolved effective S/O.
+    // Detail confidence/posterior risk below remains the texture-protection gate.
     vec4 snr=abs(x)/max(sigma,vec4(1.0e-8));
     vec4 noiseEvidence=vec4(1.0)-smoothstep(
         vec4(pc.adaptiveFullEvidenceSnr),vec4(pc.adaptiveIdentitySnr),snr);
