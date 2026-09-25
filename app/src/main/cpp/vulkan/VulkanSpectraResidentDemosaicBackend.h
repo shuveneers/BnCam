@@ -56,9 +56,6 @@ struct SpectraResidentDemosaicRequest {
     // Phase 6: topology-gated post-demosaic opponent cleanup. This is not generic NR: it
     // may only shrink physically significant isolated/zipper/overshoot chroma residuals.
     // Green/luma reconstruction is never mutated and the route is disabled without physical sigma.
-    bool phase6ResidualChromaEnabled = false;
-    float phase6MaximumBlend = 0.92f;
-    float phase6MaximumCorrection = 0.12f;
 
     // Delta 0048: scene-level soft priors. AUTO_HYBRID combines them with local
     // structure/Nyquist/chroma/noise evidence; they are never hard route selectors.
@@ -95,8 +92,6 @@ struct SpectraResidentDemosaicResult {
     float amazeReconstructPassMs = 0.0f;
     float autoHybridGuidePassMs = 0.0f;
     float autoHybridBlendPassMs = 0.0f;
-    bool phase6ResidualChromaRequested = false;
-    bool phase6ResidualChromaUsedForOutput = false;
     float phase6ClassifyPassMs = 0.0f;
     float phase6CorrectPassMs = 0.0f;
     std::uint64_t phase6ProcessedPixels = 0u;
