@@ -8,6 +8,7 @@ import com.bncam.core.nativebridge.NativeEngineLoader
 import com.bncam.core.runtime.ViewfinderStartupGate
 import com.bncam.core.vulkan.VulkanRuntimeConfig
 import com.bncam.core.vulkan.VulkanRuntimeOwner
+import com.bncam.core.vulkan.SpectraNeuralModelInstaller
 import com.bncam.data.settings.PhysicalNoiseModelRuntimeRegistry
 import org.lsposed.hiddenapibypass.HiddenApiBypass
 
@@ -50,6 +51,10 @@ class BnCamApplication : Application() {
             )
         )
         Phase0PerformanceTrace.markStartup("vulkan_init_end")
+        Phase0PerformanceTrace.markStartup("neural_model_prepare_start")
+        SpectraNeuralModelInstaller.loadBundled(applicationContext)
+        Phase0PerformanceTrace.markStartup("neural_model_prepare_end")
+
         // RAW preview pipeline creation stays out of Application.onCreate()/first-frame startup.
         // DELTA 0226 prepares it immediately after the first proven viewfinder presentation so
         // the expensive cold Vulkan setup is no longer charged to the first YUV -> RAW switch.
