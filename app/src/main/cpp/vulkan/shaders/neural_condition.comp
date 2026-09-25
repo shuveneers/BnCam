@@ -24,6 +24,7 @@ layout(set=0,binding=1,std430) readonly buffer LscInput { float lsc[]; } lscSrc;
 layout(set=0,binding=2,std430) readonly buffer Physics { float c[]; } phys;
 layout(set=0,binding=3,std430) writeonly buffer Conditioning { uint data[]; } dst;
 layout(push_constant) uniform PC { int tileX; int tileY; uint tileW; uint tileH; uint fullW; uint fullH; uint paddedW; uint paddedH; uint lscW; uint lscH; uint lscChannels; uint hasLsc; } pc;
+bool finite4(vec4 v) { return !(any(isnan(v)) || any(isinf(v))); }
 vec4 rawAt(uint x,uint y){uint p=(y*pc.fullW+x)*4u;return vec4(src.raw[p],src.raw[p+1u],src.raw[p+2u],src.raw[p+3u]);}
 vec4 lscAt(uint x,uint y){
  if(pc.hasLsc==0u||pc.lscW==0u||pc.lscH==0u)return vec4(1.0);
@@ -33,4 +34,4 @@ vec4 lscAt(uint x,uint y){
 }
 void main(){uint lx=gl_GlobalInvocationID.x,ly=gl_GlobalInvocationID.y;if(lx>=pc.tileW||ly>=pc.tileH)return;int gx=pc.tileX+int(lx),gy=pc.tileY+int(ly);uint base=(ly*pc.tileW+lx)*4u;
  if(gx<0||gy<0||gx>=int(pc.paddedW)||gy>=int(pc.paddedH)){storeC4(dst.data,base+0u,vec4(0));storeC4(dst.data,base+1u,vec4(0));storeC4(dst.data,base+2u,vec4(0));storeC4(dst.data,base+3u,vec4(0));return;}
- uint sx=min(uint(gx),pc.fullW-1u),sy=min(uint(gy),pc.fullH-1u);vec4 x=clamp(rawAt(sx,sy),vec4(0),vec4(1));vec4 S=max(vec4(phys.c[0],phys.c[1],phys.c[2],phys.c[3]),vec4(0));vec4 O=max(vec4(phys.c[4],phys.c[5],phys.c[6],phys.c[7]),vec4(0));vec4 sigma=sqrt(max(S*x+O,vec4(0)));vec4 logs=log(max(sigma,vec4(max(phys.c[8],1e-12))));vec4 lg=lscAt(sx,sy);float hspan=max(phys.c[9],1e-6);float head=min(min((1.0-x.r)/hspan,(1.0-x.g)/hspan),min((1.0-x.b)/hspan,(1.0-x.a)/hspan));head=clamp(head,0.0,1.0);storeC4(dst.data,base+0u,x);storeC4(dst.data,base+1u,logs);storeC4(dst.data,base+2u,lg);storeC4(dst.data,base+3u,vec4(clamp(phys.c[10],0.0,1.0),head,0,0));}
+ uint sx=min(uint(gx),pc.fullW-1u),sy=min(uint(gy),pc.fullH-1u);vec4 rawValue=rawAt(sx,sy);if(!finite4(rawValue))rawValue=vec4(0.0);vec4 x=clamp(rawValue,vec4(0),vec4(1));vec4 S=max(vec4(phys.c[0],phys.c[1],phys.c[2],phys.c[3]),vec4(0));vec4 O=max(vec4(phys.c[4],phys.c[5],phys.c[6],phys.c[7]),vec4(0));vec4 sigma=sqrt(max(S*x+O,vec4(0)));vec4 logs=log(max(sigma,vec4(max(phys.c[8],1e-12))));vec4 lg=lscAt(sx,sy);float hspan=max(phys.c[9],1e-6);float head=min(min((1.0-x.r)/hspan,(1.0-x.g)/hspan),min((1.0-x.b)/hspan,(1.0-x.a)/hspan));head=clamp(head,0.0,1.0);storeC4(dst.data,base+0u,x);storeC4(dst.data,base+1u,logs);storeC4(dst.data,base+2u,lg);storeC4(dst.data,base+3u,vec4(clamp(phys.c[10],0.0,1.0),head,0,0));}
