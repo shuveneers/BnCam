@@ -51,7 +51,7 @@ fun BlackLevelSettingsScreen(lensId: String, onNavigateBack: () -> Unit) {
         ) {
             ChoiceSettingRow(
                 title = "Black level type",
-                description = "System uses the sensor baseline. Dynamic follows same-frame black metadata. Manual uses four CFA values.",
+                description = "System uses exact-frame Camera2 black metadata when available, with the static sensor pattern only as fallback. Dynamic lets you deliberately blend static to same-frame black. Manual uses four CFA values.",
                 value = settings.type,
                 options = BlackLevelTypes.values,
                 onSelected = { selected ->
@@ -77,7 +77,7 @@ fun BlackLevelSettingsScreen(lensId: String, onNavigateBack: () -> Unit) {
             if (settings.type == BlackLevelTypes.DYNAMIC) {
                 SettingSliderRow(
                     title = "Strength",
-                    description = "0.00 = exact System baseline. 1.00 = full same-frame dynamic black. Intermediate values blend per CFA site.",
+                    description = "0.00 = static sensor pattern. 1.00 = full same-frame dynamic black. Intermediate values blend per CFA site.",
                     value = settings.dynamicStrength,
                     valueRange = 0f..1f,
                     onValueChange = {
