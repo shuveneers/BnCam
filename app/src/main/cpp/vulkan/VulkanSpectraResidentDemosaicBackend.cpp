@@ -1396,6 +1396,8 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
     result.lumaStructure=sums[26]*inversePixels;
     result.lumaAffected=sums[27]*inversePixels;
     result.lumaMaxRgError=sums[28];result.lumaMaxBgError=sums[29];
+    result.lumaNoisePressureMean=sums[30]*inversePixels;
+    result.chromaNoisePressureMean=sums[31]*inversePixels;
     result.baselinePhysicalChromaApplied=physicalChromaReady;
     result.chromaHfAuthorityMean=sums[12]*inversePixels;
     result.chromaLfAuthorityMean=sums[13]*inversePixels;

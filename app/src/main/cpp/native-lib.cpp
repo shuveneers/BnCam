@@ -4579,13 +4579,14 @@ Java_com_bncam_core_engine_ImageUtils_validatePhysicalLumaNative(JNIEnv* env,job
         { std::ostringstream value; value<<std::scientific<<maxParity; report+="cpuGpuMaxRgbDifference="+value.str()+"\n"; }
         // Joint chroma/luma test with heterogeneous physical spatial sigma. The
         // luma evidence remains the original Y, while its RGB delta follows chroma.
-        {
+        for(float noiseScale : {1.f,32.f}) {
             test::Image input(test::W*test::H), expected(input.size());
             float shapeMap[4]={.5f,1.f,1.5f,2.f};
-            Model lm{.000025f,.7f};bncam::chroma::Model cm{.000025f,.0004f,.0004f,.0001f};
+            Model lm{.000025f*noiseScale,.7f};
+            bncam::chroma::Model cm{.000025f*noiseScale,.0004f*noiseScale,.0004f*noiseScale,.0001f*noiseScale};
             for(size_t i=0;i<input.size();++i)input[i]={.04f+.006f*std::sin(float(i)),.02f+.005f*std::cos(float(i)),.01f};
             auto read=[&](int x,int y){return input[std::clamp(y,0,test::H-1)*test::W+std::clamp(x,0,test::W-1)];};
-            auto shape=[&](int x,int y){return shapeMap[std::clamp(int((y+.5f)*2/test::H),0,1)*2+std::clamp(int((x+.5f)*2/test::W),0,1)];};
+            auto shape=[&](int x,int y){return bncam::physical::spatialSigma(x,y,test::W,test::H,2,2,shapeMap);};
             for(int y=0;y<test::H;++y)for(int x=0;x<test::W;++x) {
                 auto c=bncam::chroma::filter(x,y,cm,read,shape).pixel;
                 expected[y*test::W+x]=filter(x,y,lm,c,read,shape).pixel;

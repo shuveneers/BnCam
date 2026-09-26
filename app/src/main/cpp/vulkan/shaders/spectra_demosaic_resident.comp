@@ -44,7 +44,7 @@ layout(push_constant) uniform Params {
 } pc;
 
 shared vec4 lumaStats0[256];
-shared vec2 lumaStats1[256];
+shared vec4 lumaStats1[256]; // xy=max chroma error, zw=mean adaptive pressures; total shared=32 KiB
 shared vec4 chromaStats0[256];
 shared vec4 chromaStats1[256];
 shared vec4 chromaStats2[256];
@@ -920,7 +920,7 @@ void main() {
     vec3 wb = vec3(0.0);
     vec3 ccm = vec3(0.0);
     vec2 cloudAppliedOpponent = vec2(0.0);
-    lumaStats0[localIndex]=vec4(0);lumaStats1[localIndex]=vec2(0);
+    lumaStats0[localIndex]=vec4(0);lumaStats1[localIndex]=vec4(0);
     chromaStats0[localIndex]=vec4(0);
     chromaStats1[localIndex]=vec4(0);
     chromaStats2[localIndex]=vec4(0);
@@ -970,7 +970,13 @@ void main() {
         vec3 postChroma=rawForWb;
         rawForWb=physicalLumaDenoise(ivec2(gid),postChroma,lumaTelemetry);
         lumaStats0[localIndex]=vec4(lumaTelemetry,any(notEqual(rawForWb,postChroma))?1.0:0.0);
-        lumaStats1[localIndex]=abs(opponentAtRgb(rawForWb).yz-co.yz);
+        lumaStats1[localIndex].xy=abs(opponentAtRgb(rawForWb).yz-co.yz);
+        float localSigma=physicalChromaShape(ivec2(gid));
+        float localShapeVariance=localSigma*localSigma;
+        lumaStats1[localIndex].z=pc.cfaEvidence1.y>0.0 ?
+            physicalNoisePressure(pc.padding0*localShapeVariance,ci.x) : 0.0;
+        lumaStats1[localIndex].w=pc.cfaEvidence1.w>0.5 ?
+            physicalNoisePressure(0.5*(pc.cfaEvidence0.y+pc.cfaEvidence0.z)*localShapeVariance,ci.x) : 0.0;
 
         // Counterfactual only: distinguishes WB-induced over-unity and old post-CCM magenta risk
         // from actual sensor-domain clipping. Neither condition is treated as lost sensor data.
@@ -1041,7 +1047,8 @@ void main() {
         if (localIndex < stride) {
             uint other = localIndex + stride;
             lumaStats0[localIndex]+=lumaStats0[other];
-            lumaStats1[localIndex]=max(lumaStats1[localIndex],lumaStats1[other]);
+            lumaStats1[localIndex].xy=max(lumaStats1[localIndex].xy,lumaStats1[other].xy);
+            lumaStats1[localIndex].zw+=lumaStats1[other].zw;
             chromaStats0[localIndex].xyz+=chromaStats0[other].xyz;
             chromaStats0[localIndex].w=max(chromaStats0[localIndex].w,chromaStats0[other].w);
             chromaStats1[localIndex]+=chromaStats1[other];
@@ -1067,7 +1074,7 @@ void main() {
         uint base = groupIndex * 32u;
         for(uint k=0u;k<4u;++k)colorStats[base+24u+k]=lumaStats0[0][k];
         colorStats[base+28u]=lumaStats1[0].x;colorStats[base+29u]=lumaStats1[0].y;
-        colorStats[base+30u]=0.0;colorStats[base+31u]=0.0;
+        colorStats[base+30u]=lumaStats1[0].z;colorStats[base+31u]=lumaStats1[0].w;
         colorStats[base + 0u] = sumRawR[0];
         colorStats[base + 1u] = sumRawG[0];
         colorStats[base + 2u] = sumRawB[0];

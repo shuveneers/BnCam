@@ -6736,14 +6736,19 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     const double ccmOnlyBlueOpponentDirectionalGain = wbRgb[2] > 1.0e-6f
             ? wbCcmBlueOpponentDirectionalGain / static_cast<double>(wbRgb[2]) : 1.0;
 
-    const auto baselinePhysicalChroma = bncam::chroma::fromNoiseState(
+    auto baselinePhysicalChroma = bncam::chroma::fromNoiseState(
             residualNoiseState.postDemosaic, physicalNoiseStatisticsActive);
     auto baselinePhysicalLuma = bncam::luma::fromNoiseState(
             residualNoiseState.postDemosaic, physicalNoiseStatisticsActive);
-    // The physical shutter S/O and protected chroma covariance remain immutable.
+    // Preserve the physical shutter S/O. Both owners use the actual fused residual.
     // Student posterior already describes the fused input: never scale it twice.
     if (!neuralPosteriorSeedApplied) {
-        baselinePhysicalLuma.varianceY *= meta.calibration.physicalFusionVarianceScale;
+        const float fusionScale = meta.calibration.physicalFusionVarianceScale;
+        baselinePhysicalLuma.varianceY *= fusionScale;
+        baselinePhysicalChroma.y *= fusionScale;
+        baselinePhysicalChroma.rg *= fusionScale;
+        baselinePhysicalChroma.bg *= fusionScale;
+        baselinePhysicalChroma.cross *= fusionScale;
     }
     if (!bncam::luma::debugEnabled.load()) baselinePhysicalLuma = {};
     // Downstream covariance stays a conservative pre-filter prediction: adaptive support is
@@ -6947,9 +6952,9 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                 };
                 auto shape = [&](int x,int y) {
                     if (!g_spatialNoiseMap.relativePhysicalShape) return 1.f;
-                    int tx=std::clamp(int((x+0.5f)*g_spatialNoiseMap.gridWidth/source.cols),0,g_spatialNoiseMap.gridWidth-1);
-                    int ty=std::clamp(int((y+0.5f)*g_spatialNoiseMap.gridHeight/source.rows),0,g_spatialNoiseMap.gridHeight-1);
-                    return g_spatialNoiseMap.tileSigma[ty*g_spatialNoiseMap.gridWidth+tx];
+                    return bncam::physical::spatialSigma(x,y,source.cols,source.rows,
+                            g_spatialNoiseMap.gridWidth,g_spatialNoiseMap.gridHeight,
+                            g_spatialNoiseMap.tileSigma.data());
                 };
                 for(int y=rows.start;y<rows.end;++y) for(int x=0;x<source.cols;++x) {
                     auto p=bncam::chroma::filter(x,y,baselinePhysicalChroma,read,shape).pixel;
@@ -6966,9 +6971,9 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                 };
                 auto shape = [&](int x,int y) {
                     if (!g_spatialNoiseMap.relativePhysicalShape) return 1.f;
-                    int tx=std::clamp(int((x+0.5f)*g_spatialNoiseMap.gridWidth/source.cols),0,g_spatialNoiseMap.gridWidth-1);
-                    int ty=std::clamp(int((y+0.5f)*g_spatialNoiseMap.gridHeight/source.rows),0,g_spatialNoiseMap.gridHeight-1);
-                    return g_spatialNoiseMap.tileSigma[ty*g_spatialNoiseMap.gridWidth+tx];
+                    return bncam::physical::spatialSigma(x,y,source.cols,source.rows,
+                            g_spatialNoiseMap.gridWidth,g_spatialNoiseMap.gridHeight,
+                            g_spatialNoiseMap.tileSigma.data());
                 };
                 for(int y=rows.start;y<rows.end;++y) for(int x=0;x<source.cols;++x) {
                     auto p=bncam::luma::filter(x,y,baselinePhysicalLuma,read(x,y),read,shape).pixel;
@@ -9275,6 +9280,9 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << ";modelConfidence=" << baselinePhysicalLuma.confidence
             << ";fusionVarianceScale=" << meta.calibration.physicalFusionVarianceScale
             << ";posteriorAlreadyIncludesFusion=" << (neuralPosteriorSeedApplied?"true":"false")
+            << ";adaptiveNoisePressureMean=" << vulkanColorTransform.lumaNoisePressureMean
+            << ";availableHfCapMean=" << (0.28+0.32*vulkanColorTransform.lumaNoisePressureMean)
+            << ";availableMidCapMean=" << (0.16+0.20*vulkanColorTransform.lumaNoisePressureMean)
             << ";hfNoiseAuthority=" << vulkanColorTransform.lumaHfAuthority
             << ";midNoiseAuthority=" << vulkanColorTransform.lumaMidAuthority
             << ";meanStructureConfidence=" << vulkanColorTransform.lumaStructure
@@ -9294,6 +9302,10 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << ";predictedSigmaBG=" << std::sqrt(baselinePhysicalChroma.bg)
             << ";predictedCovarianceRgBg=" << baselinePhysicalChroma.cross
             << ";measurementStatus=" << (vulkanColorTransform.success ? "GPU_MEASURED" : "UNAVAILABLE_CPU_FALLBACK")
+            << ";adaptiveNoisePressureMean=" << vulkanColorTransform.chromaNoisePressureMean
+            << ";availableHfCapMean=" << (0.75*(1.0+0.75*vulkanColorTransform.chromaNoisePressureMean))
+            << ";availableLfCapMean=" << (0.25*(1.0+0.75*vulkanColorTransform.chromaNoisePressureMean))
+            << ";adaptiveSupportLimit=0.90;pressureDomain=LOCAL_POST_DEMOSAIC_RESIDUAL;downstreamGainCounted=false"
             << ";hfAuthorityMean=" << vulkanColorTransform.chromaHfAuthorityMean
             << ";lfAuthorityMean=" << vulkanColorTransform.chromaLfAuthorityMean
             << ";affectedPixelFraction=" << vulkanColorTransform.chromaAffectedFraction

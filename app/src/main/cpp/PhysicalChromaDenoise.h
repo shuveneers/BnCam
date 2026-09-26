@@ -1,5 +1,6 @@
 #pragma once
 #include "SpectraNoisePropagation.h"
+#include "PhysicalNoiseAuthority.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -49,7 +50,7 @@ struct Result { Pixel pixel; float hf=0, lf=0; };
 // read(x,y) is immutable POST_DEMOSAIC_LINEAR_RGB; shape(x,y) is the existing
 // local/mean physical sigma ratio (including LSC), or unity when unavailable.
 template<class Read, class Shape>
-Result filter(int x, int y, Model m, Read read, Shape shape) {
+Result filter(int x, int y, Model m, Read read, Shape shape, bool adaptive = true) {
     Pixel in = read(x,y);
     if (!m.valid() || !finite(in)) return {in};
     Pixel p = opponent(in);
@@ -57,6 +58,8 @@ Result filter(int x, int y, Model m, Read read, Shape shape) {
     const float v = 0.5f*(m.rg+m.bg)*s;
     // Dimensionless SNR knee at signal RMS / chroma RMS = 10. No ISO curve.
     float authority = v / (v + 0.01f*p[0]*p[0]);
+    const float pressure = adaptive ? physical::noisePressure(v,p[0]) : 0.f;
+    authority *= 1.f + 0.75f*pressure;
     float hr=p[1], hb=p[2], hw=1, lr=p[1], lb=p[2], lw=1;
     for (int dy=-1; dy<=1; ++dy) for (int dx=-1; dx<=1; ++dx) {
         if (!dx && !dy) continue;
@@ -73,6 +76,10 @@ Result filter(int x, int y, Model m, Read read, Shape shape) {
         float wl=std::exp(-gate); // four times stricter than HF
         if (finite(far)) { lr+=wl*far[1]; lb+=wl*far[2]; lw+=wl; }
     }
+    // Keep >=10% centre weight even at extreme pressure. Neighbour gates and
+    // the HF/LF estimators are unchanged; no extrapolation across colour edges.
+    const float support=0.75f*(1.f-1.f/hw)+0.25f*(1.f-1.f/lw);
+    if(support>0.f) authority=std::min(authority,0.90f/support);
     float cr=p[1]+authority*(0.75f*(hr/hw-p[1])+0.25f*(lr/lw-p[1]));
     float cb=p[2]+authority*(0.75f*(hb/hw-p[2])+0.25f*(lb/lw-p[2]));
     if (cr==p[1] && cb==p[2]) return {in};
