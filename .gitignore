@@ -36,3 +36,4 @@ google-services.json
 __pycache__/
 *.py[cod]
 .pytest_cache/
+work/physical_chroma_validation/
