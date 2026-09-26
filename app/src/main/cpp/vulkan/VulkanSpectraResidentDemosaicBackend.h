@@ -2,6 +2,7 @@
 
 #include "VulkanVmaIntegration.h"
 #include "../PhysicalChromaDenoise.h"
+#include "../PhysicalLumaDenoise.h"
 
 #include <vulkan/vulkan.h>
 
@@ -119,6 +120,7 @@ struct SpectraResidentDemosaicResult {
 
 struct SpectraResidentColorTransformRequest {
     bncam::chroma::Model baselinePhysicalChroma{};
+    bncam::luma::Model baselinePhysicalLuma{};
     const float* physicalSpatialSigma = nullptr;
     std::uint32_t physicalSpatialColumns = 0, physicalSpatialRows = 0;
     // Explicit diagnostic only: return the pre-AWB stage for CPU/GPU verification.
@@ -164,6 +166,9 @@ struct SpectraResidentColorTransformRequest {
 };
 
 struct SpectraResidentColorTransformResult {
+    bool baselinePhysicalLumaApplied = false;
+    double lumaHfAuthority=0,lumaMidAuthority=0,lumaStructure=0,lumaAffected=0;
+    double lumaMaxRgError=0,lumaMaxBgError=0;
     bool baselinePhysicalChromaApplied = false;
     double chromaHfAuthorityMean=0, chromaLfAuthorityMean=0, chromaAffectedFraction=0;
     double chromaMaxLumaError=0, chromaMeanLumaError=0, chromaRmsLumaError=0;

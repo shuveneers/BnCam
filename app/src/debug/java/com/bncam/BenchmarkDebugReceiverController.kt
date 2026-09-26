@@ -48,6 +48,14 @@ object BenchmarkDebugReceiverController {
                         }
                     }
                     ACTION_SET_CONFIG -> {
+                        if (intent.hasExtra("physicalLuma")) {
+                            com.bncam.core.engine.ImageUtils.setPhysicalLumaDebugEnabled(intent.getBooleanExtra("physicalLuma", true))
+                        }
+                        if (intent.hasExtra("physicalLumaAb")) {
+                            com.bncam.core.engine.ImageUtils.physicalLumaAbDirectory =
+                                if (intent.getBooleanExtra("physicalLumaAb", false))
+                                    java.io.File(activity.filesDir, "physical_luma_ab").absolutePath else null
+                        }
                         val requestedProfileId = intent.getStringExtra("profile")
                         val format = intent.getStringExtra("format")
                         val demosaic = intent.getStringExtra("demosaic")

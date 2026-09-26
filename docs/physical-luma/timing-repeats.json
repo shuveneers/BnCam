@@ -1,0 +1,23 @@
+[
+  {
+    "repeat": "0",
+    "ispOffMs": 2241.66,
+    "ispOnMs": 1823.72,
+    "gpuOffMs": 111.787,
+    "gpuOnMs": 227.111
+  },
+  {
+    "repeat": "1",
+    "ispOffMs": 2066.69,
+    "ispOnMs": 1782.2,
+    "gpuOffMs": 111.081,
+    "gpuOnMs": 221.497
+  },
+  {
+    "repeat": "2",
+    "ispOffMs": 1988.6,
+    "ispOnMs": 1800.47,
+    "gpuOffMs": 114.119,
+    "gpuOnMs": 222.326
+  }
+]

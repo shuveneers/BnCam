@@ -220,6 +220,16 @@ bool fusePixel(uint x, uint y) {
         if (diff > fallbackMaxDiff) return false;
     }
 
+    // Physical residual variance is independent of the optional Spectra weighting.
+    // This changes statistics only; accumulated RAW values/weights stay identical.
+    if (pU(P_SPECTRA) == 0u) {
+        int ch=cfaChannel(int(x),int(y));
+        float physicalS=pF(P_S0+uint(ch)),physicalO=pF(P_O0+uint(ch));
+        float av=physicalS*anchorSignal+physicalO;
+        float sv=physicalS*supportNativeSignal+physicalO;
+        if(av>0.0 && sv>=0.0 && !isnan(av) && !isinf(av) && !isnan(sv) && !isinf(sv))
+            relativeVarianceRatio=sv/(exposureScale*exposureScale*av);
+    }
     if (weight < 0.01) return false;
     accumBuf.values[idx] += support * weight;
     weightBuf.values[idx] += weight;

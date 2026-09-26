@@ -1,0 +1,552 @@
+[
+  {
+    "label": "RAW10_AUTO_spectra0_frames1",
+    "format": "RAW10",
+    "route": "AUTO_HYBRID",
+    "spectraActual": "Off",
+    "iso": "1371",
+    "exposureNs": "29999995",
+    "luma": {
+      "enabled": "true",
+      "spectraIndependent": "true",
+      "inputDomain": "POST_PHYSICAL_CHROMA_LINEAR_RGB",
+      "noiseModel": "PHYSICAL_SO_PROPAGATED",
+      "status": "PHYSICAL_LUMA_ACTIVE",
+      "gpuExecuted": "true",
+      "predictedSigmaY": "0.00373956",
+      "modelConfidence": "0.522",
+      "fusionVarianceScale": "1",
+      "posteriorAlreadyIncludesFusion": "false",
+      "hfNoiseAuthority": "0.0858144",
+      "midNoiseAuthority": "0.0410349",
+      "meanStructureConfidence": "0.505591",
+      "affectedPixelFraction": "0.999986",
+      "chromaMaxRgError": "5.96046e-08",
+      "chromaMaxBgError": "5.96046e-08",
+      "measurementStatus": "GPU_MEASURED",
+      "flatNoiseVarianceRatio": "GROUND_TRUTH_TEST_ONLY",
+      "highSnrIdentityError": "TEST_ONLY",
+      "fusedColourLumaGpuMs": "187.589",
+      "extraFullFrameBuffers": "0",
+      "extraFullFrameReadbacks": "0",
+      "extraStatisticsBytesPerWorkgroup": "32"
+    },
+    "gpuOffMs": 95.9915,
+    "gpuOnMs": 187.589,
+    "ispOffMs": 1329.55,
+    "ispOnMs": 1583.97,
+    "regions": {
+      "wood": {
+        "sceneResidualVarianceRatio": 0.8327970650749579,
+        "noisyPairCorrelation": 0.9904857386523785,
+        "meanYDelta8bit": 0.027039188151041664
+      },
+      "pad": {
+        "sceneResidualVarianceRatio": 0.8132004361827245,
+        "noisyPairCorrelation": 0.9871233104245218,
+        "meanYDelta8bit": 0.026952655598958337
+      }
+    },
+    "jpeg444": true
+  },
+  {
+    "label": "RAW10_BILINEAR_spectra0_frames1",
+    "format": "RAW10",
+    "route": "NEURAL_JDD",
+    "spectraActual": "Off",
+    "iso": "1030",
+    "exposureNs": "29999995",
+    "luma": {
+      "enabled": "true",
+      "spectraIndependent": "true",
+      "inputDomain": "POST_PHYSICAL_CHROMA_LINEAR_RGB",
+      "noiseModel": "PHYSICAL_SO_PROPAGATED",
+      "status": "PHYSICAL_LUMA_ACTIVE",
+      "gpuExecuted": "true",
+      "predictedSigmaY": "0.00301921",
+      "modelConfidence": "0.63",
+      "fusionVarianceScale": "1",
+      "posteriorAlreadyIncludesFusion": "false",
+      "hfNoiseAuthority": "0.100374",
+      "midNoiseAuthority": "0.0477614",
+      "meanStructureConfidence": "0.520001",
+      "affectedPixelFraction": "0.999998",
+      "chromaMaxRgError": "5.96046e-08",
+      "chromaMaxBgError": "5.96046e-08",
+      "measurementStatus": "GPU_MEASURED",
+      "flatNoiseVarianceRatio": "GROUND_TRUTH_TEST_ONLY",
+      "highSnrIdentityError": "TEST_ONLY",
+      "fusedColourLumaGpuMs": "190.932",
+      "extraFullFrameBuffers": "0",
+      "extraFullFrameReadbacks": "0",
+      "extraStatisticsBytesPerWorkgroup": "32"
+    },
+    "gpuOffMs": 93.4979,
+    "gpuOnMs": 190.932,
+    "ispOffMs": 1293.04,
+    "ispOnMs": 1374.52,
+    "regions": {
+      "wood": {
+        "sceneResidualVarianceRatio": 0.8108923139012603,
+        "noisyPairCorrelation": 0.9867886638103915,
+        "meanYDelta8bit": 0.030277545572916675
+      },
+      "pad": {
+        "sceneResidualVarianceRatio": 0.7741456950146768,
+        "noisyPairCorrelation": 0.9832303833311073,
+        "meanYDelta8bit": 0.018660520833333336
+      }
+    },
+    "jpeg444": true
+  },
+  {
+    "label": "RAW10_NORMAL_spectra0_frames1",
+    "format": "RAW10",
+    "route": "MALVAR_2004",
+    "spectraActual": "Off",
+    "iso": "1309",
+    "exposureNs": "29999995",
+    "luma": {
+      "enabled": "true",
+      "spectraIndependent": "true",
+      "inputDomain": "POST_PHYSICAL_CHROMA_LINEAR_RGB",
+      "noiseModel": "PHYSICAL_SO_PROPAGATED",
+      "status": "PHYSICAL_LUMA_ACTIVE",
+      "gpuExecuted": "true",
+      "predictedSigmaY": "0.00373253",
+      "modelConfidence": "0.774",
+      "fusionVarianceScale": "1",
+      "posteriorAlreadyIncludesFusion": "false",
+      "hfNoiseAuthority": "0.131929",
+      "midNoiseAuthority": "0.0636084",
+      "meanStructureConfidence": "0.487023",
+      "affectedPixelFraction": "0.999999",
+      "chromaMaxRgError": "5.96046e-08",
+      "chromaMaxBgError": "5.96046e-08",
+      "measurementStatus": "GPU_MEASURED",
+      "flatNoiseVarianceRatio": "GROUND_TRUTH_TEST_ONLY",
+      "highSnrIdentityError": "TEST_ONLY",
+      "fusedColourLumaGpuMs": "197.593",
+      "extraFullFrameBuffers": "0",
+      "extraFullFrameReadbacks": "0",
+      "extraStatisticsBytesPerWorkgroup": "32"
+    },
+    "gpuOffMs": 96.1744,
+    "gpuOnMs": 197.593,
+    "ispOffMs": 887.228,
+    "ispOnMs": 943.753,
+    "regions": {
+      "wood": {
+        "sceneResidualVarianceRatio": 0.7397550049010956,
+        "noisyPairCorrelation": 0.9844658902296937,
+        "meanYDelta8bit": 0.06385849479166668
+      },
+      "pad": {
+        "sceneResidualVarianceRatio": 0.723985567598919,
+        "noisyPairCorrelation": 0.9821649090099293,
+        "meanYDelta8bit": 0.05425547395833333
+      }
+    },
+    "jpeg444": true
+  },
+  {
+    "label": "RAW10_NORMAL_spectra1_frames1",
+    "format": "RAW10",
+    "route": "MALVAR_2004",
+    "spectraActual": "On",
+    "iso": "8966",
+    "exposureNs": "49999986",
+    "luma": {
+      "enabled": "true",
+      "spectraIndependent": "true",
+      "inputDomain": "POST_PHYSICAL_CHROMA_LINEAR_RGB",
+      "noiseModel": "PHYSICAL_SO_PROPAGATED",
+      "status": "PHYSICAL_LUMA_ACTIVE",
+      "gpuExecuted": "true",
+      "predictedSigmaY": "0.00883594",
+      "modelConfidence": "0.76626",
+      "fusionVarianceScale": "1",
+      "posteriorAlreadyIncludesFusion": "true",
+      "hfNoiseAuthority": "0.159438",
+      "midNoiseAuthority": "0.0849269",
+      "meanStructureConfidence": "0.337547",
+      "affectedPixelFraction": "0.999976",
+      "chromaMaxRgError": "5.96046e-08",
+      "chromaMaxBgError": "1.19209e-07",
+      "measurementStatus": "GPU_MEASURED",
+      "flatNoiseVarianceRatio": "GROUND_TRUTH_TEST_ONLY",
+      "highSnrIdentityError": "TEST_ONLY",
+      "fusedColourLumaGpuMs": "194.391",
+      "extraFullFrameBuffers": "0",
+      "extraFullFrameReadbacks": "0",
+      "extraStatisticsBytesPerWorkgroup": "32"
+    },
+    "gpuOffMs": 96.3387,
+    "gpuOnMs": 194.391,
+    "ispOffMs": 2749.81,
+    "ispOnMs": 2162.38,
+    "regions": {
+      "wood": {
+        "sceneResidualVarianceRatio": 0.6059231118796494,
+        "noisyPairCorrelation": 0.995354865072358,
+        "meanYDelta8bit": 0.07200874869791668
+      },
+      "pad": {
+        "sceneResidualVarianceRatio": 0.6278188273872699,
+        "noisyPairCorrelation": 0.9957556957948828,
+        "meanYDelta8bit": 0.12086081315104169
+      }
+    },
+    "jpeg444": true
+  },
+  {
+    "label": "RAW10_QUALITY_spectra0_frames1",
+    "format": "RAW10",
+    "route": "AMAZE",
+    "spectraActual": "Off",
+    "iso": "1437",
+    "exposureNs": "29999995",
+    "luma": {
+      "enabled": "true",
+      "spectraIndependent": "true",
+      "inputDomain": "POST_PHYSICAL_CHROMA_LINEAR_RGB",
+      "noiseModel": "PHYSICAL_SO_PROPAGATED",
+      "status": "PHYSICAL_LUMA_ACTIVE",
+      "gpuExecuted": "true",
+      "predictedSigmaY": "0.00347662",
+      "modelConfidence": "0.594",
+      "fusionVarianceScale": "1",
+      "posteriorAlreadyIncludesFusion": "false",
+      "hfNoiseAuthority": "0.0871603",
+      "midNoiseAuthority": "0.0399781",
+      "meanStructureConfidence": "0.561847",
+      "affectedPixelFraction": "0.999996",
+      "chromaMaxRgError": "5.96046e-08",
+      "chromaMaxBgError": "5.96046e-08",
+      "measurementStatus": "GPU_MEASURED",
+      "flatNoiseVarianceRatio": "GROUND_TRUTH_TEST_ONLY",
+      "highSnrIdentityError": "TEST_ONLY",
+      "fusedColourLumaGpuMs": "208.362",
+      "extraFullFrameBuffers": "0",
+      "extraFullFrameReadbacks": "0",
+      "extraStatisticsBytesPerWorkgroup": "32"
+    },
+    "gpuOffMs": 93.6625,
+    "gpuOnMs": 208.362,
+    "ispOffMs": 935.923,
+    "ispOnMs": 1479.03,
+    "regions": {
+      "wood": {
+        "sceneResidualVarianceRatio": 0.870541208295666,
+        "noisyPairCorrelation": 0.9905641901518893,
+        "meanYDelta8bit": 0.03349727864583334
+      },
+      "pad": {
+        "sceneResidualVarianceRatio": 0.8692259531662698,
+        "noisyPairCorrelation": 0.9883982644658444,
+        "meanYDelta8bit": 0.020795900390625004
+      }
+    },
+    "jpeg444": true
+  },
+  {
+    "label": "RAW_SENSOR_AUTO_spectra0_frames1",
+    "format": "RAW_SENSOR",
+    "route": "AUTO_HYBRID",
+    "spectraActual": "Off",
+    "iso": "634",
+    "exposureNs": "29999995",
+    "luma": {
+      "enabled": "true",
+      "spectraIndependent": "true",
+      "inputDomain": "POST_PHYSICAL_CHROMA_LINEAR_RGB",
+      "noiseModel": "PHYSICAL_SO_PROPAGATED",
+      "status": "PHYSICAL_LUMA_ACTIVE",
+      "gpuExecuted": "true",
+      "predictedSigmaY": "0.0020826",
+      "modelConfidence": "0.522",
+      "fusionVarianceScale": "1",
+      "posteriorAlreadyIncludesFusion": "false",
+      "hfNoiseAuthority": "0.0874147",
+      "midNoiseAuthority": "0.0418307",
+      "meanStructureConfidence": "0.497535",
+      "affectedPixelFraction": "0.999997",
+      "chromaMaxRgError": "2.98023e-08",
+      "chromaMaxBgError": "1.49012e-08",
+      "measurementStatus": "GPU_MEASURED",
+      "flatNoiseVarianceRatio": "GROUND_TRUTH_TEST_ONLY",
+      "highSnrIdentityError": "TEST_ONLY",
+      "fusedColourLumaGpuMs": "186.449",
+      "extraFullFrameBuffers": "0",
+      "extraFullFrameReadbacks": "0",
+      "extraStatisticsBytesPerWorkgroup": "32"
+    },
+    "gpuOffMs": 86.273,
+    "gpuOnMs": 186.449,
+    "ispOffMs": 907.662,
+    "ispOnMs": 1006.63,
+    "regions": {
+      "wood": {
+        "sceneResidualVarianceRatio": 0.8286683250088124,
+        "noisyPairCorrelation": 0.9799195862880822,
+        "meanYDelta8bit": 0.04678429361979166
+      },
+      "pad": {
+        "sceneResidualVarianceRatio": 0.791077752999945,
+        "noisyPairCorrelation": 0.9701871260591486,
+        "meanYDelta8bit": -0.019037817057291666
+      }
+    },
+    "jpeg444": true
+  },
+  {
+    "label": "RAW_SENSOR_BILINEAR_spectra0_frames1",
+    "format": "RAW_SENSOR",
+    "route": "NEURAL_JDD",
+    "spectraActual": "Off",
+    "iso": "1336",
+    "exposureNs": "29999995",
+    "luma": {
+      "enabled": "true",
+      "spectraIndependent": "true",
+      "inputDomain": "POST_PHYSICAL_CHROMA_LINEAR_RGB",
+      "noiseModel": "PHYSICAL_SO_PROPAGATED",
+      "status": "PHYSICAL_LUMA_ACTIVE",
+      "gpuExecuted": "true",
+      "predictedSigmaY": "0.00346471",
+      "modelConfidence": "0.63",
+      "fusionVarianceScale": "1",
+      "posteriorAlreadyIncludesFusion": "false",
+      "hfNoiseAuthority": "0.0964511",
+      "midNoiseAuthority": "0.0453534",
+      "meanStructureConfidence": "0.540391",
+      "affectedPixelFraction": "0.999998",
+      "chromaMaxRgError": "5.96046e-08",
+      "chromaMaxBgError": "5.96046e-08",
+      "measurementStatus": "GPU_MEASURED",
+      "flatNoiseVarianceRatio": "GROUND_TRUTH_TEST_ONLY",
+      "highSnrIdentityError": "TEST_ONLY",
+      "fusedColourLumaGpuMs": "200.744",
+      "extraFullFrameBuffers": "0",
+      "extraFullFrameReadbacks": "0",
+      "extraStatisticsBytesPerWorkgroup": "32"
+    },
+    "gpuOffMs": 97.3308,
+    "gpuOnMs": 200.744,
+    "ispOffMs": 952.549,
+    "ispOnMs": 981.052,
+    "regions": {
+      "wood": {
+        "sceneResidualVarianceRatio": 0.8227153371996017,
+        "noisyPairCorrelation": 0.9885248188664836,
+        "meanYDelta8bit": 0.04224928255208334
+      },
+      "pad": {
+        "sceneResidualVarianceRatio": 0.793397240360808,
+        "noisyPairCorrelation": 0.985304933814206,
+        "meanYDelta8bit": 0.032971338541666666
+      }
+    },
+    "jpeg444": true
+  },
+  {
+    "label": "RAW_SENSOR_NORMAL_spectra0_frames1",
+    "format": "RAW_SENSOR",
+    "route": "MALVAR_2004",
+    "spectraActual": "Off",
+    "iso": "778",
+    "exposureNs": "29999995",
+    "luma": {
+      "enabled": "true",
+      "spectraIndependent": "true",
+      "inputDomain": "POST_PHYSICAL_CHROMA_LINEAR_RGB",
+      "noiseModel": "PHYSICAL_SO_PROPAGATED",
+      "status": "PHYSICAL_LUMA_ACTIVE",
+      "gpuExecuted": "true",
+      "predictedSigmaY": "0.00210199",
+      "modelConfidence": "0.774",
+      "fusionVarianceScale": "1",
+      "posteriorAlreadyIncludesFusion": "false",
+      "hfNoiseAuthority": "0.141403",
+      "midNoiseAuthority": "0.0698051",
+      "meanStructureConfidence": "0.453173",
+      "affectedPixelFraction": "0.999995",
+      "chromaMaxRgError": "2.98023e-08",
+      "chromaMaxBgError": "5.96046e-08",
+      "measurementStatus": "GPU_MEASURED",
+      "flatNoiseVarianceRatio": "GROUND_TRUTH_TEST_ONLY",
+      "highSnrIdentityError": "TEST_ONLY",
+      "fusedColourLumaGpuMs": "212.936",
+      "extraFullFrameBuffers": "0",
+      "extraFullFrameReadbacks": "0",
+      "extraStatisticsBytesPerWorkgroup": "32"
+    },
+    "gpuOffMs": 98.2366,
+    "gpuOnMs": 212.936,
+    "ispOffMs": 878.364,
+    "ispOnMs": 998.618,
+    "regions": {
+      "wood": {
+        "sceneResidualVarianceRatio": 0.7183775433509487,
+        "noisyPairCorrelation": 0.9708507865359594,
+        "meanYDelta8bit": 0.0856683125
+      },
+      "pad": {
+        "sceneResidualVarianceRatio": 0.6638832033255432,
+        "noisyPairCorrelation": 0.9637451337926778,
+        "meanYDelta8bit": -0.002183313802083333
+      }
+    },
+    "jpeg444": true
+  },
+  {
+    "label": "RAW_SENSOR_NORMAL_spectra0_frames3",
+    "format": "RAW_SENSOR",
+    "route": "MALVAR_2004",
+    "spectraActual": "Off",
+    "iso": "4888",
+    "exposureNs": "39999974",
+    "luma": {
+      "enabled": "true",
+      "spectraIndependent": "true",
+      "inputDomain": "POST_PHYSICAL_CHROMA_LINEAR_RGB",
+      "noiseModel": "PHYSICAL_SO_PROPAGATED",
+      "status": "PHYSICAL_LUMA_ACTIVE",
+      "gpuExecuted": "true",
+      "predictedSigmaY": "0.00384251",
+      "modelConfidence": "0.774",
+      "fusionVarianceScale": "0.685",
+      "posteriorAlreadyIncludesFusion": "false",
+      "hfNoiseAuthority": "0.132389",
+      "midNoiseAuthority": "0.0651427",
+      "meanStructureConfidence": "0.482139",
+      "affectedPixelFraction": "0.999972",
+      "chromaMaxRgError": "2.98023e-08",
+      "chromaMaxBgError": "2.98023e-08",
+      "measurementStatus": "GPU_MEASURED",
+      "flatNoiseVarianceRatio": "GROUND_TRUTH_TEST_ONLY",
+      "highSnrIdentityError": "TEST_ONLY",
+      "fusedColourLumaGpuMs": "211.419",
+      "extraFullFrameBuffers": "0",
+      "extraFullFrameReadbacks": "0",
+      "extraStatisticsBytesPerWorkgroup": "32"
+    },
+    "gpuOffMs": 100.854,
+    "gpuOnMs": 211.419,
+    "ispOffMs": 2139.69,
+    "ispOnMs": 1624.89,
+    "regions": {
+      "wood": {
+        "sceneResidualVarianceRatio": 0.727463312006959,
+        "noisyPairCorrelation": 0.9980437809567551,
+        "meanYDelta8bit": 0.04342784049479168
+      },
+      "pad": {
+        "sceneResidualVarianceRatio": 0.7376740193496119,
+        "noisyPairCorrelation": 0.998520325827712,
+        "meanYDelta8bit": 0.06244583463541667
+      }
+    },
+    "jpeg444": true
+  },
+  {
+    "label": "RAW_SENSOR_NORMAL_spectra1_frames1",
+    "format": "RAW_SENSOR",
+    "route": "MALVAR_2004",
+    "spectraActual": "On",
+    "iso": "4875",
+    "exposureNs": "29999970",
+    "luma": {
+      "enabled": "true",
+      "spectraIndependent": "true",
+      "inputDomain": "POST_PHYSICAL_CHROMA_LINEAR_RGB",
+      "noiseModel": "PHYSICAL_SO_PROPAGATED",
+      "status": "PHYSICAL_LUMA_ACTIVE",
+      "gpuExecuted": "true",
+      "predictedSigmaY": "0.00440491",
+      "modelConfidence": "0.76626",
+      "fusionVarianceScale": "1",
+      "posteriorAlreadyIncludesFusion": "true",
+      "hfNoiseAuthority": "0.165442",
+      "midNoiseAuthority": "0.0899652",
+      "meanStructureConfidence": "0.309372",
+      "affectedPixelFraction": "1",
+      "chromaMaxRgError": "2.98023e-08",
+      "chromaMaxBgError": "5.96046e-08",
+      "measurementStatus": "GPU_MEASURED",
+      "flatNoiseVarianceRatio": "GROUND_TRUTH_TEST_ONLY",
+      "highSnrIdentityError": "TEST_ONLY",
+      "fusedColourLumaGpuMs": "189.604",
+      "extraFullFrameBuffers": "0",
+      "extraFullFrameReadbacks": "0",
+      "extraStatisticsBytesPerWorkgroup": "32"
+    },
+    "gpuOffMs": 95.4568,
+    "gpuOnMs": 189.604,
+    "ispOffMs": 2223.7,
+    "ispOnMs": 2404.98,
+    "regions": {
+      "wood": {
+        "sceneResidualVarianceRatio": 0.6517267580300206,
+        "noisyPairCorrelation": 0.993884532821453,
+        "meanYDelta8bit": -0.021786404947916716
+      },
+      "pad": {
+        "sceneResidualVarianceRatio": 0.6384621219791623,
+        "noisyPairCorrelation": 0.9980851436488034,
+        "meanYDelta8bit": -0.022240194661458337
+      }
+    },
+    "jpeg444": true
+  },
+  {
+    "label": "RAW_SENSOR_QUALITY_spectra0_frames1",
+    "format": "RAW_SENSOR",
+    "route": "AMAZE",
+    "spectraActual": "Off",
+    "iso": "1157",
+    "exposureNs": "29999995",
+    "luma": {
+      "enabled": "true",
+      "spectraIndependent": "true",
+      "inputDomain": "POST_PHYSICAL_CHROMA_LINEAR_RGB",
+      "noiseModel": "PHYSICAL_SO_PROPAGATED",
+      "status": "PHYSICAL_LUMA_ACTIVE",
+      "gpuExecuted": "true",
+      "predictedSigmaY": "0.00255355",
+      "modelConfidence": "0.594",
+      "fusionVarianceScale": "1",
+      "posteriorAlreadyIncludesFusion": "false",
+      "hfNoiseAuthority": "0.085816",
+      "midNoiseAuthority": "0.0394966",
+      "meanStructureConfidence": "0.570037",
+      "affectedPixelFraction": "0.999992",
+      "chromaMaxRgError": "5.96046e-08",
+      "chromaMaxBgError": "5.96046e-08",
+      "measurementStatus": "GPU_MEASURED",
+      "flatNoiseVarianceRatio": "GROUND_TRUTH_TEST_ONLY",
+      "highSnrIdentityError": "TEST_ONLY",
+      "fusedColourLumaGpuMs": "195.388",
+      "extraFullFrameBuffers": "0",
+      "extraFullFrameReadbacks": "0",
+      "extraStatisticsBytesPerWorkgroup": "32"
+    },
+    "gpuOffMs": 91.5386,
+    "gpuOnMs": 195.388,
+    "ispOffMs": 958.444,
+    "ispOnMs": 970.203,
+    "regions": {
+      "wood": {
+        "sceneResidualVarianceRatio": 0.8918483918007148,
+        "noisyPairCorrelation": 0.9887507713686091,
+        "meanYDelta8bit": 0.016728181640625
+      },
+      "pad": {
+        "sceneResidualVarianceRatio": 0.867512952966111,
+        "noisyPairCorrelation": 0.9853115085793038,
+        "meanYDelta8bit": 0.019673743489583333
+      }
+    },
+    "jpeg444": true
+  }
+]

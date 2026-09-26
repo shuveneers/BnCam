@@ -1,0 +1,1640 @@
+{
+  "dark_flat": {
+    "pass": [
+      1.0,
+      1.0
+    ],
+    "noiseMseBefore": [
+      2.447534724e-05,
+      2.550459221e-05
+    ],
+    "noiseMseAfter": [
+      1.852879385e-05,
+      1.962118141e-05
+    ],
+    "mseRatio": [
+      0.7570390596,
+      0.7693195503
+    ],
+    "projectionBefore": [
+      1.0,
+      1.0
+    ],
+    "projectionAfter": [
+      1.0,
+      1.0
+    ],
+    "correlationBefore": [
+      1.0,
+      1.0
+    ],
+    "correlationAfter": [
+      1.0,
+      1.0
+    ],
+    "orientationBefore": [
+      1.0,
+      1.0
+    ],
+    "orientationAfter": [
+      1.0,
+      1.0
+    ],
+    "edgeAmplitudeBefore": [
+      -0.0002961481999,
+      0.0005432126801
+    ],
+    "edgeAmplitudeAfter": [
+      -0.0002742453377,
+      0.0005030872317
+    ],
+    "edgePositionBefore": [
+      47.11891444,
+      48.62111556
+    ],
+    "edgePositionAfter": [
+      47.0289794,
+      48.63074112
+    ],
+    "edgeSpreadBefore": [
+      1.243350314,
+      1.706861084
+    ],
+    "edgeSpreadAfter": [
+      1.2496219,
+      1.67555045
+    ],
+    "maxRgError": [
+      3.725290298e-09,
+      3.725290298e-09
+    ],
+    "maxBgError": [
+      1.862645149e-09,
+      1.862645149e-09
+    ],
+    "maxYChange": [
+      0.003443757072,
+      0.00383415143
+    ]
+  },
+  "midtone_flat": {
+    "pass": [
+      1.0,
+      1.0
+    ],
+    "noiseMseBefore": [
+      3.818154204e-05,
+      3.978716303e-05
+    ],
+    "noiseMseAfter": [
+      3.197651495e-05,
+      3.366312046e-05
+    ],
+    "mseRatio": [
+      0.8374862103,
+      0.8460799387
+    ],
+    "projectionBefore": [
+      1.0,
+      1.0
+    ],
+    "projectionAfter": [
+      1.0,
+      1.0
+    ],
+    "correlationBefore": [
+      1.0,
+      1.0
+    ],
+    "correlationAfter": [
+      1.0,
+      1.0
+    ],
+    "orientationBefore": [
+      1.0,
+      1.0
+    ],
+    "orientationAfter": [
+      1.0,
+      1.0
+    ],
+    "edgeAmplitudeBefore": [
+      -0.0003698887515,
+      0.0006784720727
+    ],
+    "edgeAmplitudeAfter": [
+      -0.0003525940701,
+      0.0006460936063
+    ],
+    "edgePositionBefore": [
+      47.11891355,
+      48.62111471
+    ],
+    "edgePositionAfter": [
+      47.06594032,
+      48.62328996
+    ],
+    "edgeSpreadBefore": [
+      1.243351442,
+      1.706860971
+    ],
+    "edgeSpreadAfter": [
+      1.24953219,
+      1.689229981
+    ],
+    "maxRgError": [
+      0.0,
+      7.450580597e-09
+    ],
+    "maxBgError": [
+      1.490116119e-08,
+      1.490116119e-08
+    ],
+    "maxYChange": [
+      0.002867206931,
+      0.00321534276
+    ]
+  },
+  "bright_high_snr": {
+    "pass": [
+      1.0,
+      1.0
+    ],
+    "noiseMseBefore": [
+      8.411999288e-13,
+      8.751461447e-13
+    ],
+    "noiseMseAfter": [
+      8.411999288e-13,
+      8.751461447e-13
+    ],
+    "mseRatio": [
+      1.0,
+      1.0
+    ],
+    "projectionBefore": [
+      1.0,
+      1.0
+    ],
+    "projectionAfter": [
+      1.0,
+      1.0
+    ],
+    "correlationBefore": [
+      1.0,
+      1.0
+    ],
+    "correlationAfter": [
+      1.0,
+      1.0
+    ],
+    "orientationBefore": [
+      1.0,
+      1.0
+    ],
+    "orientationAfter": [
+      1.0,
+      1.0
+    ],
+    "edgeAmplitudeBefore": [
+      -5.266205819e-08,
+      9.931285262e-08
+    ],
+    "edgeAmplitudeAfter": [
+      -5.266205819e-08,
+      9.931285262e-08
+    ],
+    "edgePositionBefore": [
+      47.08351649,
+      48.56765163
+    ],
+    "edgePositionAfter": [
+      47.08351649,
+      48.56765163
+    ],
+    "edgeSpreadBefore": [
+      1.26363582,
+      1.711863731
+    ],
+    "edgeSpreadAfter": [
+      1.26363582,
+      1.711863731
+    ],
+    "maxRgError": [
+      0.0,
+      0.0
+    ],
+    "maxBgError": [
+      0.0,
+      0.0
+    ],
+    "maxYChange": [
+      0.0,
+      0.0
+    ]
+  },
+  "strong_edge": {
+    "pass": [
+      1.0,
+      1.0
+    ],
+    "noiseMseBefore": [
+      5.591446067e-05,
+      5.873565295e-05
+    ],
+    "noiseMseAfter": [
+      4.909044561e-05,
+      5.179334501e-05
+    ],
+    "mseRatio": [
+      0.8779561676,
+      0.8852857564
+    ],
+    "projectionBefore": [
+      0.999636136,
+      1.000395993
+    ],
+    "projectionAfter": [
+      0.9996410272,
+      1.000376841
+    ],
+    "correlationBefore": [
+      0.999704512,
+      0.9997185837
+    ],
+    "correlationAfter": [
+      0.9997394518,
+      0.99975291
+    ],
+    "orientationBefore": [
+      0.9999132713,
+      0.9999509296
+    ],
+    "orientationAfter": [
+      0.9999132745,
+      0.9999509315
+    ],
+    "edgeAmplitudeBefore": [
+      0.6295145072,
+      0.6306272197
+    ],
+    "edgeAmplitudeAfter": [
+      0.6295274536,
+      0.6306170247
+    ],
+    "edgePositionBefore": [
+      47.49991818,
+      47.51697454
+    ],
+    "edgePositionAfter": [
+      47.49990049,
+      47.51716383
+    ],
+    "edgeSpreadBefore": [
+      0.1167864966,
+      0.220586691
+    ],
+    "edgeSpreadAfter": [
+      0.1166917538,
+      0.2199516473
+    ],
+    "maxRgError": [
+      3.725290298e-09,
+      3.725290298e-09
+    ],
+    "maxBgError": [
+      1.862645149e-09,
+      1.862645149e-09
+    ],
+    "maxYChange": [
+      0.005751782097,
+      0.006424767897
+    ]
+  },
+  "weak_edge": {
+    "pass": [
+      1.0,
+      1.0
+    ],
+    "noiseMseBefore": [
+      2.482484412e-05,
+      2.586249271e-05
+    ],
+    "noiseMseAfter": [
+      1.886869098e-05,
+      2.001115787e-05
+    ],
+    "mseRatio": [
+      0.7600728886,
+      0.7737520931
+    ],
+    "projectionBefore": [
+      0.9784757538,
+      1.020012559
+    ],
+    "projectionAfter": [
+      0.9786792643,
+      1.017162798
+    ],
+    "correlationBefore": [
+      0.5647463615,
+      0.5822887926
+    ],
+    "correlationAfter": [
+      0.6151643558,
+      0.633978823
+    ],
+    "orientationBefore": [
+      0.4652017135,
+      0.7259916545
+    ],
+    "orientationAfter": [
+      0.4909444391,
+      0.7409577763
+    ],
+    "edgeAmplitudeBefore": [
+      0.006700910479,
+      0.007543880719
+    ],
+    "edgeAmplitudeAfter": [
+      0.006724459232,
+      0.007504563918
+    ],
+    "edgePositionBefore": [
+      47.37746761,
+      47.94671078
+    ],
+    "edgePositionAfter": [
+      47.38840354,
+      47.87159054
+    ],
+    "edgeSpreadBefore": [
+      0.7019776025,
+      1.157733019
+    ],
+    "edgeSpreadAfter": [
+      0.5048005174,
+      1.158040327
+    ],
+    "maxRgError": [
+      3.725290298e-09,
+      3.725290298e-09
+    ],
+    "maxBgError": [
+      1.862645149e-09,
+      1.862645149e-09
+    ],
+    "maxYChange": [
+      0.003443809226,
+      0.00387968123
+    ]
+  },
+  "one_pixel_line": {
+    "pass": [
+      1.0,
+      1.0
+    ],
+    "noiseMseBefore": [
+      2.449302117e-05,
+      2.552427464e-05
+    ],
+    "noiseMseAfter": [
+      1.879755564e-05,
+      1.993311493e-05
+    ],
+    "mseRatio": [
+      0.7674657818,
+      0.7809473612
+    ],
+    "projectionBefore": [
+      0.9289446908,
+      1.064630413
+    ],
+    "projectionAfter": [
+      0.9277752279,
+      1.063909112
+    ],
+    "correlationBefore": [
+      0.3329173778,
+      0.3782442315
+    ],
+    "correlationAfter": [
+      0.3713510843,
+      0.4205658211
+    ],
+    "orientationBefore": [
+      0.8804657332,
+      0.9292392262
+    ],
+    "orientationAfter": [
+      0.8851603081,
+      0.9316555989
+    ],
+    "edgeAmplitudeBefore": [
+      -0.0002961481999,
+      0.0005432126801
+    ],
+    "edgeAmplitudeAfter": [
+      -0.0002811428212,
+      0.0004968481967
+    ],
+    "edgePositionBefore": [
+      47.90952664,
+      48.0535349
+    ],
+    "edgePositionAfter": [
+      47.93068659,
+      48.03717262
+    ],
+    "edgeSpreadBefore": [
+      0.5722732971,
+      0.7958376519
+    ],
+    "edgeSpreadAfter": [
+      0.5411185788,
+      0.8062683346
+    ],
+    "maxRgError": [
+      3.725290298e-09,
+      3.725290298e-09
+    ],
+    "maxBgError": [
+      1.862645149e-09,
+      1.862645149e-09
+    ],
+    "maxYChange": [
+      0.003443758935,
+      0.003834151896
+    ]
+  },
+  "two_pixel_line": {
+    "pass": [
+      1.0,
+      1.0
+    ],
+    "noiseMseBefore": [
+      2.451316877e-05,
+      2.55429267e-05
+    ],
+    "noiseMseAfter": [
+      1.888226375e-05,
+      2.003870589e-05
+    ],
+    "mseRatio": [
+      0.7702906109,
+      0.784510958
+    ],
+    "projectionBefore": [
+      0.9556044144,
+      1.059593608
+    ],
+    "projectionAfter": [
+      0.9530874071,
+      1.0578332
+    ],
+    "correlationBefore": [
+      0.4578140187,
+      0.4963016043
+    ],
+    "correlationAfter": [
+      0.5022705317,
+      0.5430552944
+    ],
+    "orientationBefore": [
+      0.8781325726,
+      0.9335076951
+    ],
+    "orientationAfter": [
+      0.8805707212,
+      0.9343954452
+    ],
+    "edgeAmplitudeBefore": [
+      -0.0002961481999,
+      0.0005432126801
+    ],
+    "edgeAmplitudeAfter": [
+      -0.0002880690748,
+      0.0004870498373
+    ],
+    "edgePositionBefore": [
+      48.32433976,
+      48.5141521
+    ],
+    "edgePositionAfter": [
+      48.33069347,
+      48.51455689
+    ],
+    "edgeSpreadBefore": [
+      1.014649012,
+      1.161551309
+    ],
+    "edgeSpreadAfter": [
+      1.006420184,
+      1.161619445
+    ],
+    "maxRgError": [
+      3.725290298e-09,
+      3.725290298e-09
+    ],
+    "maxBgError": [
+      1.862645149e-09,
+      1.862645149e-09
+    ],
+    "maxYChange": [
+      0.00344376266,
+      0.003834152827
+    ]
+  },
+  "text_strokes": {
+    "pass": [
+      1.0,
+      1.0
+    ],
+    "noiseMseBefore": [
+      2.474206388e-05,
+      2.576224024e-05
+    ],
+    "noiseMseAfter": [
+      2.192091868e-05,
+      2.287804235e-05
+    ],
+    "mseRatio": [
+      0.8859777738,
+      0.8924515027
+    ],
+    "projectionBefore": [
+      0.9899302249,
+      1.013669476
+    ],
+    "projectionAfter": [
+      0.9896663232,
+      1.013397188
+    ],
+    "correlationBefore": [
+      0.8558099656,
+      0.8646537089
+    ],
+    "correlationAfter": [
+      0.8688810375,
+      0.8769886341
+    ],
+    "orientationBefore": [
+      0.9686578852,
+      0.9727287196
+    ],
+    "orientationAfter": [
+      0.9690639197,
+      0.9731512332
+    ],
+    "edgeAmplitudeBefore": [
+      0.0003465873519,
+      0.001192906705
+    ],
+    "edgeAmplitudeAfter": [
+      0.0003656091485,
+      0.001165245671
+    ],
+    "edgePositionBefore": [
+      47.13929433,
+      48.42593215
+    ],
+    "edgePositionAfter": [
+      47.19969248,
+      48.34875636
+    ],
+    "edgeSpreadBefore": [
+      1.125262889,
+      1.805576606
+    ],
+    "edgeSpreadAfter": [
+      1.066423027,
+      1.794179618
+    ],
+    "maxRgError": [
+      3.725290298e-09,
+      3.725290298e-09
+    ],
+    "maxBgError": [
+      1.862645149e-09,
+      1.862645149e-09
+    ],
+    "maxYChange": [
+      0.003169428557,
+      0.003852695227
+    ]
+  },
+  "checkerboard": {
+    "pass": [
+      1.0,
+      1.0
+    ],
+    "noiseMseBefore": [
+      2.618737452e-05,
+      2.724623382e-05
+    ],
+    "noiseMseAfter": [
+      2.323681087e-05,
+      2.432665766e-05
+    ],
+    "mseRatio": [
+      0.8868342329,
+      0.8928447805
+    ],
+    "projectionBefore": [
+      0.995357769,
+      1.008045797
+    ],
+    "projectionAfter": [
+      0.9965805042,
+      1.009164819
+    ],
+    "correlationBefore": [
+      0.9583623086,
+      0.9603465382
+    ],
+    "correlationAfter": [
+      0.9628359156,
+      0.9646847494
+    ],
+    "orientationBefore": [
+      0.993964193,
+      0.9943472628
+    ],
+    "orientationAfter": [
+      0.9947202968,
+      0.9950959525
+    ],
+    "edgeAmplitudeBefore": [
+      -0.0003060219574,
+      0.000557978027
+    ],
+    "edgeAmplitudeAfter": [
+      -0.0003003634438,
+      0.0005364175895
+    ],
+    "edgePositionBefore": [
+      47.12968017,
+      48.61745411
+    ],
+    "edgePositionAfter": [
+      47.10978727,
+      48.56508839
+    ],
+    "edgeSpreadBefore": [
+      1.25427279,
+      1.715914172
+    ],
+    "edgeSpreadAfter": [
+      1.242087625,
+      1.689914403
+    ],
+    "maxRgError": [
+      3.725290298e-09,
+      3.725290298e-09
+    ],
+    "maxBgError": [
+      3.725290298e-09,
+      3.725290298e-09
+    ],
+    "maxYChange": [
+      0.001694776118,
+      0.001953205094
+    ]
+  },
+  "weave": {
+    "pass": [
+      1.0,
+      1.0
+    ],
+    "noiseMseBefore": [
+      2.465015413e-05,
+      2.566535087e-05
+    ],
+    "noiseMseAfter": [
+      2.449129155e-05,
+      2.550276197e-05
+    ],
+    "mseRatio": [
+      0.9934227054,
+      0.9947524514
+    ],
+    "projectionBefore": [
+      0.9963507189,
+      1.007594318
+    ],
+    "projectionAfter": [
+      0.9949572771,
+      1.006289501
+    ],
+    "correlationBefore": [
+      0.9211976936,
+      0.9244321865
+    ],
+    "correlationAfter": [
+      0.9214374772,
+      0.9246377154
+    ],
+    "orientationBefore": [
+      0.9175461167,
+      0.9231321502
+    ],
+    "orientationAfter": [
+      0.9187049878,
+      0.9238748369
+    ],
+    "edgeAmplitudeBefore": [
+      -0.002153609965,
+      -0.001322549912
+    ],
+    "edgeAmplitudeAfter": [
+      -0.002143253828,
+      -0.001306982543
+    ],
+    "edgePositionBefore": [
+      48.11700598,
+      48.32811979
+    ],
+    "edgePositionAfter": [
+      48.11412032,
+      48.32542878
+    ],
+    "edgeSpreadBefore": [
+      1.617790844,
+      1.672500191
+    ],
+    "edgeSpreadAfter": [
+      1.617792736,
+      1.672804146
+    ],
+    "maxRgError": [
+      3.725290298e-09,
+      3.725290298e-09
+    ],
+    "maxBgError": [
+      1.862645149e-09,
+      1.862645149e-09
+    ],
+    "maxYChange": [
+      0.001869384199,
+      0.002381781116
+    ]
+  },
+  "wood": {
+    "pass": [
+      1.0,
+      1.0
+    ],
+    "noiseMseBefore": [
+      2.448176627e-05,
+      2.551639153e-05
+    ],
+    "noiseMseAfter": [
+      2.120271659e-05,
+      2.222500896e-05
+    ],
+    "mseRatio": [
+      0.8660615562,
+      0.8737325763
+    ],
+    "projectionBefore": [
+      0.9912079749,
+      1.018154864
+    ],
+    "projectionAfter": [
+      0.9820482389,
+      1.009166731
+    ],
+    "correlationBefore": [
+      0.857217918,
+      0.8673873594
+    ],
+    "correlationAfter": [
+      0.8705295567,
+      0.8803355428
+    ],
+    "orientationBefore": [
+      0.5695456889,
+      0.5926513056
+    ],
+    "orientationAfter": [
+      0.6112990953,
+      0.6377670215
+    ],
+    "edgeAmplitudeBefore": [
+      -0.0003403085211,
+      0.0005096298823
+    ],
+    "edgeAmplitudeAfter": [
+      -0.0003376783473,
+      0.0004752687737
+    ],
+    "edgePositionBefore": [
+      48.04696197,
+      48.24811534
+    ],
+    "edgePositionAfter": [
+      48.05763761,
+      48.24390451
+    ],
+    "edgeSpreadBefore": [
+      1.620142105,
+      1.762457972
+    ],
+    "edgeSpreadAfter": [
+      1.621401316,
+      1.758687306
+    ],
+    "maxRgError": [
+      3.725290298e-09,
+      3.725290298e-09
+    ],
+    "maxBgError": [
+      1.862645149e-09,
+      1.862645149e-09
+    ],
+    "maxYChange": [
+      0.002777278423,
+      0.003499846905
+    ]
+  },
+  "foliage": {
+    "pass": [
+      1.0,
+      1.0
+    ],
+    "noiseMseBefore": [
+      2.456266167e-05,
+      2.5597733e-05
+    ],
+    "noiseMseAfter": [
+      2.212567489e-05,
+      2.305569189e-05
+    ],
+    "mseRatio": [
+      0.9002006373,
+      0.9047151488
+    ],
+    "projectionBefore": [
+      0.9950906439,
+      1.007095352
+    ],
+    "projectionAfter": [
+      0.9927570118,
+      1.004432067
+    ],
+    "correlationBefore": [
+      0.9096877655,
+      0.9129350719
+    ],
+    "correlationAfter": [
+      0.9170063826,
+      0.9200430994
+    ],
+    "orientationBefore": [
+      0.5535875365,
+      0.5751965074
+    ],
+    "orientationAfter": [
+      0.5809567908,
+      0.6031298134
+    ],
+    "edgeAmplitudeBefore": [
+      0.0002233327995,
+      0.001063120085
+    ],
+    "edgeAmplitudeAfter": [
+      0.0002324373429,
+      0.001053902756
+    ],
+    "edgePositionBefore": [
+      47.00892455,
+      48.59690425
+    ],
+    "edgePositionAfter": [
+      47.04648033,
+      48.58639353
+    ],
+    "edgeSpreadBefore": [
+      1.261090075,
+      1.680933858
+    ],
+    "edgeSpreadAfter": [
+      1.284062288,
+      1.674630863
+    ],
+    "maxRgError": [
+      3.725290298e-09,
+      3.725290298e-09
+    ],
+    "maxBgError": [
+      1.862645149e-09,
+      1.862645149e-09
+    ],
+    "maxYChange": [
+      0.002759692259,
+      0.003760924563
+    ]
+  },
+  "weak_repeating": {
+    "pass": [
+      1.0,
+      1.0
+    ],
+    "noiseMseBefore": [
+      2.447074166e-05,
+      2.550788494e-05
+    ],
+    "noiseMseAfter": [
+      2.098224494e-05,
+      2.204509325e-05
+    ],
+    "mseRatio": [
+      0.8574421337,
+      0.8678481359
+    ],
+    "projectionBefore": [
+      0.9818918744,
+      1.015014982
+    ],
+    "projectionAfter": [
+      0.955070084,
+      0.9875617378
+    ],
+    "correlationBefore": [
+      0.6399392178,
+      0.6560730485
+    ],
+    "correlationAfter": [
+      0.6577250408,
+      0.6725754
+    ],
+    "orientationBefore": [
+      0.4440227487,
+      0.4647660021
+    ],
+    "orientationAfter": [
+      0.4811992281,
+      0.5022742682
+    ],
+    "edgeAmplitudeBefore": [
+      0.0001210648898,
+      0.0009592400686
+    ],
+    "edgeAmplitudeAfter": [
+      0.0001210241384,
+      0.0009647113121
+    ],
+    "edgePositionBefore": [
+      48.01805465,
+      48.36468655
+    ],
+    "edgePositionAfter": [
+      48.02607682,
+      48.36742775
+    ],
+    "edgeSpreadBefore": [
+      1.592859174,
+      1.740470302
+    ],
+    "edgeSpreadAfter": [
+      1.599261345,
+      1.747368626
+    ],
+    "maxRgError": [
+      3.725290298e-09,
+      3.725290298e-09
+    ],
+    "maxBgError": [
+      1.862645149e-09,
+      1.862645149e-09
+    ],
+    "maxYChange": [
+      0.002797371475,
+      0.004138781689
+    ]
+  },
+  "random_only": {
+    "pass": [
+      1.0,
+      1.0
+    ],
+    "noiseMseBefore": [
+      2.447534724e-05,
+      2.550459221e-05
+    ],
+    "noiseMseAfter": [
+      1.852879385e-05,
+      1.962118141e-05
+    ],
+    "mseRatio": [
+      0.7570390596,
+      0.7693195503
+    ],
+    "projectionBefore": [
+      1.0,
+      1.0
+    ],
+    "projectionAfter": [
+      1.0,
+      1.0
+    ],
+    "correlationBefore": [
+      1.0,
+      1.0
+    ],
+    "correlationAfter": [
+      1.0,
+      1.0
+    ],
+    "orientationBefore": [
+      1.0,
+      1.0
+    ],
+    "orientationAfter": [
+      1.0,
+      1.0
+    ],
+    "edgeAmplitudeBefore": [
+      -0.0002961481999,
+      0.0005432126801
+    ],
+    "edgeAmplitudeAfter": [
+      -0.0002742453377,
+      0.0005030872317
+    ],
+    "edgePositionBefore": [
+      47.11891444,
+      48.62111556
+    ],
+    "edgePositionAfter": [
+      47.0289794,
+      48.63074112
+    ],
+    "edgeSpreadBefore": [
+      1.243350314,
+      1.706861084
+    ],
+    "edgeSpreadAfter": [
+      1.2496219,
+      1.67555045
+    ],
+    "maxRgError": [
+      3.725290298e-09,
+      3.725290298e-09
+    ],
+    "maxBgError": [
+      1.862645149e-09,
+      1.862645149e-09
+    ],
+    "maxYChange": [
+      0.003443757072,
+      0.00383415143
+    ]
+  },
+  "sub_sigma_coherent": {
+    "pass": [
+      1.0,
+      1.0
+    ],
+    "noiseMseBefore": [
+      2.446879947e-05,
+      2.549783161e-05
+    ],
+    "noiseMseAfter": [
+      1.925444948e-05,
+      2.032968491e-05
+    ],
+    "mseRatio": [
+      0.7868980049,
+      0.7973389276
+    ],
+    "projectionBefore": [
+      0.9466527579,
+      1.027128877
+    ],
+    "projectionAfter": [
+      0.9191585695,
+      0.9989735407
+    ],
+    "correlationBefore": [
+      0.4735129753,
+      0.5041277558
+    ],
+    "correlationAfter": [
+      0.5072632054,
+      0.539028291
+    ],
+    "orientationBefore": [
+      0.2086461685,
+      0.2346211052
+    ],
+    "orientationAfter": [
+      0.2427580917,
+      0.275190688
+    ],
+    "edgeAmplitudeBefore": [
+      -0.0003127319584,
+      0.0005286770794
+    ],
+    "edgeAmplitudeAfter": [
+      -0.0002833837963,
+      0.000499624091
+    ],
+    "edgePositionBefore": [
+      48.08486467,
+      48.39649948
+    ],
+    "edgePositionAfter": [
+      48.10111866,
+      48.36417993
+    ],
+    "edgeSpreadBefore": [
+      1.480649408,
+      1.809466955
+    ],
+    "edgeSpreadAfter": [
+      1.495773037,
+      1.795531465
+    ],
+    "maxRgError": [
+      3.725290298e-09,
+      3.725290298e-09
+    ],
+    "maxBgError": [
+      1.862645149e-09,
+      1.862645149e-09
+    ],
+    "maxYChange": [
+      0.003292521462,
+      0.003887261264
+    ]
+  },
+  "isolated_excursion": {
+    "pass": [
+      1.0,
+      1.0
+    ],
+    "noiseMseBefore": [
+      2.447866104e-05,
+      2.551145202e-05
+    ],
+    "noiseMseAfter": [
+      1.856216071e-05,
+      1.965748552e-05
+    ],
+    "mseRatio": [
+      0.758299675,
+      0.7705357382
+    ],
+    "projectionBefore": [
+      0.969523686,
+      1.047871931
+    ],
+    "projectionAfter": [
+      0.9695292643,
+      1.047863565
+    ],
+    "correlationBefore": [
+      0.5508991938,
+      0.583475677
+    ],
+    "correlationAfter": [
+      0.6020660792,
+      0.6360787532
+    ],
+    "orientationBefore": [
+      0.9994366256,
+      0.9999817688
+    ],
+    "orientationAfter": [
+      0.9994369302,
+      0.9999818001
+    ],
+    "edgeAmplitudeBefore": [
+      -0.0002961481999,
+      0.0005432126801
+    ],
+    "edgeAmplitudeAfter": [
+      -0.000274198152,
+      0.0005029449082
+    ],
+    "edgePositionBefore": [
+      47.62734269,
+      48.21272597
+    ],
+    "edgePositionAfter": [
+      47.63130763,
+      48.21006317
+    ],
+    "edgeSpreadBefore": [
+      0.7570900912,
+      1.372388386
+    ],
+    "edgeSpreadAfter": [
+      0.7482974245,
+      1.298602505
+    ],
+    "maxRgError": [
+      3.725290298e-09,
+      3.725290298e-09
+    ],
+    "maxBgError": [
+      1.862645149e-09,
+      1.862645149e-09
+    ],
+    "maxYChange": [
+      0.003443757072,
+      0.00383415143
+    ]
+  },
+  "missing_model": {
+    "pass": [
+      1.0,
+      1.0
+    ],
+    "noiseMseBefore": [
+      2.447534724e-05,
+      2.550459221e-05
+    ],
+    "noiseMseAfter": [
+      2.447534724e-05,
+      2.550459221e-05
+    ],
+    "mseRatio": [
+      1.0,
+      1.0
+    ],
+    "projectionBefore": [
+      1.0,
+      1.0
+    ],
+    "projectionAfter": [
+      1.0,
+      1.0
+    ],
+    "correlationBefore": [
+      1.0,
+      1.0
+    ],
+    "correlationAfter": [
+      1.0,
+      1.0
+    ],
+    "orientationBefore": [
+      1.0,
+      1.0
+    ],
+    "orientationAfter": [
+      1.0,
+      1.0
+    ],
+    "edgeAmplitudeBefore": [
+      -0.0002961481999,
+      0.0005432126801
+    ],
+    "edgeAmplitudeAfter": [
+      -0.0002961481999,
+      0.0005432126801
+    ],
+    "edgePositionBefore": [
+      47.11891444,
+      48.62111556
+    ],
+    "edgePositionAfter": [
+      47.11891444,
+      48.62111556
+    ],
+    "edgeSpreadBefore": [
+      1.243350314,
+      1.706861084
+    ],
+    "edgeSpreadAfter": [
+      1.243350314,
+      1.706861084
+    ],
+    "maxRgError": [
+      0.0,
+      0.0
+    ],
+    "maxBgError": [
+      0.0,
+      0.0
+    ],
+    "maxYChange": [
+      0.0,
+      0.0
+    ]
+  },
+  "near_zero_model": {
+    "pass": [
+      1.0,
+      1.0
+    ],
+    "noiseMseBefore": [
+      1.958057307e-14,
+      2.040375839e-14
+    ],
+    "noiseMseAfter": [
+      1.958057307e-14,
+      2.040375839e-14
+    ],
+    "mseRatio": [
+      1.0,
+      1.0
+    ],
+    "projectionBefore": [
+      1.0,
+      1.0
+    ],
+    "projectionAfter": [
+      1.0,
+      1.0
+    ],
+    "correlationBefore": [
+      1.0,
+      1.0
+    ],
+    "correlationAfter": [
+      1.0,
+      1.0
+    ],
+    "orientationBefore": [
+      1.0,
+      1.0
+    ],
+    "orientationAfter": [
+      1.0,
+      1.0
+    ],
+    "edgeAmplitudeBefore": [
+      -8.393809288e-09,
+      1.534168735e-08
+    ],
+    "edgeAmplitudeAfter": [
+      -8.393809288e-09,
+      1.534168735e-08
+    ],
+    "edgePositionBefore": [
+      47.12222466,
+      48.62392597
+    ],
+    "edgePositionAfter": [
+      47.12222466,
+      48.62392597
+    ],
+    "edgeSpreadBefore": [
+      1.24767408,
+      1.707663315
+    ],
+    "edgeSpreadAfter": [
+      1.24767408,
+      1.707663315
+    ],
+    "maxRgError": [
+      0.0,
+      0.0
+    ],
+    "maxBgError": [
+      0.0,
+      0.0
+    ],
+    "maxYChange": [
+      0.0,
+      0.0
+    ]
+  },
+  "single_covariance": {
+    "pass": [
+      1.0,
+      1.0
+    ],
+    "noiseMseBefore": [
+      2.446224977e-05,
+      2.549106886e-05
+    ],
+    "noiseMseAfter": [
+      2.032393685e-05,
+      2.141417373e-05
+    ],
+    "mseRatio": [
+      0.8308286051,
+      0.8404453439
+    ],
+    "projectionBefore": [
+      0.9733014632,
+      1.01360517
+    ],
+    "projectionAfter": [
+      0.9576218562,
+      0.998818862
+    ],
+    "correlationBefore": [
+      0.7387736871,
+      0.7552397908
+    ],
+    "correlationAfter": [
+      0.762732458,
+      0.7797864673
+    ],
+    "orientationBefore": [
+      0.40212667,
+      0.4333392088
+    ],
+    "orientationAfter": [
+      0.4515128803,
+      0.4849336029
+    ],
+    "edgeAmplitudeBefore": [
+      -0.0003293123425,
+      0.0005141193464
+    ],
+    "edgeAmplitudeAfter": [
+      -0.0003230013905,
+      0.0004852418266
+    ],
+    "edgePositionBefore": [
+      48.05051335,
+      48.31351251
+    ],
+    "edgePositionAfter": [
+      48.07488811,
+      48.30441618
+    ],
+    "edgeSpreadBefore": [
+      1.544278649,
+      1.737674348
+    ],
+    "edgeSpreadAfter": [
+      1.547726413,
+      1.729828322
+    ],
+    "maxRgError": [
+      3.725290298e-09,
+      3.725290298e-09
+    ],
+    "maxBgError": [
+      1.862645149e-09,
+      1.862645149e-09
+    ],
+    "maxYChange": [
+      0.002852378413,
+      0.003624094883
+    ]
+  },
+  "reduced_covariance": {
+    "pass": [
+      1.0,
+      1.0
+    ],
+    "noiseMseBefore": [
+      2.446224977e-05,
+      2.549106886e-05
+    ],
+    "noiseMseAfter": [
+      2.421654169e-05,
+      2.526525205e-05
+    ],
+    "mseRatio": [
+      0.9899556222,
+      0.9911413361
+    ],
+    "projectionBefore": [
+      0.9733014632,
+      1.01360517
+    ],
+    "projectionAfter": [
+      0.9729954486,
+      1.013251698
+    ],
+    "correlationBefore": [
+      0.7387736871,
+      0.7552397908
+    ],
+    "correlationAfter": [
+      0.740130169,
+      0.7567608019
+    ],
+    "orientationBefore": [
+      0.40212667,
+      0.4333392088
+    ],
+    "orientationAfter": [
+      0.4049408123,
+      0.4367093224
+    ],
+    "edgeAmplitudeBefore": [
+      -0.0003293123425,
+      0.0005141193464
+    ],
+    "edgeAmplitudeAfter": [
+      -0.0003300227935,
+      0.0005101544926
+    ],
+    "edgePositionBefore": [
+      48.05051335,
+      48.31351251
+    ],
+    "edgePositionAfter": [
+      48.05049307,
+      48.31217399
+    ],
+    "edgeSpreadBefore": [
+      1.544278649,
+      1.737674348
+    ],
+    "edgeSpreadAfter": [
+      1.544418033,
+      1.736774389
+    ],
+    "maxRgError": [
+      3.725290298e-09,
+      3.725290298e-09
+    ],
+    "maxBgError": [
+      1.862645149e-09,
+      1.862645149e-09
+    ],
+    "maxYChange": [
+      0.0005821189843,
+      0.0008246488869
+    ]
+  },
+  "clean_colour": {
+    "pass": [
+      1.0,
+      1.0
+    ],
+    "noiseMseBefore": [
+      0.0,
+      0.0
+    ],
+    "noiseMseAfter": [
+      0.0,
+      0.0
+    ],
+    "mseRatio": [
+      0.0,
+      0.0
+    ],
+    "projectionBefore": [
+      1.0,
+      1.0
+    ],
+    "projectionAfter": [
+      1.0,
+      1.0
+    ],
+    "correlationBefore": [
+      1.0,
+      1.0
+    ],
+    "correlationAfter": [
+      1.0,
+      1.0
+    ],
+    "orientationBefore": [
+      1.0,
+      1.0
+    ],
+    "orientationAfter": [
+      1.0,
+      1.0
+    ],
+    "edgeAmplitudeBefore": [
+      0.0,
+      0.0
+    ],
+    "edgeAmplitudeAfter": [
+      0.0,
+      0.0
+    ],
+    "edgePositionBefore": [
+      0.0,
+      0.0
+    ],
+    "edgePositionAfter": [
+      0.0,
+      0.0
+    ],
+    "edgeSpreadBefore": [
+      0.0,
+      0.0
+    ],
+    "edgeSpreadAfter": [
+      0.0,
+      0.0
+    ],
+    "maxRgError": [
+      0.0,
+      0.0
+    ],
+    "maxBgError": [
+      0.0,
+      0.0
+    ],
+    "maxYChange": [
+      0.0,
+      0.0
+    ]
+  }
+}

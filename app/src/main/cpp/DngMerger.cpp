@@ -1484,6 +1484,12 @@ void mergeAlignedSupport(
                 const float absoluteDiff = std::abs(anchorValue - supportValue);
                 float weight = supportBaseWeight;
                 double relativeVarianceRatio = 1.0;
+                if (!spectraValid) {
+                    const int ch=spectraCfaChannel(cfaPattern,x,y);
+                    const double a=model.effectiveS[ch]*spectraNormalizedSignal(anchorValue,x,y,whiteLevel,blackLevels)+model.effectiveO[ch];
+                    const double b=model.effectiveS[ch]*spectraNormalizedSignal(supportValue,srcX,srcY,whiteLevel,blackLevels)+model.effectiveO[ch];
+                    if(std::isfinite(a)&&std::isfinite(b)&&a>0&&b>=0) relativeVarianceRatio=b/a;
+                }
                 float localStaticProbability = 1.0f;
 
                 if (spectraValid) {
@@ -2865,6 +2871,19 @@ jobject mergeRawToDngRaw16Internal(
                             ));
                         }
                     }
+                }
+
+                // Spectra-Off still has actual fusion weights. Propagate their squared
+                // sum; do not infer residual variance from requested frame count.
+                if (!spectraModel.enabled) {
+                    double scaleSum=0; size_t samples=0;
+                    for(int y=0;y<weight32.rows;y+=8) for(int x=0;x<weight32.cols;x+=8) {
+                        const double w=weight32.at<float>(y,x);
+                        scaleSum+=std::clamp(double(weightSq32.at<float>(y,x))/(w*w),0.02,1.0);
+                        ++samples;
+                    }
+                    localStats.spectraFusionVarianceScale=samples?scaleSum/samples:1.0;
+                    localStats.spectraEffectiveFrameCount=1.0/localStats.spectraFusionVarianceScale;
                 }
 
                 localStats.framesMerged = 1 + localStats.supportAccepted;

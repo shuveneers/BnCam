@@ -1,4 +1,5 @@
 #include "PhysicalChromaDenoise.h"
+#include "PhysicalLumaDenoise.h"
 #include "ProfileColorManagement.h"
 #include "SrgbByteLut.h"
 #include "Bgr8PublicationStats.h"
@@ -6737,6 +6738,14 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
 
     const auto baselinePhysicalChroma = bncam::chroma::fromNoiseState(
             residualNoiseState.postDemosaic, physicalNoiseStatisticsActive);
+    auto baselinePhysicalLuma = bncam::luma::fromNoiseState(
+            residualNoiseState.postDemosaic, physicalNoiseStatisticsActive);
+    // The physical shutter S/O and protected chroma covariance remain immutable.
+    // Student posterior already describes the fused input: never scale it twice.
+    if (!neuralPosteriorSeedApplied) {
+        baselinePhysicalLuma.varianceY *= meta.calibration.physicalFusionVarianceScale;
+    }
+    if (!bncam::luma::debugEnabled.load()) baselinePhysicalLuma = {};
     // Downstream covariance stays a conservative pre-filter prediction: adaptive support is
     // data-dependent. Do not claim a measured posterior from a global colour-field variance.
     bncam::spectra2::NoiseState preWbNoiseState = residualNoiseState.postDemosaic;
@@ -6866,6 +6875,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         request.wbRgb = {wbRgb[0], wbRgb[1], wbRgb[2]};
         request.preWbCloudCorrectionReady = false;
         request.baselinePhysicalChroma = baselinePhysicalChroma;
+        request.baselinePhysicalLuma = baselinePhysicalLuma;
         if (g_spatialNoiseMap.relativePhysicalShape) {
             request.physicalSpatialSigma = g_spatialNoiseMap.tileSigma.data();
             request.physicalSpatialColumns = g_spatialNoiseMap.gridWidth;
@@ -6943,6 +6953,25 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                 };
                 for(int y=rows.start;y<rows.end;++y) for(int x=0;x<source.cols;++x) {
                     auto p=bncam::chroma::filter(x,y,baselinePhysicalChroma,read,shape).pixel;
+                    linearRgb.at<cv::Vec3f>(y,x)={p[0],p[1],p[2]};
+                }
+            });
+        }
+        if (baselinePhysicalLuma.valid()) {
+            const cv::Mat source = linearRgb.clone();
+            cv::parallel_for_(cv::Range(0, source.rows), [&](const cv::Range& rows) {
+                auto read = [&](int x,int y) {
+                    auto p=source.at<cv::Vec3f>(std::clamp(y,0,source.rows-1),std::clamp(x,0,source.cols-1));
+                    return bncam::luma::Pixel{p[0],p[1],p[2]};
+                };
+                auto shape = [&](int x,int y) {
+                    if (!g_spatialNoiseMap.relativePhysicalShape) return 1.f;
+                    int tx=std::clamp(int((x+0.5f)*g_spatialNoiseMap.gridWidth/source.cols),0,g_spatialNoiseMap.gridWidth-1);
+                    int ty=std::clamp(int((y+0.5f)*g_spatialNoiseMap.gridHeight/source.rows),0,g_spatialNoiseMap.gridHeight-1);
+                    return g_spatialNoiseMap.tileSigma[ty*g_spatialNoiseMap.gridWidth+tx];
+                };
+                for(int y=rows.start;y<rows.end;++y) for(int x=0;x<source.cols;++x) {
+                    auto p=bncam::luma::filter(x,y,baselinePhysicalLuma,read(x,y),read,shape).pixel;
                     linearRgb.at<cv::Vec3f>(y,x)={p[0],p[1],p[2]};
                 }
             });
@@ -9237,6 +9266,25 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; spectraResidualMotionConfidence=" << residualNoiseState.motionConfidence
             << "; spectraResidualAlignmentConfidence=" << residualNoiseState.alignmentConfidence
             << formatPropagationStateFields("spectraPreDemosaic", residualNoiseState.preDemosaic)
+            << "; baselinePhysicalLuma={enabled=" << (baselinePhysicalLuma.valid()?"true":"false")
+            << ";spectraIndependent=true;inputDomain=POST_PHYSICAL_CHROMA_LINEAR_RGB;noiseModel=PHYSICAL_SO_PROPAGATED"
+            << ";status=" << (baselinePhysicalLuma.valid()?"PHYSICAL_LUMA_ACTIVE":
+                (!bncam::luma::debugEnabled.load()?"PHYSICAL_LUMA_DEBUG_BYPASS":"PHYSICAL_LUMA_BYPASS_NO_VALID_NOISE_MODEL"))
+            << ";gpuExecuted=" << (vulkanColorTransform.baselinePhysicalLumaApplied?"true":"false")
+            << ";predictedSigmaY=" << std::sqrt(baselinePhysicalLuma.varianceY)
+            << ";modelConfidence=" << baselinePhysicalLuma.confidence
+            << ";fusionVarianceScale=" << meta.calibration.physicalFusionVarianceScale
+            << ";posteriorAlreadyIncludesFusion=" << (neuralPosteriorSeedApplied?"true":"false")
+            << ";hfNoiseAuthority=" << vulkanColorTransform.lumaHfAuthority
+            << ";midNoiseAuthority=" << vulkanColorTransform.lumaMidAuthority
+            << ";meanStructureConfidence=" << vulkanColorTransform.lumaStructure
+            << ";affectedPixelFraction=" << vulkanColorTransform.lumaAffected
+            << ";chromaMaxRgError=" << vulkanColorTransform.lumaMaxRgError
+            << ";chromaMaxBgError=" << vulkanColorTransform.lumaMaxBgError
+            << ";measurementStatus=" << (vulkanColorTransform.success?"GPU_MEASURED":"UNAVAILABLE_CPU_FALLBACK")
+            << ";flatNoiseVarianceRatio=GROUND_TRUTH_TEST_ONLY;highSnrIdentityError=TEST_ONLY"
+            << ";fusedColourLumaGpuMs=" << vulkanColorTransform.kernelMs
+            << ";extraFullFrameBuffers=0;extraFullFrameReadbacks=0;extraStatisticsBytesPerWorkgroup=32}"
             << "; baselinePhysicalChroma={enabled=" << (baselinePhysicalChroma.valid()?"true":"false")
             << ";spectraIndependent=true;inputDomain=POST_DEMOSAIC_LINEAR_RGB;noiseModel=PHYSICAL_SO_PROPAGATED"
             << ";status=" << preWbNoiseState.status

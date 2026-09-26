@@ -41,6 +41,7 @@ struct FinalSensorCalibrationNative {
     int spectraProcessingMode = 0;
     int spectraMode = 0;
     float signalModelConfidence = 0.0f;
+    float physicalFusionVarianceScale = 1.0f;
     std::string noiseProfileNotAppliedReason = "none";
 
     bool hasBlackLevel = false;

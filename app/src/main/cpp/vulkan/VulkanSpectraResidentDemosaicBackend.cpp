@@ -970,7 +970,7 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
     const std::uint64_t groupCount =
             static_cast<std::uint64_t>((request.frameWidth + 15u) / 16u) *
             static_cast<std::uint64_t>((request.frameHeight + 15u) / 16u);
-    const std::uint64_t statisticsBytes = std::max<std::uint64_t>(48u, groupCount * 24u * sizeof(float));
+    const std::uint64_t statisticsBytes = std::max<std::uint64_t>(48u, groupCount * 32u * sizeof(float));
     const ResidualSampling residualSampling = residualSamplingFor(request.frameWidth, request.frameHeight);
     // Phase 3: historical pre-WB opponent/cloud cleanup is a retired classical denoiser.
     // The transport fields remain compatibility-only; the backend cannot grant pixel authority.
@@ -1222,6 +1222,9 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
     push.cfaEvidence0[2] = noise.bg;
     push.cfaEvidence0[3] = noise.cross;
     push.cfaEvidence1[0] = sourceClipConfidenceReady ? 1.0f : 0.0f;
+    const bool physicalLumaReady=request.baselinePhysicalLuma.valid();
+    push.padding0 = physicalLumaReady ? request.baselinePhysicalLuma.varianceY : 0.f;
+    push.cfaEvidence1[1] = physicalLumaReady ? request.baselinePhysicalLuma.confidence : 0.f;
     push.cfaEvidence1[2] = request.physicalChromaValidationOnly ? 1.f : 0.f;
     push.cfaEvidence1[3] = physicalChromaReady ? 1.f : 0.f;
     push.ccm[9] = physicalShapeReady ? float(request.physicalSpatialColumns) : 0.f;
@@ -1373,11 +1376,11 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
 
     const auto reduceStart = Clock::now();
     const float* statistics = static_cast<const float*>(colorStatistics_.mapped);
-    double sums[24]{};
+    double sums[32]{};
     for (std::uint64_t group = 0; group < groupCount; ++group) {
-        const float* record = statistics + static_cast<std::size_t>(group) * 24u;
-        for (int i = 0; i < 24; ++i) {
-            if (i==15) sums[i]=std::max(sums[i],double(record[i]));
+        const float* record = statistics + static_cast<std::size_t>(group) * 32u;
+        for (int i = 0; i < 32; ++i) {
+            if (i==15 || i==28 || i==29) sums[i]=std::max(sums[i],double(record[i]));
             else sums[i] += static_cast<double>(record[i]);
         }
     }
@@ -1387,6 +1390,12 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
         result.wbMean[c] = sums[3 + c] * inversePixels;
         result.ccmMean[c] = sums[6 + c] * inversePixels;
     }
+    result.baselinePhysicalLumaApplied=physicalLumaReady;
+    result.lumaHfAuthority=sums[24]*inversePixels;
+    result.lumaMidAuthority=sums[25]*inversePixels;
+    result.lumaStructure=sums[26]*inversePixels;
+    result.lumaAffected=sums[27]*inversePixels;
+    result.lumaMaxRgError=sums[28];result.lumaMaxBgError=sums[29];
     result.baselinePhysicalChromaApplied=physicalChromaReady;
     result.chromaHfAuthorityMean=sums[12]*inversePixels;
     result.chromaLfAuthorityMean=sums[13]*inversePixels;

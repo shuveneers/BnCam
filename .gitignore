@@ -37,3 +37,4 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 work/physical_chroma_validation/
+work/physical_luma_validation/

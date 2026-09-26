@@ -89,13 +89,13 @@ fun FinalSensorCalibration.withPhysicalNoiseAuthority(): FinalSensorCalibration 
  */
 fun FinalSensorCalibration.withPhysicalMergeStats(stats: String): FinalSensorCalibration {
     if (stats.isBlank()) return this
-    val physical = noiseSnapshot?.physicalNoiseState() ?: return this
-    if (!physical.modelAvailable) return this
-
+    // Fusion weights describe this RAW product even when its shutter S/O snapshot
+    // is resolved later at render time. Recording the scale grants no denoise
+    // authority: native still requires a separately validated physical model.
     val values = stats.split(';')
         .mapNotNull { entry ->
             val split = entry.indexOf('=')
-            if (split <= 0) null else entry.substring(0, split) to entry.substring(split + 1)
+            if (split <= 0) null else entry.substring(0, split).trim() to entry.substring(split + 1).trim()
         }
         .toMap()
     val fusionVarianceScale = (values["physicalFusionVarianceScale"]

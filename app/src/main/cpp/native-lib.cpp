@@ -1,4 +1,5 @@
 #include "tests/PhysicalChromaValidation.h"
+#include "tests/PhysicalLumaValidation.h"
 #include <jni.h>
 #include <cstdint>
 #include <vector>
@@ -12,6 +13,7 @@
 #include <sstream>
 #include <iomanip>
 #include <chrono>
+#include <thread>
 #include <cstring>
 #include <atomic>
 #include <android/hardware_buffer_jni.h>
@@ -3386,6 +3388,7 @@ Java_com_bncam_core_engine_ImageUtils_renderJpegFromMasterNative(
         jboolean colorMatrixFromMetadata,
         jboolean spectraProcessingEnabled,
         jdoubleArray physicalNoiseSoArray,
+        jfloat physicalFusionVarianceScale,
         jint spectraPostRawSensitivityBoost,
         jfloat profileSpectraLuma,
         jfloat profileSpectraChroma,
@@ -3663,6 +3666,8 @@ Java_com_bncam_core_engine_ImageUtils_renderJpegFromMasterNative(
             resolveSpectraProcessingMode(spectraRequested, meta.calibration);
     meta.calibration.spectraMode = meta.calibration.spectraProcessingMode;
     meta.calibration.signalModelConfidence = physicalNoiseReady ? 1.0f : 0.0f;
+    meta.calibration.physicalFusionVarianceScale = std::isfinite(physicalFusionVarianceScale) &&
+        physicalFusionVarianceScale > 0.f && physicalFusionVarianceScale <= 1.f ? physicalFusionVarianceScale : 1.f;
     meta.calibration.postRawSensitivityBoost =
             std::clamp(static_cast<int>(spectraPostRawSensitivityBoost), 1, 1600);
     if (spectraRequested && !physicalNoiseReady) {
@@ -4547,4 +4552,187 @@ Java_com_bncam_core_engine_ImageUtils_validatePhysicalChromaNative(JNIEnv* env,j
         std::string failure=std::string("allPassed=false ")+e.what();
         return env->NewStringUTF(failure.c_str());
     }
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_bncam_core_engine_ImageUtils_validatePhysicalLumaNative(JNIEnv* env,jobject) {
+    try {
+        using namespace bncam::luma;
+        std::string report="CPU\n"+test::run();
+        double maxParity=0;
+        auto gpu=[&](const test::Image& input,Model model) {
+            bncam::vulkan::SpectraResidentColorTransformRequest r{};
+            r.frameWidth=test::W; r.frameHeight=test::H;
+            r.rowStrideFloats=test::W*3; r.rgbData=input[0].data();
+            r.baselinePhysicalLuma=model; r.physicalChromaValidationOnly=true;
+            auto result=bncam::vulkan::VulkanRuntime::instance().executeSpectraResidentAwbCcm(r);
+            if(!result.success) throw std::runtime_error(result.status+":"+result.failureReason);
+            if(result.outputRgb.size()!=input.size()*3) throw std::runtime_error("GPU readback size");
+            test::Image out(input.size());
+            std::memcpy(out.data(),result.outputRgb.data(),result.outputRgb.size()*sizeof(float));
+            auto reference=test::reference(input,model);
+            for(size_t i=0;i<out.size();++i) for(int c=0;c<3;++c)
+                maxParity=std::max(maxParity,double(std::abs(out[i][c]-reference[i][c])));
+            return out;
+        };
+        report+="GPU\n"+test::run(gpu);
+        { std::ostringstream value; value<<std::scientific<<maxParity; report+="cpuGpuMaxRgbDifference="+value.str()+"\n"; }
+        // Joint chroma/luma test with heterogeneous physical spatial sigma. The
+        // luma evidence remains the original Y, while its RGB delta follows chroma.
+        {
+            test::Image input(test::W*test::H), expected(input.size());
+            float shapeMap[4]={.5f,1.f,1.5f,2.f};
+            Model lm{.000025f,.7f};bncam::chroma::Model cm{.000025f,.0004f,.0004f,.0001f};
+            for(size_t i=0;i<input.size();++i)input[i]={.04f+.006f*std::sin(float(i)),.02f+.005f*std::cos(float(i)),.01f};
+            auto read=[&](int x,int y){return input[std::clamp(y,0,test::H-1)*test::W+std::clamp(x,0,test::W-1)];};
+            auto shape=[&](int x,int y){return shapeMap[std::clamp(int((y+.5f)*2/test::H),0,1)*2+std::clamp(int((x+.5f)*2/test::W),0,1)];};
+            for(int y=0;y<test::H;++y)for(int x=0;x<test::W;++x) {
+                auto c=bncam::chroma::filter(x,y,cm,read,shape).pixel;
+                expected[y*test::W+x]=filter(x,y,lm,c,read,shape).pixel;
+            }
+            bncam::vulkan::SpectraResidentColorTransformRequest r{};
+            r.frameWidth=test::W;r.frameHeight=test::H;r.rgbData=input[0].data();r.rowStrideFloats=test::W*3;
+            r.baselinePhysicalChroma=cm;r.baselinePhysicalLuma=lm;r.physicalChromaValidationOnly=true;
+            r.physicalSpatialSigma=shapeMap;r.physicalSpatialColumns=2;r.physicalSpatialRows=2;
+            auto c=bncam::vulkan::VulkanRuntime::instance().executeSpectraResidentAwbCcm(r);
+            if(!c.success || c.outputRgb.size()!=input.size()*3)throw std::runtime_error("spatial parity dispatch");
+            for(size_t i=0;i<input.size();++i)for(int ch=0;ch<3;++ch)
+                maxParity=std::max(maxParity,double(std::abs(c.outputRgb[i*3+ch]-expected[i][ch])));
+            report+="jointChromaLumaSpatialParity="+std::to_string(maxParity)+"\n";
+        }
+        // Production resident demosaic -> common chroma boundary, once per final output.
+        std::vector<float> mosaic(test::W*test::H,.12f);
+        for(size_t i=0;i<mosaic.size();++i) mosaic[i]+=.005f*std::sin(float(i)*1.7f);
+        using Algorithm=bncam::vulkan::SpectraGpuDemosaicAlgorithm;
+        for(auto route:{Algorithm::MALVAR_2004,Algorithm::AMAZE,Algorithm::NEURAL_JDD,Algorithm::AUTO_HYBRID}) {
+            bncam::vulkan::SpectraResidentDemosaicRequest dr{};
+            dr.mosaicData=mosaic.data();dr.frameWidth=test::W;dr.frameHeight=test::H;
+            dr.rowStrideFloats=test::W;dr.algorithm=route;
+            dr.noiseSigmaY=.005f;dr.noiseSigmaChroma=.02f;
+            auto d=bncam::vulkan::VulkanRuntime::instance().executeSpectraResidentDemosaic(dr);
+            if(!d.success) throw std::runtime_error("demosaic route "+std::to_string(int(route))+":"+d.failureReason);
+            bncam::vulkan::SpectraResidentColorTransformRequest cr{};
+            cr.frameWidth=test::W;cr.frameHeight=test::H;
+            cr.residentDemosaicGeneration=d.residentDemosaicGeneration;
+            cr.baselinePhysicalChroma={.000025f,.0004f,.0004f,0};
+            cr.baselinePhysicalLuma={.000025f,1.f};
+            cr.physicalChromaValidationOnly=true;
+            auto c=bncam::vulkan::VulkanRuntime::instance().executeSpectraResidentAwbCcm(cr);
+            if(!c.success || !c.residentInputUsed || !c.baselinePhysicalLumaApplied || c.lumaMaxRgError>1e-6 || c.lumaMaxBgError>1e-6)
+                throw std::runtime_error("resident luma route "+std::to_string(int(route))+":"+c.failureReason);
+            report+="residentRoute="+std::to_string(int(route))+" active=true maxY="+std::to_string(c.chromaMaxLumaError)+"\n";
+        }
+        // Paired warm GPU timestamps on the same frame. Readback remains deferred.
+        const int size=1024;
+        std::vector<float> bench(size*size*3);
+        for(size_t i=0;i<bench.size();++i) bench[i]=.1f+.015f*std::sin(float(i)*1.7f);
+        double enabledMs=0,identityMs=0;
+        for(int iteration=0;iteration<8;++iteration) for(int enabled=0;enabled<=1;++enabled) {
+            bncam::vulkan::SpectraResidentColorTransformRequest r{};
+            r.frameWidth=size;r.frameHeight=size;r.rowStrideFloats=size*3;r.rgbData=bench.data();
+            r.deferFullReadback=true;
+            r.baselinePhysicalChroma={.000025f,.0004f,.0004f,0};
+            if(enabled) r.baselinePhysicalLuma={.000025f,1.f};
+            auto c=bncam::vulkan::VulkanRuntime::instance().executeSpectraResidentAwbCcm(r);
+            if(!c.success) throw std::runtime_error("benchmark:"+c.failureReason);
+            if(iteration>=2) {if(enabled) enabledMs+=c.kernelMs;else identityMs+=c.kernelMs;}
+        }
+        report+="gpuBenchmark1024 identityMs="+std::to_string(identityMs/6)+" chromaLumaMs="+std::to_string(enabledMs/6)+
+                " deltaMs="+std::to_string((enabledMs-identityMs)/6)+"\n";
+
+        // Full capture dimensions, paired warm timestamps; this is test-only input.
+        {
+            const int w=3072,h=4096;std::vector<float> pixels(size_t(w)*h*3,.02f);
+            double off=0,on=0,wallOff=0,wallOn=0;
+            for(int iteration=0;iteration<4;++iteration)for(int enabled=0;enabled<2;++enabled) {
+                bncam::vulkan::SpectraResidentColorTransformRequest r{};
+                r.frameWidth=w;r.frameHeight=h;r.rowStrideFloats=w*3;r.rgbData=pixels.data();r.deferFullReadback=true;
+                r.baselinePhysicalChroma={.000025f,.0004f,.0004f,0};
+                if(enabled)r.baselinePhysicalLuma={.000025f,1.f};
+                auto c=bncam::vulkan::VulkanRuntime::instance().executeSpectraResidentAwbCcm(r);
+                if(!c.success)throw std::runtime_error("fullSizeBenchmark:"+c.failureReason);
+                if(iteration) {if(enabled){on+=c.kernelMs;wallOn+=c.totalMs;}else{off+=c.kernelMs;wallOff+=c.totalMs;}}
+            }
+            report+="gpuBenchmark3072x4096 offMs="+std::to_string(off/3)+" onMs="+std::to_string(on/3)+
+                " deltaMs="+std::to_string((on-off)/3)+" wallOffMs="+std::to_string(wallOff/3)+" wallOnMs="+std::to_string(wallOn/3)+"\n";
+            if((on-off)/3>500)report+="allPassed=false PERFORMANCE\n";
+        }
+        if(maxParity>2e-6) report+="allPassed=false CPU_GPU_PARITY\n";
+        return env->NewStringUTF(report.c_str());
+    } catch(const std::exception& e) {
+        std::string failure=std::string("allPassed=false ")+e.what();
+        return env->NewStringUTF(failure.c_str());
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_bncam_core_engine_ImageUtils_setPhysicalLumaDebugEnabled(JNIEnv*,jobject,jboolean enabled) {
+#ifndef NDEBUG
+    bncam::luma::debugEnabled.store(enabled==JNI_TRUE);
+#endif
+}
+
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_bncam_core_engine_ImageUtils_validateRawPreviewRecoveryNative(JNIEnv* env, jobject) {
+#ifndef NDEBUG
+    using namespace bncam::vulkan;
+    auto& runtime = VulkanRuntime::instance();
+    std::vector<float> lut(4096);
+    for (int i=0;i<4096;++i) lut[i]=float(i)/4095.f;
+    int frames=0;
+    float coldCompileMs=0.f;
+    for (unsigned format : {32u,37u}) {
+        constexpr unsigned w=640,h=480;
+        const unsigned stride=format==32u?w*2u:w*5u/4u;
+        std::vector<uint8_t> raw(stride*h),rgba(w*h*4u);
+        // A neutral bright step across a darker flat field exposes blank/partial output.
+        for(unsigned y=0;y<h;++y) for(unsigned x=0;x<w;x+=4u) {
+            unsigned v=x<w/2u?160u:700u;
+            if(format==32u) for(unsigned k=0;k<4u;++k) {
+                raw[y*stride+2u*(x+k)]=v&255u;
+                raw[y*stride+2u*(x+k)+1u]=v>>8u;
+            } else {
+                unsigned j=y*stride+x*5u/4u;
+                for(unsigned k=0;k<4u;++k) raw[j+k]=v>>2u;
+                raw[j+4u]=(v&3u)*85u;
+            }
+        }
+        RawPreviewGpuRequest r{};
+        r.rawData=raw.data();r.rawDataCapacityBytes=raw.size();
+        r.sourceWidth=w;r.sourceHeight=h;r.sourceRowStrideBytes=stride;
+        r.sourcePixelStrideBytes=format==32u?2u:0u;r.sourceFormat=format;
+        r.sourceCropWidth=w;r.sourceCropHeight=h;r.previewWidth=w;r.previewHeight=h;
+        r.whiteLevel=1023.f;r.captureExposureTimeMs=10.f;
+        r.toneLut=lut.data();r.toneLutSize=lut.size();
+        r.outputRgba=rgba.data();r.outputCapacityBytes=rgba.size();
+        r.pipelineGeneration=100;r.frameSlotIndex=0;
+        // Null output AHB deliberately forces the path that crashed during health recovery.
+        for(int frame=0;frame<60;++frame) {
+            std::fill(rgba.begin(),rgba.end(),0u);
+            r.sensorTimestampNs=1+frames;r.pollOnly=false;
+            auto result=runtime.executeRawPreview(r);
+            coldCompileMs=std::max(coldCompileMs,result.computePipelineMs);
+            r.pollOnly=true;
+            while(result.gpuPending) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                result=runtime.executeRawPreview(r);
+            }
+            bool valid=result.success&&!result.gpuResidentOutputUsed;
+            for(size_t i=3;i<rgba.size();i+=4) valid=valid&&rgba[i]==255u;
+            valid=valid&&rgba[(h/2*w+w/4)*4]<rgba[(h/2*w+3*w/4)*4];
+            if(!valid) {
+                std::string error="allPassed=false;format="+std::to_string(format)+
+                    ";frame="+std::to_string(frame)+";reason="+result.failureReason;
+                return env->NewStringUTF(error.c_str());
+            }
+            ++frames;
+        }
+    }
+    std::string report="frames="+std::to_string(frames)+";allPassed=true;bufferPipelineCompileMs="+
+        std::to_string(coldCompileMs);
+    return env->NewStringUTF(report.c_str());
+#else
+    return env->NewStringUTF("DEBUG_ONLY");
+#endif
 }

@@ -82,6 +82,16 @@ class SensorCalibrationFusionNoiseTest {
         })
     }
 
+    @Test
+    fun `fusion propagation survives delayed shutter noise resolution`() {
+        val base = calibration(null, "pending").copy(noiseSnapshot = null)
+        val result = base.withPhysicalMergeStats("framesMerged=2; spectraFusionVarianceScale=0.824; spectraEffectiveFrameCount=1.213")
+        assertEquals(0.824, result.physicalFusionVarianceScale, 1e-12)
+        assertEquals(1.213, result.physicalEffectiveFrameCount, 1e-12)
+        assertEquals(null, result.noiseSnapshot)
+        assertEquals(null, result.effectiveNoiseProfile)
+    }
+
     private fun calibration(
         noise: DoubleArray?,
         source: String,
@@ -210,7 +220,11 @@ class SensorCalibrationFusionNoiseTest {
                 chromaUserScale = 1.0f,
                 lumaUserScale = 1.0f,
                 spectraMode = if (noise == null) "Off" else "Auto",
-                signalModelConfidence = if (noise == null) 0.0f else 1.0f
+                signalModelConfidence = if (noise == null) 0.0f else 1.0f,
+                physicalAuthorityLocked = true,
+                physicalNoiseRequestedSource = if (noise == null) "UNRESOLVED" else "OEM",
+                physicalNoiseEffectiveSource = if (noise == null) "UNRESOLVED" else "OEM",
+                physicalNoiseProvenance = "Deterministic frozen test fixture"
             )
         )
     }

@@ -266,6 +266,8 @@ object ImageUtils {
     @Volatile
     private var rawJpegDebugDumpsEnabled: Boolean = false
 
+    @Volatile var physicalLumaAbDirectory: String? = null
+
     @Volatile
     private var rawJpegDebugDumpDirectory: String = ""
 
@@ -715,12 +717,12 @@ object ImageUtils {
         return masterFrame.nativeRaw16Buffer.withDirectBuffer { raw16DirectBuffer ->
             // Full-payload CRC verification scans the complete RAW16 array twice. Keep it available
             // for explicit developer dump/integrity sessions, but not on every debug shot.
-            val masterFingerprint = if (BuildConfig.DEBUG && rawJpegDebugDumpsEnabled) {
+            val masterFingerprint = if (BuildConfig.DEBUG && (rawJpegDebugDumpsEnabled || physicalLumaAbDirectory != null)) {
                 RawMasterIntegrity.fingerprint(raw16DirectBuffer, masterFrame.raw16ByteCount)
             } else {
                 null
             }
-            val jpegBytes = invokeNativeSafely(routeLabel) {
+            val renderOnce = { invokeNativeSafely(routeLabel) {
                 renderJpegFromMasterNative(
                 lensId = masterFrame.lensId,
                 raw16DirectBuffer = raw16DirectBuffer,
@@ -786,6 +788,7 @@ object ImageUtils {
                 } ?: (colorMatrix?.fromMetadata ?: false),
                 spectraProcessingEnabled = spectraRequestedByProfile,
                 physicalNoiseSo = physicalNoiseSo,
+                physicalFusionVarianceScale = finalCal?.physicalFusionVarianceScale?.toFloat() ?: 1f,
                 spectraPostRawSensitivityBoost = capturePostRawSensitivityBoost,
                 // Neural master authority and Adaptive Response are fixed at 100% when the
                 // spectraProcessingEnabled gate is true. Only component/protection controls cross JNI.
@@ -847,7 +850,24 @@ object ImageUtils {
                 portraitTargetBottom = portraitBounds?.bottom ?: 0f,
                 portraitMaskRotationDegrees = portraitMaskArtifact?.rotationDegrees ?: 0
             )
-        }
+        } }
+        val abDirectory = physicalLumaAbDirectory.takeIf { BuildConfig.DEBUG }
+        val jpegBytes = if (abDirectory != null) {
+            // Debug-only: render the SAME immutable master twice with identical metadata.
+            // No full-frame diagnostic readback or extra render exists in normal captures.
+            val dir = java.io.File(abDirectory, System.currentTimeMillis().toString()).apply { mkdirs() }
+            try {
+                setPhysicalLumaDebugEnabled(false)
+                val off = renderOnce()
+                if (off != null) java.io.File(dir, "off.jpg").writeBytes(off)
+                java.io.File(dir, "off.txt").writeText(lastMasterIspStats())
+                setPhysicalLumaDebugEnabled(true)
+                val on = renderOnce()
+                if (on != null) java.io.File(dir, "on.jpg").writeBytes(on)
+                java.io.File(dir, "on.txt").writeText(lastMasterIspStats())
+                on
+            } finally { setPhysicalLumaDebugEnabled(true) }
+        } else renderOnce()
         if (masterFingerprint != null) {
             if (!RawMasterIntegrity.isUnchanged(
                     raw16DirectBuffer,
@@ -1432,6 +1452,9 @@ object ImageUtils {
     private external fun validateDemosaicNative(): String
 
     external fun validatePhysicalChromaNative(): String
+    external fun validatePhysicalLumaNative(): String
+    external fun validateRawPreviewRecoveryNative(): String
+    external fun setPhysicalLumaDebugEnabled(enabled: Boolean)
 
     fun validateDemosaicImplementation(): String = validateDemosaicNative()
 
@@ -1563,6 +1586,7 @@ object ImageUtils {
         colorMatrixFromMetadata: Boolean,
         spectraProcessingEnabled: Boolean,
         physicalNoiseSo: DoubleArray,
+        physicalFusionVarianceScale: Float,
         spectraPostRawSensitivityBoost: Int,
         profileSpectraLuma: Float,
         profileSpectraChroma: Float,

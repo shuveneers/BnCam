@@ -106,7 +106,8 @@ if(BNCAM_GLSLC)
             OUTPUT "${BNCAM_RAW_PREVIEW_HEADER}"
             COMMAND "${CMAKE_COMMAND}" -E make_directory "${BNCAM_GENERATED_SHADER_DIR}"
             COMMAND "${BNCAM_GLSLC}" --target-env=vulkan1.1 -O
-                    "${CMAKE_CURRENT_SOURCE_DIR}/vulkan/shaders/raw_preview.comp"
+                    -DBNCAM_RAW_PREVIEW_BUFFER_OUTPUT=1
+                    "${CMAKE_CURRENT_SOURCE_DIR}/vulkan/shaders/raw_preview_image.comp"
                     -o "${BNCAM_RAW_PREVIEW_SPV}"
             COMMAND "${CMAKE_COMMAND}"
                     -DINPUT=${BNCAM_RAW_PREVIEW_SPV}
@@ -114,7 +115,7 @@ if(BNCAM_GLSLC)
                     -DSYMBOL=getRawPreviewSpirv
                     -P "${CMAKE_CURRENT_SOURCE_DIR}/vulkan/cmake/EmbedSpirvConstArray.cmake"
             DEPENDS
-                    "${CMAKE_CURRENT_SOURCE_DIR}/vulkan/shaders/raw_preview.comp"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/vulkan/shaders/raw_preview_image.comp"
                     "${CMAKE_CURRENT_SOURCE_DIR}/vulkan/cmake/EmbedSpirvConstArray.cmake"
             VERBATIM
     )
@@ -124,7 +125,10 @@ else()
     set(BNCAM_RAW_PREVIEW_SHADER_AVAILABLE 0)
 endif()
 
-# GPU-resident RAW preview output kernel. Identical image processing to raw_preview.comp,
+# Both output transports compile the same lightweight live image processing kernel.
+# The capture-grade legacy raw_preview.comp must not compile during preview recovery:
+# its driver compiler exhausted memory on the device when the AHB path was quarantined.
+# GPU-resident RAW preview output kernel uses identical image processing to the buffer variant,
 # but writes RGBA8 directly into an imported AHardwareBuffer-backed VkImage so the live viewfinder
 # does not perform full-frame Vulkan->host readback followed by GLES upload.
 set(BNCAM_RAW_PREVIEW_IMAGE_SPV "${BNCAM_GENERATED_SHADER_DIR}/raw_preview_image.spv")
@@ -527,6 +531,7 @@ if(BNCAM_GLSLC)
             DEPENDS
                     "${CMAKE_CURRENT_SOURCE_DIR}/vulkan/shaders/spectra_demosaic_resident.comp"
                     "${CMAKE_CURRENT_SOURCE_DIR}/vulkan/shaders/physical_chroma_denoise.glsl"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/vulkan/shaders/physical_luma_denoise.glsl"
                     "${CMAKE_CURRENT_SOURCE_DIR}/vulkan/cmake/EmbedSpirv.cmake"
             VERBATIM
     )
