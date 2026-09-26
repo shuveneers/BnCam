@@ -9,7 +9,7 @@ class Phase4SingleFrameRawDenoiseSourceContractTest {
     private fun source(path: String): String = File(path).readText()
 
     @Test
-    fun `raw capture has no pre or post demosaic denoise owner`() {
+    fun `raw capture has one physical chroma owner and no legacy denoisers`() {
         val rawFinalize = source("src/main/cpp/vulkan/shaders/spectra_raw_finalize.comp")
         val demosaic = source("src/main/cpp/vulkan/shaders/spectra_demosaic_resident.comp")
         val backendHeader = source("src/main/cpp/vulkan/VulkanSpectraResidentDemosaicBackend.h")
@@ -25,12 +25,12 @@ class Phase4SingleFrameRawDenoiseSourceContractTest {
         assertFalse(backend.contains("baselineChromaCleanupApplied"))
         assertFalse(isp.contains("resolveAdaptiveChromaPlan"))
         assertFalse(isp.contains("RawAdaptiveBaselineChroma"))
-        assertTrue(demosaic.contains("vec3 rawForWb = rawInput;"))
-        assertTrue(isp.contains("rawZeroDenoiseContract=true"))
+        assertTrue(demosaic.contains("vec3 rawForWb = physicalChromaDenoise"))
+        assertTrue(isp.contains("rawBaselinePhysicalChromaContract=true"))
     }
 
     @Test
-    fun `spectra off is zero denoise while spectra on owns the trained neural path`() {
+    fun `spectra off bypasses neural processing but both modes receive baseline chroma`() {
         val isp = source("src/main/cpp/IspCore.cpp")
         val runtime = source("src/main/cpp/vulkan/VulkanRuntime.cpp")
         val cmake = source("src/main/cpp/CMakeLists.txt")
@@ -65,7 +65,7 @@ class Phase4SingleFrameRawDenoiseSourceContractTest {
     }
 
     @Test
-    fun `noise model remains measurement only not denoise authority`() {
+    fun `physical model owns baseline chroma while legacy raw filters remain disabled`() {
         val isp = source("src/main/cpp/IspCore.cpp")
         val planner = source("src/main/cpp/vulkan/shaders/spectra_pass3_planner.comp")
 
@@ -73,7 +73,7 @@ class Phase4SingleFrameRawDenoiseSourceContractTest {
         assertTrue(isp.contains("preDemosaicAuthorityState.chromaAuthority = 0.0f"))
         assertTrue(isp.contains("preDemosaicAuthorityState.lowFrequencyAuthority = 0.0f"))
         assertTrue(isp.contains("budgetState.applied = false"))
-        assertTrue(isp.contains("rawZeroDenoiseNoiseModelRole=TELEMETRY_AND_COVARIANCE_ONLY"))
+        assertTrue(isp.contains("rawBaselineNoiseModelRole=PHYSICAL_CHROMA_AND_COVARIANCE"))
         assertTrue(planner.contains("This shader has no pixel output and cannot perform denoise or correction"))
     }
 

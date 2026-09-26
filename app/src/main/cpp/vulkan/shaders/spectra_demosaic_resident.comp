@@ -1,4 +1,5 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
@@ -7,7 +8,7 @@ layout(std430, binding = 1) buffer DemosaicRgb { float outputRgb[]; };
 layout(std430, binding = 2) buffer ColorRgb { float colorRgb[]; };
 layout(std430, binding = 3) writeonly buffer ColorStats { float colorStats[]; };
 layout(std430, binding = 4) writeonly buffer ResidualCandidates { float residualCandidates[]; };
-// Delta 46 transport-only binding. Record = (R-G correction, B-G correction, valid, reserved).
+// Reused compact storage: x = physical spatial sigma ratio; yzw reserved.
 layout(std430, binding = 5) readonly buffer CloudCorrectionMap { vec4 cloudCorrectionMap[]; };
 // Phase 9 compact counters. Per-pixel clipping/gamut evidence stays resident on GPU.
 layout(std430, binding = 6) buffer ColorTelemetry { uint colorTelemetry[]; };
@@ -27,7 +28,7 @@ layout(push_constant) uniform Params {
     float ccm4; float ccm5; float ccm6; float ccm7;
     // In demosaic modes padding1..3 transport physical noiseSigmaY,
     // noiseSigmaChroma and noisePressure respectively. Mode 3 continues to use
-    // ccm0..ccm8 only, so the fixed 128-byte push layout remains unchanged.
+    // ccm0..ccm8 for colour and padding1/2 for physical spatial grid dimensions.
     float ccm8; float padding1; float padding2; float padding3;
     uint residualStride;
     uint residualColumns;
@@ -36,12 +37,15 @@ layout(push_constant) uniform Params {
     // Delta 25+ evidence contract. Pure Malvar 2004 ignores it; adaptive RCD/AMAZE
     // may consume it in reconstructed R/B chroma paths. Sampled CFA values remain authoritative.
     // Demosaic modes: immutable CFA evidence contract. Mode 3 (AWB+CCM) reuses these slots
-    // for the mandatory developed-RAW baseline: blendRG/blendBG/sigmaRG/sigmaBG and
-    // sourceClipMapReady/sigmaY/modelConfidence/planReady. No luma filtering is authorized.
+    // for baseline covariance (Y, RG, BG, cross) and sourceClipMapReady/reserved/
+    // diagnosticOnly/modelReady. No luma filtering is authorized.
     vec4 cfaEvidence0;
     vec4 cfaEvidence1;
 } pc;
 
+shared vec4 chromaStats0[256];
+shared vec4 chromaStats1[256];
+shared vec4 chromaStats2[256];
 shared float sumRawR[256]; shared float sumRawG[256]; shared float sumRawB[256];
 shared float sumWbR[256];  shared float sumWbG[256];  shared float sumWbB[256];
 shared float sumCcmR[256]; shared float sumCcmG[256]; shared float sumCcmB[256];
@@ -787,7 +791,7 @@ vec3 opponentAtRgb(vec3 pixel) {
             pixel.b - pixel.g);
 }
 
-// RAW zero-denoise baseline: no post-demosaic opponent/chroma smoothing lives here.
+#include "physical_chroma_denoise.glsl"
 
 bool finiteBoundedRgb(vec3 pixel) {
     return all(not(isnan(pixel))) && all(not(isinf(pixel))) &&
@@ -913,6 +917,9 @@ void main() {
     vec3 wb = vec3(0.0);
     vec3 ccm = vec3(0.0);
     vec2 cloudAppliedOpponent = vec2(0.0);
+    chromaStats0[localIndex]=vec4(0);
+    chromaStats1[localIndex]=vec4(0);
+    chromaStats2[localIndex]=vec4(0);
     if (inside) {
         uint index = (gid.y * pc.frameWidth + gid.x) * 3u;
         vec3 rawInput = vec3(outputRgb[index + 0u], outputRgb[index + 1u], outputRgb[index + 2u]);
@@ -947,8 +954,14 @@ void main() {
                 ? sourceColorConfidence
                 : legacyDemosaicConfidence;
 
-        // RAW zero-denoise baseline: preserve the demosaic result exactly into WB/CCM.
-        vec3 rawForWb = rawInput;
+        // One baseline chroma pass after the final demosaic, fused with colour dispatch.
+        vec2 chromaAuthority;
+        vec3 rawForWb = physicalChromaDenoise(ivec2(gid),rawInput,chromaAuthority);
+        vec3 ci=opponentAtRgb(rawInput), co=opponentAtRgb(rawForWb);
+        float ye=abs(ci.x-co.x);
+        chromaStats0[localIndex]=vec4(chromaAuthority,any(notEqual(rawForWb,rawInput))?1.0:0.0,ye);
+        chromaStats1[localIndex]=vec4(ye,ye*ye,ci.yz);
+        chromaStats2[localIndex]=vec4(dot(ci.yz,ci.yz),co.yz,dot(co.yz,co.yz));
 
         // Counterfactual only: distinguishes WB-induced over-unity and old post-CCM magenta risk
         // from actual sensor-domain clipping. Neither condition is treated as lost sensor data.
@@ -995,6 +1008,7 @@ void main() {
         if (phase9MagentaRisk(protectedCcm)) atomicAdd(colorTelemetry[8], 1u);
         if (max(protectedCcm.r, max(protectedCcm.g, protectedCcm.b)) > 1.0) atomicAdd(colorTelemetry[9], 1u);
 
+        if(pc.cfaEvidence1.z>0.5) protectedCcm=rawForWb;
         colorRgb[index + 0u] = finiteLinear(protectedCcm.r);
         colorRgb[index + 1u] = finiteLinear(protectedCcm.g);
         colorRgb[index + 2u] = finiteLinear(protectedCcm.b);
@@ -1017,6 +1031,10 @@ void main() {
     for (uint stride = 128u; stride > 0u; stride >>= 1u) {
         if (localIndex < stride) {
             uint other = localIndex + stride;
+            chromaStats0[localIndex].xyz+=chromaStats0[other].xyz;
+            chromaStats0[localIndex].w=max(chromaStats0[localIndex].w,chromaStats0[other].w);
+            chromaStats1[localIndex]+=chromaStats1[other];
+            chromaStats2[localIndex]+=chromaStats2[other];
             sumRawR[localIndex] += sumRawR[other];
             sumRawG[localIndex] += sumRawG[other];
             sumRawB[localIndex] += sumRawB[other];
@@ -1035,7 +1053,7 @@ void main() {
     if (localIndex == 0u) {
         uint groupsX = (pc.frameWidth + 15u) / 16u;
         uint groupIndex = gl_WorkGroupID.y * groupsX + gl_WorkGroupID.x;
-        uint base = groupIndex * 12u;
+        uint base = groupIndex * 24u;
         colorStats[base + 0u] = sumRawR[0];
         colorStats[base + 1u] = sumRawG[0];
         colorStats[base + 2u] = sumRawB[0];
@@ -1048,5 +1066,10 @@ void main() {
         colorStats[base + 9u] = sumCloudAbsRG[0];
         colorStats[base + 10u] = sumCloudAbsBG[0];
         colorStats[base + 11u] = sumCloudAffected[0];
+        for(uint k=0u;k<4u;++k) {
+            colorStats[base+12u+k]=chromaStats0[0][k];
+            colorStats[base+16u+k]=chromaStats1[0][k];
+            colorStats[base+20u+k]=chromaStats2[0][k];
+        }
     }
 }

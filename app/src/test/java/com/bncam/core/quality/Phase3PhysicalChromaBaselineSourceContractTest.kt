@@ -12,13 +12,16 @@ class Phase3PhysicalChromaBaselineSourceContractTest {
     @Test
     fun `physical chroma baseline remains active with spectra profile off`() {
         val isp = File(appDir(), "src/main/cpp/IspCore.cpp").readText()
-        assertTrue(isp.contains("physicalChromaNoiseRequested"))
-        assertTrue(isp.contains("meta.calibration.noiseModelMode != 0 && chromaNrStrength > 0.005f"))
-        assertTrue(isp.contains("spectraNoiseActive || profileNoiseReductionRequested ||"))
-        assertTrue(isp.contains("physicalChromaNoiseRequested;"))
-        assertTrue(isp.contains("physicalVisibleChromaRequested"))
-        assertTrue(isp.contains("visibleChromaProcessingEnabled"))
-        assertTrue(isp.contains("spectraNoiseActive || physicalVisibleChromaRequested"))
-        assertTrue(isp.contains("PHYSICAL_NOISE_BASELINE"))
+        assertTrue(isp.contains("residualNoiseState.postDemosaic, physicalNoiseStatisticsActive"))
+        assertTrue(isp.contains("request.baselinePhysicalChroma = baselinePhysicalChroma"))
+        assertTrue(isp.indexOf("residualNoiseState.postDemosaic =") <
+            isp.indexOf("const auto baselinePhysicalChroma ="))
+        val engine = File(appDir(), "src/main/cpp/PhysicalChromaDenoise.h").readText()
+        org.junit.Assert.assertFalse(engine.contains("spectraProcessingMode"))
+        org.junit.Assert.assertFalse(engine.contains("DemosaicAlgorithm"))
+        val shader = File(appDir(), "src/main/cpp/vulkan/shaders/spectra_demosaic_resident.comp").readText()
+        assertTrue(shader.indexOf("vec3 rawForWb = physicalChromaDenoise") <
+            shader.indexOf("vec3 legacyWb = rawForWb"))
+        assertTrue(engine.contains("if (!physicalAvailable || !(n.confidence > 0)) return {}"))
     }
 }

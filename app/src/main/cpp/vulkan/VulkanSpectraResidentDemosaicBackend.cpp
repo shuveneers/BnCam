@@ -149,7 +149,7 @@ bool VulkanSpectraResidentDemosaicBackend::prepareWorkingSet(
             static_cast<std::uint64_t>((frameWidth + 15u) / 16u) *
             ((frameHeight + 15u) / 16u);
     const std::uint64_t statisticsBytes =
-            std::max<std::uint64_t>(48u, groups * 12u * sizeof(float));
+            std::max<std::uint64_t>(48u, groups * 24u * sizeof(float));
     const ResidualSampling residualSampling = residualSamplingFor(frameWidth, frameHeight);
 
     bool reallocated = false;
@@ -970,12 +970,16 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
     const std::uint64_t groupCount =
             static_cast<std::uint64_t>((request.frameWidth + 15u) / 16u) *
             static_cast<std::uint64_t>((request.frameHeight + 15u) / 16u);
-    const std::uint64_t statisticsBytes = std::max<std::uint64_t>(48u, groupCount * 12u * sizeof(float));
+    const std::uint64_t statisticsBytes = std::max<std::uint64_t>(48u, groupCount * 24u * sizeof(float));
     const ResidualSampling residualSampling = residualSamplingFor(request.frameWidth, request.frameHeight);
     // Phase 3: historical pre-WB opponent/cloud cleanup is a retired classical denoiser.
     // The transport fields remain compatibility-only; the backend cannot grant pixel authority.
     constexpr bool cloudMapContractValid = false;
-    const std::uint64_t cloudMapRecordCount = cloudMapContractValid ? 192u : 1u;
+    const bool physicalShapeReady = request.physicalSpatialSigma &&
+            request.physicalSpatialColumns > 0 && request.physicalSpatialRows > 0 &&
+            request.physicalSpatialColumns <= 256 && request.physicalSpatialRows <= 256;
+    const std::uint64_t cloudMapRecordCount = physicalShapeReady
+            ? std::uint64_t(request.physicalSpatialColumns)*request.physicalSpatialRows : 1u;
     const std::uint64_t cloudMapBytes = cloudMapRecordCount * 4u * sizeof(float);
     const bool hueSatData1Valid = request.calibratedHueSatMapEnabled &&
             hueSatTableValid(request, request.hueSatData1, request.hueSatData1FloatCount);
@@ -1054,19 +1058,14 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
     result.phase9SourceRawConfidenceMapUsed = sourceClipConfidenceReady;
     result.phase9SourceRawConfidenceMapBytes = sourceClipConfidenceReady ? expectedClipBytes : 0u;
 
-    // Upload the compact 16x12 opponent cloud field consumed by mode-3 pre-WB correction.
+    // Reuse retired cloud-map storage for the compact physical spatial sigma ratios.
     float* cloudPacked = static_cast<float*>(cloudCorrectionMap_.mapped);
     std::fill(cloudPacked, cloudPacked + static_cast<std::ptrdiff_t>(cloudMapRecordCount * 4u), 0.0f);
-    if (cloudMapContractValid) {
-        for (std::size_t i = 0; i < 192u; ++i) {
-            const std::size_t base = i * 4u;
-            cloudPacked[base + 0u] = request.preWbCloudCorrectionRG[i];
-            cloudPacked[base + 1u] = request.preWbCloudCorrectionBG[i];
-            cloudPacked[base + 2u] = request.preWbCloudCorrectionValid[i] != 0u ? 1.0f : 0.0f;
-            cloudPacked[base + 3u] = 0.0f;
+    if (physicalShapeReady) {
+        for (std::size_t i=0; i<cloudMapRecordCount; ++i) {
+            const float ratio=request.physicalSpatialSigma[i];
+            cloudPacked[i*4u]=std::isfinite(ratio) && ratio>0 ? std::clamp(ratio,0.25f,4.f) : 1.f;
         }
-        result.cloudCorrectionMapUploaded = true;
-        result.cloudCorrectionMapBytes = cloudMapBytes;
     }
     vmaFlushAllocation(allocator, cloudCorrectionMap_.allocation, 0u, static_cast<VkDeviceSize>(cloudMapBytes));
 
@@ -1162,7 +1161,7 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
     vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_TRANSFER_BIT,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr,
                          1u, &phase9TelemetryClear, 0u, nullptr);
-    if (cloudMapContractValid) {
+    if (physicalShapeReady) {
         VkBufferMemoryBarrier cloudHostToShader{};
         cloudHostToShader.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
         cloudHostToShader.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
@@ -1215,17 +1214,18 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
     push.wbR = request.wbRgb[0];
     push.wbG = request.wbRgb[1];
     push.wbB = request.wbRgb[2];
-    // Mode 3 is a pure WB/CCM colour transform in the RAW zero-denoise baseline.
-    // The existing cfaEvidence1.x slot remains the generation-scoped source-clipping flag used
-    // by highlight-colour protection. No noise/chroma-cleanup parameters are transported.
-    push.cfaEvidence0[0] = 0.0f;
-    push.cfaEvidence0[1] = 0.0f;
-    push.cfaEvidence0[2] = 0.0f;
-    push.cfaEvidence0[3] = 0.0f;
+    // Common chroma engine is fused before AWB, with immutable post-demosaic RGB evidence.
+    const auto& noise=request.baselinePhysicalChroma;
+    const bool physicalChromaReady=noise.valid();
+    push.cfaEvidence0[0] = noise.y;
+    push.cfaEvidence0[1] = noise.rg;
+    push.cfaEvidence0[2] = noise.bg;
+    push.cfaEvidence0[3] = noise.cross;
     push.cfaEvidence1[0] = sourceClipConfidenceReady ? 1.0f : 0.0f;
-    push.cfaEvidence1[1] = 0.0f;
-    push.cfaEvidence1[2] = 0.0f;
-    push.cfaEvidence1[3] = 0.0f;
+    push.cfaEvidence1[2] = request.physicalChromaValidationOnly ? 1.f : 0.f;
+    push.cfaEvidence1[3] = physicalChromaReady ? 1.f : 0.f;
+    push.ccm[9] = physicalShapeReady ? float(request.physicalSpatialColumns) : 0.f;
+    push.ccm[10] = physicalShapeReady ? float(request.physicalSpatialRows) : 0.f;
     push.ccm[0] = request.colorMatrix[0];
     push.ccm[1] = request.colorMatrix[1];
     push.ccm[2] = request.colorMatrix[2];
@@ -1373,10 +1373,13 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
 
     const auto reduceStart = Clock::now();
     const float* statistics = static_cast<const float*>(colorStatistics_.mapped);
-    double sums[12]{0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+    double sums[24]{};
     for (std::uint64_t group = 0; group < groupCount; ++group) {
-        const float* record = statistics + static_cast<std::size_t>(group) * 12u;
-        for (int i = 0; i < 12; ++i) sums[i] += static_cast<double>(record[i]);
+        const float* record = statistics + static_cast<std::size_t>(group) * 24u;
+        for (int i = 0; i < 24; ++i) {
+            if (i==15) sums[i]=std::max(sums[i],double(record[i]));
+            else sums[i] += static_cast<double>(record[i]);
+        }
     }
     const double inversePixels = 1.0 / static_cast<double>(std::max<std::uint64_t>(1u, pixelCount));
     for (int c = 0; c < 3; ++c) {
@@ -1384,7 +1387,18 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
         result.wbMean[c] = sums[3 + c] * inversePixels;
         result.ccmMean[c] = sums[6 + c] * inversePixels;
     }
-    // No pre-WB opponent/chroma correction exists in the RAW zero-denoise route.
+    result.baselinePhysicalChromaApplied=physicalChromaReady;
+    result.chromaHfAuthorityMean=sums[12]*inversePixels;
+    result.chromaLfAuthorityMean=sums[13]*inversePixels;
+    result.chromaAffectedFraction=sums[14]*inversePixels;
+    result.chromaMaxLumaError=sums[15];
+    result.chromaMeanLumaError=sums[16]*inversePixels;
+    result.chromaRmsLumaError=std::sqrt(std::max(0.0,sums[17]*inversePixels));
+    result.chromaInputFieldVariance=std::max(0.0,0.5*(sums[20]*inversePixels-
+            (sums[18]*sums[18]+sums[19]*sums[19])*inversePixels*inversePixels));
+    result.chromaOutputFieldVariance=std::max(0.0,0.5*(sums[23]*inversePixels-
+            (sums[21]*sums[21]+sums[22]*sums[22])*inversePixels*inversePixels));
+    // Retired cloud-correction telemetry remains distinct from baseline chroma.
     result.cloudMeanAbsCorrectionRG = 0.0;
     result.cloudMeanAbsCorrectionBG = 0.0;
     result.cloudAffectedPixelFraction = 0.0;

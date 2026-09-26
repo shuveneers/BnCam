@@ -1,3 +1,4 @@
+#include "PhysicalChromaDenoise.h"
 #include "ProfileColorManagement.h"
 #include "SrgbByteLut.h"
 #include "Bgr8PublicationStats.h"
@@ -6146,8 +6147,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             demosaicPhysicalSigmaChroma,
             demosaicPhysicalNoisePressure
     };
-    // RAW zero-denoise baseline: demosaic receives physical noise only as reconstruction/telemetry
-    // context. No separate residual-chroma denoise owner exists.
+    // Demosaic reconstruction precedes the common physical chroma owner at pre-AWB.
 
 
     const auto runCpuDemosaicFallback = [&]() -> cv::Mat {
@@ -6735,12 +6735,15 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     const double ccmOnlyBlueOpponentDirectionalGain = wbRgb[2] > 1.0e-6f
             ? wbCcmBlueOpponentDirectionalGain / static_cast<double>(wbRgb[2]) : 1.0;
 
-    // RAW zero-denoise baseline: propagated physical covariance remains read-only evidence.
-    // No pre-WB luma/chroma filter may mutate the demosaic output.
+    const auto baselinePhysicalChroma = bncam::chroma::fromNoiseState(
+            residualNoiseState.postDemosaic, physicalNoiseStatisticsActive);
+    // Downstream covariance stays a conservative pre-filter prediction: adaptive support is
+    // data-dependent. Do not claim a measured posterior from a global colour-field variance.
     bncam::spectra2::NoiseState preWbNoiseState = residualNoiseState.postDemosaic;
-    preWbNoiseState.stage = "POST_DEMOSAIC_PRE_AWB_ZERO_DENOISE";
-    preWbNoiseState.method = "PHYSICAL_NOISE_PROPAGATION_ONLY";
-    preWbNoiseState.status = "NO_PIXEL_DENOISE_OWNER";
+    preWbNoiseState.stage = "POST_BASELINE_CHROMA_RGB";
+    preWbNoiseState.method = "CONSERVATIVE_PRE_FILTER_PHYSICAL_COVARIANCE";
+    preWbNoiseState.status = baselinePhysicalChroma.valid() ? "BASELINE_PHYSICAL_CHROMA"
+            : "PHYSICAL_CHROMA_BYPASS_NO_VALID_NOISE_MODEL";
 
     const auto awbPropagationStart = IspClock::now();
     residualNoiseState.postAwb = bncam::spectra2::propagateAwb(
@@ -6862,6 +6865,12 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         request.deferFullReadback = true;
         request.wbRgb = {wbRgb[0], wbRgb[1], wbRgb[2]};
         request.preWbCloudCorrectionReady = false;
+        request.baselinePhysicalChroma = baselinePhysicalChroma;
+        if (g_spatialNoiseMap.relativePhysicalShape) {
+            request.physicalSpatialSigma = g_spatialNoiseMap.tileSigma.data();
+            request.physicalSpatialColumns = g_spatialNoiseMap.gridWidth;
+            request.physicalSpatialRows = g_spatialNoiseMap.gridHeight;
+        }
         for (size_t i = 0; i < request.colorMatrix.size(); ++i) {
             request.colorMatrix[i] = ccm[i];
         }
@@ -6909,10 +6918,35 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         // Typed CPU fallback only. If Vulkan colour processing fails after a resident demosaic,
         // regenerate the CPU reference once; this is failure recovery, never a normal shadow pass.
         if (linearRgb.empty()) {
+            if (!materializeRawFinalizeResidentForCpuDemosaic()) {
+                const std::string failure = "PHYSICAL_CHROMA_CPU_RECOVERY_NO_EXACT_FINALIZED_RAW";
+                if (debugOut) *debugOut = failure;
+                ISP_LOGE("%s", failure.c_str());
+                return jpegData;
+            }
             linearRgb = runCpuDemosaicFallback();
             vulkanDemosaicResident = false;
         }
-        // Failure recovery is the same zero-denoise color path: direct demosaic -> WB/CCM.
+        // Typed GPU failure recovery uses the same immutable-input chroma estimator once.
+        if (baselinePhysicalChroma.valid()) {
+            const cv::Mat source = linearRgb.clone();
+            cv::parallel_for_(cv::Range(0, linearRgb.rows), [&](const cv::Range& rows) {
+                auto read = [&](int x,int y) {
+                    const auto p=source.at<cv::Vec3f>(std::clamp(y,0,source.rows-1),std::clamp(x,0,source.cols-1));
+                    return bncam::chroma::Pixel{p[0],p[1],p[2]};
+                };
+                auto shape = [&](int x,int y) {
+                    if (!g_spatialNoiseMap.relativePhysicalShape) return 1.f;
+                    int tx=std::clamp(int((x+0.5f)*g_spatialNoiseMap.gridWidth/source.cols),0,g_spatialNoiseMap.gridWidth-1);
+                    int ty=std::clamp(int((y+0.5f)*g_spatialNoiseMap.gridHeight/source.rows),0,g_spatialNoiseMap.gridHeight-1);
+                    return g_spatialNoiseMap.tileSigma[ty*g_spatialNoiseMap.gridWidth+tx];
+                };
+                for(int y=rows.start;y<rows.end;++y) for(int x=0;x<source.cols;++x) {
+                    auto p=bncam::chroma::filter(x,y,baselinePhysicalChroma,read,shape).pixel;
+                    linearRgb.at<cv::Vec3f>(y,x)={p[0],p[1],p[2]};
+                }
+            });
+        }
         std::mutex colorStatsMutex;
         cv::parallel_for_(cv::Range(0, linearRgb.rows), [&](const cv::Range& range) {
             double localRawR = 0.0, localRawG = 0.0, localRawB = 0.0;
@@ -9203,6 +9237,26 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; spectraResidualMotionConfidence=" << residualNoiseState.motionConfidence
             << "; spectraResidualAlignmentConfidence=" << residualNoiseState.alignmentConfidence
             << formatPropagationStateFields("spectraPreDemosaic", residualNoiseState.preDemosaic)
+            << "; baselinePhysicalChroma={enabled=" << (baselinePhysicalChroma.valid()?"true":"false")
+            << ";spectraIndependent=true;inputDomain=POST_DEMOSAIC_LINEAR_RGB;noiseModel=PHYSICAL_SO_PROPAGATED"
+            << ";status=" << preWbNoiseState.status
+            << ";gpuExecuted=" << (vulkanColorTransform.baselinePhysicalChromaApplied?"true":"false")
+            << ";predictedSigmaY=" << std::sqrt(baselinePhysicalChroma.y)
+            << ";predictedSigmaRG=" << std::sqrt(baselinePhysicalChroma.rg)
+            << ";predictedSigmaBG=" << std::sqrt(baselinePhysicalChroma.bg)
+            << ";predictedCovarianceRgBg=" << baselinePhysicalChroma.cross
+            << ";measurementStatus=" << (vulkanColorTransform.success ? "GPU_MEASURED" : "UNAVAILABLE_CPU_FALLBACK")
+            << ";hfAuthorityMean=" << vulkanColorTransform.chromaHfAuthorityMean
+            << ";lfAuthorityMean=" << vulkanColorTransform.chromaLfAuthorityMean
+            << ";affectedPixelFraction=" << vulkanColorTransform.chromaAffectedFraction
+            << ";measuredInputColourFieldVariance=" << vulkanColorTransform.chromaInputFieldVariance
+            << ";measuredOutputColourFieldVariance=" << vulkanColorTransform.chromaOutputFieldVariance
+            << ";measuredMaxLumaError=" << vulkanColorTransform.chromaMaxLumaError
+            << ";measuredMeanLumaError=" << vulkanColorTransform.chromaMeanLumaError
+            << ";measuredRmsLumaError=" << vulkanColorTransform.chromaRmsLumaError
+            << ";hfYEnergyRatio=TEST_ONLY;edgeAmplitudeRatio=TEST_ONLY"
+            << ";fusedChromaAwbCcmGpuMs=" << vulkanColorTransform.kernelMs
+            << ";extraFullFrameBuffers=0;extraFullFrameReadbacks=0}"
             << formatPropagationStateFields("spectraPostDemosaic", residualNoiseState.postDemosaic)
             << formatPropagationStateFields("spectraPostAwb", residualNoiseState.postAwb)
             << formatPropagationStateFields("spectraPostColourTransform", residualNoiseState.postColourTransform)
@@ -9268,10 +9322,10 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; spectraDemosaicPreFineChromaEnergy=" << postPass2ChromaBands.fineEnergy
             << "; spectraDemosaicPreMidChromaEnergy=" << postPass2ChromaBands.midEnergy
             << "; spectraDemosaicPreLowChromaEnergy=" << postPass2ChromaBands.lowEnergy
-            << "; rawZeroDenoiseContract=true"
+            << "; rawBaselinePhysicalChromaContract=true"
             << "; rawZeroDenoisePreDemosaicSpatialNr=false"
-            << "; rawZeroDenoisePostDemosaicChromaNr=false"
-            << "; rawZeroDenoiseNoiseModelRole=TELEMETRY_AND_COVARIANCE_ONLY"
+            << "; rawBaselinePostDemosaicChromaNr=PHYSICAL_MODEL_GATED"
+            << "; rawBaselineNoiseModelRole=PHYSICAL_CHROMA_AND_COVARIANCE"
             << formatPropagationStateFields("spectraPreWbNoiseModel", preWbNoiseState)
             << "; spectraDemosaicPostLowFrequencyChromaFieldStatus="
             << (demosaicLowFrequencyChromaFieldReady

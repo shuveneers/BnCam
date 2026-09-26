@@ -1431,6 +1431,8 @@ object ImageUtils {
     @Suppress("unused")
     private external fun validateDemosaicNative(): String
 
+    external fun validatePhysicalChromaNative(): String
+
     fun validateDemosaicImplementation(): String = validateDemosaicNative()
 
     @Suppress("unused")

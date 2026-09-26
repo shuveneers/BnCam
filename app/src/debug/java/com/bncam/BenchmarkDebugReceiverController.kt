@@ -11,6 +11,7 @@ import com.bncam.core.debug.BenchmarkWriter
 import com.bncam.core.debug.AfGroundTruthTrace
 import com.bncam.core.engine.CaptureStrategy
 import com.bncam.core.quality.DemosaicMode
+import com.bncam.data.settings.ProfileIspKeys
 import com.bncam.data.settings.SettingsRepository
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
@@ -81,6 +82,10 @@ object BenchmarkDebugReceiverController {
                             if (!activeProfileId.isNullOrBlank()) {
                                 format?.takeIf { it.isNotBlank() }?.let {
                                     repository.setProfileFrameSource(activeProfileId, it)
+                                }
+                                if (intent.hasExtra("spectra")) {
+                                    repository.setProfileInt(activeProfileId, ProfileIspKeys.SPECTRA_ENABLED,
+                                        if (intent.getBooleanExtra("spectra", false)) 1 else 0)
                                 }
                                 demosaic?.takeIf { it.isNotBlank() }?.let {
                                     repository.setProfileString(

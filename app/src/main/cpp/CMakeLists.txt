@@ -526,6 +526,7 @@ if(BNCAM_GLSLC)
                     -P "${CMAKE_CURRENT_SOURCE_DIR}/vulkan/cmake/EmbedSpirv.cmake"
             DEPENDS
                     "${CMAKE_CURRENT_SOURCE_DIR}/vulkan/shaders/spectra_demosaic_resident.comp"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/vulkan/shaders/physical_chroma_denoise.glsl"
                     "${CMAKE_CURRENT_SOURCE_DIR}/vulkan/cmake/EmbedSpirv.cmake"
             VERBATIM
     )

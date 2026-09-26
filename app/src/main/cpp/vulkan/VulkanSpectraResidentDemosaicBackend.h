@@ -1,6 +1,7 @@
 #pragma once
 
 #include "VulkanVmaIntegration.h"
+#include "../PhysicalChromaDenoise.h"
 
 #include <vulkan/vulkan.h>
 
@@ -117,6 +118,11 @@ struct SpectraResidentDemosaicResult {
 };
 
 struct SpectraResidentColorTransformRequest {
+    bncam::chroma::Model baselinePhysicalChroma{};
+    const float* physicalSpatialSigma = nullptr;
+    std::uint32_t physicalSpatialColumns = 0, physicalSpatialRows = 0;
+    // Explicit diagnostic only: return the pre-AWB stage for CPU/GPU verification.
+    bool physicalChromaValidationOnly = false;
     // CPU RGB is only required when demosaic did not run in this backend (for example the
     // temporary Menon fallback). A matching resident generation consumes deviceOutput_ directly.
     const float* rgbData = nullptr;
@@ -158,6 +164,11 @@ struct SpectraResidentColorTransformRequest {
 };
 
 struct SpectraResidentColorTransformResult {
+    bool baselinePhysicalChromaApplied = false;
+    double chromaHfAuthorityMean=0, chromaLfAuthorityMean=0, chromaAffectedFraction=0;
+    double chromaMaxLumaError=0, chromaMeanLumaError=0, chromaRmsLumaError=0;
+    // Measured full-frame colour-field variance, NOT an estimator of sensor noise.
+    double chromaInputFieldVariance=0, chromaOutputFieldVariance=0;
     bool attempted = false;
     bool success = false;
     bool residentInputUsed = false;
