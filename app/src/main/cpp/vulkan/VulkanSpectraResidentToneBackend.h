@@ -190,6 +190,8 @@ struct SpectraResidentToneRequest {
 };
 
 struct SpectraResidentToneResult {
+    std::uint64_t defaultRawKhronosHighlightPixels = 0u;
+    float defaultRawKhronosMaxLumaCompression = 0.0f;
     bool attempted = false;
     bool success = false;
     bool residentInputUsed = false;

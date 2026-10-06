@@ -3,10 +3,13 @@ package com.bncam.core.isp.raw
 import kotlin.math.floor
 
 object LensShadingGrid {
+    // Camera2 MINIMUM_GAIN_FACTOR = 1; no metadata-defined upper gain limit.
+    private fun safeGain(value: Float) = value.takeIf { it.isFinite() && it >= 1f } ?: 1f
+
     fun sanitize(gains: FloatArray, columns: Int, rows: Int): FloatArray? {
-        if (columns <= 0 || rows <= 0 || gains.size < columns * rows * 4) return null
+        if (columns <= 0 || rows <= 0 || columns > gains.size / 4 / rows) return null
         return FloatArray(columns * rows * 4) { index ->
-            gains[index].takeIf { it.isFinite() }?.coerceIn(0.25f, 3.5f) ?: 1f
+            safeGain(gains[index])
         }
     }
 
@@ -33,6 +36,6 @@ object LensShadingGrid {
         fun gain(column: Int, row: Int) = safe[(row * columns + column) * 4 + plane]
         val top = gain(c0, r0) + (gain(c1, r0) - gain(c0, r0)) * tx
         val bottom = gain(c0, r1) + (gain(c1, r1) - gain(c0, r1)) * tx
-        return (top + (bottom - top) * ty).coerceIn(0.25f, 3.5f)
+        return safeGain(top + (bottom - top) * ty)
     }
 }

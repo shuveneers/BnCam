@@ -1,0 +1,7 @@
+{
+  "productReady": false,
+  "stopAtStep": 2000,
+  "automaticContinuation": false,
+  "candidates": [],
+  "controllerError": "Python exited with 1; inspect /workspace/scratch/d0624a77fdcc/implementation-verification/install-repo/build/bnc-neural-v2/v4-verification/local-20261001-195623-127/real-checkpoint-replay.log"
+}

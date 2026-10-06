@@ -2456,7 +2456,7 @@ class BnCameraManager(private val context: Context) {
         sensitivityIso: Int,
         exposureTimeNs: Long
     ): RawPreviewDemosaicDecision {
-        if (requestedBridgeMode != com.bncam.core.quality.DemosaicMode.AUTO.bridgeValue) {
+        if (requestedBridgeMode != com.bncam.core.quality.DemosaicMode.AUTO_HYBRID.bridgeValue) {
             return RawPreviewDemosaicDecision(requestedBridgeMode.coerceIn(1, 3), "manual_profile")
         }
 
@@ -2480,17 +2480,17 @@ class BnCameraManager(private val context: Context) {
         // chroma/read noise is the dominant information source.
         if (sensitivityIso >= 1000 || noisePressure >= 0.62f) {
             return RawPreviewDemosaicDecision(
-                com.bncam.core.quality.DemosaicMode.NORMAL.bridgeValue,
+                com.bncam.core.quality.DemosaicMode.MALVAR.bridgeValue,
                 "auto_malvar_noisy iso=$sensitivityIso exposureMs=$exposureMs noise=$noisePressure"
             )
         }
 
-        // Portrait evidence favours RCD's stable opponent-colour reconstruction. This is a bias,
+        // Portrait preview uses the available AMaZE quality route. This is a bias,
         // not a hard person=>algorithm contract; the noise gate above can still select Malvar.
         if (facePresent) {
             return RawPreviewDemosaicDecision(
-                com.bncam.core.quality.DemosaicMode.BILINEAR.bridgeValue,
-                "auto_rcd_portrait noise=$noisePressure"
+                com.bncam.core.quality.DemosaicMode.AMAZE.bridgeValue,
+                "auto_amaze_portrait noise=$noisePressure"
             )
         }
 
@@ -2499,14 +2499,14 @@ class BnCameraManager(private val context: Context) {
         // a static detailed subject.
         if (afLockedOrFocused && predictiveStable && noisePressure <= 0.30f) {
             return RawPreviewDemosaicDecision(
-                com.bncam.core.quality.DemosaicMode.QUALITY.bridgeValue,
+                com.bncam.core.quality.DemosaicMode.AMAZE.bridgeValue,
                 "auto_amaze_static_detail afState=$afState velocity=${prediction?.focusVelocityDioptersPerSec ?: 0f} noise=$noisePressure"
             )
         }
 
         return RawPreviewDemosaicDecision(
-            com.bncam.core.quality.DemosaicMode.BILINEAR.bridgeValue,
-            "auto_rcd_balanced afState=$afState velocity=${prediction?.focusVelocityDioptersPerSec ?: 0f} noise=$noisePressure"
+            com.bncam.core.quality.DemosaicMode.AMAZE.bridgeValue,
+            "auto_amaze_balanced afState=$afState velocity=${prediction?.focusVelocityDioptersPerSec ?: 0f} noise=$noisePressure"
         )
     }
 
@@ -2697,6 +2697,24 @@ class BnCameraManager(private val context: Context) {
                     // the WB half with a historical stable value.
                     quality.whiteBalanceGains.toNativeArray()
                 }
+                val previewFrameGains = calibrationResult?.get(CaptureResult.COLOR_CORRECTION_GAINS)?.let {
+                    floatArrayOf(it.red, it.greenEven, it.greenOdd, it.blue)
+                }
+                val previewFrameMatrix = calibrationResult?.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)
+                    ?.let(RawColorTransformEngine::colorSpaceTransformToArray)
+                val defaultRawPreview = captureMode == CaptureStrategy.SINGLE_FRAME_ZSL &&
+                    !quality.profileNoiseTuning.spectraEnabled &&
+                    quality.finalCalibration?.awbExplicitDevelopedAuthority != true &&
+                    quality.finalCalibration?.override?.colorMode == "System" &&
+                    liveWhiteBalanceTargetSensorGains == null
+                val previewExactMatrix = com.bncam.core.quality.DefaultRawCamera2PairPolicy.resolve(
+                    defaultSingleRaw = defaultRawPreview,
+                    explicitWb = false,
+                    systemColor = true,
+                    appliedGains = previewFrameGains ?: floatArrayOf(),
+                    frameGains = previewFrameGains,
+                    frameMatrix = previewFrameMatrix
+                )
                 val config = RawPreviewRenderConfig(
                     source = source,
                     pipelineGeneration = generation,
@@ -2705,8 +2723,9 @@ class BnCameraManager(private val context: Context) {
                     demosaicMode = previewDemosaic.bridgeMode,
                     blackLevels = previewDevelopedLevels.blackLevels,
                     whiteLevel = previewDevelopedLevels.whiteLevel,
-                    wbGains = previewWbGains,
-                    colorMatrix = quality.colorCorrectionMatrix.toNativeArray(),
+                    wbGains = if (previewExactMatrix != null) previewFrameGains!! else previewWbGains,
+                    colorMatrix = previewExactMatrix ?: quality.colorCorrectionMatrix.toNativeArray(),
+                    preserveExactCamera2Pair = defaultRawPreview,
                     exposureGain = previewExposureGain,
                     captureSensitivityIso = sensitivityIso,
                     captureExposureTimeNs = exposureTimeNs,
@@ -2869,12 +2888,15 @@ class BnCameraManager(private val context: Context) {
             (reportedBlack[index] * levelScale).coerceIn(0f, nativeWhite.coerceAtLeast(2) - 1f)
         }
         val rggb = calibrationResult?.get(CaptureResult.COLOR_CORRECTION_GAINS)
-        val wb = rggb?.let {
-            stabilizeRawPreviewAutoWb(
-                floatArrayOf(it.red, it.greenEven, it.greenOdd, it.blue),
-                generation
-            )
-        } ?: floatArrayOf(1f, 1f, 1f, 1f)
+        val wb = rggb?.let { floatArrayOf(it.red, it.greenEven, it.greenOdd, it.blue) }
+            ?: return@runCatching null
+        // A bootstrap image also needs a camera characterization. Do not briefly
+        // display sensor RGB as sRGB via identity, then switch color spaces when
+        // asynchronous profile loading finishes. Missing metadata waits for config.
+        val bootstrapMatrix = calibrationResult?.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)
+            ?.let(RawColorTransformEngine::colorSpaceTransformToArray)
+            ?.takeIf { RawColorTransformEngine.validateExactFrameCamera2ColorTransform(it).valid }
+            ?: return@runCatching null
         val sensitivityIso = (calibrationResult?.get(CaptureResult.SENSOR_SENSITIVITY) ?: 100)
             .coerceAtLeast(1)
         val exposureTimeNs = (calibrationResult?.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 0L)
@@ -2897,7 +2919,8 @@ class BnCameraManager(private val context: Context) {
             blackLevels = nativeBlack,
             whiteLevel = nativeWhite,
             wbGains = wb,
-            colorMatrix = floatArrayOf(1f, 0f, 0f, 0f, 1f, 0f, 0f, 0f, 1f),
+            colorMatrix = bootstrapMatrix,
+            preserveExactCamera2Pair = true,
             exposureGain = exposureGain,
             captureSensitivityIso = sensitivityIso,
             captureExposureTimeNs = exposureTimeNs,

@@ -5,24 +5,24 @@
 #include <opencv2/core.hpp>
 
 enum class DemosaicMode : int {
-    Auto = 0,
-    NormalMalvar2004 = 1,
-    QualityMenon2007 = 2,
-    Bilinear = 3
+    AutoHybrid = 0,
+    Malvar = 1,
+    Amaze = 2,
+    BncNeural = 3
 };
 
 enum class DemosaicAlgorithm : int {
     Malvar2004 = 0,
     Menon2007 = 1,
     Bilinear = 2, // Legacy/reference-only; no longer used by product bridge slot 3.
-    NeuralJdd = 3,
-    RcdInspired = NeuralJdd, // Legacy ABI alias; product identity is Neural JDD.
+    BncNeural = 3,
+    RcdInspired = BncNeural, // Legacy ABI alias; product identity is BnC Neural.
     Amaze = 4,
     AmazeInspired = Amaze // Legacy source alias; product identity is AMaZE.
 };
 
 struct DemosaicResolution {
-    DemosaicMode requestedMode = DemosaicMode::NormalMalvar2004;
+    DemosaicMode requestedMode = DemosaicMode::Malvar;
     DemosaicAlgorithm algorithm = DemosaicAlgorithm::Malvar2004;
     std::string reason = "normal_mode_forces_malvar_2004";
     bool fallbackOccurred = false;
@@ -36,7 +36,7 @@ struct DemosaicResolution {
     float autoCoherentEdgeFraction = 0.0f;
     float autoLowSignalFraction = 0.0f;
     float autoMalvarScore = 0.0f;
-    float autoRcdScore = 0.0f; // Legacy storage field; Phase 5 stores Neural-JDD score here.
+    float autoBncNeuralScore = 0.0f; // Reserved; unavailable routes have score -1 and prior zero.
     float autoAmazeScore = 0.0f;
     float autoCfaChromaRisk = 0.0f;
     float autoScoreDelta = 0.0f;
@@ -45,7 +45,7 @@ struct DemosaicResolution {
     // dominant single-route candidate only as an explicit CPU failure fallback/noise proxy.
     bool autoHybridExecution = false;
     float autoMalvarPrior = 0.0f;
-    float autoNeuralJddPrior = 0.0f;
+    float autoBncNeuralPrior = 0.0f;
     float autoAmazePrior = 0.0f;
     std::string autoRunnerUp = "not_used";
     std::string autoSignals = "not_used";
@@ -180,7 +180,7 @@ cv::Mat demosaicMalvar2004ToRgb32f(
         const DemosaicCfaEvidence* cfaEvidence = nullptr,
         const DemosaicNoiseContext* noiseContext = nullptr
 );
-// Neural JDD CPU fallback/validation behind the legacy RCD symbol. Production execution is
+// BnC Neural CPU fallback/validation behind the legacy RCD symbol. Production execution is
 // Vulkan-primary; the old symbol remains only to preserve existing native call-site ABI.
 cv::Mat demosaicRcdInspiredToRgb32f(
         const cv::Mat& normalizedBayer,

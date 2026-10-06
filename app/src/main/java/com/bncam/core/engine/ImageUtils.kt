@@ -713,6 +713,22 @@ object ImageUtils {
         // as the JNI request source. Native combines this immutable profile request with the frozen
         // PhysicalNoiseState S/O and disables Neural production when that physical model is invalid.
         val spectraRequestedByProfile = qualityConfig?.profileNoiseTuning?.spectraEnabled == true
+        // On default RAW the native "metadata matrix" flag denotes an actual
+        // same-frame pair, not merely any static CameraCharacteristics matrix.
+        val defaultSingleRaw = masterFrame.frameCount == 1 && !spectraRequestedByProfile
+        val frameTransform = captureResult?.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)
+        val exactFrameMatrix = com.bncam.core.quality.DefaultRawCamera2PairPolicy.resolve(
+            defaultSingleRaw = defaultSingleRaw,
+            explicitWb = finalCal?.awbExplicitDevelopedAuthority == true,
+            systemColor = finalCal?.override?.colorMode?.equals("System", ignoreCase = true)
+                ?: (colorMatrix == null || colorMatrix.fromMetadata),
+            appliedGains = nativeWb,
+            frameGains = fallbackWb.takeIf { rggbVector != null },
+            frameMatrix = frameTransform?.let {
+                com.bncam.core.quality.RawColorTransformEngine.colorSpaceTransformToArray(it)
+            }
+        )
+        val exactFramePair = exactFrameMatrix != null
 
         return masterFrame.nativeRaw16Buffer.withDirectBuffer { raw16DirectBuffer ->
             // Full-payload CRC verification scans the complete RAW16 array twice. Keep it available
@@ -777,13 +793,13 @@ object ImageUtils {
                 masterStorageLeftShift = domainInfo.masterStorageLeftShift,
                 masterStorageContract = domainInfo.masterStorageContract,
                 wbGains = nativeWb,
-                wbFromMetadata = nativeWbFromMetadata,
+                wbFromMetadata = if (defaultSingleRaw) exactFramePair else nativeWbFromMetadata,
                 awbCalibrationAuthority = finalCal?.awbCalibrationAuthority ?: 0f,
                 awbExplicitDevelopedAuthority = finalCal?.awbExplicitDevelopedAuthority == true,
                 awbManualGreenSplitAuthority = finalCal?.awbExplicitDevelopedAuthority == true &&
                     finalCal.awbRequestedGreenSplitMode.equals("Manual", ignoreCase = true),
-                colorMatrix = nativeColorMatrix,
-                colorMatrixFromMetadata = finalCal?.effectiveColorMatrixSource?.let { source ->
+                colorMatrix = exactFrameMatrix ?: nativeColorMatrix,
+                colorMatrixFromMetadata = if (defaultSingleRaw) exactFramePair else finalCal?.effectiveColorMatrixSource?.let { source ->
                     source.contains("CaptureResult", ignoreCase = true) || source.contains("CameraCharacteristics", ignoreCase = true)
                 } ?: (colorMatrix?.fromMetadata ?: false),
                 spectraProcessingEnabled = spectraRequestedByProfile,

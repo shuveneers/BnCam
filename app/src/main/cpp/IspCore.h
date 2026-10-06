@@ -19,7 +19,7 @@
 
 struct IspFrameMetadata {
     int cfaPattern = 0;
-    int requestedDemosaicMode = static_cast<int>(DemosaicMode::NormalMalvar2004);
+    int requestedDemosaicMode = static_cast<int>(DemosaicMode::AutoHybrid);
     bool demosaicFallbackOccurred = false;
     std::string demosaicFallbackReason = "none";
     bool demosaicFocusStabilityKnown = false;
@@ -38,6 +38,8 @@ struct IspFrameMetadata {
     float demosaicTemporalMotionAcceptance = 0.0f;
     int demosaicTemporalAcceptedPairs = 0;
     bool isRaw10 = false;
+    // Set by the RAW single-frame entry only; merged/Spectra routes retain their policy.
+    bool singleShotRaw = false;
     int captureSensitivityIso = 0;
     int64_t captureExposureTimeNs = 0;
     float raw10UnpackMs = 0.0f;

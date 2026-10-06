@@ -1,0 +1,38 @@
+{
+  "sourceCheckpoint": "build/bnc-neural-v2/training/w24-palette-fix/checkpoints/latest.pt",
+  "sourceCheckpointSHA256": "49c0c6db5ea1a2aa9949626f68b171280fee342851030d54dd9c8b21e1960ead",
+  "checkpointStep": 28000,
+  "checkpointNextSampleIndex": 896000,
+  "failureOptimizerStep": 28036,
+  "failureSampleIndex": 897163,
+  "seed": 823109,
+  "datasetSource": "procedural",
+  "sceneType": "circles_arcs",
+  "cfaPattern": "GBRG",
+  "exposure": 3.752959131789347,
+  "spectralMixingMatrix": null,
+  "sceneLinearRGBRange": [0.96736157, 3.2394352],
+  "normalizedInputRange": [0.2418403923511505, 0.8098587989807129],
+  "normalizedTargetRange": [0.2418403923511505, 0.8098587989807129],
+  "proceduralParameters": {
+    "frequency": 0.23779296875,
+    "angle": 0.5039638215133627,
+    "phase": 0.31600004230444206,
+    "width": 7.82,
+    "xOffset": 27.020099557311454,
+    "yOffset": -31.15021508038481,
+    "leftColor": [0.8503926396369934, 0.7906232476234436, 0.257759690284729],
+    "rightColor": [0.8597949743270874, 0.8631682991981506, 0.469112753868103]
+  },
+  "firstNonfinite": {
+    "tensor": "opponent[2] gated product a*b under FP16 autocast",
+    "locationSingleSampleNCHW": [0, 6, 80, 77],
+    "a": -317.0,
+    "b": 210.75,
+    "fp32Product": -66807.75,
+    "fp16Maximum": 65504,
+    "upstreamFinite": true,
+    "fp32ProductFinite": true
+  },
+  "status": "numerical FP16 overflow; original checkpoint preserved"
+}

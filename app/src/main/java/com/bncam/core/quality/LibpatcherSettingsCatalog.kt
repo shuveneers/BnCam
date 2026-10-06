@@ -390,7 +390,7 @@ object LibpatcherSettingsCatalog {
         "Shadow Compensation" -> "Interior recovery. Positive lifts shadows/lower mids while guarding highlights. Neutral has no extra effect."
         "Overall Lightness" -> "Display brightness bias. Positive lifts; negative gently darkens. Neutral has no extra effect."
         "JPEG Quality" -> "Sets the final JPEG encoder quality."
-        "Demosaic mode" -> "Select Malvar Inspired, RCD Inspired, AMAZE Inspired, or Auto."
+        "Demosaic mode" -> "Select Malvar, AMaZE, BnC Neural (currently falls back to Malvar), or Auto Hybrid."
         "Chroma Suppress" -> "Suppresses color noise and chroma mottling."
         "Luma Suppress" -> "Suppresses luminance noise."
         "Spatial Suppress" -> "Filters static noise patterns in a single frame."

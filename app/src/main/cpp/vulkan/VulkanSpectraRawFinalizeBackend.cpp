@@ -1,4 +1,5 @@
 #include "VulkanSpectraRawFinalizeBackend.h"
+#include "../LensShadingMetadata.h"
 #include "../RawGreenSplitPolicy.h"
 #include "../RawAdaptiveExposurePolicy.h"
 #include "VulkanPipelineCacheRegistry.h"
@@ -87,8 +88,9 @@ struct PushConstants {
     float o1 = 0.0f;
     float o2 = 0.0f;
     float o3 = 0.0f;
+    std::uint32_t neutralDefaultRaw = 0u;
 };
-static_assert(sizeof(PushConstants) == 108u, "raw finalize push constant layout mismatch");
+static_assert(sizeof(PushConstants) == 112u, "raw finalize push constant layout mismatch");
 
 float medianFromSamples(std::vector<float>& values) {
     if (values.empty()) return 0.0f;
@@ -182,7 +184,7 @@ bool VulkanSpectraRawFinalizeBackend::ensureLensMapLocked(
     return false;
 #else
     const bool valid = request.lensShadingMap != nullptr &&
-            request.lensShadingColumns > 0u && request.lensShadingRows > 0u;
+            bncam::lsc::validShape(request.lensShadingElementCount, request.lensShadingColumns, request.lensShadingRows);
     const std::uint64_t floats = valid
             ? static_cast<std::uint64_t>(request.lensShadingColumns) * request.lensShadingRows * 4u
             : 4u;
@@ -602,16 +604,18 @@ SpectraRawFinalizeResult VulkanSpectraRawFinalizeBackend::executeInternal(
     push.cfaOffsetX = request.cfaOffsetX;
     push.cfaOffsetY = request.cfaOffsetY;
     push.mode = 0u;
+    push.neutralDefaultRaw = request.neutralDefaultRaw
+            ? (request.preserveExactCamera2Pair ? 3u : 1u) : 0u;
     push.xStep = xStep;
     push.yStep = yStep;
     push.sampleColumns = columns;
     push.sampleRows = rows;
     push.lensColumns = request.lensShadingColumns;
     push.lensRows = request.lensShadingRows;
-    push.lensEnabled = (request.lensShadingMap != nullptr && request.lensShadingColumns > 0u &&
-                        request.lensShadingRows > 0u) ? 1u : 0u;
+    push.lensEnabled = (request.lensShadingMap != nullptr && bncam::lsc::validShape(request.lensShadingElementCount, request.lensShadingColumns, request.lensShadingRows)) ? 1u : 0u;
     push.baseDefectThreshold = request.isRaw10 ? 0.070f : 0.050f;
-    push.greenCalibrationRatio = std::clamp(request.greenCalibrationRatio, 0.50f, 2.0f);
+    push.greenCalibrationRatio = request.preserveExactCamera2Pair ? request.greenCalibrationRatio :
+            std::clamp(request.greenCalibrationRatio, 0.50f, 2.0f);
     push.noiseModelEnabled = request.noiseModelValid ? 1u : 0u;
     push.s0 = request.effectiveS[0]; push.s1 = request.effectiveS[1];
     push.s2 = request.effectiveS[2]; push.s3 = request.effectiveS[3];
@@ -903,6 +907,8 @@ SpectraRawFinalizeResult VulkanSpectraRawFinalizeBackend::executeInternal(
     vmaInvalidateAllocation(allocator, telemetry_.allocation, 0u, static_cast<VkDeviceSize>(telemetryBytes));
     const auto* telemetry = static_cast<const std::uint32_t*>(telemetry_.mapped);
     result.sourceSaturatedPixelCount = telemetry[0];
+    result.defaultRawPartialClipPixels = request.neutralDefaultRaw ? telemetry[30] : 0u;
+    result.defaultRawFullClipPixels = request.neutralDefaultRaw ? telemetry[31] : 0u;
     result.defectCorrectedPixelCount = telemetry[1];
     result.lensCorrectedPixelCount = telemetry[2];
     result.overRangePixelCount = telemetry[3];
@@ -910,8 +916,7 @@ SpectraRawFinalizeResult VulkanSpectraRawFinalizeBackend::executeInternal(
     const std::uint32_t gainBits = telemetry[4];
     std::memcpy(&maxGain, &gainBits, sizeof(maxGain));
     result.lensMaximumGain = std::isfinite(maxGain) ? std::max(1.0f, maxGain) : 1.0f;
-    result.lensShadingApplied = request.lensShadingMap != nullptr && request.lensShadingColumns > 0u &&
-            request.lensShadingRows > 0u;
+    result.lensShadingApplied = request.lensShadingMap != nullptr && bncam::lsc::validShape(request.lensShadingElementCount, request.lensShadingColumns, request.lensShadingRows);
 
     if (request.adaptiveExposureEnabled) {
         const auto telemetryFloat = [&](std::uint32_t index, float fallback) noexcept {

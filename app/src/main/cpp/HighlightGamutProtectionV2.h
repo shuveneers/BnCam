@@ -110,6 +110,33 @@ inline SensorColorConfidence resolveSensorColorConfidence(const Rgb& raw) noexce
     return out;
 }
 
+// Default single-shot RAW: each CFA sample retains full authority below the sensor
+// clip guard. Chroma is reduced only when ALL four samples lose information. In
+// particular a clipped R, B, or one green cannot erase the other channel ratios.
+// No missing channel is guessed from a neutral prior; preserve measured colour
+// when reconstruction is underdetermined, and leave display rolloff to Khronos.
+inline float defaultRawSampleLoss(float value) noexcept {
+    return finite(value) ? smoothstep(kSensorClipThreshold, 1.0f, value) : 1.0f;
+}
+
+inline float defaultRawCellConfidence(const std::array<float, 4>& samples) noexcept {
+    float loss = 1.0f;
+    for (float value : samples) loss *= defaultRawSampleLoss(value);
+    return std::clamp(1.0f - loss, 0.0f, 1.0f);
+}
+
+// Interpolate evidence only, never RGB. The owning cell is a lower bound on
+// confidence: clipped neighbours cannot neutralize an intact/partially clipped cell.
+template<class ReadCell>
+inline float defaultRawConfidenceAt(int x, int y, ReadCell read) noexcept {
+    const float cx = float(x) * 0.5f - 0.25f, cy = float(y) * 0.5f - 0.25f;
+    const int x0 = int(std::floor(cx)), y0 = int(std::floor(cy));
+    const float fx = cx - float(x0), fy = cy - float(y0);
+    const float top = read(x0,y0) * (1.0f-fx) + read(x0+1,y0) * fx;
+    const float bottom = read(x0,y0+1) * (1.0f-fx) + read(x0+1,y0+1) * fx;
+    return std::max(read(x/2,y/2), top * (1.0f-fy) + bottom * fy);
+}
+
 // Apply only after normal WB + camera color transform, while values are still linear.
 // Mixing toward [Y,Y,Y] preserves BT.709 linear luminance exactly because the luma
 // coefficients sum to one. Values above 1.0 remain scene-linear headroom for Phase 10.
@@ -166,9 +193,10 @@ inline bool heuristicMagentaHighlightRisk(const Rgb& rgb) noexcept {
 }
 
 
-// Scene-linear sRGB has no meaningful upper unit bound before tone mapping; values >1 are HDR
-// headroom. The relevant pre-tone gamut failure is a negative CCM component. Compress chroma
-// toward the neutral axis at constant linear-sRGB luminance only when needed to reach RGB>=0.
+// Legacy scene-stage policy, also used at the default RAW display-render entrance.
+// Negative sRGB coordinates can describe valid scene colours outside these primaries.
+// Default RAW must NOT call this before LOG/FLLF: preserve signed scene chromaticity
+// until the nonnegative Rec.709 input contract of the Khronos display mapper.
 inline GamutProtectionResult protectSignedCcmLowerGamut(const Rgb& signedRgb) noexcept {
     GamutProtectionResult result{};
     result.rgb = signedRgb;
