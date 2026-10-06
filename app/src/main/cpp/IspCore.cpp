@@ -1,11 +1,15 @@
 #include "PhysicalChromaDenoise.h"
 #include "PhysicalLumaDenoise.h"
+// BEGIN_PHYSICAL_MODEL_ONLY
+#include "PhysicalNoisePropagation.h"
+// END_PHYSICAL_MODEL_ONLY
 #include "ProfileColorManagement.h"
 #include "SrgbByteLut.h"
 #include "Bgr8PublicationStats.h"
 #include "ObjectiveValidationSummary.h"
 #include "JpegEncodingPolicy.h"
 #include "IspCore.h"
+#include "LensShadingMetadata.h"
 #include "RawCfaLevelMapping.h"
 #include "RawDefectCorrectionPolicy.h"
 #include "RawSceneBlackAuthorityPolicy.h"
@@ -24,6 +28,8 @@
 #include "RawCameraHueSatMapTelemetry.h"
 #include "RawCameraHueSatMapNoisePropagation.h"
 #include "HighlightGamutProtectionV2.h"
+#include "DefaultRawColorPipeline.h"
+#include "DefaultRawSceneEvidence.h"
 #include "Demosaic.h"
 #include "FastLocalLaplacianPolicy.h"
 #include "ProfileToneRenderPolicy.h"
@@ -257,16 +263,15 @@ float safeWbGain(float value) {
 }
 
 float safeLensGain(float value) {
-    if (!std::isfinite(value)) return 1.0f;
-    return std::clamp(value, 0.25f, 3.5f);
+    // Camera2 gains are finite and >= 1. Valid metadata has no arbitrary upper cap.
+    return bncam::lsc::safeGain(value);
 }
 
 bool lensShadingMapValid(const IspFrameMetadata& meta) {
     const int cols = meta.lensShadingColumns;
     const int rows = meta.lensShadingRows;
     if (!meta.lensShadingFromMetadata || cols <= 0 || rows <= 0) return false;
-    const size_t needed = static_cast<size_t>(cols) * static_cast<size_t>(rows) * 4u;
-    return meta.lensShadingMap.size() >= needed;
+    return bncam::lsc::validShape(meta.lensShadingMap.size(), cols, rows);
 }
 
 float lensShadingGainAt(const IspFrameMetadata& meta, int channel, int x, int y, int width, int height) {
@@ -1154,15 +1159,15 @@ GenericCurvePropagationEstimate estimateGenericCurvePropagation(
 
 bncam::spectra2::DemosaicModel requestedDemosaicNoiseModel(int requestedMode) {
     switch (static_cast<DemosaicMode>(requestedMode)) {
-        case DemosaicMode::Bilinear:
-            // Legacy bridge value 3 is the persisted identity for RCD Inspired.
-            return bncam::spectra2::DemosaicModel::RcdInspired;
-        case DemosaicMode::QualityMenon2007:
+        case DemosaicMode::BncNeural:
+            // Propagation follows the actual unavailable-backend fallback.
+            return bncam::spectra2::DemosaicModel::Malvar2004;
+        case DemosaicMode::Amaze:
             // Legacy bridge value 2 is the persisted identity for AMAZE Inspired.
             return bncam::spectra2::DemosaicModel::AmazeInspired;
-        case DemosaicMode::NormalMalvar2004:
+        case DemosaicMode::Malvar:
             return bncam::spectra2::DemosaicModel::Malvar2004;
-        case DemosaicMode::Auto:
+        case DemosaicMode::AutoHybrid:
         default:
             return bncam::spectra2::DemosaicModel::Unknown;
     }
@@ -2407,7 +2412,8 @@ DefectCorrectionDebug applyDefectCorrectionToJpegRaw(LinearFloatRaw& raw, const 
 GreenSplitDebug applyGreenSplitCorrectionToJpegRaw(
         LinearFloatRaw& raw,
         float greenCalibrationRatio,
-        bool allowResidualCorrection) {
+        bool allowResidualCorrection,
+        bool preserveExactPair = false) {
     GreenSplitDebug debug{};
     const auto start = IspClock::now();
     if (raw.mosaic.empty() || raw.mosaic.type() != CV_32FC1) {
@@ -2419,7 +2425,7 @@ GreenSplitDebug applyGreenSplitCorrectionToJpegRaw(
     std::vector<float> greenEven;
     std::vector<float> greenOdd;
     const int pattern = cfaPatternOrDefault(raw.info.effectiveCfaPattern);
-    const float safeGreenRatio = std::clamp(
+    const float safeGreenRatio = preserveExactPair ? greenCalibrationRatio : std::clamp(
             std::isfinite(greenCalibrationRatio) ? greenCalibrationRatio : 1.0f, 0.50f, 2.0f);
     const float greenEvenPriorScale = (2.0f * safeGreenRatio) / (safeGreenRatio + 1.0f);
     const float greenOddPriorScale = 2.0f / (safeGreenRatio + 1.0f);
@@ -4835,6 +4841,14 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     const char* sourceName = rawSourceFormatName(workingRaw.info.sourceFormat);
     const bool isRaw10 = workingRaw.info.sourceFormat == RawSourceFormat::RAW10;
     const bool isRawSensor = workingRaw.info.sourceFormat == RawSourceFormat::RAW_SENSOR;
+    const bool neutralDefaultRaw = meta.singleShotRaw && meta.calibration.spectraProcessingMode == 0;
+    const bool preserveExactCamera2Pair = neutralDefaultRaw && uiConfig.wbFromMetadata &&
+            uiConfig.colorMatrixFromMetadata && !meta.calibration.awbExplicitDevelopedAuthority &&
+            std::all_of(meta.calibration.effectiveWbGains, meta.calibration.effectiveWbGains + 4,
+                    [](float gain) { return std::isfinite(gain) && gain > 0.0f; });
+    const auto colorWbGain = [preserveExactCamera2Pair](float gain) {
+        return preserveExactCamera2Pair ? gain : safeWbGain(gain);
+    };
     if (!isRaw10 && !isRawSensor) {
         if (debugOut != nullptr) {
             *debugOut = std::string("RAW_BASELINE_RENDER: unsupported source format: ") + sourceName;
@@ -5561,9 +5575,54 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         return true;
     };
 
+    cv::Mat defaultRawSourceConfidence;
+    std::uint64_t defaultRawCpuPartialClipPixels = 0u, defaultRawCpuFullClipPixels = 0u;
+    float defaultRawCpuMinConfidence = 1.0f;
+    const auto ensureDefaultRawSourceConfidence = [&]() {
+        if (!neutralDefaultRaw || !defaultRawSourceConfidence.empty()) return;
+        defaultRawSourceConfidence.create((rawHeight + 1) / 2, (rawWidth + 1) / 2, CV_32FC1);
+        const auto source = [&](int x, int y) {
+            x = std::clamp(x, 0, rawWidth - 1);
+            y = std::clamp(y, 0, rawHeight - 1);
+            return residentEntry ? residentInput->sampleView.sample(x, y)
+                                 : jpegRaw.mosaic.at<float>(y, x);
+        };
+        for (int y = 0; y < rawHeight; y += 2) for (int x = 0; x < rawWidth; x += 2) {
+            const std::array<float, 4> samples{source(x,y), source(x+1,y), source(x,y+1), source(x+1,y+1)};
+            int clipped = 0;
+            for (float v : samples) if (v >= bncam::highlight::kSensorClipThreshold) ++clipped;
+            const int pixels = std::min(2,rawWidth-x) * std::min(2,rawHeight-y);
+            if (clipped > 0 && clipped < 4) defaultRawCpuPartialClipPixels += pixels;
+            if (clipped == 4) defaultRawCpuFullClipPixels += pixels;
+            defaultRawSourceConfidence.at<float>(y/2, x/2) = bncam::highlight::defaultRawCellConfidence(samples);
+        }
+        for (int y = 0; y < rawHeight; ++y) for (int x = 0; x < rawWidth; ++x) {
+            defaultRawCpuMinConfidence = std::min(defaultRawCpuMinConfidence,
+                    bncam::highlight::defaultRawConfidenceAt(x, y, [&](int cx, int cy) {
+                        return defaultRawSourceConfidence.at<float>(
+                                std::clamp(cy,0,defaultRawSourceConfidence.rows-1),
+                                std::clamp(cx,0,defaultRawSourceConfidence.cols-1));
+                    }));
+        }
+    };
+    const auto defaultRawConfidence = [&](int x, int y) {
+        bncam::highlight::SensorColorConfidence evidence{};
+        evidence.confidence = bncam::highlight::defaultRawConfidenceAt(x, y, [&](int cx, int cy) {
+            return defaultRawSourceConfidence.at<float>(
+                    std::clamp(cy, 0, defaultRawSourceConfidence.rows-1),
+                    std::clamp(cx, 0, defaultRawSourceConfidence.cols-1));
+        });
+        evidence.reduced = evidence.confidence < 1.0f - 1.0e-6f;
+        evidence.zero = evidence.confidence <= 1.0e-6f;
+        return evidence;
+    };
+    std::atomic<std::uint64_t> defaultRawCpuNeutralizedPixels{0u};
+    std::atomic<std::uint64_t> defaultRawCpuConfidenceReducedPixels{0u};
+
     const auto runCpuRawFinalize = [&]() {
         if (jpegRawCpuFinalized) return;
         if (jpegRaw.mosaic.empty() && !ensureCpuWorkingRaw("CPU_RAW_FINALIZE_EXPLICIT_FAILSAFE")) return;
+        ensureDefaultRawSourceConfidence();
         std::atomic<uint64_t> fullRaw16SaturatedCount{0};
         cv::parallel_for_(cv::Range(0, jpegRaw.mosaic.rows), [&](const cv::Range& range) {
             uint64_t localSaturated = 0;
@@ -5580,13 +5639,15 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                         static_cast<double>(jpegRaw.mosaic.total())
                 : 0.0;
         defectDebug = applyDefectCorrectionToJpegRaw(jpegRaw, meta);
-        const float greenWbEven = safeWbGain(meta.calibration.effectiveWbGains[1]);
-        const float greenWbOdd = safeWbGain(meta.calibration.effectiveWbGains[2]);
-        const float greenCalibrationRatio = std::clamp(greenWbEven / std::max(1.0e-4f, greenWbOdd), 0.50f, 2.0f);
+        const float greenWbEven = colorWbGain(meta.calibration.effectiveWbGains[1]);
+        const float greenWbOdd = colorWbGain(meta.calibration.effectiveWbGains[2]);
+        const float greenCalibrationRatio = preserveExactCamera2Pair ? greenWbEven / greenWbOdd :
+                std::clamp(greenWbEven / std::max(1.0e-4f, greenWbOdd), 0.50f, 2.0f);
         greenSplitDebug = applyGreenSplitCorrectionToJpegRaw(
                 jpegRaw,
                 greenCalibrationRatio,
-                !meta.calibration.awbManualGreenSplitAuthority);
+                !meta.calibration.awbManualGreenSplitAuthority && !preserveExactCamera2Pair,
+                preserveExactCamera2Pair);
         lensDebug = applyLensShadingToJpegRaw(jpegRaw, meta);
         // Automatic software exposure is intentionally neutral. Local FLLF tone mapping owns
         // automatic brightness/DR placement after calibrated scene-linear colour.
@@ -5595,7 +5656,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     };
 
     const bool autoDemosaicRequested =
-            meta.requestedDemosaicMode == static_cast<int>(DemosaicMode::Auto);
+            resolveDemosaicMode(meta.requestedDemosaicMode).requestedMode == DemosaicMode::AutoHybrid;
 
     // Phase 3/8/11 contract: keep the frozen physical-noise export alive for the entire
     // RAW finalize + downstream propagation section. Neural preparation and later read-only
@@ -5604,6 +5665,8 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     const auto frozenPhysicalNoise = meta.calibration.frozenPhysicalNoiseModel();
     {
         bncam::vulkan::SpectraRawFinalizeRequest request{};
+        request.neutralDefaultRaw = neutralDefaultRaw;
+        request.preserveExactCamera2Pair = preserveExactCamera2Pair;
         request.mosaicData = jpegRaw.mosaic.empty() ? nullptr : jpegRaw.mosaic.ptr<float>(0);
         request.deferFullFrameReadback = true;
         request.frameWidth = static_cast<std::uint32_t>(rawWidth);
@@ -5626,13 +5689,15 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         request.noiseModelValid = frozenPhysicalNoise.available;
         request.effectiveS = frozenPhysicalNoise.shotS;
         request.effectiveO = frozenPhysicalNoise.readO;
-        const float greenWbEven = safeWbGain(meta.calibration.effectiveWbGains[1]);
-        const float greenWbOdd = safeWbGain(meta.calibration.effectiveWbGains[2]);
-        request.greenCalibrationRatio = std::clamp(
+        const float greenWbEven = colorWbGain(meta.calibration.effectiveWbGains[1]);
+        const float greenWbOdd = colorWbGain(meta.calibration.effectiveWbGains[2]);
+        request.greenCalibrationRatio = preserveExactCamera2Pair ? greenWbEven / greenWbOdd : std::clamp(
                 greenWbEven / std::max(1.0e-4f, greenWbOdd), 0.50f, 2.0f);
-        request.allowGreenResidualCorrection = !meta.calibration.awbManualGreenSplitAuthority;
+        request.allowGreenResidualCorrection = !meta.calibration.awbManualGreenSplitAuthority &&
+                !preserveExactCamera2Pair;
         if (lensShadingMapValid(meta)) {
             request.lensShadingMap = meta.lensShadingMap.data();
+            request.lensShadingElementCount = meta.lensShadingMap.size();
             request.lensShadingColumns = static_cast<std::uint32_t>(meta.lensShadingColumns);
             request.lensShadingRows = static_cast<std::uint32_t>(meta.lensShadingRows);
             request.lensShadingGenerationId = spectraLensMapGenerationId(meta);
@@ -6113,6 +6178,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         if (!rawFinalizeResident || vulkanRawFinalize.residentOutputGeneration == 0u) {
             return true;
         }
+        ensureDefaultRawSourceConfidence();
         std::vector<float> materialized;
         if (!bncam::vulkan::VulkanRuntime::instance().readbackSpectraRawFinalizeResident(
                     vulkanRawFinalize.residentOutputGeneration, materialized) ||
@@ -6158,11 +6224,6 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         runCpuRawFinalize();
         cv::Mat cpuRgb;
         switch (demosaicResolution.algorithm) {
-            case DemosaicAlgorithm::RcdInspired:
-                cpuRgb = demosaicRcdInspiredToRgb32f(
-                        jpegRaw.mosaic, jpegRaw.info.effectiveCfaPattern, &demosaicRunStats,
-                        &demosaicExecutionCfaEvidence, &demosaicNoiseContext);
-                break;
             case DemosaicAlgorithm::AmazeInspired:
                 cpuRgb = demosaicAmazeInspiredToRgb32f(
                         jpegRaw.mosaic, jpegRaw.info.effectiveCfaPattern, &demosaicRunStats,
@@ -6176,6 +6237,11 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                 cpuRgb = demosaicMenon2007ToRgb32f(
                         jpegRaw.mosaic, jpegRaw.info.effectiveCfaPattern, &demosaicRunStats);
                 break;
+            case DemosaicAlgorithm::BncNeural:
+                demosaicResolution.algorithm = DemosaicAlgorithm::Malvar2004;
+                demosaicResolution.fallbackOccurred = true;
+                demosaicResolution.fallbackReason = "BNC_NEURAL_BACKEND_UNAVAILABLE";
+                [[fallthrough]];
             case DemosaicAlgorithm::Malvar2004:
             default:
                 cpuRgb = demosaicMalvar2004ToRgb32f(
@@ -6208,7 +6274,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         request.noiseSigmaChroma = demosaicNoiseContext.sigmaChroma;
         request.noisePressure = demosaicNoiseContext.pressure;
         request.autoMalvarPrior = demosaicResolution.autoMalvarPrior;
-        request.autoNeuralJddPrior = demosaicResolution.autoNeuralJddPrior;
+        request.autoBncNeuralPrior = demosaicResolution.autoBncNeuralPrior;
         request.autoAmazePrior = demosaicResolution.autoAmazePrior;
         if (demosaicResolution.autoHybridExecution) {
             request.algorithm = bncam::vulkan::SpectraGpuDemosaicAlgorithm::AUTO_HYBRID;
@@ -6293,7 +6359,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             ? bncam::spectra2::propagateAutoHybridDemosaic(
                     residualNoiseState.preDemosaic,
                     demosaicResolution.autoMalvarPrior,
-                    demosaicResolution.autoNeuralJddPrior,
+                    demosaicResolution.autoBncNeuralPrior,
                     demosaicResolution.autoAmazePrior,
                     "POST_DEMOSAIC_RGB")
             : bncam::spectra2::propagateDemosaic(
@@ -6454,10 +6520,10 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     // normal Vulkan execution reuses the compact post-demosaic GPU sample grid already read back
     // for residual observability. CPU sampling exists only on the typed demosaic failure route.
     const float wbMetadata[4] = {
-            safeWbGain(meta.calibration.effectiveWbGains[0]),
-            safeWbGain(meta.calibration.effectiveWbGains[1]),
-            safeWbGain(meta.calibration.effectiveWbGains[2]),
-            safeWbGain(meta.calibration.effectiveWbGains[3])
+            colorWbGain(meta.calibration.effectiveWbGains[0]),
+            colorWbGain(meta.calibration.effectiveWbGains[1]),
+            colorWbGain(meta.calibration.effectiveWbGains[2]),
+            colorWbGain(meta.calibration.effectiveWbGains[3])
     };
     const float greenReference = std::max(1.0e-4f, 0.5f * (wbMetadata[1] + wbMetadata[2]));
     float wbPriorRgb[3] = {
@@ -6536,6 +6602,14 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         nativeAppliedContributionWeight = 0.0f;
         nativeAdjustmentType = "none_explicit_lens_awb_hard_authority";
         nativeAdjustmentMagnitude = 0.0f;
+    } else if (preserveExactCamera2Pair) {
+        // Camera2's matrix follows these exact gains; scene evidence cannot change
+        // one half of that solution. Green-site WB was applied before demosaic.
+        phase7AwbEstimate.finalGainsRgb = {wbPriorRgb[0], 1.0, wbPriorRgb[2]};
+        phase7AwbEstimate.dataAuthority = 0.0;
+        phase7AwbEstimate.method = "CAMERA2_EXACT_FRAME_PAIR_UNMODIFIED";
+        phase7AwbEstimate.status = "READY_EXACT_CAMERA2_PAIR_UNMODIFIED";
+        nativeAdjustmentType = "none_exact_camera2_color_pair";
     } else if (exactCamera2ColorPair) {
         // Sensor Auto may use a bounded physical scene refinement while the exact Camera2 colour
         // transform remains intact.
@@ -6585,6 +6659,11 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             1.0f,
             static_cast<float>(phase7AwbEstimate.finalGainsRgb[2])
     };
+    if (preserveExactCamera2Pair) {
+        wbRgb[0] = wbMetadata[0];
+        wbRgb[1] = greenReference;
+        wbRgb[2] = wbMetadata[3];
+    }
     const float phase7AwbEstimatorMs = elapsedMs(phase7AwbStart);
 
     const float* camera2Ccm = meta.calibration.effectiveColorMatrix;
@@ -6636,9 +6715,10 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                     calibratedHueSatMapAvailable && calibratedProfile != nullptr && calibratedProfile->valid(),
                     true
             });
-    const bool calibratedMatrixProfileActive = cameraCharacterizationPlan.calibratedMatrixApply;
-    const bool calibratedHueSatMapActive = cameraCharacterizationPlan.calibratedHueSatMapApply;
+    const bool calibratedMatrixProfileActive = !preserveExactCamera2Pair && cameraCharacterizationPlan.calibratedMatrixApply;
+    const bool calibratedHueSatMapActive = !preserveExactCamera2Pair && cameraCharacterizationPlan.calibratedHueSatMapApply;
     const bncam::color::RawAdaptiveColorAuthorityPlan adaptiveColorAuthority =
+            preserveExactCamera2Pair ? bncam::color::exactCamera2Authority(activeColorMatrix) :
             bncam::color::resolveRawAdaptiveColorAuthority({
                     exactCamera2ColorPair,
                     calibratedMatrixProfileActive && calibratedForwardTransform.ready,
@@ -6867,6 +6947,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     const auto awbColourTransformStart = IspClock::now();
     {
         bncam::vulkan::SpectraResidentColorTransformRequest request{};
+        request.neutralDefaultRaw = neutralDefaultRaw;
         request.rgbData = linearRgb.empty() ? nullptr : linearRgb.ptr<float>(0);
         request.frameWidth = static_cast<std::uint32_t>(
                 linearRgb.empty() ? demosaicInputWidth : linearRgb.cols);
@@ -6981,6 +7062,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                 }
             });
         }
+        ensureDefaultRawSourceConfidence();
         std::mutex colorStatsMutex;
         cv::parallel_for_(cv::Range(0, linearRgb.rows), [&](const cv::Range& range) {
             double localRawR = 0.0, localRawG = 0.0, localRawB = 0.0;
@@ -7005,6 +7087,14 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                     const float signedR = ccm[0] * wbR + ccm[1] * wbG + ccm[2] * wbB;
                     const float signedG = ccm[3] * wbR + ccm[4] * wbG + ccm[5] * wbB;
                     const float signedB = ccm[6] * wbR + ccm[7] * wbG + ccm[8] * wbB;
+                    bncam::highlight::Rgb profileInput{signedR, signedG, signedB};
+                    if (neutralDefaultRaw) {
+                        const auto evidence = defaultRawConfidence(x, y);
+                        const auto safe = bncam::highlight::applyClippingAwareHighlightColor(profileInput, evidence);
+                        profileInput = safe.rgb;
+                        if (safe.applied) defaultRawCpuNeutralizedPixels.fetch_add(1u, std::memory_order_relaxed);
+                        if (evidence.reduced) defaultRawCpuConfidenceReducedPixels.fetch_add(1u, std::memory_order_relaxed);
+                    }
                     cv::Vec3f rendered(
                             std::max(0.0f, signedR),
                             std::max(0.0f, signedG),
@@ -7013,15 +7103,20 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                         bool hsmApplied = false;
                         const auto corrected = bncam::color::rawCameraApplyCalibratedHueSatMapLinearSrgb(
                                 calibratedHueSatMapCpu,
-                                {signedR, signedG, signedB},
+                                {profileInput.r, profileInput.g, profileInput.b},
                                 &hsmApplied);
                         if (hsmApplied) {
+                            profileInput = {corrected[0], corrected[1], corrected[2]};
                             rendered = cv::Vec3f(
                                     std::max(0.0f, corrected[0]),
                                     std::max(0.0f, corrected[1]),
                                     std::max(0.0f, corrected[2]));
                             cpuFallbackHueSatAppliedPixels.fetch_add(1u, std::memory_order_relaxed);
                         }
+                    }
+                    if (neutralDefaultRaw) {
+                        const auto safe = bncam::color::preserveSignedSceneColor(profileInput);
+                        rendered = cv::Vec3f(safe.rgb.r, safe.rgb.g, safe.rgb.b);
                     }
                     // Keep Phase-8 matrix statistics in the linear post-matrix/pre-HSM domain
                     // on both GPU and failure-only CPU routes. The scene observer later sees
@@ -7104,6 +7199,11 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             bncam::color::auditPrePresentationSceneMean(ccmMeanR, ccmMeanG, ccmMeanB);
 
     Phase9ColorProtectionDebug phase9ColorDebug{};
+    if (neutralDefaultRaw && cpuColorTransformApplied) {
+        phase9ColorDebug.cpuFallback = true;
+        phase9ColorDebug.colorConfidenceAppliedPixels = defaultRawCpuNeutralizedPixels.load();
+        phase9ColorDebug.sourceRawConfidenceCandidatePixels = defaultRawCpuConfidenceReducedPixels.load();
+    }
     if (vulkanColorTransform.success) {
         phase9ColorDebug.gpuPrimary = true;
         phase9ColorDebug.sensorClipCandidatePixels = vulkanColorTransform.phase9SensorClipCandidatePixels;
@@ -7178,6 +7278,8 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             return;
         }
         const auto phase9CpuStart = IspClock::now();
+        if (neutralDefaultRaw && !materializeRawFinalizeResidentForCpuDemosaic()) return;
+        ensureDefaultRawSourceConfidence();
         linearRgb = runCpuDemosaicFallback();
         vulkanDemosaicResident = false;
         if (linearRgb.empty() || linearRgb.type() != CV_32FC3) {
@@ -7215,7 +7317,9 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                     const cv::Vec3f rawCv = outRow[x];
                     const bncam::highlight::Rgb raw{rawCv[0], rawCv[1], rawCv[2]};
                     const auto clip = bncam::highlight::classifySensorClip(raw);
-                    const auto colorConfidence = bncam::highlight::resolveSensorColorConfidence(raw);
+                    const auto colorConfidence = neutralDefaultRaw
+                            ? defaultRawConfidence(x, y)
+                            : bncam::highlight::resolveSensorColorConfidence(raw);
                     if (colorConfidence.reduced) {
                         sensorClipCandidates.fetch_add(1u, std::memory_order_relaxed);
                     }
@@ -7268,6 +7372,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                         }
                     }
                     const auto protectedCcm =
+                            neutralDefaultRaw ? bncam::color::preserveSignedSceneColor(profileInput) :
                             bncam::highlight::protectSignedCcmLowerGamut(profileInput);
                     if (protectedCcm.applied) gamutCompressed.fetch_add(1u, std::memory_order_relaxed);
                     if (bncam::highlight::heuristicMagentaHighlightRisk(protectedCcm.rgb)) {
@@ -7595,8 +7700,14 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     // WB/CCM can lift an objectively dim RAW median well above the pre-color RAW fraction;
     // retain indoor-surroundings evidence through that expected perceptual range.
     const float darkSurroundingsGate = 1.0f - baselineSmoothstep(0.08f, 0.24f, p50);
+    const bool displayTouchesEdge = bestDisplayMinX == 0 || bestDisplayMinY == 0 ||
+            bestDisplayMaxX == displayGridWidth-1 || bestDisplayMaxY == displayGridHeight-1;
+    const auto defaultRawScene = bncam::tone::defaultRawSceneEvidence(
+            actualIso, exposureMs, exposureKnown, displayTouchesEdge);
+    const float defaultRawDaylightEvidence = defaultRawScene.daylight;
+    const float defaultRawDisplayGate = neutralDefaultRaw ? defaultRawScene.displayGate : 1.0f;
     const float displayHighlightConfidence = std::clamp(
-            displayAreaGate * darkSurroundingsGate *
+            defaultRawDisplayGate * displayAreaGate * darkSurroundingsGate *
                     (0.45f * displayRectGate + 0.35f * displayContrastGate +
                      0.20f * indoorLowLightConfidence),
             0.0f,
@@ -7614,7 +7725,8 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     const float outdoorSkyConfidence = std::clamp(
             outdoorSkyEvidence *
                     (1.0f - 0.82f * displayHighlightConfidence) *
-                    (1.0f - 0.68f * indoorLowLightConfidence),
+                    (1.0f - 0.68f * indoorLowLightConfidence *
+                            (neutralDefaultRaw ? 1.0f - defaultRawDaylightEvidence : 1.0f)),
             0.0f,
             1.0f
     );
@@ -7694,9 +7806,10 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             ? "indoor_display_highlight"
             : (outdoorSkyScene
                     ? "outdoor_sky"
-                    : (indoorLowLightConfidence >= 0.60f
+                    : (neutralDefaultRaw && defaultRawDaylightEvidence >= 0.72f && p50 >= 0.04f
+                            ? "outdoor_daylight" : (indoorLowLightConfidence >= 0.60f
                             ? "indoor_low_light"
-                            : (strongHighlightScene ? "localized_highlight" : "normal")));
+                            : (strongHighlightScene ? "localized_highlight" : "normal"))));
 
     std::atomic<bool> highlightNeutralize{false};
 
@@ -8086,7 +8199,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         // Explicit profile Exposure and HAL post-RAW sensitivity boost are transported as one
         // scene-linear scalar. The shader applies it after FLLF and before PBR Neutral.
         request.exposureGain = exposureGain;
-        request.rawJpegBaseVibrance = 1.0f;
+        request.rawJpegBaseVibrance = neutralDefaultRaw ? -1.0f : 1.0f;
         request.shoulderStart = 0.68f;
         request.shoulderStrength = 1.0f;
         request.localToneStrength = 0.0f;
@@ -8192,6 +8305,8 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         cpuSceneProcessingApplied = true;
     }
 
+    std::atomic<std::uint64_t> defaultRawCpuKhronosPixels{0u};
+    std::atomic<float> defaultRawCpuKhronosMaxCompression{0.0f};
     const auto applyCpuToneAndProfile = [&]() {
         cv::parallel_for_(cv::Range(0, linearRgb.rows), [&](const cv::Range& range) {
             for (int y = range.start; y < range.end; ++y) {
@@ -8200,7 +8315,18 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                     // Failure-reference only. Heavy FLLF remains Vulkan-resident; if that backend
                     // failed, do not invent a CPU local-tone implementation. Preserve the same final
                     // display mapper and explicit profile stage for a deterministic degraded reference.
-                    const cv::Vec3f pbr = phase5PbrNeutralCpu(row[x] * exposureGain);
+                    const cv::Vec3f preKhronos = row[x] * exposureGain;
+                    const auto displayInput = neutralDefaultRaw
+                            ? bncam::color::mapSceneToKhronosInput({preKhronos[0],preKhronos[1],preKhronos[2]})
+                            : bncam::highlight::Rgb{preKhronos[0],preKhronos[1],preKhronos[2]};
+                    const cv::Vec3f pbr = phase5PbrNeutralCpu({displayInput.r,displayInput.g,displayInput.b});
+                    if (neutralDefaultRaw && std::max({preKhronos[0],preKhronos[1],preKhronos[2]}) >= 0.8f) {
+                        defaultRawCpuKhronosPixels.fetch_add(1u, std::memory_order_relaxed);
+                        const float compression = std::max(0.0f, phase5LumaCpu(preKhronos)-phase5LumaCpu(pbr));
+                        float previous = defaultRawCpuKhronosMaxCompression.load(std::memory_order_relaxed);
+                        while (compression > previous && !defaultRawCpuKhronosMaxCompression.compare_exchange_weak(
+                                previous, compression, std::memory_order_relaxed)) {}
+                    }
                     float r = pbr[0];
                     float g = pbr[1];
                     float b = pbr[2];
@@ -8219,19 +8345,21 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                     g *= lookScale;
                     b *= lookScale;
 
-                    // Perceptual Midtone Chromaticity & Saturation Adaptation (RAW display presentation parity)
-                    const float toneLumaWeight = smoothstepIsp(0.008f, 0.07f, lookLuma) *
-                            (1.0f - smoothstepIsp(0.72f, 0.98f, lookLuma));
-                    const float maxC = std::max({r, g, b});
-                    const float minC = std::min({r, g, b});
-                    const float satC = maxC > 1.0e-5f ? (maxC - minC) / maxC : 0.0f;
-                    const float satProt = 1.0f - 0.45f * satC;
-                    const float adaptSat = 0.28f * toneLumaWeight * satProt;
-                    const float adaptVib = 0.14f * toneLumaWeight * (1.0f - 0.70f * satC);
-                    const float totalGain = 1.0f + adaptSat + adaptVib;
-                    r = lookLuma + (r - lookLuma) * totalGain;
-                    g = lookLuma + (g - lookLuma) * totalGain;
-                    b = lookLuma + (b - lookLuma) * totalGain;
+                    if (!neutralDefaultRaw) {
+                        // Perceptual Midtone Chromaticity & Saturation Adaptation (RAW display presentation parity)
+                        const float toneLumaWeight = smoothstepIsp(0.008f, 0.07f, lookLuma) *
+                                (1.0f - smoothstepIsp(0.72f, 0.98f, lookLuma));
+                        const float maxC = std::max({r, g, b});
+                        const float minC = std::min({r, g, b});
+                        const float satC = maxC > 1.0e-5f ? (maxC - minC) / maxC : 0.0f;
+                        const float satProt = 1.0f - 0.45f * satC;
+                        const float adaptSat = 0.28f * toneLumaWeight * satProt;
+                        const float adaptVib = 0.14f * toneLumaWeight * (1.0f - 0.70f * satC);
+                        const float totalGain = 1.0f + adaptSat + adaptVib;
+                        r = lookLuma + (r - lookLuma) * totalGain;
+                        g = lookLuma + (g - lookLuma) * totalGain;
+                        b = lookLuma + (b - lookLuma) * totalGain;
+                    }
 
                     applyBncamProfileColorManagement(r, g, b, uiConfig, false);
                     const cv::Vec3f mapped = phase5CompressUnitGamutCpu(cv::Vec3f(r, g, b));
@@ -8955,6 +9083,23 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; outdoorSkyRejectedReason=" << outdoorSkyRejectedReason
             << "; displayHighlightConfidence=" << displayHighlightConfidence
             << "; indoorLowLightConfidence=" << indoorLowLightConfidence
+            << "; automaticRawColorBoostActive=" << (neutralDefaultRaw ? "false" : "true")
+            << "; defaultRawSceneColorDomain=" << (neutralDefaultRaw ? "SIGNED_LINEAR_SRGB_D65" : "LEGACY")
+            << "; defaultRawLowerGamutOwner=" << (neutralDefaultRaw ? "POST_FLLF_KHRONOS_DISPLAY_ENTRANCE" : "POST_CCM")
+            << "; defaultRawExactCamera2PairPreserved=" << (preserveExactCamera2Pair ? "true" : "false")
+            << "; defaultRawHighlightPolicy=" << (neutralDefaultRaw ? "ALL_CFA_CHANNEL_LOSS" : "LEGACY")
+            << "; defaultRawClipEvidenceDomain=PRE_FINALIZE_CFA_2X2_PIXEL_COVERAGE"
+            << "; defaultRawPartialSensorClipPixels=" << (vulkanRawFinalize.success
+                    ? vulkanRawFinalize.defaultRawPartialClipPixels : defaultRawCpuPartialClipPixels)
+            << "; defaultRawFullSensorClipPixels=" << (vulkanRawFinalize.success
+                    ? vulkanRawFinalize.defaultRawFullClipPixels : defaultRawCpuFullClipPixels)
+            << "; defaultRawMinColorConfidence=" << (vulkanColorTransform.success
+                    ? vulkanColorTransform.defaultRawMinColorConfidence : defaultRawCpuMinConfidence)
+            << "; defaultRawChromaNeutralizedPixels=" << phase9ColorDebug.colorConfidenceAppliedPixels
+            << "; defaultRawKhronosHighlightPixels=" << (vulkanToneApplied ? vulkanTone.defaultRawKhronosHighlightPixels : defaultRawCpuKhronosPixels.load())
+            << "; defaultRawKhronosMaxLumaCompression=" << (vulkanToneApplied ? vulkanTone.defaultRawKhronosMaxLumaCompression : defaultRawCpuKhronosMaxCompression.load())
+            << "; defaultRawDisplayGate=" << defaultRawDisplayGate
+            << "; defaultRawDaylightEvidence=" << defaultRawDaylightEvidence
             << "; sceneClassificationFinal=" << sceneClassificationFinal
             << "; highlightNeutralize=" << (highlightNeutralize.load() ? "true" : "false")
             << "; localHighlightRecoveryApplied=" << (highlightDebug.applied ? "true" : "false")
@@ -9031,8 +9176,8 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                             ? "AUTO_HYBRID_LOCAL_STRUCTURE_NYQUIST_CHROMA_NOISE_ACTIVE"
                             : demosaicResolution.algorithm == DemosaicAlgorithm::RcdInspired
                                     ? (demosaicNoiseContext.available
-                                            ? "NEURAL_JDD_PHYSICAL_NOISE_CONTEXT_ACTIVE"
-                                            : "NEURAL_JDD_CFA_CONTEXT_ACTIVE")
+                                            ? "BNC_NEURAL_PHYSICAL_NOISE_CONTEXT_ACTIVE"
+                                            : "BNC_NEURAL_CFA_CONTEXT_ACTIVE")
                                     : demosaicResolution.algorithm == DemosaicAlgorithm::AmazeInspired
                                             ? (demosaicNoiseContext.available
                                                     ? "AMAZE_OPPONENT_NOISE_SIGNIFICANCE_V2_ACTIVE"
@@ -9100,15 +9245,17 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; autoCoherentEdgeFraction=" << demosaicResolution.autoCoherentEdgeFraction
             << "; autoLowSignalFraction=" << demosaicResolution.autoLowSignalFraction
             << "; autoMalvarScore=" << demosaicResolution.autoMalvarScore
-            << "; autoRcdScore=" << demosaicResolution.autoRcdScore
+            << "; autoBncNeuralScore=" << demosaicResolution.autoBncNeuralScore
             << "; autoAmazeScore=" << demosaicResolution.autoAmazeScore
             << "; autoCfaChromaRisk=" << demosaicResolution.autoCfaChromaRisk
             << "; autoRunnerUp=" << demosaicResolution.autoRunnerUp
             << "; autoScoreDelta=" << demosaicResolution.autoScoreDelta
+            << "; bncNeuralAvailable=false"
+            << "; autoHybridActiveRoutes=" << (autoHybridUsedForOutput ? "MALVAR_2004,AMAZE" : "not_active")
             << "; autoHybridExecutionRequested=" << (demosaicResolution.autoHybridExecution ? "true" : "false")
             << "; autoHybridUsedForOutput=" << (autoHybridUsedForOutput ? "true" : "false")
             << "; autoMalvarPrior=" << demosaicResolution.autoMalvarPrior
-            << "; autoNeuralJddPrior=" << demosaicResolution.autoNeuralJddPrior
+            << "; autoBncNeuralPrior=" << demosaicResolution.autoBncNeuralPrior
             << "; autoAmazePrior=" << demosaicResolution.autoAmazePrior
             << "; autoSignals=" << demosaicResolution.autoSignals
             << "; physicalChromaModelDriven=false"
@@ -9293,6 +9440,16 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << ";flatNoiseVarianceRatio=GROUND_TRUTH_TEST_ONLY;highSnrIdentityError=TEST_ONLY"
             << ";fusedColourLumaGpuMs=" << vulkanColorTransform.kernelMs
             << ";extraFullFrameBuffers=0;extraFullFrameReadbacks=0;extraStatisticsBytesPerWorkgroup=32}"
+            // BEGIN_PHYSICAL_MODEL_ONLY
+            // Read-only prediction: do not feed corrected covariance/confidence into
+            // baselinePhysicalChroma/Luma, downstream tone state, or GPU push constants.
+            << bncam::physical::formatNoisePredictionOnly(
+                    residualNoiseState.preDemosaic,
+                    resolvedDemosaicNoiseModel(demosaicResolution.algorithm),
+                    residualNoiseState.postDemosaic, physicalNoiseStatisticsActive,
+                    meta.calibration.spectraProcessingMode == 0 &&
+                    !neuralPosteriorSeedApplied && !autoHybridUsedForOutput)
+            // END_PHYSICAL_MODEL_ONLY
             << "; baselinePhysicalChroma={enabled=" << (baselinePhysicalChroma.valid()?"true":"false")
             << ";spectraIndependent=true;inputDomain=POST_DEMOSAIC_LINEAR_RGB;noiseModel=PHYSICAL_SO_PROPAGATED"
             << ";status=" << preWbNoiseState.status
@@ -9585,7 +9742,8 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                             ? "PHASE2_CALIBRATED_DNG_FORWARD_MATRIX"
                             : "PHASE2_CHARACTERIZATION_FALLBACK_OR_NONE"))
             << "; rawColorDisplayHighlightChromaSafety=SOURCE_RAW_PHASE9_OWNER"
-            << "; phase5ColorPairOwner=" << (exactCamera2ColorPair
+            << "; phase5ColorPairOwner=" << (preserveExactCamera2Pair
+                    ? "CAMERA2_EXACT_FRAME_PAIR_UNMODIFIED" : exactCamera2ColorPair
                     ? "CAMERA2_EXACT_FRAME_PAIR_WITH_BOUNDED_PHYSICAL_AWB"
                     : "RESOLVED_FALLBACK_OR_PROFILE")
             << "; toneSensorClipPressure=" << fllfPlan.highlightPressure

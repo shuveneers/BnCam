@@ -50,7 +50,7 @@ struct RawPreviewGpuRequest {
     std::uint32_t previewHeight = 0;
     std::uint32_t cfaCellDecimation = 1;
     std::uint32_t cfaPattern = 0;
-    std::uint32_t demosaicMode = 3;
+    std::uint32_t demosaicMode = 0;
     std::array<float, 4> blackLevels{0.0f, 0.0f, 0.0f, 0.0f};
     float whiteLevel = 1.0f;
     const float* lensShadingMap = nullptr;

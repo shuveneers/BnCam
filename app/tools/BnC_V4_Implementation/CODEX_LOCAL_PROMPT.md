@@ -1,0 +1,7 @@
+# Instructie voor lokale Codex
+
+Installeer het bijgevoegde BnC Neural V4-pakket in deze BnCam-projectmap en voer de eerste kwalificatie uit. Stijn heeft deze runnercorrecties en nieuwe onderzoekskandidaten geautoriseerd.
+
+Lees lokale AGENTS.md-instructies en bekijk git status. Behoud lokale wijzigingen en alle originele A/C-checkpoints. Lees README.md, VALIDATION.md en PATCH_MANIFEST.json uit het uitgepakte pakket. Start Apply-BnC-V4.ps1 met deze projectroot. Als de hashcontrole een bronconflict meldt, vergelijk het bestaande bestand met de payload en changes.patch; integreer de bedoelde wijziging met behoud van lokale verbeteringen. Omzeil de controle niet door broncode te resetten of hashes te vervalsen. Test een eventuele merge opnieuw.
+
+Voer Start-BnC-V4-Qualification.ps1 uit in de projectroot. Laat N en S tot maximaal step 2.000 lopen. Start geen automatische 100k-training en exporteer deze nieuwe graph niet via het oude formaat. Zorg dat de bestaande corpus, vaste validatie, klassieke vergelijkingsfixtures en CUDA-runtime beschikbaar zijn. Als een controle stopt, rapporteer oorzaak en bewijs; laat thresholds/data/loss ongemoeid en herstart een afgewezen kandidaat niet automatisch. Rapporteer het pad naar de gemaakte V4-qualification ZIP, de N/S-stappen, numerieke fouten, kwaliteitsregressies en gemeten GPU-kosten. Upload/commit/push is voor deze lokale kwalificatie niet nodig.

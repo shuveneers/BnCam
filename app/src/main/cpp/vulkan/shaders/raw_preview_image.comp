@@ -166,6 +166,10 @@ uint lensChannel(uint site, uint sensorY) {
     return (sensorY & 1u) == 0u ? 1u : 2u;
 }
 
+float safeLensGain(float value) {
+    return !isnan(value) && !isinf(value) && value >= 1.0 ? value : 1.0;
+}
+
 float lensGain(uint sx, uint sy, uint site) {
     uint columns = uint(lensMapData[0]);
     uint rows = uint(lensMapData[1]);
@@ -175,11 +179,11 @@ float lensGain(uint sx, uint sy, uint site) {
     uint x0 = uint(floor(u)); uint y0 = uint(floor(v));
     uint x1 = min(x0 + 1u, columns - 1u); uint y1 = min(y0 + 1u, rows - 1u);
     uint channel = lensChannel(site, sy);
-    float g00 = lensMapData[6u + (y0 * columns + x0) * 4u + channel];
-    float g10 = lensMapData[6u + (y0 * columns + x1) * 4u + channel];
-    float g01 = lensMapData[6u + (y1 * columns + x0) * 4u + channel];
-    float g11 = lensMapData[6u + (y1 * columns + x1) * 4u + channel];
-    return clamp(mix(mix(g00, g10, fract(u)), mix(g01, g11, fract(u)), fract(v)), 0.25, 16.0);
+    float g00 = safeLensGain(lensMapData[6u + (y0 * columns + x0) * 4u + channel]);
+    float g10 = safeLensGain(lensMapData[6u + (y0 * columns + x1) * 4u + channel]);
+    float g01 = safeLensGain(lensMapData[6u + (y1 * columns + x0) * 4u + channel]);
+    float g11 = safeLensGain(lensMapData[6u + (y1 * columns + x1) * 4u + channel]);
+    return safeLensGain(mix(mix(g00, g10, fract(u)), mix(g01, g11, fract(u)), fract(v)));
 }
 
 int mirrorCoord(int p, int extent) {

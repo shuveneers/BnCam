@@ -10,7 +10,7 @@
 struct RawPreviewParameters {
     int sourceFormat = 0;
     int cfaPattern = 0;
-    int demosaicMode = 3; // DemosaicMode bridge value: 0 Auto, 1 Malvar, 2 AMAZE, 3 RCD.
+    int demosaicMode = 0; // DemosaicMode bridge value: 0 Auto, 1 Malvar, 2 AMaZE, 3 BnC Neural (Malvar fallback).
     float blackLevels[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     int whiteLevel = 1;
     int captureSensitivityIso = 100;

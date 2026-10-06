@@ -261,16 +261,16 @@ vec3 applyProfileColor(vec3 rgb, ivec2 pixel) {
     float y = max(0.0, lumaOf(rgb));
     float saturation = profileColorRelativeSaturation(rgb);
 
-    // Preserve the established base RAW/YUV colourfulness compensation. Explicit creative
-    // controls remain separate owners layered after this automatic display adaptation.
+    // Default single-shot RAW opts out of automatic colour via the negative legacy carrier.
+    // Shared Spectra/merged RAW and YUV callers keep their existing behavior.
     float toneLumaWeight = smoothstep(0.008, 0.07, y) * (1.0 - smoothstep(0.72, 0.98, y));
-    if (pc.isRawBayer != 0u) {
+    if (pc.isRawBayer != 0u && pc.rawJpegBaseVibrance >= 0.0) {
         float saturationProtection = 1.0 - 0.45 * saturation;
         float adaptiveSaturationBoost = 0.28 * toneLumaWeight * saturationProtection;
         float adaptiveVibranceBoost = 0.14 * toneLumaWeight * (1.0 - 0.70 * saturation);
         rgb = vec3(y) + (rgb - vec3(y)) *
                 (1.0 + adaptiveSaturationBoost + adaptiveVibranceBoost);
-    } else {
+    } else if (pc.isRawBayer == 0u) {
         float midtoneWeight = smoothstep(0.04, 0.22, y) * (1.0 - smoothstep(0.68, 0.98, y));
         float adaptiveVibranceLift = 0.125 * midtoneWeight * (1.0 - 0.65 * saturation);
         rgb = vec3(y) + (rgb - vec3(y)) * (1.0 + adaptiveVibranceLift);
@@ -817,6 +817,18 @@ vec3 applyBroadShadowPlacement(vec3 color) {
     return color * exp2(maxLiftEv * blackGuard * shadowWindow);
 }
 
+// Display entrance only: retain Y and the RGB opponent direction while reaching
+// Khronos' nonnegative Rec.709 input cone. HDR values above one remain untouched.
+vec3 mapSceneToKhronosInput(vec3 rgb) {
+    if (any(isnan(rgb)) || any(isinf(rgb))) return vec3(0.0);
+    float minimum = min(rgb.r, min(rgb.g, rgb.b));
+    if (minimum >= 0.0) return rgb;
+    float y = lumaOf(rgb);
+    if (!(y > 1.0e-7)) return vec3(0.0);
+    float scale = clamp(y / max(y - minimum, 1.0e-8), 0.0, 1.0);
+    return max(vec3(y) + (rgb - vec3(y)) * scale, vec3(0.0));
+}
+
 // Shadow-neutral Khronos PBR Neutral display mapper.
 // The reference minimum-channel offset is retained as shoulder preparation, but no longer
 // re-crushes the entire shadow range. It fades in only as the highlight shoulder approaches.
@@ -876,7 +888,14 @@ void runTone(uvec2 gid) {
         if (pc.presenceReserved0 != 0u) rgb = applyFllfLocalExposure(gid, rgb);
         rgb = applyBroadShadowPlacement(rgb);
         rgb *= max(0.0, pc.exposureGain);
+        vec3 preKhronos = rgb;
+        if (pc.rawJpegBaseVibrance < 0.0) rgb = mapSceneToKhronosInput(rgb);
         rgb = pbrNeutralToneMapping(rgb);
+        if (pc.rawJpegBaseVibrance < 0.0 && max(preKhronos.r, max(preKhronos.g, preKhronos.b)) >= 0.8) {
+            atomicAdd(telemetry[56], 1u);
+            float compression = max(0.0, lumaOf(preKhronos) - lumaOf(rgb));
+            atomicMax(telemetry[57], floatBitsToUint(compression));
+        }
         rgb = applyToneLookLut(rgb);
         rgb = applyExplicitProfileToneContrast(rgb);
         rgb = applyProfileColor(rgb, ivec2(gid));

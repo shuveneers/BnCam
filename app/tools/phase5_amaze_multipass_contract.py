@@ -76,8 +76,8 @@ require('gpu-pass-timings', 'amazeGreenPassMs' in bhdr and 'amazeReconstructPass
 require('gpu-guide-scratch-binding', 'scratchOverride' in bcpp and 'rgbUpload_.buffer' in bcpp)
 require('gpu-guide-barrier', 'VkBufferMemoryBarrier guideBarrier' in bcpp and 'VK_ACCESS_SHADER_WRITE_BIT' in bcpp)
 require('gpu-mode5-guide', 'push.mode = 5u' in bcpp)
-require('gpu-mode6-reconstruct', 'push.mode = 6u' in bcpp)
-require('gpu-awb-restores-binding2', 'updateDescriptorSetLocked(device);' in bcpp)
+require('gpu-mode6-reconstruct', 'push.mode = effectiveAlgorithm == SpectraGpuDemosaicAlgorithm::AMAZE ? 6u : 8u;' in bcpp)
+require('gpu-awb-restores-binding2', 'updateDescriptorSetLocked(device,\n            sourceClipConfidenceReady ? sourceClipConfidence_.buffer : VK_NULL_HANDLE,\n            rgbUpload_.buffer);' in bcpp)
 
 require('shader-binding2-readable', 'layout(std430, binding = 2) buffer ColorRgb' in shader)
 require('shader-guide-pass', 'void amazeGuidePass(' in shader)
@@ -88,12 +88,12 @@ require('shader-old-onepass-amaze-removed', 'vec3 amazeAt(' not in shader)
 require('shader-mode5-branch', 'if (pc.mode == 5u)' in shader)
 require('shader-mode6-branch', 'if (pc.mode == 6u)' in shader)
 
-require('ui-label-amaze', 'QUALITY(2, "AMaZE", true)' in kt)
+require('ui-label-amaze', 'AMAZE(2, "AMaZE", true)' in kt)
 require('legacy-amaze-profile-migration', '"AMAZE_INSPIRED"' in kt)
-require('neural-debug-name', 'ResolvedDemosaicAlgorithm.RCD_INSPIRED -> "NEURAL_JDD"' in kt)
-require('amaze-debug-name', 'ResolvedDemosaicAlgorithm.AMAZE_INSPIRED -> "AMAZE"' in kt)
+require('neural-debug-name', 'ResolvedDemosaicAlgorithm.BNC_NEURAL -> "BNC_NEURAL"' in kt)
+require('amaze-debug-name', 'ResolvedDemosaicAlgorithm.AMAZE -> "AMAZE"' in kt)
 require('profile-telemetry-canonical', 'resolvedId = demosaicSelection.resolvedDebugName' in recipe)
-require('no-product-amaze-inspired-label', 'QUALITY(2, "AMaZE Inspired"' not in kt)
+require('no-product-amaze-inspired-label', 'AMAZE(2, "AMaZE Inspired"' not in kt)
 
 failed = [name for name, ok in checks if not ok]
 for name, ok in checks:

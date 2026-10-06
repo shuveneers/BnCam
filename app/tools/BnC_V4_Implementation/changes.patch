@@ -1,0 +1,1277 @@
+--- a/app/tools/bnc_neural_training/package.py
++++ b/app/tools/bnc_neural_training/package.py
+@@ -26,6 +26,8 @@
+ 
+ 
+ def export_reference(model, path, provenance):
++    if not getattr(model.config, 'export_allowed', True):
++        raise PackageError('BNC_NEURAL_RESEARCH_GRAPH_EXPORT_NOT_IMPLEMENTED')
+     for field in REQUIRED:
+         if field not in provenance or provenance[field] in (None, ""):
+             raise PackageError("BNC_NEURAL_PROVENANCE_MISSING:" + field)
+--- /dev/null
++++ b/app/tools/bnc_neural_training/v2/training_safety.py
+@@ -0,0 +1,249 @@
++"""Scoped diagnostics and fail-closed update checks; no clipping or loss changes."""
++import copy
++import hashlib
++import math
++from pathlib import Path
++
++import numpy as np
++import torch
++from torch.nn import functional as F
++
++from .data import TrainingData, encode
++from .losses import reconstruction_loss, diagnostics
++
++
++class UnsafeUpdate(FloatingPointError):
++    def __init__(self, stage, reason):
++        self.stage = stage
++        super().__init__(reason)
++
++
++class ResearchRegression(RuntimeError):
++    stage = 'quality_regression'
++
++
++def enforce_guard(screen):
++    if not screen['numericalPassed']:
++        raise UnsafeUpdate('sentinel_numerical','; '.join(screen['failures']))
++    if not screen['regressionPassed']:
++        raise ResearchRegression('; '.join(screen['failures']))
++
++
++def finite(value):
++    # Reduce on each device first; avoid one host/GPU synchronization per tensor.
++    groups={}
++    scalars_ok=True
++    def collect(item):
++        nonlocal scalars_ok
++        if isinstance(item,torch.Tensor):
++            if item.is_floating_point() or item.is_complex():
++                groups.setdefault(item.device,[]).append(item)
++        elif isinstance(item,dict):
++            for child in item.values():collect(child)
++        elif isinstance(item,(list,tuple)):
++            for child in item:collect(child)
++        elif isinstance(item,(float,np.floating)):
++            scalars_ok=scalars_ok and math.isfinite(item)
++    collect(value)
++    return scalars_ok and all(bool(torch.stack([torch.isfinite(t).all() for t in group]).all())
++                              for group in groups.values())
++
++
++def serializable(value):
++    if isinstance(value, torch.Tensor):
++        return serializable(value.detach().cpu().tolist())
++    if isinstance(value, np.generic):
++        return serializable(value.item())
++    if isinstance(value, float) and not math.isfinite(value):
++        return str(value)
++    if isinstance(value, dict):
++        return {k: serializable(v) for k, v in value.items()}
++    if isinstance(value, (list, tuple)):
++        return [serializable(v) for v in value]
++    return value
++
++
++def peak(value):
++    return float(value.detach().abs().amax())
++
++
++def check_before_update(model, optimizer):
++    """Conservatively reject overflow-prone FP32 AdamW squares, never rescale."""
++    if not finite((model.state_dict(),optimizer.state_dict()['state'])):
++        raise UnsafeUpdate('pre_update_state', 'nonfinite model or optimizer before update')
++    gradients = [p.grad for p in model.parameters() if p.grad is not None]
++    if not gradients or not finite(gradients):
++        raise UnsafeUpdate('gradient', 'missing or nonfinite gradients')
++    for group in optimizer.param_groups:
++        beta2 = group['betas'][1]
++        grads=[p.grad for p in group['params'] if p.grad is not None]
++        if not grads:
++            continue
++        if any(g.dtype!=torch.float32 for g in grads):
++            raise UnsafeUpdate('precision','research updates require FP32 gradients')
++        maximum=float(torch.stack([g.detach().abs().amax() for g in grads]).amax())
++        limit=torch.finfo(torch.float32).max
++        if maximum>math.sqrt(limit):
++            raise UnsafeUpdate('adamw_square','finite gradient exceeds safe FP32 square range')
++        moments=[optimizer.state[p]['exp_avg_sq'] for p in group['params']
++                 if p.grad is not None and 'exp_avg_sq' in optimizer.state.get(p,{})]
++        old=float(torch.stack([m.detach().amax() for m in moments]).amax()) if moments else 0.
++        if moments and bool(torch.stack([m.detach().amin()<0 for m in moments]).any()):
++            raise UnsafeUpdate('adamw_moment','negative AdamW second moment')
++        if beta2*old+(1-beta2)*maximum**2>limit:
++            raise UnsafeUpdate('adamw_moment','prospective second moment exceeds FP32 range')
++    return float(torch.stack([g.detach().abs().amax() for g in gradients]).amax())
++
++
++def checked_step(model, optimizer):
++    maximum = check_before_update(model, optimizer)
++    optimizer.step()
++    if not finite((model.state_dict(),optimizer.state_dict()['state'])):
++        raise UnsafeUpdate('post_update_state', 'nonfinite state after optimizer update; do not checkpoint')
++    return maximum
++
++
++def gate(a, b, variant):
++    if variant == 'A':
++        return a*b
++    if variant == 'B':
++        return a*torch.tanh(b)
++    if variant in ('C', 'N'):
++        return 16*torch.tanh((a*b)/16)
++    if variant == 'S':
++        return .5*(F.silu(a)+F.silu(b))
++    raise ValueError('unknown gate variant')
++
++
++class ScopedObserver:
++    """Only forwards while these hooks are installed belong to this scope."""
++    def __init__(self, model, scope):
++        self.scope = scope
++        self.blocks = {}
++        self.output_peak = None
++        self.handles = []
++        for name, block in model.named_modules():
++            if hasattr(block, 'variant') and hasattr(block, 'expand'):
++                self.handles.append(block.expand.register_forward_hook(self.hook(name, block.variant)))
++        self.handles.append(model.register_forward_hook(self.output_hook))
++
++    def hook(self, name, variant):
++        def observe(module, inputs, output):
++            a, b = output.detach().chunk(2, 1)
++            actual = gate(a, b, variant)
++            raw = a*b if variant != 'S' else None
++            previous = self.blocks.get(name, {})
++            values = dict(branchMax=torch.maximum(a.abs().amax(),b.abs().amax()), gateMax=actual.abs().amax())
++            if raw is not None:
++                values['rawProductMax'] = raw.abs().amax()
++            self.blocks[name] = {key:torch.maximum(previous[key],value) if key in previous else value
++                                for key,value in values.items()}
++        return observe
++
++    def output_hook(self, module, inputs, output):
++        value=output.detach().abs().amax()
++        self.output_peak=value if self.output_peak is None else torch.maximum(self.output_peak,value)
++
++    def result(self):
++        blocks={name:{key:float(value) for key,value in row.items()} for name,row in self.blocks.items()}
++        return dict(scope=self.scope,blocks=blocks,
++                    modelOutputMax=float(self.output_peak) if self.output_peak is not None else 0.,
++                    maxBranchActivation=max((v['branchMax'] for v in blocks.values()), default=0.),
++                    maxActualGateOutput=max((v['gateMax'] for v in blocks.values()), default=0.),
++                    maxRawProduct=max((v['rawProductMax'] for v in blocks.values() if 'rawProductMax' in v), default=None))
++
++    def close(self):
++        for handle in self.handles:
++            handle.remove()
++
++
++def probe(model, optimizer, packed, truth, scope, backward=True):
++    """Model/AdamW copies only: original parameters, gradients, mode and state survive."""
++    clone = copy.deepcopy(model).eval()
++    for block in clone.modules():
++        # Diagnostic closures on the live model must not receive copied forwards.
++        block._forward_hooks.clear()
++        block._forward_pre_hooks.clear()
++        block._backward_hooks.clear()
++        for key in ('peak_branch', 'peak_gate'):
++            if hasattr(block, key):
++                setattr(block, key, None)
++    device = next(clone.parameters()).device
++    a, b = packed.to(device).float(), truth.to(device).float()
++    if a.ndim == 3:
++        a, b = a.unsqueeze(0), b.unsqueeze(0)
++    observer = ScopedObserver(clone, scope)
++    try:
++        with torch.autocast(device_type=device.type, enabled=False):
++            output = clone(a)
++            loss, terms, rgb = reconstruction_loss(a, output, b, True)
++        result = dict(scope=scope, finite=finite((a,b,output,loss,terms,rgb)),
++                      outputMax=peak(output), loss=float(loss.detach()), maxGradient=None,
++                      optimizerPreflightPassed=None, optimizerAfterProbeFinite=None)
++        if result['finite']:
++            result['metrics'] = diagnostics(a, output, b, True)
++            result['finite'] = finite(result['metrics'])
++        if backward and result['finite']:
++            loss.backward()
++            gradients = [p.grad for p in clone.parameters() if p.grad is not None]
++            result['finite'] = finite(gradients)
++            result['maxGradient'] = max((peak(g) for g in gradients), default=None)
++            if optimizer is not None and result['finite']:
++                copied = torch.optim.AdamW(clone.parameters(), lr=.001, betas=(.9,.99), weight_decay=1e-4)
++                copied.load_state_dict(copy.deepcopy(optimizer.state_dict()))
++                try:
++                    check_before_update(clone, copied)
++                    result['optimizerPreflightPassed'] = True
++                    checked_step(clone, copied)
++                    result['optimizerAfterProbeFinite'] = True
++                except UnsafeUpdate as error:
++                    result.update(optimizerPreflightPassed=False if error.stage != 'post_update_state' else True,
++                                  optimizerAfterProbeFinite=False if error.stage == 'post_update_state' else None,
++                                  rejectedStage=error.stage, rejectedReason=str(error))
++        result['activation'] = observer.result()
++        result.update(maxBranchActivation=result['activation']['maxBranchActivation'],
++                      maxGateOutput=result['activation']['maxActualGateOutput'])
++        return serializable(result)
++    finally:
++        observer.close()
++
++
++def stress_probe(model, optimizer, train_records=()):
++    a,b = TrainingData(train_records, 1, 823109, 1009779)[0]
++    result = probe(model, optimizer, a,b, 'known_stress_single_sample', True)
++    result['sampleIndex'] = 1009779
++    result['optimizerProbeScope'] = 'independent copy; single sample, not the original training batch'
++    return result
++
++
++def edge_input(archive, expected_sha):
++    archive = Path(archive)
++    if hashlib.sha256(archive.read_bytes()).hexdigest() != expected_sha:
++        raise ValueError('frozen validation archive changed')
++    with np.load(archive, allow_pickle=False) as content:
++        rgb = content['rgb_16']
++        if rgb.shape != (256,256,3) or rgb.dtype != np.float32 or not np.isfinite(rgb).all() or rgb.min()<0 or rgb.max()>4:
++            raise ValueError('invalid frozen edge')
++        return encode(rgb, 'BGGR')
++
++
++def guard(current, baseline=None, factor=4.):
++    """Versioned catastrophic-regression research stop, not a release quality gate."""
++    numerical_reasons, quality_reasons = [], []
++    stress, edge = current['stress'], current['edge']
++    if not stress['finite'] or stress.get('optimizerPreflightPassed') is not True:
++        numerical_reasons.append('known stress fails finite/AdamW preflight')
++    if not edge['finite']:
++        numerical_reasons.append('frozen edge nonfinite')
++    if baseline:
++        for name, value, reference in (
++            ('stress loss', stress['loss'], baseline['stress']['loss']),
++            ('edge missing RGB', edge.get('metrics',{}).get('missing_rgb_l1'),
++             baseline['edge'].get('metrics',{}).get('missing_rgb_l1'))):
++            if not isinstance(value,(int,float)) or not math.isfinite(value) or value > factor*max(reference, 1e-8):
++                quality_reasons.append(f'{name} exceeds {factor:g}x frozen research baseline')
++    return dict(version='catastrophic_regression_v1', factor=factor,
++                passed=not numerical_reasons and not quality_reasons,
++                numericalPassed=not numerical_reasons,regressionPassed=not quality_reasons,
++                numericalFailures=numerical_reasons,qualityFailures=quality_reasons,
++                failures=numerical_reasons+quality_reasons,releaseQualification=False)
+--- a/app/tools/bnc_neural_training/v2/v3_phase_a/run.py
++++ b/app/tools/bnc_neural_training/v2/v3_phase_a/run.py
+@@ -15,10 +15,8 @@
+ 
+ from ..checkpoint import GlobalCosine, capture, load, objective_identity, restore_rng, save
+ from ..data import TrainingData, read_corpus
+-from ..evaluate import synthetic_gate
+ from ..losses import reconstruction_loss
+ from ..model import BncNeuralV2
+-from ..session_report import comparison
+ from ..train import atomic_json, validate
+ from ..validation_freeze import cases as fixed_cases
+ from .model import GATES, PhaseModel, VARIANTS
+@@ -93,32 +91,14 @@
+ 
+ 
+ def failed_probe(model, train_records, optimizer):
+-    packed, truth = TrainingData(train_records, 1, SEED, FAILED_INDEX)[0]
+-    packed = packed.unsqueeze(0).cuda()
+-    truth = truth.unsqueeze(0).cuda()
+-    model.eval()
+-    optimizer.zero_grad(set_to_none=True)
+-    with torch.autocast('cuda', enabled=False):
+-        output = model(packed.float())
+-        loss, terms, rgb = reconstruction_loss(packed.float(), output, truth.float(), True)
+-    okay = finite((packed, truth, output, loss, terms, rgb))
+-    peak_gradient = None
+-    if okay:
+-        loss.backward()
+-        grads = [p.grad for p in model.parameters() if p.grad is not None]
+-        okay = finite(grads)
+-        if okay:
+-            peak_gradient = float(torch.stack([g.detach().abs().amax() for g in grads]).amax())
+-    optimizer.zero_grad(set_to_none=True)
+-    model.train()
+-    return dict(sampleIndex=FAILED_INDEX, finite=okay,
+-                outputMax=safe_float(output.detach().abs().amax()),
+-                loss=safe_float(loss), maxGradient=peak_gradient,
+-                maxBranchActivation=model.peaks()['maxBranchActivation'],
+-                maxGateOutput=model.peaks()['maxGateOutput'])
++    # Independent copies: never mix probe gradients/state with the live run.
++    from ..training_safety import stress_probe
++    return stress_probe(model, optimizer, train_records)
+ 
+ 
+ def evaluate_milestone(model, optimizer, cases, train_records, variant, step, stats, out):
++    from ..evaluate import synthetic_gate
++    from ..session_report import comparison
+     probe = failed_probe(model, train_records, optimizer)
+     rows, aggregate = validate(model, cases, 'cuda', True)
+     aggregate['step'] = step
+--- a/app/tools/bnc_neural_training/v2/v3_phase_b/run.py
++++ b/app/tools/bnc_neural_training/v2/v3_phase_b/run.py
+@@ -1,5 +1,6 @@
+ """Resume a v3 A/C candidate, stop at an explicit step, then evaluate and exit."""
+ import argparse
++import copy
+ import hashlib
+ import json
+ import os
+@@ -15,11 +16,10 @@
+ 
+ from ..checkpoint import GlobalCosine, capture, load, objective_identity, restore_rng, save
+ from ..data import TrainingData, read_corpus
+-from ..evaluate import synthetic_gate
+ from ..losses import reconstruction_loss
+-from ..session_report import comparison
+ from ..train import atomic_json, validate
+ from ..validation_freeze import cases as fixed_cases
++from ..training_safety import (UnsafeUpdate, ResearchRegression, enforce_guard, ScopedObserver, checked_step, probe as scoped_probe, guard as research_guard, serializable)
+ from ..signed_tanh_study.distribution import Histogram
+ from ..v3_phase_a.model import GATES, PhaseBlock, PhaseModel
+ from ..v3_phase_a.run import FAILED_INDEX, FROZEN, MANIFEST, SEED, failed_probe, finite, setup
+@@ -300,9 +300,13 @@
+             msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+         except OSError as error:
+             raise RuntimeError(f'another Phase B session already owns the GPU lock: {root}') from error
++        signal_snapshot = {getattr(signal,n): signal.getsignal(getattr(signal,n)) for n in
++                           ('SIGINT','SIGTERM','SIGBREAK') if hasattr(signal,n)}
+         try:
+             return _run_locked(candidate, target, root, prepare_only)
+         finally:
++            for sig,handler in signal_snapshot.items():
++                signal.signal(sig,handler)
+             lock.seek(0)
+             msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+     finally:
+@@ -310,6 +314,8 @@
+ 
+ 
+ def _run_locked(candidate, target, root, prepare_only):
++    from ..evaluate import synthetic_gate
++    from ..session_report import comparison
+     parts, corpus = read_corpus(MANIFEST)
+     if not json.loads(MANIFEST.read_text()).get('dedupFinalized'):
+         raise ValueError('deduplicated W24 corpus required')
+@@ -325,6 +331,9 @@
+     setup()
+     frozen = json.loads(FROZEN.read_text())
+     provenance = state['provenance']
++    source_base = Path(__file__).resolve().parent.parent
++    provenance['runnerSafetyRevision'] = {name: sha256(source_base/name) for name in
++        ('v3_phase_b/run.py','v3_phase_a/run.py','training_safety.py')}
+     if provenance['generatorReliabilityMigration']['validationArchiveSHA256'] != frozen['sha256']:
+         raise ValueError('fixed validation archive changed')
+     cases = fixed_cases(parts['validation'], SEED, provenance)
+@@ -346,7 +355,7 @@
+     args = SimpleNamespace(seed=SEED, microbatch=32, workers=4, variant=candidate,
+                            manifest=str(MANIFEST), fullFP32=True)
+     start = time.perf_counter()
+-    stats = dict(numericalFailures=0, maxBranchActivation=0., maxRawProduct=0.,
++    stats = dict(numericalFailures=0, qualityFailures=0, maxBranchActivation=0., maxRawProduct=0.,
+                  maxActualGateOutput=0., maxModelOutput=0., maxGradient=0.,
+                  adamWStateFinite=True, activationQuantileSource='fixed validation')
+     stop_requested = False
+@@ -378,6 +387,54 @@
+             trim_recovery(directory)
+         return directory / 'latest.pt'
+ 
++    failure_dir = out / 'failures'
++    last_qualified_step = None
++    def record_failure(error, attempted_step):
++        key = 'qualityFailures' if isinstance(error,ResearchRegression) else 'numericalFailures'
++        stats[key] += 1
++        failure_dir.mkdir(exist_ok=True)
++        event = dict(candidate=candidate, attemptedStep=attempted_step,
++                     stage=getattr(error, 'stage', 'runtime_numerical'), reason=str(error),
++                     numericalFailures=stats['numericalFailures'], qualityFailures=stats['qualityFailures'],
++                     lastStoredCheckpoint=str((out/'checkpoints/latest.pt').resolve()),
++                     lastQualifiedStep=last_qualified_step,
++                     automaticRestart=False, productReady=False, safeToPowerOff=True)
++        atomic_json(failure_dir/f'{time.time_ns()}.json', serializable(event))
++        atomic_json(out/'status.json', dict(status='RESEARCH_STOP', **serializable(event)))
++
++    edge_case = next((a,b) for name,a,b in cases if name == 'analytic:validation:16:isoluminant_edge')
++    baseline = None
++    reference_path = out/'checkpoints/stop_step_015000.pt'
++    if reference_path.exists():
++        reference_state = load(reference_path)
++        verify_state(reference_state, candidate, corpus)
++        reference = copy.deepcopy(model)
++        reference.load_state_dict(reference_state['model'], strict=True)
++        reference_opt = torch.optim.AdamW(reference.parameters(), lr=.001, betas=(.9,.99), weight_decay=1e-4)
++        reference_opt.load_state_dict(reference_state['optimizer'])
++        baseline = dict(stress=failed_probe(reference, parts['train'], reference_opt),
++                        edge=scoped_probe(reference,None,*edge_case,'frozen_isoluminant_edge',False))
++        del reference, reference_opt
++
++    def qualify():
++        nonlocal last_qualified_step
++        checks = dict(stress=failed_probe(model,parts['train'],optimizer),
++                      edge=scoped_probe(model,None,*edge_case,'frozen_isoluminant_edge',False))
++        screen = research_guard(checks,baseline,4.)
++        audit = out/'sentinels'/f'step_{step:06d}_{time.time_ns()}.json'
++        audit.parent.mkdir(exist_ok=True)
++        atomic_json(audit,serializable(dict(step=step,sentinels=checks,researchGuard=screen,
++                    baseline='same-candidate frozen 15k checkpoint' if baseline else 'numerical only before 15k')))
++        if not screen['passed']:
++            enforce_guard(screen)
++        last_qualified_step = step
++
++    try:
++        qualify()
++    except (FloatingPointError, ResearchRegression) as error:
++        record_failure(error,step+1)
++        raise
++    training_observer = ScopedObserver(model,'training_only')
+     raw_observer = TrainingRawObserver(model)
+     if step < target:
+         before = generator.get_state()
+@@ -406,7 +463,7 @@
+                 stats['maxModelOutput'] = max(stats['maxModelOutput'], float(output.detach().abs().amax()))
+                 stats['maxGradient'] = max(stats['maxGradient'],
+                                            float(torch.stack([g.detach().abs().amax() for g in grads]).amax()))
+-                optimizer.step()
++                checked_step(model, optimizer)
+                 step += 1
+                 scheduler.committed()
+                 if step % 50 == 0 or step == start_step+1:
+@@ -416,11 +473,22 @@
+                     print(f'candidate={candidate} step={step} target={target} '
+                           f'lr={optimizer.param_groups[0]["lr"]:.10f} loss={float(loss.detach()):.7f} '
+                           f'elapsed={elapsed:.0f}s ETA={eta:.0f}s finite=true', flush=True)
++                if step % 250 == 0 or step == target:
++                    qualify()
+                 if step % 1000 == 0:
+                     latest_checkpoint(recovery=True)
++        except (FloatingPointError, ResearchRegression) as error:
++            training_observer.close()
++            raw_observer.close()
++            record_failure(error,step+1)
++            raise
+         finally:
+             if hasattr(loader, '_shutdown_workers'):
+                 loader._shutdown_workers()
++    training_activation = training_observer.result()
++    training_observer.close()
++    stats.update(maxBranchActivation=training_activation['maxBranchActivation'],
++                 maxActualGateOutput=training_activation['maxActualGateOutput'])
+     stats['maxRawProduct'] = max(stats['maxRawProduct'], raw_observer.value())
+     raw_observer.close()
+     if stop_requested and step < target:
+@@ -441,13 +509,8 @@
+         observer.close()
+     aggregate['step'] = step
+     activation = observer.result()
+-    stats['maxBranchActivation'] = max(stats['maxBranchActivation'], model.peaks()['maxBranchActivation'])
+-    stats['maxRawProduct'] = max(stats['maxRawProduct'], activation['maxRawProduct'])
+-    stats['maxActualGateOutput'] = max(stats['maxActualGateOutput'],
+-                                      model.peaks()['maxGateOutput'], activation['maxActualGateOutput'])
+-    stats['maxModelOutput'] = max(stats['maxModelOutput'], probe['outputMax'])
+-    stats['maxModelOutput'] = max(stats['maxModelOutput'], activation['maxModelOutput'])
+-    stats['maxGradient'] = max(stats['maxGradient'], probe['maxGradient'])
++    stats['scopes'] = dict(training=training_activation, fixedValidation=activation, knownStress=probe)
++    stats['scopeOfFlatMaxima'] = 'training only; fixed validation and known stress are separate'
+     stats['adamWStateFinite'] = finite(optimizer.state_dict()['state'])
+     if not stats['adamWStateFinite']:
+         raise FloatingPointError('AdamW state nonfinite at session end')
+--- /dev/null
++++ b/app/tools/bnc_neural_training/v2/v4_research/__init__.py
+@@ -0,0 +1 @@
++"""Independent Bayer demosaic candidates; never exported or product enabled here."""
+--- /dev/null
++++ b/app/tools/bnc_neural_training/v2/v4_research/model.py
+@@ -0,0 +1,65 @@
++"""Matched W24 controls: normalized bounded gate versus normalized ungated SiLU."""
++import torch
++from torch import nn
++from ..model import BncNeuralV2, Config, GatedBlock, SHARED_DILATIONS, OPPONENT_DILATIONS
++from ..training_safety import gate
++
++
++class FeatureNorm(nn.Module):
++    """Channel-wise at each pixel, never scene/gain normalization of measured RAW."""
++    def __init__(self, width):
++        super().__init__()
++        self.weight = nn.Parameter(torch.ones(1,width,1,1))
++        self.bias = nn.Parameter(torch.zeros(1,width,1,1))
++        self.eps = 1e-6
++
++    def forward(self, x):
++        x = x.float()
++        centered = x-x.mean(1,keepdim=True)
++        variance = centered.square().mean(1,keepdim=True)
++        return centered*torch.rsqrt(variance+self.eps)*self.weight+self.bias
++
++
++class ResearchConfig(Config):
++    export_allowed = False
++    def __init__(self, variant):
++        super().__init__()
++        object.__setattr__(self,'variant',variant)
++
++    @property
++    def parameter_count(self):
++        return super().parameter_count+2*self.width*self.blocks
++
++    def description(self):
++        result = super().description()
++        result.update(architectureVersion='BNC_NEURAL_V4_RESEARCH_W24', candidate=self.variant,
++                      featureNormalization='per-pixel across learned channels; affine; eps=1e-6',
++                      blockOperation='16*tanh(a*b/16)' if self.variant=='N' else '0.5*(SiLU(a)+SiLU(b))',
++                      forwardPrecision='FP32', productReady=False)
++        return result
++
++
++class ResearchBlock(GatedBlock):
++    def __init__(self,width,dilation,variant):
++        super().__init__(width,dilation)
++        self.variant = variant
++        self.norm = FeatureNorm(width)
++
++    def forward(self,x):
++        a,b = self.expand(self.depthwise(self.norm(x))).chunk(2,1)
++        delta = self.project(gate(a,b,self.variant))
++        return x+torch.tanh(self.alpha)*delta
++
++
++class ResearchModel(BncNeuralV2):
++    def __init__(self,variant):
++        if variant not in ('N','S'):
++            raise ValueError('V4 research permits N and S only')
++        super().__init__(ResearchConfig(variant))
++        w=self.config.width
++        self.shared=nn.Sequential(*(ResearchBlock(w,d,variant) for d in SHARED_DILATIONS))
++        self.opponent=nn.Sequential(*(ResearchBlock(w,d,variant) for d in OPPONENT_DILATIONS))
++
++    def forward(self,packed):
++        with torch.autocast(device_type=packed.device.type,enabled=False):
++            return super().forward(packed.float())
+--- /dev/null
++++ b/app/tools/bnc_neural_training/v2/v4_research/run.py
+@@ -0,0 +1,449 @@
++"""Fresh, matched V4 research; explicit sessions, protected artifacts, no export."""
++import argparse
++import copy
++from contextlib import contextmanager
++import hashlib
++import json
++import os
++import platform
++from pathlib import Path
++import random
++import signal
++import time
++from types import SimpleNamespace
++
++import numpy as np
++import torch
++from torch.utils.data import DataLoader
++
++from ..checkpoint import capture, load, save, GlobalCosine, objective_identity, rng_state, restore_rng
++from ..data import read_corpus, TrainingData
++from ..losses import diagnostics, reconstruction_loss
++from ..train import atomic_json, validate
++from ..training_safety import (UnsafeUpdate, ResearchRegression, enforce_guard,
++                              ScopedObserver, checked_step, finite,
++                              serializable, probe, stress_probe, edge_input, guard)
++from ..validation_freeze import cases as fixed_cases
++from .model import ResearchModel
++
++ROOT=Path('build/bnc-neural-v2/v4-research')
++MANIFEST=Path('build/bnc-neural-v2/corpus/corpus.json')
++ARCHIVE=Path('build/bnc-neural-v2/training/w24/fixed-validation-procedural.npz')
++ARCHIVE_SHA='62c51c87018c755b700f10a1624998e25e7a023cb9652041016212a1fac2b00b'
++SEED=823109
++MICROBATCH=32
++WORKERS=4
++FIRST_STOP=2000
++CHECK_EVERY=250
++GUARD_FACTOR=4.
++
++
++def sha(path):
++    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
++
++
++def code_identity():
++    base=Path(__file__).resolve().parent.parent
++    names=('v4_research/model.py','v4_research/run.py','training_safety.py',
++           'checkpoint.py','train.py','validation_freeze.py','session_report.py','evaluate.py')
++    parent_names=('package.py','evaluate.py','opponent.py','inspect_candidate.py')
++    external=base.parent.parent/'raw_truth/quality_metrics.py'
++    return dict(objective=objective_identity(),research={n:sha(base/n) for n in names},
++                evaluators={n:sha(base.parent/n) for n in parent_names},
++                rawTruthQualityMetrics=sha(external) if external.is_file() else None)
++
++
++@contextmanager
++def session_lock(root):
++    """One research process, including preparation/evaluation, per output root."""
++    root.mkdir(parents=True,exist_ok=True)
++    stream=(root/'.research-session.lock').open('a+b')
++    locked=False
++    try:
++        if os.name=='nt':
++            import msvcrt
++            stream.seek(0)
++            if not stream.read(1):
++                stream.write(b'0');stream.flush()
++            stream.seek(0)
++            msvcrt.locking(stream.fileno(),msvcrt.LK_NBLCK,1)
++        else:
++            import fcntl
++            fcntl.flock(stream.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
++        locked=True
++        yield
++    finally:
++        if locked:
++            if os.name=='nt':
++                stream.seek(0);msvcrt.locking(stream.fileno(),msvcrt.LK_UNLCK,1)
++            else:
++                fcntl.flock(stream.fileno(),fcntl.LOCK_UN)
++        stream.close()
++
++
++def setup(device):
++    os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG',':4096:8')
++    torch.set_num_threads(2)
++    torch.use_deterministic_algorithms(True)
++    torch.backends.cudnn.benchmark=False
++    torch.backends.cudnn.deterministic=True
++    torch.backends.cuda.matmul.allow_tf32=False
++    torch.backends.cudnn.allow_tf32=False
++    if device=='cuda' and not torch.cuda.is_available():
++        raise RuntimeError('CUDA unavailable; no automatic CPU training fallback')
++
++
++def fresh(candidate,device,corpus,archive):
++    random.seed(SEED);np.random.seed(SEED);torch.manual_seed(SEED)
++    if torch.cuda.is_available():
++        torch.cuda.manual_seed_all(SEED)
++    model=ResearchModel(candidate).to(device)
++    optimizer=torch.optim.AdamW(model.parameters(),lr=.001,betas=(.9,.99),weight_decay=1e-4)
++    scheduler=GlobalCosine(optimizer)
++    scaler=torch.amp.GradScaler('cuda',enabled=False)
++    generator=torch.Generator().manual_seed(SEED+7919)
++    digest=hashlib.sha256()
++    for name,tensor in sorted(model.state_dict().items()):
++        digest.update(name.encode());digest.update(tensor.detach().cpu().numpy().tobytes())
++    provenance=dict(trainingCorpus=corpus,initialWeightsSHA256=digest.hexdigest(),
++        sourceWeights='fresh seeded initialization; never v3 checkpoint conversion',
++        sourceOptimizer='new AdamW',productReady=False,researchCodeIdentity=code_identity(),
++        environment=dict(torchVersion=str(torch.__version__),pythonVersion=platform.python_version(),
++            device=device,cudaVersion=torch.version.cuda,cudnnVersion=torch.backends.cudnn.version(),
++            gpuName=torch.cuda.get_device_name() if device=='cuda' else None),
++        generatorReliabilityMigration=dict(validationArchive=str(archive.resolve()),
++            validationArchiveSHA256=ARCHIVE_SHA),
++        researchStopGuard=dict(version='catastrophic_regression_v1',factor=GUARD_FACTOR,
++            baselineRule='best observed sentinel metrics at/after 2000 updates; recorded steps',releaseQualification=False))
++    args=SimpleNamespace(seed=SEED,microbatch=MICROBATCH,workers=WORKERS,variant=candidate,
++                         manifest=corpus.get('manifest',str(MANIFEST)),fullFP32=True,checkEvery=CHECK_EVERY)
++    state=capture(model,optimizer,scaler,scheduler,0,[],float('inf'),provenance,0.,args,generator)
++    return model,optimizer,scheduler,scaler,generator,state
++
++
++def verify(state,candidate,corpus):
++    if state['modelIdentity']!=ResearchModel(candidate).config.description():
++        raise ValueError('V4 candidate identity mismatch; v3 resumes are forbidden')
++    if state['objectiveIdentity']!=objective_identity() or state['provenance']['researchCodeIdentity']!=code_identity():
++        raise ValueError('research/model/objective code changed; create a new identified research run')
++    if state['datasetIdentity']['sha256']!=corpus['sha256']:
++        raise ValueError('corpus changed')
++    a=state['trainingArguments']
++    if (a['seed'],a['microbatch'],a['workers'],a['variant'],a['checkEvery'])!=(SEED,MICROBATCH,WORKERS,candidate,CHECK_EVERY):
++        raise ValueError('training/sample/qualification cadence changed')
++    if state['sampler']['nextSampleIndex']!=state['step']*MICROBATCH or state['scheduler']['nextStep']!=state['step']:
++        raise ValueError('committed optimizer/sampler boundary changed')
++    if not finite(state['model']) or not finite(state['optimizer']['state']):
++        raise UnsafeUpdate('resume','nonfinite checkpoint')
++
++
++def protected_root(root):
++    root=Path(root).resolve()
++    old=Path('build/bnc-neural-v2').resolve()
++    for name in ('v3-phase-a','v3-phase-b','training','corpus','python'):
++        forbidden=old/name
++        if root==forbidden or root.is_relative_to(forbidden):
++            raise ValueError('V4 output must not be inside an existing training/data/dependency tree')
++    return root
++
++
++def prepare(root,candidate,device,corpus,archive):
++    out=root/candidate
++    latest=out/'checkpoints/latest.pt'
++    identity_path=out/'identity.json'
++    if not identity_path.exists():
++        if out.exists() and any(out.iterdir()):
++            raise ValueError('nonempty candidate directory without identity; refusing overwrite')
++        out.mkdir(parents=True,exist_ok=True)
++        model,opt,scheduler,scaler,generator,state=fresh(candidate,device,corpus,archive)
++        save(latest,state)
++        save(out/'checkpoints/source_step_000000.pt',state)
++        atomic_json(identity_path,dict(candidate=candidate,modelIdentity=state['modelIdentity'],
++            initialWeightsSHA256=state['provenance']['initialWeightsSHA256'],
++            sourceCheckpointSHA256=sha(out/'checkpoints/source_step_000000.pt'),
++            corpusSHA256=corpus['sha256'],codeIdentity=code_identity(),productReady=False))
++    identity=json.loads(identity_path.read_text())
++    if identity['candidate']!=candidate or identity['codeIdentity']!=code_identity() or identity['corpusSHA256']!=corpus['sha256']:
++        raise ValueError('existing V4 run identity changed')
++    state=load(latest);verify(state,candidate,corpus)
++    model=ResearchModel(candidate).to(device)
++    model.load_state_dict(state['model'],strict=True)
++    opt=torch.optim.AdamW(model.parameters(),lr=.001,betas=(.9,.99),weight_decay=1e-4)
++    opt.load_state_dict(state['optimizer'])
++    scheduler=GlobalCosine(opt);scheduler.load_state_dict(state['scheduler'])
++    scaler=torch.amp.GradScaler('cuda',enabled=False);scaler.load_state_dict(state['scaler'])
++    generator=torch.Generator();generator.set_state(state['sampler']['loaderGeneratorState'])
++    return out,model,opt,scheduler,scaler,generator,state
++
++
++def sentinels(model,opt,archive):
++    a,b=edge_input(archive,ARCHIVE_SHA)
++    return dict(stress=stress_probe(model,opt),
++                edge=probe(model,None,a,b,'frozen_isoluminant_edge',False))
++
++
++@contextmanager
++def preserved_rng():
++    saved=rng_state()
++    try:
++        yield
++    finally:
++        restore_rng(saved)
++
++
++def qualification_resources():
++    from ..evaluate import REQUIRED, PERIODS, DETAIL
++    root=Path('build/bnc-neural/synthetic')
++    resources={}
++    for name in REQUIRED+PERIODS+DETAIL+('flat_neutral','color_edge','isoluminant_color_edge'):
++        paths=[root/'fixtures'/f'synthetic-{name}'/'ground-truth.rgb.f32']
++        paths.extend(root/'demosaic'/f'synthetic-{name}'/f'{route}-lsc-off.rgb.f32' for route in ('malvar','amaze'))
++        for path in paths:
++            if not path.is_file():
++                raise FileNotFoundError(f'qualification resource missing: {path}')
++            resources[str(path)]=sha(path)
++    v1=Path('build/bnc-neural/training/opponent-v2-full/candidate.bncmodel')
++    for path in (v1,v1.with_suffix('.bncmodel.sha256')):
++        if not path.is_file():
++            raise FileNotFoundError(f'existing comparison resource missing: {path}')
++        resources[str(path)]=sha(path)
++    return resources
++
++
++def evaluate_only(out,model,opt,parts,state,archive,device):
++    """Full report retry/inspection: checkpoint bytes and failure latch are untouched."""
++    from ..session_report import comparison
++    from ..evaluate import synthetic_gate
++    resources=qualification_resources()
++    cases=fixed_cases(parts['validation'],SEED,state['provenance'])
++    if len(cases)!=116:
++        raise ValueError('full fixed validation changed')
++    observer=ScopedObserver(model,'fixed_validation_only')
++    with preserved_rng():
++        try:
++            rows,aggregate=validate(model,cases,device,True)
++        finally:
++            observer.close()
++        checks=sentinels(model,opt,archive)
++        synthetic,_=comparison(copy.deepcopy(model).cpu().eval())
++    value=dict(step=state['step'],optimizerUpdates=0,checkpointWrites=0,
++        validation=dict(cases=rows,aggregate=aggregate),synthetic=synthetic,
++        syntheticGate=synthetic_gate(synthetic),sentinels=checks,
++        researchGuard=guard(checks,state['provenance'].get('sentinelBaseline'),GUARD_FACTOR),
++        activation=observer.result(),qualificationResourceSHA256=resources,
++        resourcesMatchTraining=state['provenance'].get('qualificationResourceSHA256') in (None,resources),
++        productReady=False,automaticContinuation=False)
++    path=out/'evaluation-only'/f'step_{state["step"]:06d}_{time.time_ns()}.json'
++    path.parent.mkdir(exist_ok=True)
++    atomic_json(path,serializable(value))
++    print(str(path.resolve()),flush=True)
++
++
++def fail(out,error,step,last_valid):
++    event=dict(status='RESEARCH_STOP',attemptedStep=step,
++        stage=getattr(error,'stage','evaluation_or_runtime'),reason=str(error),
++        numericalFailures=1 if isinstance(error,FloatingPointError) else 0,
++        qualityFailures=1 if isinstance(error,ResearchRegression) else 0,
++        lastValidCheckpoint=str(last_valid.resolve()),productReady=False,
++        automaticContinuation=False,safeToPowerOff=True)
++    path=out/'failures'/f'{time.time_ns()}.json';path.parent.mkdir(exist_ok=True)
++    atomic_json(path,serializable(event));atomic_json(out/'status.json',serializable(event))
++
++
++def run(candidate,root,device,mode,target,manifest=MANIFEST,archive=ARCHIVE):
++    root=protected_root(root)
++    setup(device)
++    parts,corpus=read_corpus(manifest)
++    if not json.loads(Path(manifest).read_text()).get('dedupFinalized'):
++        raise ValueError('finalized group-disjoint corpus required')
++    # Validate archive before creating a candidate.
++    edge_input(archive,ARCHIVE_SHA)
++    with session_lock(root):
++        out,model,opt,scheduler,scaler,generator,state=prepare(root,candidate,device,corpus,archive)
++        step=state['step'];last_valid=out/'checkpoints/latest.pt'
++        if mode=='prepare':
++            print(json.dumps(dict(candidate=candidate,step=step,initialWeightsSHA256=state['provenance']['initialWeightsSHA256'],
++                                  checkpoint=str(last_valid.resolve()),optimizerUpdates=0,productReady=False)),flush=True)
++            return
++        if mode=='diagnose':
++            checks=sentinels(model,opt,archive)
++            path=out/f'diagnosis_step_{step:06d}_{time.time_ns()}.json'
++            atomic_json(path,serializable(dict(step=step,sentinels=checks,guard=guard(checks),optimizerUpdates=0,productReady=False)))
++            print(str(path.resolve()),flush=True)
++            return
++        if mode=='validate':
++            evaluate_only(out,model,opt,parts,state,archive,device)
++            return
++        if device!='cuda':
++            raise ValueError('full corpus training requires explicit CUDA; use unit tests for CPU checks')
++        if target is None or not step<target<=100000:
++            raise ValueError('stop target must exceed current step and be at most 100000')
++        if step<FIRST_STOP and target>FIRST_STOP:
++            raise ValueError('first research session must stop at 2000 or earlier for review')
++        status=out/'status.json'
++        if status.exists() and json.loads(status.read_text())['status']=='RESEARCH_STOP':
++            raise ValueError('research stop is latched; diagnose and create a reviewed new run, never silently resume')
++        if (out/'sessions'/f'step_{target:06d}').exists():
++            raise ValueError('completed session exists; refusing overwrite')
++        # Never skip the known failure before allowing a new optimizer update.
++        baseline=state['provenance'].get('sentinelBaseline')
++        initial=sentinels(model,opt,archive)
++        gate=guard(initial,baseline,GUARD_FACTOR)
++        if not gate['passed']:
++            try:
++                enforce_guard(gate)
++            except (UnsafeUpdate,ResearchRegression) as error:
++                fail(out,error,step,last_valid);raise
++        provenance=state['provenance']
++        cases=fixed_cases(parts['validation'],SEED,provenance)
++        if len(cases)!=116:
++            raise ValueError('fixed full-validation case count changed')
++        # Fail before training if repo-only evaluators/classical fixtures are unavailable.
++        resources=qualification_resources()
++        previous_resources=provenance.get('qualificationResourceSHA256')
++        if previous_resources is not None and previous_resources!=resources:
++            raise ValueError('qualification fixtures/classical baselines changed; no training started')
++        provenance['qualificationResourceSHA256']=resources
++        history,best=state['history'],state['best']
++        args=SimpleNamespace(**state['trainingArguments'])
++        start_step=step;start=time.perf_counter();elapsed=state['elapsed']
++        restore_rng(state['rng'])
++        stop_requested=False
++        def request_stop(signum,frame):
++            nonlocal stop_requested
++            stop_requested=True
++        handlers={}
++        for name in ('SIGINT','SIGTERM','SIGBREAK'):
++            if hasattr(signal,name):
++                sig=getattr(signal,name);handlers[sig]=signal.getsignal(sig);signal.signal(sig,request_stop)
++        loader=None
++        observer=ScopedObserver(model,'training_only')
++        train_stats=dict(maxGradient=0.,numericalFailures=0)
++        def snapshot():
++            return capture(model,opt,scaler,scheduler,step,history,best,provenance,
++                           elapsed+time.perf_counter()-start,args,generator)
++        def persist(name=None):
++            nonlocal last_valid
++            snap=snapshot()
++            if not finite(snap['model']) or not finite(snap['optimizer']['state']):
++                raise UnsafeUpdate('checkpoint','invalid state cannot be resumable')
++            if name:
++                path=out/'checkpoints'/name
++                if path.exists():
++                    raise FileExistsError(path)
++                save(path,snap)
++            save(out/'checkpoints/latest.pt',snap)
++            last_valid=out/'checkpoints/latest.pt'
++        try:
++            before=generator.get_state()
++            loader=iter(DataLoader(TrainingData(parts['train'],(target-step)*MICROBATCH,SEED,step*MICROBATCH),
++                batch_size=MICROBATCH,shuffle=False,num_workers=WORKERS,pin_memory=True,
++                persistent_workers=True,prefetch_factor=2,generator=generator))
++            generator.set_state(before)
++            model.train()
++            while step<target and not stop_requested:
++                a,b=next(loader);a,b=a.to(device,non_blocking=True).float(),b.to(device,non_blocking=True).float()
++                opt.zero_grad(set_to_none=True);scheduler.apply(step)
++                output=model(a);loss,terms,rgb=reconstruction_loss(a,output,b,True)
++                if not finite((a,b,output,loss,terms,rgb)):
++                    raise UnsafeUpdate('forward','nonfinite inputs/forward/loss')
++                loss.backward()
++                maximum=checked_step(model,opt)
++                step+=1;scheduler.committed()
++                train_stats['maxGradient']=max(train_stats['maxGradient'],maximum)
++                if step%50==0:
++                    print(f'candidate={candidate} step={step} target={target} loss={float(loss.detach()):.7f} finite=true',flush=True)
++                if step%CHECK_EVERY==0 or step==target or stop_requested:
++                    checks=sentinels(model,opt,archive)
++                    screen=guard(checks,baseline,GUARD_FACTOR)
++                    audit=out/'sentinels'/f'step_{step:06d}.json';audit.parent.mkdir(exist_ok=True)
++                    atomic_json(audit,serializable(dict(step=step,sentinels=checks,guard=screen)))
++                    if not screen['passed']:
++                        # A numerically finite rejected model is research evidence, not a resume target.
++                        save(out/'checkpoints'/f'rejected_step_{step:06d}.pt',snapshot())
++                        enforce_guard(screen)
++                    if step>=FIRST_STOP:
++                        if baseline is None:
++                            baseline=copy.deepcopy(checks)
++                            baseline['referenceSteps']=dict(stress=step,edge=step)
++                        else:
++                            if checks['stress']['loss']<baseline['stress']['loss']:
++                                baseline['stress']=copy.deepcopy(checks['stress'])
++                                baseline['referenceSteps']['stress']=step
++                            if checks['edge']['metrics']['missing_rgb_l1']<baseline['edge']['metrics']['missing_rgb_l1']:
++                                baseline['edge']=copy.deepcopy(checks['edge'])
++                                baseline['referenceSteps']['edge']=step
++                        provenance['sentinelBaseline']=baseline
++                    persist(f'recovery_step_{step:06d}.pt')
++            training_activation=observer.result();observer.close()
++            # Evaluation scopes do not share hooks or accumulated peaks with training.
++            validation_observer=ScopedObserver(model,'fixed_validation_only')
++            try:
++                rows,aggregate=validate(model,cases,device,True)
++            finally:
++                validation_observer.close()
++            if not finite(rows):
++                raise UnsafeUpdate('validation','nonfinite metrics')
++            final=sentinels(model,opt,archive);screen=guard(final,baseline,GUARD_FACTOR)
++            if not screen['passed']:
++                enforce_guard(screen)
++            aggregate['step']=step
++            history.append(aggregate)
++            improved=aggregate['selectionScore']<best
++            if improved:
++                best=aggregate['selectionScore']
++            # Existing product quality gates, evaluated using repo fixtures; never export V4 weights.
++            from ..session_report import comparison
++            from ..evaluate import synthetic_gate
++            with preserved_rng():
++                cpu_model=copy.deepcopy(model).cpu().eval()
++                synthetic,_=comparison(cpu_model)
++            quality=synthetic_gate(synthetic)
++            evidence=dict(candidate=candidate,startStep=start_step,endStep=step,
++                validation=dict(cases=rows,aggregate=aggregate),synthetic=synthetic,syntheticGate=quality,
++                numerical=dict(training=train_stats,trainingActivation=training_activation,
++                    fixedValidationActivation=validation_observer.result(),sentinels=final),
++                researchGuard=screen,interrupted=stop_requested and step<target,productReady=False,
++                automaticContinuation=False,noPackageExport=True)
++            session=out/'sessions'/f'step_{step:06d}';session.mkdir(parents=True,exist_ok=False)
++            atomic_json(session/'evidence.json',serializable(evidence))
++            text=(f'# BnC Neural V4 {candidate} — step {step}\n\n'
++                  f'Fixed validation selection score: {aggregate["selectionScore"]:.9f}.\n'
++                  f'Synthetic quality failures: {len(quality["failures"])}.\n'
++                  'Research only. No export, Vulkan, or product activation. No automatic continuation.\n')
++            (session/'report.md').write_text(text,encoding='utf-8')
++            persist(f'stop_step_{step:06d}.pt')
++            if improved:
++                save(out/'checkpoints/best.pt',snapshot())
++            atomic_json(out/'status.json',dict(status='SESSION_STOPPED',step=step,
++                checkpoint=str(last_valid.resolve()),report=str((session/'report.md').resolve()),
++                safeToPowerOff=True,productReady=False,automaticContinuation=False))
++            print(text,flush=True)
++        except BaseException as error:
++            fail(out,error,step+1 if step<target else step,last_valid)
++            raise
++        finally:
++            observer.close()
++            if loader is not None and hasattr(loader,'_shutdown_workers'):
++                loader._shutdown_workers()
++            for sig,handler in handlers.items():
++                signal.signal(sig,handler)
++
++
++def main():
++    parser=argparse.ArgumentParser(__doc__)
++    parser.add_argument('--candidate',choices=('N','S'),required=True)
++    parser.add_argument('--output-root',type=Path,default=ROOT)
++    parser.add_argument('--device',choices=('cuda','cpu'),default='cuda')
++    group=parser.add_mutually_exclusive_group(required=True)
++    group.add_argument('--prepare-only',action='store_true')
++    group.add_argument('--diagnose-only',action='store_true')
++    group.add_argument('--validate-only',action='store_true')
++    group.add_argument('--stop-at-step',type=int)
++    args=parser.parse_args()
++    mode='prepare' if args.prepare_only else 'diagnose' if args.diagnose_only else 'validate' if args.validate_only else 'train'
++    run(args.candidate,args.output_root,args.device,mode,args.stop_at_step)
++
++
++if __name__=='__main__':
++    main()
+--- /dev/null
++++ b/app/tools/bnc_neural_training/v2/v4_research/test_research.py
+@@ -0,0 +1,194 @@
++"""Contract and real failure-mode tests; no corpus/GPU dependency."""
++import copy
++import tempfile
++import unittest
++from pathlib import Path
++
++import numpy as np
++import torch
++
++from ...contracts import pack, merge, measured_mask
++from ...model import infer_tiled
++from ..model import MissingRgbAdapter, missing_rgb
++from ..checkpoint import save, load, capture
++from ..training_safety import UnsafeUpdate, ResearchRegression, enforce_guard, ScopedObserver, checked_step, guard, probe
++from .model import ResearchModel, FeatureNorm
++from .run import session_lock, protected_root, fresh, verify, fail, preserved_rng
++from types import SimpleNamespace
++
++torch.set_num_threads(2)
++
++
++class ResearchTests(unittest.TestCase):
++    def test_matched_fresh_weights_and_new_identity(self):
++        torch.manual_seed(823109);a=ResearchModel('N')
++        torch.manual_seed(823109);b=ResearchModel('S')
++        self.assertTrue(all(torch.equal(v,b.state_dict()[k]) for k,v in a.state_dict().items()))
++        self.assertEqual(sum(p.numel() for p in a.parameters()),27632)
++        self.assertEqual(a.config.parameter_count,27632)
++        self.assertNotEqual(a.config.description(),b.config.description())
++        self.assertEqual(a.config.halo,20)
++
++    def test_exact_measured_samples_all_patterns_offsets_and_odd_size(self):
++        raw=np.random.default_rng(19).uniform(0,4,(31,35)).astype('f4')
++        for variant in ('N','S'):
++            torch.manual_seed(17);model=ResearchModel(variant).eval()
++            for pattern in ('RGGB','GRBG','GBRG','BGGR'):
++                for offset in ((0,0),(1,0),(0,1),(1,1)):
++                    packed,g=pack(raw,pattern,crop_offset=offset)
++                    a=torch.from_numpy(packed.transpose(2,0,1).copy())[None]
++                    with torch.no_grad():
++                        missing=missing_rgb(a,model(a))[0].permute(1,2,0).numpy()
++                    output=merge(raw,missing,g)
++                    self.assertTrue(np.array_equal(output[measured_mask(g)].view('u4'),raw.ravel().view('u4')))
++
++    def test_tiling_matches_full_without_spatial_normalization(self):
++        for variant in ('N','S'):
++            torch.manual_seed(9);m=MissingRgbAdapter(ResearchModel(variant).eval())
++            x=torch.rand(1,4,57,61)
++            with torch.no_grad():
++                reference=m(x);tiled=infer_tiled(m,x,inner=24)
++            self.assertLess(float((reference-tiled).abs().max()),1e-5)
++
++    def test_optimizer_overflow_rejected_before_mutation(self):
++        m=torch.nn.Linear(1,1,bias=False)
++        opt=torch.optim.AdamW(m.parameters(),lr=.001,betas=(.9,.99))
++        m.weight.grad=torch.full_like(m.weight,6e30)
++        before=copy.deepcopy(m.state_dict());state=copy.deepcopy(opt.state_dict())
++        with self.assertRaises(UnsafeUpdate) as caught:
++            checked_step(m,opt)
++        self.assertEqual(caught.exception.stage,'adamw_square')
++        self.assertTrue(torch.equal(m.weight,before['weight']))
++        self.assertEqual(opt.state_dict(),state)
++
++    def test_post_update_failure_is_detected_immediately(self):
++        m=torch.nn.Linear(1,1,bias=False)
++        class BadAdamW(torch.optim.AdamW):
++            def step(self,closure=None):
++                super().step(closure)
++                self.state[next(iter(m.parameters()))]['exp_avg_sq'].fill_(float('inf'))
++        opt=BadAdamW(m.parameters(),lr=.001,betas=(.9,.99))
++        m.weight.grad=torch.ones_like(m.weight)
++        with self.assertRaises(UnsafeUpdate) as caught:
++            checked_step(m,opt)
++        self.assertEqual(caught.exception.stage,'post_update_state')
++
++    def test_probe_isolation_preserves_live_gradients_state_and_scope(self):
++        torch.manual_seed(3);m=ResearchModel('N').train()
++        opt=torch.optim.AdamW(m.parameters(),lr=.001,betas=(.9,.99))
++        for p in m.parameters():p.grad=torch.ones_like(p)
++        old=copy.deepcopy(m.state_dict());grads=[p.grad.clone() for p in m.parameters()]
++        observer=ScopedObserver(m,'training_only')
++        a=torch.rand(1,4,12,14);t=torch.rand(1,3,24,28)
++        result=probe(m,opt,a,t,'diagnostic',True)
++        self.assertTrue(m.training)
++        self.assertEqual(observer.result()['modelOutputMax'],0.)
++        self.assertTrue(all(torch.equal(v,old[k]) for k,v in m.state_dict().items()))
++        self.assertTrue(all(torch.equal(p.grad,g) for p,g in zip(m.parameters(),grads)))
++        self.assertEqual(opt.state_dict()['state'],{})
++        self.assertTrue(result['optimizerPreflightPassed'])
++        observer.close()
++
++    def test_regression_guards_detect_c_edge_and_stress(self):
++        reference=dict(stress=dict(finite=True,optimizerPreflightPassed=True,loss=.128),
++                       edge=dict(finite=True,metrics=dict(missing_rgb_l1=.005727)))
++        current=copy.deepcopy(reference)
++        current['stress']['loss']=3.657
++        current['edge']['metrics']['missing_rgb_l1']=.0599
++        result=guard(current,reference)
++        self.assertEqual(len(result['failures']),2)
++        self.assertFalse(result['passed'])
++        self.assertFalse(result['releaseQualification'])
++        self.assertTrue(result['numericalPassed'])
++        with self.assertRaises(ResearchRegression):enforce_guard(result)
++
++    def test_training_root_and_cross_process_lock_are_protected(self):
++        with self.assertRaises(ValueError):protected_root('build/bnc-neural-v2/v3-phase-b')
++        with tempfile.TemporaryDirectory() as temp:
++            with session_lock(Path(temp)):
++                with self.assertRaises(OSError):
++                    with session_lock(Path(temp)):pass
++
++    def test_checkpoint_resume_preserves_next_update_and_sampler(self):
++        corpus=dict(sha256='test-corpus',counts={},revision='unit-test')
++        m,opt,schedule,scaler,generator,state=fresh('N','cpu',corpus,Path('not-used.npz'))
++        args=SimpleNamespace(**state['trainingArguments'])
++        a=torch.rand(1,4,12,14);truth=torch.rand(1,3,24,28)
++        from ..losses import reconstruction_loss
++        schedule.apply(0)
++        reconstruction_loss(a,m(a),truth,True)[0].backward()
++        checked_step(m,opt);schedule.committed();opt.zero_grad(set_to_none=True)
++        saved=capture(m,opt,scaler,schedule,1,[],float('inf'),state['provenance'],0.,args,generator)
++        with tempfile.TemporaryDirectory() as temp:
++            path=Path(temp)/'latest.pt';save(path,saved);resumed=load(path)
++        verify(resumed,'N',corpus)
++        self.assertEqual(resumed['sampler']['nextSampleIndex'],32)
++        b=ResearchModel('N');b.load_state_dict(resumed['model'],strict=True)
++        other=torch.optim.AdamW(b.parameters(),lr=.001,betas=(.9,.99),weight_decay=1e-4)
++        other.load_state_dict(resumed['optimizer'])
++        from ..checkpoint import GlobalCosine
++        next_schedule=GlobalCosine(other);next_schedule.load_state_dict(resumed['scheduler'])
++        for model,optimizer,scheduler in ((m,opt,schedule),(b,other,next_schedule)):
++            scheduler.apply(1);optimizer.zero_grad(set_to_none=True)
++            reconstruction_loss(a,model(a),truth,True)[0].backward()
++            checked_step(model,optimizer);scheduler.committed()
++        self.assertTrue(all(torch.equal(v,b.state_dict()[k]) for k,v in m.state_dict().items()))
++        self.assertEqual(next_schedule.next_step,2)
++
++    def test_rejected_update_does_not_overwrite_last_checkpoint(self):
++        import hashlib,json
++        with tempfile.TemporaryDirectory() as temp:
++            out=Path(temp);latest=out/'latest.pt';latest.write_bytes(b'preserve this checkpoint')
++            original=hashlib.sha256(latest.read_bytes()).hexdigest()
++            fail(out,UnsafeUpdate('adamw_square','unsafe gradient'),29001,latest)
++            self.assertEqual(hashlib.sha256(latest.read_bytes()).hexdigest(),original)
++            event=json.loads((out/'status.json').read_text())
++            self.assertEqual(event['numericalFailures'],1)
++            self.assertEqual(event['status'],'RESEARCH_STOP')
++            self.assertEqual(len(list((out/'failures').glob('*.json'))),1)
++
++    def test_research_graph_cannot_be_exported_as_old_schema(self):
++        from ...package import export_reference,PackageError
++        with tempfile.TemporaryDirectory() as temp:
++            path=Path(temp)/'candidate.bncmodel'
++            with self.assertRaises(PackageError):
++                export_reference(ResearchModel('N'),path,{})
++            self.assertFalse(path.exists())
++
++    def test_evaluation_does_not_consume_resume_rng(self):
++        import random
++        torch.manual_seed(9);np.random.seed(9);random.seed(9)
++        from ..checkpoint import rng_state
++        before=rng_state()
++        with preserved_rng():
++            torch.rand(8);np.random.random(8);random.random()
++        after=rng_state()
++        self.assertTrue(torch.equal(before['torchCPU'],after['torchCPU']))
++        self.assertEqual(before['numpy'],after['numpy'])
++        self.assertEqual(before['python'],after['python'])
++
++    def test_prepare_and_diagnose_never_advance_or_replace_checkpoint(self):
++        from unittest.mock import patch
++        import hashlib,json
++        from . import run as runner
++        a=torch.rand(4,12,14);b=torch.rand(3,24,28)
++        corpus=dict(sha256='mock-corpus',counts={},revision='workflow-test')
++        with tempfile.TemporaryDirectory() as temp:
++            root=Path(temp)/'research';manifest=Path(temp)/'corpus.json'
++            manifest.write_text(json.dumps(dict(dedupFinalized=True)))
++            with patch.object(runner,'read_corpus',return_value=(dict(train=[],validation=[]),corpus)), \
++                 patch.object(runner,'edge_input',return_value=(a,b)), \
++                 patch('app.tools.bnc_neural_training.v2.v4_research.run.sentinels',
++                       side_effect=lambda model,opt,archive: dict(stress=probe(model,opt,a,b,'stress',True),
++                                                                 edge=probe(model,None,a,b,'edge',False))):
++                runner.run('N',root,'cpu','prepare',None,manifest,Path(temp)/'unused.npz')
++                checkpoint=root/'N/checkpoints/latest.pt'
++                before=hashlib.sha256(checkpoint.read_bytes()).hexdigest()
++                runner.run('N',root,'cpu','diagnose',None,manifest,Path(temp)/'unused.npz')
++                self.assertEqual(hashlib.sha256(checkpoint.read_bytes()).hexdigest(),before)
++                self.assertEqual(load(checkpoint)['step'],0)
++                self.assertEqual(len(list((root/'N').glob('diagnosis_step_*.json'))),1)
++
++
++if __name__=='__main__':
++    unittest.main()
+--- /dev/null
++++ b/app/tools/bnc_neural_training/v2/v4_research/verify_local.py
+@@ -0,0 +1,72 @@
++"""Replays real A/C failures and checks fresh V4, without original checkpoint writes."""
++import argparse
++import copy
++import hashlib
++import json
++from pathlib import Path
++
++import torch
++
++from ..checkpoint import load, objective_identity
++from ..data import TrainingData
++from ..training_safety import edge_input, probe, stress_probe, guard, serializable
++from ..v3_phase_a.model import PhaseModel
++from .model import ResearchModel
++from .run import ARCHIVE, ARCHIVE_SHA, SEED, setup
++
++
++def verify(checkpoint_root,archive,output,device='cpu'):
++    setup(device)
++    a,b=edge_input(archive,ARCHIVE_SHA)
++    result=dict(device=device,torchVersion=torch.__version__,sourceObjective=objective_identity(),
++                archiveSHA256=ARCHIVE_SHA,originalCheckpointWrites=0,replays=[])
++    for candidate in ('A','C'):
++        baseline=None
++        for step in (15000,29000,30000):
++            name='recovery_step_029000.pt' if step==29000 else f'stop_step_{step:06d}.pt'
++            path=Path(checkpoint_root)/candidate/'checkpoints'/name
++            state=load(path)
++            if state['objectiveIdentity']!=objective_identity():
++                raise ValueError('original checkpoint objective differs from current source')
++            model=PhaseModel(candidate).to(device)
++            model.load_state_dict(state['model'],strict=True)
++            opt=torch.optim.AdamW(model.parameters(),lr=.001,betas=(.9,.99),weight_decay=1e-4)
++            opt.load_state_dict(state['optimizer'])
++            check=dict(stress=stress_probe(model,opt),edge=probe(model,None,a,b,'frozen_isoluminant_edge',False))
++            if step==15000:
++                baseline=copy.deepcopy(check)
++            screen=guard(check,baseline)
++            row=dict(candidate=candidate,step=step,checkpointSHA256=hashlib.sha256(path.read_bytes()).hexdigest(),
++                     sentinels=check,researchGuard=screen)
++            result['replays'].append(row)
++            expected=step==15000
++            if screen['passed']!=expected:
++                raise AssertionError(f'unexpected real-fixture guard result: {candidate} step {step}')
++            print(f'{candidate} step {step}: guard={screen["passed"]} reasons={screen["failures"]}',flush=True)
++    for candidate in ('N','S'):
++        torch.manual_seed(SEED)
++        model=ResearchModel(candidate).to(device)
++        opt=torch.optim.AdamW(model.parameters(),lr=.001,betas=(.9,.99),weight_decay=1e-4)
++        check=dict(stress=stress_probe(model,opt),edge=probe(model,None,a,b,'frozen_isoluminant_edge',False))
++        screen=guard(check)
++        if not screen['passed']:
++            raise AssertionError(f'fresh V4 {candidate} fails numerical probe')
++        result['replays'].append(dict(candidate=candidate,step=0,sentinels=check,researchGuard=screen,
++                                     note='untrained random model: finite is not reconstruction qualification'))
++    output=Path(output);output.parent.mkdir(parents=True,exist_ok=True)
++    output.write_text(json.dumps(serializable(result),indent=2,allow_nan=False),encoding='utf-8')
++    print(str(output.resolve()),flush=True)
++
++
++def main():
++    parser=argparse.ArgumentParser(__doc__)
++    parser.add_argument('--checkpoint-root',type=Path,default=Path('build/bnc-neural-v2/v3-phase-b'))
++    parser.add_argument('--archive',type=Path,default=ARCHIVE)
++    parser.add_argument('--out',type=Path,default=Path('build/bnc-neural-v2/v4-verification/replay.json'))
++    parser.add_argument('--device',choices=('cpu','cuda'),default='cpu')
++    args=parser.parse_args()
++    verify(args.checkpoint_root,args.archive,args.out,args.device)
++
++
++if __name__=='__main__':
++    main()

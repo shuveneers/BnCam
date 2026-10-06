@@ -3,6 +3,7 @@ package com.bncam.data.settings
 import com.bncam.core.capture.CaptureMode
 import com.bncam.core.capture.FrameOrigin
 import com.bncam.core.capture.OutputPolicy
+import com.bncam.core.quality.DemosaicMode
 
 enum class CaptureSettingType { BOOLEAN, INT, FLOAT, STRING, ENUM }
 enum class CaptureSettingVisibility { BASIC, PRO, LAB, HIDDEN }
@@ -144,7 +145,7 @@ object CaptureSettingsSchema {
         superseded(CaptureSettingKeys.DNG_MASTER_FRAMES_RAW_SENSOR, "Profile DNG master frames RAW_SENSOR", CaptureSettingType.INT, "App Settings → Output / app_dng_master_frames_raw"),
         active(CaptureSettingKeys.MERGE_STRICTNESS, "Merge Strictness", CaptureSettingType.FLOAT, "0.8", "0.0..1.0", CaptureSettingVisibility.LAB, modes = multiOnly),
         active(CaptureSettingKeys.MERGE_MAX_SHIFT, "Maximum Translation", CaptureSettingType.INT, "150", "1..sensor bounded", CaptureSettingVisibility.LAB, modes = multiOnly),
-        active(CaptureSettingKeys.DEMOSAIC_METHOD, "Demosaic", CaptureSettingType.ENUM, "Malvar Inspired", "Malvar Inspired|RCD Inspired|AMAZE Inspired|Auto", CaptureSettingVisibility.PRO, sources = setOf(FrameOrigin.RAW10, FrameOrigin.RAW_SENSOR)),
+        active(CaptureSettingKeys.DEMOSAIC_METHOD, "Demosaic", CaptureSettingType.ENUM, DemosaicMode.DEFAULT.displayName, DemosaicMode.USER_ORDER.joinToString("|") { it.displayName }, CaptureSettingVisibility.PRO, sources = setOf(FrameOrigin.RAW10, FrameOrigin.RAW_SENSOR)),
         active(CaptureSettingKeys.JPEG_QUALITY, "JPEG Quality", CaptureSettingType.INT, "98", "80..100", CaptureSettingVisibility.PRO, outputs = setOf(OutputPolicy.JPEG, OutputPolicy.JPEG_PLUS_RAW)),
         active(CaptureSettingKeys.PHONE_ASSISTANCE_SENSORS, "Phone Assistance Sensors", CaptureSettingType.BOOLEAN, "false", "true|false", CaptureSettingVisibility.PRO),
         unavailable(CaptureSettingKeys.BASE_TEMPORAL_BIAS, "Multi-frame Temporal Bias"),

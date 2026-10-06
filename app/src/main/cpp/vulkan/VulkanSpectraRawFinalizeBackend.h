@@ -34,6 +34,8 @@ struct SpectraRawFinalizeRequest {
     std::int32_t cfaOffsetX = 0;
     std::int32_t cfaOffsetY = 0;
     bool isRaw10 = false;
+    bool neutralDefaultRaw = false;
+    bool preserveExactCamera2Pair = false;
     bool noiseModelValid = false;
     // Canonical BnCam sensor-noise order [R, Gr, Gb, B] in normalized RAW units.
     std::array<float, 4> effectiveS{0.0f, 0.0f, 0.0f, 0.0f};
@@ -47,6 +49,7 @@ struct SpectraRawFinalizeRequest {
     bool allowGreenResidualCorrection = true;
 
     const float* lensShadingMap = nullptr;
+    std::size_t lensShadingElementCount = 0;
     std::uint32_t lensShadingColumns = 0;
     std::uint32_t lensShadingRows = 0;
     std::uint64_t lensShadingGenerationId = 0;
@@ -97,6 +100,8 @@ struct SpectraRawFinalizeResult {
     std::uint64_t sourceSaturatedPixelCount = 0;
     // Phase 9 source-domain highlight provenance. One float per 2x2 Bayer cell is
     // appended to the resident output buffer and never materialized on the CPU path.
+    std::uint64_t defaultRawPartialClipPixels = 0u;
+    std::uint64_t defaultRawFullClipPixels = 0u;
     bool sourceClipConfidenceMapReady = false;
     std::uint64_t sourceClipConfidenceMapBytes = 0;
     std::uint64_t defectCorrectedPixelCount = 0;

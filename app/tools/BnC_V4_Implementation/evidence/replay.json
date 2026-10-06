@@ -1,0 +1,1660 @@
+{
+  "device": "cpu",
+  "torchVersion": "2.14.1+cpu",
+  "sourceObjective": {
+    "contracts.py": "bbd02f32062edb877df031fa1a9d2b8804b07e41820c8bd622c0bcf6d2ca8bba",
+    "model.py": "27f14e2b13e38f88a96265702571c09c06118cc8cd3512f28d16bd5408801336",
+    "losses.py": "7befcb5ef701da396f527ab1f67250a3e2ff0db4c0e8bdd8e8b8941d4fab97f8",
+    "corpus.py": "811f6a505c40ae7c3496a978cd9c27db3b54b1e9d812fdf2acfaa087d24fc928",
+    "v2/model.py": "b6999a3624c30a6e5afdc6b62ead892eddc903f5cf368075ae9ab7a9e834b71f",
+    "v2/losses.py": "9834f935f190b93e86dcdeae2adc3c9607c1fc11969c1e7dd5bec935f2979e69",
+    "v2/data.py": "3a9386ba28386e8bface835d52debda99280dca01a5381bed14ec0b70a03163b",
+    "v2/procedural.py": "938ec060dff8b936e79b8b19336ba286fe9ee11e773cfa23eae682b0c95b9c7f"
+  },
+  "archiveSHA256": "62c51c87018c755b700f10a1624998e25e7a023cb9652041016212a1fac2b00b",
+  "originalCheckpointWrites": 0,
+  "replays": [
+    {
+      "candidate": "A",
+      "step": 15000,
+      "checkpointSHA256": "c7391490056350c9d8120a5c23e390fd64d7f3651fc5af99847a7a3bd4e7ef09",
+      "sentinels": {
+        "stress": {
+          "scope": "known_stress_single_sample",
+          "finite": true,
+          "outputMax": 1.1135849952697754,
+          "loss": 0.12732630968093872,
+          "maxGradient": 0.06083006411790848,
+          "optimizerPreflightPassed": true,
+          "optimizerAfterProbeFinite": true,
+          "metrics": {
+            "total_loss": 0.12732630968093872,
+            "losses": {
+              "missing_charbonnier": 0.053200267255306244,
+              "green_missing": 0.0675293430685997,
+              "opponent_value": 0.059969544410705566,
+              "opponent_gradient": 0.05449511110782623,
+              "luma_gradient": 0.06241508573293686,
+              "laplacian": 0.22527877986431122,
+              "zero_chroma_falsecolor": 0.00468980148434639,
+              "chromatic_edge": 0.0
+            },
+            "missing_rgb_l1": 0.05319952964782715,
+            "missing_g_l1": 0.0675293430685997,
+            "rg_rms": 0.08323103189468384,
+            "bg_rms": 0.08318919688463211,
+            "luma_gradient_ratio": 0.909105122089386,
+            "opponent_gradient_ratio": null,
+            "neutral_false_color_energy": 0.006923923268914223,
+            "chromatic_edge_retention": {
+              "RG": null,
+              "BG": null
+            },
+            "opponent_gradient_error_rms": 0.06848212331533432,
+            "alternating_opponent_sign_change_fraction": 0.32969897985458374,
+            "alternating_opponent_sign_change_error": 0.32969897985458374
+          },
+          "activation": {
+            "scope": "known_stress_single_sample",
+            "blocks": {
+              "shared.0": {
+                "branchMax": 2.1519453525543213,
+                "gateMax": 0.7029756307601929,
+                "rawProductMax": 0.7029756307601929
+              },
+              "shared.1": {
+                "branchMax": 0.8129831552505493,
+                "gateMax": 0.46180886030197144,
+                "rawProductMax": 0.46180886030197144
+              },
+              "shared.2": {
+                "branchMax": 1.0839118957519531,
+                "gateMax": 0.4099534749984741,
+                "rawProductMax": 0.4099534749984741
+              },
+              "shared.3": {
+                "branchMax": 0.8852890133857727,
+                "gateMax": 0.38746169209480286,
+                "rawProductMax": 0.38746169209480286
+              },
+              "shared.4": {
+                "branchMax": 1.2606571912765503,
+                "gateMax": 0.740973174571991,
+                "rawProductMax": 0.740973174571991
+              },
+              "shared.5": {
+                "branchMax": 1.9478020668029785,
+                "gateMax": 1.5026895999908447,
+                "rawProductMax": 1.5026895999908447
+              },
+              "opponent.0": {
+                "branchMax": 0.9767128825187683,
+                "gateMax": 0.3759419023990631,
+                "rawProductMax": 0.3759419023990631
+              },
+              "opponent.1": {
+                "branchMax": 0.6725532412528992,
+                "gateMax": 0.3780064284801483,
+                "rawProductMax": 0.3780064284801483
+              },
+              "opponent.2": {
+                "branchMax": 1.6511623859405518,
+                "gateMax": 0.6558786630630493,
+                "rawProductMax": 0.6558786630630493
+              }
+            },
+            "modelOutputMax": 1.1135849952697754,
+            "maxBranchActivation": 2.1519453525543213,
+            "maxActualGateOutput": 1.5026895999908447,
+            "maxRawProduct": 1.5026895999908447
+          },
+          "maxBranchActivation": 2.1519453525543213,
+          "maxGateOutput": 1.5026895999908447,
+          "sampleIndex": 1009779,
+          "optimizerProbeScope": "independent copy; single sample, not the original training batch"
+        },
+        "edge": {
+          "scope": "frozen_isoluminant_edge",
+          "finite": true,
+          "outputMax": 0.8782382607460022,
+          "loss": 0.016140684485435486,
+          "maxGradient": null,
+          "optimizerPreflightPassed": null,
+          "optimizerAfterProbeFinite": null,
+          "metrics": {
+            "total_loss": 0.016140684485435486,
+            "losses": {
+              "missing_charbonnier": 0.005345817189663649,
+              "green_missing": 0.004861847031861544,
+              "opponent_value": 0.005012813489884138,
+              "opponent_gradient": 0.005306443199515343,
+              "luma_gradient": 0.003973201848566532,
+              "laplacian": 0.01651296764612198,
+              "zero_chroma_falsecolor": 0.0,
+              "chromatic_edge": 0.05156783014535904
+            },
+            "missing_rgb_l1": 0.0053427452221512794,
+            "missing_g_l1": 0.004861847031861544,
+            "rg_rms": 0.009792822413146496,
+            "bg_rms": 0.019202176481485367,
+            "luma_gradient_ratio": null,
+            "opponent_gradient_ratio": 0.9338388442993164,
+            "neutral_false_color_energy": 0.0,
+            "chromatic_edge_retention": {
+              "RG": 0.8122419714927673,
+              "BG": 0.8320935368537903
+            },
+            "opponent_gradient_error_rms": 0.015074090100824833,
+            "alternating_opponent_sign_change_fraction": 0.005920649506151676,
+            "alternating_opponent_sign_change_error": 0.005920649506151676
+          },
+          "activation": {
+            "scope": "frozen_isoluminant_edge",
+            "blocks": {
+              "shared.0": {
+                "branchMax": 2.1989123821258545,
+                "gateMax": 0.6573209762573242,
+                "rawProductMax": 0.6573209762573242
+              },
+              "shared.1": {
+                "branchMax": 1.2569379806518555,
+                "gateMax": 0.6574086546897888,
+                "rawProductMax": 0.6574086546897888
+              },
+              "shared.2": {
+                "branchMax": 1.3896064758300781,
+                "gateMax": 0.5952540040016174,
+                "rawProductMax": 0.5952540040016174
+              },
+              "shared.3": {
+                "branchMax": 1.0963640213012695,
+                "gateMax": 0.3377772569656372,
+                "rawProductMax": 0.3377772569656372
+              },
+              "shared.4": {
+                "branchMax": 1.5976301431655884,
+                "gateMax": 0.6100959777832031,
+                "rawProductMax": 0.6100959777832031
+              },
+              "shared.5": {
+                "branchMax": 1.5932447910308838,
+                "gateMax": 1.6000269651412964,
+                "rawProductMax": 1.6000269651412964
+              },
+              "opponent.0": {
+                "branchMax": 2.46909499168396,
+                "gateMax": 1.5001996755599976,
+                "rawProductMax": 1.5001996755599976
+              },
+              "opponent.1": {
+                "branchMax": 0.782964289188385,
+                "gateMax": 0.436848908662796,
+                "rawProductMax": 0.436848908662796
+              },
+              "opponent.2": {
+                "branchMax": 3.236886739730835,
+                "gateMax": 1.8997315168380737,
+                "rawProductMax": 1.8997315168380737
+              }
+            },
+            "modelOutputMax": 0.8782382607460022,
+            "maxBranchActivation": 3.236886739730835,
+            "maxActualGateOutput": 1.8997315168380737,
+            "maxRawProduct": 1.8997315168380737
+          },
+          "maxBranchActivation": 3.236886739730835,
+          "maxGateOutput": 1.8997315168380737
+        }
+      },
+      "researchGuard": {
+        "version": "catastrophic_regression_v1",
+        "factor": 4.0,
+        "passed": true,
+        "numericalPassed": true,
+        "regressionPassed": true,
+        "numericalFailures": [],
+        "qualityFailures": [],
+        "failures": [],
+        "releaseQualification": false
+      }
+    },
+    {
+      "candidate": "A",
+      "step": 29000,
+      "checkpointSHA256": "00938dd77132d8cbc009e3aa2ad98b6d7854ec6339cd258ca5035402cd0e73c4",
+      "sentinels": {
+        "stress": {
+          "scope": "known_stress_single_sample",
+          "finite": true,
+          "outputMax": 1.325178336313344e+16,
+          "loss": 5.093731966372569e+28,
+          "maxGradient": 2.1889154224875246e+31,
+          "optimizerPreflightPassed": false,
+          "optimizerAfterProbeFinite": null,
+          "metrics": {
+            "total_loss": 5.093731966372569e+28,
+            "losses": {
+              "missing_charbonnier": 193821908402176.0,
+              "green_missing": 16.710182189941406,
+              "opponent_value": 258429205610496.0,
+              "opponent_gradient": 273635453435904.0,
+              "luma_gradient": 56574030643200.0,
+              "laplacian": 467473803509760.0,
+              "zero_chroma_falsecolor": 5.0937318719252396e+29,
+              "chromatic_edge": 0.0
+            },
+            "missing_rgb_l1": 193821908402176.0,
+            "missing_g_l1": 16.710182189941406,
+            "rg_rms": 475609008439296.0,
+            "bg_rms": 681309991075840.0,
+            "luma_gradient_ratio": 645646528806912.0,
+            "opponent_gradient_ratio": null,
+            "neutral_false_color_energy": 3.4519358066034845e+29,
+            "chromatic_edge_retention": {
+              "RG": null,
+              "BG": null
+            },
+            "opponent_gradient_error_rms": 713703842381824.0,
+            "alternating_opponent_sign_change_fraction": 0.4263250529766083,
+            "alternating_opponent_sign_change_error": 0.4263250529766083
+          },
+          "rejectedStage": "adamw_square",
+          "rejectedReason": "finite gradient exceeds safe FP32 square range",
+          "activation": {
+            "scope": "known_stress_single_sample",
+            "blocks": {
+              "shared.0": {
+                "branchMax": 3.494171142578125,
+                "gateMax": 5.259207248687744,
+                "rawProductMax": 5.259207248687744
+              },
+              "shared.1": {
+                "branchMax": 2.097599506378174,
+                "gateMax": 3.904404640197754,
+                "rawProductMax": 3.904404640197754
+              },
+              "shared.2": {
+                "branchMax": 5.486289978027344,
+                "gateMax": 9.939769744873047,
+                "rawProductMax": 9.939769744873047
+              },
+              "shared.3": {
+                "branchMax": 8.340775489807129,
+                "gateMax": 24.4769287109375,
+                "rawProductMax": 24.4769287109375
+              },
+              "shared.4": {
+                "branchMax": 16.294326782226562,
+                "gateMax": 215.65240478515625,
+                "rawProductMax": 215.65240478515625
+              },
+              "shared.5": {
+                "branchMax": 63.531776428222656,
+                "gateMax": 1686.300537109375,
+                "rawProductMax": 1686.300537109375
+              },
+              "opponent.0": {
+                "branchMax": 631.7489013671875,
+                "gateMax": 212793.5625,
+                "rawProductMax": 212793.5625
+              },
+              "opponent.1": {
+                "branchMax": 42010.5859375,
+                "gateMax": 781950912.0,
+                "rawProductMax": 781950912.0
+              },
+              "opponent.2": {
+                "branchMax": 728656000.0,
+                "gateMax": 1.0445469556041318e+17,
+                "rawProductMax": 1.0445469556041318e+17
+              }
+            },
+            "modelOutputMax": 1.325178336313344e+16,
+            "maxBranchActivation": 728656000.0,
+            "maxActualGateOutput": 1.0445469556041318e+17,
+            "maxRawProduct": 1.0445469556041318e+17
+          },
+          "maxBranchActivation": 728656000.0,
+          "maxGateOutput": 1.0445469556041318e+17,
+          "sampleIndex": 1009779,
+          "optimizerProbeScope": "independent copy; single sample, not the original training batch"
+        },
+        "edge": {
+          "scope": "frozen_isoluminant_edge",
+          "finite": true,
+          "outputMax": 0.8612225651741028,
+          "loss": 0.021531475707888603,
+          "maxGradient": null,
+          "optimizerPreflightPassed": null,
+          "optimizerAfterProbeFinite": null,
+          "metrics": {
+            "total_loss": 0.021531475707888603,
+            "losses": {
+              "missing_charbonnier": 0.008522490970790386,
+              "green_missing": 0.00518815079703927,
+              "opponent_value": 0.009365829639136791,
+              "opponent_gradient": 0.0065986537374556065,
+              "luma_gradient": 0.005781359970569611,
+              "laplacian": 0.027864858508110046,
+              "zero_chroma_falsecolor": 0.0,
+              "chromatic_edge": 0.04874183237552643
+            },
+            "missing_rgb_l1": 0.008518397808074951,
+            "missing_g_l1": 0.00518815079703927,
+            "rg_rms": 0.00974130630493164,
+            "bg_rms": 0.01994464173913002,
+            "luma_gradient_ratio": null,
+            "opponent_gradient_ratio": 0.9012391567230225,
+            "neutral_false_color_energy": 0.0,
+            "chromatic_edge_retention": {
+              "RG": 0.8605525493621826,
+              "BG": 0.787739634513855
+            },
+            "opponent_gradient_error_rms": 0.014585176482796669,
+            "alternating_opponent_sign_change_fraction": 0.004748774692416191,
+            "alternating_opponent_sign_change_error": 0.004748774692416191
+          },
+          "activation": {
+            "scope": "frozen_isoluminant_edge",
+            "blocks": {
+              "shared.0": {
+                "branchMax": 2.5211689472198486,
+                "gateMax": 2.4211270809173584,
+                "rawProductMax": 2.4211270809173584
+              },
+              "shared.1": {
+                "branchMax": 2.215228319168091,
+                "gateMax": 2.1727774143218994,
+                "rawProductMax": 2.1727774143218994
+              },
+              "shared.2": {
+                "branchMax": 2.0190675258636475,
+                "gateMax": 1.660528302192688,
+                "rawProductMax": 1.660528302192688
+              },
+              "shared.3": {
+                "branchMax": 2.128176212310791,
+                "gateMax": 2.680114507675171,
+                "rawProductMax": 2.680114507675171
+              },
+              "shared.4": {
+                "branchMax": 1.508495807647705,
+                "gateMax": 1.847778558731079,
+                "rawProductMax": 1.847778558731079
+              },
+              "shared.5": {
+                "branchMax": 2.086137533187866,
+                "gateMax": 1.1944118738174438,
+                "rawProductMax": 1.1944118738174438
+              },
+              "opponent.0": {
+                "branchMax": 1.8657833337783813,
+                "gateMax": 1.0982294082641602,
+                "rawProductMax": 1.0982294082641602
+              },
+              "opponent.1": {
+                "branchMax": 1.4281693696975708,
+                "gateMax": 1.3427046537399292,
+                "rawProductMax": 1.3427046537399292
+              },
+              "opponent.2": {
+                "branchMax": 2.0704967975616455,
+                "gateMax": 0.8378655314445496,
+                "rawProductMax": 0.8378655314445496
+              }
+            },
+            "modelOutputMax": 0.8612225651741028,
+            "maxBranchActivation": 2.5211689472198486,
+            "maxActualGateOutput": 2.680114507675171,
+            "maxRawProduct": 2.680114507675171
+          },
+          "maxBranchActivation": 2.5211689472198486,
+          "maxGateOutput": 2.680114507675171
+        }
+      },
+      "researchGuard": {
+        "version": "catastrophic_regression_v1",
+        "factor": 4.0,
+        "passed": false,
+        "numericalPassed": false,
+        "regressionPassed": false,
+        "numericalFailures": [
+          "known stress fails finite/AdamW preflight"
+        ],
+        "qualityFailures": [
+          "stress loss exceeds 4x frozen research baseline"
+        ],
+        "failures": [
+          "known stress fails finite/AdamW preflight",
+          "stress loss exceeds 4x frozen research baseline"
+        ],
+        "releaseQualification": false
+      }
+    },
+    {
+      "candidate": "A",
+      "step": 30000,
+      "checkpointSHA256": "a39c0c4abf48f743acd68aa4e75b34aa1a762cd6060e4bb9b4983da907b7178d",
+      "sentinels": {
+        "stress": {
+          "scope": "known_stress_single_sample",
+          "finite": true,
+          "outputMax": 3520531273875456.0,
+          "loss": 1.0290762630019698e+28,
+          "maxGradient": 6.133185332211557e+30,
+          "optimizerPreflightPassed": false,
+          "optimizerAfterProbeFinite": null,
+          "metrics": {
+            "total_loss": 1.0290762630019698e+28,
+            "losses": {
+              "missing_charbonnier": 92178051235840.0,
+              "green_missing": 2.3419785499572754,
+              "opponent_value": 122904071110656.0,
+              "opponent_gradient": 119843445538816.0,
+              "luma_gradient": 23024346595328.0,
+              "laplacian": 216852479344640.0,
+              "zero_chroma_falsecolor": 1.0290761921664726e+29,
+              "chromatic_edge": 0.0
+            },
+            "missing_rgb_l1": 92178051235840.0,
+            "missing_g_l1": 2.3419785499572754,
+            "rg_rms": 122225566941184.0,
+            "bg_rms": 376054854189056.0,
+            "luma_gradient_ratio": 247514485751808.0,
+            "opponent_gradient_ratio": null,
+            "neutral_false_color_energy": 7.817816793863069e+28,
+            "chromatic_edge_retention": {
+              "RG": null,
+              "BG": null
+            },
+            "opponent_gradient_error_rms": 320792181080064.0,
+            "alternating_opponent_sign_change_fraction": 0.36706113815307617,
+            "alternating_opponent_sign_change_error": 0.36706113815307617
+          },
+          "rejectedStage": "adamw_square",
+          "rejectedReason": "finite gradient exceeds safe FP32 square range",
+          "activation": {
+            "scope": "known_stress_single_sample",
+            "blocks": {
+              "shared.0": {
+                "branchMax": 3.463623285293579,
+                "gateMax": 4.4679274559021,
+                "rawProductMax": 4.4679274559021
+              },
+              "shared.1": {
+                "branchMax": 2.110163450241089,
+                "gateMax": 2.8454396724700928,
+                "rawProductMax": 2.8454396724700928
+              },
+              "shared.2": {
+                "branchMax": 4.478967666625977,
+                "gateMax": 6.573530197143555,
+                "rawProductMax": 6.573530197143555
+              },
+              "shared.3": {
+                "branchMax": 4.075325012207031,
+                "gateMax": 8.760796546936035,
+                "rawProductMax": 8.760796546936035
+              },
+              "shared.4": {
+                "branchMax": 10.745890617370605,
+                "gateMax": 62.00779724121094,
+                "rawProductMax": 62.00779724121094
+              },
+              "shared.5": {
+                "branchMax": 63.642005920410156,
+                "gateMax": 483.0716552734375,
+                "rawProductMax": 483.0716552734375
+              },
+              "opponent.0": {
+                "branchMax": 330.29486083984375,
+                "gateMax": 42856.88671875,
+                "rawProductMax": 42856.88671875
+              },
+              "opponent.1": {
+                "branchMax": 21331.15234375,
+                "gateMax": 257195808.0,
+                "rawProductMax": 257195808.0
+              },
+              "opponent.2": {
+                "branchMax": 841505600.0,
+                "gateMax": 1.3120342546238669e+17,
+                "rawProductMax": 1.3120342546238669e+17
+              }
+            },
+            "modelOutputMax": 3520531273875456.0,
+            "maxBranchActivation": 841505600.0,
+            "maxActualGateOutput": 1.3120342546238669e+17,
+            "maxRawProduct": 1.3120342546238669e+17
+          },
+          "maxBranchActivation": 841505600.0,
+          "maxGateOutput": 1.3120342546238669e+17,
+          "sampleIndex": 1009779,
+          "optimizerProbeScope": "independent copy; single sample, not the original training batch"
+        },
+        "edge": {
+          "scope": "frozen_isoluminant_edge",
+          "finite": true,
+          "outputMax": 0.8768898248672485,
+          "loss": 0.017808958888053894,
+          "maxGradient": null,
+          "optimizerPreflightPassed": null,
+          "optimizerAfterProbeFinite": null,
+          "metrics": {
+            "total_loss": 0.017808958888053894,
+            "losses": {
+              "missing_charbonnier": 0.006103879306465387,
+              "green_missing": 0.005307390354573727,
+              "opponent_value": 0.005669357255101204,
+              "opponent_gradient": 0.006700959987938404,
+              "luma_gradient": 0.004328555427491665,
+              "laplacian": 0.0185844823718071,
+              "zero_chroma_falsecolor": 0.0,
+              "chromatic_edge": 0.05286329984664917
+            },
+            "missing_rgb_l1": 0.006100556813180447,
+            "missing_g_l1": 0.005307390354573727,
+            "rg_rms": 0.010122010484337807,
+            "bg_rms": 0.01770154945552349,
+            "luma_gradient_ratio": null,
+            "opponent_gradient_ratio": 0.9133671522140503,
+            "neutral_false_color_energy": 0.0,
+            "chromatic_edge_retention": {
+              "RG": 0.8272655606269836,
+              "BG": 0.7815245389938354
+            },
+            "opponent_gradient_error_rms": 0.015416272915899754,
+            "alternating_opponent_sign_change_fraction": 0.013905484229326248,
+            "alternating_opponent_sign_change_error": 0.013905484229326248
+          },
+          "activation": {
+            "scope": "frozen_isoluminant_edge",
+            "blocks": {
+              "shared.0": {
+                "branchMax": 2.6079511642456055,
+                "gateMax": 2.8384060859680176,
+                "rawProductMax": 2.8384060859680176
+              },
+              "shared.1": {
+                "branchMax": 2.5350286960601807,
+                "gateMax": 3.3366658687591553,
+                "rawProductMax": 3.3366658687591553
+              },
+              "shared.2": {
+                "branchMax": 2.200162887573242,
+                "gateMax": 1.5939706563949585,
+                "rawProductMax": 1.5939706563949585
+              },
+              "shared.3": {
+                "branchMax": 2.4489939212799072,
+                "gateMax": 3.545196533203125,
+                "rawProductMax": 3.545196533203125
+              },
+              "shared.4": {
+                "branchMax": 2.2607204914093018,
+                "gateMax": 2.4989871978759766,
+                "rawProductMax": 2.4989871978759766
+              },
+              "shared.5": {
+                "branchMax": 1.828357219696045,
+                "gateMax": 1.3162952661514282,
+                "rawProductMax": 1.3162952661514282
+              },
+              "opponent.0": {
+                "branchMax": 2.269641399383545,
+                "gateMax": 1.1655001640319824,
+                "rawProductMax": 1.1655001640319824
+              },
+              "opponent.1": {
+                "branchMax": 1.4876526594161987,
+                "gateMax": 1.0352461338043213,
+                "rawProductMax": 1.0352461338043213
+              },
+              "opponent.2": {
+                "branchMax": 2.4901516437530518,
+                "gateMax": 0.9447787404060364,
+                "rawProductMax": 0.9447787404060364
+              }
+            },
+            "modelOutputMax": 0.8768898248672485,
+            "maxBranchActivation": 2.6079511642456055,
+            "maxActualGateOutput": 3.545196533203125,
+            "maxRawProduct": 3.545196533203125
+          },
+          "maxBranchActivation": 2.6079511642456055,
+          "maxGateOutput": 3.545196533203125
+        }
+      },
+      "researchGuard": {
+        "version": "catastrophic_regression_v1",
+        "factor": 4.0,
+        "passed": false,
+        "numericalPassed": false,
+        "regressionPassed": false,
+        "numericalFailures": [
+          "known stress fails finite/AdamW preflight"
+        ],
+        "qualityFailures": [
+          "stress loss exceeds 4x frozen research baseline"
+        ],
+        "failures": [
+          "known stress fails finite/AdamW preflight",
+          "stress loss exceeds 4x frozen research baseline"
+        ],
+        "releaseQualification": false
+      }
+    },
+    {
+      "candidate": "C",
+      "step": 15000,
+      "checkpointSHA256": "9f72fc4e58c2257b3d80efd5f14524f774884b80c3739afa8e6a16ab6e0fed46",
+      "sentinels": {
+        "stress": {
+          "scope": "known_stress_single_sample",
+          "finite": true,
+          "outputMax": 1.1038085222244263,
+          "loss": 0.12821482121944427,
+          "maxGradient": 0.07536277174949646,
+          "optimizerPreflightPassed": true,
+          "optimizerAfterProbeFinite": true,
+          "metrics": {
+            "total_loss": 0.12821482121944427,
+            "losses": {
+              "missing_charbonnier": 0.05361882224678993,
+              "green_missing": 0.06800883263349533,
+              "opponent_value": 0.06056128069758415,
+              "opponent_gradient": 0.05510713532567024,
+              "luma_gradient": 0.0627216249704361,
+              "laplacian": 0.22549089789390564,
+              "zero_chroma_falsecolor": 0.004760623909533024,
+              "chromatic_edge": 0.0
+            },
+            "missing_rgb_l1": 0.05361815541982651,
+            "missing_g_l1": 0.06800883263349533,
+            "rg_rms": 0.0837005078792572,
+            "bg_rms": 0.08366064727306366,
+            "luma_gradient_ratio": 0.9059098958969116,
+            "opponent_gradient_ratio": null,
+            "neutral_false_color_energy": 0.007002438418567181,
+            "chromatic_edge_retention": {
+              "RG": null,
+              "BG": null
+            },
+            "opponent_gradient_error_rms": 0.06899727135896683,
+            "alternating_opponent_sign_change_fraction": 0.3268994987010956,
+            "alternating_opponent_sign_change_error": 0.3268994987010956
+          },
+          "activation": {
+            "scope": "known_stress_single_sample",
+            "blocks": {
+              "shared.0": {
+                "branchMax": 2.0594894886016846,
+                "gateMax": 0.6727631688117981,
+                "rawProductMax": 0.6731600761413574
+              },
+              "shared.1": {
+                "branchMax": 0.8296842575073242,
+                "gateMax": 0.4326227009296417,
+                "rawProductMax": 0.4327281713485718
+              },
+              "shared.2": {
+                "branchMax": 1.1033830642700195,
+                "gateMax": 0.3694031834602356,
+                "rawProductMax": 0.3694688379764557
+              },
+              "shared.3": {
+                "branchMax": 0.9532981514930725,
+                "gateMax": 0.3811814486980438,
+                "rawProductMax": 0.38125360012054443
+              },
+              "shared.4": {
+                "branchMax": 1.2199692726135254,
+                "gateMax": 0.7764649987220764,
+                "rawProductMax": 0.7770754098892212
+              },
+              "shared.5": {
+                "branchMax": 1.89542555809021,
+                "gateMax": 1.5738965272903442,
+                "rawProductMax": 1.5790027379989624
+              },
+              "opponent.0": {
+                "branchMax": 0.9139371514320374,
+                "gateMax": 0.4026564061641693,
+                "rawProductMax": 0.4027414321899414
+              },
+              "opponent.1": {
+                "branchMax": 0.6995726823806763,
+                "gateMax": 0.40825605392456055,
+                "rawProductMax": 0.40834468603134155
+              },
+              "opponent.2": {
+                "branchMax": 1.7632147073745728,
+                "gateMax": 0.5798452496528625,
+                "rawProductMax": 0.5800992846488953
+              }
+            },
+            "modelOutputMax": 1.1038085222244263,
+            "maxBranchActivation": 2.0594894886016846,
+            "maxActualGateOutput": 1.5738965272903442,
+            "maxRawProduct": 1.5790027379989624
+          },
+          "maxBranchActivation": 2.0594894886016846,
+          "maxGateOutput": 1.5738965272903442,
+          "sampleIndex": 1009779,
+          "optimizerProbeScope": "independent copy; single sample, not the original training batch"
+        },
+        "edge": {
+          "scope": "frozen_isoluminant_edge",
+          "finite": true,
+          "outputMax": 0.8953245878219604,
+          "loss": 0.01730339229106903,
+          "maxGradient": null,
+          "optimizerPreflightPassed": null,
+          "optimizerAfterProbeFinite": null,
+          "metrics": {
+            "total_loss": 0.01730339229106903,
+            "losses": {
+              "missing_charbonnier": 0.0057309577241539955,
+              "green_missing": 0.0051316991448402405,
+              "opponent_value": 0.005740348715335131,
+              "opponent_gradient": 0.006470164284110069,
+              "luma_gradient": 0.004727316554635763,
+              "laplacian": 0.01791946031153202,
+              "zero_chroma_falsecolor": 0.0,
+              "chromatic_edge": 0.05211801081895828
+            },
+            "missing_rgb_l1": 0.005727394483983517,
+            "missing_g_l1": 0.0051316991448402405,
+            "rg_rms": 0.010258432477712631,
+            "bg_rms": 0.020819276571273804,
+            "luma_gradient_ratio": null,
+            "opponent_gradient_ratio": 0.9763251543045044,
+            "neutral_false_color_energy": 0.0,
+            "chromatic_edge_retention": {
+              "RG": 0.8138549327850342,
+              "BG": 0.8332211375236511
+            },
+            "opponent_gradient_error_rms": 0.016091695055365562,
+            "alternating_opponent_sign_change_fraction": 0.006663602776825428,
+            "alternating_opponent_sign_change_error": 0.006663602776825428
+          },
+          "activation": {
+            "scope": "frozen_isoluminant_edge",
+            "blocks": {
+              "shared.0": {
+                "branchMax": 2.1470797061920166,
+                "gateMax": 0.6597151160240173,
+                "rawProductMax": 0.660089373588562
+              },
+              "shared.1": {
+                "branchMax": 1.4395900964736938,
+                "gateMax": 0.7132566571235657,
+                "rawProductMax": 0.7137296795845032
+              },
+              "shared.2": {
+                "branchMax": 1.440736174583435,
+                "gateMax": 0.5801407098770142,
+                "rawProductMax": 0.5803951621055603
+              },
+              "shared.3": {
+                "branchMax": 0.9547903537750244,
+                "gateMax": 0.3388161063194275,
+                "rawProductMax": 0.3388667702674866
+              },
+              "shared.4": {
+                "branchMax": 1.4442652463912964,
+                "gateMax": 0.5942606329917908,
+                "rawProductMax": 0.5945340991020203
+              },
+              "shared.5": {
+                "branchMax": 1.668939471244812,
+                "gateMax": 1.5324615240097046,
+                "rawProductMax": 1.5371735095977783
+              },
+              "opponent.0": {
+                "branchMax": 1.90481436252594,
+                "gateMax": 1.6150161027908325,
+                "rawProductMax": 1.6205347776412964
+              },
+              "opponent.1": {
+                "branchMax": 1.041624903678894,
+                "gateMax": 0.6671755909919739,
+                "rawProductMax": 0.6675626635551453
+              },
+              "opponent.2": {
+                "branchMax": 3.301593780517578,
+                "gateMax": 1.801466703414917,
+                "rawProductMax": 1.8091374635696411
+              }
+            },
+            "modelOutputMax": 0.8953245878219604,
+            "maxBranchActivation": 3.301593780517578,
+            "maxActualGateOutput": 1.801466703414917,
+            "maxRawProduct": 1.8091374635696411
+          },
+          "maxBranchActivation": 3.301593780517578,
+          "maxGateOutput": 1.801466703414917
+        }
+      },
+      "researchGuard": {
+        "version": "catastrophic_regression_v1",
+        "factor": 4.0,
+        "passed": true,
+        "numericalPassed": true,
+        "regressionPassed": true,
+        "numericalFailures": [],
+        "qualityFailures": [],
+        "failures": [],
+        "releaseQualification": false
+      }
+    },
+    {
+      "candidate": "C",
+      "step": 29000,
+      "checkpointSHA256": "ca950776a67f85e434d13f9fe12fae9b3d6f5a5954e58f8d64eb2de13420896f",
+      "sentinels": {
+        "stress": {
+          "scope": "known_stress_single_sample",
+          "finite": true,
+          "outputMax": 11.414010047912598,
+          "loss": 2.8971705436706543,
+          "maxGradient": 22.146324157714844,
+          "optimizerPreflightPassed": true,
+          "optimizerAfterProbeFinite": true,
+          "metrics": {
+            "total_loss": 2.8971705436706543,
+            "losses": {
+              "missing_charbonnier": 1.2600231170654297,
+              "green_missing": 0.49421244859695435,
+              "opponent_value": 1.480264663696289,
+              "opponent_gradient": 1.6328628063201904,
+              "luma_gradient": 0.5787625312805176,
+              "laplacian": 3.3793752193450928,
+              "zero_chroma_falsecolor": 4.801557540893555,
+              "chromatic_edge": 0.0
+            },
+            "missing_rgb_l1": 1.2600228786468506,
+            "missing_g_l1": 0.49421244859695435,
+            "rg_rms": 1.6148350238800049,
+            "bg_rms": 1.9069756269454956,
+            "luma_gradient_ratio": 3.7144694328308105,
+            "opponent_gradient_ratio": null,
+            "neutral_false_color_energy": 3.122124195098877,
+            "chromatic_edge_retention": {
+              "RG": null,
+              "BG": null
+            },
+            "opponent_gradient_error_rms": 2.1912455558776855,
+            "alternating_opponent_sign_change_fraction": 0.4333946108818054,
+            "alternating_opponent_sign_change_error": 0.4333946108818054
+          },
+          "activation": {
+            "scope": "known_stress_single_sample",
+            "blocks": {
+              "shared.0": {
+                "branchMax": 3.1888046264648438,
+                "gateMax": 6.052519798278809,
+                "rawProductMax": 6.368860721588135
+              },
+              "shared.1": {
+                "branchMax": 2.907386064529419,
+                "gateMax": 5.923093795776367,
+                "rawProductMax": 6.218354225158691
+              },
+              "shared.2": {
+                "branchMax": 4.456409931182861,
+                "gateMax": 8.643741607666016,
+                "rawProductMax": 9.671772003173828
+              },
+              "shared.3": {
+                "branchMax": 7.936336040496826,
+                "gateMax": 15.081714630126953,
+                "rawProductMax": 28.1749324798584
+              },
+              "shared.4": {
+                "branchMax": 16.936555862426758,
+                "gateMax": 16.0,
+                "rawProductMax": 157.69410705566406
+              },
+              "shared.5": {
+                "branchMax": 20.36191749572754,
+                "gateMax": 15.999927520751953,
+                "rawProductMax": 103.96480560302734
+              },
+              "opponent.0": {
+                "branchMax": 14.425225257873535,
+                "gateMax": 15.999999046325684,
+                "rawProductMax": 140.76939392089844
+              },
+              "opponent.1": {
+                "branchMax": 29.238910675048828,
+                "gateMax": 16.0,
+                "rawProductMax": 561.2235107421875
+              },
+              "opponent.2": {
+                "branchMax": 164.09181213378906,
+                "gateMax": 16.0,
+                "rawProductMax": 3969.947998046875
+              }
+            },
+            "modelOutputMax": 11.414010047912598,
+            "maxBranchActivation": 164.09181213378906,
+            "maxActualGateOutput": 16.0,
+            "maxRawProduct": 3969.947998046875
+          },
+          "maxBranchActivation": 164.09181213378906,
+          "maxGateOutput": 16.0,
+          "sampleIndex": 1009779,
+          "optimizerProbeScope": "independent copy; single sample, not the original training batch"
+        },
+        "edge": {
+          "scope": "frozen_isoluminant_edge",
+          "finite": true,
+          "outputMax": 0.8583696484565735,
+          "loss": 0.017907502129673958,
+          "maxGradient": null,
+          "optimizerPreflightPassed": null,
+          "optimizerAfterProbeFinite": null,
+          "metrics": {
+            "total_loss": 0.017907502129673958,
+            "losses": {
+              "missing_charbonnier": 0.006365422159433365,
+              "green_missing": 0.0048686908558011055,
+              "opponent_value": 0.005816365126520395,
+              "opponent_gradient": 0.0068795522674918175,
+              "luma_gradient": 0.004849669057875872,
+              "laplacian": 0.02023439295589924,
+              "zero_chroma_falsecolor": 0.0,
+              "chromatic_edge": 0.04953603446483612
+            },
+            "missing_rgb_l1": 0.006361284293234348,
+            "missing_g_l1": 0.0048686908558011055,
+            "rg_rms": 0.008797970600426197,
+            "bg_rms": 0.018721092492341995,
+            "luma_gradient_ratio": null,
+            "opponent_gradient_ratio": 0.8965209722518921,
+            "neutral_false_color_energy": 0.0,
+            "chromatic_edge_retention": {
+              "RG": 0.8255167007446289,
+              "BG": 0.7743342518806458
+            },
+            "opponent_gradient_error_rms": 0.014868316240608692,
+            "alternating_opponent_sign_change_fraction": 0.1261412352323532,
+            "alternating_opponent_sign_change_error": 0.1261412352323532
+          },
+          "activation": {
+            "scope": "frozen_isoluminant_edge",
+            "blocks": {
+              "shared.0": {
+                "branchMax": 2.5907981395721436,
+                "gateMax": 2.9979777336120605,
+                "rawProductMax": 3.0338211059570312
+              },
+              "shared.1": {
+                "branchMax": 2.216499090194702,
+                "gateMax": 2.52471923828125,
+                "rawProductMax": 2.545992612838745
+              },
+              "shared.2": {
+                "branchMax": 1.7727806568145752,
+                "gateMax": 1.5853713750839233,
+                "rawProductMax": 1.590590476989746
+              },
+              "shared.3": {
+                "branchMax": 2.063833236694336,
+                "gateMax": 2.350463390350342,
+                "rawProductMax": 2.367594003677368
+              },
+              "shared.4": {
+                "branchMax": 1.4802912473678589,
+                "gateMax": 1.6089534759521484,
+                "rawProductMax": 1.6144100427627563
+              },
+              "shared.5": {
+                "branchMax": 1.973324179649353,
+                "gateMax": 1.0905804634094238,
+                "rawProductMax": 1.0922740697860718
+              },
+              "opponent.0": {
+                "branchMax": 1.3672024011611938,
+                "gateMax": 1.2637056112289429,
+                "rawProductMax": 1.2663432359695435
+              },
+              "opponent.1": {
+                "branchMax": 1.3621429204940796,
+                "gateMax": 1.3199107646942139,
+                "rawProductMax": 1.3229172229766846
+              },
+              "opponent.2": {
+                "branchMax": 2.8066904544830322,
+                "gateMax": 1.6227235794067383,
+                "rawProductMax": 1.6283220052719116
+              }
+            },
+            "modelOutputMax": 0.8583696484565735,
+            "maxBranchActivation": 2.8066904544830322,
+            "maxActualGateOutput": 2.9979777336120605,
+            "maxRawProduct": 3.0338211059570312
+          },
+          "maxBranchActivation": 2.8066904544830322,
+          "maxGateOutput": 2.9979777336120605
+        }
+      },
+      "researchGuard": {
+        "version": "catastrophic_regression_v1",
+        "factor": 4.0,
+        "passed": false,
+        "numericalPassed": true,
+        "regressionPassed": false,
+        "numericalFailures": [],
+        "qualityFailures": [
+          "stress loss exceeds 4x frozen research baseline"
+        ],
+        "failures": [
+          "stress loss exceeds 4x frozen research baseline"
+        ],
+        "releaseQualification": false
+      }
+    },
+    {
+      "candidate": "C",
+      "step": 30000,
+      "checkpointSHA256": "58c3c965ca9a89e41bd429819c7ce733d2c38a3b53de32a2bb753f7d98ce436a",
+      "sentinels": {
+        "stress": {
+          "scope": "known_stress_single_sample",
+          "finite": true,
+          "outputMax": 9.795136451721191,
+          "loss": 3.657442569732666,
+          "maxGradient": 27.21117401123047,
+          "optimizerPreflightPassed": true,
+          "optimizerAfterProbeFinite": true,
+          "metrics": {
+            "total_loss": 3.657442569732666,
+            "losses": {
+              "missing_charbonnier": 1.5207645893096924,
+              "green_missing": 0.37341371178627014,
+              "opponent_value": 1.8970907926559448,
+              "opponent_gradient": 2.0984416007995605,
+              "luma_gradient": 0.6183025240898132,
+              "laplacian": 4.105403423309326,
+              "zero_chroma_falsecolor": 7.7345476150512695,
+              "chromatic_edge": 0.0
+            },
+            "missing_rgb_l1": 1.5207645893096924,
+            "missing_g_l1": 0.37341371178627014,
+            "rg_rms": 2.0657007694244385,
+            "bg_rms": 2.307643175125122,
+            "luma_gradient_ratio": 3.686491012573242,
+            "opponent_gradient_ratio": null,
+            "neutral_false_color_energy": 4.796168327331543,
+            "chromatic_edge_retention": {
+              "RG": null,
+              "BG": null
+            },
+            "opponent_gradient_error_rms": 2.7811055183410645,
+            "alternating_opponent_sign_change_fraction": 0.4455767273902893,
+            "alternating_opponent_sign_change_error": 0.4455767273902893
+          },
+          "activation": {
+            "scope": "known_stress_single_sample",
+            "blocks": {
+              "shared.0": {
+                "branchMax": 3.1632299423217773,
+                "gateMax": 6.389313220977783,
+                "rawProductMax": 6.765664577484131
+              },
+              "shared.1": {
+                "branchMax": 2.9049265384674072,
+                "gateMax": 5.3540940284729,
+                "rawProductMax": 5.568544387817383
+              },
+              "shared.2": {
+                "branchMax": 4.320478439331055,
+                "gateMax": 6.871997356414795,
+                "rawProductMax": 7.348531723022461
+              },
+              "shared.3": {
+                "branchMax": 6.179148197174072,
+                "gateMax": 14.311578750610352,
+                "rawProductMax": 23.101886749267578
+              },
+              "shared.4": {
+                "branchMax": 15.490581512451172,
+                "gateMax": 16.0,
+                "rawProductMax": 158.22055053710938
+              },
+              "shared.5": {
+                "branchMax": 28.848739624023438,
+                "gateMax": 15.999974250793457,
+                "rawProductMax": 112.29043579101562
+              },
+              "opponent.0": {
+                "branchMax": 13.028214454650879,
+                "gateMax": 15.994024276733398,
+                "rawProductMax": 68.68480682373047
+              },
+              "opponent.1": {
+                "branchMax": 19.740833282470703,
+                "gateMax": 16.0,
+                "rawProductMax": 280.34619140625
+              },
+              "opponent.2": {
+                "branchMax": 185.12559509277344,
+                "gateMax": 16.0,
+                "rawProductMax": 4861.5537109375
+              }
+            },
+            "modelOutputMax": 9.795136451721191,
+            "maxBranchActivation": 185.12559509277344,
+            "maxActualGateOutput": 16.0,
+            "maxRawProduct": 4861.5537109375
+          },
+          "maxBranchActivation": 185.12559509277344,
+          "maxGateOutput": 16.0,
+          "sampleIndex": 1009779,
+          "optimizerProbeScope": "independent copy; single sample, not the original training batch"
+        },
+        "edge": {
+          "scope": "frozen_isoluminant_edge",
+          "finite": true,
+          "outputMax": 1.724165678024292,
+          "loss": 0.11579577624797821,
+          "maxGradient": null,
+          "optimizerPreflightPassed": null,
+          "optimizerAfterProbeFinite": null,
+          "metrics": {
+            "total_loss": 0.11579577624797821,
+            "losses": {
+              "missing_charbonnier": 0.05991002917289734,
+              "green_missing": 0.00871317833662033,
+              "opponent_value": 0.07672068476676941,
+              "opponent_gradient": 0.07414482533931732,
+              "luma_gradient": 0.02320610173046589,
+              "laplacian": 0.16495175659656525,
+              "zero_chroma_falsecolor": 0.0,
+              "chromatic_edge": 0.05261334776878357
+            },
+            "missing_rgb_l1": 0.05990671366453171,
+            "missing_g_l1": 0.00871317833662033,
+            "rg_rms": 0.1464342474937439,
+            "bg_rms": 0.14176033437252045,
+            "luma_gradient_ratio": null,
+            "opponent_gradient_ratio": 8.323569297790527,
+            "neutral_false_color_energy": 0.0,
+            "chromatic_edge_retention": {
+              "RG": 0.8363766670227051,
+              "BG": 0.7523570656776428
+            },
+            "opponent_gradient_error_rms": 0.16356202960014343,
+            "alternating_opponent_sign_change_fraction": 0.07644761353731155,
+            "alternating_opponent_sign_change_error": 0.07644761353731155
+          },
+          "activation": {
+            "scope": "frozen_isoluminant_edge",
+            "blocks": {
+              "shared.0": {
+                "branchMax": 2.594515323638916,
+                "gateMax": 2.754885196685791,
+                "rawProductMax": 2.7826037406921387
+              },
+              "shared.1": {
+                "branchMax": 2.87341570854187,
+                "gateMax": 4.211564064025879,
+                "rawProductMax": 4.313086986541748
+              },
+              "shared.2": {
+                "branchMax": 2.588949203491211,
+                "gateMax": 4.537078857421875,
+                "rawProductMax": 4.664915084838867
+              },
+              "shared.3": {
+                "branchMax": 3.2790887355804443,
+                "gateMax": 5.250951766967773,
+                "rawProductMax": 5.452675819396973
+              },
+              "shared.4": {
+                "branchMax": 2.0229570865631104,
+                "gateMax": 3.765878438949585,
+                "rawProductMax": 3.8378260135650635
+              },
+              "shared.5": {
+                "branchMax": 1.9689770936965942,
+                "gateMax": 1.3355211019515991,
+                "rawProductMax": 1.338635802268982
+              },
+              "opponent.0": {
+                "branchMax": 3.1633315086364746,
+                "gateMax": 4.537330150604248,
+                "rawProductMax": 4.665188312530518
+              },
+              "opponent.1": {
+                "branchMax": 6.120757579803467,
+                "gateMax": 13.710525512695312,
+                "rawProductMax": 20.50543212890625
+              },
+              "opponent.2": {
+                "branchMax": 63.921607971191406,
+                "gateMax": 16.0,
+                "rawProductMax": 573.5316162109375
+              }
+            },
+            "modelOutputMax": 1.724165678024292,
+            "maxBranchActivation": 63.921607971191406,
+            "maxActualGateOutput": 16.0,
+            "maxRawProduct": 573.5316162109375
+          },
+          "maxBranchActivation": 63.921607971191406,
+          "maxGateOutput": 16.0
+        }
+      },
+      "researchGuard": {
+        "version": "catastrophic_regression_v1",
+        "factor": 4.0,
+        "passed": false,
+        "numericalPassed": true,
+        "regressionPassed": false,
+        "numericalFailures": [],
+        "qualityFailures": [
+          "stress loss exceeds 4x frozen research baseline",
+          "edge missing RGB exceeds 4x frozen research baseline"
+        ],
+        "failures": [
+          "stress loss exceeds 4x frozen research baseline",
+          "edge missing RGB exceeds 4x frozen research baseline"
+        ],
+        "releaseQualification": false
+      }
+    },
+    {
+      "candidate": "N",
+      "step": 0,
+      "sentinels": {
+        "stress": {
+          "scope": "known_stress_single_sample",
+          "finite": true,
+          "outputMax": 0.3297881484031677,
+          "loss": 0.5643302202224731,
+          "maxGradient": 0.6255030035972595,
+          "optimizerPreflightPassed": true,
+          "optimizerAfterProbeFinite": true,
+          "metrics": {
+            "total_loss": 0.5643302202224731,
+            "losses": {
+              "missing_charbonnier": 0.22017857432365417,
+              "green_missing": 0.3767242431640625,
+              "opponent_value": 0.09553911536931992,
+              "opponent_gradient": 0.2729073762893677,
+              "luma_gradient": 0.31273332238197327,
+              "laplacian": 0.9492128491401672,
+              "zero_chroma_falsecolor": 0.18961367011070251,
+              "chromatic_edge": 0.0
+            },
+            "missing_rgb_l1": 0.22017842531204224,
+            "missing_g_l1": 0.3767242431640625,
+            "rg_rms": 0.2917807102203369,
+            "bg_rms": 0.2973008155822754,
+            "luma_gradient_ratio": 2.1589040756225586,
+            "opponent_gradient_ratio": null,
+            "neutral_false_color_energy": 0.08676188439130783,
+            "chromatic_edge_retention": {
+              "RG": null,
+              "BG": null
+            },
+            "opponent_gradient_error_rms": 0.43544653058052063,
+            "alternating_opponent_sign_change_fraction": 0.5174134373664856,
+            "alternating_opponent_sign_change_error": 0.5174134373664856
+          },
+          "activation": {
+            "scope": "known_stress_single_sample",
+            "blocks": {
+              "shared.0": {
+                "branchMax": 1.491410732269287,
+                "gateMax": 1.15664803981781,
+                "rawProductMax": 1.1586692333221436
+              },
+              "shared.1": {
+                "branchMax": 1.385109543800354,
+                "gateMax": 0.8268803358078003,
+                "rawProductMax": 0.8276176452636719
+              },
+              "shared.2": {
+                "branchMax": 1.1360139846801758,
+                "gateMax": 0.6212189793586731,
+                "rawProductMax": 0.6215314269065857
+              },
+              "shared.3": {
+                "branchMax": 1.0845338106155396,
+                "gateMax": 0.7266543507575989,
+                "rawProductMax": 0.727154552936554
+              },
+              "shared.4": {
+                "branchMax": 1.2670410871505737,
+                "gateMax": 0.8451488018035889,
+                "rawProductMax": 0.845936119556427
+              },
+              "shared.5": {
+                "branchMax": 1.0278939008712769,
+                "gateMax": 0.738360583782196,
+                "rawProductMax": 0.7388854026794434
+              },
+              "opponent.0": {
+                "branchMax": 1.1604533195495605,
+                "gateMax": 0.5825170278549194,
+                "rawProductMax": 0.5827745795249939
+              },
+              "opponent.1": {
+                "branchMax": 1.2516093254089355,
+                "gateMax": 0.5659302473068237,
+                "rawProductMax": 0.5661664605140686
+              },
+              "opponent.2": {
+                "branchMax": 0.869234561920166,
+                "gateMax": 0.6034409999847412,
+                "rawProductMax": 0.6037273406982422
+              }
+            },
+            "modelOutputMax": 0.3297881484031677,
+            "maxBranchActivation": 1.491410732269287,
+            "maxActualGateOutput": 1.15664803981781,
+            "maxRawProduct": 1.1586692333221436
+          },
+          "maxBranchActivation": 1.491410732269287,
+          "maxGateOutput": 1.15664803981781,
+          "sampleIndex": 1009779,
+          "optimizerProbeScope": "independent copy; single sample, not the original training batch"
+        },
+        "edge": {
+          "scope": "frozen_isoluminant_edge",
+          "finite": true,
+          "outputMax": 0.36196404695510864,
+          "loss": 1.229914665222168,
+          "maxGradient": null,
+          "optimizerPreflightPassed": null,
+          "optimizerAfterProbeFinite": null,
+          "metrics": {
+            "total_loss": 1.229914665222168,
+            "losses": {
+              "missing_charbonnier": 0.4726695716381073,
+              "green_missing": 0.8065160512924194,
+              "opponent_value": 0.3569974899291992,
+              "opponent_gradient": 0.4224933981895447,
+              "luma_gradient": 0.6929226517677307,
+              "laplacian": 2.275977611541748,
+              "zero_chroma_falsecolor": 0.0,
+              "chromatic_edge": 0.3872934579849243
+            },
+            "missing_rgb_l1": 0.4726695418357849,
+            "missing_g_l1": 0.8065160512924194,
+            "rg_rms": 0.4767329692840576,
+            "bg_rms": 0.6479790806770325,
+            "luma_gradient_ratio": null,
+            "opponent_gradient_ratio": 26.804779052734375,
+            "neutral_false_color_energy": 0.0,
+            "chromatic_edge_retention": {
+              "RG": 7.370728969573975,
+              "BG": 2.190065383911133
+            },
+            "opponent_gradient_error_rms": 0.5275946855545044,
+            "alternating_opponent_sign_change_fraction": 0.5518420934677124,
+            "alternating_opponent_sign_change_error": 0.5518420934677124
+          },
+          "activation": {
+            "scope": "frozen_isoluminant_edge",
+            "blocks": {
+              "shared.0": {
+                "branchMax": 1.240818977355957,
+                "gateMax": 0.7964457869529724,
+                "rawProductMax": 0.7971045970916748
+              },
+              "shared.1": {
+                "branchMax": 1.1549321413040161,
+                "gateMax": 0.8290643095970154,
+                "rawProductMax": 0.8298075199127197
+              },
+              "shared.2": {
+                "branchMax": 0.8944298624992371,
+                "gateMax": 0.45471882820129395,
+                "rawProductMax": 0.4548413157463074
+              },
+              "shared.3": {
+                "branchMax": 0.7402417063713074,
+                "gateMax": 0.2471211701631546,
+                "rawProductMax": 0.2471408247947693
+              },
+              "shared.4": {
+                "branchMax": 1.2051931619644165,
+                "gateMax": 0.5093288421630859,
+                "rawProductMax": 0.5095009803771973
+              },
+              "shared.5": {
+                "branchMax": 1.059298038482666,
+                "gateMax": 0.7329530119895935,
+                "rawProductMax": 0.733466386795044
+              },
+              "opponent.0": {
+                "branchMax": 1.0374884605407715,
+                "gateMax": 0.5538368225097656,
+                "rawProductMax": 0.5540581941604614
+              },
+              "opponent.1": {
+                "branchMax": 1.162706732749939,
+                "gateMax": 0.4057901203632355,
+                "rawProductMax": 0.40587717294692993
+              },
+              "opponent.2": {
+                "branchMax": 0.7966092824935913,
+                "gateMax": 0.3226259648799896,
+                "rawProductMax": 0.32266971468925476
+              }
+            },
+            "modelOutputMax": 0.36196404695510864,
+            "maxBranchActivation": 1.240818977355957,
+            "maxActualGateOutput": 0.8290643095970154,
+            "maxRawProduct": 0.8298075199127197
+          },
+          "maxBranchActivation": 1.240818977355957,
+          "maxGateOutput": 0.8290643095970154
+        }
+      },
+      "researchGuard": {
+        "version": "catastrophic_regression_v1",
+        "factor": 4.0,
+        "passed": true,
+        "numericalPassed": true,
+        "regressionPassed": true,
+        "numericalFailures": [],
+        "qualityFailures": [],
+        "failures": [],
+        "releaseQualification": false
+      },
+      "note": "untrained random model: finite is not reconstruction qualification"
+    },
+    {
+      "candidate": "S",
+      "step": 0,
+      "sentinels": {
+        "stress": {
+          "scope": "known_stress_single_sample",
+          "finite": true,
+          "outputMax": 0.3383813798427582,
+          "loss": 0.5706941485404968,
+          "maxGradient": 0.617859959602356,
+          "optimizerPreflightPassed": true,
+          "optimizerAfterProbeFinite": true,
+          "metrics": {
+            "total_loss": 0.5706941485404968,
+            "losses": {
+              "missing_charbonnier": 0.22378148138523102,
+              "green_missing": 0.3772450089454651,
+              "opponent_value": 0.10121148824691772,
+              "opponent_gradient": 0.2728128433227539,
+              "luma_gradient": 0.31425824761390686,
+              "laplacian": 0.96601402759552,
+              "zero_chroma_falsecolor": 0.1880148947238922,
+              "chromatic_edge": 0.0
+            },
+            "missing_rgb_l1": 0.22378131747245789,
+            "missing_g_l1": 0.3772450089454651,
+            "rg_rms": 0.2948471009731293,
+            "bg_rms": 0.29852670431137085,
+            "luma_gradient_ratio": 2.1634459495544434,
+            "opponent_gradient_ratio": null,
+            "neutral_false_color_energy": 0.0880265086889267,
+            "chromatic_edge_retention": {
+              "RG": null,
+              "BG": null
+            },
+            "opponent_gradient_error_rms": 0.4336068332195282,
+            "alternating_opponent_sign_change_fraction": 0.5080652236938477,
+            "alternating_opponent_sign_change_error": 0.5080652236938477
+          },
+          "activation": {
+            "scope": "known_stress_single_sample",
+            "blocks": {
+              "shared.0": {
+                "branchMax": 1.491410732269287,
+                "gateMax": 0.8032453656196594
+              },
+              "shared.1": {
+                "branchMax": 1.3980662822723389,
+                "gateMax": 0.6765501499176025
+              },
+              "shared.2": {
+                "branchMax": 1.1045846939086914,
+                "gateMax": 0.5509756207466125
+              },
+              "shared.3": {
+                "branchMax": 1.0666359663009644,
+                "gateMax": 0.4899677038192749
+              },
+              "shared.4": {
+                "branchMax": 1.3013478517532349,
+                "gateMax": 0.5878461599349976
+              },
+              "shared.5": {
+                "branchMax": 1.0686782598495483,
+                "gateMax": 0.49400246143341064
+              },
+              "opponent.0": {
+                "branchMax": 1.1737374067306519,
+                "gateMax": 0.49298402667045593
+              },
+              "opponent.1": {
+                "branchMax": 1.2674537897109985,
+                "gateMax": 0.39941951632499695
+              },
+              "opponent.2": {
+                "branchMax": 0.8893283009529114,
+                "gateMax": 0.315752774477005
+              }
+            },
+            "modelOutputMax": 0.3383813798427582,
+            "maxBranchActivation": 1.491410732269287,
+            "maxActualGateOutput": 0.8032453656196594,
+            "maxRawProduct": null
+          },
+          "maxBranchActivation": 1.491410732269287,
+          "maxGateOutput": 0.8032453656196594,
+          "sampleIndex": 1009779,
+          "optimizerProbeScope": "independent copy; single sample, not the original training batch"
+        },
+        "edge": {
+          "scope": "frozen_isoluminant_edge",
+          "finite": true,
+          "outputMax": 0.39123156666755676,
+          "loss": 1.2384268045425415,
+          "maxGradient": null,
+          "optimizerPreflightPassed": null,
+          "optimizerAfterProbeFinite": null,
+          "metrics": {
+            "total_loss": 1.2384268045425415,
+            "losses": {
+              "missing_charbonnier": 0.47725409269332886,
+              "green_missing": 0.808713972568512,
+              "opponent_value": 0.36117830872535706,
+              "opponent_gradient": 0.4261226952075958,
+              "luma_gradient": 0.6945997476577759,
+              "laplacian": 2.287187099456787,
+              "zero_chroma_falsecolor": 0.0,
+              "chromatic_edge": 0.39203447103500366
+            },
+            "missing_rgb_l1": 0.47725406289100647,
+            "missing_g_l1": 0.808713972568512,
+            "rg_rms": 0.476619154214859,
+            "bg_rms": 0.6550097465515137,
+            "luma_gradient_ratio": null,
+            "opponent_gradient_ratio": 27.009798049926758,
+            "neutral_false_color_energy": 0.0,
+            "chromatic_edge_retention": {
+              "RG": 7.477653980255127,
+              "BG": 2.1798441410064697
+            },
+            "opponent_gradient_error_rms": 0.5316268801689148,
+            "alternating_opponent_sign_change_fraction": 0.5512561798095703,
+            "alternating_opponent_sign_change_error": 0.5512561798095703
+          },
+          "activation": {
+            "scope": "frozen_isoluminant_edge",
+            "blocks": {
+              "shared.0": {
+                "branchMax": 1.240818977355957,
+                "gateMax": 0.663901686668396
+              },
+              "shared.1": {
+                "branchMax": 1.1590219736099243,
+                "gateMax": 0.531427264213562
+              },
+              "shared.2": {
+                "branchMax": 0.8935397863388062,
+                "gateMax": 0.4604285955429077
+              },
+              "shared.3": {
+                "branchMax": 0.738627552986145,
+                "gateMax": 0.29926398396492004
+              },
+              "shared.4": {
+                "branchMax": 1.1966876983642578,
+                "gateMax": 0.45986294746398926
+              },
+              "shared.5": {
+                "branchMax": 1.0534793138504028,
+                "gateMax": 0.43081313371658325
+              },
+              "opponent.0": {
+                "branchMax": 1.0187431573867798,
+                "gateMax": 0.47338706254959106
+              },
+              "opponent.1": {
+                "branchMax": 1.1518349647521973,
+                "gateMax": 0.2918283939361572
+              },
+              "opponent.2": {
+                "branchMax": 0.8079356551170349,
+                "gateMax": 0.2696262300014496
+              }
+            },
+            "modelOutputMax": 0.39123156666755676,
+            "maxBranchActivation": 1.240818977355957,
+            "maxActualGateOutput": 0.663901686668396,
+            "maxRawProduct": null
+          },
+          "maxBranchActivation": 1.240818977355957,
+          "maxGateOutput": 0.663901686668396
+        }
+      },
+      "researchGuard": {
+        "version": "catastrophic_regression_v1",
+        "factor": 4.0,
+        "passed": true,
+        "numericalPassed": true,
+        "regressionPassed": true,
+        "numericalFailures": [],
+        "qualityFailures": [],
+        "failures": [],
+        "releaseQualification": false
+      },
+      "note": "untrained random model: finite is not reconstruction qualification"
+    }
+  ]
+}

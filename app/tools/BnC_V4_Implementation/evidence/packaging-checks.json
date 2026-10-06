@@ -1,0 +1,11 @@
+{
+  "payloadFiles": 11,
+  "payloadAndInstalledHashesMatch": true,
+  "originalCoreHashesUnchanged": true,
+  "conflictStopsBeforeNewHelperCreation": true,
+  "controllerWithoutCUDAStopsBeforeCandidateCreation": true,
+  "controllerErrorEvidenceSaved": true,
+  "unitTestsPassed": 33,
+  "originalCheckpointsWritten": 0,
+  "windowsCUDAQualificationExecuted": false
+}

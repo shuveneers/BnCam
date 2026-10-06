@@ -19,8 +19,9 @@ enum class SpectraGpuDemosaicAlgorithm : std::uint32_t {
     BILINEAR = 0u,
     MALVAR_2004 = 1u,
     MENON_2007 = 2u,
-    NEURAL_JDD = 3u,
-    RCD_INSPIRED = NEURAL_JDD, // Legacy ABI alias only; no RCD product route.
+    BNC_NEURAL = 3u,
+    NEURAL_JDD = BNC_NEURAL, // Legacy ABI name only.
+    RCD_INSPIRED = BNC_NEURAL, // Legacy ABI alias only; no RCD product route.
     AMAZE = 4u,
     AMAZE_INSPIRED = AMAZE, // Legacy source alias only; product identity is AMaZE.
     AUTO_HYBRID = 5u,
@@ -37,7 +38,7 @@ struct SpectraResidentDemosaicRequest {
     SpectraGpuDemosaicAlgorithm algorithm = SpectraGpuDemosaicAlgorithm::MALVAR_2004;
 
     // Immutable pre-demosaic CFA evidence. Pure Malvar 2004 ignores these values;
-    // AMaZE may consume them. Neural JDD uses CFA phase/pattern plus physical noise context.
+    // AMaZE may consume them. BnC Neural uses CFA phase/pattern plus physical noise context.
     // Sampled sensels remain the network input authority.
     float cfaEvidenceAvailable = 0.0f;
     float cfaCommonOpponentSupport = 0.0f;
@@ -61,9 +62,9 @@ struct SpectraResidentDemosaicRequest {
 
     // Delta 0048: scene-level soft priors. AUTO_HYBRID combines them with local
     // structure/Nyquist/chroma/noise evidence; they are never hard route selectors.
-    float autoMalvarPrior = 1.0f / 3.0f;
-    float autoNeuralJddPrior = 1.0f / 3.0f;
-    float autoAmazePrior = 1.0f / 3.0f;
+    float autoMalvarPrior = 0.5f;
+    float autoBncNeuralPrior = 0.0f;
+    float autoAmazePrior = 0.5f;
 };
 
 struct SpectraResidentDemosaicResult {
@@ -119,6 +120,7 @@ struct SpectraResidentDemosaicResult {
 };
 
 struct SpectraResidentColorTransformRequest {
+    bool neutralDefaultRaw = false;
     bncam::chroma::Model baselinePhysicalChroma{};
     bncam::luma::Model baselinePhysicalLuma{};
     const float* physicalSpatialSigma = nullptr;
@@ -218,6 +220,7 @@ struct SpectraResidentColorTransformResult {
     std::uint64_t phase9FullySensorClippedPixels = 0u;
     std::uint64_t phase9PartialColorConfidencePixels = 0u;
     // Source-domain clipping provenance recovered from the RawFinalize 2x2 Bayer-cell map.
+    float defaultRawMinColorConfidence = 1.0f;
     bool phase9SourceRawConfidenceMapUsed = false;
     std::uint64_t phase9SourceRawConfidenceMapBytes = 0u;
     std::uint64_t phase9SourceRawConfidenceCandidatePixels = 0u;
@@ -241,7 +244,7 @@ struct SpectraResidentColorTransformResult {
 /**
  * Milestone 8H-E/F resident demosaic + colour backend.
  *
- * Malvar, Neural JDD, AMaZE and Auto Hybrid are GPU-primary. Menon/Bilinear remain reference-only legacy paths. A successful demosaic keeps its RGB in deviceOutput_; AWB+CCM
+ * Malvar, BnC Neural, AMaZE and Auto Hybrid are GPU-primary. Menon/Bilinear remain reference-only legacy paths. A successful demosaic keeps its RGB in deviceOutput_; AWB+CCM
  * can consume that generation directly, transform in-place, reduce compact colour statistics,
  * and perform one final RGB readback without a duplicate CPU colour pass.
  */

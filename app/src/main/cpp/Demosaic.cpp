@@ -1188,35 +1188,37 @@ std::mutex gBilinearScratchMutex;
 
 DemosaicResolution resolveDemosaicMode(int requestedModeValue) {
     DemosaicResolution result{};
-    if (requestedModeValue == static_cast<int>(DemosaicMode::NormalMalvar2004)) {
+    if (requestedModeValue == static_cast<int>(DemosaicMode::Malvar)) {
         return result;
     }
 
-    if (requestedModeValue == static_cast<int>(DemosaicMode::Bilinear)) {
-        // Bridge value 3 is retained for persisted-profile compatibility; Phase 5
-        // assigns this slot to the trained Neural JDD reconstruction route.
-        result.requestedMode = DemosaicMode::Bilinear;
-        result.algorithm = DemosaicAlgorithm::NeuralJdd;
-        result.reason = "legacy_slot_3_executes_neural_jdd";
+    if (requestedModeValue == static_cast<int>(DemosaicMode::BncNeural)) {
+        // Stable requested slot; the production GPU currently executes its
+        // explicit Malvar fallback and reports that in the execution result.
+        result.requestedMode = DemosaicMode::BncNeural;
+        result.algorithm = DemosaicAlgorithm::Malvar2004;
+        result.reason = "bnc_neural_requested_malvar_fallback";
+        result.fallbackOccurred = true;
+        result.fallbackReason = "BNC_NEURAL_BACKEND_UNAVAILABLE";
         return result;
     }
 
-    if (requestedModeValue == static_cast<int>(DemosaicMode::QualityMenon2007)) {
-        // Bridge value 2 is retained for profile compatibility while the product path is
-        // cut over from legacy Menon to BnCam AMaZE.
-        result.requestedMode = DemosaicMode::QualityMenon2007;
+    if (requestedModeValue == static_cast<int>(DemosaicMode::Amaze)) {
+        // Stable bridge value 2 selects BnCam AMaZE.
+        result.requestedMode = DemosaicMode::Amaze;
         result.algorithm = DemosaicAlgorithm::Amaze;
-        result.reason = "legacy_slot_2_forces_amaze";
+        result.reason = "amaze_mode";
         return result;
     }
 
-    if (requestedModeValue == static_cast<int>(DemosaicMode::Auto)) {
-        result.requestedMode = DemosaicMode::Auto;
+    if (requestedModeValue == static_cast<int>(DemosaicMode::AutoHybrid)) {
+        result.requestedMode = DemosaicMode::AutoHybrid;
         result.reason = "auto_hybrid_pending_scene_analysis";
         return result;
     }
 
-    result.reason = "invalid_mode_forced_malvar_2004";
+    result.requestedMode = DemosaicMode::AutoHybrid;
+    result.reason = "invalid_mode_default_auto_hybrid";
     result.fallbackOccurred = true;
     result.fallbackReason = "invalid_native_demosaic_mode";
     return result;
@@ -1240,13 +1242,9 @@ bool amazeRuntimeValidated() {
     return validationPassed;
 }
 
-bool neuralJddRuntimeValidated() {
-    static std::once_flag validationOnce;
-    static bool validationPassed = false;
-    std::call_once(validationOnce, [] {
-        validationPassed = validateRcdInspiredImplementation().passed;
-    });
-    return validationPassed;
+bool bncNeuralRuntimeValidated() {
+    // No independent learned Bayer-to-RGB model/backend is installed.
+    return false;
 }
 
 bool malvarRuntimeValidated() {
@@ -1264,7 +1262,7 @@ DemosaicResolution resolveDemosaicForSceneMetrics(
         const AutoDemosaicContext& context
 ) {
     DemosaicResolution result = resolveDemosaicMode(requestedModeValue);
-    if (requestedModeValue == static_cast<int>(DemosaicMode::QualityMenon2007)) {
+    if (requestedModeValue == static_cast<int>(DemosaicMode::Amaze)) {
         if (!amazeRuntimeValidated()) {
             result.algorithm = DemosaicAlgorithm::Malvar2004;
             result.reason = "AMAZE_REQUESTED_BUT_VALIDATION_FAILED_FALLBACK_TO_MALVAR";
@@ -1273,9 +1271,9 @@ DemosaicResolution resolveDemosaicForSceneMetrics(
         }
         return result;
     }
-    if (requestedModeValue != static_cast<int>(DemosaicMode::Auto)) return result;
+    if (result.requestedMode != DemosaicMode::AutoHybrid) return result;
 
-    result.requestedMode = DemosaicMode::Auto;
+    result.requestedMode = DemosaicMode::AutoHybrid;
     result.autoSceneAnalysisUsed = true;
     result.autoSampleCount = metrics.sampleCount;
     result.autoMedianSignal = metrics.medianSignal;
@@ -1286,10 +1284,10 @@ DemosaicResolution resolveDemosaicForSceneMetrics(
     result.autoLowSignalFraction = metrics.lowSignalFraction;
 
     const bool malvarReady = malvarRuntimeValidated();
-    const bool neuralJddReady = neuralJddRuntimeValidated();
+    const bool bncNeuralReady = bncNeuralRuntimeValidated();
     const bool amazeReady = amazeRuntimeValidated();
 
-    // Phase-5 deterministic Auto fallback/tie policy is AMaZE first, then Malvar, then Neural JDD.
+    // Phase-5 deterministic Auto fallback/tie policy is AMaZE first, then Malvar; BnC Neural is unavailable.
     if (!metrics.valid) {
         if (amazeReady) {
             result.algorithm = DemosaicAlgorithm::Amaze;
@@ -1298,8 +1296,8 @@ DemosaicResolution resolveDemosaicForSceneMetrics(
             result.algorithm = DemosaicAlgorithm::Malvar2004;
             result.reason = "auto_metrics_unavailable_amaze_invalid_fallback_malvar";
         } else {
-            result.algorithm = DemosaicAlgorithm::NeuralJdd;
-            result.reason = "auto_metrics_unavailable_amaze_malvar_invalid_fallback_neural_jdd";
+            result.algorithm = DemosaicAlgorithm::Malvar2004;
+            result.reason = "auto_metrics_unavailable_no_validated_routes";
         }
         result.fallbackOccurred = true;
         result.fallbackReason = "auto_scene_metrics_unavailable";
@@ -1407,20 +1405,7 @@ DemosaicResolution resolveDemosaicForSceneMetrics(
             0.10f * memoryRisk -
             0.10f * detailConfidence * signalQuality;
 
-    float neuralJddScore =
-            0.50f +
-            0.28f * detailConfidence +
-            0.10f * signalQuality +
-            0.08f * focusStability +
-            0.06f * focusSharpness +
-            0.10f * personConfidence +
-            0.04f * personConfidence * (1.0f - noiseRisk) +
-            0.06f * temporalStaticConfidence +
-            0.03f * cfaChromaRisk -
-            0.18f * noiseRisk -
-            0.10f * motionRisk -
-            0.12f * integrityRisk -
-            0.06f * memoryRisk;
+    float bncNeuralScore = -1.0f; // No learned backend: never a scored active candidate.
 
     float amazeScore =
             0.38f +
@@ -1438,11 +1423,11 @@ DemosaicResolution resolveDemosaicForSceneMetrics(
             0.10f * memoryRisk;
 
     if (!malvarReady) malvarScore = -1.0f;
-    if (!neuralJddReady) neuralJddScore = -1.0f;
+    if (!bncNeuralReady) bncNeuralScore = -1.0f;
     if (!amazeReady) amazeScore = -1.0f;
 
     result.autoMalvarScore = malvarScore;
-    result.autoRcdScore = neuralJddScore;
+    result.autoBncNeuralScore = bncNeuralScore;
     result.autoAmazeScore = amazeScore;
     result.autoCfaChromaRisk = cfaChromaRisk;
 
@@ -1456,7 +1441,7 @@ DemosaicResolution resolveDemosaicForSceneMetrics(
     std::array<Candidate, 3> candidates{{
             {DemosaicAlgorithm::Amaze, amazeScore, "AMAZE", "auto_score_winner_amaze"},
             {DemosaicAlgorithm::Malvar2004, malvarScore, "MALVAR_2004", "auto_score_winner_malvar_2004"},
-            {DemosaicAlgorithm::NeuralJdd, neuralJddScore, "NEURAL_JDD", "auto_score_winner_neural_jdd"}
+            {DemosaicAlgorithm::BncNeural, bncNeuralScore, "BNC_NEURAL", "auto_score_winner_bnc_neural"}
     }};
     std::stable_sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
         return a.score > b.score;
@@ -1473,18 +1458,18 @@ DemosaicResolution resolveDemosaicForSceneMetrics(
         result.reason = "auto_no_validated_demosaic_default_identity_amaze";
         result.fallbackOccurred = true;
         result.fallbackReason = "all_demosaic_reference_validations_failed";
-    } else if (malvarReady && neuralJddReady && amazeReady) {
+    } else if (malvarReady && amazeReady) {
         // Delta 0048: scene analysis is now only a global prior. The production Vulkan path
-        // resolves locally between all three validated reconstructions and blends them softly.
+        // resolves locally between the two available classical reconstructions.
         // A bounded temperature and floor keep every route available to local evidence instead
         // of turning the prior back into a disguised whole-frame hard selector.
-        const float maxScore = std::max({malvarScore, neuralJddScore, amazeScore});
+        const float maxScore = std::max(malvarScore, amazeScore);
         constexpr float kPriorTemperature = 0.30f;
         const auto priorExp = [&](float score) {
             return std::exp(std::clamp((score - maxScore) / kPriorTemperature, -12.0f, 0.0f));
         };
         float malvarPrior = priorExp(malvarScore);
-        float neuralPrior = priorExp(neuralJddScore);
+        float neuralPrior = 0.0f; // Reserved for a real future BnC Neural backend.
         float amazePrior = priorExp(amazeScore);
         const float initialSum = std::max(1.0e-6f, malvarPrior + neuralPrior + amazePrior);
         malvarPrior /= initialSum;
@@ -1492,11 +1477,11 @@ DemosaicResolution resolveDemosaicForSceneMetrics(
         amazePrior /= initialSum;
         constexpr float kPriorFloor = 0.08f;
         malvarPrior = std::max(kPriorFloor, malvarPrior);
-        neuralPrior = std::max(kPriorFloor, neuralPrior);
+        // Unavailable routes receive neither softmax mass nor a prior floor.
         amazePrior = std::max(kPriorFloor, amazePrior);
         const float flooredSum = malvarPrior + neuralPrior + amazePrior;
         result.autoMalvarPrior = malvarPrior / flooredSum;
-        result.autoNeuralJddPrior = neuralPrior / flooredSum;
+        result.autoBncNeuralPrior = neuralPrior / flooredSum;
         result.autoAmazePrior = amazePrior / flooredSum;
         result.autoHybridExecution = true;
         result.reason = "auto_hybrid_region_aware_gpu";
@@ -1506,7 +1491,7 @@ DemosaicResolution resolveDemosaicForSceneMetrics(
         // single-route fallback.
         result.reason = candidates[0].reason;
         result.fallbackOccurred = true;
-        result.fallbackReason = "auto_hybrid_requires_all_three_validated_routes";
+        result.fallbackReason = "auto_hybrid_requires_both_classical_routes";
     }
 
     std::ostringstream signals;
@@ -1553,14 +1538,6 @@ DemosaicResolution resolveDemosaicForSceneMetrics(
             << ",staticDetail=" << (-0.03f * temporalStaticConfidence * detailConfidence * signalQuality)
             << ",integrityMemory=" << (0.18f * integrityRisk + 0.10f * memoryRisk)
             << ",detail=" << (-0.10f * detailConfidence * signalQuality) << "}"
-            << ",neuralJddFactors={base=0.5000"
-            << ",detailSignal=" << (0.28f * detailConfidence + 0.10f * signalQuality)
-            << ",focus=" << (0.08f * focusStability + 0.06f * focusSharpness)
-            << ",portrait=" << (0.10f * personConfidence + 0.04f * personConfidence * (1.0f - noiseRisk))
-            << ",static=" << (0.06f * temporalStaticConfidence)
-            << ",chroma=" << (0.03f * cfaChromaRisk)
-            << ",noiseMotion=" << (-0.18f * noiseRisk - 0.10f * motionRisk)
-            << ",integrityMemory=" << (-0.12f * integrityRisk - 0.06f * memoryRisk) << "}"
             << ",amazeFactors={base=0.3800"
             << ",detailSignal=" << (0.48f * detailConfidence + 0.18f * signalQuality)
             << ",focus=" << (0.18f * focusStability + 0.14f * focusSharpness)
@@ -1571,16 +1548,16 @@ DemosaicResolution resolveDemosaicForSceneMetrics(
             << ",noiseMotion=" << (-0.38f * noiseRisk - 0.38f * motionRisk)
             << ",integrityMemory=" << (-0.20f * integrityRisk - 0.10f * memoryRisk) << "}"
             << ",malvarScore=" << malvarScore
-            << ",neuralJddScore=" << neuralJddScore
+            << ",bncNeuralScore=" << bncNeuralScore
             << ",amazeScore=" << amazeScore
             << ",runnerUp=" << result.autoRunnerUp
             << ",scoreDelta=" << result.autoScoreDelta
             << ",autoHybridExecution=" << (result.autoHybridExecution ? "true" : "false")
             << ",autoMalvarPrior=" << result.autoMalvarPrior
-            << ",autoNeuralJddPrior=" << result.autoNeuralJddPrior
+            << ",autoBncNeuralPrior=" << result.autoBncNeuralPrior
             << ",autoAmazePrior=" << result.autoAmazePrior
             << ",malvarReady=" << (malvarReady ? "true" : "false")
-            << ",neuralJddReady=" << (neuralJddReady ? "true" : "false")
+            << ",bncNeuralReady=" << (bncNeuralReady ? "true" : "false")
             << ",amazeReady=" << (amazeReady ? "true" : "false");
     result.autoSignals = signals.str();
     return result;
@@ -1592,7 +1569,7 @@ DemosaicResolution resolveDemosaicForFrame(
         const AutoDemosaicContext& context
 ) {
     const AutoDemosaicSceneMetrics metrics =
-            requestedModeValue == static_cast<int>(DemosaicMode::Auto)
+            resolveDemosaicMode(requestedModeValue).requestedMode == DemosaicMode::AutoHybrid
             ? analyzeAutoDemosaicScene(normalizedBayer)
             : AutoDemosaicSceneMetrics{};
     return resolveDemosaicForSceneMetrics(requestedModeValue, metrics, context);
@@ -1606,10 +1583,10 @@ void recordMenonDemosaicTimeMs(float elapsedMs) {
 
 const char* demosaicModeName(DemosaicMode mode) {
     switch (mode) {
-        case DemosaicMode::Auto: return "AUTO_HYBRID";
-        case DemosaicMode::Bilinear: return "NEURAL_JDD";
-        case DemosaicMode::NormalMalvar2004: return "MALVAR_2004";
-        case DemosaicMode::QualityMenon2007: return "AMAZE";
+        case DemosaicMode::AutoHybrid: return "AUTO_HYBRID";
+        case DemosaicMode::BncNeural: return "BNC_NEURAL";
+        case DemosaicMode::Malvar: return "MALVAR_2004";
+        case DemosaicMode::Amaze: return "AMAZE";
         default: return "MALVAR_2004";
     }
 }
@@ -1617,7 +1594,7 @@ const char* demosaicModeName(DemosaicMode mode) {
 const char* demosaicAlgorithmName(DemosaicAlgorithm algorithm) {
     switch (algorithm) {
         case DemosaicAlgorithm::Bilinear: return "BILINEAR_REFERENCE_ONLY";
-        case DemosaicAlgorithm::NeuralJdd: return "NEURAL_JDD";
+        case DemosaicAlgorithm::BncNeural: return "BNC_NEURAL";
         case DemosaicAlgorithm::Amaze: return "AMAZE";
         case DemosaicAlgorithm::Malvar2004: return "MALVAR_2004";
         case DemosaicAlgorithm::Menon2007: return "MENON_2007_DDFAPD";
@@ -1938,9 +1915,9 @@ cv::Mat demosaicRcdInspiredToRgb32f(
         const DemosaicNoiseContext* noiseContext
 ) {
     // Legacy function symbol retained to avoid breaking the established native call ABI.
-    // Product identity for bridge slot 3 is now Neural JDD: a trained noisy-CFA -> clean-RGB
-    // residual network. Pure MHC provides the deterministic reconstruction baseline; the network
-    // jointly corrects demosaic residuals and physical CFA noise before WB/CCM/tone.
+    // Retired Neural JDD residual experiment, retained for reference compatibility only.
+    // This is NOT the future independent BnC Neural Bayer-to-RGB route.
+    // No product resolver or fallback is allowed to select this implementation.
     const auto setupStart = DemosaicClock::now();
     if (normalizedBayer.empty() || normalizedBayer.type() != CV_32FC1) return {};
     (void)cfaEvidence;
@@ -2543,7 +2520,7 @@ DemosaicValidationResult validateMalvar2004Implementation() {
 }
 
 DemosaicValidationResult validateRcdInspiredImplementation() {
-    // Legacy validation symbol now validates the Neural JDD implementation behind bridge slot 3.
+    // Reference-only validation of the retired Neural JDD residual experiment.
     DemosaicValidationResult result{};
     result.kernelDcGainPassed = true; // Not a fixed linear kernel.
     result.samplePreservationPassed = true; // Not applicable: joint denoise may alter sampled sensels.
@@ -2603,7 +2580,7 @@ DemosaicValidationResult validateRcdInspiredImplementation() {
             << ";features=25cfa+4sitePhase+4bayerPattern+noiseSigma"
             << ";network=34x12x6x3_relu_residual"
             << ";trainedNoisyCfaToCleanRgb=true"
-            << ";implementation=BNCAM_NEURAL_JDD_0046";
+            << ";implementation=LEGACY_NEURAL_JDD_RESIDUAL_REFERENCE_ONLY";
     result.details = details.str();
     return result;
 }

@@ -43,7 +43,8 @@ int cfaChannel4(uint pattern, int x, int y) {
 }
 
 float safeLensGain(float value) {
-    return finite1(value) ? clamp(value, 0.25, 3.5) : 1.0;
+    // Camera2 MINIMUM_GAIN_FACTOR = 1; preserve every valid metadata gain.
+    return finite1(value) && value >= 1.0 ? value : 1.0;
 }
 
 float lensGainAt(int channel, int x, int y) {

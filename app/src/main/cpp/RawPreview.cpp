@@ -154,17 +154,14 @@ cv::Mat cpuDemosaicFallback(
         int cfaPattern,
         int requestedDemosaicMode
 ) {
-    // Bridge values: 1 Malvar Inspired, 2 AMAZE Inspired, 3 RCD Inspired. Auto is resolved in
-    // Kotlin before the live-preview request reaches native; an unexpected 0 therefore uses the
-    // BnCam default (RCD Inspired) rather than resurrecting retired Bilinear behavior.
+    // Bridge IDs remain stable. Slot 3 has no learned backend; use explicit Malvar fallback.
     switch (requestedDemosaicMode) {
         case 1:
+        case 3:
             return demosaicMalvar2004ToRgb32f(normalizedMosaic, cfaPattern);
         case 2:
-            return demosaicAmazeInspiredToRgb32f(normalizedMosaic, cfaPattern);
-        case 3:
         default:
-            return demosaicRcdInspiredToRgb32f(normalizedMosaic, cfaPattern);
+            return demosaicAmazeInspiredToRgb32f(normalizedMosaic, cfaPattern);
     }
 }
 
@@ -856,8 +853,10 @@ RawPreviewResult renderRawPreviewRgba(
             demosaicRequest.algorithm = bncam::vulkan::SpectraGpuDemosaicAlgorithm::AMAZE_INSPIRED;
             break;
         case 3:
+            demosaicRequest.algorithm = bncam::vulkan::SpectraGpuDemosaicAlgorithm::BNC_NEURAL;
+            break;
         default:
-            demosaicRequest.algorithm = bncam::vulkan::SpectraGpuDemosaicAlgorithm::RCD_INSPIRED;
+            demosaicRequest.algorithm = bncam::vulkan::SpectraGpuDemosaicAlgorithm::AMAZE;
             break;
     }
     const auto demosaicStarted = std::chrono::steady_clock::now();

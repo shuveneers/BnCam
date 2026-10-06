@@ -740,6 +740,9 @@ float phase9SourceRawColorConfidence(int x, int y) {
     float c01 = phase9SourceRawConfidenceCell(x0, y0 + 1);
     float c11 = phase9SourceRawConfidenceCell(x0 + 1, y0 + 1);
     float centerConf = mix(mix(c00, c10, fx), mix(c01, c11, fx), fy);
+    if (pc.padding4 != 0u) {
+        return max(phase9SourceRawConfidenceCell(x / 2, y / 2), centerConf);
+    }
     float minNeighbour = min(min(c00, c10), min(c01, c11));
     float confidence = mix(centerConf, min(centerConf, minNeighbour), 0.35);
     return clamp(confidence, 0.0, 1.0);
@@ -754,7 +757,7 @@ vec3 phase9ApplyClippingAwareHighlightColor(
     float y = phase9Luma(postCcmLinearRgb);
     // Smooth S-curve transition so confidence rolloff is soft and natural,
     // preventing posterized white patches and letting Khronos smoothly desaturate specular peaks.
-    float t = smoothstep(0.0, 1.0, confidence);
+    float t = pc.padding4 != 0u ? confidence : smoothstep(0.0, 1.0, confidence);
     vec3 safeRgb = mix(vec3(y), postCcmLinearRgb, t);
     applied = any(greaterThan(abs(safeRgb - postCcmLinearRgb), vec3(1.0e-7)));
     // No upper clamp: neutral highlights above 1.0 remain valid scene-linear headroom.
@@ -764,6 +767,9 @@ vec3 phase9ApplyClippingAwareHighlightColor(
 vec3 phase9ProtectSignedCcmLowerGamut(vec3 signedRgb, out bool excursion, out bool applied) {
     excursion = min(signedRgb.r, min(signedRgb.g, signedRgb.b)) < -1.0e-6;
     applied = false;
+    // Default RAW transports finite signed scene coordinates through LOG/FLLF.
+    // The display entrance owns lower-cone mapping, not camera characterization.
+    if (pc.padding4 != 0u && !any(isnan(signedRgb)) && !any(isinf(signedRgb))) return signedRgb;
     if (!excursion || any(isnan(signedRgb)) || any(isinf(signedRgb))) {
         if (any(isnan(signedRgb)) || any(isinf(signedRgb))) {
             applied = true;
@@ -957,6 +963,10 @@ void main() {
         float colorConfidence = sourceRawConfidence
                 ? sourceColorConfidence
                 : legacyDemosaicConfidence;
+
+        if (pc.padding4 != 0u && colorConfidence < 1.0) {
+            atomicMax(colorTelemetry[17], floatBitsToUint(1.0-colorConfidence));
+        }
 
         // One baseline chroma pass after the final demosaic, fused with colour dispatch.
         vec2 chromaAuthority;

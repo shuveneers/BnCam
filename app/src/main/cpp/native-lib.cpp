@@ -3187,29 +3187,29 @@ Java_com_bncam_core_engine_ImageUtils_validateDemosaicNative(JNIEnv *env, jobjec
         }
     }
     const DemosaicResolution normal = resolveDemosaicMode(
-            static_cast<int>(DemosaicMode::NormalMalvar2004)
+            static_cast<int>(DemosaicMode::Malvar)
     );
     const bool normalForcesMalvar =
-            normal.requestedMode == DemosaicMode::NormalMalvar2004 &&
+            normal.requestedMode == DemosaicMode::Malvar &&
             normal.algorithm == DemosaicAlgorithm::Malvar2004 &&
             normal.reason == "normal_mode_forces_malvar_2004" &&
             !normal.fallbackOccurred;
     const DemosaicResolution quality = resolveDemosaicMode(
-            static_cast<int>(DemosaicMode::QualityMenon2007)
+            static_cast<int>(DemosaicMode::Amaze)
     );
     const bool legacySlot2ForcesAmaze =
-            quality.requestedMode == DemosaicMode::QualityMenon2007 &&
+            quality.requestedMode == DemosaicMode::Amaze &&
             quality.algorithm == DemosaicAlgorithm::AmazeInspired &&
-            quality.reason == "legacy_slot_2_forces_amaze_inspired" &&
+            quality.reason == "amaze_mode" &&
             !quality.fallbackOccurred;
     const DemosaicResolution bilinearResolution = resolveDemosaicMode(
-            static_cast<int>(DemosaicMode::Bilinear)
+            static_cast<int>(DemosaicMode::BncNeural)
     );
-    const bool legacySlot3ForcesRcd =
-            bilinearResolution.requestedMode == DemosaicMode::Bilinear &&
-            bilinearResolution.algorithm == DemosaicAlgorithm::RcdInspired &&
-            bilinearResolution.reason == "legacy_slot_3_forces_rcd_inspired" &&
-            !bilinearResolution.fallbackOccurred;
+    const bool legacySlot3FallsBackMalvar =
+            bilinearResolution.requestedMode == DemosaicMode::BncNeural &&
+            bilinearResolution.algorithm == DemosaicAlgorithm::Malvar2004 &&
+            bilinearResolution.fallbackReason == "BNC_NEURAL_BACKEND_UNAVAILABLE" &&
+            bilinearResolution.fallbackOccurred;
 
     AutoDemosaicSceneMetrics balancedMetrics{};
     balancedMetrics.valid = true;
@@ -3225,7 +3225,7 @@ Java_com_bncam_core_engine_ImageUtils_validateDemosaicNative(JNIEnv *env, jobjec
     balancedContext.motionRiskKnown = true;
     balancedContext.highMotionRisk = false;
     const DemosaicResolution autoBalanced = resolveDemosaicForSceneMetrics(
-            static_cast<int>(DemosaicMode::Auto), balancedMetrics, balancedContext);
+            static_cast<int>(DemosaicMode::AutoHybrid), balancedMetrics, balancedContext);
 
     AutoDemosaicSceneMetrics fineDetailMetrics = balancedMetrics;
     fineDetailMetrics.medianSignal = 0.32f;
@@ -3238,7 +3238,7 @@ Java_com_bncam_core_engine_ImageUtils_validateDemosaicNative(JNIEnv *env, jobjec
     fineDetailContext.motionRiskKnown = true;
     fineDetailContext.highMotionRisk = false;
     const DemosaicResolution autoFineDetail = resolveDemosaicForSceneMetrics(
-            static_cast<int>(DemosaicMode::Auto), fineDetailMetrics, fineDetailContext);
+            static_cast<int>(DemosaicMode::AutoHybrid), fineDetailMetrics, fineDetailContext);
 
     AutoDemosaicContext fineDetailHighChromaContext = fineDetailContext;
     fineDetailHighChromaContext.cfaChromaEvidenceKnown = true;
@@ -3249,7 +3249,7 @@ Java_com_bncam_core_engine_ImageUtils_validateDemosaicNative(JNIEnv *env, jobjec
     fineDetailHighChromaContext.cfaRedOpponentCorrectionConfidence = 0.90f;
     fineDetailHighChromaContext.cfaBlueOpponentCorrectionConfidence = 0.80f;
     const DemosaicResolution autoFineDetailHighChroma = resolveDemosaicForSceneMetrics(
-            static_cast<int>(DemosaicMode::Auto), fineDetailMetrics, fineDetailHighChromaContext);
+            static_cast<int>(DemosaicMode::AutoHybrid), fineDetailMetrics, fineDetailHighChromaContext);
 
     AutoDemosaicSceneMetrics noisyMetrics = balancedMetrics;
     noisyMetrics.medianSignal = 0.035f;
@@ -3262,22 +3262,18 @@ Java_com_bncam_core_engine_ImageUtils_validateDemosaicNative(JNIEnv *env, jobjec
     noisyContext.motionRiskKnown = true;
     noisyContext.highMotionRisk = true;
     const DemosaicResolution autoNoisy = resolveDemosaicForSceneMetrics(
-            static_cast<int>(DemosaicMode::Auto), noisyMetrics, noisyContext);
+            static_cast<int>(DemosaicMode::AutoHybrid), noisyMetrics, noisyContext);
 
-    const bool autoResolverPassed =
-            autoBalanced.algorithm == DemosaicAlgorithm::RcdInspired &&
-            autoFineDetail.algorithm == DemosaicAlgorithm::AmazeInspired &&
-            autoFineDetailHighChroma.algorithm == DemosaicAlgorithm::RcdInspired &&
-            autoFineDetailHighChroma.autoCfaChromaRisk > 0.70f &&
-            autoNoisy.algorithm == DemosaicAlgorithm::Malvar2004 &&
-            autoBalanced.autoRcdScore > autoBalanced.autoMalvarScore &&
-            autoBalanced.autoRcdScore > autoBalanced.autoAmazeScore &&
-            autoFineDetail.autoAmazeScore > autoFineDetail.autoRcdScore &&
-            autoNoisy.autoMalvarScore > autoNoisy.autoRcdScore &&
-            autoNoisy.autoMalvarScore > autoNoisy.autoAmazeScore &&
-            autoBalanced.autoSceneAnalysisUsed &&
-            autoFineDetail.autoSceneAnalysisUsed &&
-            autoNoisy.autoSceneAnalysisUsed;
+    const auto validHybrid = [](const DemosaicResolution& r) {
+        return r.autoHybridExecution && r.autoSceneAnalysisUsed &&
+            r.autoBncNeuralPrior == 0.0f &&
+            std::abs(r.autoMalvarPrior + r.autoAmazePrior - 1.0f) < 1.e-6f &&
+            r.algorithm != DemosaicAlgorithm::BncNeural;
+    };
+    const bool autoResolverPassed = validHybrid(autoBalanced) && validHybrid(autoFineDetail) &&
+            validHybrid(autoFineDetailHighChroma) && validHybrid(autoNoisy) &&
+            autoFineDetail.algorithm == DemosaicAlgorithm::Amaze &&
+            autoNoisy.algorithm == DemosaicAlgorithm::Malvar2004;
     std::ostringstream result;
     result << "bilinearReference{" << bilinear.details << "}"
            << ";malvar{" << malvar.details << "}"
@@ -3285,19 +3281,19 @@ Java_com_bncam_core_engine_ImageUtils_validateDemosaicNative(JNIEnv *env, jobjec
            << ";amaze{" << amaze.details << "}"
            << ";menonReference{" << menon.details << "}"
            << ";cfaShiftOddXY=" << (cfaShiftPassed ? "true" : "false")
-           << ";legacySlot3ForcesRcd=" << (legacySlot3ForcesRcd ? "true" : "false")
+           << ";legacySlot3FallsBackMalvar=" << (legacySlot3FallsBackMalvar ? "true" : "false")
            << ";normalForcesMalvar=" << (normalForcesMalvar ? "true" : "false")
            << ";legacySlot2ForcesAmaze=" << (legacySlot2ForcesAmaze ? "true" : "false")
-           << ";autoBalancedRcd=" << (autoBalanced.algorithm == DemosaicAlgorithm::RcdInspired ? "true" : "false")
+           << ";autoBalancedAvailableRoutes=" << (validHybrid(autoBalanced) ? "true" : "false")
            << ";autoFineDetailAmaze=" << (autoFineDetail.algorithm == DemosaicAlgorithm::AmazeInspired ? "true" : "false")
-           << ";autoFineDetailHighChromaRcd=" << (autoFineDetailHighChroma.algorithm == DemosaicAlgorithm::RcdInspired ? "true" : "false")
+           << ";autoFineDetailHighChromaAvailableRoutes=" << (validHybrid(autoFineDetailHighChroma) ? "true" : "false")
            << ";autoFineDetailHighChromaRisk=" << autoFineDetailHighChroma.autoCfaChromaRisk
            << ";autoNoisyMalvar=" << (autoNoisy.algorithm == DemosaicAlgorithm::Malvar2004 ? "true" : "false")
-           << ";autoThreeWayScoring=true"
+           << ";autoHybridActiveRoutes=MALVAR_2004,AMAZE;bncNeuralAvailable=false"
            << ";autoResolverPassed=" << (autoResolverPassed ? "true" : "false")
            << ";allPassed="
            << (bilinear.passed && malvar.passed && rcd.passed && amaze.passed && menon.passed && cfaShiftPassed &&
-               legacySlot3ForcesRcd && normalForcesMalvar && legacySlot2ForcesAmaze &&
+               legacySlot3FallsBackMalvar && normalForcesMalvar && legacySlot2ForcesAmaze &&
                autoResolverPassed
                ? "true" : "false");
     return env->NewStringUTF(result.str().c_str());
@@ -3532,6 +3528,8 @@ Java_com_bncam_core_engine_ImageUtils_renderJpegFromMasterNative(
     }
 
     IspFrameMetadata meta;
+    meta.singleShotRaw = routeLabel == "JPEG_WORKING_LINEAR_RAW_FROM_RAW10_SINGLE" ||
+            routeLabel == "JPEG_WORKING_LINEAR_RAW_FROM_RAW_SENSOR_SINGLE";
     meta.phoneAssistanceSensorsEnabled = (phoneAssistanceSensorsEnabled == JNI_TRUE);
     meta.auxSensorValid = (auxSensorValid == JNI_TRUE);
     meta.auxCctKelvin = static_cast<float>(auxCctKelvin);
@@ -4512,7 +4510,7 @@ Java_com_bncam_core_engine_ImageUtils_validatePhysicalChromaNative(JNIEnv* env,j
         std::vector<float> mosaic(test::W*test::H,.12f);
         for(size_t i=0;i<mosaic.size();++i) mosaic[i]+=.005f*std::sin(float(i)*1.7f);
         using Algorithm=bncam::vulkan::SpectraGpuDemosaicAlgorithm;
-        for(auto route:{Algorithm::MALVAR_2004,Algorithm::AMAZE,Algorithm::NEURAL_JDD,Algorithm::AUTO_HYBRID}) {
+        for(auto route:{Algorithm::MALVAR_2004,Algorithm::AMAZE,Algorithm::BNC_NEURAL,Algorithm::AUTO_HYBRID}) {
             bncam::vulkan::SpectraResidentDemosaicRequest dr{};
             dr.mosaicData=mosaic.data();dr.frameWidth=test::W;dr.frameHeight=test::H;
             dr.rowStrideFloats=test::W;dr.algorithm=route;
@@ -4605,7 +4603,7 @@ Java_com_bncam_core_engine_ImageUtils_validatePhysicalLumaNative(JNIEnv* env,job
         std::vector<float> mosaic(test::W*test::H,.12f);
         for(size_t i=0;i<mosaic.size();++i) mosaic[i]+=.005f*std::sin(float(i)*1.7f);
         using Algorithm=bncam::vulkan::SpectraGpuDemosaicAlgorithm;
-        for(auto route:{Algorithm::MALVAR_2004,Algorithm::AMAZE,Algorithm::NEURAL_JDD,Algorithm::AUTO_HYBRID}) {
+        for(auto route:{Algorithm::MALVAR_2004,Algorithm::AMAZE,Algorithm::BNC_NEURAL,Algorithm::AUTO_HYBRID}) {
             bncam::vulkan::SpectraResidentDemosaicRequest dr{};
             dr.mosaicData=mosaic.data();dr.frameWidth=test::W;dr.frameHeight=test::H;
             dr.rowStrideFloats=test::W;dr.algorithm=route;

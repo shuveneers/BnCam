@@ -7,26 +7,24 @@ enum class DemosaicMode(
     val displayName: String,
     val available: Boolean
 ) {
-    // Internal enum symbols retain legacy names for persisted-profile/source compatibility.
-    // Product bridge identities are 1=Malvar, 2=AMaZE,
-    // 3=Neural JDD. Auto is the final region-aware GPU Auto Hybrid route.
-    AUTO(0, "Auto Hybrid", true),
-    NORMAL(1, "Malvar", true),
-    QUALITY(2, "AMaZE", true),
-    BILINEAR(3, "Neural JDD", true);
+    // Stable bridge IDs preserve existing profiles; legacy text values are parsed below.
+    // BnC Neural remains selectable, with its current native Malvar fallback reported explicitly.
+    AUTO_HYBRID(0, "Auto Hybrid", true),
+    MALVAR(1, "Malvar", true),
+    AMAZE(2, "AMaZE", true),
+    BNC_NEURAL(3, "BnC Neural", true);
 
     companion object {
         const val PROFILE_KEY = "demosaic_mode"
 
-        // Product default remains the deterministic Malvar path. AMaZE and Neural JDD are
-        // explicit alternatives; Auto Hybrid stays the fourth UI choice.
-        val DEFAULT: DemosaicMode = NORMAL
-        val USER_ORDER: List<DemosaicMode> = listOf(NORMAL, QUALITY, BILINEAR, AUTO)
+        // Missing/new profiles use automatic routing. AMaZE remains the classical quality baseline.
+        val DEFAULT: DemosaicMode = AUTO_HYBRID
+        val USER_ORDER: List<DemosaicMode> = listOf(MALVAR, AMAZE, BNC_NEURAL, AUTO_HYBRID)
 
         /**
          * Parses both the new product names and all legacy persisted values.
          * Legacy slot semantics intentionally migrate with their bridge value:
-         * NORMAL/Malvar -> Malvar, QUALITY/Menon -> AMaZE, BILINEAR/RCD -> Neural JDD.
+         * MALVAR/Malvar -> Malvar, AMAZE/Menon -> AMaZE, BNC_NEURAL/RCD -> BnC Neural.
          */
         fun fromPersisted(value: String?): DemosaicMode? {
             val trimmed = value?.trim().orEmpty()
@@ -35,15 +33,16 @@ enum class DemosaicMode(
                 return entries.firstOrNull { it.bridgeValue == persistedId }
             }
             return when (trimmed.uppercase(Locale.US)) {
-                "AUTO", "AUTO_HYBRID", "AUTO HYBRID", "AUTOHYBRID" -> AUTO
+                "AUTO", "AUTO_HYBRID", "AUTO HYBRID", "AUTOHYBRID" -> AUTO_HYBRID
                 "NORMAL", "MALVAR", "MALVAR_2004", "MALVAR 2004",
-                "MALVAR_INSPIRED", "MALVAR INSPIRED" -> NORMAL
+                "MALVAR_INSPIRED", "MALVAR INSPIRED" -> MALVAR
 
                 "QUALITY", "MENON", "MENON_2007", "MENON 2007",
-                "MENON_2007_DDFAPD", "AMAZE", "AMAZE_INSPIRED", "AMAZE INSPIRED" -> QUALITY
+                "MENON_2007_DDFAPD", "AMAZE", "AMAZE_INSPIRED", "AMAZE INSPIRED" -> AMAZE
 
                 "BILINEAR", "RCD", "RCD_INSPIRED", "RCD INSPIRED",
-                "NEURAL_JDD", "NEURAL JDD", "NEURALJDD" -> BILINEAR
+                "BNC_NEURAL", "BNC NEURAL", "BNCNEURAL",
+                "NEURAL_JDD", "NEURAL JDD", "NEURALJDD", "NEURAL BN" -> BNC_NEURAL
                 else -> null
             }
         }
@@ -52,40 +51,40 @@ enum class DemosaicMode(
             val stored = fromPersisted(value)
             val invalidRequested = value != null && value.isNotBlank() && stored == null
             return when (stored) {
-                QUALITY -> DemosaicSelection(
-                    requestedMode = QUALITY,
-                    resolvedAlgorithm = ResolvedDemosaicAlgorithm.AMAZE_INSPIRED,
-                    resolveReason = "legacy_slot_2_forces_amaze",
+                AMAZE -> DemosaicSelection(
+                    requestedMode = AMAZE,
+                    resolvedAlgorithm = ResolvedDemosaicAlgorithm.AMAZE,
+                    resolveReason = "amaze_mode",
                     fallbackOccurred = false,
                     fallbackReason = "none"
                 )
-                BILINEAR -> DemosaicSelection(
-                    requestedMode = BILINEAR,
-                    resolvedAlgorithm = ResolvedDemosaicAlgorithm.RCD_INSPIRED,
-                    resolveReason = "legacy_slot_3_executes_neural_jdd",
-                    fallbackOccurred = false,
-                    fallbackReason = "none"
+                BNC_NEURAL -> DemosaicSelection(
+                    requestedMode = BNC_NEURAL,
+                    resolvedAlgorithm = ResolvedDemosaicAlgorithm.MALVAR_2004,
+                    resolveReason = "bnc_neural_requested_malvar_fallback",
+                    fallbackOccurred = true,
+                    fallbackReason = "BNC_NEURAL_BACKEND_UNAVAILABLE"
                 )
-                AUTO -> DemosaicSelection(
-                    requestedMode = AUTO,
-                    resolvedAlgorithm = ResolvedDemosaicAlgorithm.AUTO_SCENE_ADAPTIVE_NATIVE,
+                AUTO_HYBRID -> DemosaicSelection(
+                    requestedMode = AUTO_HYBRID,
+                    resolvedAlgorithm = ResolvedDemosaicAlgorithm.AUTO_HYBRID,
                     resolveReason = "auto_hybrid_requires_native_scene_analysis",
                     fallbackOccurred = false,
                     fallbackReason = "none"
                 )
-                NORMAL -> DemosaicSelection(
-                    requestedMode = NORMAL,
-                    resolvedAlgorithm = ResolvedDemosaicAlgorithm.MALVAR_INSPIRED,
+                MALVAR -> DemosaicSelection(
+                    requestedMode = MALVAR,
+                    resolvedAlgorithm = ResolvedDemosaicAlgorithm.MALVAR_2004,
                     resolveReason = "normal_mode_forces_malvar_2004",
                     fallbackOccurred = false,
                     fallbackReason = "none"
                 )
                 null -> DemosaicSelection(
                     requestedMode = DEFAULT,
-                    resolvedAlgorithm = ResolvedDemosaicAlgorithm.MALVAR_INSPIRED,
-                    resolveReason = "default_malvar_2004_noise_robust",
+                    resolvedAlgorithm = ResolvedDemosaicAlgorithm.AUTO_HYBRID,
+                    resolveReason = "default_auto_hybrid_requires_native_scene_analysis",
                     fallbackOccurred = invalidRequested,
-                    fallbackReason = if (invalidRequested) "invalid_profile_value_defaulted_malvar_2004" else "none"
+                    fallbackReason = if (invalidRequested) "invalid_profile_value_defaulted_auto_hybrid" else "none"
                 )
             }
         }
@@ -93,10 +92,10 @@ enum class DemosaicMode(
 }
 
 enum class ResolvedDemosaicAlgorithm {
-    MALVAR_INSPIRED,
-    RCD_INSPIRED,
-    AMAZE_INSPIRED,
-    AUTO_SCENE_ADAPTIVE_NATIVE
+    MALVAR_2004,
+    BNC_NEURAL,
+    AMAZE,
+    AUTO_HYBRID
 }
 
 data class DemosaicSelection(
@@ -108,18 +107,18 @@ data class DemosaicSelection(
 ) {
     val resolvedDebugName: String
         get() = when (resolvedAlgorithm) {
-            ResolvedDemosaicAlgorithm.MALVAR_INSPIRED -> "MALVAR_2004"
-            ResolvedDemosaicAlgorithm.RCD_INSPIRED -> "NEURAL_JDD"
-            ResolvedDemosaicAlgorithm.AMAZE_INSPIRED -> "AMAZE"
-            ResolvedDemosaicAlgorithm.AUTO_SCENE_ADAPTIVE_NATIVE -> "AUTO_HYBRID"
+            ResolvedDemosaicAlgorithm.MALVAR_2004 -> "MALVAR_2004"
+            ResolvedDemosaicAlgorithm.BNC_NEURAL -> "BNC_NEURAL"
+            ResolvedDemosaicAlgorithm.AMAZE -> "AMAZE"
+            ResolvedDemosaicAlgorithm.AUTO_HYBRID -> "AUTO_HYBRID"
         }
 
     private val requestedDebugName: String
         get() = when (requestedMode) {
-            DemosaicMode.AUTO -> "AUTO_HYBRID"
-            DemosaicMode.BILINEAR -> "NEURAL_JDD"
-            DemosaicMode.NORMAL -> "MALVAR"
-            DemosaicMode.QUALITY -> "AMAZE"
+            DemosaicMode.AUTO_HYBRID -> "AUTO_HYBRID"
+            DemosaicMode.BNC_NEURAL -> "BNC_NEURAL"
+            DemosaicMode.MALVAR -> "MALVAR"
+            DemosaicMode.AMAZE -> "AMAZE"
         }
 
     val debugPairs: List<Pair<String, String>>
@@ -128,7 +127,8 @@ data class DemosaicSelection(
             "resolvedDemosaicAlgorithm" to resolvedDebugName,
             "demosaicResolveReason" to resolveReason,
             "malvar2004Available" to "true",
-            "neuralJddAvailable" to "true",
+            "bncNeuralAvailable" to "false",
+            "bncNeuralFallbackAlgorithm" to "MALVAR_2004",
             "rcdInspiredAvailable" to "false",
             "amazeAvailable" to "true",
             "amazeInspiredAvailable" to "false",

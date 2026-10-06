@@ -1665,6 +1665,8 @@ SpectraResidentToneResult VulkanSpectraResidentToneBackend::executeTone(
     result.fllfPhysicalNoiseSigmaY = std::clamp(
             request.fllfPhysicalNoiseSigmaY, 0.0f, 0.50f);
     result.fllfApplied = fllfRequested && result.fllfAdjustedPixels > 0u;
+    result.defaultRawKhronosHighlightPixels = telemetry[56];
+    std::memcpy(&result.defaultRawKhronosMaxLumaCompression, &telemetry[57], sizeof(float));
     result.linearDetailEvaluatedPixels = telemetry[31];
     result.linearDetailChangedPixels = telemetry[32];
     result.linearDetailEdgeSupportedPixels = telemetry[33];

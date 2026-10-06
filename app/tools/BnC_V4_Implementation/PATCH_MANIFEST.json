@@ -1,0 +1,97 @@
+{
+  "schema": 1,
+  "name": "BnC Neural V4 research and runner correction",
+  "files": [
+    {
+      "path": "app/tools/bnc_neural_training/package.py",
+      "sha256": "cf24f5e4d41cf3325476248ca5189ee20560c163427a8950e9a3504d203e89dc",
+      "expectedCurrentSHA256": "2e43d9b61a94aa31712a7cca63f3f87dc1ef5266c0d884ae9af703cbce9b84ca"
+    },
+    {
+      "path": "app/tools/bnc_neural_training/v2/training_safety.py",
+      "sha256": "c911ddf92402845c7856fa28fc5c20eae7bafe5dc2b423b89110f92161034a83",
+      "expectedCurrentSHA256": null
+    },
+    {
+      "path": "app/tools/bnc_neural_training/v2/v3_phase_a/run.py",
+      "sha256": "62a9b06ca893ced109c58511fd70c60050b1e6881eead3ddb233c1e13e642bce",
+      "expectedCurrentSHA256": "b4e1354845c0416da2745e4d98a070d7ddef5f1a9c4990d1aace60ce1166b797"
+    },
+    {
+      "path": "app/tools/bnc_neural_training/v2/v3_phase_b/run.py",
+      "sha256": "27136cdc1809f065665fe49b3419da9c0fcf6f8efac99f4d0f307b88a6ada2a6",
+      "expectedCurrentSHA256": "d99fc6fe2580bb1848ae3fad1324790c078610dee616b4b73f755c3c1f02559d"
+    },
+    {
+      "path": "app/tools/bnc_neural_training/v2/v4_research/__init__.py",
+      "sha256": "ff5b187f5f17e815896000cfbac30e44ff6187bc0cf88571e04a44766abce2ba",
+      "expectedCurrentSHA256": null
+    },
+    {
+      "path": "app/tools/bnc_neural_training/v2/v4_research/model.py",
+      "sha256": "701b7db25cc419d01dbae9a824dcbdae37072d679c2dfafe537f2db2fcd82fc3",
+      "expectedCurrentSHA256": null
+    },
+    {
+      "path": "app/tools/bnc_neural_training/v2/v4_research/run.py",
+      "sha256": "8cfdbb54f2ea4a1a8814c3f635d7e2c9d09a2d068e0a25028ed64915b61e6791",
+      "expectedCurrentSHA256": null
+    },
+    {
+      "path": "app/tools/bnc_neural_training/v2/v4_research/test_research.py",
+      "sha256": "1fe8e392aa33481d258338953d84302c8056af8afe5324facaa59df99789e571",
+      "expectedCurrentSHA256": null
+    },
+    {
+      "path": "app/tools/bnc_neural_training/v2/v4_research/verify_local.py",
+      "sha256": "39807c271f0209612c36a30e9381259e5fe15fe702eeace8fa3f8a0a64ac8dfb",
+      "expectedCurrentSHA256": null
+    },
+    {
+      "path": "train-bnc-v4.ps1",
+      "sha256": "809886f049032a4896a387a9383a4dd483c2f93830f10176b594c9afc30cdf76",
+      "expectedCurrentSHA256": null
+    },
+    {
+      "path": "Start-BnC-V4-Qualification.ps1",
+      "sha256": "7ad20cab2e90ae2a1e191148fe116ffa497cebfd1fe484f60f62237a5b26c904",
+      "expectedCurrentSHA256": null
+    }
+  ],
+  "unchangedCore": [
+    {
+      "path": "app/tools/bnc_neural_training/contracts.py",
+      "sha256": "bbd02f32062edb877df031fa1a9d2b8804b07e41820c8bd622c0bcf6d2ca8bba"
+    },
+    {
+      "path": "app/tools/bnc_neural_training/model.py",
+      "sha256": "27f14e2b13e38f88a96265702571c09c06118cc8cd3512f28d16bd5408801336"
+    },
+    {
+      "path": "app/tools/bnc_neural_training/losses.py",
+      "sha256": "7befcb5ef701da396f527ab1f67250a3e2ff0db4c0e8bdd8e8b8941d4fab97f8"
+    },
+    {
+      "path": "app/tools/bnc_neural_training/corpus.py",
+      "sha256": "811f6a505c40ae7c3496a978cd9c27db3b54b1e9d812fdf2acfaa087d24fc928"
+    },
+    {
+      "path": "app/tools/bnc_neural_training/v2/model.py",
+      "sha256": "b6999a3624c30a6e5afdc6b62ead892eddc903f5cf368075ae9ab7a9e834b71f"
+    },
+    {
+      "path": "app/tools/bnc_neural_training/v2/losses.py",
+      "sha256": "9834f935f190b93e86dcdeae2adc3c9607c1fc11969c1e7dd5bec935f2979e69"
+    },
+    {
+      "path": "app/tools/bnc_neural_training/v2/data.py",
+      "sha256": "3a9386ba28386e8bface835d52debda99280dca01a5381bed14ec0b70a03163b"
+    },
+    {
+      "path": "app/tools/bnc_neural_training/v2/procedural.py",
+      "sha256": "938ec060dff8b936e79b8b19336ba286fe9ee11e773cfa23eae682b0c95b9c7f"
+    }
+  ],
+  "productReady": false,
+  "firstQualificationStop": 2000
+}

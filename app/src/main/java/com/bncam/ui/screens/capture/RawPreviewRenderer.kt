@@ -64,6 +64,7 @@ data class RawPreviewRenderConfig(
     val sectionCurve: FloatArray,
     val rotationDegrees: Int,
     val isBootstrap: Boolean = false,
+    val preserveExactCamera2Pair: Boolean = false,
     val calibrationSensorId: String = "",
     val staticBlackLevels: FloatArray? = null,
     val staticWhiteLevel: Int = 0,
@@ -189,8 +190,9 @@ class RawPreviewFrame internal constructor(
 /**
  * Bounded-jitter RAW viewfinder renderer. The input handle is an independently retained native
  * AHardwareBuffer reference; neither this class nor native code owns the Image/ring-buffer handle.
- * One pending RAW frame is replaced by each newer offer while submitted GPU slots retain their
- * own frames. The capture warm ring has independent ownership and is never pruned here.
+ * Default RAW keeps at most four pending images for their exact Camera2 color metadata, then
+ * selects the newest complete pair. Other routes retain latest-only submission. Submitted GPU
+ * slots own their frames; the capture warm ring is independent and is never pruned here.
  */
 private object RawPreviewRetiredGpuBackings {
     private const val MAX_RETAINED = 24
@@ -274,7 +276,7 @@ class RawPreviewRenderer(
         Thread(runnable, "BnCamRawPreviewWarmup").apply { priority = Thread.NORM_PRIORITY }
     }
     private val pendingRequestLock = Any()
-    private var pendingRequest: Request? = null
+    private val pendingFrames = RawPreviewPendingFrames<Request> { it.sensorTimestampNs }
     private data class NativeGeometry(
         val width: Int, val height: Int, val rowStride: Int, val pixelStride: Int,
         val cropLeft: Int, val cropTop: Int, val cropWidth: Int, val cropHeight: Int
@@ -309,6 +311,8 @@ class RawPreviewRenderer(
     private val exactFrameColorPairs = ConcurrentHashMap<RawPreviewFrameMetadataCache.Key, ExactFrameColorPair>()
     private val frameMetadata = RawPreviewFrameMetadataCache()
     private val autoWhiteBalanceColorPair = AtomicReference<ExactFrameColorPair?>(null)
+    @Volatile private var colorAuditStartedMs = 0L
+    private var lastColorAuditMs = 0L
     private val latestOfferedSensorTimestampNs = AtomicLong(Long.MIN_VALUE)
     private val lastRendererOfferElapsedNs = AtomicLong(0L)
     private val lastRendererPublishElapsedNs = AtomicLong(0L)
@@ -626,9 +630,10 @@ class RawPreviewRenderer(
     private fun enqueuePendingRequest(request: Request) {
         val (stale, accepted) = synchronized(pendingRequestLock) {
             if (closed || !isCurrent(request)) {
-                null to false
+                emptyList<Request>() to false
             } else {
-                pendingRequest.also { pendingRequest = request } to true
+                pendingFrames.offer(request, if (request.config.preserveExactCamera2Pair)
+                    MAX_PENDING_REQUESTS else 1) to true
             }
         }
         if (!accepted) {
@@ -636,7 +641,7 @@ class RawPreviewRenderer(
                 else RawPreviewDropReason.STALE_GENERATION, "offer_after_route_change")
             return
         }
-        stale?.let { dropped ->
+        stale.forEach { dropped ->
             droppedBusy++
             retireQueuedRequest(dropped, RawPreviewDropReason.PREVIEW_DROP_REPLACED_BY_NEWER,
                 "preview_replaced_by_newer")
@@ -652,23 +657,37 @@ class RawPreviewRenderer(
             request.sensorTimestampNs, SystemClock.elapsedRealtimeNanos(), detail)
     }
 
-    private fun pollPendingRequest(): Request? = synchronized(pendingRequestLock) {
-        pendingRequest.also { pendingRequest = null }
+    private fun pollPendingRequest(): Request? {
+        val now = SystemClock.elapsedRealtimeNanos()
+        val result = synchronized(pendingRequestLock) {
+            pendingFrames.poll(
+                ready = { !it.config.preserveExactCamera2Pair ||
+                    liveWhiteBalanceOverride.get() != null ||
+                    exactFrameColorPairs.containsKey(metadataKey(it)) },
+                expired = { !isCurrent(it) || (it.config.preserveExactCamera2Pair &&
+                    now - it.offeredElapsedNs > COLOR_PAIR_MAX_WAIT_NS) }
+            )
+        }
+        result.discarded.forEach {
+            retireQueuedRequest(it, RawPreviewDropReason.PREVIEW_DROP_REPLACED_BY_NEWER,
+                "color_pair_expired_or_superseded")
+        }
+        return result.ready
     }
 
     private fun hasPendingRequest(): Boolean = synchronized(pendingRequestLock) {
-        pendingRequest != null
+        pendingFrames.size > 0
     }
 
     private fun pendingRequestCount(): Int = synchronized(pendingRequestLock) {
-        if (pendingRequest == null) 0 else 1
+        pendingFrames.size
     }
 
     private fun clearPendingRequests() {
         val stale = synchronized(pendingRequestLock) {
-            pendingRequest.also { pendingRequest = null }
+            pendingFrames.clear()
         }
-        stale?.let { request ->
+        stale.forEach { request ->
             val closing = closed
             retireQueuedRequest(request, if (closing) RawPreviewDropReason.PREVIEW_DROP_RENDERER_CLOSING
                 else RawPreviewDropReason.STALE_GENERATION,
@@ -788,6 +807,7 @@ class RawPreviewRenderer(
             wbGains = gains.copyOf(4),
             colorMatrix = colorMatrix.copyOf(9)
         )
+        if (hasPendingRequest()) scheduleDrain()
         if (exactFrameColorPairs.size > 24) {
             val oldest = exactFrameColorPairs.keys.minByOrNull { it.timestampNs }
             if (oldest != null && oldest != key) exactFrameColorPairs.remove(oldest)
@@ -848,6 +868,7 @@ class RawPreviewRenderer(
             previous.source != config.source || previous.profileId != config.profileId
         activeConfig = config
         if (routeChanged) {
+            colorAuditStartedMs = SystemClock.elapsedRealtime()
             liveWhiteBalanceOverride.set(null)
             exactFrameColorPairs.clear()
             frameMetadata.clear()
@@ -881,6 +902,9 @@ class RawPreviewRenderer(
                     "cfa=${config?.cfaPattern ?: -1} white=${config?.whiteLevel ?: -1} " +
                     "black=${config?.blackLevels?.joinToString(prefix = "[", postfix = "]") ?: "[]"} " +
                     "wb=${config?.wbGains?.joinToString(prefix = "[", postfix = "]") ?: "[]"} " +
+                    "camera2PairOwner=${config?.preserveExactCamera2Pair ?: false} " +
+                    "bootstrap=${config?.isBootstrap ?: false} " +
+                    "ccm=${config?.colorMatrix?.joinToString(prefix = "[", postfix = "]") ?: "[]"} " +
                     "iso=${config?.captureSensitivityIso ?: -1} exposureNs=${config?.captureExposureTimeNs ?: -1L} " +
                     "focusDetailPriority=${config?.focusDetailPriority ?: 0f} " +
                     "rotation=${config?.rotationDegrees ?: -1} routeChanged=$routeChanged"
@@ -982,7 +1006,10 @@ class RawPreviewRenderer(
         val fresh = if (pendingFirst == null && availableOutputSlots.isNotEmpty() &&
             !(probing && gpuInteropController.snapshot().probeAttempted)) pollPendingRequest() else null
         val pending = pendingFirst ?: if (fresh == null) pendingGpuRequests.poll() else null
-        val request = fresh ?: pending?.request ?: return
+        val request = fresh ?: pending?.request ?: run {
+            if (hasPendingRequest()) scheduleDrain(5L)
+            return
+        }
         val polling = pending != null
         if (!polling && isCurrent(request) && request.config.calibrationSensorId.isNotBlank() &&
             !frameMetadata.hasExact(metadataKey(request), SystemClock.elapsedRealtimeNanos()) &&
@@ -1148,7 +1175,24 @@ class RawPreviewRenderer(
                 } else {
                     null
                 }
-                val autoPair = if (liveWb == null) autoWhiteBalanceColorPair.get() else null
+                val autoPair = if (liveWb == null && !request.config.preserveExactCamera2Pair)
+                    autoWhiteBalanceColorPair.get() else null
+                val auditNow = SystemClock.elapsedRealtime()
+                if (com.bncam.BuildConfig.DEBUG && auditNow - colorAuditStartedMs < 8_000L &&
+                    auditNow - lastColorAuditMs >= 250L) {
+                    lastColorAuditMs = auditNow
+                    val owner = when {
+                        liveWb != null -> "EXPLICIT_LIVE"
+                        autoPair != null -> "TEMPORAL_AUTO"
+                        exactFramePair != null -> "EXACT_TIMESTAMP"
+                        else -> "CONFIG_FALLBACK"
+                    }
+                    Log.i(TAG, "RAW_PREVIEW_COLOR_OWNER generation=${request.config.pipelineGeneration} " +
+                        "ageMs=${auditNow-colorAuditStartedMs} owner=$owner bootstrap=${request.config.isBootstrap} " +
+                        "timestamp=${request.sensorTimestampNs} sensor=${request.config.calibrationSensorId} " +
+                        "wb=${(liveWb ?: autoPair?.wbGains ?: exactFramePair?.wbGains ?: request.config.wbGains).contentToString()} " +
+                        "ccm=${(liveColorPair?.colorMatrix ?: autoPair?.colorMatrix ?: exactFramePair?.colorMatrix ?: request.config.colorMatrix).contentToString()}")
+                }
                 ResolvedColors(
                     renderWb = (liveWb ?: autoPair?.wbGains ?: exactFramePair?.wbGains ?: request.config.wbGains).copyOf(),
                     renderMatrix = (liveColorPair?.colorMatrix ?: autoPair?.colorMatrix ?: exactFramePair?.colorMatrix ?: request.config.colorMatrix).copyOf(),
@@ -1885,15 +1929,8 @@ class RawPreviewRenderer(
     )
 
     private fun requeueWaitingForMetadata(request: Request) {
-        val newer = synchronized(pendingRequestLock) {
-            val current = pendingRequest
-            if (!closed && current == null) pendingRequest = request
-            current
-        }
-        if (newer != null || closed) {
-            retireQueuedRequest(request, if (closed) RawPreviewDropReason.PREVIEW_DROP_RENDERER_CLOSING
-                else RawPreviewDropReason.PREVIEW_DROP_REPLACED_BY_NEWER, "metadata_wait_replaced")
-        } else scheduleDrain(2L)
+        enqueuePendingRequest(request)
+        if (hasPendingRequest()) scheduleDrain(2L)
     }
 
     private fun resolveCalibration(request: Request): ResolvedCalibration {
@@ -1969,7 +2006,8 @@ class RawPreviewRenderer(
         const val RGBA_BYTES_PER_PIXEL = 4
         const val OUTPUT_SLOT_COUNT = 3
         const val MAX_QUARANTINED_GPU_BACKINGS_PER_SLOT = 2
-        const val MAX_PENDING_REQUESTS = 1
+        const val MAX_PENDING_REQUESTS = 4
+        const val COLOR_PAIR_MAX_WAIT_NS = 150_000_000L
         const val METADATA_PAIR_GRACE_NS = 20_000_000L
         const val MAX_OUTPUT_BYTES = PREVIEW_MAX_WIDTH * PREVIEW_MAX_HEIGHT * RGBA_BYTES_PER_PIXEL
         const val MAX_ANALYSIS_NV21_BYTES = ((PREVIEW_MAX_WIDTH / 4) * (PREVIEW_MAX_HEIGHT / 4) * 3) / 2

@@ -479,9 +479,9 @@ SpectraResidentDemosaicResult VulkanSpectraResidentDemosaicBackend::executeInter
     const auto totalStart = Clock::now();
     // Phase 3 hard boundary: legacy Neural-JDD/RCD is a retired denoiser. Even a stale/direct
     // backend caller cannot re-enable it; slot 3 is reconstructed with deterministic Malvar.
-    const bool retiredNeuralJddRequested =
-            request.algorithm == SpectraGpuDemosaicAlgorithm::NEURAL_JDD;
-    const SpectraGpuDemosaicAlgorithm effectiveAlgorithm = retiredNeuralJddRequested
+    const bool retiredBncNeuralRequested =
+            request.algorithm == SpectraGpuDemosaicAlgorithm::BNC_NEURAL;
+    const SpectraGpuDemosaicAlgorithm effectiveAlgorithm = retiredBncNeuralRequested
             ? SpectraGpuDemosaicAlgorithm::MALVAR_2004
             : request.algorithm;
     if (effectiveAlgorithm == SpectraGpuDemosaicAlgorithm::MENON_2007) {
@@ -720,7 +720,7 @@ SpectraResidentDemosaicResult VulkanSpectraResidentDemosaicBackend::executeInter
             malvarPrior = amazePrior = 0.5f;
         }
         // ccm[0..2] are unused by demosaic modes and map to GLSL ccm0..ccm2.
-        // Slot 1 is intentionally zero: retired Neural JDD has no Auto-Hybrid authority.
+        // Slot 1 is intentionally zero: retired BnC Neural has no Auto-Hybrid authority.
         push.ccm[0] = malvarPrior;
         push.ccm[1] = 0.0f;
         push.ccm[2] = amazePrior;
@@ -729,7 +729,7 @@ SpectraResidentDemosaicResult VulkanSpectraResidentDemosaicBackend::executeInter
         case SpectraGpuDemosaicAlgorithm::BILINEAR:
             push.mode = 0u;
             break;
-        case SpectraGpuDemosaicAlgorithm::NEURAL_JDD:
+        case SpectraGpuDemosaicAlgorithm::BNC_NEURAL:
             // Phase 4 safety: legacy direct requests cannot regain denoise pixel authority.
             push.mode = 1u;
             break;
@@ -903,19 +903,19 @@ SpectraResidentDemosaicResult VulkanSpectraResidentDemosaicBackend::executeInter
     result.residentDemosaicGeneration = residentDemosaicGeneration_;
     const char* algorithmStatus = effectiveAlgorithm == SpectraGpuDemosaicAlgorithm::BILINEAR
             ? "BILINEAR"
-            : (effectiveAlgorithm == SpectraGpuDemosaicAlgorithm::NEURAL_JDD
-                    ? "NEURAL_JDD"
+            : (effectiveAlgorithm == SpectraGpuDemosaicAlgorithm::BNC_NEURAL
+                    ? "BNC_NEURAL"
                     : (effectiveAlgorithm == SpectraGpuDemosaicAlgorithm::AMAZE
                             ? "AMAZE"
                             : (effectiveAlgorithm == SpectraGpuDemosaicAlgorithm::AUTO_HYBRID
                                     ? "AUTO_HYBRID"
                                     : "MALVAR_2004")));
-    result.status = retiredNeuralJddRequested
-            ? "GPU_PRIMARY_MALVAR_2004_LEGACY_NEURAL_JDD_RETIRED"
+    result.status = retiredBncNeuralRequested
+            ? "GPU_PRIMARY_MALVAR_2004_BNC_NEURAL_FALLBACK"
             : std::string(residentInput ? "GPU_RESIDENT_INPUT_PRIMARY_" : "GPU_PRIMARY_") +
                     algorithmStatus;
-    result.failureReason = retiredNeuralJddRequested
-            ? "NEURAL_JDD_RETIRED_NEURAL_DENOISE_IS_SOLE_NOISE_PIXEL_OWNER"
+    result.failureReason = retiredBncNeuralRequested
+            ? "BNC_NEURAL_BACKEND_UNAVAILABLE"
             : "none";
     result.totalMs = elapsedMs(totalStart);
     return result;
@@ -1026,6 +1026,13 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
             sourceClipConfidenceHeight_ == expectedClipHeight &&
             sourceClipConfidence_.buffer != VK_NULL_HANDLE &&
             sourceClipConfidence_.capacityBytes >= expectedClipBytes;
+    // Never infer sensor clipping from demosaic overshoot or lens-shading gains.
+    // A failed resident source handoff must use the CPU's original-source evidence.
+    if (request.neutralDefaultRaw && !sourceClipConfidenceReady) {
+        result.status = "DEFAULT_RAW_SOURCE_CONFIDENCE_REQUIRED";
+        result.failureReason = "source_confidence_unavailable_use_cpu_reference";
+        return result;
+    }
     bool reallocated = false;
     const std::uint32_t writeAccess = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
     const std::uint32_t readAccess = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
@@ -1211,6 +1218,7 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
     push.frameWidth = request.frameWidth;
     push.frameHeight = request.frameHeight;
     push.mode = 3u;
+    push.padding1 = request.neutralDefaultRaw ? 1u : 0u;
     push.wbR = request.wbRgb[0];
     push.wbG = request.wbRgb[1];
     push.wbB = request.wbRgb[2];
@@ -1426,6 +1434,9 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
     result.phase9SceneLinearOverUnityPixels = phase9[9];
     result.phase9FullySensorClippedPixels = phase9[10];
     result.phase9PartialColorConfidencePixels = phase9[11];
+    float defaultRawMaxColorLoss = 0.0f;
+    std::memcpy(&defaultRawMaxColorLoss, &phase9[17], sizeof(float));
+    result.defaultRawMinColorConfidence = 1.0f - defaultRawMaxColorLoss;
     result.phase9SourceRawConfidenceCandidatePixels = phase9[12];
     result.phase9SourceRawZeroConfidencePixels = phase9[13];
     result.phase9SourceRawPartialConfidencePixels = phase9[14];
