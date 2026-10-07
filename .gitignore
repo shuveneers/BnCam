@@ -2,6 +2,9 @@
 .gradle/
 build/
 
+# Validation
+/work/
+
 # Local configuration file (sdk path, etc)
 local.properties
 
