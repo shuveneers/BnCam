@@ -224,7 +224,8 @@ class ShotLogger(
         logIsp: Boolean = true,
         logWarnings: Boolean = true,
         logFrameAnalysis: Boolean = true,
-        logVendorInjection: Boolean = true
+        logVendorInjection: Boolean = true,
+        captureId: String? = null
     ) {
         cleanupTerminalStateDirectories()
         val timeStamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
@@ -259,7 +260,7 @@ class ShotLogger(
         lastVulkanExport = null
         activeAttemptId = null
         activeAttemptState = null
-        currentCaptureLabel = folderName
+        currentCaptureLabel = captureId?.takeIf { it.isNotBlank() } ?: folderName
         currentPublicFolderName = folderName
         lastLogSummary = logSummary
         lastLogActiveMode = logCapture

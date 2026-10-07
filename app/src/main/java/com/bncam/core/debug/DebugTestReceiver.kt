@@ -74,6 +74,24 @@ class DebugTestReceiver : BroadcastReceiver() {
                     val activeLens = repo.activeLensIdFlow.first() ?: "0"
                     val lensId = intent.getStringExtra("lens_id") ?: activeLens
                     val stableKey = StableLensKey.fromString(lensId)
+                    if (com.bncam.BuildConfig.DEBUG) {
+                        if (intent.hasExtra("shot_logger")) repo.setEnableShotLogger(intent.getBooleanExtra("shot_logger", false))
+                        if (intent.hasExtra("demosaic")) {
+                            val method = intent.getIntExtra("demosaic", 0)
+                            require(method in 0..2)
+                            val profileId = if (intent.getBooleanExtra("switch_lens", false)) "${lensId}_profile_1"
+                                else repo.activeProfileIdFlow.first() ?: "${lensId}_disabled"
+                            repo.setProfileStringOverride(profileId, "demosaic_mode", method.toString())
+                        }
+                        intent.getStringExtra("output_policy")?.let {
+                            repo.setOutputPolicy(com.bncam.core.capture.OutputPolicy.valueOf(it))
+                        }
+                        intent.getStringExtra("flash_mode")?.let { repo.setFlashMode(it) }
+                        if (intent.getBooleanExtra("switch_lens", false)) {
+                            repo.setActiveLensAndProfile(lensId, "${lensId}_profile_1")
+                            frameSource?.let { repo.setProfileFrameSource("${lensId}_profile_1", it.uppercase()) }
+                        }
+                    }
 
                     val meteringStyle = intent.getStringExtra("metering_style")
                     if (meteringStyle != null) {
@@ -121,12 +139,9 @@ class DebugTestReceiver : BroadcastReceiver() {
                     }
                     if (frameSource != null) {
                         val normSource = frameSource.uppercase()
-                        for (l in 0..3) {
-                            repo.setProfileFrameSource("${l}_disabled", normSource)
-                            for (p in 1..12) {
-                                repo.setProfileFrameSource("${l}_profile_$p", normSource)
-                            }
-                        }
+                        val profileId = if (intent.getBooleanExtra("switch_lens", false)) "${lensId}_profile_1"
+                            else repo.activeProfileIdFlow.first() ?: "${lensId}_disabled"
+                        repo.setProfileFrameSource(profileId, normSource)
                     }
                     val vfStream = intent.getStringExtra("viewfinder_stream")
                     if (vfStream != null) {

@@ -90,6 +90,10 @@ enum class DngSource {
  * re-resolve captured settings from DataStore.
  */
 class CaptureRecipe private constructor(
+    val captureId: String,
+    val displayRotation: Int,
+    val afStateAtShutter: Int?,
+    val aeStateAtShutter: Int?,
     val schemaVersion: Int,
     val applicationVersion: String,
     val activeProfileIdentifier: String,
@@ -128,6 +132,7 @@ class CaptureRecipe private constructor(
     val executionSettings: CaptureExecutionSettings
 ) {
     init {
+        require(captureId.isNotBlank())
         require(schemaVersion > 0)
         require(activeProfileIdentifier.isNotBlank())
         require(profileVersionHash.isNotBlank())
@@ -139,6 +144,10 @@ class CaptureRecipe private constructor(
 
     fun toJson(): String = StableJson.encode(
         linkedMapOf(
+            "captureId" to captureId,
+            "displayRotation" to displayRotation,
+            "afStateAtShutter" to afStateAtShutter,
+            "aeStateAtShutter" to aeStateAtShutter,
             "schemaVersion" to schemaVersion,
             "applicationVersion" to applicationVersion,
             "activeProfileIdentifier" to activeProfileIdentifier,
@@ -309,9 +318,13 @@ class CaptureRecipe private constructor(
     )
 
     companion object {
-        const val CURRENT_SCHEMA_VERSION = 3
+        const val CURRENT_SCHEMA_VERSION = 4
 
         fun create(input: CaptureRecipeInput): CaptureRecipe = CaptureRecipe(
+            captureId = input.captureId,
+            displayRotation = input.displayRotation,
+            afStateAtShutter = input.afStateAtShutter,
+            aeStateAtShutter = input.aeStateAtShutter,
             schemaVersion = CURRENT_SCHEMA_VERSION,
             applicationVersion = input.applicationVersion,
             activeProfileIdentifier = input.activeProfileIdentifier,
@@ -346,13 +359,17 @@ class CaptureRecipe private constructor(
             hardwareOverrideFingerprint = input.hardwareOverrideFingerprint,
             thermalState = input.thermalState,
             captureTimestampEpochMs = input.captureTimestampEpochMs,
-            capabilityResolutions = input.capabilityResolutions.toList(),
+            capabilityResolutions = input.capabilityResolutions.immutableList(),
             executionSettings = input.executionSettings.frozenCopy()
         )
     }
 }
 
 data class CaptureRecipeInput(
+    val captureId: String = CaptureIds.newId(),
+    val displayRotation: Int = 0,
+    val afStateAtShutter: Int? = null,
+    val aeStateAtShutter: Int? = null,
     val applicationVersion: String,
     val activeProfileIdentifier: String,
     val profileVersionHash: String,
@@ -410,23 +427,23 @@ private fun MethodResolution.asJsonMap(): Map<String, Any?> = linkedMapOf(
 
 private fun CaptureExecutionSettings.frozenCopy(): CaptureExecutionSettings {
     val frozenLens = lensHardwareSettings.copy(
-        warnings = lensHardwareSettings.warnings.toList(),
-        noiseA = lensHardwareSettings.noiseA.toList(),
-        noiseB = lensHardwareSettings.noiseB.toList(),
-        noiseC = lensHardwareSettings.noiseC.toList(),
-        noiseD = lensHardwareSettings.noiseD.toList(),
-        manualBlackLevels = lensHardwareSettings.manualBlackLevels.toList(),
-        manualColorMatrix = lensHardwareSettings.manualColorMatrix.toList()
+        warnings = lensHardwareSettings.warnings.immutableList(),
+        noiseA = lensHardwareSettings.noiseA.immutableList(),
+        noiseB = lensHardwareSettings.noiseB.immutableList(),
+        noiseC = lensHardwareSettings.noiseC.immutableList(),
+        noiseD = lensHardwareSettings.noiseD.immutableList(),
+        manualBlackLevels = lensHardwareSettings.manualBlackLevels.immutableList(),
+        manualColorMatrix = lensHardwareSettings.manualColorMatrix.immutableList()
     )
     val frozenRender = renderPreferences.copy(
         resolvedIspSettings = renderPreferences.resolvedIspSettings.copy(
-            activeSettings = renderPreferences.resolvedIspSettings.activeSettings.toList(),
-            hiddenSettings = renderPreferences.resolvedIspSettings.hiddenSettings.toList()
+            activeSettings = renderPreferences.resolvedIspSettings.activeSettings.immutableList(),
+            hiddenSettings = renderPreferences.resolvedIspSettings.hiddenSettings.immutableList()
         ),
         curves = renderPreferences.curves.copy(
-            toneNodes = renderPreferences.curves.toneNodes.toList(),
-            gammaNodes = renderPreferences.curves.gammaNodes.toList(),
-            sectionNodes = renderPreferences.curves.sectionNodes.toList()
+            toneNodes = renderPreferences.curves.toneNodes.immutableList(),
+            gammaNodes = renderPreferences.curves.gammaNodes.immutableList(),
+            sectionNodes = renderPreferences.curves.sectionNodes.immutableList()
         )
     )
     return copy(
@@ -504,3 +521,6 @@ private fun stablePrivateValueHash(value: String): String {
         .take(8)
         .joinToString("") { "%02x".format(it) }
 }
+
+private fun <T> Collection<T>.immutableList(): List<T> =
+    java.util.Collections.unmodifiableList(ArrayList(this))

@@ -547,7 +547,11 @@ class SingleFrameRunner(
             "SingleFrameRunner requires a valid non-zero userShutterTimestampNs from actual shutter press."
         }
 
-        val performanceTracker = CapturePerformanceTracker("SINGLE_FRAME_${formatLabel(activeZslFormat)}")
+        val performanceTracker = CapturePerformanceTracker("SINGLE_FRAME_${formatLabel(activeZslFormat)}", recipe.captureId)
+        performanceTracker.attachRecipe(recipe)
+        performanceTracker.setMetric("captureId", recipe.captureId)
+        performanceTracker.setMetric("output.displayRotation", recipe.displayRotation)
+        performanceTracker.setMetric("shutter.elapsedRealtimeNs", userShutterTimestampNs)
         performanceTracker.setMetric("thermalStatusAtShutter", recipe.thermalState)
         performanceTracker.sampleSystemState(context, "processing_start")
         performanceTracker.setMetric("captureMode", "SINGLE")
@@ -558,7 +562,7 @@ class SingleFrameRunner(
         performanceTracker.setMetric("portraitMaskAvailableAtShutter", portraitCaptureContext.available)
         performanceTracker.setMetric("portraitMaskStatus", portraitCaptureContext.status)
         val captureDispatchLatencyMs =
-            ((android.os.SystemClock.elapsedRealtimeNanos() - shutterTimestampNs).coerceAtLeast(0L) / 1_000_000.0)
+            ((android.os.SystemClock.elapsedRealtimeNanos() - userShutterTimestampNs).coerceAtLeast(0L) / 1_000_000.0)
         val expectedCollectionGeneration = ringBuffer.currentGeneration()
         val candidateCollectionResult = ShutterCandidateCollector(ringBuffer).collect(
             shutterTimestampNs = shutterTimestampNs,
@@ -576,6 +580,7 @@ class SingleFrameRunner(
         val capturedSettings = recipe.executionSettings
         val activeBufferFormatLabel = formatLabel(activeZslFormat)
 
+        val processingStartNs = System.nanoTime()
         val startTimeMs = System.currentTimeMillis()
         val isoFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
         val startedAtStr = isoFormat.format(Date(startTimeMs))
@@ -598,7 +603,7 @@ class SingleFrameRunner(
                             sensorTimestampComparableToElapsedRealtime)
         val lensHardwareSettings = capturedSettings.lensHardwareSettings
         val nativeLensHardwarePushed = ImageUtils.updateHardwareConfigNative(lensHardwareSettings)
-        val finalJpegRotation = getJpegOrientation(chars, deviceRotation)
+        val finalJpegRotation = getJpegOrientation(chars, recipe.displayRotation)
         val isFrontCamera = chars.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_FRONT
 
         val mirrorFront = capturedSettings.output.mirrorFrontPreview
@@ -627,7 +632,7 @@ class SingleFrameRunner(
         val exifSaveSignature = capturedSettings.output.exifSaveSignature
         val exifExtraData = capturedSettings.output.exifExtraData
 
-        val attemptId = "${activeLens.id}-$shutterTimestampNs"
+        val attemptId = recipe.captureId
         val singleFeatureName = when {
             portraitCaptureContext.requested -> "Portrait"
             recipe.computationalHdrRequested -> "CompHDR"
@@ -635,7 +640,8 @@ class SingleFrameRunner(
         }
         performanceTracker.setMetric("actualRunner", "SingleFrameRunner")
         performanceTracker.setMetric("computationalHdrResolutionReason", recipe.computationalHdrResolutionReason)
-        val shotId = if (enableShotLogger) {
+        val shotId = recipe.captureId
+        if (enableShotLogger) {
             shotLogger.startNewShot(
                 sensorName = activeLens.name.substringBefore(" "),
                 modeName = "SingleFrame",
@@ -646,7 +652,8 @@ class SingleFrameRunner(
                 logIsp = logPipelineDebug,
                 logWarnings = logWarnings,
                 logFrameAnalysis = logFrameAnalysis,
-                logVendorInjection = logVendorInjection
+                logVendorInjection = logVendorInjection,
+                captureId = recipe.captureId
             )
             shotLogger.writeTextFile("capture_recipe.json", recipe.toJson())
             shotLogger.writeInitialStatus(attemptId, "SHUTTER_DISPATCH")
@@ -660,12 +667,9 @@ class SingleFrameRunner(
                 )
                 throw testException
             }
-            shotLogger.getShotDir()?.name ?: "Unknown_Shot_ID"
-        } else {
-            "Unknown_Shot_ID"
         }
         val captureTrace =
-            com.bncam.core.tracing.CaptureTraceRecorder(recipe = recipe, captureId = shotId)
+            com.bncam.core.tracing.CaptureTraceRecorder(recipe = recipe, captureId = recipe.captureId)
 
         if (enableShotLogger) {
             shotLogger.recordPipelineEvent("Camera2 Control Policy", "meteringPlan", meteringPolicySummary)
@@ -1711,6 +1715,31 @@ class SingleFrameRunner(
             provenance = anchorFrame.requestProvenance
         )
         val selectedRequestSnapshot = selectedFrameProvenanceProof.snapshot
+        // Requested controls are from this frame's request; effective controls are from its result.
+        performanceTracker.setMetric("source.imageTimestampNs", selectedImageTimestampNs)
+        performanceTracker.setMetric("source.frameNumber", captureMetadata?.frameNumber ?: "unavailable")
+        performanceTracker.setMetric("source.requestCaptureId", anchorFrame.requestProvenance?.captureId ?: "UNASSIGNED_TO_SHUTTER")
+        performanceTracker.setMetric("source.request", selectedRequestSnapshot?.diagnosticSummary() ?: "UNPROVEN")
+        performanceTracker.setMetric("exposure.requestedAeMode", selectedRequestSnapshot?.state?.aeMode ?: "unavailable")
+        performanceTracker.setMetric("exposure.requestedAeLock", selectedRequestSnapshot?.state?.aeLock ?: "unavailable")
+        performanceTracker.setMetric("exposure.requestedCompensation", selectedRequestSnapshot?.state?.aeExposureCompensation ?: "unavailable")
+        performanceTracker.setMetric("exposure.requestedShutterNs", selectedRequestSnapshot?.state?.sensorExposureTimeNs ?: "AUTO")
+        performanceTracker.setMetric("exposure.requestedIso", selectedRequestSnapshot?.state?.sensorSensitivityIso ?: "AUTO")
+        performanceTracker.setMetric("exposure.requestedFpsLower", selectedRequestSnapshot?.state?.aeTargetFpsLower ?: "unavailable")
+        performanceTracker.setMetric("exposure.requestedFpsUpper", selectedRequestSnapshot?.state?.aeTargetFpsUpper ?: "unavailable")
+        performanceTracker.setMetric("focus.requestedMode", selectedRequestSnapshot?.state?.afMode ?: "unavailable")
+        performanceTracker.setMetric("focus.requestedTrigger", selectedRequestSnapshot?.state?.afTrigger ?: "unavailable")
+        performanceTracker.setMetric("focus.ownerAtShutter", focusCaptureContext.owner.name)
+        performanceTracker.setMetric("focus.afStateAtShutter", recipe.afStateAtShutter ?: "unavailable")
+        performanceTracker.setMetric("exposure.aeStateAtShutter", recipe.aeStateAtShutter ?: "unavailable")
+        performanceTracker.setMetric("output.rotationDegrees", finalJpegRotation)
+        performanceTracker.setMetric("exposure.effectiveShutterNs", rawAuthorityCaptureResult?.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: "unavailable")
+        performanceTracker.setMetric("exposure.effectiveIso", rawAuthorityCaptureResult?.get(CaptureResult.SENSOR_SENSITIVITY) ?: "unavailable")
+        performanceTracker.setMetric("exposure.effectiveFrameDurationNs", rawAuthorityCaptureResult?.get(CaptureResult.SENSOR_FRAME_DURATION) ?: "unavailable")
+        performanceTracker.setMetric("exposure.effectiveAeState", rawAuthorityCaptureResult?.get(CaptureResult.CONTROL_AE_STATE) ?: "unavailable")
+        performanceTracker.setMetric("focus.effectiveAfState", rawAuthorityCaptureResult?.get(CaptureResult.CONTROL_AF_STATE) ?: "unavailable")
+        performanceTracker.setMetric("focus.effectiveDistanceDiopters", rawAuthorityCaptureResult?.get(CaptureResult.LENS_FOCUS_DISTANCE) ?: "unavailable")
+
 
         val scoredCandidates = selectionResult.ranked.map { selectionScore ->
             val cand = selectionScore.candidate
@@ -2075,6 +2104,9 @@ class SingleFrameRunner(
             0.0
         }
         acquiredRawInputForCleanup = acquiredRawInput
+        if (acquiredRawInput != null) {
+            com.bncam.core.debug.SingleFrameReplayExport.exportIfRequested(context, acquiredRawInput, recipe)
+        }
         if (enableShotLogger && acquiredRawInput != null) {
             acquiredRawInput.rawFrameInfo.whiteAuthorityDebugPairs().forEach { (key, value) ->
                 shotLogger.recordPipelineEvent("White Level Authority", key, value)
@@ -2102,6 +2134,7 @@ class SingleFrameRunner(
         if (isRawFrameSource) {
             performanceTracker.mark("raw_unpack_time")
             performanceTracker.recordDuration("raw_materialization", rawUnpackMs)
+            performanceTracker.setMetric("raw.domainContract", acquiredRawInput?.rawFrameInfo?.dump() ?: "unavailable")
             performanceTracker.setMetric("immutableRaw16ByteCount", acquiredRawInput?.raw16ByteCount ?: 0)
             performanceTracker.setMetric("raw16NativeOwner", "NativeRaw16Buffer")
             performanceTracker.setMetric("raw16OwnershipContract", "NATIVE_DIRECT_BUFFER_V1")
@@ -2238,6 +2271,8 @@ class SingleFrameRunner(
                     }
                     performanceTracker.setMetric("rawOnlyRgbIspExecuted", false)
                     performanceTracker.setMetric("rawOnlyJpegEncoded", false)
+                    performanceTracker.setMetric("output.dngWidth", rawInput.width)
+                    performanceTracker.setMetric("output.dngHeight", rawInput.height)
                     performanceTracker.setMetric("rawOnlyHiddenJpegCreated", false)
                     captureTrace.record(
                         com.bncam.core.tracing.CaptureTraceSection.ISP_EXECUTION,
@@ -2417,7 +2452,7 @@ class SingleFrameRunner(
             var dngWriteTimeMs = 0L
             var nativeRawOwnerTransferredToSaveQueue = false
             try {
-            val renderStartMs = System.currentTimeMillis()
+            val renderStartNs = System.nanoTime()
             stageListener.nativeProcessingStart()
             try {
                 if (activeZslFormat == ImageFormat.RAW10 || activeZslFormat == ImageFormat.RAW_SENSOR) {
@@ -2430,7 +2465,8 @@ class SingleFrameRunner(
                         masterFrame = rawInput,
                         qualityConfig = renderQualityConfig,
                         rotationDegrees = finalJpegRotation,
-                        portraitCaptureContext = portraitCaptureContext
+                        portraitCaptureContext = portraitCaptureContext,
+                        captureId = recipe.captureId
                     )
                     } else null
                     ultraHdrGainmapArtifact = jpegResult?.ultraHdrGainmap
@@ -2674,7 +2710,7 @@ class SingleFrameRunner(
             } finally {
                 // RAW handed ownership to immutable RAW16 during acquisition. YUV still owns the
                 // selected HardwareBuffer until its native render has consumed it.
-                renderTimeMs = System.currentTimeMillis() - renderStartMs
+                renderTimeMs = (System.nanoTime() - renderStartNs) / 1_000_000L
                 performanceTracker.mark("jpeg_render")
                 stageListener.nativeProcessingEnd(finalJpegBytes?.isNotEmpty() == true)
             }
@@ -2877,7 +2913,7 @@ class SingleFrameRunner(
             val saveBlock: suspend () -> Unit = {
             try {
             // Exif writing and saving to pre-inserted Uri
-            val saveStartMs = System.currentTimeMillis()
+            val saveStartNs = System.nanoTime()
             var bytesToSave = finalJpegBytes
             if (isFrontCamera && mirrorFront && bytesToSave != null && bytesToSave.isNotEmpty()) {
                 try {
@@ -3140,7 +3176,7 @@ class SingleFrameRunner(
                     Log.w(tag, "Failed to remove empty JPEG uri=$jpegPublicUri", cleanupError)
                 }
             }
-            val saveTimeMs = System.currentTimeMillis() - saveStartMs
+            val saveTimeMs = (System.nanoTime() - saveStartNs) / 1_000_000L
             performanceTracker.mark("jpeg_save")
 
             val raw16ForDngSave = if (plan.outputPolicy.producesRaw) {
@@ -3207,7 +3243,7 @@ class SingleFrameRunner(
                     "raw_export_time=$dngWriteTimeMs total_until_file_saved=${String.format(Locale.US, "%.3f", performanceTracker.elapsedMs())}"
             )
 
-            val totalProcessingTimeMs = System.currentTimeMillis() - startTimeMs
+            val totalProcessingTimeMs = (System.nanoTime() - processingStartNs) / 1_000_000L
             performanceTracker.mark("complete")
             val jpegPublished = saveSucceeded && mediaStorePendingCleared
             val dngPublished = dngPublicUri != null
@@ -3846,6 +3882,22 @@ class SingleFrameRunner(
                             "jpegFailure=${jpegSaveFailure?.message ?: "not published"}; dngFailure=$dngFailureReason",
                     jpegSaveFailure
                 )
+            }
+            performanceTracker.setMetric("output.jpegPublished", jpegPublished)
+            performanceTracker.setMetric("output.dngPublished", dngPublished)
+            performanceTracker.setMetric("output.jpegByteCount", bytesToSave?.size ?: 0)
+            performanceTracker.setMetric("output.dngByteCount", dngBytesSize)
+            performanceTracker.setMetric("source.width", frameWidth)
+            performanceTracker.setMetric("source.height", frameHeight)
+            if (jpegPublished && bytesToSave != null) {
+                val encodedBounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                BitmapFactory.decodeByteArray(bytesToSave, 0, bytesToSave.size, encodedBounds)
+                performanceTracker.setMetric("output.jpegWidth", encodedBounds.outWidth)
+                performanceTracker.setMetric("output.jpegHeight", encodedBounds.outHeight)
+            }
+            if (dngPublished) {
+                performanceTracker.setMetric("output.dngWidth", acquiredRawInput?.width ?: "unavailable")
+                performanceTracker.setMetric("output.dngHeight", acquiredRawInput?.height ?: "unavailable")
             }
             val stringOutputs = com.bncam.core.output.PublicationPolicyResolver.resolveStrings(
                 outputPolicy = plan.outputPolicy,

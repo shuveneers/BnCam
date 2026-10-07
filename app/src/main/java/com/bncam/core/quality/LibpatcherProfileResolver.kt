@@ -73,9 +73,12 @@ data class ResolvedIspSettings(
     val activeSettings: List<ResolvedLibpatcherSetting>,
     val hiddenSettings: List<HiddenLibpatcherSetting>
 ) {
-    val commonRenderSettings: List<ResolvedLibpatcherSetting> = activeSettings.filter { it.runtimeScope == LibpatcherRuntimeScope.COMMON_RENDER }
-    val rawDemosaicSettings: List<ResolvedLibpatcherSetting> = activeSettings.filter { it.runtimeScope == LibpatcherRuntimeScope.RAW_DEMOSAIC }
-    val outputEncodeSettings: List<ResolvedLibpatcherSetting> = activeSettings.filter { it.runtimeScope == LibpatcherRuntimeScope.OUTPUT_ENCODE }
+    val commonRenderSettings: List<ResolvedLibpatcherSetting> =
+        java.util.Collections.unmodifiableList(activeSettings.filter { it.runtimeScope == LibpatcherRuntimeScope.COMMON_RENDER })
+    val rawDemosaicSettings: List<ResolvedLibpatcherSetting> =
+        java.util.Collections.unmodifiableList(activeSettings.filter { it.runtimeScope == LibpatcherRuntimeScope.RAW_DEMOSAIC })
+    val outputEncodeSettings: List<ResolvedLibpatcherSetting> =
+        java.util.Collections.unmodifiableList(activeSettings.filter { it.runtimeScope == LibpatcherRuntimeScope.OUTPUT_ENCODE })
 
     val activeCommonRenderCount: Int = commonRenderSettings.count { it.active }
     val activeOutputEncodeCount: Int = outputEncodeSettings.count { it.active }

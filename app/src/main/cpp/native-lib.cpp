@@ -35,6 +35,7 @@
 #include "ultrahdr/UltraHdrJpegPackager.h"
 #include "JpegEncodingPolicy.h"
 #include "Demosaic.h"
+#include "SingleFrameRawReplayValidation.h"
 #include "NeutralYuvToneMapper.h"
 #include "YuvSignalDiagnostics.h"
 #include "RawPreview.h"
@@ -3163,6 +3164,7 @@ Java_com_bncam_core_engine_ImageUtils_getLastMasterIspStatsNative(JNIEnv *env, j
 extern "C"
 JNIEXPORT jstring JNICALL
 Java_com_bncam_core_engine_ImageUtils_validateDemosaicNative(JNIEnv *env, jobject /* thiz */) {
+    const std::string replay = validateSingleFrameRawReplay();
     const DemosaicValidationResult bilinear = validateBilinearImplementation();
     const DemosaicValidationResult malvar = validateMalvar2004Implementation();
     const DemosaicValidationResult rcd = validateRcdInspiredImplementation();
@@ -3275,7 +3277,7 @@ Java_com_bncam_core_engine_ImageUtils_validateDemosaicNative(JNIEnv *env, jobjec
             autoFineDetail.algorithm == DemosaicAlgorithm::Amaze &&
             autoNoisy.algorithm == DemosaicAlgorithm::Malvar2004;
     std::ostringstream result;
-    result << "bilinearReference{" << bilinear.details << "}"
+    result << replay << ";bilinearReference{" << bilinear.details << "}"
            << ";malvar{" << malvar.details << "}"
            << ";rcd{" << rcd.details << "}"
            << ";amaze{" << amaze.details << "}"
@@ -3294,7 +3296,7 @@ Java_com_bncam_core_engine_ImageUtils_validateDemosaicNative(JNIEnv *env, jobjec
            << ";allPassed="
            << (bilinear.passed && malvar.passed && rcd.passed && amaze.passed && menon.passed && cfaShiftPassed &&
                legacySlot3FallsBackMalvar && normalForcesMalvar && legacySlot2ForcesAmaze &&
-               autoResolverPassed
+               autoResolverPassed && replay.find("replayPassed=true") != std::string::npos
                ? "true" : "false");
     return env->NewStringUTF(result.str().c_str());
 }
@@ -3324,6 +3326,7 @@ JNIEXPORT jbyteArray JNICALL
 Java_com_bncam_core_engine_ImageUtils_renderJpegFromMasterNative(
         JNIEnv *env,
         jclass clazz,
+        jstring captureIdString,
         jstring lensIdStr,
         jobject raw16DirectBuffer,
         jint width,
@@ -3528,6 +3531,8 @@ Java_com_bncam_core_engine_ImageUtils_renderJpegFromMasterNative(
     }
 
     IspFrameMetadata meta;
+    const std::string canonicalCaptureId = getJniString(env, captureIdString, "");
+    if (!canonicalCaptureId.empty()) meta.captureAttemptId = canonicalCaptureId;
     meta.singleShotRaw = routeLabel == "JPEG_WORKING_LINEAR_RAW_FROM_RAW10_SINGLE" ||
             routeLabel == "JPEG_WORKING_LINEAR_RAW_FROM_RAW_SENSOR_SINGLE";
     meta.phoneAssistanceSensorsEnabled = (phoneAssistanceSensorsEnabled == JNI_TRUE);

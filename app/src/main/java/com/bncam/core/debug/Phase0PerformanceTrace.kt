@@ -437,14 +437,16 @@ object Phase0PerformanceTrace {
         val context = appContext ?: return
         runCatching {
             val directory = File(context.filesDir, EVIDENCE_DIR)
-            if (!directory.exists() && !directory.mkdirs() && !directory.isDirectory) return@runCatching
+            check(directory.isDirectory || directory.mkdirs()) { "Cannot create performance evidence directory" }
             val file = File(directory, fileName)
             if (file.exists() && file.length() >= MAX_EVIDENCE_BYTES) {
                 val previous = File(directory, "$fileName.1")
-                if (previous.exists()) previous.delete()
-                file.renameTo(previous)
+                check(!previous.exists() || previous.delete()) { "Cannot retire performance evidence archive" }
+                check(file.renameTo(previous)) { "Cannot rotate performance evidence" }
             }
             file.appendText(report + "\n", Charsets.UTF_8)
+        }.onFailure { failure ->
+            android.util.Log.e("BnCamPerformance", "Unable to persist $fileName", failure)
         }
     }
 }

@@ -3,14 +3,14 @@ package com.bncam.core.isp.raw
 object RawSampleReaders {
     fun packedRaw10RowBytes(widthPixels: Int): Int {
         require(widthPixels > 0) { "widthPixels must be positive" }
-        return ((widthPixels + 3) / 4) * 5
+        return checkedSize(((widthPixels.toLong() + 3L) / 4L) * 5L, "RAW10 row")
     }
 
     fun packRaw10Rows(samples: IntArray, width: Int, height: Int, rowStrideBytes: Int = packedRaw10RowBytes(width)): ByteArray {
         require(width > 0 && height > 0) { "width and height must be positive" }
-        require(samples.size >= width * height) { "not enough samples for RAW10 frame" }
+        require(samples.size >= checkedSize(width.toLong() * height, "sample count")) { "not enough samples for RAW10 frame" }
         require(rowStrideBytes >= packedRaw10RowBytes(width)) { "rowStrideBytes is smaller than packed RAW10 row" }
-        val out = ByteArray(rowStrideBytes * height)
+        val out = ByteArray(checkedSize(rowStrideBytes.toLong() * height, "packed byte count"))
         for (y in 0 until height) {
             var x = 0
             while (x < width) {
@@ -33,8 +33,8 @@ object RawSampleReaders {
     fun unpackRaw10Rows(packed: ByteArray, width: Int, height: Int, rowStrideBytes: Int): IntArray {
         require(width > 0 && height > 0) { "width and height must be positive" }
         require(rowStrideBytes >= packedRaw10RowBytes(width)) { "rowStrideBytes is smaller than packed RAW10 row" }
-        require(packed.size >= rowStrideBytes * height) { "packed buffer is smaller than declared stride/height" }
-        val out = IntArray(width * height)
+        require(packed.size.toLong() >= (height - 1L) * rowStrideBytes + packedRaw10RowBytes(width)) { "packed buffer is smaller than declared stride/height" }
+        val out = IntArray(checkedSize(width.toLong() * height, "sample count"))
         for (y in 0 until height) {
             var x = 0
             while (x < width) {
@@ -57,10 +57,10 @@ object RawSampleReaders {
     fun readRawSensor16LittleEndian(data: ByteArray, width: Int, height: Int, rowStrideBytes: Int, pixelStrideBytes: Int): IntArray {
         require(width > 0 && height > 0) { "width and height must be positive" }
         require(pixelStrideBytes >= 2) { "RAW_SENSOR pixelStrideBytes must be at least 2" }
-        val minimumRowBytes = (width - 1) * pixelStrideBytes + 2
+        val minimumRowBytes = checkedSize((width - 1L) * pixelStrideBytes + 2L, "RAW_SENSOR row")
         require(rowStrideBytes >= minimumRowBytes) { "rowStrideBytes is smaller than RAW_SENSOR row payload" }
-        require(data.size >= rowStrideBytes * height) { "RAW_SENSOR buffer is smaller than declared stride/height" }
-        val out = IntArray(width * height)
+        require(data.size.toLong() >= (height - 1L) * rowStrideBytes + minimumRowBytes) { "RAW_SENSOR buffer is smaller than declared stride/height" }
+        val out = IntArray(checkedSize(width.toLong() * height, "sample count"))
         for (y in 0 until height) {
             val rowBase = y * rowStrideBytes
             for (x in 0 until width) {
@@ -71,6 +71,11 @@ object RawSampleReaders {
             }
         }
         return out
+    }
+
+    private fun checkedSize(value: Long, label: String): Int {
+        require(value in 1..Int.MAX_VALUE.toLong()) { "$label exceeds supported array size" }
+        return value.toInt()
     }
 
     fun cfaOriginAfterCrop(originX: Int, originY: Int, cropLeft: Int, cropTop: Int): Pair<Int, Int> {

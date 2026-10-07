@@ -8877,6 +8877,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     if (debugOut != nullptr) {
         std::ostringstream dbg;
         dbg << "RAW_BASELINE_RENDER: "
+            << "captureId=" << meta.captureAttemptId << "; "
             << "source=" << sourceName
             << "; rawBayerRouteType=" << (isRaw10 ? "RAW10" : "RAW_SENSOR")
             << "; sharedRawBayerJpegPolicyUsed=true"
@@ -10448,7 +10449,9 @@ std::string IspCore::validateNoiseModelImplementation(
     raw.info.effectiveCfaPattern = CFA_BGGR;
     raw.diagnostics.valid = true;
     raw.diagnostics.failureReason = "none";
-    raw.mosaic = cv::Mat(192, 256, CV_32FC1);
+    // The production provenance observer requires >=32 samples per tile at a 16px
+    // cadence. A 192x256 fixture yields only 16 and legitimately rejects every tile.
+    raw.mosaic = cv::Mat(768, 1024, CV_32FC1);
     for (int y = 0; y < raw.mosaic.rows; ++y) {
         float* row = raw.mosaic.ptr<float>(y);
         for (int x = 0; x < raw.mosaic.cols; ++x) {

@@ -90,7 +90,9 @@ class SpectraMilestone1SourceContractTest {
             app,
             "src/main/java/com/bncam/core/debug/CapturePerformanceTracker.kt"
         ).readText()
-        assertTrue(performance.contains("put(\"schemaVersion\", 2)"))
+        assertTrue(performance.contains("put(\"schemaVersion\", 3)"))
+        assertTrue(performance.contains("put(\"captureRecipe\""))
+        assertTrue(performance.contains("BuildConfig.GIT_REVISION"))
         assertTrue(performance.contains("sequentialStageDurationsMs"))
         assertTrue(performance.contains("explicitNestedDurationsMs"))
         assertTrue(performance.contains("EXPLICIT_DURATIONS_MAY_OVERLAP"))

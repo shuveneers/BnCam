@@ -1,0 +1,9 @@
+{
+  "width": 2,
+  "height": 3,
+  "sensorCfa": 3,
+  "origin": [0, 1],
+  "white": 4095,
+  "positionalBlack": [64, 65, 66, 67],
+  "samples": [0, 4095, 512, 2048, 66, 67]
+}

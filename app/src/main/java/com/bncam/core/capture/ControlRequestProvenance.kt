@@ -235,7 +235,8 @@ data class ControlRequestSnapshot(
 data class CameraRequestTag(
     val pipelineGeneration: Int,
     val controlRequestEpoch: Long,
-    val snapshot: ControlRequestSnapshot
+    val snapshot: ControlRequestSnapshot,
+    val captureId: String? = null
 ) {
     val identity: CameraRequestIdentity
         get() = CameraRequestIdentity(pipelineGeneration, controlRequestEpoch)
@@ -244,7 +245,8 @@ data class CameraRequestTag(
 data class FrameRequestProvenance(
     val identity: CameraRequestIdentity,
     val snapshot: ControlRequestSnapshot,
-    val associationStatus: String = "EXACT_CAPTURE_CALLBACK_REQUEST_TAG"
+    val associationStatus: String = "EXACT_CAPTURE_CALLBACK_REQUEST_TAG",
+    val captureId: String? = null
 )
 
 data class SelectedFrameProvenanceProof(
@@ -439,7 +441,8 @@ internal class ControlRequestEpochTracker(
         return CameraRequestTagResolution(
             provenance = FrameRequestProvenance(
                 identity = requestTag.identity,
-                snapshot = requestTag.snapshot
+                snapshot = requestTag.snapshot,
+                captureId = requestTag.captureId
             ),
             status = "EXACT_CAPTURE_CALLBACK_REQUEST_TAG"
         )

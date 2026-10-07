@@ -10,6 +10,20 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ControlRequestProvenanceTest {
+    @Test
+    fun captureIdentitySurvivesExactCallbackAndDoesNotChangeControlEpoch() {
+        val tracker = ControlRequestEpochTracker()
+        val prepared = prepareAndCommit(tracker, 7, ControlRequestState.create(aeMode = 1))
+        val captureId = CaptureIds.forAttempt(42)
+        val tagged = prepared.tag.copy(captureId = captureId)
+        assertEquals(prepared.tag.identity, tagged.identity)
+        val callback = tracker.resolveTag(tagged, 7)
+        assertEquals(captureId, callback.provenance?.captureId)
+        assertSame(prepared.tag.snapshot, callback.provenance?.snapshot)
+        assertNull(tracker.resolveTag(tagged, 8).provenance)
+        assertNull(tracker.resolveTag(prepared.tag, 7).provenance?.captureId)
+    }
+
 
     private fun prepareAndCommit(
         tracker: ControlRequestEpochTracker,

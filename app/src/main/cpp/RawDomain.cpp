@@ -168,8 +168,8 @@ RawNormalizedSampleView makeRawNormalizedSampleView(
     const size_t minimumStride = static_cast<size_t>(view.info.width) * sizeof(uint16_t);
     view.rowStrideBytes = view.info.masterRowStrideBytes > 0u
             ? view.info.masterRowStrideBytes : minimumStride;
-    if (view.rowStrideBytes < minimumStride) {
-        view.failureReason = "master_row_stride_smaller_than_width";
+    if (view.rowStrideBytes < minimumStride || view.rowStrideBytes % alignof(uint16_t) != 0u) {
+        view.failureReason = "master_row_stride_smaller_than_width_or_unaligned";
         return view;
     }
 
@@ -220,8 +220,8 @@ LinearFloatRaw normalizeRawForJpeg(const uint16_t* masterRaw16, const RawDomainI
     const size_t rowStride = out.info.masterRowStrideBytes > 0
             ? out.info.masterRowStrideBytes
             : minimumStride;
-    if (rowStride < minimumStride) {
-        out.diagnostics.failureReason = "master_row_stride_smaller_than_width";
+    if (rowStride < minimumStride || rowStride % alignof(uint16_t) != 0u) {
+        out.diagnostics.failureReason = "master_row_stride_smaller_than_width_or_unaligned";
         RAW_DOMAIN_LOGE("RAW normalization rejected rowStride=%zu minimum=%zu", rowStride, minimumStride);
         return out;
     }
@@ -269,9 +269,10 @@ LinearFloatRaw normalizeRawForJpeg(const uint16_t* masterRaw16, const RawDomainI
             }
 #endif
             for (; x < out.info.width; ++x) {
-                const int cfaX = (x + out.info.cfaOffsetX) & 1;
-                const float blk = (cfaX == 0) ? blk0 : blk1;
-                const float invR = (cfaX == 0) ? invRange0 : invRange1;
+                // blk0/blk1 already include the sensor-origin X phase. Select by
+                // local column parity, matching the vector loop above.
+                const float blk = (x & 1) == 0 ? blk0 : blk1;
+                const float invR = (x & 1) == 0 ? invRange0 : invRange1;
                 destinationRow[x] = std::clamp((static_cast<float>(sourceRow[x]) - blk) * invR, 0.0f, 1.0f);
             }
         }

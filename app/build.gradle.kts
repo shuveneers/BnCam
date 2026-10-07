@@ -3,6 +3,13 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
+val captureGitRevision = runCatching {
+    providers.exec {
+        workingDir(rootProject.projectDir)
+        commandLine("git", "rev-parse", "HEAD")
+    }.standardOutput.asText.get().trim()
+}.getOrDefault("unavailable")
+
 android {
     namespace = "com.bncam"
     compileSdk {
@@ -13,6 +20,7 @@ android {
 
     defaultConfig {
         applicationId = "com.bncam"
+        buildConfigField("String", "GIT_REVISION", "\"$captureGitRevision\"")
         minSdk = 29 // <-- AANGEPAST VAN 26 NAAR 29 VOOR HARDWARE BUFFERS
         targetSdk = 36
         versionCode = 1

@@ -1,0 +1,230 @@
+{
+  "device": {
+    "manufacturer": "HONOR",
+    "model": "BKQ-N49",
+    "android": "17",
+    "api": 37,
+    "abi": "arm64-v8a",
+    "serial": "AUWE025B03006422",
+    "gpu": "Adreno 840"
+  },
+  "fixture": {
+    "captureId": "c6a3cd0e-2267-4174-bb29-d5941ca6718f-1",
+    "rawSha256": "07cac3e40cbca321e79a8207f7db2c8b7a1cf5a629bbf698af8dc89dc2b335af",
+    "bytes": 25165824
+  },
+  "captureCount": 91,
+  "uniqueCaptureIds": 91,
+  "validLensSmokeCount": 24,
+  "stressPublished": 36,
+  "lifecyclePublished": 15,
+  "flashRegressionPublished": 3,
+  "performance": {
+    "malvar": {
+      "medianMs": {
+        "ingest": 204.996,
+        "normalize": 59.3753,
+        "demosaic": 2017.53,
+        "post": 5341.592000000001,
+        "encode": 214.82,
+        "save": 16.132,
+        "total": 7947.43,
+        "gpuKernel": 14.8052,
+        "gpuSync": 24.2397
+      },
+      "hashes": [
+        "a8879da66325cc06e69fb2f5c74e9a924988903439c713d3491f97485b3e05d9"
+      ],
+      "runs": [
+        {
+          "ingest": 204.996,
+          "normalize": 63.2788,
+          "demosaic": 2348.44,
+          "post": 6259.369,
+          "encode": 321.701,
+          "save": 22.495,
+          "total": 9309.5,
+          "gpuKernel": 21.8927,
+          "gpuSync": 33.157,
+          "sha256": "a8879da66325cc06e69fb2f5c74e9a924988903439c713d3491f97485b3e05d9",
+          "fallback": "none"
+        },
+        {
+          "ingest": 209.127,
+          "normalize": 59.3753,
+          "demosaic": 2017.53,
+          "post": 5341.592000000001,
+          "encode": 213.138,
+          "save": 16.132,
+          "total": 7947.43,
+          "gpuKernel": 14.7644,
+          "gpuSync": 24.2397,
+          "sha256": "a8879da66325cc06e69fb2f5c74e9a924988903439c713d3491f97485b3e05d9",
+          "fallback": "none"
+        },
+        {
+          "ingest": 140.384,
+          "normalize": 47.0171,
+          "demosaic": 1624.33,
+          "post": 4175.96,
+          "encode": 214.82,
+          "save": 16.0069,
+          "total": 6283.74,
+          "gpuKernel": 14.8052,
+          "gpuSync": 24.056,
+          "sha256": "a8879da66325cc06e69fb2f5c74e9a924988903439c713d3491f97485b3e05d9",
+          "fallback": "none"
+        }
+      ]
+    },
+    "amaze": {
+      "medianMs": {
+        "ingest": 138.304,
+        "normalize": 50.6453,
+        "demosaic": 1628.64,
+        "post": 3814.2999999999997,
+        "encode": 128.69,
+        "save": 13.0124,
+        "total": 5830.29,
+        "gpuKernel": 55.8064,
+        "gpuSync": 65.5584
+      },
+      "hashes": [
+        "ec7d8cd7e9310a9ea2e37e090b7ea1f2990c84bc694fa529fe4a204fb564f89e"
+      ],
+      "runs": [
+        {
+          "ingest": 138.304,
+          "normalize": 50.6453,
+          "demosaic": 1656.45,
+          "post": 4158.729,
+          "encode": 211.621,
+          "save": 15.2772,
+          "total": 6286.42,
+          "gpuKernel": 55.7684,
+          "gpuSync": 65.8243,
+          "sha256": "ec7d8cd7e9310a9ea2e37e090b7ea1f2990c84bc694fa529fe4a204fb564f89e",
+          "fallback": "none"
+        },
+        {
+          "ingest": 140.335,
+          "normalize": 46.3194,
+          "demosaic": 1628.64,
+          "post": 3814.2999999999997,
+          "encode": 128.69,
+          "save": 7.42057,
+          "total": 5830.29,
+          "gpuKernel": 55.8064,
+          "gpuSync": 65.5584,
+          "sha256": "ec7d8cd7e9310a9ea2e37e090b7ea1f2990c84bc694fa529fe4a204fb564f89e",
+          "fallback": "none"
+        },
+        {
+          "ingest": 117.107,
+          "normalize": 71.2828,
+          "demosaic": 1124.82,
+          "post": 2904.983,
+          "encode": 126.867,
+          "save": 13.0124,
+          "total": 4408.71,
+          "gpuKernel": 56.5151,
+          "gpuSync": 59.0886,
+          "sha256": "ec7d8cd7e9310a9ea2e37e090b7ea1f2990c84bc694fa529fe4a204fb564f89e",
+          "fallback": "none"
+        }
+      ]
+    },
+    "hybrid": {
+      "medianMs": {
+        "ingest": 104.023,
+        "normalize": 40.0015,
+        "demosaic": 1078.99,
+        "post": 3294.794000000001,
+        "encode": 172.089,
+        "save": 10.1373,
+        "total": 4790.89,
+        "gpuKernel": 68.8824,
+        "gpuSync": 76.8059
+      },
+      "hashes": [
+        "7bcf244fb8f50a9f192fe8d69b3edbe3e3b274dad2f18a3bda971b2dd2b0472c"
+      ],
+      "runs": [
+        {
+          "ingest": 121.318,
+          "normalize": 40.0015,
+          "demosaic": 971.593,
+          "post": 2729.088,
+          "encode": 125.829,
+          "save": 10.1373,
+          "total": 4044.86,
+          "gpuKernel": 83.8183,
+          "gpuSync": 86.2452,
+          "sha256": "7bcf244fb8f50a9f192fe8d69b3edbe3e3b274dad2f18a3bda971b2dd2b0472c",
+          "fallback": "none"
+        },
+        {
+          "ingest": 100.012,
+          "normalize": 63.7442,
+          "demosaic": 1078.99,
+          "post": 3294.794000000001,
+          "encode": 190.316,
+          "save": 10.7228,
+          "total": 4790.89,
+          "gpuKernel": 68.8824,
+          "gpuSync": 76.8059,
+          "sha256": "7bcf244fb8f50a9f192fe8d69b3edbe3e3b274dad2f18a3bda971b2dd2b0472c",
+          "fallback": "none"
+        },
+        {
+          "ingest": 104.023,
+          "normalize": 38.1602,
+          "demosaic": 1529.48,
+          "post": 3295.551,
+          "encode": 172.089,
+          "save": 8.45656,
+          "total": 5186.39,
+          "gpuKernel": 66.3559,
+          "gpuSync": 75.7839,
+          "sha256": "7bcf244fb8f50a9f192fe8d69b3edbe3e3b274dad2f18a3bda971b2dd2b0472c",
+          "fallback": "none"
+        }
+      ]
+    }
+  },
+  "neighborJvm": {
+    "tests": 41,
+    "failures": [
+      "FrameRingBufferTest > delayedDeliveryFrameFullyExposedBeforeShutterSatisfiesWait",
+      "FrameRingBufferTest > releasingFinalLeaseAfterClearClosesUnderlyingResourcesExactlyOnce",
+      "FrameRingBufferTest > coldStartBufferStateTransitionsAndSingleFrameReadiness",
+      "FrameRingBufferTest > resizeSmallerWhileLeased",
+      "FrameRingBufferTest > telemetryInvariantsVerificationAcrossClearGenerationCaptureCycles",
+      "FrameRingBufferTest > repeatedResizeDuringSameActiveLease",
+      "FrameRingBufferTest > clearRequestedDuringActiveLeaseDoesNotDestroyFrameImmediately",
+      "FrameRingBufferTest > clearPlusResizePlusGenerationChangeDuringSameLease",
+      "FrameRingBufferTest > producerInsertsFramesWhileCandidatesAreScored",
+      "FrameRingBufferTest > disposalRequestedMultipleTimesIncrementsDeferredCloseCountOnlyOnce",
+      "FrameRingBufferTest > queriedFramesSurviveInspectionAndAreNotDestroyed",
+      "FrameRingBufferTest > asyncColdStartWaitWakesImmediatelyWhenPreShutterFrameArrives",
+      "FrameRingBufferTest > resizeLargerWhileLeasedWithoutCloningOrLeaseStateCorruption",
+      "CaptureLifecycleSourceContractTest > startupAndResetNeverUseSyntheticOrStaleYuvReader",
+      "CaptureLifecycleSourceContractTest > asynchronousQrAnalysisDoesNotRetainRingOwnedImage",
+      "CaptureLifecycleSourceContractTest > singleFrameMotionFreshnessAndReadinessHaveIndependentTruthSources",
+      "FlashCaptureSequenceSourceContractTest > dedicatedFlashForcesSingleFrameAndProvesExactStillPair"
+    ],
+    "newFailures": []
+  },
+  "finalTargetedJvm": {
+    "tests": 69,
+    "passed": 69,
+    "failed": 0
+  },
+  "preservedOutputsUnchanged": true,
+  "connectedFinal": {
+    "tests": 11,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0
+  }
+}

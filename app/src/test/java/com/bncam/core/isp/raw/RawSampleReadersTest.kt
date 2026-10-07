@@ -7,6 +7,29 @@ import org.junit.Test
 
 class RawSampleReadersTest {
     @Test
+    fun lastRowMayOmitTrailingStridePadding() {
+        val samples = intArrayOf(1, 2, 3, 4, 5, 6, 7, 8)
+        val packed = RawSampleReaders.packRaw10Rows(samples, 4, 2, 9).copyOf(14)
+        assertArrayEquals(samples, RawSampleReaders.unpackRaw10Rows(packed, 4, 2, 9))
+        val sensor = byteArrayOf(1, 0, 2, 0, 0, 0, 3, 0, 4, 0)
+        assertArrayEquals(intArrayOf(1, 2, 3, 4), RawSampleReaders.readRawSensor16LittleEndian(sensor, 2, 2, 6, 2))
+    }
+
+    @Test
+    fun extremeGeometryIsRejectedBeforeAllocationOrIndexing() {
+        val operations = listOf<() -> Unit>(
+            { RawSampleReaders.packedRaw10RowBytes(Int.MAX_VALUE) },
+            { RawSampleReaders.packRaw10Rows(intArrayOf(), 65536, 65536) },
+            { RawSampleReaders.unpackRaw10Rows(byteArrayOf(), 4, Int.MAX_VALUE, 5) },
+            { RawSampleReaders.readRawSensor16LittleEndian(byteArrayOf(), Int.MAX_VALUE, 1, 8, 4) }
+        )
+        operations.forEach { operation ->
+            try { operation(); fail("Invalid geometry must be rejected") }
+            catch (_: IllegalArgumentException) { }
+        }
+    }
+
+    @Test
     fun raw10RoundTripSupportsPaddingAndOddWidths() {
         val width = 7
         val height = 3

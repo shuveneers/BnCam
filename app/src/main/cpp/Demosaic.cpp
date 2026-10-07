@@ -1107,23 +1107,6 @@ struct MenonScratch {
 MenonScratch gMenonScratch;
 std::mutex gMenonScratchMutex;
 
-struct MalvarScratch {
-    cv::Mat rgb;
-
-    bool matches(const cv::Size& size) const {
-        return !rgb.empty() && rgb.size() == size && rgb.type() == CV_32FC3;
-    }
-
-    void ensure(const cv::Size& size) {
-        if (!matches(size)) {
-            rgb.create(size, CV_32FC3);
-        }
-    }
-};
-
-MalvarScratch gMalvarScratch;
-std::mutex gMalvarScratchMutex;
-
 struct RcdScratch {
     cv::Mat green;
     cv::Mat rgb;
@@ -1149,18 +1132,15 @@ std::mutex gRcdScratchMutex;
 struct AmazeScratch {
     cv::Mat green;
     cv::Mat guide; // CV_32FC2: nyquist score + reserved direction statistic.
-    cv::Mat rgb;
 
     bool matches(const cv::Size& size) const {
         return !green.empty() && green.size() == size && green.type() == CV_32FC1 &&
-               !guide.empty() && guide.size() == size && guide.type() == CV_32FC2 &&
-               !rgb.empty() && rgb.size() == size && rgb.type() == CV_32FC3;
+               !guide.empty() && guide.size() == size && guide.type() == CV_32FC2;
     }
 
     void ensure(const cv::Size& size) {
         if (green.empty() || green.size() != size || green.type() != CV_32FC1) green.create(size, CV_32FC1);
         if (guide.empty() || guide.size() != size || guide.type() != CV_32FC2) guide.create(size, CV_32FC2);
-        if (rgb.empty() || rgb.size() != size || rgb.type() != CV_32FC3) rgb.create(size, CV_32FC3);
     }
 };
 
@@ -1760,17 +1740,18 @@ cv::Mat demosaicMalvar2004ToRgb32f(
         const DemosaicNoiseContext* noiseContext
 ) {
     const auto setupStart = DemosaicClock::now();
-    if (normalizedBayer.empty() || normalizedBayer.type() != CV_32FC1) return {};
+    if (normalizedBayer.empty() || normalizedBayer.type() != CV_32FC1 ||
+        effectiveCfaPattern < CFA_RGGB || effectiveCfaPattern > CFA_BGGR) return {};
     // Phase 5 / Delta 0045 identity contract: this route is pure deterministic
     // Malvar-He-Cutler 2004. Shared adaptive context remains in the call ABI only.
     (void)cfaEvidence;
     (void)noiseContext;
     const int pattern = safeCfaPattern(effectiveCfaPattern);
 
-    std::unique_lock<std::mutex> scratchLock(gMalvarScratchMutex);
-    const bool scratchReused = gMalvarScratch.matches(normalizedBayer.size());
-    gMalvarScratch.ensure(normalizedBayer.size());
-    cv::Mat rgb = gMalvarScratch.rgb;
+    // No extra copy: allocate the caller-owned output directly. A later capture must
+    // never overwrite a retained result, even when both inputs have identical dimensions.
+    const bool scratchReused = false;
+    cv::Mat rgb(normalizedBayer.size(), CV_32FC3);
 
     if (stats != nullptr) {
         stats->setupMs = elapsedDemosaicMs(setupStart);
@@ -2011,7 +1992,8 @@ cv::Mat demosaicAmazeInspiredToRgb32f(
         const DemosaicNoiseContext* noiseContext
 ) {
     const auto setupStart = DemosaicClock::now();
-    if (normalizedBayer.empty() || normalizedBayer.type() != CV_32FC1) return {};
+    if (normalizedBayer.empty() || normalizedBayer.type() != CV_32FC1 ||
+        effectiveCfaPattern < CFA_RGGB || effectiveCfaPattern > CFA_BGGR) return {};
     const int pattern = safeCfaPattern(effectiveCfaPattern);
 
     std::unique_lock<std::mutex> scratchLock(gAmazeScratchMutex);
@@ -2019,13 +2001,14 @@ cv::Mat demosaicAmazeInspiredToRgb32f(
     gAmazeScratch.ensure(normalizedBayer.size());
     cv::Mat green = gAmazeScratch.green;
     cv::Mat guide = gAmazeScratch.guide;
-    cv::Mat rgb = gAmazeScratch.rgb;
+    cv::Mat rgb(normalizedBayer.size(), CV_32FC3);
     if (stats != nullptr) {
         stats->setupMs = elapsedDemosaicMs(setupStart);
         stats->allocationReuse = scratchReused;
         stats->workingBufferBytesEstimate = static_cast<uint64_t>(normalizedBayer.total()) *
                 (sizeof(float) + 2u * sizeof(float) + 3u * sizeof(float));
-        stats->allocatedScratchBytesThisShot = scratchReused ? 0u : stats->workingBufferBytesEstimate;
+        stats->allocatedScratchBytesThisShot = static_cast<uint64_t>(normalizedBayer.total()) *
+                (scratchReused ? 3u * sizeof(float) : 6u * sizeof(float));
     }
 
     const int rows = normalizedBayer.rows;

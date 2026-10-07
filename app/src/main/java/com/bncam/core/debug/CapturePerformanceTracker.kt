@@ -8,7 +8,6 @@ import org.json.JSONObject
 import java.util.LinkedHashMap
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicLong
 
 data class CaptureMemorySnapshot(
     val stage: String,
@@ -21,7 +20,7 @@ data class CaptureMemorySnapshot(
 
 /** Immutable, overlap-safe timing view for capture debug exports. */
 data class CapturePerformanceTraceSnapshot(
-    val captureId: Long,
+    val captureId: String,
     val route: String,
     val elapsedMs: Double,
     val sequentialStageDurationsMs: Map<String, Double>,
@@ -56,8 +55,18 @@ data class CapturePerformanceTraceSnapshot(
  * This makes physical-device verification possible on devices where logcat is unavailable or
  * encrypted. The report is bounded by a simple rotation policy.
  */
-class CapturePerformanceTracker(private val route: String) {
-    val captureId: Long = NEXT_CAPTURE_ID.incrementAndGet()
+class CapturePerformanceTracker(
+    private val route: String,
+    val captureId: String = com.bncam.core.capture.CaptureIds.newId()
+) {
+
+    private var captureRecipeJson: String? = null
+
+    @Synchronized
+    fun attachRecipe(recipe: com.bncam.core.capture.CaptureRecipe) {
+        require(recipe.captureId == captureId) { "Performance and recipe capture identities differ" }
+        captureRecipeJson = recipe.toJson()
+    }
 
     private val startedNs = SystemClock.elapsedRealtimeNanos()
     private val runtime = Runtime.getRuntime()
@@ -217,7 +226,15 @@ class CapturePerformanceTracker(private val route: String) {
             val peak = snapshots.maxByOrNull { it.combinedBytes } ?: baseline
             val latest = snapshots.last()
             JSONObject().apply {
-                put("schemaVersion", 2)
+                put("schemaVersion", 3)
+                put("captureRecipe", captureRecipeJson?.let { JSONObject(it) } ?: JSONObject.NULL)
+                put("build", JSONObject().apply {
+                    put("gitRevision", com.bncam.BuildConfig.GIT_REVISION)
+                    put("buildType", com.bncam.BuildConfig.BUILD_TYPE)
+                    put("version", com.bncam.BuildConfig.VERSION_NAME)
+                    put("nativeFeatures", "CXX17;VULKAN_PRIMARY;ARM64;" +
+                        if (com.bncam.BuildConfig.DEBUG) "GPU_BENCHMARKS;VULKAN_VALIDATION" else "NO_GPU_BENCHMARKS;NO_VULKAN_VALIDATION")
+                })
                 put("captureId", captureId)
                 put("route", route)
                 put("status", status)
@@ -288,7 +305,4 @@ class CapturePerformanceTracker(private val route: String) {
 
     private fun format(value: Double): String = String.format(Locale.US, "%.3f", value)
 
-    companion object {
-        private val NEXT_CAPTURE_ID = AtomicLong(0L)
-    }
 }

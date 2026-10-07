@@ -550,6 +550,7 @@ add_library(bncam SHARED
         DngMerger.cpp
         RawDomain.cpp
         Demosaic.cpp
+        SingleFrameRawReplayValidation.cpp
         IspCore.cpp
         ultrahdr/UltraHdrJpegPackager.cpp
         VulkanCapabilities.cpp
@@ -649,3 +650,8 @@ target_link_libraries(bncam
         ${egl-lib}
         ${gles3-lib}
 )
+
+# Standalone replay uses the same production shared library; no second ISP.
+add_executable(bncam_raw_replay EXCLUDE_FROM_ALL ../../test/cpp/DefaultRawSceneReplay.cpp)
+target_include_directories(bncam_raw_replay PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${OpenCV_INCLUDE_DIR})
+target_link_libraries(bncam_raw_replay PRIVATE bncam lib_opencv)

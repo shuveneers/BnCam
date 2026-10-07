@@ -537,7 +537,8 @@ object ImageUtils {
         masterFrame: Raw16RenderInput,
         qualityConfig: RenderQualityConfig?,
         rotationDegrees: Int = masterFrame.orientationDegrees,
-        portraitCaptureContext: com.bncam.core.capture.PortraitCaptureContext? = null
+        portraitCaptureContext: com.bncam.core.capture.PortraitCaptureContext? = null,
+        captureId: String = ""
     ): ByteArray? {
         val post = qualityConfig?.post
         // The Master RAW owns the capture-specific post-observer/post-fusion calibration.
@@ -740,6 +741,7 @@ object ImageUtils {
             }
             val renderOnce = { invokeNativeSafely(routeLabel) {
                 renderJpegFromMasterNative(
+                captureId = captureId,
                 lensId = masterFrame.lensId,
                 raw16DirectBuffer = raw16DirectBuffer,
                 width = masterFrame.width,
@@ -904,13 +906,15 @@ object ImageUtils {
         masterFrame: Raw16RenderInput,
         qualityConfig: RenderQualityConfig?,
         rotationDegrees: Int = masterFrame.orientationDegrees,
-        portraitCaptureContext: com.bncam.core.capture.PortraitCaptureContext? = null
+        portraitCaptureContext: com.bncam.core.capture.PortraitCaptureContext? = null,
+        captureId: String = ""
     ): RawJpegRenderResult? {
         val jpeg = renderJpegFromRaw16InputSafe(
             masterFrame = masterFrame,
             qualityConfig = qualityConfig,
             rotationDegrees = rotationDegrees,
-            portraitCaptureContext = portraitCaptureContext
+            portraitCaptureContext = portraitCaptureContext,
+            captureId = captureId
         ) ?: run {
             if (qualityConfig?.ultraHdrGainmapEnabled == true) {
                 try { consumeLastUltraHdrGainmapArtifactNative() } catch (_: Throwable) { null }
@@ -1542,6 +1546,7 @@ object ImageUtils {
 
     @JvmStatic
     private external fun renderJpegFromMasterNative(
+        captureId: String,
         lensId: String,
         raw16DirectBuffer: ByteBuffer,
         width: Int,

@@ -607,7 +607,7 @@ object AfGroundTruthTrace {
             chars.get(CameraCharacteristics.LENS_INFO_FOCUS_DISTANCE_CALIBRATION),
         "CONTROL_AF_AVAILABLE_MODES" to chars.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES),
         "CONTROL_MAX_REGIONS_AF" to chars.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AF),
-        "CONTROL_ZOOM_RATIO_RANGE" to chars.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE),
+        "CONTROL_ZOOM_RATIO_RANGE" to if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) chars.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE) else null,
         "SCALER_AVAILABLE_MAX_DIGITAL_ZOOM" to
             chars.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM)
     )
@@ -631,7 +631,7 @@ object AfGroundTruthTrace {
         "afRegions" to builder.get(CaptureRequest.CONTROL_AF_REGIONS),
         "aeRegions" to builder.get(CaptureRequest.CONTROL_AE_REGIONS),
         "cropRegion" to builder.get(CaptureRequest.SCALER_CROP_REGION),
-        "zoomRatio" to builder.get(CaptureRequest.CONTROL_ZOOM_RATIO),
+        "zoomRatio" to if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) builder.get(CaptureRequest.CONTROL_ZOOM_RATIO) else null,
         "lensFocusDistance" to builder.get(CaptureRequest.LENS_FOCUS_DISTANCE),
         "sensorExposureTimeNs" to builder.get(CaptureRequest.SENSOR_EXPOSURE_TIME),
         "sensorSensitivityIso" to builder.get(CaptureRequest.SENSOR_SENSITIVITY),
@@ -657,7 +657,7 @@ object AfGroundTruthTrace {
         "afRegions" to request.get(CaptureRequest.CONTROL_AF_REGIONS),
         "aeRegions" to request.get(CaptureRequest.CONTROL_AE_REGIONS),
         "cropRegion" to request.get(CaptureRequest.SCALER_CROP_REGION),
-        "zoomRatio" to request.get(CaptureRequest.CONTROL_ZOOM_RATIO),
+        "zoomRatio" to if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) request.get(CaptureRequest.CONTROL_ZOOM_RATIO) else null,
         "lensFocusDistance" to request.get(CaptureRequest.LENS_FOCUS_DISTANCE),
         "sensorExposureTimeNs" to request.get(CaptureRequest.SENSOR_EXPOSURE_TIME),
         "sensorSensitivityIso" to request.get(CaptureRequest.SENSOR_SENSITIVITY),
@@ -693,7 +693,7 @@ object AfGroundTruthTrace {
         "lensFocusDistance" to result.get(CaptureResult.LENS_FOCUS_DISTANCE),
         "lensState" to result.get(CaptureResult.LENS_STATE),
         "cropRegion" to result.get(CaptureResult.SCALER_CROP_REGION),
-        "zoomRatio" to result.get(CaptureResult.CONTROL_ZOOM_RATIO)
+        "zoomRatio" to if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) result.get(CaptureResult.CONTROL_ZOOM_RATIO) else null
     )
 
     private fun writeRecord(

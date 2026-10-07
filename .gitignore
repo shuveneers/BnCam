@@ -38,3 +38,6 @@ __pycache__/
 .pytest_cache/
 work/physical_chroma_validation/
 work/physical_luma_validation/
+# Local device validation captures, logs and replay outputs.
+work/device-validation/
+work/device-first-logcat.txt

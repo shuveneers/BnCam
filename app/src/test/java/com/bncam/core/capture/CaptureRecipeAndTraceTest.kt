@@ -23,6 +23,40 @@ import org.junit.Test
 
 class CaptureRecipeAndTraceTest {
     @Test
+    fun capturedListsCannotBeMutatedThroughJavaOrMutableListCast() {
+        val recipe = recipeFixture()
+        val before = recipe.toJson()
+        try {
+            (recipe.executionSettings.lensHardwareSettings.warnings as MutableList<String>).add("late")
+            org.junit.Assert.fail("Snapshot must reject mutation")
+        } catch (_: UnsupportedOperationException) {
+            assertEquals(before, recipe.toJson())
+        }
+    }
+
+    @Test
+    fun derivedProcessingSettingListsAreImmutableToo() {
+        val settings = recipeFixture().executionSettings.renderPreferences.resolvedIspSettings
+        listOf(settings.commonRenderSettings, settings.rawDemosaicSettings, settings.outputEncodeSettings).forEach { values ->
+            try {
+                (values as MutableList<com.bncam.core.quality.ResolvedLibpatcherSetting>).clear()
+                org.junit.Assert.fail("Derived snapshot lists must reject mutation")
+            } catch (_: UnsupportedOperationException) { }
+        }
+    }
+
+    @Test
+    fun identityIsStableWithoutShotLoggingAndSerializedInRecipe() {
+        val recipe = recipeFixture()
+        assertTrue(recipe.captureId.isNotBlank())
+        assertTrue(recipe.toJson().contains("\"captureId\":\"${recipe.captureId}\""))
+        assertNotEquals(recipe.captureId, recipeFixture().captureId)
+        assertEquals(CaptureIds.forAttempt(4), CaptureIds.forAttempt(4))
+        assertNotEquals(CaptureIds.forAttempt(4), CaptureIds.forAttempt(5))
+        assertNotEquals(CaptureIds.forAttempt(1, "manager-a"), CaptureIds.forAttempt(1, "manager-b"))
+    }
+
+    @Test
     fun recipeIsImmutableAndDefensivelyCopiesNestedLists() {
         val mutableWarnings = mutableListOf("initial")
         val recipe = recipeFixture(mutableWarnings)
@@ -47,9 +81,9 @@ class CaptureRecipeAndTraceTest {
         assertEquals(CaptureMode.MULTI, recipe.captureMode)
         assertEquals(40, recipe.requestedFrameCount)
         assertEquals(25, recipe.effectiveFrameCount)
-        assertEquals(3, recipe.schemaVersion)
+        assertEquals(4, recipe.schemaVersion)
         assertEquals(first, second)
-        assertTrue(first.contains("\"schemaVersion\":3"))
+        assertTrue(first.contains("\"schemaVersion\":4"))
         assertTrue(first.contains("\"dngSource\":\"FUSED_RAW\""))
         assertTrue(first.contains("\"runtimeSafeMaximum\":30"))
         assertFalse(first.contains("\"deviceSupportedMaximum\""))

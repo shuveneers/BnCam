@@ -1537,7 +1537,8 @@ class BnCameraManager(private val context: Context) {
         val shutterTimestampDomain: String,
         val controlRequestEpochAtShutter: Long,
         val vendorDebugCaptureResult: TotalCaptureResult?,
-        val captureFailureReason: String?
+        val captureFailureReason: String?,
+        val exactFrameLease: com.bncam.core.buffer.FrameLease
     )
 
     @Volatile
@@ -1592,6 +1593,7 @@ class BnCameraManager(private val context: Context) {
         com.google.mlkit.vision.objects.ObjectDetection.getClient(objectTrackerOptions)
     private val barcodeScanner = com.google.mlkit.vision.barcode.BarcodeScanning.getClient()
 
+    private val captureIdentityNamespace = com.bncam.core.capture.CaptureIds.newId()
     private val captureAttempts = CaptureAttemptCoordinator { event, detail ->
         Log.i("BnCamCaptureLifecycle", "$event $detail")
     }
@@ -5318,7 +5320,11 @@ class BnCameraManager(private val context: Context) {
             submissionType = CameraRequestSubmissionType.ONE_SHOT,
             reason = reason
         )
-        builder.setTag(prepared.tag)
+        builder.setTag(prepared.tag.copy(
+            captureId = captureAttempts.snapshot.captureAttemptId?.let {
+                com.bncam.core.capture.CaptureIds.forAttempt(it, captureIdentityNamespace)
+            }
+        ))
         val request = builder.build()
         val sequenceId = session.capture(request, callback, handler)
         com.bncam.core.debug.AfGroundTruthTrace.recordSubmission(
@@ -5331,7 +5337,7 @@ class BnCameraManager(private val context: Context) {
         controlRequestEpochTracker.commit(prepared)
         Log.i(
             "CameraRequestProvenance",
-            "event=REQUEST_SUBMITTED type=ONE_SHOT reason=$reason " +
+            "event=REQUEST_SUBMITTED type=ONE_SHOT reason=$reason captureId=${(request.tag as? com.bncam.core.capture.CameraRequestTag)?.captureId} " +
                     "pipelineGeneration=${prepared.tag.pipelineGeneration} " +
                     "controlRequestEpoch=${prepared.tag.controlRequestEpoch} " +
                     "epochAdvanced=${prepared.advancesEpoch} sequenceId=$sequenceId " +
@@ -11806,7 +11812,17 @@ class BnCameraManager(private val context: Context) {
     private fun finalizeManagerShutdown(reason: String) {
         if (!managerShutdownFinalized.compareAndSet(false, true)) return
 
-        owningLifecycle?.lifecycle?.removeObserver(managerLifecycleObserver)
+        owningLifecycle?.let { owner ->
+            // Safe-release callbacks run on the camera transition worker. LifecycleRegistry
+            // requires observer removal on the main thread, including Activity destruction.
+            if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+                owner.lifecycle.removeObserver(managerLifecycleObserver)
+            } else {
+                Handler(android.os.Looper.getMainLooper()).post {
+                    owner.lifecycle.removeObserver(managerLifecycleObserver)
+                }
+            }
+        }
         phoneAssistanceSensorHelper.stopListening()
         trackingTimeoutJob?.cancel()
         tapFocusTimeoutJob?.cancel()
@@ -12940,7 +12956,10 @@ class BnCameraManager(private val context: Context) {
             val deviceId = cameraDevice?.id ?: return
             // Cadence is allowed to adapt to the exact stream, but Standard Auto exposure itself
             // has one owner on every lens and format: Camera2 AE.
-            applyOptimalAeTargetFpsRange(builder, deviceId)
+            if (builder.get(CaptureRequest.CONTROL_CAPTURE_INTENT) !=
+                CaptureRequest.CONTROL_CAPTURE_INTENT_STILL_CAPTURE) {
+                applyOptimalAeTargetFpsRange(builder, deviceId)
+            }
 
             val deviceCharacteristics = runCatching {
                 cameraManager.getCameraCharacteristics(deviceId)
@@ -13778,7 +13797,8 @@ class BnCameraManager(private val context: Context) {
                 mapperSensorNormalizedX = mapped.sensorNormPoint.x,
                 mapperSensorNormalizedY = mapped.sensorNormPoint.y,
                 requestedCropRegion = request.get(CaptureRequest.SCALER_CROP_REGION)?.let(::Rect),
-                requestedZoomRatio = request.get(CaptureRequest.CONTROL_ZOOM_RATIO)
+                requestedZoomRatio = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R)
+                    request.get(CaptureRequest.CONTROL_ZOOM_RATIO) else null
             )
             com.bncam.core.debug.AfGroundTruthTrace.recordTapMapping(
                 mapping = traceMapping,
@@ -16326,6 +16346,25 @@ class BnCameraManager(private val context: Context) {
             ) {
                 captureAttempts.captureResultReceived()
                 vendorDebugCaptureResult = result
+                val exactSensorTimestamp = result.get(CaptureResult.SENSOR_TIMESTAMP)
+                if (exactSensorTimestamp != null && pipelineGeneration == flashPipelineGeneration) {
+                    val tagResolution = controlRequestEpochTracker.resolveTag(
+                        tag = request.tag,
+                        expectedPipelineGeneration = flashPipelineGeneration
+                    )
+                    val sensorSnapshot = frameSensorMetadataSnapshot(
+                        result = result,
+                        expectedGeneration = flashPipelineGeneration,
+                        fallbackLogicalCameraId = device.id
+                    )
+                    ringBuffer.addMetadata(
+                        timestamp = sensorSnapshot?.sensorTimestampNs ?: exactSensorTimestamp,
+                        result = result,
+                        generationId = flashPipelineGeneration,
+                        requestProvenance = tagResolution.provenance,
+                        sensorMetadataSnapshot = sensorSnapshot
+                    )
+                }
                 val traceIdentity = synchronized(pipelineLock) { activePipelineIdentity }
                 com.bncam.core.debug.AfGroundTruthTrace.recordCaptureResult(
                     logicalCameraId = traceIdentity?.logicalCameraId ?: device.id,
@@ -16461,8 +16500,9 @@ class BnCameraManager(private val context: Context) {
                 if (currentFlashMode == "On" && firedState != null && !flashFired) {
                     Log.w(tag, "Flash mode On requested, but exact still result reports FLASH_STATE=$firedState")
                 }
-            } finally {
+            } catch (failure: Throwable) {
                 exactFlashFrameLease.release()
+                throw failure
             }
         }
 
@@ -16514,7 +16554,8 @@ class BnCameraManager(private val context: Context) {
             shutterTimestampDomain = shutterTimestampDomain,
             controlRequestEpochAtShutter = currentSubmittedControlRequestEpochAtShutter,
             vendorDebugCaptureResult = vendorDebugCaptureResult,
-            captureFailureReason = captureFailureReason
+            captureFailureReason = captureFailureReason,
+            exactFrameLease = exactFlashFrameLease
         )
     }
 
@@ -16534,6 +16575,8 @@ class BnCameraManager(private val context: Context) {
         // failures are still observable by the UI instead of being swallowed by StateFlow
         // de-duplication.
         _captureContractError.value = null
+        val afStateAtShutter = lastAfState
+        val aeStateAtShutter = lastAeState
         val focusCaptureContextAtShutter = snapshotFocusCaptureContext()
         val portraitCaptureContextAtShutter = snapshotPortraitCaptureContext(viewfinderMode)
         val pipelineIdentity = synchronized(pipelineLock) { activePipelineIdentity }
@@ -16556,6 +16599,8 @@ class BnCameraManager(private val context: Context) {
             _captureContractError.value = "Capture is still being admitted; the duplicate shutter press was ignored."
             return@withContext null
         }
+        val captureId = com.bncam.core.capture.CaptureIds.forAttempt(attemptId, captureIdentityNamespace)
+        Log.i(tag, "SHUTTER_ACCEPTED captureId=$captureId attemptId=$attemptId")
         // While capture owns the production path, tracking/portrait analysis is suspended. Keep
         // compact NV21 enabled only for consumers that remain valid during capture (currently QR).
         refreshRawPreviewCompactAnalysisRequest()
@@ -16567,6 +16612,8 @@ class BnCameraManager(private val context: Context) {
         var preleasedNormalMultiAnchor: FrameRingBuffer.LeasedCandidate? = null
         var preleasedProvisionalNearZslAnchor: FrameRingBuffer.LeasedCandidate? = null
         var preleasedSingleAnchor: FrameRingBuffer.LeasedCandidate? = null
+        var dedicatedFlashFrameLease: com.bncam.core.buffer.FrameLease? = null
+        var admittedRecipe: com.bncam.core.capture.CaptureRecipe? = null
         var rawShutterTicket: RawShutterTicket? = null
         var rawShutterSoundPlayedAtAcceptance = false
         var singleAnchorTemporalClass = "UNRESOLVED"
@@ -16903,6 +16950,10 @@ class BnCameraManager(private val context: Context) {
             val recipe = com.bncam.core.capture.CaptureRecipeFactory.create(
                 repository = settingsRepo,
                 request = com.bncam.core.capture.CaptureRecipeRequest(
+                    captureId = captureId,
+                    displayRotation = deviceRotation,
+                    afStateAtShutter = afStateAtShutter,
+                    aeStateAtShutter = aeStateAtShutter,
                     applicationVersion = com.bncam.BuildConfig.VERSION_NAME,
                     profileId = activeProfile.id,
                     profileDefaultName = activeProfile.name,
@@ -16966,9 +17017,10 @@ class BnCameraManager(private val context: Context) {
             )
             val requestedSingleFrameBaseCandidateCount =
                 recipe.executionSettings.selection.baseCandidateCount
+            admittedRecipe = recipe
             val requestedRouteFrameCount = recipe.requestedFrameCount
             traceCaptureRuntime(
-                "CAPTURE_RECIPE attemptId=$attemptId schema=${recipe.schemaVersion} " +
+                "CAPTURE_RECIPE captureId=$captureId attemptId=$attemptId schema=${recipe.schemaVersion} " +
                     "profileHash=${recipe.profileVersionHash} requestedFrames=${recipe.requestedFrameCount} " +
                     "effectiveFrames=${recipe.effectiveFrameCount} bufferCapacity=${recipe.bufferCapacity} " +
                     "capacityReason=${recipe.processingFrameResolution.resolutionReason} " +
@@ -17304,6 +17356,7 @@ class BnCameraManager(private val context: Context) {
                     return@withContext null
                 }
                 shutterTimestampNs = flashCaptureResult.shutterTimestampNs
+                dedicatedFlashFrameLease = flashCaptureResult.exactFrameLease
                 shutterTimestampDomain = flashCaptureResult.shutterTimestampDomain
                 currentSubmittedControlRequestEpochAtShutter =
                     flashCaptureResult.controlRequestEpochAtShutter
@@ -17458,7 +17511,7 @@ class BnCameraManager(private val context: Context) {
                                 evOffset = currentEvOffset,
                                 currentSubmittedControlRequestEpochAtShutter =
                                     currentSubmittedControlRequestEpochAtShutter,
-                                aeStateBeforeCapture = lastAeState,
+                                aeStateBeforeCapture = aeStateAtShutter,
                                 meteringPolicySummary = lastMeteringPlanSummary,
                                 exposurePolicySummary = singleRunnerExposurePolicySummary,
                                 postShutterStillCaptureUsed = postShutterStillCaptureUsed,
@@ -17478,7 +17531,8 @@ class BnCameraManager(private val context: Context) {
                                 stableAutoWhiteBalance = stableAutoWhiteBalanceAtShutter,
                                 focusCaptureContext = focusCaptureContextAtShutter,
                                 portraitCaptureContext = portraitCaptureContextAtShutter,
-                                reservedAnchor = preleasedSingleAnchor?.lease?.takeIf { rawSingle }
+                                reservedAnchor = dedicatedFlashFrameLease
+                                    ?: preleasedSingleAnchor?.lease?.takeIf { rawSingle }
                             )
                         }
 
@@ -17499,7 +17553,7 @@ class BnCameraManager(private val context: Context) {
                                 evOffset = currentEvOffset,
                                 currentSubmittedControlRequestEpochAtShutter =
                                     currentSubmittedControlRequestEpochAtShutter,
-                                aeStateBeforeCapture = lastAeState,
+                                aeStateBeforeCapture = aeStateAtShutter,
                                 meteringPolicySummary = lastMeteringPlanSummary,
                                 exposurePolicySummary = lastExposurePlanSummary + unifiedRuntimeDiagnosticsSuffix,
                                 postShutterStillCaptureUsed = postShutterStillCaptureUsed,
@@ -17544,7 +17598,7 @@ class BnCameraManager(private val context: Context) {
                                 meteringStyle = currentMeteringStyle,
                                 evOffset = currentEvOffset,
                                 currentSubmittedControlRequestEpochAtShutter = currentSubmittedControlRequestEpochAtShutter,
-                                aeStateBeforeCapture = lastAeState,
+                                aeStateBeforeCapture = aeStateAtShutter,
                                 meteringPolicySummary = lastMeteringPlanSummary,
                                 exposurePolicySummary = lastExposurePlanSummary + unifiedRuntimeDiagnosticsSuffix,
                                 postShutterStillCaptureUsed = postShutterStillCaptureUsed,
@@ -17677,7 +17731,8 @@ class BnCameraManager(private val context: Context) {
             // diagnostics from an older/newer shutter.
             runCatching {
                 shotLogger.finalizeFailureWithPublicDiagnostics(
-                    attemptId = "${activeLens.id}-$userShutterTimestampNs",
+                    attemptId = if (admittedRecipe?.captureMode == com.bncam.core.capture.CaptureMode.SINGLE)
+                        captureId else "${activeLens.id}-$userShutterTimestampNs",
                     stage = "CAPTURE_ROUTER_EXCEPTION",
                     exception = e
                 )
@@ -17687,6 +17742,8 @@ class BnCameraManager(private val context: Context) {
             finishCaptureAttempt(attemptId, null, finishReason)
             null
         } finally {
+            dedicatedFlashFrameLease?.release()
+            dedicatedFlashFrameLease = null
             preleasedProvisionalNearZslAnchor?.let { provisional ->
                 traceCaptureRuntime(
                     "SHUTTER_ENTRY_ANCHOR_RELEASE_SCOPE attemptId=$attemptId frameVersion=${provisional.frameVersion}"

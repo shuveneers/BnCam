@@ -9,6 +9,10 @@ import java.security.MessageDigest
 import kotlinx.coroutines.flow.first
 
 data class CaptureRecipeRequest(
+    val captureId: String = CaptureIds.newId(),
+    val displayRotation: Int = 0,
+    val afStateAtShutter: Int? = null,
+    val aeStateAtShutter: Int? = null,
     val applicationVersion: String,
     val profileId: String,
     val profileDefaultName: String,
@@ -325,6 +329,10 @@ object CaptureRecipeFactory {
 
         return CaptureRecipe.create(
             CaptureRecipeInput(
+                captureId = request.captureId,
+                displayRotation = request.displayRotation,
+                afStateAtShutter = request.afStateAtShutter,
+                aeStateAtShutter = request.aeStateAtShutter,
                 applicationVersion = request.applicationVersion,
                 activeProfileIdentifier = request.profileId,
                 profileVersionHash = profileHash,
