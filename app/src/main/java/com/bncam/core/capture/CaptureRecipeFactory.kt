@@ -172,7 +172,10 @@ object CaptureRecipeFactory {
             shotBiasExposure = repository.getProfileString(
                 request.profileId, CaptureSettingKeys.SHOT_BIAS_EXPOSURE, "Auto"
             ).first(),
-            maxFrameExposure = repository.getProfileString(
+            exposureMode = repository.getProfileString(
+                    request.profileId, CaptureSettingKeys.SENSOR_EXPOSURE_MODE, "STANDARD_AUTO"
+                ).first(),
+                maxFrameExposure = repository.getProfileString(
                 request.profileId, CaptureSettingKeys.SHOT_BIAS_MAX_FRAME_EXPOSURE, "Max exposure time"
             ).first()
         )

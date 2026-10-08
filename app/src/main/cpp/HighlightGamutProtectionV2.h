@@ -110,31 +110,39 @@ inline SensorColorConfidence resolveSensorColorConfidence(const Rgb& raw) noexce
     return out;
 }
 
-// Default single-shot RAW: each CFA sample retains full authority below the sensor
-// clip guard. Chroma is reduced only when ALL four samples lose information. In
-// particular a clipped R, B, or one green cannot erase the other channel ratios.
-// No missing channel is guessed from a neutral prior; preserve measured colour
-// when reconstruction is underdetermined, and leave display rolloff to Khronos.
+// Default single-shot RAW physical chroma uncertainty. Never reconstruct RAW samples.
+// The sensor-normalized source uses its actual CFA black/white levels. Each sample
+// has a quintic shoulder; 8-bit confidence mirrors the GPU packed sideband exactly.
+constexpr float kDefaultRawConfidenceStart = 0.940f;
 inline float defaultRawSampleLoss(float value) noexcept {
-    return finite(value) ? smoothstep(kSensorClipThreshold, 1.0f, value) : 1.0f;
+    if (!finite(value)) return 1.0f;
+    const float t=std::clamp((value-kDefaultRawConfidenceStart)/0.06f,0.0f,1.0f);
+    return t*t*t*(t*(t*6.0f-15.0f)+10.0f);
 }
-
-inline float defaultRawCellConfidence(const std::array<float, 4>& samples) noexcept {
-    float loss = 1.0f;
-    for (float value : samples) loss *= defaultRawSampleLoss(value);
-    return std::clamp(1.0f - loss, 0.0f, 1.0f);
+inline float defaultRawCellConfidence(const std::array<float,4>& samples) noexcept {
+    float confidence=1.0f;
+    for(float value:samples){
+        const float c=std::clamp(1.0f-defaultRawSampleLoss(value),0.0f,1.0f);
+        confidence *= float(std::lround(c*255.0f))/255.0f;
+    }
+    return confidence;
 }
-
-// Interpolate evidence only, never RGB. The owning cell is a lower bound on
-// confidence: clipped neighbours cannot neutralize an intact/partially clipped cell.
+// Positive cubic B-spline weights interpolate confidence only, with no Bayer-cell
+// ownership floor or RGB filtering. Canonical colour order is irrelevant to the product.
+inline std::array<float,4> defaultRawConfidenceWeights(float t) noexcept {
+    const float a=1.0f-t;
+    return {a*a*a/6.0f,(3.0f*t*t*t-6.0f*t*t+4.0f)/6.0f,
+            (-3.0f*t*t*t+3.0f*t*t+3.0f*t+1.0f)/6.0f,t*t*t/6.0f};
+}
 template<class ReadCell>
-inline float defaultRawConfidenceAt(int x, int y, ReadCell read) noexcept {
-    const float cx = float(x) * 0.5f - 0.25f, cy = float(y) * 0.5f - 0.25f;
-    const int x0 = int(std::floor(cx)), y0 = int(std::floor(cy));
-    const float fx = cx - float(x0), fy = cy - float(y0);
-    const float top = read(x0,y0) * (1.0f-fx) + read(x0+1,y0) * fx;
-    const float bottom = read(x0,y0+1) * (1.0f-fx) + read(x0+1,y0+1) * fx;
-    return std::max(read(x/2,y/2), top * (1.0f-fy) + bottom * fy);
+inline float defaultRawConfidenceAt(int x,int y,ReadCell read) noexcept {
+    const float cx=float(x)*0.5f-0.25f,cy=float(y)*0.5f-0.25f;
+    const int x0=int(std::floor(cx)),y0=int(std::floor(cy));
+    const auto wx=defaultRawConfidenceWeights(cx-float(x0));
+    const auto wy=defaultRawConfidenceWeights(cy-float(y0));
+    float q=0.0f;
+    for(int j=0;j<4;++j)for(int i=0;i<4;++i)q+=wx[i]*wy[j]*read(x0+i-1,y0+j-1);
+    return std::clamp(q,0.0f,1.0f);
 }
 
 // Apply only after normal WB + camera color transform, while values are still linear.

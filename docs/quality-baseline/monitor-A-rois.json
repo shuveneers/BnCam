@@ -1,0 +1,8 @@
+{
+  "scope": "Manually inspected monitor photograph; not a physical flat/noise/color reference. Coordinates in rendered 3072x4096 JPEG pixels.",
+  "rois": [
+    {"id":"display_dark_area","stage":"FINAL_JPEG","kind":"DISPLAY_DARK_AREA","box":[450,520,256,96]},
+    {"id":"display_text","stage":"FINAL_JPEG","kind":"MONITOR_TEXT","box":[1250,1350,1050,160]},
+    {"id":"display_divider","stage":"FINAL_JPEG","kind":"EDGE","profileAxis":"x","box":[1040,1200,128,96]}
+  ]
+}

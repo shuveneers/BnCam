@@ -1,0 +1,9 @@
+{
+  "scope":"Manually declared second RAW_SENSOR E series. Same objects as RAW10, visibly different framing; regions are independently selected and not registered pixel pairs. No characterized reflectance reference.",
+  "rois":[
+    {"id":"red_toy_texture","stage":"FINAL_JPEG","kind":"COLORED_TEXTURE_PROXY","box":[1900,1700,180,100]},
+    {"id":"blue_watch","stage":"FINAL_JPEG","kind":"COLORED_OBJECT_PROXY","box":[800,1920,180,80]},
+    {"id":"yellow_token","stage":"FINAL_JPEG","kind":"COLORED_OBJECT_PROXY","box":[1450,2500,160,120]},
+    {"id":"dotted_white_paper_proxy","stage":"FINAL_JPEG","kind":"PRINTED_WHITE_PAPER_PROXY","box":[1600,3000,256,128]}
+  ]
+}

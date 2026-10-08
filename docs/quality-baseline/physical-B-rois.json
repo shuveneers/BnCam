@@ -1,0 +1,9 @@
+{
+  "scope": "Manually inspected low-light physical scene B; JPEG coordinates. Framing differs from A, so no registered pixel/temporal-noise comparison between scenes. Paper is an uncharacterized proxy.",
+  "rois": [
+    {"id":"blank_white_paper","stage":"FINAL_JPEG","kind":"WHITE_PAPER_PROXY","box":[1800,2750,256,96]},
+    {"id":"dark_desk_texture","stage":"FINAL_JPEG","kind":"DARK_TEXTURE_SURFACE","box":[250,3000,256,128]},
+    {"id":"printed_text","stage":"FINAL_JPEG","kind":"PRINTED_TEXT","box":[1460,1780,900,700]},
+    {"id":"plant_structure","stage":"FINAL_JPEG","kind":"FINE_NATURAL_STRUCTURE","box":[1000,130,520,600]}
+  ]
+}

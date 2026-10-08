@@ -21,8 +21,9 @@ struct Result { Pixel pixel; float hf=0, mid=0, structure=0, pressure=0; };
 // Redundant directional lifting residuals at spacing 1 and 2. Each prediction
 // reproduces affine illumination exactly; no coarse/DC band is attenuated.
 // Five parallel residuals provide noise-normalized continuity evidence, including
-// weak lines. All evidence reads immutable Y; chroma's Y-invariance lets the GPU
-// reuse demosaic RGB without materializing a second post-chroma image.
+// weak lines. All evidence reads immutable demosaic Y; the luma correction is
+// added to post-chroma RGB. The CPU uses the same immutable source, including
+// when chroma preserves WB/CCM-domain Y rather than camera-domain Y.
 template<class Read, class Shape>
 Result filter(int x, int y, Model model, Pixel postChroma, Read read, Shape shape, bool adaptive = true) {
     if (!model.valid() || !chroma::finite(postChroma)) return {postChroma};

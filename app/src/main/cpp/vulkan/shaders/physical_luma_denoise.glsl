@@ -1,5 +1,5 @@
-// CPU oracle: PhysicalLumaDenoise.h. Mode 3 only; immutable final demosaic Y
-// equals post-chroma Y. Apply a common RGB delta AFTER physical chroma.
+// CPU oracle: PhysicalLumaDenoise.h. Mode 3 only; evidence reads immutable
+// demosaic Y. Add the existing camera-RGB luma delta AFTER physical chroma.
 vec3 physicalLumaDenoise(ivec2 xy,vec3 postChroma,out vec3 telemetry) {
     telemetry=vec3(0);
     if(pc.cfaEvidence1.y<=0.0 || !physicalChromaFinite(postChroma)) return postChroma;

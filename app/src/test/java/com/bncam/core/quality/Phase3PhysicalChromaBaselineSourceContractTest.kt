@@ -15,7 +15,7 @@ class Phase3PhysicalChromaBaselineSourceContractTest {
         assertTrue(isp.contains("residualNoiseState.postDemosaic, physicalNoiseStatisticsActive"))
         assertTrue(isp.contains("request.baselinePhysicalChroma = baselinePhysicalChroma"))
         assertTrue(isp.indexOf("residualNoiseState.postDemosaic =") <
-            isp.indexOf("const auto baselinePhysicalChroma ="))
+            isp.indexOf("auto baselinePhysicalChroma ="))
         val engine = File(appDir(), "src/main/cpp/PhysicalChromaDenoise.h").readText()
         org.junit.Assert.assertFalse(engine.contains("spectraProcessingMode"))
         org.junit.Assert.assertFalse(engine.contains("DemosaicAlgorithm"))

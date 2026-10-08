@@ -67,7 +67,7 @@ int main(int argc,char**argv){
  assert(argc==2);std::string dir=argv[1];Gpu gpu;std::array<Buffer,16> b;for(auto& v:b)v=gpu.buffer();
  auto& source=b[0];auto& finalized=b[1];auto& rgb=b[2];auto& color=b[3];auto& stats=b[4];auto& telemetry=b[5];auto& empty=b[6];auto& lut=b[7];auto& tone=b[8];
  float maxMapError=0,maxColorError=0,maxToneError=0;unsigned partialUnchanged=0,fullNeutral=0;
- for(int lens=0;lens<3;++lens)for(int format=0;format<2;++format){
+ for(int pattern=0;pattern<4;++pattern)for(int lens=0;lens<3;++lens)for(int format=0;format<2;++format){
   float quantum=format?65535.f:1023.f;std::vector<float> cells(N/4),raw(N*3);
   for(unsigned y=0;y<H;y+=2)for(unsigned x=0;x<W;x+=2){
    // All clipping masks, a dense .96..1.0 ramp, coloured textures and one-green-only clipping.
@@ -77,9 +77,9 @@ int main(int argc,char**argv){
    source.p[y*W+x]=s[0];source.p[y*W+x+1]=s[1];source.p[(y+1)*W+x]=s[2];source.p[(y+1)*W+x+1]=s[3];cells[k]=bncam::highlight::defaultRawCellConfidence(s);
    for(unsigned dy=0;dy<2;++dy)for(unsigned dx=0;dx<2;++dx){unsigned p=((y+dy)*W+x+dx)*3;raw[p]=s[0];raw[p+1]=.5f*(s[1]+s[2]);raw[p+2]=s[3];}
   }
-  Push fp;fp.u[0]=W;fp.u[1]=H;fp.u[6]=1;fp.f(14,2.f);fp.f(15,1.f);fp.f(16,1.f);fp.f(17,1.f);fp.u[27]=1;
+  Push fp;fp.u[0]=W;fp.u[1]=H;fp.u[2]=pattern;fp.u[6]=1;fp.f(14,2.f);fp.f(15,1.f);fp.f(16,1.f);fp.f(17,1.f);fp.u[27]=1;
   std::memset(telemetry.p,0,telemetry.bytes);gpu.run(dir+"/spectra_raw_finalize.comp.spv",{&source,&finalized,&empty,&telemetry,&empty},fp.u.data(),112);
-  maxMapError=std::max(maxMapError,error(cells,finalized.p+N));assert(maxMapError<2e-6f);
+  for(unsigned i=0;i<N/4;++i){uint32_t bits;std::memcpy(&bits,finalized.p+N+i,4);float decoded=1.f;for(int ch=0;ch<4;++ch)decoded*=float((bits>>(ch*8))&255u)/255.f;maxMapError=std::max(maxMapError,std::abs(cells[i]-decoded));}assert(maxMapError<2e-6f);
   std::memcpy(rgb.p,raw.data(),N*3*4);std::memset(telemetry.p,0,telemetry.bytes);
   Push cp;cp.u[0]=W;cp.u[1]=H;cp.u[3]=3;std::array<float,9> matrix{1.15f+.05f*lens,-.15f-.05f*lens,0.f,-.13f,1.07f,.06f,.01f,-.6f-.1f*lens,1.59f+.1f*lens};float wr=1.6f+.2f*lens,wb=1.3f+.15f*lens;cp.f(4,wr);cp.f(5,1);cp.f(6,wb);for(int i=0;i<9;++i)cp.f(8+i,matrix[i]);cp.u[23]=1;cp.f(28,1);
   gpu.run(dir+"/spectra_demosaic_resident.comp.spv",{&finalized,&rgb,&color,&stats,&empty,&empty,&telemetry,&empty},cp.u.data(),128,N*4);
@@ -95,12 +95,12 @@ int main(int argc,char**argv){
   gpu.run(dir+"/spectra_tone_resident.comp.spv",{&color,&tone,&empty,&lut,&telemetry,&empty,&empty,&empty,&empty,&empty,&empty,&empty,&empty},tp.u.data(),120);
   for(unsigned p=0;p<N*3;p+=3){Rgb c=pbr(bncam::color::mapSceneToKhronosInput({expected[p],expected[p+1],expected[p+2]}));bncamCompressToUnitGamutPreserveLuma(c.r,c.g,c.b);for(int ch=0;ch<3;++ch)expected[p+ch]=c[ch];}
   maxToneError=std::max(maxToneError,error(expected,tone.p));assert(maxToneError<1e-5f);
-  std::cout<<"synthetic lens="<<lens<<" format="<<(format?"RAW_SENSOR":"RAW10")<<" pixels="<<N<<" passed\n";
+  std::cout<<"synthetic cfa="<<pattern<<" lens="<<lens<<" format="<<(format?"RAW_SENSOR":"RAW10")<<" pixels="<<N<<" passed\n";
  }
- // Continuous highlight response: no premature chroma loss for one/two clipped channels.
- for(int i=0;i<=10000;++i){float v=.9f+.1f*i/10000.f;assert(bncam::highlight::defaultRawCellConfidence({v,.8f,.8f,v})==1.f);}
+ // Trust intact coloured samples exactly; physical saturation loses chromaticity confidence.
+ for(int i=0;i<=10000;++i){float v=.9f+.04f*i/10000.f;assert(bncam::highlight::defaultRawCellConfidence({v,.8f,.8f,v})==1.f);}assert(bncam::highlight::defaultRawCellConfidence({1.f,.8f,.8f,.8f})==0.f);
  float prevConfidence=1.f,prevY=-1.f;
- for(int i=0;i<=10000;++i){float v=.96f+.04f*i/10000.f;float confidence=bncam::highlight::defaultRawCellConfidence({v,v,v,v});assert(confidence<=prevConfidence+1e-6f);assert(prevConfidence-confidence<.002f);prevConfidence=confidence;}
+ for(int i=0;i<=10000;++i){float v=.94f+.06f*i/10000.f;float confidence=bncam::highlight::defaultRawCellConfidence({v,v,v,v});assert(confidence<=prevConfidence+1e-6f);assert(prevConfidence-confidence<4.f/255.f+1e-6f);prevConfidence=confidence;}
  for(int i=0;i<=10000;++i){float v=.7f+3.3f*i/10000.f;float y=pbr({v,v,v}).r;assert(y>prevY);prevY=y;}
  for(float v:{.2f,.5f,.96f,.985f,.99f,.999f,1.f,2.f}){auto c=pbr({v,v,v});assert(std::isfinite(c.r)&&c.r<1.f&&c.r==c.g&&c.g==c.b);}
  // The production classifier must keep bright rectangles insufficient on their own.
@@ -125,11 +125,11 @@ int main(int argc,char**argv){
   assert(std::abs(finalized.p[y*W+x]-expected)<1e-7f);
  }
  std::cout<<"exact unequal Camera2 greens preserved: passed\n";
- // Compile HEAD shaders separately and prove shared Spectra/YUV behavior is bit-identical.
+ // Compare the session frozen accepted baseline: shared Spectra/YUV behavior stays exact.
  for(const char* stage:{"spectra_raw_finalize.comp","spectra_demosaic_resident.comp","spectra_tone_resident.comp","yuv_shared"}){
   std::vector<float> previous;
   for(int baseline=0;baseline<2;++baseline){std::memset(telemetry.p,0,telemetry.bytes);std::string file=dir+"/"+(baseline?"head-":"")+(std::string(stage)=="yuv_shared"?"spectra_tone_resident.comp":stage)+".spv";
-   if(std::string(stage).find("raw_finalize")!=std::string::npos){Push p;p.u[0]=W;p.u[1]=H;p.u[6]=1;p.f(14,2);p.f(15,1);p.f(16,1);p.f(17,1);gpu.run(file,{&source,&finalized,&empty,&telemetry,&empty},p.u.data(),baseline?108:112);if(!baseline)previous.assign(finalized.p,finalized.p+N+N/4);else assert(error(previous,finalized.p)==0);}
+   if(std::string(stage).find("raw_finalize")!=std::string::npos){Push p;p.u[0]=W;p.u[1]=H;p.u[6]=1;p.f(14,2);p.f(15,1);p.f(16,1);p.f(17,1);gpu.run(file,{&source,&finalized,&empty,&telemetry,&empty},p.u.data(),112);if(!baseline)previous.assign(finalized.p,finalized.p+N+N/4);else assert(error(previous,finalized.p)==0);}
    else if(std::string(stage).find("demosaic")!=std::string::npos){Push p;p.u[0]=W;p.u[1]=H;p.u[3]=3;p.f(4,2);p.f(5,1);p.f(6,1.6f);p.f(8,1);p.f(12,1);p.f(16,1);p.f(28,1);gpu.run(file,{&finalized,&rgb,&color,&stats,&empty,&empty,&telemetry,&empty},p.u.data(),128,N*4);if(!baseline)previous.assign(color.p,color.p+N*3);else assert(error(previous,color.p)==0);}
    else{std::memcpy(tone.p,color.p,N*3*4);Push p;p.u[0]=W;p.u[1]=H;p.u[2]=3;p.u[6]=std::string(stage)=="yuv_shared"?0u:1u;p.f(8,1);p.f(9,1);p.f(14,.68f);p.f(15,1);gpu.run(file,{&color,&tone,&empty,&lut,&telemetry,&empty,&empty,&empty,&empty,&empty,&empty,&empty,&empty},p.u.data(),120);if(!baseline)previous.assign(tone.p,tone.p+N*3);else assert(error(previous,tone.p)==0);}
   }

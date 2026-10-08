@@ -1,5 +1,14 @@
 package com.bncam.core.capture
 
+enum class SensorExposureMode(val label: String) {
+    STANDARD_AUTO("Standard Auto"), BN_AUTO("Bn Auto"), MANUAL("Manual");
+
+    companion object {
+        fun fromPersisted(value: String?): SensorExposureMode =
+            entries.firstOrNull { it.name == value || it.label == value } ?: STANDARD_AUTO
+    }
+}
+
 /** Legacy persisted priority enum retained only for decoding older profiles. */
 enum class CaptureExposurePriorityMode(val persistedValue: String) {
     BALANCED("Balanced"),
@@ -93,7 +102,8 @@ data class CaptureExposurePreferences(
     val isoMultiplier: Float = 1.0f,
     val captureEvBias: Float = 0.0f,
     val shotBiasExposure: ShotBiasExposureChoice = ShotBiasExposureChoice.AUTO,
-    val maxFrameExposure: MaxFrameExposureChoice = MaxFrameExposureChoice.SENSOR_MAX
+    val maxFrameExposure: MaxFrameExposureChoice = MaxFrameExposureChoice.SENSOR_MAX,
+    val exposureMode: SensorExposureMode = SensorExposureMode.STANDARD_AUTO
 ) {
     fun sanitized(): CaptureExposurePreferences = copy(
         priorityMode = CaptureExposurePriorityMode.BALANCED,
@@ -108,8 +118,9 @@ data class CaptureExposurePreferences(
      * Camera2 AE compensation so Auto remains genuinely Auto.
      */
     fun requiresAeBaseline(): Boolean =
-        shotBiasExposure != ShotBiasExposureChoice.AUTO ||
-            maxFrameExposure != MaxFrameExposureChoice.SENSOR_MAX
+        exposureMode != SensorExposureMode.BN_AUTO &&
+            (shotBiasExposure != ShotBiasExposureChoice.AUTO ||
+                maxFrameExposure != MaxFrameExposureChoice.SENSOR_MAX)
 
     fun effectivePriorityMode(): CaptureExposurePriorityMode = when {
         shotBiasExposure.useSensorMaxIso || shotBiasExposure.fixedIso != null -> CaptureExposurePriorityMode.ISO_PRIORITY
@@ -118,6 +129,7 @@ data class CaptureExposurePreferences(
     }
 
     fun debugMap(): Map<String, Any> = linkedMapOf(
+        "exposureMode" to exposureMode.name,
         "shotBiasExposure" to shotBiasExposure.persistedValue,
         "maxFrameExposure" to maxFrameExposure.persistedValue,
         "captureEvBias" to captureEvBias,
@@ -136,7 +148,8 @@ data class CaptureExposurePreferences(
             isoMultiplier: Float,
             captureEvBias: Float,
             shotBiasExposure: String? = null,
-            maxFrameExposure: String? = null
+            maxFrameExposure: String? = null,
+            exposureMode: String? = null
         ): CaptureExposurePreferences = CaptureExposurePreferences(
             // Decode legacy values only to keep old files readable; Profile V3 does not execute them.
             priorityMode = CaptureExposurePriorityMode.fromPersisted(priorityMode),
@@ -144,7 +157,8 @@ data class CaptureExposurePreferences(
             isoMultiplier = isoMultiplier,
             captureEvBias = captureEvBias,
             shotBiasExposure = ShotBiasExposureChoice.fromPersisted(shotBiasExposure),
-            maxFrameExposure = MaxFrameExposureChoice.fromPersisted(maxFrameExposure)
+            maxFrameExposure = MaxFrameExposureChoice.fromPersisted(maxFrameExposure),
+            exposureMode = SensorExposureMode.fromPersisted(exposureMode)
         ).sanitized()
     }
 }

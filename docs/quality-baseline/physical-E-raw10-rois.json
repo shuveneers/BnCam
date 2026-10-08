@@ -1,0 +1,60 @@
+{
+  "scope": "Manually declared RAW10 E regions; framing differs from the earlier RAW_SENSOR series. Uncharacterized objects, no absolute color reference. Pencil ROI includes background.",
+  "rois": [
+    {
+      "id": "red_toy_texture",
+      "stage": "FINAL_JPEG",
+      "kind": "COLORED_TEXTURE_PROXY",
+      "box": [
+        2200,
+        1600,
+        200,
+        120
+      ]
+    },
+    {
+      "id": "blue_watch",
+      "stage": "FINAL_JPEG",
+      "kind": "COLORED_OBJECT_PROXY",
+      "box": [
+        1050,
+        1820,
+        180,
+        80
+      ]
+    },
+    {
+      "id": "green_pencils_mixed",
+      "stage": "FINAL_JPEG",
+      "kind": "COLORED_OBJECT_MIXED",
+      "box": [
+        1100,
+        2850,
+        180,
+        350
+      ]
+    },
+    {
+      "id": "yellow_token",
+      "stage": "FINAL_JPEG",
+      "kind": "COLORED_OBJECT_PROXY",
+      "box": [
+        1600,
+        2500,
+        160,
+        120
+      ]
+    },
+    {
+      "id": "dotted_white_paper_proxy",
+      "stage": "FINAL_JPEG",
+      "kind": "PRINTED_WHITE_PAPER_PROXY",
+      "box": [
+        1700,
+        3300,
+        256,
+        128
+      ]
+    }
+  ]
+}

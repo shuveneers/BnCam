@@ -4505,6 +4505,51 @@ Java_com_bncam_core_engine_ImageUtils_validatePhysicalChromaNative(JNIEnv* env,j
             return out;
         };
         report+="GPU\n"+test::run(gpu);
+        // Nonidentity WB/CCM: covariance transport and pixel transport must agree,
+        // including signed/HDR input. Luma identity belongs to the analysis domain.
+        {
+            const std::array<float,3> gains{2.2f,1.f,1.6f};
+            const std::array<float,9> matrix{1.35f,-.31f,-.04f,-.08f,1.23f,-.15f,.02f,-.61f,1.59f};
+            std::array<float,9> transform{};
+            for(int r=0;r<3;++r)for(int c=0;c<3;++c)transform[r*3+c]=matrix[r*3+c]*gains[c];
+            auto n=bncam::spectra2::makeState("TEST","PHYSICAL_COVARIANCE","VALID",1.,
+                    bncam::spectra2::diagonalCovariance(.00015,.00008,.0002));
+            auto model=inColorDomain(fromNoiseState(n,true),n,transform,1.f);
+            if(!model.colorDomain)throw std::runtime_error("WB_CCM model rejected");
+            test::Image input(test::W*test::H);
+            std::mt19937 rng(20261008);std::normal_distribution<float> normal(0,1);
+            for(int y=0;y<test::H;++y)for(int x=0;x<test::W;++x) {
+                float level=x<32?.025f:1.2f;
+                input[y*test::W+x]={level+.012f*normal(rng),level+.009f*normal(rng),level+.014f*normal(rng)};
+            }
+            bncam::vulkan::SpectraResidentColorTransformRequest r{};
+            r.frameWidth=test::W;r.frameHeight=test::H;r.rowStrideFloats=test::W*3;
+            r.rgbData=input[0].data();r.baselinePhysicalChroma=model;r.wbRgb=gains;r.colorMatrix=matrix;
+            r.physicalChromaValidationOnly=true;
+            auto result=bncam::vulkan::VulkanRuntime::instance().executeSpectraResidentAwbCcm(r);
+            if(!result.success||result.outputRgb.size()!=input.size()*3)throw std::runtime_error("WB_CCM GPU unavailable");
+            auto reference=test::reference(input,model);double maxY=0,parity=0;
+            for(size_t i=0;i<input.size();++i) {
+                Pixel out{result.outputRgb[i*3],result.outputRgb[i*3+1],result.outputRgb[i*3+2]};
+                if(!finite(out))throw std::runtime_error("WB_CCM nonfinite");
+                maxY=std::max(maxY,double(std::abs(opponent(transformPixel(transform,out))[0]-opponent(transformPixel(transform,input[i]))[0])));
+                for(int c=0;c<3;++c)parity=std::max(parity,double(std::abs(out[c]-reference[i][c])));
+            }
+            if(maxY>2e-6||parity>2e-6)throw std::runtime_error("WB_CCM luma/parity regression");
+            report+="wbCcmCovarianceDomain maxY="+std::to_string(maxY)+" cpuGpuMax="+std::to_string(parity)+"\n";
+            r.baselinePhysicalLuma=bncam::luma::fromNoiseState(n,true);
+            auto joint=bncam::vulkan::VulkanRuntime::instance().executeSpectraResidentAwbCcm(r);
+            if(!joint.success||joint.outputRgb.size()!=input.size()*3)throw std::runtime_error("WB_CCM joint GPU unavailable");
+            double jointParity=0;
+            auto read=[&](int x,int y){return test::at(input,x,y);};
+            for(int y=0;y<test::H;++y)for(int x=0;x<test::W;++x) {
+                size_t i=y*test::W+x;
+                auto cpu=bncam::luma::filter(x,y,r.baselinePhysicalLuma,reference[i],read,[](int,int){return 1.f;}).pixel;
+                for(int c=0;c<3;++c)jointParity=std::max(jointParity,double(std::abs(cpu[c]-joint.outputRgb[i*3+c])));
+            }
+            if(jointParity>2e-6)throw std::runtime_error("WB_CCM joint parity regression");
+            report+="wbCcmJointImmutableInput cpuGpuMax="+std::to_string(jointParity)+"\n";
+        }
         { std::ostringstream value; value<<std::scientific<<maxParity; report+="cpuGpuMaxRgbDifference="+value.str()+"\n"; }
         // Production resident demosaic -> common chroma boundary, once per final output.
         std::vector<float> mosaic(test::W*test::H,.12f);

@@ -237,6 +237,7 @@ object LibpatcherProfileResolver {
         // values that are temporarily hidden by capability/mode gating. Profile AWB is portable; physical
         // noise/black/white/color-matrix calibration, global app/output settings and legacy duplicate keys remain outside.
         val captureProfileSpecs = listOf(
+            s(CaptureSettingKeys.SENSOR_EXPOSURE_MODE, "STANDARD_AUTO"),
             s(CaptureSettingKeys.SHOT_BIAS_EXPOSURE, "Auto"),
             s(CaptureSettingKeys.SHOT_BIAS_MAX_FRAME_EXPOSURE, "Max exposure time"),
             f(CaptureSettingKeys.CAPTURE_EV_BIAS, 0.0f)

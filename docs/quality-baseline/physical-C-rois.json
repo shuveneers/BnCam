@@ -1,0 +1,8 @@
+{
+  "scope": "Manually inspected physical specular-highlight scene C; JPEG coordinates. Strong reflection is sensor clipped. No attribution of colored edge to a pipeline stage without independent evidence.",
+  "rois": [
+    {"id":"specular_highlight","stage":"FINAL_JPEG","kind":"SPECULAR_HIGHLIGHT","box":[1180,1900,520,240]},
+    {"id":"reflective_dark_surface","stage":"FINAL_JPEG","kind":"REFLECTIVE_TEXTURE_SURFACE","box":[1600,2600,256,128]},
+    {"id":"colored_toy","stage":"FINAL_JPEG","kind":"UNCHARACTERIZED_COLORED_OBJECT","box":[1800,1500,600,360]}
+  ]
+}

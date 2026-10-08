@@ -12,6 +12,7 @@ package com.bncam.core.capture
  */
 enum class PhysicalSensorExposureOwner {
     CAMERA2_HAL_AE,
+    BN_AUTO,
     PROFILE_EXPLICIT_PRIORITY,
     USER_MANUAL_SENSOR
 }
@@ -27,11 +28,16 @@ data class PhysicalSensorExposureAuthorityDecision(
 object PhysicalSensorExposureAuthorityPolicy {
     fun resolve(
         explicitManualSensorRequest: Boolean,
-        profileRequiresExplicitExposurePriority: Boolean
+        profileRequiresExplicitExposurePriority: Boolean,
+        bnAutoRequested: Boolean = false
     ): PhysicalSensorExposureAuthorityDecision = when {
         explicitManualSensorRequest -> PhysicalSensorExposureAuthorityDecision(
             owner = PhysicalSensorExposureOwner.USER_MANUAL_SENSOR,
             reason = "explicit_user_manual_sensor_request"
+        )
+        bnAutoRequested -> PhysicalSensorExposureAuthorityDecision(
+            owner = PhysicalSensorExposureOwner.BN_AUTO,
+            reason = "bn_auto_physical_sensor_authority"
         )
         profileRequiresExplicitExposurePriority -> PhysicalSensorExposureAuthorityDecision(
             owner = PhysicalSensorExposureOwner.PROFILE_EXPLICIT_PRIORITY,

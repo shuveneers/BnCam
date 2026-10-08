@@ -1,0 +1,10 @@
+{
+  "scope": "Manually inspected colored-object scene E. Uncharacterized red toy, blue watch, green pencils, yellow token and dotted white-paper proxy; no absolute color accuracy, Delta-E or calibrated WB claim. Pencil ROI intentionally includes background.",
+  "rois": [
+    {"id":"red_toy_texture","stage":"FINAL_JPEG","kind":"UNCHARACTERIZED_RED_TEXTURE","box":[1850,1300,200,120]},
+    {"id":"blue_watch","stage":"FINAL_JPEG","kind":"UNCHARACTERIZED_BLUE_OBJECT","box":[700,1450,200,100]},
+    {"id":"green_pencils_mixed","stage":"FINAL_JPEG","kind":"UNCHARACTERIZED_GREEN_OBJECT_MIXED","box":[800,2300,230,400]},
+    {"id":"yellow_token","stage":"FINAL_JPEG","kind":"UNCHARACTERIZED_YELLOW_TEXTURE","box":[1270,2240,160,120]},
+    {"id":"dotted_white_paper_proxy","stage":"FINAL_JPEG","kind":"WHITE_PRINTED_PAPER_PROXY","box":[1500,2800,256,128]}
+  ]
+}

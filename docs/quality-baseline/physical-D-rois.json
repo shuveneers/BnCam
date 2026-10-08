@@ -1,0 +1,11 @@
+{
+  "scope": "Manually inspected fine-detail scene D; rendered JPEG coordinates. Cloth and printed packaging are scene texture, not sensor-noise flats. Printed color is uncharacterized.",
+  "rois": [
+    {"id":"woven_fabric","stage":"FINAL_JPEG","kind":"FINE_REPEATING_FABRIC","box":[1500,2900,800,650]},
+    {"id":"small_package_text","stage":"FINAL_JPEG","kind":"FINE_PRINTED_TEXT","box":[760,800,600,900]},
+    {"id":"card_text","stage":"FINAL_JPEG","kind":"PRINTED_TEXT","box":[1450,2140,800,200]},
+    {"id":"card_blank_proxy","stage":"FINAL_JPEG","kind":"UNCHARACTERIZED_PRINTED_FLAT_PROXY","box":[1650,2350,256,96]},
+    {"id":"colored_card_texture","stage":"FINAL_JPEG","kind":"FINE_COLORED_PRINT","box":[1500,1500,700,340]},
+    {"id":"card_edge","stage":"FINAL_JPEG","kind":"EDGE","profileAxis":"x","box":[1330,2100,180,16]}
+  ]
+}

@@ -85,7 +85,7 @@ $fixtureEvidence = Join-Path $evidenceRoot ("fixture-" + [guid]::NewGuid().ToStr
 Invoke-Checked $Adb @('-s',$Serial,'pull',$Fixture,$fixtureEvidence) (Join-Path $evidenceRoot 'pull-fixture.log')
 $fixtureEvidence | Set-Content (Join-Path $evidenceRoot 'fixture-directory.txt')
 Invoke-Checked 'python' @('scripts\single_frame_qualification.py','benchmark','--directory',$fixtureEvidence) (Join-Path $evidenceRoot 'benchmark-summary.log')
-$benchmarkSummary = Get-Content -LiteralPath 'docs\single-frame-qualification\warm-benchmark-summary.json' -Raw | ConvertFrom-Json
+$benchmarkSummary = Get-Content -LiteralPath 'work\single-frame-qualification\warm-benchmark-summary.json' -Raw | ConvertFrom-Json
 foreach ($pathResult in $benchmarkSummary.PSObject.Properties | Where-Object { $_.Name -match '^[012]$' }) {
     if (-not $pathResult.Value.rankingQualified) {
         throw "Benchmark not qualified for $($pathResult.Value.path): thermal/unknown timing/determinism. Measurements were preserved."

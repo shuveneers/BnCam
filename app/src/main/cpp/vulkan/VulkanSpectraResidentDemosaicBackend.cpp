@@ -1250,6 +1250,7 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
     // Common chroma engine is fused before AWB, with immutable post-demosaic RGB evidence.
     const auto& noise=request.baselinePhysicalChroma;
     const bool physicalChromaReady=noise.valid();
+    push.ccm[11]=noise.colorDomain?1.f:0.f;
     push.cfaEvidence0[0] = noise.y;
     push.cfaEvidence0[1] = noise.rg;
     push.cfaEvidence0[2] = noise.bg;
@@ -1447,6 +1448,8 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
     result.cloudMeanAbsCorrectionBG = 0.0;
     result.cloudAffectedPixelFraction = 0.0;
     const auto* phase9 = static_cast<const std::uint32_t*>(colorTelemetry_.mapped);
+    result.chromaInputNonfinitePixels=phase9[18];
+    result.colorOutputNonfinitePixels=phase9[19];
     result.phase9SensorClipCandidatePixels = phase9[0];
     result.phase9SingleChannelSensorClipPixels = phase9[1];
     result.phase9MultiChannelSensorClipPixels = phase9[2];

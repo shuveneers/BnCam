@@ -21,51 +21,58 @@ float physicalChromaShape(ivec2 p) {
     s*=s;
     return sqrt(mix(mix(s.x,s.y,f.x),mix(s.z,s.w,f.x),f.y));
 }
-float physicalChromaDistance(vec3 a,vec3 b,vec4 m,float scale) {
-    if(!physicalChromaFinite(b)) return 1e20;
-    float rho=clamp(m.w/(sqrt(m.y)*sqrt(m.z)),-1.0,1.0);
-    float u=(a.y-b.y)/sqrt(m.y),v=(a.z-b.z)/sqrt(m.z);
-    float dc=0.5*((u+v)*(u+v)/(1.0+rho+1e-5)+(u-v)*(u-v)/(1.0-rho+1e-5));
-    float dy=a.x-b.x;
-    return dc/scale+dy*dy/(m.x*scale);
-}
 vec3 physicalChromaRead(ivec2 p) {
     p=clamp(p,ivec2(0),ivec2(pc.frameWidth,pc.frameHeight)-1);
     uint i=(uint(p.y)*pc.frameWidth+uint(p.x))*3u;
     return vec3(outputRgb[i],outputRgb[i+1u],outputRgb[i+2u]);
 }
+// Exact linear WB/CCM analysis; same production colour transform still runs once.
+mat3 physicalChromaTransform() {
+    if(pc.padding3<0.5)return mat3(1);
+    return mat3(vec3(pc.ccm0,pc.ccm3,pc.ccm6)*pc.wbR,
+                vec3(pc.ccm1,pc.ccm4,pc.ccm7)*pc.wbG,
+                vec3(pc.ccm2,pc.ccm5,pc.ccm8)*pc.wbB);
+}
+float physicalChromaShrink(float eigen) {
+    return eigen>=16.0?0.0:min(1.0,1.0/max(1.0,eigen));
+}
 vec3 physicalChromaDenoise(ivec2 xy,vec3 inputRgb,out vec2 authority) {
     authority=vec2(0);
     if(pc.cfaEvidence1.w<0.5 || !physicalChromaFinite(inputRgb)) return inputRgb;
-    vec4 m=pc.cfaEvidence0; // variance Y, RG, BG; covariance RG/BG
-    vec3 p=opponentAtRgb(inputRgb);
-    float s=physicalChromaShape(xy); s*=s;
-    float v=0.5*(m.y+m.z)*s;
-    float a=v/(v+0.01*p.x*p.x);
-    a*=1.0+0.75*physicalNoisePressure(v,p.x);
-    vec2 hs=p.yz,ls=p.yz; float hw=1.0,lw=1.0;
-    for(int dy=-1;dy<=1;++dy) for(int dx=-1;dx<=1;++dx) {
-        if(dx==0&&dy==0) continue;
-        ivec2 offset=ivec2(dx,dy);
-        vec3 q=opponentAtRgb(physicalChromaRead(xy+offset));
-        float ns=physicalChromaShape(xy+offset);
-        float d=physicalChromaDistance(p,q,m,s+ns*ns);
-        float w=exp(-0.25*d);
-        if(physicalChromaFinite(q)) {hs+=w*q.yz;hw+=w;}
-        vec3 mid=opponentAtRgb(physicalChromaRead(xy+2*offset));
-        vec3 far=opponentAtRgb(physicalChromaRead(xy+3*offset));
-        float ms=physicalChromaShape(xy+2*offset),fs=physicalChromaShape(xy+3*offset);
-        float gate=max(d,max(physicalChromaDistance(p,mid,m,s+ms*ms),physicalChromaDistance(p,far,m,s+fs*fs)));
-        float wl=exp(-gate);
-        if(physicalChromaFinite(far)) {ls+=wl*far.yz;lw+=wl;}
+    vec4 m=pc.cfaEvidence0;
+    mat3 transform=physicalChromaTransform();
+    vec3 p=opponentAtRgb(transform*inputRgb);
+    float s=physicalChromaShape(xy);s*=s;
+    float sr=sqrt(m.y*s),sb=sqrt(m.z*s);
+    float rho=clamp(m.w/sqrt(m.y*m.z),-0.99999,0.99999),tail=sqrt(1.0-rho*rho);
+    vec2 mean=vec2(0);vec3 moment=vec3(0);float weight=0.0,weight2=0.0;
+    for(int dy=-2;dy<=2;++dy) for(int dx=-2;dx<=2;++dx) {
+        ivec2 pos=xy+ivec2(dx,dy);
+        vec3 q=opponentAtRgb(transform*physicalChromaRead(pos));
+        if(!physicalChromaFinite(q))continue;
+        float ns=physicalChromaShape(pos),yd=q.x-p.x;
+        float w=exp(-yd*yd/(4.0*m.x*(s+ns*ns)));
+        float u=(q.y-p.y)/sr,v=((q.z-p.z)/sb-rho*u)/tail;
+        mean+=w*vec2(u,v);moment+=w*vec3(u*u,v*v,u*v);weight+=w;weight2+=w*w;
     }
-    float support=0.75*(1.0-1.0/hw)+0.25*(1.0-1.0/lw);
-    if(support>0.0)a=min(a,0.90/support);
-    vec2 c=p.yz+a*(0.75*(hs/hw-p.yz)+0.25*(ls/lw-p.yz));
-    if(all(equal(c,p.yz))) return inputRgb;
-    float g=p.x-0.2126*c.x-0.0722*c.y;
-    vec3 result=vec3(g+c.x,g,g+c.y);
-    if(!physicalChromaFinite(result)) return inputRgb;
-    authority=a*vec2(0.75*(1.0-1.0/hw),0.25*(1.0-1.0/lw));
-    return result; // no clipping, no Y averaging, no saturation adjustment
+    if(!(weight>1.001))return inputRgb;
+    mean/=weight;
+    vec3 cov=(moment/weight-vec3(mean.x*mean.x,mean.y*mean.y,mean.x*mean.y))*
+        (weight*weight/max(1e-6,weight*weight-weight2));
+    float a=max(0.0,cov.x),d=max(0.0,cov.y),b=cov.z;
+    float gap=sqrt((a-d)*(a-d)+4.0*b*b);
+    float lo=max(0.0,0.5*(a+d-gap)),hi=0.5*(a+d+gap);
+    float sl=physicalChromaShrink(lo),sh=physicalChromaShrink(hi);
+    vec2 delta=sl*mean;
+    if(gap>1e-5)delta+=(sh-sl)/gap*vec2((a-lo)*mean.x+b*mean.y,b*mean.x+(d-lo)*mean.y);
+    float v=0.5*(m.y+m.z)*s;
+    float strength=min(0.90,v/(v+0.01*p.x*p.x));
+    if(strength<1e-6)return inputRgb;
+    vec2 chromaDelta=strength*vec2(sr*delta.x,sb*(rho*delta.x+tail*delta.y));
+    float gd=-0.2126*chromaDelta.x-0.0722*chromaDelta.y;
+    vec3 correction=vec3(gd+chromaDelta.x,gd,gd+chromaDelta.y);
+    vec3 result=inputRgb+inverse(transform)*correction;
+    if(!physicalChromaFinite(result))return inputRgb;
+    authority=vec2(strength,0);
+    return result;
 }

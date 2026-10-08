@@ -239,7 +239,13 @@ def main():
     p.add_argument('--adb',default=str(pathlib.Path.home()/'AppData/Local/Android/Sdk/platform-tools/adb.exe'))
     p.add_argument('--serial');p.add_argument('--scene',default='CURRENT_UNCONTROLLED')
     p.add_argument('--count',type=int)
+    p.add_argument('--output-directory',help='Evidence destination; runtime data defaults to ignored work/.')
     a=p.parse_args()
+    global OUT
+    if a.output_directory:
+        OUT=pathlib.Path(a.output_directory)
+    elif a.action!='debt':
+        OUT=ROOT/'work/single-frame-qualification'
     if a.action=='debt':debt(a.directory)
     elif a.action=='benchmark':benchmark(a.directory)
     else:

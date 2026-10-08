@@ -1,0 +1,11 @@
+{
+  "scope": "Manually inspected physical indoor scene A; coordinates in 3072x4096 rendered JPEG. White paper is an uncharacterized neutral proxy. Desk/plant texture variance is not isolated noise. Edge proxy includes lens blur, slight slant and processing.",
+  "rois": [
+    {"id":"blank_white_paper","stage":"FINAL_JPEG","kind":"WHITE_PAPER_PROXY","box":[1800,3050,256,96]},
+    {"id":"dark_desk_texture","stage":"FINAL_JPEG","kind":"DARK_TEXTURE_SURFACE","box":[250,3000,256,128]},
+    {"id":"printed_text","stage":"FINAL_JPEG","kind":"PRINTED_TEXT","box":[1460,2050,900,700]},
+    {"id":"plant_structure","stage":"FINAL_JPEG","kind":"FINE_NATURAL_STRUCTURE","box":[1000,230,520,600]},
+    {"id":"paper_edge","stage":"FINAL_JPEG","kind":"EDGE","profileAxis":"x","box":[1180,2680,240,16]},
+    {"id":"red_scissors","stage":"FINAL_JPEG","kind":"COLORED_OBJECT_MIXED","box":[1290,1950,120,100]}
+  ]
+}

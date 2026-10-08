@@ -67,7 +67,11 @@ int main() {
     double oldPower=0,newPower=0,oldHf=0,newHf=0,maxY=0;
     for(int y=4;y<H-4;++y)for(int x=4;x<W-4;++x) {
         chroma::Model m{sigma*sigma,sigma*sigma,sigma*sigma,0};
-        auto a=chroma::filter(x,y,m,read,shape,false),b=chroma::filter(x,y,m,read,shape);
+        // The local covariance estimator replaced the legacy pressure toggle.
+        // Identical samples must receive more cleanup when physical variance
+        // explains their residual, rather than when variance is underestimated.
+        chroma::Model reduced{m.y*.25f,m.rg*.25f,m.bg*.25f,0};
+        auto a=chroma::filter(x,y,reduced,read,shape),b=chroma::filter(x,y,m,read,shape);
         auto pa=chroma::opponent(a.pixel),pb=chroma::opponent(b.pixel);
         oldPower+=pa[1]*pa[1]+pa[2]*pa[2];newPower+=pb[1]*pb[1]+pb[2]*pb[2];
         oldHf+=a.hf;newHf+=b.hf;maxY=std::max(maxY,double(std::abs(pb[0]-chroma::opponent(read(x,y))[0])));

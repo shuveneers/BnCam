@@ -6831,6 +6831,11 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         baselinePhysicalChroma.cross *= fusionScale;
     }
     if (!bncam::luma::debugEnabled.load()) baselinePhysicalLuma = {};
+    std::array<float,9> chromaColorTransform{};
+    for(int r=0;r<3;++r)for(int c=0;c<3;++c)chromaColorTransform[r*3+c]=ccm[r*3+c]*wbRgb[c];
+    baselinePhysicalChroma=bncam::chroma::inColorDomain(baselinePhysicalChroma,
+            residualNoiseState.postDemosaic,chromaColorTransform,
+            neuralPosteriorSeedApplied?1.f:meta.calibration.physicalFusionVarianceScale);
     // Downstream covariance stays a conservative pre-filter prediction: adaptive support is
     // data-dependent. Do not claim a measured posterior from a global colour-field variance.
     bncam::spectra2::NoiseState preWbNoiseState = residualNoiseState.postDemosaic;
@@ -7023,9 +7028,13 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             linearRgb = runCpuDemosaicFallback();
             vulkanDemosaicResident = false;
         }
+        // Both residual owners read the same immutable demosaic. Chroma preserves
+        // analysis-domain Y; its inverse colour transform need not preserve camera Y.
+        const cv::Mat physicalSource=(baselinePhysicalChroma.valid()||baselinePhysicalLuma.valid())
+                ?linearRgb.clone():cv::Mat{};
         // Typed GPU failure recovery uses the same immutable-input chroma estimator once.
         if (baselinePhysicalChroma.valid()) {
-            const cv::Mat source = linearRgb.clone();
+            const cv::Mat& source = physicalSource;
             cv::parallel_for_(cv::Range(0, linearRgb.rows), [&](const cv::Range& rows) {
                 auto read = [&](int x,int y) {
                     const auto p=source.at<cv::Vec3f>(std::clamp(y,0,source.rows-1),std::clamp(x,0,source.cols-1));
@@ -7044,7 +7053,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             });
         }
         if (baselinePhysicalLuma.valid()) {
-            const cv::Mat source = linearRgb.clone();
+            const cv::Mat& source = physicalSource;
             cv::parallel_for_(cv::Range(0, source.rows), [&](const cv::Range& rows) {
                 auto read = [&](int x,int y) {
                     auto p=source.at<cv::Vec3f>(std::clamp(y,0,source.rows-1),std::clamp(x,0,source.cols-1));
@@ -7057,7 +7066,9 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                             g_spatialNoiseMap.tileSigma.data());
                 };
                 for(int y=rows.start;y<rows.end;++y) for(int x=0;x<source.cols;++x) {
-                    auto p=bncam::luma::filter(x,y,baselinePhysicalLuma,read(x,y),read,shape).pixel;
+                    auto current=linearRgb.at<cv::Vec3f>(y,x);
+                    auto p=bncam::luma::filter(x,y,baselinePhysicalLuma,
+                            bncam::luma::Pixel{current[0],current[1],current[2]},read,shape).pixel;
                     linearRgb.at<cv::Vec3f>(y,x)={p[0],p[1],p[2]};
                 }
             });
@@ -9452,6 +9463,10 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             // END_PHYSICAL_MODEL_ONLY
             << "; baselinePhysicalChroma={enabled=" << (baselinePhysicalChroma.valid()?"true":"false")
             << ";spectraIndependent=true;inputDomain=POST_DEMOSAIC_LINEAR_RGB;noiseModel=PHYSICAL_SO_PROPAGATED"
+            << ";analysisDomain=" << (baselinePhysicalChroma.colorDomain?"WB_CCM_LINEAR_RGB":"CAMERA_LINEAR_RGB")
+            << ";inputNonfinitePixels=" << vulkanColorTransform.chromaInputNonfinitePixels
+            << ";colorOutputNonfinitePixels=" << vulkanColorTransform.colorOutputNonfinitePixels
+            << ";estimator=LOCAL_COVARIANCE_WIENER_444;lumaIdentityDomain=ANALYSIS_DOMAIN"
             << ";status=" << preWbNoiseState.status
             << ";gpuExecuted=" << (vulkanColorTransform.baselinePhysicalChromaApplied?"true":"false")
             << ";predictedSigmaY=" << std::sqrt(baselinePhysicalChroma.y)
@@ -9460,9 +9475,9 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << ";predictedCovarianceRgBg=" << baselinePhysicalChroma.cross
             << ";measurementStatus=" << (vulkanColorTransform.success ? "GPU_MEASURED" : "UNAVAILABLE_CPU_FALLBACK")
             << ";adaptiveNoisePressureMean=" << vulkanColorTransform.chromaNoisePressureMean
-            << ";availableHfCapMean=" << (0.75*(1.0+0.75*vulkanColorTransform.chromaNoisePressureMean))
-            << ";availableLfCapMean=" << (0.25*(1.0+0.75*vulkanColorTransform.chromaNoisePressureMean))
-            << ";adaptiveSupportLimit=0.90;pressureDomain=LOCAL_POST_DEMOSAIC_RESIDUAL;downstreamGainCounted=false"
+            << ";availableHfCapMean=0.90;availableLfCapMean=0"
+            << ";adaptiveSupportLimit=0.90;pressureDomain=ANALYSIS_DOMAIN;downstreamGainCounted="
+            << (baselinePhysicalChroma.colorDomain?"true":"false")
             << ";hfAuthorityMean=" << vulkanColorTransform.chromaHfAuthorityMean
             << ";lfAuthorityMean=" << vulkanColorTransform.chromaLfAuthorityMean
             << ";affectedPixelFraction=" << vulkanColorTransform.chromaAffectedFraction
@@ -10376,7 +10391,9 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << phase9ColorDebug.calibratedHueSatMapAppliedPixels
             << "; phase9CalibratedHueSatMapProfileBytes="
             << phase9ColorDebug.calibratedHueSatMapProfileBytes
-            << "; phase9SourceRawConfidencePropagation=2X2_BAYER_CELL_MIN_CONFIDENCE_PLUS_BOUNDED_3X3_DEMOSAIC_FOOTPRINT"
+            << "; phase9SourceRawConfidencePropagation="
+            << (neutralDefaultRaw ? "PER_CFA_QUINTIC_UNORM8_CUBIC_BSPLINE_444"
+                                  : "2X2_BAYER_CELL_MIN_CONFIDENCE_PLUS_BOUNDED_3X3_DEMOSAIC_FOOTPRINT")
             << "; phase9LegacyDemosaicConfidenceRole=DIAGNOSTIC_AND_TYPED_CPU_FALLBACK_ONLY"
             << "; phase9SingleChannelSensorClipPixels=" << phase9ColorDebug.singleChannelSensorClipPixels
             << "; phase9MultiChannelSensorClipPixels=" << phase9ColorDebug.multiChannelSensorClipPixels

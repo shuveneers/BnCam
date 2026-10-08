@@ -40,6 +40,7 @@ object CaptureSettingKeys {
     const val EXPOSURE_PRIORITY_MODE = "capture_exposure_priority_mode"
     const val SHUTTER_PRIORITY_MULTIPLIER = "capture_shutter_priority_multiplier"
     const val ISO_PRIORITY_MULTIPLIER = "capture_iso_priority_multiplier"
+    const val SENSOR_EXPOSURE_MODE = "sensor_exposure_mode"
     const val CAPTURE_EV_BIAS = "capture_ev_bias"
     const val SHOT_BIAS_EXPOSURE = "shot_bias_exposure"
     const val SHOT_BIAS_MAX_FRAME_EXPOSURE = "shot_bias_max_frame_exposure"
@@ -89,6 +90,7 @@ object CaptureSettingsSchema {
     private val multiOnly = setOf(CaptureMode.MULTI)
 
     val definitions: List<CaptureSettingDefinition> = listOf(
+        active(CaptureSettingKeys.SENSOR_EXPOSURE_MODE, "Exposure mode", CaptureSettingType.STRING, "STANDARD_AUTO", "STANDARD_AUTO|BN_AUTO|MANUAL", CaptureSettingVisibility.PRO),
         active(CaptureSettingKeys.FRAME_SOURCE, "Frame Source", CaptureSettingType.ENUM, "YUV", "YUV|RAW10|RAW_SENSOR", CaptureSettingVisibility.PRO, session = true),
         active(CaptureSettingKeys.CAPTURE_MODE, "Capture Mode", CaptureSettingType.ENUM, "SINGLE", "SINGLE|MULTI", CaptureSettingVisibility.PRO, session = true),
         active(CaptureSettingKeys.OUTPUT_POLICY, "Output Policy", CaptureSettingType.ENUM, "JPEG", "JPEG|JPEG_PLUS_RAW|RAW_ONLY", CaptureSettingVisibility.PRO),

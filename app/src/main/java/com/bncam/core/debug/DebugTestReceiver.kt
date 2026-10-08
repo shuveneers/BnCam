@@ -62,6 +62,12 @@ class DebugTestReceiver : BroadcastReceiver() {
             if (com.bncam.BuildConfig.DEBUG && intent.hasExtra("qualification_scene")) {
                 QualificationEvidence.scene = intent.getStringExtra("qualification_scene")?.takeIf { it.isNotBlank() }
             }
+            if (com.bncam.BuildConfig.DEBUG && intent.hasExtra("quality_scene")) {
+                val scene = intent.getStringExtra("quality_scene")
+                val role = intent.getStringExtra("quality_lens_role") ?: "UNDECLARED"
+                QualityCaptureReplay.request = scene?.takeIf { it.matches(Regex("[A-Za-z0-9_-]{1,64}")) }
+                    ?.let { QualityCaptureReplay.Request(it, role, intent.getIntExtra("quality_repetition", 1)) }
+            }
             val pendingResult = goAsync()
             kotlinx.coroutines.runBlocking(Dispatchers.IO) {
                 try {
@@ -77,6 +83,19 @@ class DebugTestReceiver : BroadcastReceiver() {
                     val activeLens = repo.activeLensIdFlow.first() ?: "0"
                     val lensId = intent.getStringExtra("lens_id") ?: activeLens
                     val stableKey = StableLensKey.fromString(lensId)
+
+                    if (com.bncam.BuildConfig.DEBUG && intent.hasExtra("active_frame_source")) {
+                        com.bncam.core.engine.BnCameraManager.activeInstance?.setDebugActiveFrameSource(
+                            intent.getStringExtra("active_frame_source")!!.uppercase(), repo)
+                    }
+                    if (com.bncam.BuildConfig.DEBUG && intent.hasExtra("output_policy")) {
+                        repo.setOutputPolicy(com.bncam.core.capture.OutputPolicy.parse(intent.getStringExtra("output_policy")))
+                    }
+                    if (com.bncam.BuildConfig.DEBUG && intent.hasExtra("exposure_mode")) {
+                        val exposureMode = com.bncam.core.capture.SensorExposureMode.fromPersisted(intent.getStringExtra("exposure_mode"))
+                        com.bncam.core.engine.BnCameraManager.activeInstance?.setDebugSensorExposureMode(exposureMode, repo)
+                        Log.i("DebugTestReceiver", "SET_TEST_CONFIG exposure_mode=$exposureMode")
+                    }
 
                     val meteringStyle = intent.getStringExtra("metering_style")
                     if (meteringStyle != null) {

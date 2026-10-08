@@ -145,8 +145,10 @@ int main(int argc,char**argv) {
             cpuRegression();auto linear=normalizeRawForJpeg(raw.data(),info);check(linear.diagnostics.valid,"normalization");
             numerical(runtime,linear.mosaic,cfa,iso,root);runtime.shutdown();return 0;
         }
-        check(action=="benchmark","unknown action");
-        const int measured=argc>3?std::stoi(argv[3]):10;check(measured>=10,"minimum 10 measured samples");
+        const bool replayOnly=action=="replay";
+        check(action=="benchmark"||replayOnly,"unknown action");
+        const int measured=replayOnly?0:(argc>3?std::stoi(argv[3]):10);
+        check(replayOnly||measured>=10,"minimum 10 measured samples");
         std::string fixtureLens;
         std::ifstream lensFile(root+"/lens-id.txt");lensFile>>fixtureLens;
         if(fixtureLens.empty()) {
@@ -169,6 +171,15 @@ int main(int argc,char**argv) {
         if(capture){capture>>meta.calibration.signalModelConfidence;for(int i=0;i<4;++i)capture>>meta.calibration.effectiveS[i]>>meta.calibration.effectiveO[i];
             capture>>meta.lensShadingRows>>meta.lensShadingColumns;meta.lensShadingMap.resize(size_t(meta.lensShadingRows)*meta.lensShadingColumns*4);
             for(auto&v:meta.lensShadingMap)capture>>v;check(!capture.fail(),"capture metadata");meta.lensShadingFromMetadata=true;meta.calibration.physicalNoiseJniPayloadReceived=true;}
+        int rotation=90;
+        std::ifstream frozen(root+"/replay-context.txt");
+        if(frozen) {
+            frozen>>rotation>>meta.captureExposureTimeNs>>meta.demosaicFocusStabilityKnown
+                  >>meta.demosaicFocusStabilityConfidence>>meta.demosaicFocusSharpConfidence
+                  >>meta.demosaicFocusMotionRisk>>meta.demosaicFocusVelocityDioptersPerSec
+                  >>meta.demosaicPredictiveAfConfidence;
+            check(!frozen.fail(),"frozen replay context");
+        }
         auto acquireThermal=reinterpret_cast<AThermalManager*(*)()>(dlsym(RTLD_DEFAULT,"AThermal_acquireManager"));
         auto getThermal=reinterpret_cast<AThermalStatus(*)(AThermalManager*)>(dlsym(RTLD_DEFAULT,"AThermal_getCurrentThermalStatus"));
         auto releaseThermal=reinterpret_cast<void(*)(AThermalManager*)>(dlsym(RTLD_DEFAULT,"AThermal_releaseManager"));
@@ -176,7 +187,7 @@ int main(int argc,char**argv) {
         std::mt19937 random(20261007);std::vector<unsigned char> reference[3];
         std::ofstream csv(root+"/warm-benchmark.csv");
         csv<<"round,mode,warmup,thermal,thermalAfter,rssBeforeKb,rssAfterKb,nativeBeforeBytes,nativeAfterBytes,fixtureReadMs,normalizeMs,pipelineMs,totalMs,bitexact\n";
-        for(int round=0;round<measured+3;++round) {
+        for(int round=0;round<(replayOnly?2:measured+3);++round) {
             std::array<int,3> order{0,1,2};std::shuffle(order.begin(),order.end(),random);
             for(int mode:order) {
                 int thermalStatus=thermal?int(getThermal(thermal)):-1;
@@ -184,7 +195,7 @@ int main(int argc,char**argv) {
                 auto totalStart=Clock::now();auto normalizeStart=Clock::now();
                 auto linear=normalizeRawForJpeg(raw.data(),info);check(linear.diagnostics.valid,"normalization");double normalizeMs=ms(normalizeStart);
                 meta.requestedDemosaicMode=mode;std::string debug;auto pipelineStart=Clock::now();
-                auto jpeg=IspCore::renderRawBaselineJpeg(std::move(linear),meta,quality,&debug,90);
+                auto jpeg=IspCore::renderRawBaselineJpeg(std::move(linear),meta,quality,&debug,rotation);
                 double pipelineMs=ms(pipelineStart),totalMs=ms(totalStart);check(!jpeg.empty(),"empty JPEG");
                 int thermalAfter=thermal?int(getThermal(thermal)):-1;
                 bool bitexact=reference[mode].empty()||reference[mode]==jpeg;
@@ -193,7 +204,7 @@ int main(int argc,char**argv) {
                 // Exports happen after measured wall time. Diagnostics construction is included.
                 std::string stem="warm-"+std::to_string(round)+"-"+std::to_string(mode);
                 std::ofstream(root+"/"+stem+".txt")<<debug;
-                if(round==3){std::ofstream out(root+"/warm-mode-"+std::to_string(mode)+".jpg",std::ios::binary);out.write(reinterpret_cast<const char*>(jpeg.data()),jpeg.size());}
+                if(round==3||replayOnly){std::ofstream out(root+"/"+(replayOnly?stem:"warm-mode-"+std::to_string(mode))+".jpg",std::ios::binary);out.write(reinterpret_cast<const char*>(jpeg.data()),jpeg.size());}
                 csv<<round<<','<<mode<<','<<(round<3)<<','<<thermalStatus<<','<<thermalAfter<<','<<before<<','<<after<<','<<heapBefore<<','<<heapAfter<<','<<fixtureReadMs<<','<<normalizeMs<<','<<pipelineMs<<','<<totalMs<<','<<bitexact<<'\n';csv.flush();
                 std::cout<<stem<<" thermal="<<thermalStatus<<" totalMs="<<totalMs<<" bitexact="<<bitexact<<std::endl;
                 check(bitexact,"warm JPEG nondeterminism");

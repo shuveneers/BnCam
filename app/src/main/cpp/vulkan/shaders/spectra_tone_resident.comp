@@ -808,12 +808,22 @@ vec3 applyBroadShadowPlacement(vec3 color) {
     // telemetry-backed parameters are zero, so this stage is exact identity as well.
     float localLift = clamp(fllfParam(10u, 0.0), 0.0, 1.35);
     float localStrength = clamp(fllfParam(8u, 0.0), 0.0, 0.92);
-    float maxLiftEv = clamp(0.70 * localLift + 0.15 * localStrength - 0.05, 0.0, 0.95);
+    // Broad placement supplements the signed local Laplacian correction. Keep
+    // its independent lift below one half-stop instead of washing dark regions
+    // toward grey with a second nearly one-stop shadow lift.
+    float maxLiftEv = clamp(0.36 * localLift + 0.10 * localStrength - 0.05, 0.0, 0.50);
     if (maxLiftEv <= 1.0e-5) return color;
     float y = max(0.0, lumaOf(color));
     if (y <= 1.0e-8) return color;
-    float blackGuard = smoothstep(0.006, 0.032, y);
-    float shadowWindow = 1.0 - smoothstep(0.105, 0.340, y);
+    // A rational black anchor avoids the narrow linear-Y gate's extra acutance.
+    // Its logarithmic gain slope is bounded by maxLiftEv*ln(2)/2; black stays
+    // pinned and the mapping approaches identity continuously at the origin.
+    float blackGuard = y * y / (y * y + 0.024 * 0.024);
+    // Fade over luminance stops rather than a short linear interval. The old
+    // fade could collapse relative contrast to 0.007 at the allowed lift limit.
+    // This C2 window and the lift bound keep relative contrast above 0.72.
+    float t = clamp(log2(y / 0.05) / 3.32192809489, 0.0, 1.0);
+    float shadowWindow = 1.0 - t*t*t*(t*(t*6.0 - 15.0) + 10.0);
     return color * exp2(maxLiftEv * blackGuard * shadowWindow);
 }
 

@@ -733,6 +733,22 @@ float phase9ColorConfidence(vec3 raw, uint hardClipMask) {
     return clamp(1.0 - pressure, 0.0, 1.0);
 }
 
+
+vec4 highlightWeights(float t) {
+    float a=1.0-t;return vec4(a*a*a,3.0*t*t*t-6.0*t*t+4.0,-3.0*t*t*t+3.0*t*t+3.0*t+1.0,t*t*t)/6.0;
+}
+float highlightQ(vec2 pixel) {
+    ivec2 size=ivec2((pc.frameWidth+1u)/2u,(pc.frameHeight+1u)/2u);
+    vec2 cell=pixel*0.5-0.25;ivec2 at=ivec2(floor(cell));
+    vec4 wx=highlightWeights(fract(cell.x)),wy=highlightWeights(fract(cell.y));
+    float q=0.0;
+    for(int j=0;j<4;++j)for(int i=0;i<4;++i){
+        ivec2 p=clamp(at+ivec2(i-1,j-1),ivec2(0),size-1);
+        vec4 c=unpackUnorm4x8(floatBitsToUint(inputMosaic[uint(p.y*size.x+p.x)]));
+        q+=wx[i]*wy[j]*(c.x*c.y*c.z*c.w);
+    }
+    return clamp(q,0.0,1.0);
+}
 bool phase9SourceRawConfidenceAvailable() {
     // Mode 3 repurposes cfaEvidence1.x as a generation-validated availability bit.
     return pc.cfaEvidence1.x > 0.5;
@@ -748,6 +764,8 @@ float phase9SourceRawConfidenceCell(int cellX, int cellY) {
 }
 
 float phase9SourceRawColorConfidence(int x, int y) {
+    if(pc.padding4!=0u)return highlightQ(vec2(x,y));
+    // Legacy routes retain their previous bilinear confidence policy.
     // Bilinear interpolation across the 2x2 Bayer cell confidence map eliminates
     // pixel-block quantization, giving continuous C0 confidence transitions.
     float cx = float(x) * 0.5 - 0.25;
@@ -761,9 +779,6 @@ float phase9SourceRawColorConfidence(int x, int y) {
     float c01 = phase9SourceRawConfidenceCell(x0, y0 + 1);
     float c11 = phase9SourceRawConfidenceCell(x0 + 1, y0 + 1);
     float centerConf = mix(mix(c00, c10, fx), mix(c01, c11, fx), fy);
-    if (pc.padding4 != 0u) {
-        return max(phase9SourceRawConfidenceCell(x / 2, y / 2), centerConf);
-    }
     float minNeighbour = min(min(c00, c10), min(c01, c11));
     float confidence = mix(centerConf, min(centerConf, minNeighbour), 0.35);
     return clamp(confidence, 0.0, 1.0);
@@ -960,6 +975,7 @@ void main() {
     if (inside) {
         uint index = (gid.y * pc.frameWidth + gid.x) * 3u;
         vec3 rawInput = vec3(outputRgb[index + 0u], outputRgb[index + 1u], outputRgb[index + 2u]);
+        if(!physicalChromaFinite(rawInput))atomicAdd(colorTelemetry[18],1u);
         raw = rawInput; // Immutable pre-WB sensor-domain/demosaic RGB for classification and stats.
         uint sensorClipMask = phase9SensorClipMask(rawInput);
         int sensorClipChannels = phase9BitCount3(sensorClipMask);
@@ -999,7 +1015,9 @@ void main() {
         vec2 chromaAuthority;
         vec3 rawForWb = physicalChromaDenoise(ivec2(gid),rawInput,chromaAuthority);
         vec3 ci=opponentAtRgb(rawInput), co=opponentAtRgb(rawForWb);
-        float ye=abs(ci.x-co.x);
+        mat3 chromaAnalysisTransform=physicalChromaTransform();
+        float ye=abs(opponentAtRgb(chromaAnalysisTransform*rawInput).x-
+                     opponentAtRgb(chromaAnalysisTransform*rawForWb).x);
         chromaStats0[localIndex]=vec4(chromaAuthority,any(notEqual(rawForWb,rawInput))?1.0:0.0,ye);
         chromaStats1[localIndex]=vec4(ye,ye*ye,ci.yz);
         chromaStats2[localIndex]=vec4(dot(ci.yz,ci.yz),co.yz,dot(co.yz,co.yz));
@@ -1060,7 +1078,9 @@ void main() {
         if (phase9MagentaRisk(protectedCcm)) atomicAdd(colorTelemetry[8], 1u);
         if (max(protectedCcm.r, max(protectedCcm.g, protectedCcm.b)) > 1.0) atomicAdd(colorTelemetry[9], 1u);
 
+
         if(pc.cfaEvidence1.z>0.5) protectedCcm=rawForWb;
+        if(!physicalChromaFinite(protectedCcm))atomicAdd(colorTelemetry[19],1u);
         colorRgb[index + 0u] = finiteLinear(protectedCcm.r);
         colorRgb[index + 1u] = finiteLinear(protectedCcm.g);
         colorRgb[index + 2u] = finiteLinear(protectedCcm.b);

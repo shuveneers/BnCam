@@ -550,6 +550,7 @@ class SingleFrameRunner(
 
         val performanceTracker = CapturePerformanceTracker("SINGLE_FRAME_${formatLabel(activeZslFormat)}")
         val qualificationScene = com.bncam.core.debug.QualificationEvidence.activeScene()
+        val qualityReplayRequest = com.bncam.core.debug.QualityCaptureReplay.snapshot()
         performanceTracker.setMetric("captureTriggerId", captureTriggerId)
         performanceTracker.setMetric("userShutterTimestampNs", userShutterTimestampNs)
         if (qualificationScene != null) performanceTracker.setMetric("qualificationScene", qualificationScene)
@@ -2433,6 +2434,13 @@ class SingleFrameRunner(
                     Log.i(tag, "RAW single-frame processing start (SingleRaw16Frame; no Master RAW16 builder)")
                     val rawInput = singleRawFrame
                     val jpegResult = if (rawInput != null && rawJpegContractFailure == null) {
+                        if (qualityReplayRequest != null) {
+                            val exportPath = com.bncam.core.debug.QualityCaptureReplay.export(
+                                context, qualityReplayRequest, rawInput, renderQualityConfig, recipe,
+                                focusCaptureContext, evOffset, finalJpegRotation, portraitCaptureContext,
+                                captureTriggerId)
+                            performanceTracker.setMetric("qualityReplayPath", exportPath)
+                        }
                         performanceTracker.incrementCounter("rawIspInvocationCount")
                         performanceTracker.incrementCounter("jpegEncodeInvocationCount")
                         ImageUtils.renderJpegFromRaw16InputWithUltraHdrSafe(

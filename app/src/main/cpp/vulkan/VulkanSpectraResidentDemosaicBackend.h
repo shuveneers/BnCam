@@ -213,6 +213,8 @@ struct SpectraResidentColorTransformResult {
     std::array<double, 3> ccmMean{0.0, 0.0, 0.0};
     // Phase 9 compact classification/protection telemetry from the same resident AWB+CCM pass.
     std::uint64_t phase9SensorClipCandidatePixels = 0u;
+    std::uint64_t chromaInputNonfinitePixels = 0u;
+    std::uint64_t colorOutputNonfinitePixels = 0u;
     std::uint64_t phase9SingleChannelSensorClipPixels = 0u;
     std::uint64_t phase9MultiChannelSensorClipPixels = 0u;
     std::uint64_t phase9WbAboveUnityWithoutSensorClipPixels = 0u;
