@@ -418,6 +418,16 @@ object Phase0PerformanceTrace {
         writer.execute { appendEvidenceLine(CAPTURE_EVIDENCE_FILE, report) }
     }
 
+    fun enqueueQualificationReport(context: Context, report: String) {
+        if (appContext == null) appContext = context.applicationContext
+        writer.execute { appendEvidenceLine("qualification_evidence.jsonl", report) }
+    }
+
+    fun enqueueTerminalReport(context: Context, report: String) {
+        if (appContext == null) appContext = context.applicationContext
+        writer.execute { appendEvidenceLine("capture_terminal.jsonl", report) }
+    }
+
     private fun persistDirect(section: String, report: String) {
         val context = appContext ?: return
         runCatching {

@@ -551,6 +551,12 @@ SpectraResidentDemosaicResult VulkanSpectraResidentDemosaicBackend::executeInter
             static_cast<std::uint64_t>((request.frameHeight + 15u) / 16u);
     const std::uint64_t statisticsBytes = std::max<std::uint64_t>(36u, groupCount * 9u * sizeof(float));
     const ResidualSampling residualSampling = residualSamplingFor(request.frameWidth, request.frameHeight);
+    bool validateHybrid = false;
+#if BNCAM_VULKAN_VALIDATION_ENABLED
+    validateHybrid = request.hybridValidationReadback &&
+            effectiveAlgorithm == SpectraGpuDemosaicAlgorithm::AUTO_HYBRID;
+#endif
+    const std::uint64_t validationBytes = validateHybrid ? pixelCount * 20u * sizeof(float) : 0u;
     // Phase 4: classical residual-chroma pixel correction was physically removed.
     // Keep the result bit false until the later ABI cleanup phase removes legacy telemetry fields.
     const bool reconstructionScratchRequired =
@@ -579,7 +585,7 @@ SpectraResidentDemosaicResult VulkanSpectraResidentDemosaicBackend::executeInter
         (sourceClipMapAppended &&
          !ensureBufferLocked(allocator, sourceClipBytes, 0u, sourceClipConfidence_, reallocated, failure)) ||
         !ensureBufferLocked(allocator, 16u, writeAccess, cloudCorrectionMap_, reallocated, failure) ||
-        !ensureBufferLocked(allocator, std::max<std::uint64_t>(24u, residualSampling.bytes),
+        !ensureBufferLocked(allocator, std::max<std::uint64_t>(24u, std::max(residualSampling.bytes, validationBytes)),
                             readAccess, residualCandidates_, reallocated, failure)) {
         result.cpuFallbackRequired = true;
         result.status = "GPU_DEMOSAIC_BUFFER_ALLOCATION_FAILED";
@@ -807,6 +813,21 @@ SpectraResidentDemosaicResult VulkanSpectraResidentDemosaicBackend::executeInter
     if (queryPool_ != VK_NULL_HANDLE) {
         vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 7u);
     }
+    if (validateHybrid) {
+        VkBufferMemoryBarrier validationBarrier{};
+        validationBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        validationBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        validationBarrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        validationBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        validationBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        validationBarrier.buffer = residualCandidates_.buffer;
+        validationBarrier.size = VK_WHOLE_SIZE;
+        vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr, 1u, &validationBarrier, 0u, nullptr);
+        push.mode = 12u;
+        vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0u, sizeof(push), &push);
+        vkCmdDispatch(commandBuffer_, (request.frameWidth + 15u)/16u, (request.frameHeight + 15u)/16u, 1u);
+    }
     VkBufferMemoryBarrier residualBarrier{};
     residualBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
     residualBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -876,7 +897,11 @@ SpectraResidentDemosaicResult VulkanSpectraResidentDemosaicBackend::executeInter
         }
     }
     const auto readStart = Clock::now();
-    if (residualSampling.bytes > 0u) {
+    if (validateHybrid) {
+        vmaInvalidateAllocation(allocator, residualCandidates_.allocation, 0u, validationBytes);
+        result.hybridValidation.resize(static_cast<std::size_t>(pixelCount) * 20u);
+        std::memcpy(result.hybridValidation.data(), residualCandidates_.mapped, static_cast<std::size_t>(validationBytes));
+    } else if (residualSampling.bytes > 0u) {
         vmaInvalidateAllocation(allocator, residualCandidates_.allocation, 0u,
                                 static_cast<VkDeviceSize>(residualSampling.bytes));
         result.residualCandidates.resize(static_cast<std::size_t>(residualSampling.recordCount) * 8u);

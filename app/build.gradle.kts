@@ -3,6 +3,8 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
+val buildGitRevision = providers.exec { commandLine("git", "rev-parse", "HEAD") }.standardOutput.asText.get().trim()
+
 android {
     namespace = "com.bncam"
     compileSdk {
@@ -17,6 +19,7 @@ android {
         targetSdk = 36
         versionCode = 1
         versionName = "1.0"
+        buildConfigField("String", "GIT_REVISION", "\"$buildGitRevision\"")
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 

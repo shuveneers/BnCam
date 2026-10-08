@@ -37,7 +37,8 @@ class Phase1ASingleYuvLifecycleContractTest {
         val yuvSection = runner.substringAfter(
             "val yuvReservation = CaptureProcessingQueue.tryReserve"
         )
-        val submitSection = yuvSection.substringBefore("return@withContext")
+        val submitSection = yuvSection.substringAfter("val yuvSubmitted = CaptureProcessingQueue.submit")
+            .substringBefore("return@withContext")
         assertTrue(submitSection.contains("finally {"))
         assertTrue(submitSection.contains("yuvAnchorLease.release()"))
         assertTrue(submitSection.contains("anchorLease = null"))
@@ -53,7 +54,7 @@ class Phase1ASingleYuvLifecycleContractTest {
             "src/main/java/com/bncam/ui/screens/capture/CameraScreen.kt"
         ).readText()
 
-        val trigger = screen.substringAfter("val triggerCaptureSequence =")
+        val trigger = screen.substringAfter("val triggerCaptureSequence:")
             .substringBefore("// EVENT BUS LISTENER")
         assertTrue(screen.contains("lifecycleOwner.lifecycleScope"))
         assertTrue(trigger.contains("captureScope.launch"))

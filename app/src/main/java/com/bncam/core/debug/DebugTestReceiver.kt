@@ -24,7 +24,7 @@ class DebugTestReceiver : BroadcastReceiver() {
         Log.i("DebugTestReceiver", "Received broadcast action: $action")
         if (action == "com.bncam.TRIGGER_CAPTURE") {
             Log.i("DebugTestReceiver", "Triggering capture via ADB broadcast...")
-            com.bncam.CameraEventBus.captureRequests.tryEmit(Unit)
+            com.bncam.CameraEventBus.requestCapture("adb_explicit")
             return
         }
         if (action == "com.bncam.DUMP_TELEMETRY") {
@@ -59,6 +59,9 @@ class DebugTestReceiver : BroadcastReceiver() {
             return
         }
         if (action == "com.bncam.SET_TEST_CONFIG") {
+            if (com.bncam.BuildConfig.DEBUG && intent.hasExtra("qualification_scene")) {
+                QualificationEvidence.scene = intent.getStringExtra("qualification_scene")?.takeIf { it.isNotBlank() }
+            }
             val pendingResult = goAsync()
             kotlinx.coroutines.runBlocking(Dispatchers.IO) {
                 try {

@@ -48,8 +48,9 @@ class VulkanDeviceVerificationTest {
         assertEquals(1L, snapshot.instanceCreationCount)
         assertEquals(1L, snapshot.deviceCreationCount)
         assertEquals(0L, snapshot.inFlightSubmissionCount)
-        assertFalse(snapshot.productionVulkanActive)
-        assertTrue(snapshot.activeProductionStages.isEmpty())
+        assertTrue(snapshot.productionVulkanActive)
+        assertTrue(snapshot.activeProductionStages.contains("SPECTRA_FP32_DEMOSAIC_GPU_PRIMARY"))
+        assertTrue(snapshot.activeProductionStages.contains("SPECTRA_FP32_AWB_CCM_GPU_PRIMARY"))
 
         // 4. Persistence check: subsequent snapshot queries retain exact identity & counts = 1
         for (i in 1..10) {

@@ -1,0 +1,102 @@
+[
+  {
+    "command": "git status --short; git branch --show-current; git log -1 --oneline",
+    "exitCode": 0,
+    "result": "clean main 5c3f718"
+  },
+  {
+    "command": "adb devices",
+    "exitCode": 1,
+    "result": "adb absent from PATH; resolved SDK executable"
+  },
+  {
+    "command": "SDK/platform-tools/adb.exe devices -l; shell getprop ro.product.model; shell getprop ro.build.version.release; shell getprop ro.build.version.sdk; shell getprop ro.product.cpu.abi",
+    "exitCode": 0,
+    "result": "BKQ-N49 Android17/API37 arm64 AUWE025B03006422"
+  },
+  {
+    "command": ".\\gradlew.bat assembleDebug assembleDebugAndroidTest --console=plain (without JAVA_HOME)",
+    "exitCode": 1,
+    "result": "Java absent from terminal path"
+  },
+  {
+    "command": "JAVA_HOME=C:/Program Files/Android/Android Studio/jbr; .\\gradlew.bat assembleDebug assembleDebugAndroidTest --console=plain",
+    "exitCode": 0,
+    "result": "work/qualification-baseline-build.log"
+  },
+  {
+    "command": ":app:connectedDebugAndroidTest --console=plain",
+    "exitCode": 1,
+    "result": "work/qualification-baseline-connected.log; 10 tests, 4 baseline failures"
+  },
+  {
+    "command": ":app:testDebugUnitTest --console=plain",
+    "exitCode": 1,
+    "result": "work/qualification-baseline-jvm.log; 1954 tests, 355 baseline failures"
+  },
+  {
+    "command": "targeted terminal JVM tests + assembleDebug assembleDebugAndroidTest",
+    "exitCode": 0,
+    "result": "work/qualification-terminal-build.log"
+  },
+  {
+    "command": "assembleDebug assembleDebugAndroidTest (initial new native harness build)",
+    "exitCode": 1,
+    "result": "work/qualification-hybrid-build.log; harness declaration/API29 compilation errors"
+  },
+  {
+    "command": "assembleDebug assembleDebugAndroidTest (corrected harness)",
+    "exitCode": 0,
+    "result": "work/qualification-hybrid-build2.log"
+  },
+  {
+    "command": "adb -s AUWE025B03006422 push qualification executable /data/local/tmp/bncam-validation/",
+    "exitCode": 1,
+    "result": "device not found; numerical/benchmark did not execute"
+  },
+  {
+    "command": "assembleDebug assembleDebugAndroidTest :app:testDebugUnitTest --console=plain (final full run)",
+    "exitCode": 1,
+    "result": "work/qualification-final-build-and-debt.log; APK/tests build, 1959 tests, same 355 failures"
+  },
+  {
+    "command": "python scripts/single_frame_qualification.py debt",
+    "exitCode": 0,
+    "result": "355 classifications saved"
+  },
+  {
+    "command": "python scripts/audit_single_frame_settings.py",
+    "exitCode": 0,
+    "result": "220 declaration call sites, 15 partial priority traces"
+  },
+  {
+    "command": "python -m py_compile scripts/single_frame_qualification.py scripts/audit_single_frame_settings.py",
+    "exitCode": 0,
+    "result": "Python syntax checked"
+  },
+  {
+    "command": "PowerShell AST parse scripts/validateBnCamSingleFrame.ps1",
+    "exitCode": 0,
+    "result": "no parse errors"
+  },
+  {
+    "command": "benchmark analyzer synthetic self-test",
+    "exitCode": 0,
+    "result": "warmup exclusion,n,median,p90,thermal,memory; no device performance claim"
+  },
+  {
+    "command": ".\\scripts\\validateBnCamSingleFrame.ps1 -LocalOnly",
+    "exitCode": 0,
+    "result": "work/qualification-final-gate-script.log; 56 tests, 0 failures, APK and instrumentation built"
+  },
+  {
+    "command": "git diff --check",
+    "exitCode": 0,
+    "result": "no whitespace errors; only Git LF/CRLF conversion notices"
+  },
+  {
+    "command": "SDK/platform-tools/adb.exe devices -l (final)",
+    "exitCode": 0,
+    "result": "empty list; external prerequisite not restored"
+  }
+]

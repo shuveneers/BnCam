@@ -219,6 +219,9 @@ class CapturePerformanceTracker(private val route: String) {
             JSONObject().apply {
                 put("schemaVersion", 2)
                 put("captureId", captureId)
+                put("recordType", "PROCESSING_PERFORMANCE")
+                put("captureTriggerId", metrics["captureTriggerId"] ?: JSONObject.NULL)
+                put("terminalAuthority", "capture_terminal.jsonl")
                 put("route", route)
                 put("status", status)
                 put("failureReason", failureReason ?: JSONObject.NULL)
@@ -264,6 +267,9 @@ class CapturePerformanceTracker(private val route: String) {
                 content = report
             )
             Phase0PerformanceTrace.enqueueCaptureReport(context.applicationContext, report)
+            if (synchronized(this) { metrics.containsKey("qualificationScene") }) {
+                Phase0PerformanceTrace.enqueueQualificationReport(context.applicationContext, report)
+            }
             Log.i(
                 "BnCamPerformance",
                 "capture_report_routed captureId=$captureId route=$route status=$status"

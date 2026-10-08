@@ -23,6 +23,25 @@ class BnCamApplication : Application() {
         PhysicalNoiseModelRuntimeRegistry.initialize(applicationContext)
 
         Phase0PerformanceTrace.applicationOnCreateStarted(this, applicationOnCreateStartNs)
+        com.bncam.core.capture.CaptureTerminalAccounting.process = com.bncam.core.capture.CaptureTerminalAccounting(
+            clockNs = SystemClock::elapsedRealtimeNanos,
+            terminal = { record ->
+                val report = org.json.JSONObject().apply {
+                    put("schemaVersion", 1)
+                    put("session", record.session)
+                    put("captureId", record.trigger.id)
+                    put("timestampNs", record.trigger.timestampNs)
+                    put("timestampUtcMs", record.trigger.timestampUtcMs)
+                    put("source", record.trigger.source)
+                    put("admitted", record.admitted)
+                    put("status", record.outcome.name)
+                    put("reason", record.reason)
+                    put("completedNs", record.completedNs)
+                    put("context", record.context)
+                }
+                Phase0PerformanceTrace.enqueueTerminalReport(applicationContext, report.toString())
+            }
+        )
 
         // Preserve the existing startup prerequisite before any native engine work begins.
         Phase0PerformanceTrace.markStartup("hidden_api_setup_start")

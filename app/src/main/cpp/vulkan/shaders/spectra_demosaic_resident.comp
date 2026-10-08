@@ -540,6 +540,27 @@ vec3 autoHybridAt(int x, int y) {
     vec3 malvarRgb = malvarAt(x, y);
     vec3 amazeRgb = amazeReconstructAt(x, y);
     vec3 value = malvar * malvarRgb + amaze * amazeRgb;
+    // Explicit diagnostic pass after reconstruction. Ordinary mode 8 never writes this field.
+    if (pc.mode == 12u) {
+        uint pixel = uint(y) * pc.frameWidth + uint(x);
+        uint i = pixel * 20u;
+        residualCandidates[i+0u] = malvar;
+        residualCandidates[i+1u] = amaze;
+        residualCandidates[i+2u] = structure;
+        residualCandidates[i+3u] = nyquist;
+        residualCandidates[i+4u] = noise;
+        residualCandidates[i+5u] = chromaRisk;
+        residualCandidates[i+6u] = lowSignal;
+        residualCandidates[i+7u] = nearTie;
+        for (uint c = 0u; c < 3u; ++c) {
+            residualCandidates[i+8u+c] = malvarRgb[c];
+            residualCandidates[i+11u+c] = amazeRgb[c];
+            residualCandidates[i+14u+c] = outputRgb[pixel*3u+c];
+        }
+        residualCandidates[i+17u] = 1.0;
+        residualCandidates[i+18u] = float(x);
+        residualCandidates[i+19u] = float(y);
+    }
     return vec3(finiteLinear(value.r), finiteLinear(value.g), finiteLinear(value.b));
 }
 
@@ -897,6 +918,12 @@ void main() {
     if (pc.mode == 7u) {
         if (!inside) return;
         amazeGuidePass(int(gid.x), int(gid.y));
+        return;
+    }
+
+    if (pc.mode == 12u) {
+        if (!inside) return;
+        autoHybridAt(int(gid.x), int(gid.y));
         return;
     }
 

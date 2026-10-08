@@ -235,6 +235,22 @@ object CaptureProcessingQueue {
 
     private val admission = BoundedCaptureWorkAdmission(MAX_IN_FLIGHT_RAW_WORK)
     private val tracker = CaptureWorkStateTracker(clockNs = SystemClock::elapsedRealtimeNanos)
+    private val terminalListenerLock = Any()
+    private val terminalListeners = HashMap<Long, (CaptureWorkSnapshot) -> Unit>()
+
+    /** Queue-owned completion survives Activity teardown; late registration reconciles fast work. */
+    fun onTerminal(workId: Long, listener: (CaptureWorkSnapshot) -> Unit) {
+        val completed = synchronized(terminalListenerLock) {
+            val snapshot = tracker.snapshot(workId)
+            if (snapshot?.state == CaptureWorkState.PUBLISHED || snapshot?.state == CaptureWorkState.FAILED) {
+                snapshot
+            } else {
+                terminalListeners[workId] = listener
+                null
+            }
+        }
+        completed?.let(listener)
+    }
     private val jobs = Channel<ProcessingJob>(capacity = MAX_IN_FLIGHT_RAW_WORK)
 
     private val mutableSnapshotsFlow = MutableStateFlow<List<CaptureWorkSnapshot>>(emptyList())
@@ -491,6 +507,12 @@ object CaptureProcessingQueue {
         ) {
             val updated =
                 tracker.transition(workId, state, failureReason = reason, publishedUri = publishedUri, publishedOutputs = publishedOutputs) ?: return
+            if (state == CaptureWorkState.PUBLISHED || state == CaptureWorkState.FAILED) {
+                val listener = synchronized(terminalListenerLock) { terminalListeners.remove(workId) }
+                if (listener != null) runCatching { listener(updated) }.onFailure {
+                    Log.e("BnCamProcessingQueue", "Terminal observer failed workId=$workId", it)
+                }
+            }
             emitStateUpdates()
             mutableSharedEvents.tryEmit(updated)
             Log.i(

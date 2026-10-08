@@ -10497,7 +10497,12 @@ std::string IspCore::validateNoiseModelImplementation(
             isoLow.combinedNoisePressure <= isoMid.combinedNoisePressure + 1.0e-6f &&
             isoMid.combinedNoisePressure <= isoHigh.combinedNoisePressure + 1.0e-6f;
 
-    const SpectraProvenanceField provenance = buildSpectraProvenanceField(raw, isoHighMeta);
+    // The legacy 256x192 fixture produces tiles with fewer than 32 samples at stride 16.
+    // Prove that rejection, then validate the production provenance contract at sufficient coverage.
+    const SpectraProvenanceField undersampled = buildSpectraProvenanceField(raw, isoHighMeta);
+    LinearFloatRaw coveredRaw = raw;
+    cv::repeat(raw.mosaic, 4, 4, coveredRaw.mosaic);
+    const SpectraProvenanceField provenance = buildSpectraProvenanceField(coveredRaw, isoHighMeta);
     const bool provenanceValid = provenance.validTiles > 0 &&
             provenance.meanPredictedRawVariance > 0.0f &&
             provenance.meanPredictedChromaResidualVariance > 0.0f;
@@ -10509,7 +10514,8 @@ std::string IspCore::validateNoiseModelImplementation(
             lowStats.meanSensorNoiseVariance != highStats.meanSensorNoiseVariance;
 
     const bool allPassed =
-            offSamples == 0 && measurementRespondsToSo && isoAdaptiveMonotonic && provenanceValid;
+            offSamples == 0 && measurementRespondsToSo && isoAdaptiveMonotonic && provenanceValid &&
+            undersampled.validTiles == 0;
 
     std::ostringstream out;
     out << std::setprecision(17)
@@ -10532,6 +10538,10 @@ std::string IspCore::validateNoiseModelImplementation(
         << ";measurementRespondsToSo=" << (measurementRespondsToSo ? "true" : "false")
         << ";isoAdaptiveMonotonic=" << (isoAdaptiveMonotonic ? "true" : "false")
         << ";provenanceValid=" << (provenanceValid ? "true" : "false")
+        << ";undersampledValidTiles=" << undersampled.validTiles
+        << ";coveredValidTiles=" << provenance.validTiles
+        << ";coveredRawVariance=" << provenance.meanPredictedRawVariance
+        << ";coveredChromaVariance=" << provenance.meanPredictedChromaResidualVariance
         << ";classicalPostDemosaicNrOwner=false"
         << ";profileNrOwner=false"
         << ";physicalBaselineNrOwner=false"

@@ -1,0 +1,3683 @@
+{
+  "0": {
+    "path": "Auto Hybrid",
+    "timing": {
+      "normalizeMs": {
+        "n": 10,
+        "min": 26.0743,
+        "median": 31.06245,
+        "mean": 30.33481,
+        "p90": 32.497699999999995,
+        "max": 33.1502,
+        "sd": 2.3688448185420103
+      },
+      "pipelineMs": {
+        "n": 10,
+        "min": 2815.9,
+        "median": 2847.2799999999997,
+        "mean": 2848.79,
+        "p90": 2883.806,
+        "max": 2884.04,
+        "sd": 23.072587390427
+      },
+      "totalMs": {
+        "n": 10,
+        "min": 2847.09,
+        "median": 2875.73,
+        "mean": 2879.124,
+        "p90": 2911.9269999999997,
+        "max": 2912.44,
+        "sd": 21.956388187090777
+      }
+    },
+    "nativeTiming": {
+      "awbColourTransformMs": {
+        "n": 10,
+        "min": 281.868,
+        "median": 305.896,
+        "mean": 306.0702,
+        "p90": 325.5372,
+        "max": 339.48,
+        "sd": 18.042965251495303
+      },
+      "bilinearTimeMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "defectCorrectionMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "defectFullPassMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "defectPreScanMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "demosaicFinalizeMs": {
+        "n": 10,
+        "min": 16.1306,
+        "median": 32.77535,
+        "mean": 27.18836,
+        "p90": 34.77009,
+        "max": 35.1678,
+        "sd": 8.667447364734581
+      },
+      "demosaicKernelMs": {
+        "n": 10,
+        "min": 55.0327,
+        "median": 55.0646,
+        "mean": 55.06124,
+        "p90": 55.07649,
+        "max": 55.0872,
+        "sd": 0.017996863924338233
+      },
+      "demosaicMs": {
+        "n": 10,
+        "min": 73.3344,
+        "median": 90.1407,
+        "mean": 84.52385,
+        "p90": 92.24022,
+        "max": 92.7309,
+        "sd": 8.753099457049485
+      },
+      "demosaicSetupMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "demosaicTimeMs": {
+        "n": 10,
+        "min": 73.3344,
+        "median": 90.1407,
+        "mean": 84.52385,
+        "p90": 92.24022,
+        "max": 92.7309,
+        "sd": 8.753099457049485
+      },
+      "demosaicTotalMs": {
+        "n": 10,
+        "min": 73.3344,
+        "median": 90.1407,
+        "mean": 84.52385,
+        "p90": 92.24022,
+        "max": 92.7309,
+        "sd": 8.753099457049485
+      },
+      "exposureMs": {
+        "n": 10,
+        "min": 30.0,
+        "median": 30.0,
+        "mean": 30.0,
+        "p90": 30.0,
+        "max": 30.0,
+        "sd": 0.0
+      },
+      "finalOutClampQuantMs": {
+        "n": 10,
+        "min": 16.928,
+        "median": 20.15195,
+        "mean": 20.92961,
+        "p90": 24.63427,
+        "max": 24.7591,
+        "sd": 2.711670496801229
+      },
+      "finalOutputPassMs": {
+        "n": 10,
+        "min": 24.2236,
+        "median": 25.7679,
+        "mean": 28.02771,
+        "p90": 31.664059999999996,
+        "max": 36.7424,
+        "sd": 3.959744593461105
+      },
+      "fllfPyramidBuildMs": {
+        "n": 10,
+        "min": 4.66958,
+        "median": 4.69234,
+        "mean": 4.83655,
+        "p90": 4.856885999999999,
+        "max": 6.15312,
+        "sd": 0.4628165591966938
+      },
+      "fllfRemapReconstructMs": {
+        "n": 10,
+        "min": 2.96891,
+        "median": 2.975155,
+        "mean": 2.976308,
+        "p90": 2.982828,
+        "max": 2.98812,
+        "sd": 0.006219731684101918
+      },
+      "fusedChromaAwbCcmGpuMs": {
+        "n": 10,
+        "min": 250.219,
+        "median": 272.706,
+        "mean": 270.8945,
+        "p90": 287.7363,
+        "max": 288.486,
+        "sd": 13.748455212212832
+      },
+      "fusedColourLumaGpuMs": {
+        "n": 10,
+        "min": 250.219,
+        "median": 272.706,
+        "mean": 270.8945,
+        "p90": 287.7363,
+        "max": 288.486,
+        "sd": 13.748455212212832
+      },
+      "greenSplitMs": {
+        "n": 10,
+        "min": 0.621302,
+        "median": 0.6270830000000001,
+        "mean": 0.6295364999999999,
+        "p90": 0.640469,
+        "max": 0.646094,
+        "sd": 0.007642432440729245
+      },
+      "highlightRecoveryMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "jpegEncodeMs": {
+        "n": 10,
+        "min": 168.786,
+        "median": 170.07150000000001,
+        "mean": 169.8792,
+        "p90": 170.5236,
+        "max": 170.862,
+        "sd": 0.7132773809831735
+      },
+      "lensShadingMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "malvarTimeMs": {
+        "n": 10,
+        "min": 73.3344,
+        "median": 90.1407,
+        "mean": 84.52385,
+        "p90": 92.24022,
+        "max": 92.7309,
+        "sd": 8.753099457049485
+      },
+      "measurementTimeMs": {
+        "n": 10,
+        "min": 0.0012,
+        "median": 0.0017,
+        "mean": 0.00197,
+        "p90": 0.00292,
+        "max": 0.0031,
+        "sd": 0.0007196449741983118
+      },
+      "menonTimeMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "outputRotateMs": {
+        "n": 10,
+        "min": 5.2e-05,
+        "median": 5.2e-05,
+        "mean": 5.21e-05,
+        "p90": 5.21e-05,
+        "max": 5.3e-05,
+        "sd": 3.162277660168392e-07
+      },
+      "phase11LinearDetailKernelMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "phase11LinearDetailPropagationMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "phase12PerceptualDetailKernelMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "phase16DemosaicMs": {
+        "n": 10,
+        "min": 73.3344,
+        "median": 90.1407,
+        "mean": 84.52385,
+        "p90": 92.24022,
+        "max": 92.7309,
+        "sd": 8.753099457049485
+      },
+      "phase16RawIspMs": {
+        "n": 10,
+        "min": 2789.3,
+        "median": 2820.685,
+        "mean": 2822.147,
+        "p90": 2857.132,
+        "max": 2857.33,
+        "sd": 23.028409049114355
+      },
+      "phase5ToneStageMs": {
+        "n": 10,
+        "min": 350.157,
+        "median": 352.456,
+        "mean": 353.23629999999997,
+        "p90": 355.6434,
+        "max": 360.327,
+        "sd": 2.8576074705171752
+      },
+      "phase7AwbEstimatorMs": {
+        "n": 10,
+        "min": 60.8705,
+        "median": 61.060500000000005,
+        "mean": 61.073660000000004,
+        "p90": 61.230309999999996,
+        "max": 61.2961,
+        "sd": 0.1350235386886302
+      },
+      "phase9CpuFailureReferenceMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "processingTimeMs": {
+        "n": 10,
+        "min": 0.0106,
+        "median": 0.0133,
+        "mean": 0.01469,
+        "p90": 0.016709999999999996,
+        "max": 0.0294,
+        "sd": 0.005324461370776286
+      },
+      "raw10MergeOrSingleMasterMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "raw10SharedRawBayerIspMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "raw10ToMasterRaw16Ms": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "raw10UnpackMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "rawFinalizeGpuGreenReductionCpuMs": {
+        "n": 10,
+        "min": 0.621302,
+        "median": 0.6270830000000001,
+        "mean": 0.6295364999999999,
+        "p90": 0.640469,
+        "max": 0.646094,
+        "sd": 0.007642432440729245
+      },
+      "rawFinalizeGpuGreenSamplingKernelMs": {
+        "n": 10,
+        "min": 0.01625,
+        "median": 0.016484350000000002,
+        "mean": 0.01645312,
+        "p90": 0.01656771,
+        "max": 0.0166146,
+        "sd": 0.00012140108730979341
+      },
+      "rawFinalizeGpuInputPackingMs": {
+        "n": 10,
+        "min": 1.99521,
+        "median": 2.3562250000000002,
+        "mean": 2.517486,
+        "p90": 2.7579389999999995,
+        "max": 4.28766,
+        "sd": 0.6462931790552436
+      },
+      "rawFinalizeGpuKernelMs": {
+        "n": 10,
+        "min": 13.3704,
+        "median": 13.37635,
+        "mean": 13.37575,
+        "p90": 13.3791,
+        "max": 13.3791,
+        "sd": 0.0031767383692501232
+      },
+      "rawFinalizeGpuLensMapUploadMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "rawFinalizeGpuReadbackMs": {
+        "n": 10,
+        "min": 10.9394,
+        "median": 11.053650000000001,
+        "mean": 12.140089999999999,
+        "p90": 14.432869999999998,
+        "max": 16.8374,
+        "sd": 2.0175359137378996
+      },
+      "rawFinalizeGpuSynchronizationMs": {
+        "n": 10,
+        "min": 19.4507,
+        "median": 20.18685,
+        "mean": 20.33796,
+        "p90": 20.57931,
+        "max": 22.266,
+        "sd": 0.729465731736438
+      },
+      "rawFinalizeGpuTotalMs": {
+        "n": 10,
+        "min": 33.6638,
+        "median": 34.5634,
+        "mean": 35.74295,
+        "p90": 38.8178,
+        "max": 40.1894,
+        "sd": 2.2452871601794424
+      },
+      "rawIspAccountedMs": {
+        "n": 10,
+        "min": 2691.96,
+        "median": 2723.8149999999996,
+        "mean": 2724.66,
+        "p90": 2760.234,
+        "max": 2760.27,
+        "sd": 23.341109180537615
+      },
+      "rawIspUnattributedMs": {
+        "n": 10,
+        "min": 96.7629,
+        "median": 97.19565,
+        "mean": 97.48424,
+        "p90": 98.69489,
+        "max": 99.0737,
+        "sd": 0.7922685167710929
+      },
+      "rawSensorReadMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "rawSensorSharedRawBayerIspMs": {
+        "n": 10,
+        "min": 2789.3,
+        "median": 2820.685,
+        "mean": 2822.147,
+        "p90": 2857.132,
+        "max": 2857.33,
+        "sd": 23.028409049114355
+      },
+      "rawSensorToMasterRaw16Ms": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "sharpenMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "spectraAccountedProcessingMs": {
+        "n": 10,
+        "min": 107.627,
+        "median": 107.96549999999999,
+        "mean": 108.0624,
+        "p90": 108.48780000000001,
+        "max": 108.882,
+        "sd": 0.39408183019379467
+      },
+      "spectraAwbPropagationMs": {
+        "n": 10,
+        "min": 0.005677,
+        "median": 0.005911,
+        "mean": 0.0060519,
+        "p90": 0.006432,
+        "max": 0.006666,
+        "sd": 0.00035052260982709825
+      },
+      "spectraCaptureProvenanceMs": {
+        "n": 10,
+        "min": 107.334,
+        "median": 107.6645,
+        "mean": 107.7584,
+        "p90": 108.2033,
+        "max": 108.584,
+        "sd": 0.38959044022038325
+      },
+      "spectraCfaBandObserverProcessingTimeMs": {
+        "n": 10,
+        "min": 0.010625,
+        "median": 0.0132815,
+        "mean": 0.0146875,
+        "p90": 0.016724399999999993,
+        "max": 0.029427,
+        "sd": 0.0053326138108394415
+      },
+      "spectraCfaLowBandObserverProcessingTimeMs": {
+        "n": 10,
+        "min": 0.001406,
+        "median": 0.001719,
+        "mean": 0.001849,
+        "p90": 0.0021092999999999993,
+        "max": 0.003282,
+        "sd": 0.0005326583228382796
+      },
+      "spectraChromaBandEnergyInputMeasurementMs": {
+        "n": 10,
+        "min": 0.001197,
+        "median": 0.0016925,
+        "mean": 0.0019632,
+        "p90": 0.0029369,
+        "max": 0.003125,
+        "sd": 0.0007221281511384713
+      },
+      "spectraChromaBandEnergyPostPass2MeasurementMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "spectraColourTransformPropagationMs": {
+        "n": 10,
+        "min": 0.004323,
+        "median": 0.004479,
+        "mean": 0.0045677,
+        "p90": 0.0047452,
+        "max": 0.00526,
+        "sd": 0.00027229846778040363
+      },
+      "spectraDemosaicPropagationMs": {
+        "n": 10,
+        "min": 0.010417,
+        "median": 0.015078,
+        "mean": 0.015260600000000001,
+        "p90": 0.0206615,
+        "max": 0.021458,
+        "sd": 0.003425874169058494
+      },
+      "spectraDownstreamInputMeasurementMs": {
+        "n": 10,
+        "min": 74.7089,
+        "median": 74.9882,
+        "mean": 75.14949,
+        "p90": 75.67291,
+        "max": 76.5847,
+        "sd": 0.5622193906494349
+      },
+      "spectraDownstreamOutputMeasurementMs": {
+        "n": 10,
+        "min": 5.2e-05,
+        "median": 0.000208,
+        "mean": 0.0001769,
+        "p90": 0.00026,
+        "max": 0.00026,
+        "sd": 9.234771247843662e-05
+      },
+      "spectraDownstreamProcessingTimeMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "spectraDownstreamPropagationMs": {
+        "n": 10,
+        "min": 0.008438,
+        "median": 0.0116405,
+        "mean": 0.0111666,
+        "p90": 0.0129837,
+        "max": 0.013125,
+        "sd": 0.0018267076759386912
+      },
+      "spectraFinalProvenanceMs": {
+        "n": 10,
+        "min": 0.25552,
+        "median": 0.263542,
+        "mean": 0.2749583,
+        "p90": 0.28115589999999996,
+        "max": 0.379219,
+        "sd": 0.0368562073109055
+      },
+      "spectraMeasuredPostColourTransformResidualMs": {
+        "n": 10,
+        "min": 27.3449,
+        "median": 27.4824,
+        "mean": 27.605710000000002,
+        "p90": 27.87969,
+        "max": 28.3629,
+        "sd": 0.30327924224677444
+      },
+      "spectraMeasuredPostDemosaicResidualMs": {
+        "n": 10,
+        "min": 26.6846,
+        "median": 28.138849999999998,
+        "mean": 28.21754,
+        "p90": 29.05688,
+        "max": 29.5724,
+        "sd": 0.7904361105673806
+      },
+      "spectraMeasuredVisibleResidualMs": {
+        "n": 10,
+        "min": 5.2e-05,
+        "median": 0.000208,
+        "mean": 0.0001769,
+        "p90": 0.00026,
+        "max": 0.00026,
+        "sd": 9.234771247843662e-05
+      },
+      "spectraPerformanceDeviceProfileFirstWindowMedianMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "spectraPerformanceDeviceProfileMedianDownstreamIspMs": {
+        "n": 10,
+        "min": 74.7178,
+        "median": 75.0008,
+        "mean": 75.12847,
+        "p90": 75.34643,
+        "max": 76.5959,
+        "sd": 0.5404618643140123
+      },
+      "spectraPerformanceDeviceProfileMedianSpectraPassesMs": {
+        "n": 10,
+        "min": 0.0242965,
+        "median": 0.027343,
+        "mean": 0.0293515,
+        "p90": 0.0362486,
+        "max": 0.044219,
+        "sd": 0.006037587312458145
+      },
+      "spectraPerformanceDeviceProfileMedianStatisticsMs": {
+        "n": 10,
+        "min": 197.62,
+        "median": 200.728,
+        "mean": 200.3212,
+        "p90": 201.84890000000001,
+        "max": 201.875,
+        "sd": 1.430055383542888
+      },
+      "spectraPerformanceDeviceProfileMedianTotalIspMs": {
+        "n": 10,
+        "min": 2779.69,
+        "median": 2815.7250000000004,
+        "mean": 2816.588,
+        "p90": 2857.132,
+        "max": 2857.33,
+        "sd": 26.66438273552695
+      },
+      "spectraPerformanceDeviceProfileMedianVisibleChromaMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "spectraPerformanceDeviceProfileP95TotalIspMs": {
+        "n": 10,
+        "min": 2788.34,
+        "median": 2820.685,
+        "mean": 2821.591,
+        "p90": 2857.132,
+        "max": 2857.33,
+        "sd": 23.23080878201762
+      },
+      "spectraPerformanceDeviceProfileRecentWindowMedianMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "spectraPerformanceInitialStatisticsMs": {
+        "n": 10,
+        "min": 42.6571,
+        "median": 43.2937,
+        "mean": 43.47187,
+        "p90": 44.46798,
+        "max": 44.6361,
+        "sd": 0.6819929456298567
+      },
+      "spectraPerformancePostPass1StatisticsMs": {
+        "n": 10,
+        "min": 154.403,
+        "median": 157.01850000000002,
+        "mean": 156.6772,
+        "p90": 158.0914,
+        "max": 158.347,
+        "sd": 1.4599388723885345
+      },
+      "spectraPerformancePostPass2StatisticsMs": {
+        "n": 10,
+        "min": 154.403,
+        "median": 157.01850000000002,
+        "mean": 156.6772,
+        "p90": 158.0914,
+        "max": 158.347,
+        "sd": 1.4599388723885345
+      },
+      "spectraPerformanceSimdValidationElapsedMs": {
+        "n": 10,
+        "min": 7.72375,
+        "median": 7.72375,
+        "mean": 7.72375,
+        "p90": 7.72375,
+        "max": 7.72375,
+        "sd": 0.0
+      },
+      "spectraPerformanceStatisticsTotalMs": {
+        "n": 10,
+        "min": 197.62,
+        "median": 200.4405,
+        "mean": 200.1491,
+        "p90": 201.84890000000001,
+        "max": 201.875,
+        "sd": 1.3964480696077122
+      },
+      "spectraPropagationMathMs": {
+        "n": 10,
+        "min": 395.596,
+        "median": 397.1545,
+        "mean": 397.4236,
+        "p90": 398.3619,
+        "max": 402.483,
+        "sd": 1.964427323957572
+      },
+      "spectraPropagationSequentialMs": {
+        "n": 10,
+        "min": 129.369,
+        "median": 130.9345,
+        "mean": 131.0099,
+        "p90": 131.7467,
+        "max": 133.661,
+        "sd": 1.1190559960172786
+      },
+      "spectraTonePropagationMs": {
+        "n": 10,
+        "min": 265.519,
+        "median": 266.3135,
+        "mean": 266.4137,
+        "p90": 267.08230000000003,
+        "max": 268.822,
+        "sd": 0.9800382135406772
+      },
+      "spectraTotalProcessingMs": {
+        "n": 10,
+        "min": 1613.17,
+        "median": 1616.0,
+        "mean": 1616.17,
+        "p90": 1618.493,
+        "max": 1619.06,
+        "sd": 1.8098802907006488
+      },
+      "spectraUnattributedProcessingMs": {
+        "n": 10,
+        "min": 1505.32,
+        "median": 1508.23,
+        "mean": 1508.109,
+        "p90": 1510.1870000000001,
+        "max": 1510.25,
+        "sd": 1.6070500925609357
+      },
+      "totalRawBayerJpegIspMs": {
+        "n": 10,
+        "min": 2789.3,
+        "median": 2820.685,
+        "mean": 2822.147,
+        "p90": 2857.132,
+        "max": 2857.33,
+        "sd": 23.028409049114355
+      },
+      "totalRawIspCoreMs": {
+        "n": 10,
+        "min": 2789.3,
+        "median": 2820.685,
+        "mean": 2822.147,
+        "p90": 2857.132,
+        "max": 2857.33,
+        "sd": 23.028409049114355
+      },
+      "vulkanAwbCcmCompactStatisticsReductionMs": {
+        "n": 10,
+        "min": 8.12172,
+        "median": 8.236585,
+        "mean": 8.761303999999999,
+        "p90": 9.939488,
+        "max": 10.0436,
+        "sd": 0.7869778785568103
+      },
+      "vulkanAwbCcmInputPackingMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "vulkanAwbCcmKernelMs": {
+        "n": 10,
+        "min": 250.219,
+        "median": 272.706,
+        "mean": 270.8945,
+        "p90": 287.7363,
+        "max": 288.486,
+        "sd": 13.748455212212832
+      },
+      "vulkanAwbCcmReadbackMs": {
+        "n": 10,
+        "min": 16.2013,
+        "median": 16.732950000000002,
+        "mean": 18.85329,
+        "p90": 20.827289999999994,
+        "max": 34.4514,
+        "sd": 5.5821675581862165
+      },
+      "vulkanAwbCcmResidualKernelMs": {
+        "n": 10,
+        "min": 0.983229,
+        "median": 0.992083,
+        "mean": 1.1450674,
+        "p90": 1.1666649999999996,
+        "max": 2.48755,
+        "sd": 0.47181475113984683
+      },
+      "vulkanAwbCcmSynchronizationMs": {
+        "n": 10,
+        "min": 257.263,
+        "median": 279.9285,
+        "mean": 278.3266,
+        "p90": 295.07730000000004,
+        "max": 297.168,
+        "sd": 14.052179887832361
+      },
+      "vulkanAwbCcmTotalMs": {
+        "n": 10,
+        "min": 281.852,
+        "median": 305.88,
+        "mean": 306.053,
+        "p90": 325.5188,
+        "max": 339.458,
+        "sd": 18.041809542159452
+      },
+      "vulkanDemosaicAmazeGuideMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "vulkanDemosaicAmazeReconstructMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "vulkanDemosaicAutoHybridBlendMs": {
+        "n": 10,
+        "min": 41.4071,
+        "median": 41.4236,
+        "mean": 41.42501,
+        "p90": 41.43821,
+        "max": 41.4446,
+        "sd": 0.012756736782317804
+      },
+      "vulkanDemosaicAutoHybridGuideMs": {
+        "n": 10,
+        "min": 13.6214,
+        "median": 13.63635,
+        "mean": 13.63621,
+        "p90": 13.644029999999999,
+        "max": 13.6542,
+        "sd": 0.008931399044320349
+      },
+      "vulkanDemosaicInputPackingMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "vulkanDemosaicKernelMs": {
+        "n": 10,
+        "min": 55.0327,
+        "median": 55.0646,
+        "mean": 55.06124,
+        "p90": 55.07649,
+        "max": 55.0872,
+        "sd": 0.017996863924338233
+      },
+      "vulkanDemosaicReadbackMs": {
+        "n": 10,
+        "min": 16.1306,
+        "median": 32.77535,
+        "mean": 27.18836,
+        "p90": 34.77009,
+        "max": 35.1678,
+        "sd": 8.667447364734581
+      },
+      "vulkanDemosaicResidualKernelMs": {
+        "n": 10,
+        "min": 0.975885,
+        "median": 0.9785675,
+        "mean": 0.9797291,
+        "p90": 0.9822919,
+        "max": 0.993073,
+        "sd": 0.005001193289828153
+      },
+      "vulkanDemosaicSynchronizationMs": {
+        "n": 10,
+        "min": 57.0291,
+        "median": 57.23715,
+        "mean": 57.19526,
+        "p90": 57.29207,
+        "max": 57.3809,
+        "sd": 0.11262046587247534
+      },
+      "vulkanDemosaicTotalMs": {
+        "n": 10,
+        "min": 73.317,
+        "median": 90.12535,
+        "mean": 84.50506,
+        "p90": 92.21620999999999,
+        "max": 92.7032,
+        "sd": 8.751437542001632
+      },
+      "vulkanDemosaicUploadMs": {
+        "n": 10,
+        "min": 1.00032,
+        "median": 1.18948,
+        "mean": 1.154298,
+        "p90": 1.255393,
+        "max": 1.32922,
+        "sd": 0.11208855088723378
+      },
+      "vulkanSceneCompactReadbackMs": {
+        "n": 10,
+        "min": 1.34255,
+        "median": 1.3924500000000002,
+        "mean": 1.404755,
+        "p90": 1.471885,
+        "max": 1.48318,
+        "sd": 0.061113743362502165
+      },
+      "vulkanSceneHighlightKernelMs": {
+        "n": 10,
+        "min": 4.47771,
+        "median": 4.49008,
+        "mean": 4.495756,
+        "p90": 4.516208,
+        "max": 4.53365,
+        "sd": 0.01687417105782935
+      },
+      "vulkanSceneSampleKernelMs": {
+        "n": 10,
+        "min": 0.339323,
+        "median": 0.3416405,
+        "mean": 0.3451979,
+        "p90": 0.3542862,
+        "max": 0.357708,
+        "sd": 0.006397336780081056
+      },
+      "vulkanSceneSynchronizationMs": {
+        "n": 10,
+        "min": 6.69089,
+        "median": 6.756145,
+        "mean": 6.957751,
+        "p90": 7.491671999999999,
+        "max": 7.55964,
+        "sd": 0.35422473627314305
+      },
+      "vulkanSceneTotalMs": {
+        "n": 10,
+        "min": 8.21927,
+        "median": 8.34177,
+        "mean": 8.540416,
+        "p90": 9.139783,
+        "max": 9.21568,
+        "sd": 0.39949666802114886
+      },
+      "vulkanToneBgr8PublicationReadbackMs": {
+        "n": 10,
+        "min": 0.000208,
+        "median": 0.0006515,
+        "mean": 0.0006461,
+        "p90": 0.0009536999999999997,
+        "max": 0.001563,
+        "sd": 0.0003985112433935975
+      },
+      "vulkanToneKernelMs": {
+        "n": 10,
+        "min": 17.1501,
+        "median": 17.15755,
+        "mean": 17.1733,
+        "p90": 17.181079999999998,
+        "max": 17.3231,
+        "sd": 0.05284530884257069
+      },
+      "vulkanToneLutUploadMs": {
+        "n": 10,
+        "min": 0.022969,
+        "median": 0.023932000000000002,
+        "mean": 0.0241511,
+        "p90": 0.0255834,
+        "max": 0.025677,
+        "sd": 0.0008929407657348331
+      },
+      "vulkanToneReadbackMs": {
+        "n": 10,
+        "min": 0.002917,
+        "median": 0.006588999999999999,
+        "mean": 0.0082448,
+        "p90": 0.012739499999999997,
+        "max": 0.020052,
+        "sd": 0.005433337603270306
+      },
+      "vulkanToneSynchronizationMs": {
+        "n": 10,
+        "min": 82.6128,
+        "median": 84.29814999999999,
+        "mean": 84.85947,
+        "p90": 87.46439,
+        "max": 89.5343,
+        "sd": 2.1523454731215135
+      },
+      "vulkanToneTotalMs": {
+        "n": 10,
+        "min": 82.7826,
+        "median": 84.4346,
+        "mean": 85.02657,
+        "p90": 87.67662,
+        "max": 89.7252,
+        "sd": 2.16299633998252
+      }
+    },
+    "thermal": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "thermalAfter": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "thermallyInfluenced": false,
+    "thermalUnavailable": false,
+    "bitexact": true,
+    "memory": {
+      "rssBeforeKb": [
+        252288,
+        252288,
+        252288,
+        252288,
+        252288,
+        252288,
+        252288,
+        252288,
+        252288,
+        252288
+      ],
+      "rssAfterKb": [
+        266468,
+        266468,
+        266468,
+        266468,
+        266468,
+        266468,
+        266468,
+        266468,
+        266468,
+        266468
+      ],
+      "nativeBeforeBytes": [
+        75060208,
+        75060208,
+        75061104,
+        75061104,
+        75061104,
+        75062000,
+        75062000,
+        75062000,
+        75062896,
+        75062896
+      ],
+      "nativeAfterBytes": [
+        91939840,
+        91939840,
+        91940736,
+        91940736,
+        91940736,
+        91941632,
+        91941632,
+        91942528,
+        91942528,
+        91942976
+      ]
+    },
+    "graphicsMemory": "UNAVAILABLE in standalone native process; capture dumpsys meminfo separately",
+    "monotoneRssGrowth": false,
+    "waterfall": {
+      "normalization": {
+        "n": 10,
+        "min": 26.0743,
+        "median": 31.06245,
+        "mean": 30.33481,
+        "p90": 32.497699999999995,
+        "max": 33.1502,
+        "sd": 2.3688448185420103
+      },
+      "nativeCore": {
+        "n": 10,
+        "min": 2789.3,
+        "median": 2820.685,
+        "mean": 2822.147,
+        "p90": 2857.132,
+        "max": 2857.33,
+        "sd": 23.028409049114355
+      },
+      "postCoreIncludingDiagnostics": {
+        "n": 10,
+        "min": 26.48999999999978,
+        "median": 26.644999999999982,
+        "mean": 26.642999999999983,
+        "p90": 26.739999999999828,
+        "max": 26.740000000000236,
+        "sd": 0.0879456903119952
+      },
+      "coordination": {
+        "n": 10,
+        "min": 0,
+        "median": 0.0,
+        "mean": 0.0013199999999415012,
+        "p90": 0.0050399999997353,
+        "max": 0.0072000000000116415,
+        "sd": 0.0025581243128110095
+      },
+      "contract": "These four outer categories reconcile total; nativeKernel/sync/stage durations are nested and must not be added again."
+    },
+    "needsFurtherInstrumentation": false,
+    "rankingQualified": true
+  },
+  "1": {
+    "path": "Malvar",
+    "timing": {
+      "normalizeMs": {
+        "n": 10,
+        "min": 26.6247,
+        "median": 28.7434,
+        "mean": 28.78194,
+        "p90": 30.34142,
+        "max": 32.561,
+        "sd": 1.801589537787858
+      },
+      "pipelineMs": {
+        "n": 10,
+        "min": 2773.59,
+        "median": 2807.435,
+        "mean": 2808.781,
+        "p90": 2828.949,
+        "max": 2867.64,
+        "sd": 27.714225168073295
+      },
+      "totalMs": {
+        "n": 10,
+        "min": 2806.16,
+        "median": 2836.92,
+        "mean": 2837.567,
+        "p90": 2855.752,
+        "max": 2896.0,
+        "sd": 26.78890900271148
+      }
+    },
+    "nativeTiming": {
+      "awbColourTransformMs": {
+        "n": 10,
+        "min": 282.285,
+        "median": 301.345,
+        "mean": 301.3811,
+        "p90": 315.6329,
+        "max": 337.583,
+        "sd": 17.448387091648332
+      },
+      "bilinearTimeMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "defectCorrectionMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "defectFullPassMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "defectPreScanMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "demosaicFinalizeMs": {
+        "n": 10,
+        "min": 16.0571,
+        "median": 33.15675,
+        "mean": 29.68778,
+        "p90": 39.25677,
+        "max": 39.423,
+        "sd": 9.459696308350614
+      },
+      "demosaicKernelMs": {
+        "n": 10,
+        "min": 16.0782,
+        "median": 16.083,
+        "mean": 16.14576,
+        "p90": 16.15666,
+        "max": 16.7035,
+        "sd": 0.1960364603276073
+      },
+      "demosaicMs": {
+        "n": 10,
+        "min": 34.2633,
+        "median": 51.9103,
+        "mean": 48.1519,
+        "p90": 57.76258,
+        "max": 57.8632,
+        "sd": 9.564668670337374
+      },
+      "demosaicSetupMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "demosaicTimeMs": {
+        "n": 10,
+        "min": 34.2633,
+        "median": 51.9103,
+        "mean": 48.1519,
+        "p90": 57.76258,
+        "max": 57.8632,
+        "sd": 9.564668670337374
+      },
+      "demosaicTotalMs": {
+        "n": 10,
+        "min": 34.2633,
+        "median": 51.9103,
+        "mean": 48.1519,
+        "p90": 57.76258,
+        "max": 57.8632,
+        "sd": 9.564668670337374
+      },
+      "exposureMs": {
+        "n": 10,
+        "min": 30.0,
+        "median": 30.0,
+        "mean": 30.0,
+        "p90": 30.0,
+        "max": 30.0,
+        "sd": 0.0
+      },
+      "finalOutClampQuantMs": {
+        "n": 10,
+        "min": 18.6523,
+        "median": 19.8129,
+        "mean": 20.39676,
+        "p90": 22.58072,
+        "max": 23.1362,
+        "sd": 1.6807433323780678
+      },
+      "finalOutputPassMs": {
+        "n": 10,
+        "min": 24.8747,
+        "median": 26.67935,
+        "mean": 26.85432,
+        "p90": 29.6585,
+        "max": 30.0365,
+        "sd": 1.9168478092952497
+      },
+      "fllfPyramidBuildMs": {
+        "n": 10,
+        "min": 4.66797,
+        "median": 4.696795,
+        "mean": 4.70291,
+        "p90": 4.728407000000001,
+        "max": 4.76474,
+        "sd": 0.027219143590086974
+      },
+      "fllfRemapReconstructMs": {
+        "n": 10,
+        "min": 2.93328,
+        "median": 2.9437249999999997,
+        "mean": 2.9441829999999998,
+        "p90": 2.9484,
+        "max": 2.97099,
+        "sd": 0.010336590938129575
+      },
+      "fusedChromaAwbCcmGpuMs": {
+        "n": 10,
+        "min": 249.32,
+        "median": 259.98199999999997,
+        "mean": 265.8507,
+        "p90": 280.5955,
+        "max": 305.71,
+        "sd": 17.56428702446466
+      },
+      "fusedColourLumaGpuMs": {
+        "n": 10,
+        "min": 249.32,
+        "median": 259.98199999999997,
+        "mean": 265.8507,
+        "p90": 280.5955,
+        "max": 305.71,
+        "sd": 17.56428702446466
+      },
+      "greenSplitMs": {
+        "n": 10,
+        "min": 0.622396,
+        "median": 0.631094,
+        "mean": 0.633922,
+        "p90": 0.642885,
+        "max": 0.66651,
+        "sd": 0.012823375686612347
+      },
+      "highlightRecoveryMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "jpegEncodeMs": {
+        "n": 10,
+        "min": 160.838,
+        "median": 169.051,
+        "mean": 168.32580000000002,
+        "p90": 169.8787,
+        "max": 170.434,
+        "sd": 2.711210955356381
+      },
+      "lensShadingMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "malvarTimeMs": {
+        "n": 10,
+        "min": 34.2633,
+        "median": 51.9103,
+        "mean": 48.1519,
+        "p90": 57.76258,
+        "max": 57.8632,
+        "sd": 9.564668670337374
+      },
+      "measurementTimeMs": {
+        "n": 10,
+        "min": 0.001,
+        "median": 0.0015999999999999999,
+        "mean": 0.0015999999999999999,
+        "p90": 0.0019199999999999998,
+        "max": 0.0021,
+        "sd": 0.00032998316455372216
+      },
+      "menonTimeMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "outputRotateMs": {
+        "n": 10,
+        "min": 5.2e-05,
+        "median": 5.2e-05,
+        "mean": 5.73e-05,
+        "p90": 5.809999999999998e-05,
+        "max": 0.000104,
+        "sd": 1.641171668182352e-05
+      },
+      "phase11LinearDetailKernelMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "phase11LinearDetailPropagationMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "phase12PerceptualDetailKernelMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "phase16DemosaicMs": {
+        "n": 10,
+        "min": 34.2633,
+        "median": 51.9103,
+        "mean": 48.1519,
+        "p90": 57.76258,
+        "max": 57.8632,
+        "sd": 9.564668670337374
+      },
+      "phase16RawIspMs": {
+        "n": 10,
+        "min": 2746.85,
+        "median": 2779.5950000000003,
+        "mean": 2781.5,
+        "p90": 2802.065,
+        "max": 2841.08,
+        "sd": 28.075503359492753
+      },
+      "phase5ToneStageMs": {
+        "n": 10,
+        "min": 350.204,
+        "median": 351.83050000000003,
+        "mean": 351.92810000000003,
+        "p90": 353.1742,
+        "max": 354.004,
+        "sd": 1.1361912446610585
+      },
+      "phase7AwbEstimatorMs": {
+        "n": 10,
+        "min": 60.9241,
+        "median": 61.05575,
+        "mean": 61.175650000000005,
+        "p90": 61.606170000000006,
+        "max": 61.6959,
+        "sd": 0.2768079528802923
+      },
+      "phase9CpuFailureReferenceMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "processingTimeMs": {
+        "n": 10,
+        "min": 0.0118,
+        "median": 0.01225,
+        "mean": 0.01313,
+        "p90": 0.01474,
+        "max": 0.0169,
+        "sd": 0.0016275748830698999
+      },
+      "raw10MergeOrSingleMasterMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "raw10SharedRawBayerIspMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "raw10ToMasterRaw16Ms": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "raw10UnpackMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "rawFinalizeGpuGreenReductionCpuMs": {
+        "n": 10,
+        "min": 0.622396,
+        "median": 0.631094,
+        "mean": 0.633922,
+        "p90": 0.642885,
+        "max": 0.66651,
+        "sd": 0.012823375686612347
+      },
+      "rawFinalizeGpuGreenSamplingKernelMs": {
+        "n": 10,
+        "min": 0.0158333,
+        "median": 0.0165104,
+        "mean": 0.016458340000000002,
+        "p90": 0.01668753,
+        "max": 0.016875,
+        "sd": 0.0002852823093008045
+      },
+      "rawFinalizeGpuInputPackingMs": {
+        "n": 10,
+        "min": 1.83542,
+        "median": 2.20203,
+        "mean": 2.192385,
+        "p90": 2.3176059999999996,
+        "max": 2.45167,
+        "sd": 0.16880153542284831
+      },
+      "rawFinalizeGpuKernelMs": {
+        "n": 10,
+        "min": 13.374,
+        "median": 13.3772,
+        "mean": 13.37774,
+        "p90": 13.380329999999999,
+        "max": 13.3842,
+        "sd": 0.0031002508859048535
+      },
+      "rawFinalizeGpuLensMapUploadMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "rawFinalizeGpuReadbackMs": {
+        "n": 10,
+        "min": 10.919,
+        "median": 13.6874,
+        "mean": 14.35276,
+        "p90": 18.368979999999997,
+        "max": 21.3172,
+        "sd": 3.2626807557249267
+      },
+      "rawFinalizeGpuSynchronizationMs": {
+        "n": 10,
+        "min": 14.9084,
+        "median": 20.18485,
+        "mean": 19.86046,
+        "p90": 20.82638,
+        "max": 22.1213,
+        "sd": 1.8547792550297972
+      },
+      "rawFinalizeGpuTotalMs": {
+        "n": 10,
+        "min": 30.0808,
+        "median": 36.848150000000004,
+        "mean": 37.15382,
+        "p90": 41.44217999999999,
+        "max": 44.6424,
+        "sd": 4.182572770649398
+      },
+      "rawIspAccountedMs": {
+        "n": 10,
+        "min": 2649.94,
+        "median": 2679.245,
+        "mean": 2682.448,
+        "p90": 2702.8340000000003,
+        "max": 2740.67,
+        "sd": 27.19238529033042
+      },
+      "rawIspUnattributedMs": {
+        "n": 10,
+        "min": 96.5767,
+        "median": 98.26175,
+        "mean": 99.04974,
+        "p90": 101.95450000000001,
+        "max": 103.246,
+        "sd": 2.3511558846188367
+      },
+      "rawSensorReadMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "rawSensorSharedRawBayerIspMs": {
+        "n": 10,
+        "min": 2746.85,
+        "median": 2779.5950000000003,
+        "mean": 2781.5,
+        "p90": 2802.065,
+        "max": 2841.08,
+        "sd": 28.075503359492753
+      },
+      "rawSensorToMasterRaw16Ms": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "sharpenMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "spectraAccountedProcessingMs": {
+        "n": 10,
+        "min": 107.602,
+        "median": 108.104,
+        "mean": 108.3065,
+        "p90": 109.14139999999999,
+        "max": 109.784,
+        "sd": 0.6806642588922479
+      },
+      "spectraAwbPropagationMs": {
+        "n": 10,
+        "min": 0.005261,
+        "median": 0.0057555,
+        "mean": 0.0058802,
+        "p90": 0.0063437,
+        "max": 0.007187,
+        "sd": 0.0005501363063419425
+      },
+      "spectraCaptureProvenanceMs": {
+        "n": 10,
+        "min": 107.315,
+        "median": 107.8165,
+        "mean": 108.01650000000001,
+        "p90": 108.852,
+        "max": 109.491,
+        "sd": 0.6790318680134081
+      },
+      "spectraCfaBandObserverProcessingTimeMs": {
+        "n": 10,
+        "min": 0.01177,
+        "median": 0.012265999999999999,
+        "mean": 0.013125,
+        "p90": 0.0147186,
+        "max": 0.016875,
+        "sd": 0.0016140150763442912
+      },
+      "spectraCfaLowBandObserverProcessingTimeMs": {
+        "n": 10,
+        "min": 0.001563,
+        "median": 0.001823,
+        "mean": 0.0018281,
+        "p90": 0.0020007,
+        "max": 0.002187,
+        "sd": 0.00019398708433524355
+      },
+      "spectraChromaBandEnergyInputMeasurementMs": {
+        "n": 10,
+        "min": 0.001042,
+        "median": 0.0015890000000000001,
+        "mean": 0.001594,
+        "p90": 0.0019427,
+        "max": 0.002084,
+        "sd": 0.0003258878471021724
+      },
+      "spectraChromaBandEnergyPostPass2MeasurementMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "spectraColourTransformPropagationMs": {
+        "n": 10,
+        "min": 0.004375,
+        "median": 0.0044535,
+        "mean": 0.0045573,
+        "p90": 0.0047132,
+        "max": 0.005417,
+        "sd": 0.000314720352058776
+      },
+      "spectraDemosaicPropagationMs": {
+        "n": 10,
+        "min": 0.008802,
+        "median": 0.014791499999999999,
+        "mean": 0.014734200000000001,
+        "p90": 0.0181193,
+        "max": 0.020885,
+        "sd": 0.0038522694552115063
+      },
+      "spectraDownstreamInputMeasurementMs": {
+        "n": 10,
+        "min": 74.7529,
+        "median": 74.8981,
+        "mean": 75.94297,
+        "p90": 76.14573,
+        "max": 85.398,
+        "sd": 3.3239024651588207
+      },
+      "spectraDownstreamOutputMeasurementMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.000209,
+        "mean": 0.0001669,
+        "p90": 0.0002601,
+        "max": 0.000261,
+        "sd": 9.76757106165317e-05
+      },
+      "spectraDownstreamProcessingTimeMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "spectraDownstreamPropagationMs": {
+        "n": 10,
+        "min": 0.008647,
+        "median": 0.0115635,
+        "mean": 0.0112555,
+        "p90": 0.013041,
+        "max": 0.01323,
+        "sd": 0.0016637524689020833
+      },
+      "spectraFinalProvenanceMs": {
+        "n": 10,
+        "min": 0.257864,
+        "median": 0.2616665,
+        "mean": 0.2628593,
+        "p90": 0.2696715,
+        "max": 0.27,
+        "sd": 0.004185336467292027
+      },
+      "spectraMeasuredPostColourTransformResidualMs": {
+        "n": 10,
+        "min": 27.2042,
+        "median": 27.352400000000003,
+        "mean": 27.6643,
+        "p90": 28.24287,
+        "max": 28.8348,
+        "sd": 0.5542713515157636
+      },
+      "spectraMeasuredPostDemosaicResidualMs": {
+        "n": 10,
+        "min": 26.6358,
+        "median": 28.44905,
+        "mean": 28.70769,
+        "p90": 30.75007,
+        "max": 31.1233,
+        "sd": 1.709082546897929
+      },
+      "spectraMeasuredVisibleResidualMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.000209,
+        "mean": 0.0001669,
+        "p90": 0.0002601,
+        "max": 0.000261,
+        "sd": 9.76757106165317e-05
+      },
+      "spectraPerformanceDeviceProfileFirstWindowMedianMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "spectraPerformanceDeviceProfileMedianDownstreamIspMs": {
+        "n": 10,
+        "min": 74.7631,
+        "median": 74.86,
+        "mean": 75.92796,
+        "p90": 76.15722999999998,
+        "max": 85.4104,
+        "sd": 3.333432466259232
+      },
+      "spectraPerformanceDeviceProfileMedianSpectraPassesMs": {
+        "n": 10,
+        "min": 0.02474,
+        "median": 0.0266915,
+        "mean": 0.0266303,
+        "p90": 0.0283366,
+        "max": 0.02836,
+        "sd": 0.0013147801717397474
+      },
+      "spectraPerformanceDeviceProfileMedianStatisticsMs": {
+        "n": 10,
+        "min": 198.109,
+        "median": 199.9995,
+        "mean": 200.0055,
+        "p90": 201.48340000000002,
+        "max": 201.802,
+        "sd": 1.1812256581854115
+      },
+      "spectraPerformanceDeviceProfileMedianTotalIspMs": {
+        "n": 10,
+        "min": 2753.18,
+        "median": 2779.5950000000003,
+        "mean": 2788.271,
+        "p90": 2828.777,
+        "max": 2841.08,
+        "sd": 30.00070645464494
+      },
+      "spectraPerformanceDeviceProfileMedianVisibleChromaMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "spectraPerformanceDeviceProfileP95TotalIspMs": {
+        "n": 10,
+        "min": 2753.18,
+        "median": 2788.24,
+        "mean": 2797.438,
+        "p90": 2842.386,
+        "max": 2854.14,
+        "sd": 36.613820644972584
+      },
+      "spectraPerformanceDeviceProfileRecentWindowMedianMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "spectraPerformanceInitialStatisticsMs": {
+        "n": 10,
+        "min": 42.533,
+        "median": 42.8301,
+        "mean": 42.940979999999996,
+        "p90": 43.65444,
+        "max": 43.8303,
+        "sd": 0.4488425628460641
+      },
+      "spectraPerformancePostPass1StatisticsMs": {
+        "n": 10,
+        "min": 155.726,
+        "median": 157.002,
+        "mean": 157.0081,
+        "p90": 158.0663,
+        "max": 158.915,
+        "sd": 1.0372284062185482
+      },
+      "spectraPerformancePostPass2StatisticsMs": {
+        "n": 10,
+        "min": 155.726,
+        "median": 157.002,
+        "mean": 157.0081,
+        "p90": 158.0663,
+        "max": 158.915,
+        "sd": 1.0372284062185482
+      },
+      "spectraPerformanceSimdValidationElapsedMs": {
+        "n": 10,
+        "min": 7.72375,
+        "median": 7.72375,
+        "mean": 7.72375,
+        "p90": 7.72375,
+        "max": 7.72375,
+        "sd": 0.0
+      },
+      "spectraPerformanceStatisticsTotalMs": {
+        "n": 10,
+        "min": 198.527,
+        "median": 199.9265,
+        "mean": 199.9489,
+        "p90": 201.48340000000002,
+        "max": 201.802,
+        "sd": 1.1214409827439817
+      },
+      "spectraPropagationMathMs": {
+        "n": 10,
+        "min": 396.162,
+        "median": 397.201,
+        "mean": 398.6117,
+        "p90": 400.4608,
+        "max": 409.504,
+        "sd": 4.003823868087445
+      },
+      "spectraPropagationSequentialMs": {
+        "n": 10,
+        "min": 129.006,
+        "median": 131.22750000000002,
+        "mean": 132.3518,
+        "p90": 134.439,
+        "max": 143.763,
+        "sd": 4.285687985739408
+      },
+      "spectraTonePropagationMs": {
+        "n": 10,
+        "min": 265.222,
+        "median": 265.8195,
+        "mean": 266.26009999999997,
+        "p90": 267.3708,
+        "max": 268.296,
+        "sd": 0.9408308916413506
+      },
+      "spectraTotalProcessingMs": {
+        "n": 10,
+        "min": 1610.13,
+        "median": 1617.45,
+        "mean": 1616.302,
+        "p90": 1619.037,
+        "max": 1621.62,
+        "sd": 3.4497368659717065
+      },
+      "spectraUnattributedProcessingMs": {
+        "n": 10,
+        "min": 1502.53,
+        "median": 1508.655,
+        "mean": 1507.996,
+        "p90": 1510.929,
+        "max": 1513.17,
+        "sd": 3.1081906133455126
+      },
+      "totalRawBayerJpegIspMs": {
+        "n": 10,
+        "min": 2746.85,
+        "median": 2779.5950000000003,
+        "mean": 2781.5,
+        "p90": 2802.065,
+        "max": 2841.08,
+        "sd": 28.075503359492753
+      },
+      "totalRawIspCoreMs": {
+        "n": 10,
+        "min": 2746.85,
+        "median": 2779.5950000000003,
+        "mean": 2781.5,
+        "p90": 2802.065,
+        "max": 2841.08,
+        "sd": 28.075503359492753
+      },
+      "vulkanAwbCcmCompactStatisticsReductionMs": {
+        "n": 10,
+        "min": 8.11922,
+        "median": 8.180915,
+        "mean": 8.366068,
+        "p90": 8.897997,
+        "max": 9.22359,
+        "sd": 0.3744544513110594
+      },
+      "vulkanAwbCcmInputPackingMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "vulkanAwbCcmKernelMs": {
+        "n": 10,
+        "min": 249.32,
+        "median": 259.98199999999997,
+        "mean": 265.8507,
+        "p90": 280.5955,
+        "max": 305.71,
+        "sd": 17.56428702446466
+      },
+      "vulkanAwbCcmReadbackMs": {
+        "n": 10,
+        "min": 16.3017,
+        "median": 17.684350000000002,
+        "mean": 19.91496,
+        "p90": 24.9373,
+        "max": 30.6901,
+        "sd": 4.560922862803585
+      },
+      "vulkanAwbCcmResidualKernelMs": {
+        "n": 10,
+        "min": 0.987292,
+        "median": 0.9909375,
+        "mean": 0.9907865,
+        "p90": 0.9929222,
+        "max": 0.993437,
+        "sd": 0.0022591824111095403
+      },
+      "vulkanAwbCcmSynchronizationMs": {
+        "n": 10,
+        "min": 256.47,
+        "median": 267.047,
+        "mean": 272.982,
+        "p90": 287.63300000000004,
+        "max": 312.833,
+        "sd": 17.57732829527856
+      },
+      "vulkanAwbCcmTotalMs": {
+        "n": 10,
+        "min": 282.263,
+        "median": 301.321,
+        "mean": 301.3633,
+        "p90": 315.6142,
+        "max": 337.567,
+        "sd": 17.448566525330637
+      },
+      "vulkanDemosaicAmazeGuideMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "vulkanDemosaicAmazeReconstructMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "vulkanDemosaicAutoHybridBlendMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "vulkanDemosaicAutoHybridGuideMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "vulkanDemosaicInputPackingMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "vulkanDemosaicKernelMs": {
+        "n": 10,
+        "min": 16.0782,
+        "median": 16.083,
+        "mean": 16.14576,
+        "p90": 16.15666,
+        "max": 16.7035,
+        "sd": 0.1960364603276073
+      },
+      "vulkanDemosaicReadbackMs": {
+        "n": 10,
+        "min": 16.0571,
+        "median": 33.15675,
+        "mean": 29.68778,
+        "p90": 39.25677,
+        "max": 39.423,
+        "sd": 9.459696308350614
+      },
+      "vulkanDemosaicResidualKernelMs": {
+        "n": 10,
+        "min": 0.973594,
+        "median": 0.9776564999999999,
+        "mean": 0.9806195,
+        "p90": 0.9851192,
+        "max": 1.00682,
+        "sd": 0.00964012093342772
+      },
+      "vulkanDemosaicSynchronizationMs": {
+        "n": 10,
+        "min": 18.0805,
+        "median": 18.22755,
+        "mean": 18.34188,
+        "p90": 18.532149999999998,
+        "max": 19.1905,
+        "sd": 0.32540354365344915
+      },
+      "vulkanDemosaicTotalMs": {
+        "n": 10,
+        "min": 34.2534,
+        "median": 51.8959,
+        "mean": 48.13747,
+        "p90": 57.74826,
+        "max": 57.846,
+        "sd": 9.563346492038118
+      },
+      "vulkanDemosaicUploadMs": {
+        "n": 10,
+        "min": 1.01625,
+        "median": 1.16654,
+        "mean": 1.215501,
+        "p90": 1.413752,
+        "max": 1.51313,
+        "sd": 0.1703966195837099
+      },
+      "vulkanSceneCompactReadbackMs": {
+        "n": 10,
+        "min": 1.35635,
+        "median": 1.4302100000000002,
+        "mean": 1.449761,
+        "p90": 1.557208,
+        "max": 1.65583,
+        "sd": 0.09074329500176734
+      },
+      "vulkanSceneHighlightKernelMs": {
+        "n": 10,
+        "min": 4.48234,
+        "median": 4.4915400000000005,
+        "mean": 4.495515,
+        "p90": 4.509281,
+        "max": 4.51172,
+        "sd": 0.010679126316740081
+      },
+      "vulkanSceneSampleKernelMs": {
+        "n": 10,
+        "min": 0.33901,
+        "median": 0.342656,
+        "mean": 0.3433278,
+        "p90": 0.3486089,
+        "max": 0.350156,
+        "sd": 0.003637455239892623
+      },
+      "vulkanSceneSynchronizationMs": {
+        "n": 10,
+        "min": 6.7263,
+        "median": 6.7943,
+        "mean": 7.140543,
+        "p90": 8.004788999999999,
+        "max": 8.03052,
+        "sd": 0.5929891314921191
+      },
+      "vulkanSceneTotalMs": {
+        "n": 10,
+        "min": 8.26583,
+        "median": 8.412815,
+        "mean": 8.777395,
+        "p90": 9.657448,
+        "max": 9.74932,
+        "sd": 0.6258532490439664
+      },
+      "vulkanToneBgr8PublicationReadbackMs": {
+        "n": 10,
+        "min": 0.000313,
+        "median": 0.000547,
+        "mean": 0.0005314,
+        "p90": 0.0007862,
+        "max": 0.000833,
+        "sd": 0.00019270426392099717
+      },
+      "vulkanToneKernelMs": {
+        "n": 10,
+        "min": 17.1184,
+        "median": 17.1299,
+        "mean": 17.1306,
+        "p90": 17.13856,
+        "max": 17.1472,
+        "sd": 0.008068319389921209
+      },
+      "vulkanToneLutUploadMs": {
+        "n": 10,
+        "min": 0.023125,
+        "median": 0.023672,
+        "mean": 0.0240574,
+        "p90": 0.024735,
+        "max": 0.026562,
+        "sd": 0.0009830354577079663
+      },
+      "vulkanToneReadbackMs": {
+        "n": 10,
+        "min": 0.002344,
+        "median": 0.006927,
+        "mean": 0.0064843999999999995,
+        "p90": 0.0101198,
+        "max": 0.011198,
+        "sd": 0.003106595464133973
+      },
+      "vulkanToneSynchronizationMs": {
+        "n": 10,
+        "min": 82.6301,
+        "median": 83.8617,
+        "mean": 83.70636999999999,
+        "p90": 84.18261,
+        "max": 84.6048,
+        "sd": 0.6115167719149928
+      },
+      "vulkanToneTotalMs": {
+        "n": 10,
+        "min": 82.7983,
+        "median": 84.03264999999999,
+        "mean": 83.86702,
+        "p90": 84.33353,
+        "max": 84.7613,
+        "sd": 0.6055528728177078
+      }
+    },
+    "thermal": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "thermalAfter": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "thermallyInfluenced": false,
+    "thermalUnavailable": false,
+    "bitexact": true,
+    "memory": {
+      "rssBeforeKb": [
+        252288,
+        252288,
+        252288,
+        252288,
+        252288,
+        252288,
+        252288,
+        252288,
+        252288,
+        252288
+      ],
+      "rssAfterKb": [
+        266396,
+        266396,
+        266396,
+        266396,
+        266396,
+        266396,
+        266396,
+        266396,
+        266396,
+        266396
+      ],
+      "nativeBeforeBytes": [
+        75060208,
+        75060208,
+        75061104,
+        75061104,
+        75061104,
+        75062000,
+        75062000,
+        75062896,
+        75062896,
+        75063344
+      ],
+      "nativeAfterBytes": [
+        91939840,
+        91940736,
+        91940736,
+        91940736,
+        91941632,
+        91941632,
+        91941632,
+        91942528,
+        91942528,
+        91942976
+      ]
+    },
+    "graphicsMemory": "UNAVAILABLE in standalone native process; capture dumpsys meminfo separately",
+    "monotoneRssGrowth": false,
+    "waterfall": {
+      "normalization": {
+        "n": 10,
+        "min": 26.6247,
+        "median": 28.7434,
+        "mean": 28.78194,
+        "p90": 30.34142,
+        "max": 32.561,
+        "sd": 1.801589537787858
+      },
+      "nativeCore": {
+        "n": 10,
+        "min": 2746.85,
+        "median": 2779.5950000000003,
+        "mean": 2781.5,
+        "p90": 2802.065,
+        "max": 2841.08,
+        "sd": 28.075503359492753
+      },
+      "postCoreIncludingDiagnostics": {
+        "n": 10,
+        "min": 26.550000000000182,
+        "median": 26.66500000000019,
+        "mean": 27.28099999999995,
+        "p90": 27.590999999999937,
+        "max": 32.36999999999989,
+        "sd": 1.7967529354674892
+      },
+      "coordination": {
+        "n": 10,
+        "min": 0,
+        "median": 0.004800000000386717,
+        "mean": 0.004430000000047585,
+        "p90": 0.006839999999692735,
+        "max": 0.008999999999559805,
+        "sd": 0.002782105517529793
+      },
+      "contract": "These four outer categories reconcile total; nativeKernel/sync/stage durations are nested and must not be added again."
+    },
+    "needsFurtherInstrumentation": false,
+    "rankingQualified": true
+  },
+  "2": {
+    "path": "AMaZE",
+    "timing": {
+      "normalizeMs": {
+        "n": 10,
+        "min": 24.5571,
+        "median": 28.79455,
+        "mean": 28.81066,
+        "p90": 30.994329999999998,
+        "max": 34.1833,
+        "sd": 2.762597946056494
+      },
+      "pipelineMs": {
+        "n": 10,
+        "min": 2827.65,
+        "median": 2841.025,
+        "mean": 2842.265,
+        "p90": 2855.866,
+        "max": 2860.15,
+        "sd": 12.255346452331187
+      },
+      "totalMs": {
+        "n": 10,
+        "min": 2856.43,
+        "median": 2872.84,
+        "mean": 2871.077,
+        "p90": 2884.512,
+        "max": 2887.41,
+        "sd": 10.934074212702617
+      }
+    },
+    "nativeTiming": {
+      "awbColourTransformMs": {
+        "n": 10,
+        "min": 283.309,
+        "median": 300.2375,
+        "mean": 300.20550000000003,
+        "p90": 310.8361,
+        "max": 325.192,
+        "sd": 12.340109753248628
+      },
+      "bilinearTimeMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "defectCorrectionMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "defectFullPassMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "defectPreScanMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "demosaicFinalizeMs": {
+        "n": 10,
+        "min": 15.7869,
+        "median": 29.92755,
+        "mean": 30.35019,
+        "p90": 39.80017,
+        "max": 39.8521,
+        "sd": 6.767653163960656
+      },
+      "demosaicKernelMs": {
+        "n": 10,
+        "min": 45.9145,
+        "median": 45.94685,
+        "mean": 45.9436,
+        "p90": 45.95973,
+        "max": 45.9627,
+        "sd": 0.016336326256401107
+      },
+      "demosaicMs": {
+        "n": 10,
+        "min": 63.9773,
+        "median": 78.21885,
+        "mean": 78.60523,
+        "p90": 88.15276,
+        "max": 88.2352,
+        "sd": 6.827342611400461
+      },
+      "demosaicSetupMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "demosaicTimeMs": {
+        "n": 10,
+        "min": 63.9773,
+        "median": 78.21885,
+        "mean": 78.60523,
+        "p90": 88.15276,
+        "max": 88.2352,
+        "sd": 6.827342611400461
+      },
+      "demosaicTotalMs": {
+        "n": 10,
+        "min": 63.9773,
+        "median": 78.21885,
+        "mean": 78.60523,
+        "p90": 88.15276,
+        "max": 88.2352,
+        "sd": 6.827342611400461
+      },
+      "exposureMs": {
+        "n": 10,
+        "min": 30.0,
+        "median": 30.0,
+        "mean": 30.0,
+        "p90": 30.0,
+        "max": 30.0,
+        "sd": 0.0
+      },
+      "finalOutClampQuantMs": {
+        "n": 10,
+        "min": 19.6453,
+        "median": 23.313200000000002,
+        "mean": 22.99868,
+        "p90": 25.095129999999997,
+        "max": 26.3473,
+        "sd": 2.131793549416391
+      },
+      "finalOutputPassMs": {
+        "n": 10,
+        "min": 26.2715,
+        "median": 30.6629,
+        "mean": 31.1388,
+        "p90": 34.68720999999999,
+        "max": 36.9931,
+        "sd": 3.1164698975318563
+      },
+      "fllfPyramidBuildMs": {
+        "n": 10,
+        "min": 4.65177,
+        "median": 4.690315,
+        "mean": 4.6913540000000005,
+        "p90": 4.721972,
+        "max": 4.72937,
+        "sd": 0.024889684253164412
+      },
+      "fllfRemapReconstructMs": {
+        "n": 10,
+        "min": 2.97651,
+        "median": 2.984345,
+        "mean": 2.985874,
+        "p90": 2.994451,
+        "max": 2.99563,
+        "sd": 0.006168113704096736
+      },
+      "fusedChromaAwbCcmGpuMs": {
+        "n": 10,
+        "min": 249.967,
+        "median": 264.861,
+        "mean": 264.6712,
+        "p90": 277.6289,
+        "max": 285.575,
+        "sd": 11.256206532891573
+      },
+      "fusedColourLumaGpuMs": {
+        "n": 10,
+        "min": 249.967,
+        "median": 264.861,
+        "mean": 264.6712,
+        "p90": 277.6289,
+        "max": 285.575,
+        "sd": 11.256206532891573
+      },
+      "greenSplitMs": {
+        "n": 10,
+        "min": 0.624219,
+        "median": 0.6409895,
+        "mean": 0.6402502,
+        "p90": 0.6550315,
+        "max": 0.656719,
+        "sd": 0.01101133022340575
+      },
+      "highlightRecoveryMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "jpegEncodeMs": {
+        "n": 10,
+        "min": 167.183,
+        "median": 168.178,
+        "mean": 168.1736,
+        "p90": 168.97469999999998,
+        "max": 169.125,
+        "sd": 0.6188891841212176
+      },
+      "lensShadingMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "malvarTimeMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "measurementTimeMs": {
+        "n": 10,
+        "min": 0.0009,
+        "median": 0.00145,
+        "mean": 0.00162,
+        "p90": 0.0020299999999999997,
+        "max": 0.0032,
+        "sd": 0.0006124631508189788
+      },
+      "menonTimeMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "outputRotateMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 5.2e-05,
+        "mean": 4.6899999999999995e-05,
+        "p90": 5.21e-05,
+        "max": 5.3e-05,
+        "sd": 1.6481976688357364e-05
+      },
+      "phase11LinearDetailKernelMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "phase11LinearDetailPropagationMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "phase12PerceptualDetailKernelMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "phase16DemosaicMs": {
+        "n": 10,
+        "min": 63.9773,
+        "median": 78.21885,
+        "mean": 78.60523,
+        "p90": 88.15276,
+        "max": 88.2352,
+        "sd": 6.827342611400461
+      },
+      "phase16RawIspMs": {
+        "n": 10,
+        "min": 2801.02,
+        "median": 2814.46,
+        "mean": 2815.605,
+        "p90": 2829.293,
+        "max": 2833.28,
+        "sd": 12.24377596985512
+      },
+      "phase5ToneStageMs": {
+        "n": 10,
+        "min": 350.974,
+        "median": 352.2645,
+        "mean": 352.5172,
+        "p90": 353.807,
+        "max": 354.338,
+        "sd": 1.08827670092573
+      },
+      "phase7AwbEstimatorMs": {
+        "n": 10,
+        "min": 61.3005,
+        "median": 61.5525,
+        "mean": 62.0221,
+        "p90": 63.29966,
+        "max": 64.3604,
+        "sd": 1.012931369837068
+      },
+      "phase9CpuFailureReferenceMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "processingTimeMs": {
+        "n": 10,
+        "min": 0.0112,
+        "median": 0.01335,
+        "mean": 0.01494,
+        "p90": 0.017169999999999994,
+        "max": 0.0304,
+        "sd": 0.005630512114068014
+      },
+      "raw10MergeOrSingleMasterMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "raw10SharedRawBayerIspMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "raw10ToMasterRaw16Ms": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "raw10UnpackMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "rawFinalizeGpuGreenReductionCpuMs": {
+        "n": 10,
+        "min": 0.624219,
+        "median": 0.6409895,
+        "mean": 0.6402502,
+        "p90": 0.6550315,
+        "max": 0.656719,
+        "sd": 0.01101133022340575
+      },
+      "rawFinalizeGpuGreenSamplingKernelMs": {
+        "n": 10,
+        "min": 0.0163021,
+        "median": 0.0165104,
+        "mean": 0.01656248,
+        "p90": 0.016890620000000002,
+        "max": 0.0170312,
+        "sd": 0.00022367882132895645
+      },
+      "rawFinalizeGpuInputPackingMs": {
+        "n": 10,
+        "min": 1.98318,
+        "median": 2.26961,
+        "mean": 2.263579,
+        "p90": 2.351988,
+        "max": 2.47203,
+        "sd": 0.12255898067189261
+      },
+      "rawFinalizeGpuKernelMs": {
+        "n": 10,
+        "min": 13.3719,
+        "median": 13.37605,
+        "mean": 13.37532,
+        "p90": 13.37777,
+        "max": 13.3802,
+        "sd": 0.002784400992833006
+      },
+      "rawFinalizeGpuLensMapUploadMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "rawFinalizeGpuReadbackMs": {
+        "n": 10,
+        "min": 10.9409,
+        "median": 10.992049999999999,
+        "mean": 11.87516,
+        "p90": 13.819059999999999,
+        "max": 14.7187,
+        "sd": 1.3645820517653016
+      },
+      "rawFinalizeGpuSynchronizationMs": {
+        "n": 10,
+        "min": 19.507,
+        "median": 20.36135,
+        "mean": 20.83491,
+        "p90": 22.129949999999997,
+        "max": 23.1321,
+        "sd": 1.1426404027028314
+      },
+      "rawFinalizeGpuTotalMs": {
+        "n": 10,
+        "min": 34.0204,
+        "median": 35.81275,
+        "mean": 35.73089,
+        "p90": 36.97159,
+        "max": 37.1317,
+        "sd": 1.0797739798988806
+      },
+      "rawIspAccountedMs": {
+        "n": 10,
+        "min": 2697.86,
+        "median": 2716.585,
+        "mean": 2715.604,
+        "p90": 2728.5919999999996,
+        "max": 2731.94,
+        "sd": 11.593274103739816
+      },
+      "rawIspUnattributedMs": {
+        "n": 10,
+        "min": 96.8335,
+        "median": 100.33600000000001,
+        "mean": 100.00382,
+        "p90": 102.5079,
+        "max": 103.164,
+        "sd": 2.2390436027713085
+      },
+      "rawSensorReadMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "rawSensorSharedRawBayerIspMs": {
+        "n": 10,
+        "min": 2801.02,
+        "median": 2814.46,
+        "mean": 2815.605,
+        "p90": 2829.293,
+        "max": 2833.28,
+        "sd": 12.24377596985512
+      },
+      "rawSensorToMasterRaw16Ms": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "sharpenMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "spectraAccountedProcessingMs": {
+        "n": 10,
+        "min": 107.423,
+        "median": 107.8375,
+        "mean": 107.9099,
+        "p90": 108.5213,
+        "max": 108.587,
+        "sd": 0.4118566228407383
+      },
+      "spectraAwbPropagationMs": {
+        "n": 10,
+        "min": 0.005,
+        "median": 0.006589,
+        "mean": 0.0062814,
+        "p90": 0.0068698,
+        "max": 0.007291,
+        "sd": 0.0006957982146826447
+      },
+      "spectraCaptureProvenanceMs": {
+        "n": 10,
+        "min": 107.137,
+        "median": 107.49449999999999,
+        "mean": 107.60679999999999,
+        "p90": 108.2235,
+        "max": 108.3,
+        "sd": 0.41771941672743823
+      },
+      "spectraCfaBandObserverProcessingTimeMs": {
+        "n": 10,
+        "min": 0.011198,
+        "median": 0.013359,
+        "mean": 0.014932299999999999,
+        "p90": 0.017145799999999996,
+        "max": 0.030365,
+        "sd": 0.005619698865993127
+      },
+      "spectraCfaLowBandObserverProcessingTimeMs": {
+        "n": 10,
+        "min": 0.001458,
+        "median": 0.001771,
+        "mean": 0.0019585,
+        "p90": 0.0021717999999999993,
+        "max": 0.003907,
+        "sd": 0.0007020597078121869
+      },
+      "spectraChromaBandEnergyInputMeasurementMs": {
+        "n": 10,
+        "min": 0.000937,
+        "median": 0.001433,
+        "mean": 0.0016147,
+        "p90": 0.0020104999999999993,
+        "max": 0.00323,
+        "sd": 0.000617008562879533
+      },
+      "spectraChromaBandEnergyPostPass2MeasurementMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "spectraColourTransformPropagationMs": {
+        "n": 10,
+        "min": 0.004218,
+        "median": 0.004609500000000001,
+        "mean": 0.0046614000000000004,
+        "p90": 0.0049740999999999995,
+        "max": 0.005677,
+        "sd": 0.00040741221276627314
+      },
+      "spectraDemosaicPropagationMs": {
+        "n": 10,
+        "min": 0.00901,
+        "median": 0.016432500000000003,
+        "mean": 0.0155727,
+        "p90": 0.0186765,
+        "max": 0.019896,
+        "sd": 0.0033674651874798776
+      },
+      "spectraDownstreamInputMeasurementMs": {
+        "n": 10,
+        "min": 74.6297,
+        "median": 74.82130000000001,
+        "mean": 74.95277,
+        "p90": 75.34378,
+        "max": 75.8287,
+        "sd": 0.3636881296752285
+      },
+      "spectraDownstreamOutputMeasurementMs": {
+        "n": 10,
+        "min": 5.2e-05,
+        "median": 0.00018199999999999998,
+        "mean": 0.00018219999999999998,
+        "p90": 0.00031729999999999996,
+        "max": 0.000365,
+        "sd": 0.00011587809686620389
+      },
+      "spectraDownstreamProcessingTimeMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "spectraDownstreamPropagationMs": {
+        "n": 10,
+        "min": 0.00875,
+        "median": 0.00974,
+        "mean": 0.0102865,
+        "p90": 0.0120468,
+        "max": 0.013125,
+        "sd": 0.0014650592138203832
+      },
+      "spectraFinalProvenanceMs": {
+        "n": 10,
+        "min": 0.257084,
+        "median": 0.264766,
+        "mean": 0.2742293,
+        "p90": 0.2845468,
+        "max": 0.35875,
+        "sd": 0.030238040563538876
+      },
+      "spectraMeasuredPostColourTransformResidualMs": {
+        "n": 10,
+        "min": 27.3647,
+        "median": 27.8818,
+        "mean": 27.97351,
+        "p90": 28.52716,
+        "max": 29.191,
+        "sd": 0.5274138211857721
+      },
+      "spectraMeasuredPostDemosaicResidualMs": {
+        "n": 10,
+        "min": 27.0476,
+        "median": 28.994799999999998,
+        "mean": 29.92379,
+        "p90": 31.83122,
+        "max": 36.7607,
+        "sd": 2.778874540948787
+      },
+      "spectraMeasuredVisibleResidualMs": {
+        "n": 10,
+        "min": 5.2e-05,
+        "median": 0.00018199999999999998,
+        "mean": 0.00018219999999999998,
+        "p90": 0.00031729999999999996,
+        "max": 0.000365,
+        "sd": 0.00011587809686620389
+      },
+      "spectraPerformanceDeviceProfileFirstWindowMedianMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "spectraPerformanceDeviceProfileMedianDownstreamIspMs": {
+        "n": 10,
+        "min": 74.6387,
+        "median": 74.83285000000001,
+        "mean": 74.96323,
+        "p90": 75.35416,
+        "max": 75.8389,
+        "sd": 0.36378828717935197
+      },
+      "spectraPerformanceDeviceProfileMedianSpectraPassesMs": {
+        "n": 10,
+        "min": 0.024844,
+        "median": 0.0269275,
+        "mean": 0.0290003,
+        "p90": 0.030978599999999995,
+        "max": 0.046356,
+        "sd": 0.006259982375729539
+      },
+      "spectraPerformanceDeviceProfileMedianStatisticsMs": {
+        "n": 10,
+        "min": 197.913,
+        "median": 199.254,
+        "mean": 199.4811,
+        "p90": 200.7138,
+        "max": 202.116,
+        "sd": 1.223733399615021
+      },
+      "spectraPerformanceDeviceProfileMedianTotalIspMs": {
+        "n": 10,
+        "min": 2801.02,
+        "median": 2814.46,
+        "mean": 2815.605,
+        "p90": 2829.293,
+        "max": 2833.28,
+        "sd": 12.24377596985512
+      },
+      "spectraPerformanceDeviceProfileMedianVisibleChromaMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "spectraPerformanceDeviceProfileP95TotalIspMs": {
+        "n": 10,
+        "min": 2801.02,
+        "median": 2814.46,
+        "mean": 2815.605,
+        "p90": 2829.293,
+        "max": 2833.28,
+        "sd": 12.24377596985512
+      },
+      "spectraPerformanceDeviceProfileRecentWindowMedianMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "spectraPerformanceInitialStatisticsMs": {
+        "n": 10,
+        "min": 42.5906,
+        "median": 42.9845,
+        "mean": 43.08035,
+        "p90": 43.496370000000006,
+        "max": 44.1081,
+        "sd": 0.4237413997816226
+      },
+      "spectraPerformancePostPass1StatisticsMs": {
+        "n": 10,
+        "min": 153.805,
+        "median": 156.5995,
+        "mean": 156.401,
+        "p90": 157.3303,
+        "max": 159.133,
+        "sd": 1.395548796869693
+      },
+      "spectraPerformancePostPass2StatisticsMs": {
+        "n": 10,
+        "min": 153.805,
+        "median": 156.5995,
+        "mean": 156.401,
+        "p90": 157.3303,
+        "max": 159.133,
+        "sd": 1.395548796869693
+      },
+      "spectraPerformanceSimdValidationElapsedMs": {
+        "n": 10,
+        "min": 7.72375,
+        "median": 7.72375,
+        "mean": 7.72375,
+        "p90": 7.72375,
+        "max": 7.72375,
+        "sd": 0.0
+      },
+      "spectraPerformanceStatisticsTotalMs": {
+        "n": 10,
+        "min": 197.913,
+        "median": 199.254,
+        "mean": 199.4811,
+        "p90": 200.7138,
+        "max": 202.116,
+        "sd": 1.223733399615021
+      },
+      "spectraPropagationMathMs": {
+        "n": 10,
+        "min": 396.424,
+        "median": 398.29650000000004,
+        "mean": 399.0819,
+        "p90": 401.38349999999997,
+        "max": 404.871,
+        "sd": 2.678187714357099
+      },
+      "spectraPropagationSequentialMs": {
+        "n": 10,
+        "min": 129.486,
+        "median": 132.344,
+        "mean": 132.8871,
+        "p90": 135.31629999999998,
+        "max": 139.036,
+        "sd": 2.6656877557416827
+      },
+      "spectraTonePropagationMs": {
+        "n": 10,
+        "min": 265.383,
+        "median": 265.765,
+        "mean": 266.1948,
+        "p90": 267.1404,
+        "max": 268.242,
+        "sd": 0.9124117978680986
+      },
+      "spectraTotalProcessingMs": {
+        "n": 10,
+        "min": 1609.62,
+        "median": 1615.5549999999998,
+        "mean": 1616.343,
+        "p90": 1621.9299999999998,
+        "max": 1622.92,
+        "sd": 4.1668107975071935
+      },
+      "spectraUnattributedProcessingMs": {
+        "n": 10,
+        "min": 1502.15,
+        "median": 1507.77,
+        "mean": 1508.434,
+        "p90": 1513.818,
+        "max": 1515.15,
+        "sd": 4.092123056692104
+      },
+      "totalRawBayerJpegIspMs": {
+        "n": 10,
+        "min": 2801.02,
+        "median": 2814.46,
+        "mean": 2815.605,
+        "p90": 2829.293,
+        "max": 2833.28,
+        "sd": 12.24377596985512
+      },
+      "totalRawIspCoreMs": {
+        "n": 10,
+        "min": 2801.02,
+        "median": 2814.46,
+        "mean": 2815.605,
+        "p90": 2829.293,
+        "max": 2833.28,
+        "sd": 12.24377596985512
+      },
+      "vulkanAwbCcmCompactStatisticsReductionMs": {
+        "n": 10,
+        "min": 8.10906,
+        "median": 8.17323,
+        "mean": 8.376098,
+        "p90": 8.934324,
+        "max": 9.57984,
+        "sd": 0.47843476157616804
+      },
+      "vulkanAwbCcmInputPackingMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "vulkanAwbCcmKernelMs": {
+        "n": 10,
+        "min": 249.967,
+        "median": 264.861,
+        "mean": 264.6712,
+        "p90": 277.6289,
+        "max": 285.575,
+        "sd": 11.256206532891573
+      },
+      "vulkanAwbCcmReadbackMs": {
+        "n": 10,
+        "min": 16.7603,
+        "median": 20.9606,
+        "mean": 20.21166,
+        "p90": 22.49804,
+        "max": 23.9285,
+        "sd": 2.5199443865997426
+      },
+      "vulkanAwbCcmResidualKernelMs": {
+        "n": 10,
+        "min": 0.975833,
+        "median": 0.9859375,
+        "mean": 0.9874528,
+        "p90": 0.9913852000000001,
+        "max": 1.00432,
+        "sd": 0.007052443954639681
+      },
+      "vulkanAwbCcmSynchronizationMs": {
+        "n": 10,
+        "min": 257.276,
+        "median": 272.28499999999997,
+        "mean": 271.4899,
+        "p90": 284.9484,
+        "max": 292.944,
+        "sd": 11.84049352809624
+      },
+      "vulkanAwbCcmTotalMs": {
+        "n": 10,
+        "min": 283.29,
+        "median": 300.22299999999996,
+        "mean": 300.1866,
+        "p90": 310.81669999999997,
+        "max": 325.169,
+        "sd": 12.339352046737831
+      },
+      "vulkanDemosaicAmazeGuideMs": {
+        "n": 10,
+        "min": 10.3772,
+        "median": 10.38385,
+        "mean": 10.384830000000001,
+        "p90": 10.39053,
+        "max": 10.398,
+        "sd": 0.006092992331814797
+      },
+      "vulkanDemosaicAmazeReconstructMs": {
+        "n": 10,
+        "min": 35.535,
+        "median": 35.562799999999996,
+        "mean": 35.558769999999996,
+        "p90": 35.57258,
+        "max": 35.5823,
+        "sd": 0.015234248696057072
+      },
+      "vulkanDemosaicAutoHybridBlendMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "vulkanDemosaicAutoHybridGuideMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "vulkanDemosaicInputPackingMs": {
+        "n": 10,
+        "min": 0.0,
+        "median": 0.0,
+        "mean": 0.0,
+        "p90": 0.0,
+        "max": 0.0,
+        "sd": 0.0
+      },
+      "vulkanDemosaicKernelMs": {
+        "n": 10,
+        "min": 45.9145,
+        "median": 45.94685,
+        "mean": 45.9436,
+        "p90": 45.95973,
+        "max": 45.9627,
+        "sd": 0.016336326256401107
+      },
+      "vulkanDemosaicReadbackMs": {
+        "n": 10,
+        "min": 15.7869,
+        "median": 29.92755,
+        "mean": 30.35019,
+        "p90": 39.80017,
+        "max": 39.8521,
+        "sd": 6.767653163960656
+      },
+      "vulkanDemosaicResidualKernelMs": {
+        "n": 10,
+        "min": 0.980365,
+        "median": 0.982109,
+        "mean": 0.985166,
+        "p90": 0.9886918,
+        "max": 1.00786,
+        "sd": 0.008189682411424747
+      },
+      "vulkanDemosaicSynchronizationMs": {
+        "n": 10,
+        "min": 47.9193,
+        "median": 48.14615,
+        "mean": 48.12741,
+        "p90": 48.268229999999996,
+        "max": 48.2784,
+        "sd": 0.11570522364084378
+      },
+      "vulkanDemosaicTotalMs": {
+        "n": 10,
+        "min": 63.966,
+        "median": 78.20085,
+        "mean": 78.58771,
+        "p90": 88.13325999999999,
+        "max": 88.2193,
+        "sd": 6.825729558475376
+      },
+      "vulkanDemosaicUploadMs": {
+        "n": 10,
+        "min": 1.01292,
+        "median": 1.225675,
+        "mean": 1.198629,
+        "p90": 1.328916,
+        "max": 1.35714,
+        "sd": 0.1101036091294619
+      },
+      "vulkanSceneCompactReadbackMs": {
+        "n": 10,
+        "min": 1.33766,
+        "median": 1.39169,
+        "mean": 1.422936,
+        "p90": 1.485866,
+        "max": 1.68536,
+        "sd": 0.10054767417609528
+      },
+      "vulkanSceneHighlightKernelMs": {
+        "n": 10,
+        "min": 4.47568,
+        "median": 4.499504999999999,
+        "mean": 4.50849,
+        "p90": 4.536894,
+        "max": 4.57734,
+        "sd": 0.03165833644818817
+      },
+      "vulkanSceneSampleKernelMs": {
+        "n": 10,
+        "min": 0.339531,
+        "median": 0.34223950000000003,
+        "mean": 0.3421822,
+        "p90": 0.3445835,
+        "max": 0.347396,
+        "sd": 0.0024465452649262945
+      },
+      "vulkanSceneSynchronizationMs": {
+        "n": 10,
+        "min": 6.69255,
+        "median": 6.750625,
+        "mean": 6.879771,
+        "p90": 7.373517,
+        "max": 7.48203,
+        "sd": 0.2899014871545926
+      },
+      "vulkanSceneTotalMs": {
+        "n": 10,
+        "min": 8.18781,
+        "median": 8.348804999999999,
+        "mean": 8.477552,
+        "p90": 9.001204999999999,
+        "max": 9.13391,
+        "sd": 0.32549514967541704
+      },
+      "vulkanToneBgr8PublicationReadbackMs": {
+        "n": 10,
+        "min": 0.000208,
+        "median": 0.000573,
+        "mean": 0.0006145,
+        "p90": 0.0007654999999999997,
+        "max": 0.001562,
+        "sd": 0.00036723055125871236
+      },
+      "vulkanToneKernelMs": {
+        "n": 10,
+        "min": 17.2446,
+        "median": 17.252499999999998,
+        "mean": 17.25311,
+        "p90": 17.258589999999998,
+        "max": 17.2621,
+        "sd": 0.005035308663163892
+      },
+      "vulkanToneLutUploadMs": {
+        "n": 10,
+        "min": 0.023177,
+        "median": 0.023828000000000002,
+        "mean": 0.024073,
+        "p90": 0.0255056,
+        "max": 0.026771,
+        "sd": 0.0011447508219889792
+      },
+      "vulkanToneReadbackMs": {
+        "n": 10,
+        "min": 0.002188,
+        "median": 0.006510500000000001,
+        "mean": 0.0070886,
+        "p90": 0.008469099999999995,
+        "max": 0.019531,
+        "sd": 0.004693050588074054
+      },
+      "vulkanToneSynchronizationMs": {
+        "n": 10,
+        "min": 83.6375,
+        "median": 84.26115,
+        "mean": 84.35575,
+        "p90": 84.67024,
+        "max": 86.0971,
+        "sd": 0.6660208409318397
+      },
+      "vulkanToneTotalMs": {
+        "n": 10,
+        "min": 83.788,
+        "median": 84.4253,
+        "mean": 84.52575999999999,
+        "p90": 84.81497,
+        "max": 86.2484,
+        "sd": 0.6519445583108379
+      }
+    },
+    "thermal": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "thermalAfter": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "thermallyInfluenced": false,
+    "thermalUnavailable": false,
+    "bitexact": true,
+    "memory": {
+      "rssBeforeKb": [
+        252288,
+        252288,
+        252288,
+        252288,
+        252288,
+        252288,
+        252288,
+        252288,
+        252288,
+        252288
+      ],
+      "rssAfterKb": [
+        266136,
+        266136,
+        266136,
+        266136,
+        266136,
+        266136,
+        266136,
+        266136,
+        266136,
+        266136
+      ],
+      "nativeBeforeBytes": [
+        75060208,
+        75060208,
+        75061104,
+        75061104,
+        75062000,
+        75062000,
+        75062000,
+        75062896,
+        75062896,
+        75063344
+      ],
+      "nativeAfterBytes": [
+        91939840,
+        91939840,
+        91940736,
+        91940736,
+        91941632,
+        91941632,
+        91941632,
+        91942528,
+        91942528,
+        91943424
+      ]
+    },
+    "graphicsMemory": "UNAVAILABLE in standalone native process; capture dumpsys meminfo separately",
+    "monotoneRssGrowth": false,
+    "waterfall": {
+      "normalization": {
+        "n": 10,
+        "min": 24.5571,
+        "median": 28.79455,
+        "mean": 28.81066,
+        "p90": 30.994329999999998,
+        "max": 34.1833,
+        "sd": 2.762597946056494
+      },
+      "nativeCore": {
+        "n": 10,
+        "min": 2801.02,
+        "median": 2814.46,
+        "mean": 2815.605,
+        "p90": 2829.293,
+        "max": 2833.28,
+        "sd": 12.24377596985512
+      },
+      "postCoreIncludingDiagnostics": {
+        "n": 10,
+        "min": 26.48999999999978,
+        "median": 26.63500000000022,
+        "mean": 26.660000000000036,
+        "p90": 26.882999999999903,
+        "max": 27.0,
+        "sd": 0.16158932858051303
+      },
+      "coordination": {
+        "n": 10,
+        "min": 0,
+        "median": 0.0014000000003306923,
+        "mean": 0.002649999999994179,
+        "p90": 0.007119999999895298,
+        "max": 0.010899999999764987,
+        "sd": 0.003650951169712673
+      },
+      "contract": "These four outer categories reconcile total; nativeKernel/sync/stage durations are nested and must not be added again."
+    },
+    "needsFurtherInstrumentation": false,
+    "rankingQualified": true
+  },
+  "_fixture": {
+    "capture-metadata.txt": "e30b587cdf4bb08411e4474d553938028a96c038bb56cb376c9fa543aea3cbbf",
+    "fixture.txt": "273ac3490ba3a4303e88ce2c9c3daac19a957059c25e6f5fd95ab56d481b2948",
+    "raw.bin": "07cac3e40cbca321e79a8207f7db2c8b7a1cf5a629bbf698af8dc89dc2b335af",
+    "recipe.json": "e816960e449b2c6dd8639447df7b18a8498cc61be3b4db422af695b3b33f8385"
+  }
+}

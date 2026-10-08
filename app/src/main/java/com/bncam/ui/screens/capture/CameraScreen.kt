@@ -1543,8 +1543,11 @@ fun CameraScreen(
     // ==========================================
     // CENTRALE CAPTURE FUNCTIE (Met Timer Ondersteuning)
     // ==========================================
-    val triggerCaptureSequence = {
+    val triggerCaptureSequence: (com.bncam.core.capture.CaptureTrigger?) -> Unit = { received ->
+        val ledger = com.bncam.core.capture.CaptureTerminalAccounting.process
+        val trigger = received ?: ledger.receive("ui_shutter")
         if (viewfinderMode == ViewfinderMode.VIDEO) {
+            ledger.finish(trigger, com.bncam.core.capture.CaptureOutcome.REJECTED, "unsupported_video")
             // Video is intentionally present in the product strip but is not implemented by the
             // still-capture engine. Never silently take a photo while the UI says Video.
             android.widget.Toast.makeText(
@@ -1602,7 +1605,8 @@ fun CameraScreen(
                         deviceRotation = sensorUtils.captureRotation.intValue,
                         temporaryPreviewPath = null,
                         userShutterTimestampNs = userShutterTimestampNs,
-                        viewfinderMode = viewfinderMode
+                        viewfinderMode = viewfinderMode,
+                        captureTrigger = trigger
                     )
                     val shutterPreviewPath = shutterPreviewDeferred.await()
 
@@ -1670,11 +1674,21 @@ fun CameraScreen(
                     isCountingDown = false
                     activeCountdown = 0
                     shutterDispatchInFlight = false
+                    // The manager owns admitted work. Only pre-router UI/timer failures end here.
+                    if (ledger.isOutstanding(trigger)) {
+                        ledger.finishUnadmitted(trigger, "ui_capture_scope_cancelled")
+                    }
                 }
             }
+        } else {
+            ledger.finish(trigger, com.bncam.core.capture.CaptureOutcome.REJECTED,
+                if (isCountingDown) "timer_running" else "shutter_dispatch_in_flight")
         }
     }
     val latestTriggerCaptureSequence by rememberUpdatedState(triggerCaptureSequence)
+    DisposableEffect(Unit) {
+        onDispose { com.bncam.core.capture.CaptureTerminalAccounting.process.cancelUnadmitted("capture_ui_disposed") }
+    }
 
 // ==========================================
 // EVENT BUS LISTENER (Volumeknoppen)
@@ -1717,11 +1731,11 @@ fun CameraScreen(
     }
 
     LaunchedEffect(Unit) {
-        com.bncam.CameraEventBus.captureRequests.collect {
+        com.bncam.CameraEventBus.captureRequests.collect { trigger ->
             // This collector intentionally lives for the whole CameraScreen lifetime. Resolve the
             // current closure at delivery time so profile/lens/settings changes are never captured
             // from the first composition.
-            latestTriggerCaptureSequence()
+            latestTriggerCaptureSequence(trigger)
         }
     }
 
@@ -2942,7 +2956,7 @@ fun CameraScreen(
                             indication = null,
                             onClick = {
                                 shutterRotation += 90f
-                                triggerCaptureSequence()
+                                triggerCaptureSequence(null)
                             }
                         )
                 ) {

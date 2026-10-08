@@ -1,0 +1,27 @@
+{
+  "scene": "CURRENT_UNCONTROLLED",
+  "triggered": 1,
+  "routerAdmitted": 1,
+  "outcomes": {
+    "PUBLISHED": 1
+  },
+  "reasons": {
+    "output_published:FULL_SUCCESS": 1
+  },
+  "exactAccounting": true,
+  "records": [
+    {
+      "schemaVersion": 1,
+      "session": "a941f2c7-0529-4ea1-8167-3573505bae3b",
+      "captureId": 1,
+      "timestampNs": 132346683031902,
+      "timestampUtcMs": 1791437137615,
+      "source": "adb_explicit",
+      "admitted": true,
+      "status": "PUBLISHED",
+      "reason": "output_published:FULL_SUCCESS",
+      "completedNs": 132348816910286,
+      "context": "format=RAW_SENSOR cameraId=2 physicalCameraId=none lens=1.0x bufferMode=CAMERA2_RAW_SENSOR_WARM_IMAGEREADER_BUFFER captureMode=PHOTO:SINGLE_FRAME_ZSL generationId=2 imageReaderMaxImages=15 ringBufferFrameCount=15"
+    }
+  ]
+}

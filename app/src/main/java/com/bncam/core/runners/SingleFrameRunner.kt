@@ -541,13 +541,18 @@ class SingleFrameRunner(
         temporaryPreviewPath: String? = null,
         focusCaptureContext: com.bncam.core.engine.FocusCaptureContext = com.bncam.core.engine.FocusCaptureContext(),
         portraitCaptureContext: com.bncam.core.capture.PortraitCaptureContext = com.bncam.core.capture.PortraitCaptureContext(),
-        reservedAnchor: com.bncam.core.buffer.FrameLease? = null
+        reservedAnchor: com.bncam.core.buffer.FrameLease? = null,
+        captureTriggerId: Long? = null
     ): com.bncam.core.output.CaptureSubmissionResult = withContext(Dispatchers.IO) {
         require(userShutterTimestampNs > 0L) {
             "SingleFrameRunner requires a valid non-zero userShutterTimestampNs from actual shutter press."
         }
 
         val performanceTracker = CapturePerformanceTracker("SINGLE_FRAME_${formatLabel(activeZslFormat)}")
+        val qualificationScene = com.bncam.core.debug.QualificationEvidence.activeScene()
+        performanceTracker.setMetric("captureTriggerId", captureTriggerId)
+        performanceTracker.setMetric("userShutterTimestampNs", userShutterTimestampNs)
+        if (qualificationScene != null) performanceTracker.setMetric("qualificationScene", qualificationScene)
         performanceTracker.setMetric("thermalStatusAtShutter", recipe.thermalState)
         performanceTracker.sampleSystemState(context, "processing_start")
         performanceTracker.setMetric("captureMode", "SINGLE")
@@ -2012,9 +2017,7 @@ class SingleFrameRunner(
                 performanceTracker.setMetric("processingWorkId", it.workId)
                 performanceTracker.setMetric("shotSequenceId", it.shotSequenceId)
             } ?: run {
-                throw IllegalStateException(
-                    "RAW processing queue is full; capture was not accepted."
-                )
+                return@withContext com.bncam.core.output.CaptureSubmissionResult.Rejected("processing_queue_full")
             }
         } else {
             null
@@ -2075,6 +2078,12 @@ class SingleFrameRunner(
             0.0
         }
         acquiredRawInputForCleanup = acquiredRawInput
+        if (qualificationScene != null && acquiredRawInput != null) {
+            val evidenceStartNs = android.os.SystemClock.elapsedRealtimeNanos()
+            performanceTracker.setMetric("qualification.raw", com.bncam.core.debug.QualificationEvidence.raw(
+                acquiredRawInput, recipe, focusCaptureContext, evOffset))
+            performanceTracker.recordDuration("qualificationRawEvidence", (android.os.SystemClock.elapsedRealtimeNanos()-evidenceStartNs)/1_000_000.0)
+        }
         if (enableShotLogger && acquiredRawInput != null) {
             acquiredRawInput.rawFrameInfo.whiteAuthorityDebugPairs().forEach { (key, value) ->
                 shotLogger.recordPipelineEvent("White Level Authority", key, value)
@@ -3864,6 +3873,23 @@ class SingleFrameRunner(
             }
             performanceTracker.setMetric("genuinelyFusedFrameCount", 0)
             performanceTracker.setMetric("finalJpegByteCount", bytesToSave?.size ?: 0)
+            if (qualificationScene != null && jpegPublished && jpegPublicUri != null) {
+                val evidenceStartNs = android.os.SystemClock.elapsedRealtimeNanos()
+                performanceTracker.setMetric("qualification.jpegUri", jpegPublicUri.toString())
+                bytesToSave?.let { jpeg ->
+                    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                    BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size, bounds)
+                    performanceTracker.setMetric("qualification.outputWidth", bounds.outWidth)
+                    performanceTracker.setMetric("qualification.outputHeight", bounds.outHeight)
+                }
+                val digest = java.security.MessageDigest.getInstance("SHA-256")
+                context.contentResolver.openInputStream(jpegPublicUri)?.use { source ->
+                    val chunk = ByteArray(65536)
+                    while (true) { val count = source.read(chunk); if (count < 0) break; digest.update(chunk, 0, count) }
+                } ?: error("Qualification published JPEG is unreadable")
+                performanceTracker.setMetric("qualification.jpegSha256", digest.digest().joinToString("") { "%02x".format(it.toInt() and 255) })
+                performanceTracker.recordDuration("qualificationOutputEvidence", (android.os.SystemClock.elapsedRealtimeNanos()-evidenceStartNs)/1_000_000.0)
+            }
             val rawOwnerAtPublication = singleRawFrame
             performanceTracker.setMetric("dngRaw16ByteCount", rawOwnerAtPublication?.raw16ByteCount ?: 0)
             if (rawOwnerAtPublication != null) {
@@ -4187,9 +4213,7 @@ class SingleFrameRunner(
             route = plan.route.id,
             captureStartedNs = shutterTimestampNs,
             temporaryPreviewPath = temporaryPreviewPath
-        ) ?: throw IllegalStateException(
-            "Processing queue is full; Single YUV was not accepted."
-        )
+        ) ?: return@withContext com.bncam.core.output.CaptureSubmissionResult.Rejected("processing_queue_full")
 
         val yuvAnchorLease = requireNotNull(anchorLease) {
             "Single YUV requires the selected Near-ZSL FrameLease before processing handoff."

@@ -16,7 +16,10 @@ class PostPhase10HardwareShutterInputSourceContractTest {
         val activity = read("src/main/java/com/bncam/MainActivity.kt")
         assertTrue("KeyEvent.KEYCODE_CAMERA" in activity)
         assertTrue("Intent.ACTION_CAMERA_BUTTON" in activity)
-        assertTrue("CameraEventBus.captureRequests.tryEmit(Unit)" in activity)
+        assertTrue("CameraEventBus.requestCapture(\"hardware\")" in activity)
+        assertTrue("captureRequests.tryEmit(trigger)" in activity)
+        assertTrue("no_active_capture_ui" in activity)
+        assertTrue("shutter_event_buffer_full" in activity)
         assertTrue("HARDWARE SHUTTER INPUT" in activity)
     }
 

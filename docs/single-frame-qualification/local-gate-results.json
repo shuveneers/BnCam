@@ -1,0 +1,51 @@
+{
+  "tests": 56,
+  "failures": 0,
+  "suites": [
+    {
+      "name": "com.bncam.core.capture.CaptureAttemptCoordinatorTest",
+      "tests": 8,
+      "failures": 0
+    },
+    {
+      "name": "com.bncam.core.capture.CaptureTerminalAccountingTest",
+      "tests": 5,
+      "failures": 0
+    },
+    {
+      "name": "com.bncam.core.capture.FrameSelectionExposurePolicyTest",
+      "tests": 14,
+      "failures": 0
+    },
+    {
+      "name": "com.bncam.core.engine.FocusOwnershipStateTest",
+      "tests": 2,
+      "failures": 0
+    },
+    {
+      "name": "com.bncam.core.output.CaptureProcessingLifecycleTest",
+      "tests": 8,
+      "failures": 0
+    },
+    {
+      "name": "com.bncam.core.output.CaptureProcessingQueueTest",
+      "tests": 6,
+      "failures": 0
+    },
+    {
+      "name": "com.bncam.core.performance.Phase1ASingleYuvLifecycleContractTest",
+      "tests": 3,
+      "failures": 0
+    },
+    {
+      "name": "com.bncam.core.quality.DemosaicModeTest",
+      "tests": 8,
+      "failures": 0
+    },
+    {
+      "name": "com.bncam.PostPhase10HardwareShutterInputSourceContractTest",
+      "tests": 2,
+      "failures": 0
+    }
+  ]
+}

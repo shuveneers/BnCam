@@ -1,0 +1,72 @@
+[
+  {
+    "captureTriggerId": "2",
+    "rawSha256": "aecbab9a697770e85fd55a037da733a4a5a88e7a2971190304671b9c3fb9b624",
+    "jpegSha256": "8abf8b6bb6a85926d75045df7843c8fddd334488bb6f6295dd46659533fec1f9",
+    "jpegBytes": 19783751,
+    "jpegUri": "content://media/external/images/media/103497",
+    "metadataKeysPresent": true,
+    "rawChecksumIndependentReplay": "NOT EXPORTED; digest calculated inside native-buffer ownership",
+    "nullHalFields": []
+  },
+  {
+    "captureTriggerId": "6",
+    "rawSha256": "052cf73f6bd60bbda33da778557d112a64a461d282a107071c2e7f0c78c578ea",
+    "jpegSha256": "a81f673e3a99e01fd2488b1ad92a96edb34926cedb64bb8651e24f04949939dd",
+    "jpegBytes": 20464229,
+    "jpegUri": "content://media/external/images/media/103498",
+    "metadataKeysPresent": true,
+    "rawChecksumIndependentReplay": "NOT EXPORTED; digest calculated inside native-buffer ownership",
+    "nullHalFields": []
+  },
+  {
+    "captureTriggerId": "10",
+    "rawSha256": "994e21706fc10cd19c93435082c8bae1fe6b1ea1793460616a82eb6a70ae28ee",
+    "jpegSha256": "f6feb0b373a0a729b2e465e303bc3872fafd6145bf3ae7df38c47fd40a862679",
+    "jpegBytes": 20510544,
+    "jpegUri": "content://media/external/images/media/103499",
+    "metadataKeysPresent": true,
+    "rawChecksumIndependentReplay": "NOT EXPORTED; digest calculated inside native-buffer ownership",
+    "nullHalFields": []
+  },
+  {
+    "captureTriggerId": "25",
+    "rawSha256": "8dc883f2cde0579ecd345b62aa88e7359830555ebd4e3a0bf709aaf9e76fb2a1",
+    "jpegSha256": "a4b4b1a7d6cf9aa24c5a1b810bc3026054caba805c60e104c420981cc4023dbf",
+    "jpegBytes": 19769861,
+    "jpegUri": "content://media/external/images/media/103500",
+    "metadataKeysPresent": true,
+    "rawChecksumIndependentReplay": "NOT EXPORTED; digest calculated inside native-buffer ownership",
+    "nullHalFields": []
+  },
+  {
+    "captureTriggerId": "50",
+    "rawSha256": "35b71ee118c7b5b1109259cbaac8ebb4c73092d3275e5dcd94ad5e7dbb833a2f",
+    "jpegSha256": "5dc6e6fb4d5c0939aca67fd99f19cf424451c94720fb6e4615b91b7c808bdf8c",
+    "jpegBytes": 20398563,
+    "jpegUri": "content://media/external/images/media/103501",
+    "metadataKeysPresent": true,
+    "rawChecksumIndependentReplay": "NOT EXPORTED; digest calculated inside native-buffer ownership",
+    "nullHalFields": []
+  },
+  {
+    "captureTriggerId": "76",
+    "rawSha256": "b110601afbf132ce4e006041d4527ecb36aa11b5a8af5c62641ea235a3d6bd2a",
+    "jpegSha256": "caa382b0ce63756b3c3289f514a597119b21f553264605a6d7fc1907d8b0e7ec",
+    "jpegBytes": 19721929,
+    "jpegUri": "content://media/external/images/media/103502",
+    "metadataKeysPresent": true,
+    "rawChecksumIndependentReplay": "NOT EXPORTED; digest calculated inside native-buffer ownership",
+    "nullHalFields": []
+  },
+  {
+    "captureTriggerId": "100",
+    "rawSha256": "210a7b9e80807653d8845c318b6aede22f8137d7be9cba71ef354e92c8240070",
+    "jpegSha256": "e22c8fec03a2d469af2154fa3c673668fc4625ff0c63d6a7cfb5042672f9c99c",
+    "jpegBytes": 20430422,
+    "jpegUri": "content://media/external/images/media/103503",
+    "metadataKeysPresent": true,
+    "rawChecksumIndependentReplay": "NOT EXPORTED; digest calculated inside native-buffer ownership",
+    "nullHalFields": []
+  }
+]

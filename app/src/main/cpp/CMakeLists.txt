@@ -649,3 +649,10 @@ target_link_libraries(bncam
         ${egl-lib}
         ${gles3-lib}
 )
+
+if(BNCAM_ENABLE_GPU_BENCHMARKS)
+    add_executable(bncam_single_frame_qualification ../../test/cpp/SingleFrameQualification.cpp)
+    target_include_directories(bncam_single_frame_qualification PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR} ${OpenCV_INCLUDE_DIR})
+    target_link_libraries(bncam_single_frame_qualification bncam lib_opencv ${android-lib})
+endif()

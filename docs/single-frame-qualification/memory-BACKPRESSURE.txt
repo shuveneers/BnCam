@@ -1,0 +1,76 @@
+Applications Memory Usage (in Kilobytes):
+Uptime: 37542079 Realtime: 132371334
+
+** MEMINFO in pid 21945 [com.bncam] **
+                   Pss  Private  Private  SwapPss      Rss     Heap     Heap     Heap
+                 Total    Dirty    Clean    Dirty    Total     Size    Alloc     Free
+                ------   ------   ------   ------   ------   ------   ------   ------
+  Native Heap    51110    51068       12        9    55784   123096    61250    57775
+  Dalvik Heap    16005    15080      872        6    22408    55973    31397    24576
+ Dalvik Other    19634     9112        0        0    30684                           
+        Stack     4896     4896        0        0     4904                           
+       Ashmem      542        0        0        0     1716                           
+      Gfx dev   230424   163364    67060        0   230428                           
+    Other dev      141        4      136        0      724                           
+     .so mmap    13273     1380     3276        1    84584                           
+    .jar mmap     5108        0     1024        0    66772                           
+    .apk mmap   101474     1184    99996        0   103800                           
+    .ttf mmap      375        0      312        0      852                           
+    .dex mmap        6        0        0        0      952                           
+    .oat mmap       21        0        0        0     1328                           
+    .art mmap     9849     9568      116        1    27900                           
+   Other mmap     5297        4       12        0    11700                           
+   EGL mtrack   107572   107572        0        0   107572                           
+    GL mtrack     1276     1276        0        0     1276                           
+      Unknown     3211     2832      376        3     4572                           
+        TOTAL   570234   367340   173192       20   757956   179069    92647    82351
+ 
+ App Summary
+                       Pss(KB)                        Rss(KB)
+                        ------                         ------
+           Java Heap:    24764                          50308
+         Native Heap:    51068                          55784
+                Code:   107776                         279936
+               Stack:     4896                           4904
+            Graphics:   339272                         339276
+       Private Other:    12756
+              System:    29702
+             Unknown:                                   27748
+ 
+           TOTAL PSS:   570234            TOTAL RSS:   757956       TOTAL SWAP PSS:       20
+ 
+ Objects
+               Views:       10         ViewRootImpl:        1
+         AppContexts:        6           Activities:        1
+              Assets:       36        AssetManagers:        0
+       Local Binders:       48        Proxy Binders:      132
+       Parcel memory:       27         Parcel count:      107
+    Death Recipients:        8             WebViews:        0
+ 
+ Native Allocations
+                         Count                       Total(kB)
+                        ------                         ------
+   Bitmap (malloced):       85                             12
+Bitmap (nonmalloced):       83                          18144
+    Other (malloced):     1258                            118
+ Other (nonmalloced):      168                            121
+HardwareBuffer (nonmalloced):       18                         201216
+ 
+ Mapped Bitmaps
+                         Count                       Size(KB)
+                        ------                         ------
+              Mapped:        0                              0
+              Unique:        0                              0
+ 
+ SQL
+         MEMORY_USED:      177
+  PAGECACHE_OVERFLOW:       97          MALLOC_SIZE:       46
+ 
+ DATABASES
+      pgsz     dbsz   Lookaside(b) cache hits cache misses cache size  Dbname
+PER CONNECTION STATS
+         4       84            112   385   107    12  /data/user/0/com.bncam/databases/com.google.android.datatransport.events
+POOL STATS
+     cache hits  cache misses    cache size  Dbname
+            385           108            12  /data/user/0/com.bncam/databases/com.google.android.datatransport.events
+ 

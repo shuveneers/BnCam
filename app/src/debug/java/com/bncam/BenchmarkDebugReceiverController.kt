@@ -153,7 +153,7 @@ object BenchmarkDebugReceiverController {
                     }
                     ACTION_TRIGGER_CAPTURE -> {
                         activity.lifecycleScope.launch {
-                            CameraEventBus.captureRequests.emit(Unit)
+                            CameraEventBus.requestCapture("adb_dynamic")
                         }
                     }
                 }

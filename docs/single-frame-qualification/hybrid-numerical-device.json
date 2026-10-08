@@ -1,0 +1,1 @@
+{"width":257,"height":193,"replays":3,"weightMin":0.0517537,"weightMax":0.948246,"nan":0,"inf":0,"outOfRange":0,"unwritten":0,"complementError":8.56817e-08,"candidateError":0,"oracleError":1.88356e-09,"tolerance":0.000002,"bitexact":true,"malvarPrior":0.920808,"amazePrior":0.0791915,"malvarScore":0.790357,"amazeScore":0.0133865,"candidatesAvailable":true,"fallbackReason":"none"}

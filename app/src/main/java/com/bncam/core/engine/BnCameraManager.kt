@@ -15184,7 +15184,8 @@ class BnCameraManager(private val context: Context) {
         captureAttemptId: Long,
         outputUri: Uri?,
         reason: String,
-        outputProduced: Boolean = outputUri != null
+        outputProduced: Boolean = outputUri != null,
+        terminalResult: CaptureAttemptResult? = null
     ) {
         // This is the only normal terminal path. It resets capture/processing/save/pending
         // state and restores repeating continuity for success and every failure category.
@@ -15206,7 +15207,7 @@ class BnCameraManager(private val context: Context) {
                 content = summary
             )
         }
-        val result = captureAttempts.terminalResult(captureAttemptId, outputProduced)
+        val result = terminalResult ?: captureAttempts.terminalResult(captureAttemptId, outputProduced)
         captureAttempts.finish(captureAttemptId, result, reason)
         // Capture ownership changed. Re-evaluate whether QR/tracking/portrait still requires the
         // compact NV21 side image instead of leaving preview analysis in a stale pre-capture state.
@@ -16525,7 +16526,8 @@ class BnCameraManager(private val context: Context) {
         deviceRotation: Int,
         temporaryPreviewPath: String? = null,
         userShutterTimestampNs: Long,
-        viewfinderMode: ViewfinderMode = ViewfinderMode.PHOTO
+        viewfinderMode: ViewfinderMode = ViewfinderMode.PHOTO,
+        captureTrigger: com.bncam.core.capture.CaptureTrigger? = null
     ): Uri? = withContext(Dispatchers.IO) {
         require(userShutterTimestampNs > 0L) {
             "executeCapture requires a valid non-zero userShutterTimestampNs from actual shutter press."
@@ -16547,7 +16549,8 @@ class BnCameraManager(private val context: Context) {
                 captureMode = "${viewfinderMode.name}:${activeProfile.captureStrategy.name}",
                 generationId = pipelineGeneration,
                 imageReaderMaxImages = pipelineIdentity?.maxImages ?: ringBuffer.currentCapacity(),
-                ringBufferFrameCount = ringBuffer.completeFrameCount()
+                ringBufferFrameCount = ringBuffer.completeFrameCount(),
+                trigger = captureTrigger
             )
         )
         if (attemptId == null) {
@@ -16558,8 +16561,6 @@ class BnCameraManager(private val context: Context) {
         }
         // While capture owns the production path, tracking/portrait analysis is suspended. Keep
         // compact NV21 enabled only for consumers that remain valid during capture (currently QR).
-        refreshRawPreviewCompactAnalysisRequest()
-
         var finalOutputUri: Uri? = null
         var finishReason = "capture did not produce an output"
         // All shutter-time leases are declared before entering the ownership scope so the finally
@@ -16574,6 +16575,7 @@ class BnCameraManager(private val context: Context) {
         var singleAnchorEffectiveShutterTimestampDomain = "ELAPSED_REALTIME"
 
         try {
+            refreshRawPreviewCompactAnalysisRequest()
             // This must be the first accepted-shutter ownership transaction. Freeze the live RAW
             // selection contract and atomically pin one current-generation complete pre-shutter pair
             // before diagnostics, settings Flow reads, recipe construction, or any other suspend
@@ -17462,6 +17464,7 @@ class BnCameraManager(private val context: Context) {
                                 meteringPolicySummary = lastMeteringPlanSummary,
                                 exposurePolicySummary = singleRunnerExposurePolicySummary,
                                 postShutterStillCaptureUsed = postShutterStillCaptureUsed,
+                                captureTriggerId = attemptId,
                                 captureStageListener = captureAttempts.listenerFor(attemptId),
                                 onRawProcessingFeedback = { feedback ->
                                     asyncRenderHealthOwner.get()?.let { owner ->
@@ -17612,6 +17615,13 @@ class BnCameraManager(private val context: Context) {
                         "CAPTURE_SUBMITTED attemptId=$attemptId workId=${submissionResult.workId}"
                     )
                     captureAttempts.markSubmitted(attemptId, submissionResult.workId)
+                    val attemptOwner = captureAttempts
+                    com.bncam.core.output.CaptureProcessingQueue.onTerminal(submissionResult.workId) { completed ->
+                        val published = completed.state == com.bncam.core.output.CaptureWorkState.PUBLISHED &&
+                            completed.publicationResult != com.bncam.core.output.CapturePublicationResult.FAILURE
+                        attemptOwner.finish(attemptId, attemptOwner.terminalResult(attemptId, published),
+                            completed.failureReason ?: "output_published:${completed.publicationResult}")
+                    }
                     // The worker may finish before this coroutine receives Submitted. Reconcile
                     // the durable snapshot after installing the attempt/work mapping so a fast
                     // terminal event cannot be lost by the non-replaying SharedFlow.
@@ -17657,7 +17667,7 @@ class BnCameraManager(private val context: Context) {
                             "Capture submission rejected: ${submissionResult.reason}"
                         )
                     )
-                    finishCaptureAttempt(attemptId, null, finishReason)
+                    finishCaptureAttempt(attemptId, null, finishReason, terminalResult = CaptureAttemptResult.REJECTED)
                     return@withContext null
                 }
             }
@@ -17684,7 +17694,9 @@ class BnCameraManager(private val context: Context) {
             }.onFailure { diagnosticsFailure ->
                 Log.e(tag, "Failed to publish terminal capture diagnostics", diagnosticsFailure)
             }
-            finishCaptureAttempt(attemptId, null, finishReason)
+            finishCaptureAttempt(attemptId, null, finishReason,
+                terminalResult = if (e is kotlinx.coroutines.CancellationException) CaptureAttemptResult.CANCELLED else null)
+            if (e is kotlinx.coroutines.CancellationException) throw e
             null
         } finally {
             preleasedProvisionalNearZslAnchor?.let { provisional ->

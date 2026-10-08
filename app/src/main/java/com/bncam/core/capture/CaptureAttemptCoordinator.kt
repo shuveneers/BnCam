@@ -13,7 +13,8 @@ data class CaptureAttemptContext(
     val captureMode: String,
     val generationId: Int,
     val imageReaderMaxImages: Int,
-    val ringBufferFrameCount: Int
+    val ringBufferFrameCount: Int,
+    val trigger: CaptureTrigger? = null
 )
 
 data class CaptureAttemptSnapshot(
@@ -76,6 +77,7 @@ interface CaptureStageListener {
  */
 class CaptureAttemptCoordinator(
     private val clockNs: () -> Long = System::nanoTime,
+    private val accounting: CaptureTerminalAccounting? = null,
     private val trace: (event: String, detail: String) -> Unit = { _, _ -> }
 ) : CaptureStageListener {
     private val nextAttemptId = AtomicLong(0L)
@@ -137,16 +139,24 @@ class CaptureAttemptCoordinator(
 
     @Synchronized
     fun begin(context: CaptureAttemptContext): Long? {
+        val ledger = accounting ?: runCatching { CaptureTerminalAccounting.process }.getOrNull()
+        val trigger = context.trigger ?: ledger?.receive("router")
+        if (trigger != null && ledger?.isOutstanding(trigger) == false) {
+            trace("captureRejected", "captureAttemptId=${trigger.id} reason=trigger_already_terminal")
+            return null
+        }
         val active = activeAcquisition()
         if (active != null) {
             pendingCapture = true
             refreshSnapshot(preferredAttemptId = active.id)
-            trace("captureRejected", "reason=previous_acquisition_running ${stateString()}")
+            trigger?.let { ledger?.finish(it, CaptureOutcome.REJECTED, "previous_acquisition_running") }
+            trace("captureRejected", "captureAttemptId=${trigger?.id} reason=previous_acquisition_running ${stateString()}")
             return null
         }
-        val id = nextAttemptId.incrementAndGet()
+        val id = trigger?.id ?: nextAttemptId.incrementAndGet()
         val now = clockNs()
-        attempts[id] = ActiveAttempt(id, context, now)
+        attempts[id] = ActiveAttempt(id, context, now, trigger = trigger)
+        trigger?.let { ledger?.admit(it, contextString(context)) }
         activeAcquisitionId = id
         pendingCapture = false
         refreshSnapshot(preferredAttemptId = id)
@@ -319,6 +329,17 @@ class CaptureAttemptCoordinator(
             stateReset = true,
             nextCaptureAllowed = true
         )
+        attempt.trigger?.let { trigger ->
+            (accounting ?: runCatching { CaptureTerminalAccounting.process }.getOrNull())?.finish(
+                trigger,
+                when (result) {
+                    CaptureAttemptResult.SUCCESS -> CaptureOutcome.PUBLISHED
+                    CaptureAttemptResult.REJECTED -> CaptureOutcome.REJECTED
+                    CaptureAttemptResult.CANCELLED -> CaptureOutcome.CANCELLED
+                    else -> CaptureOutcome.FAILURE
+                }, reason
+            )
+        }
         refreshSnapshot(preferredAttemptId = attemptId)
         trace("captureStateReset", "captureAttemptId=$attemptId attemptReleased=true ${stateString()}")
         trace(
@@ -330,10 +351,11 @@ class CaptureAttemptCoordinator(
 
     @Synchronized
     fun forceReset(reason: String) {
-        val ids = attempts.keys.toList()
-        attempts.clear()
+        // Acquisition belongs to Camera2. Submitted work belongs to the process queue and must
+        // retain its identity until actual publication, even when this camera/Activity closes.
+        val ids = attempts.values.filter { !it.detachedWork }.map { it.id }
+        ids.forEach { finish(it, CaptureAttemptResult.CANCELLED, reason) }
         activeAcquisitionId = null
-        workToAttemptMap.clear()
         inFlightImageCount = 0
         pendingCapture = false
         refreshSnapshot(preferredAttemptId = null)
@@ -391,6 +413,7 @@ class CaptureAttemptCoordinator(
         val id: Long,
         val context: CaptureAttemptContext,
         val shutterNs: Long,
+        val trigger: CaptureTrigger? = null,
         var requestNs: Long = 0L,
         var resultNs: Long = 0L,
         var imageNs: Long = 0L,

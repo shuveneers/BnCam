@@ -1,0 +1,12 @@
+[
+  {
+    "captureTriggerId": "1",
+    "rawSha256": "a783683a9bdb098ca437033728f284a943e0844db0ac327559377559460fd62c",
+    "jpegSha256": "c9ae73930b9b3358b974b84fe9784f1b3a9b61ce81cea80579dba951ea76b656",
+    "jpegBytes": 19812246,
+    "jpegUri": "content://media/external/images/media/103496",
+    "metadataKeysPresent": true,
+    "rawChecksumIndependentReplay": "NOT EXPORTED; digest calculated inside native-buffer ownership",
+    "nullHalFields": []
+  }
+]

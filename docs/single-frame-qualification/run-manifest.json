@@ -1,0 +1,21 @@
+{
+  "date": "2026-10-07",
+  "timezone": "Europe/Amsterdam",
+  "branch": "main",
+  "baselineCommit": "5c3f7188a10f2a231f8192d9fe5b3a8f1d828b86",
+  "initialWorkingTree": "CLEAN",
+  "finalWorkingTree": "DIRTY_INTENTIONAL",
+  "deviceSerial": "AUWE025B03006422",
+  "deviceModel": "BKQ-N49",
+  "android": "17",
+  "api": 37,
+  "abi": "arm64-v8a",
+  "deviceAtEnd": "NOT_LISTED_BY_ADB",
+  "trackedDiffSha256": "eb41b35ee5c205e6c0cd04616d093d845087ad5003c154331dc92a873338c7d7",
+  "untrackedSources": {
+    "app/src/test/cpp/SingleFrameQualification.cpp": "98247e5bcd0d316422bc74efd7660ccff4ff32370e4ed2953cfe88de985b7d67",
+    "app/src/main/java/com/bncam/core/capture/CaptureTerminalAccounting.kt": "3757eb46af9a189490ebbd5726ff1e9c8fd41ddb712559b09289cc26af67c220",
+    "app/src/main/java/com/bncam/core/debug/QualificationEvidence.kt": "63465b0fe732e0cdf5b7b31ecd8ee7f9f19ecf560c6b8c1ea73dc7a8f05ea49a"
+  },
+  "scope": "LOCAL_IMPLEMENTATION_VERIFIED; POST_CHANGE_DEVICE_QUALIFICATION_BLOCKED"
+}

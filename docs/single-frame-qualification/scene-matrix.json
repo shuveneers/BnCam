@@ -1,0 +1,298 @@
+[
+  {
+    "scene": "A",
+    "name": "daylight / good lighting",
+    "setup": "Stable well-lit detail plus neutral areas; record lamp/daylight setup.",
+    "goals": [
+      "detail",
+      "CFA",
+      "color",
+      "clipping"
+    ],
+    "status": "NOT AVAILABLE",
+    "qualification": "NOT QUALIFIED",
+    "reason": "No controlled physical scene verified; ADB disconnected before new device qualification.",
+    "paths": [
+      "Malvar",
+      "AMaZE",
+      "Auto Hybrid"
+    ],
+    "rawFormats": [
+      "RAW10",
+      "RAW_SENSOR"
+    ],
+    "lensCoverage": [
+      "main",
+      "ultrawide",
+      "tele",
+      "front"
+    ],
+    "repeats": 2,
+    "captureCommand": "python scripts/single_frame_qualification.py capture --scene A_PATH_FORMAT_LENS_TAKE",
+    "requiredEvidence": [
+      "terminal session/capture ID",
+      "qualification_evidence.jsonl",
+      "setup notes",
+      "physical changes with timestamps"
+    ],
+    "instruction": "Set the intended existing profile controls in the app; record them. The script does not choose/tune image parameters."
+  },
+  {
+    "scene": "B",
+    "name": "low light",
+    "setup": "Physically dim lighting, stable tripod/phone position; record light source and ISO.",
+    "goals": [
+      "shot/read noise",
+      "chroma noise",
+      "exposure allocation",
+      "demosaic stability"
+    ],
+    "status": "NOT AVAILABLE",
+    "qualification": "NOT QUALIFIED",
+    "reason": "No controlled physical scene verified; ADB disconnected before new device qualification.",
+    "paths": [
+      "Malvar",
+      "AMaZE",
+      "Auto Hybrid"
+    ],
+    "rawFormats": [
+      "RAW10",
+      "RAW_SENSOR"
+    ],
+    "lensCoverage": [
+      "main",
+      "ultrawide",
+      "tele",
+      "front"
+    ],
+    "repeats": 2,
+    "captureCommand": "python scripts/single_frame_qualification.py capture --scene B_PATH_FORMAT_LENS_TAKE",
+    "requiredEvidence": [
+      "terminal session/capture ID",
+      "qualification_evidence.jsonl",
+      "setup notes",
+      "physical changes with timestamps"
+    ],
+    "instruction": "Set the intended existing profile controls in the app; record them. The script does not choose/tune image parameters."
+  },
+  {
+    "scene": "C",
+    "name": "highlights",
+    "setup": "Bright light and specular/bright patch with adjacent color; avoid aiming at sun.",
+    "goals": [
+      "white level",
+      "per-channel clipping",
+      "highlight color"
+    ],
+    "status": "NOT AVAILABLE",
+    "qualification": "NOT QUALIFIED",
+    "reason": "No controlled physical scene verified; ADB disconnected before new device qualification.",
+    "paths": [
+      "Malvar",
+      "AMaZE",
+      "Auto Hybrid"
+    ],
+    "rawFormats": [
+      "RAW10",
+      "RAW_SENSOR"
+    ],
+    "lensCoverage": [
+      "main",
+      "ultrawide",
+      "tele",
+      "front"
+    ],
+    "repeats": 2,
+    "captureCommand": "python scripts/single_frame_qualification.py capture --scene C_PATH_FORMAT_LENS_TAKE",
+    "requiredEvidence": [
+      "terminal session/capture ID",
+      "qualification_evidence.jsonl",
+      "setup notes",
+      "physical changes with timestamps"
+    ],
+    "instruction": "Set the intended existing profile controls in the app; record them. The script does not choose/tune image parameters."
+  },
+  {
+    "scene": "D",
+    "name": "fine detail / Nyquist",
+    "setup": "Fixed text, fine lines, fabric, grid and slanted edges at documented distance.",
+    "goals": [
+      "false color",
+      "zippering",
+      "aliasing",
+      "Malvar/AMaZE/Hybrid"
+    ],
+    "status": "NOT AVAILABLE",
+    "qualification": "NOT QUALIFIED",
+    "reason": "No controlled physical scene verified; ADB disconnected before new device qualification.",
+    "paths": [
+      "Malvar",
+      "AMaZE",
+      "Auto Hybrid"
+    ],
+    "rawFormats": [
+      "RAW10",
+      "RAW_SENSOR"
+    ],
+    "lensCoverage": [
+      "main",
+      "ultrawide",
+      "tele",
+      "front"
+    ],
+    "repeats": 2,
+    "captureCommand": "python scripts/single_frame_qualification.py capture --scene D_PATH_FORMAT_LENS_TAKE",
+    "requiredEvidence": [
+      "terminal session/capture ID",
+      "qualification_evidence.jsonl",
+      "setup notes",
+      "physical changes with timestamps"
+    ],
+    "instruction": "Set the intended existing profile controls in the app; record them. The script does not choose/tune image parameters."
+  },
+  {
+    "scene": "E",
+    "name": "color reference",
+    "setup": "ColorChecker with named lighting or fixed reproducible colorful scene.",
+    "goals": [
+      "measure differences only; do not tune"
+    ],
+    "status": "NOT AVAILABLE",
+    "qualification": "NOT QUALIFIED",
+    "reason": "No controlled physical scene verified; ADB disconnected before new device qualification.",
+    "paths": [
+      "Malvar",
+      "AMaZE",
+      "Auto Hybrid"
+    ],
+    "rawFormats": [
+      "RAW10",
+      "RAW_SENSOR"
+    ],
+    "lensCoverage": [
+      "main",
+      "ultrawide",
+      "tele",
+      "front"
+    ],
+    "repeats": 2,
+    "captureCommand": "python scripts/single_frame_qualification.py capture --scene E_PATH_FORMAT_LENS_TAKE",
+    "requiredEvidence": [
+      "terminal session/capture ID",
+      "qualification_evidence.jsonl",
+      "setup notes",
+      "physical changes with timestamps"
+    ],
+    "instruction": "Set the intended existing profile controls in the app; record them. The script does not choose/tune image parameters."
+  },
+  {
+    "scene": "F",
+    "name": "exposure transition",
+    "setup": "Physical dark-to-bright and bright-to-dark change just before shutter; timestamp change.",
+    "goals": [
+      "AE convergence",
+      "pre/post change frame provenance"
+    ],
+    "status": "NOT AVAILABLE",
+    "qualification": "NOT QUALIFIED",
+    "reason": "No controlled physical scene verified; ADB disconnected before new device qualification.",
+    "paths": [
+      "Malvar",
+      "AMaZE",
+      "Auto Hybrid"
+    ],
+    "rawFormats": [
+      "RAW10",
+      "RAW_SENSOR"
+    ],
+    "lensCoverage": [
+      "main",
+      "ultrawide",
+      "tele",
+      "front"
+    ],
+    "repeats": 2,
+    "captureCommand": "python scripts/single_frame_qualification.py capture --scene F_PATH_FORMAT_LENS_TAKE",
+    "requiredEvidence": [
+      "terminal session/capture ID",
+      "qualification_evidence.jsonl",
+      "setup notes",
+      "physical changes with timestamps"
+    ],
+    "instruction": "Set the intended existing profile controls in the app; record them. The script does not choose/tune image parameters."
+  },
+  {
+    "scene": "G",
+    "name": "focus challenge",
+    "setup": "Documented near/far foreground/background targets; tap and fast second shutter.",
+    "goals": [
+      "continuous AF",
+      "tap",
+      "settled/direct captures",
+      "loss/recovery"
+    ],
+    "status": "NOT AVAILABLE",
+    "qualification": "NOT QUALIFIED",
+    "reason": "No controlled physical scene verified; ADB disconnected before new device qualification.",
+    "paths": [
+      "Malvar",
+      "AMaZE",
+      "Auto Hybrid"
+    ],
+    "rawFormats": [
+      "RAW10",
+      "RAW_SENSOR"
+    ],
+    "lensCoverage": [
+      "main",
+      "ultrawide",
+      "tele",
+      "front"
+    ],
+    "repeats": 2,
+    "captureCommand": "python scripts/single_frame_qualification.py capture --scene G_PATH_FORMAT_LENS_TAKE",
+    "requiredEvidence": [
+      "terminal session/capture ID",
+      "qualification_evidence.jsonl",
+      "setup notes",
+      "physical changes with timestamps"
+    ],
+    "instruction": "Set the intended existing profile controls in the app; record them. The script does not choose/tune image parameters."
+  },
+  {
+    "scene": "H",
+    "name": "physical orientation",
+    "setup": "Physically rotate portrait, landscape left, landscape right while scene stays fixed.",
+    "goals": [
+      "sensor/output orientation",
+      "front mirror"
+    ],
+    "status": "NOT AVAILABLE",
+    "qualification": "NOT QUALIFIED",
+    "reason": "No controlled physical scene verified; ADB disconnected before new device qualification.",
+    "paths": [
+      "Malvar",
+      "AMaZE",
+      "Auto Hybrid"
+    ],
+    "rawFormats": [
+      "RAW10",
+      "RAW_SENSOR"
+    ],
+    "lensCoverage": [
+      "main",
+      "ultrawide",
+      "tele",
+      "front"
+    ],
+    "repeats": 2,
+    "captureCommand": "python scripts/single_frame_qualification.py capture --scene H_PATH_FORMAT_LENS_TAKE",
+    "requiredEvidence": [
+      "terminal session/capture ID",
+      "qualification_evidence.jsonl",
+      "setup notes",
+      "physical changes with timestamps"
+    ],
+    "instruction": "Set the intended existing profile controls in the app; record them. The script does not choose/tune image parameters."
+  }
+]

@@ -62,6 +62,8 @@ struct SpectraResidentDemosaicRequest {
 
     // Delta 0048: scene-level soft priors. AUTO_HYBRID combines them with local
     // structure/Nyquist/chroma/noise evidence; they are never hard route selectors.
+    // Explicit validation request, ignored in release. Never enabled by production rendering.
+    bool hybridValidationReadback = false;
     float autoMalvarPrior = 0.5f;
     float autoBncNeuralPrior = 0.0f;
     float autoAmazePrior = 0.5f;
@@ -79,6 +81,9 @@ struct SpectraResidentDemosaicResult {
     bool residentInputUsed = false;
     bool fullReadbackDeferred = false;
     std::vector<float> outputRgb;
+    // 20 floats/pixel: M,A,structure,Nyquist,noise,chromaRisk,lowSignal,nearTie,
+    // Malvar RGB, AMaZE RGB, actual resident output RGB, written flag, x,y.
+    std::vector<float> hybridValidation;
     // Compact GPU-generated flat-region residual candidates. Eight floats per sample:
     // hpY, hpRG, hpBG, structure, tileIndex, (validFlag + centerY), centerRG, centerBG.
     // Slot 5 is 0 for invalid samples and 1+linearLuma for valid samples, preserving the

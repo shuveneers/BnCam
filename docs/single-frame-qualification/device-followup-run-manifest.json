@@ -1,0 +1,39 @@
+{
+  "date": "2026-10-08",
+  "serial": "AUWE025B03006422",
+  "branch": "main",
+  "baseCommit": "5c3f7188a10f2a231f8192d9fe5b3a8f1d828b86",
+  "trackedDiffSha256": "05fe3d42ba8ada4a98ec41bfe4d70ca8d49a3cd83bf9bec84d048a88dc6e1280",
+  "artifactsSha256": {
+    "app/build/outputs/apk/debug/app-debug.apk": "497dc66df1292097c64f37e6ceaf74a4a9c2c6a33ab53659162b5c9882e34545",
+    "app/src/test/cpp/SingleFrameQualification.cpp": "2ea7b0920728e92a2c28c838320ce8184aba27a496aac7fec76947303b5f27f4",
+    "scripts/validateBnCamSingleFrame.ps1": "5c74315f18d499cbcb4d3e0831d9c6222ddf551f141f48e675dfce45fd8e2585",
+    "scripts/single_frame_qualification.py": "82406f82cb8cf2cdd49e3e56c9e0c28c071b166463b98a8b6994c7b75f841057",
+    "app/src/main/java/com/bncam/core/capture/CaptureTerminalAccounting.kt": "3757eb46af9a189490ebbd5726ff1e9c8fd41ddb712559b09289cc26af67c220",
+    "app/src/main/java/com/bncam/core/debug/QualificationEvidence.kt": "63465b0fe732e0cdf5b7b31ecd8ee7f9f19ecf560c6b8c1ea73dc7a8f05ea49a",
+    "work/single-frame-gate/fixture-e9ada040aef24114997eaf342e3b7086/hybrid-mask-evidence.f32": "437955b2b72073cf90d8a78748b086d6682d53aa5b387d67c528cbdb33b32509",
+    "work/single-frame-gate/fixture-e9ada040aef24114997eaf342e3b7086/warm-benchmark.csv": "8cad24ebda82b2f5725528f047f2dcf87ba3b3b7648d49b256c537976e0ca74b"
+  },
+  "gateRun": 9,
+  "gate": "PASS",
+  "connectedFull": {
+    "tests": 12,
+    "passed": 11,
+    "failed": 1,
+    "knownRootCause": "Espresso 3.5.1 InputManager.getInstance API37"
+  },
+  "fixtureDirectory": "work\\single-frame-gate\\fixture-e9ada040aef24114997eaf342e3b7086",
+  "benchmarkQualified": true,
+  "physicalSceneMatrix": "NOT QUALIFIED",
+  "jvmRegression": {
+    "tests": 1959,
+    "baselineFailures": 355,
+    "finalFailures": 355,
+    "new": [],
+    "resolved": []
+  },
+  "reset": false,
+  "commit": false,
+  "push": false,
+  "qualityTuning": false
+}

@@ -38,7 +38,16 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 
 object CameraEventBus {
-    val captureRequests = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
+    val captureRequests = MutableSharedFlow<com.bncam.core.capture.CaptureTrigger>(extraBufferCapacity = 1)
+    fun requestCapture(source: String) {
+        val ledger = com.bncam.core.capture.CaptureTerminalAccounting.process
+        val trigger = ledger.receive(source)
+        if (captureRequests.subscriptionCount.value == 0) {
+            ledger.finish(trigger, com.bncam.core.capture.CaptureOutcome.REJECTED, "no_active_capture_ui")
+        } else if (!captureRequests.tryEmit(trigger)) {
+            ledger.finish(trigger, com.bncam.core.capture.CaptureOutcome.REJECTED, "shutter_event_buffer_full")
+        }
+    }
     // +1 = zoom in, -1 = zoom out. Events are intentionally non-replayed so a volume press on a
     // non-camera destination cannot be applied later when returning to the viewfinder.
     val zoomRequests = MutableSharedFlow<Int>(extraBufferCapacity = 4)
@@ -147,9 +156,13 @@ class MainActivity : ComponentActivity() {
 
     private fun emitHardwareCapture(source: String, event: KeyEvent?) {
         val now = SystemClock.elapsedRealtime()
-        if (now - lastHardwareCaptureElapsedMs < 250L) return
+        if (now - lastHardwareCaptureElapsedMs < 250L) {
+            val ledger = com.bncam.core.capture.CaptureTerminalAccounting.process
+            ledger.finish(ledger.receive("hardware"), com.bncam.core.capture.CaptureOutcome.REJECTED, "hardware_debounce")
+            return
+        }
         lastHardwareCaptureElapsedMs = now
-        CameraEventBus.captureRequests.tryEmit(Unit)
+        CameraEventBus.requestCapture("hardware")
         DiagnosticsAggregator.recordKeyValues(
             stream = DiagnosticsAggregator.Stream.CAMERA,
             scope = "APPLICATION",
@@ -188,7 +201,7 @@ class MainActivity : ComponentActivity() {
                     "Do Nothing" -> true
                     "Take Photo" -> {
                         // Vuur een signaal af naar CameraScreen!
-                        CameraEventBus.captureRequests.tryEmit(Unit)
+                        CameraEventBus.requestCapture("hardware")
                         true
                     }
                     "Zoom" -> {

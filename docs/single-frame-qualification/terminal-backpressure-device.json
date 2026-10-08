@@ -1,0 +1,606 @@
+{
+  "triggered": 100,
+  "queueAdmitted": 3,
+  "records": [
+    {
+      "captureId": 4,
+      "timestampNs": 37501170904183,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 5,
+      "timestampNs": 37501171441527,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 6,
+      "timestampNs": 37501171689027,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 7,
+      "timestampNs": 37501171913558,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 8,
+      "timestampNs": 37501172142204,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 9,
+      "timestampNs": 37501172352412,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 10,
+      "timestampNs": 37501172550589,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 11,
+      "timestampNs": 37501172749964,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 12,
+      "timestampNs": 37501172945277,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 13,
+      "timestampNs": 37501173134600,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 14,
+      "timestampNs": 37501173316631,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 15,
+      "timestampNs": 37501173477621,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 16,
+      "timestampNs": 37501173636371,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 17,
+      "timestampNs": 37501173801944,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 18,
+      "timestampNs": 37501173945381,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 19,
+      "timestampNs": 37501174102412,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 20,
+      "timestampNs": 37501174243610,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 21,
+      "timestampNs": 37501174376319,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 22,
+      "timestampNs": 37501174514027,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 23,
+      "timestampNs": 37501174648923,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 24,
+      "timestampNs": 37501174781735,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 25,
+      "timestampNs": 37501174910225,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 26,
+      "timestampNs": 37501175052100,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 27,
+      "timestampNs": 37501175190225,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 28,
+      "timestampNs": 37501175318141,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 29,
+      "timestampNs": 37501175460329,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 30,
+      "timestampNs": 37501175592985,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 31,
+      "timestampNs": 37501175721631,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 32,
+      "timestampNs": 37501175854287,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 33,
+      "timestampNs": 37501175988506,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 34,
+      "timestampNs": 37501176159131,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 35,
+      "timestampNs": 37501176297569,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 36,
+      "timestampNs": 37501176427725,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 37,
+      "timestampNs": 37501176576839,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 38,
+      "timestampNs": 37501176709287,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 39,
+      "timestampNs": 37501177067933,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 40,
+      "timestampNs": 37501177491423,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 41,
+      "timestampNs": 37501177608402,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 42,
+      "timestampNs": 37501177719756,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 43,
+      "timestampNs": 37501177834964,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 44,
+      "timestampNs": 37501177949548,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 45,
+      "timestampNs": 37501178062256,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 46,
+      "timestampNs": 37501178182985,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 47,
+      "timestampNs": 37501178303089,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 48,
+      "timestampNs": 37501178413194,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 49,
+      "timestampNs": 37501178541475,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 50,
+      "timestampNs": 37501178668766,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 51,
+      "timestampNs": 37501178786110,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 52,
+      "timestampNs": 37501178901266,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 53,
+      "timestampNs": 37501179053141,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 54,
+      "timestampNs": 37501179179756,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 55,
+      "timestampNs": 37501179316110,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 56,
+      "timestampNs": 37501179450173,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 57,
+      "timestampNs": 37501179614652,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 58,
+      "timestampNs": 37501179749652,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 59,
+      "timestampNs": 37501179874235,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 60,
+      "timestampNs": 37501180026631,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 61,
+      "timestampNs": 37501180164079,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 62,
+      "timestampNs": 37501180297569,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 63,
+      "timestampNs": 37501180433194,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 64,
+      "timestampNs": 37501180565381,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 65,
+      "timestampNs": 37501180689287,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 66,
+      "timestampNs": 37501180823923,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 67,
+      "timestampNs": 37501180955850,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 68,
+      "timestampNs": 37501181087464,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 69,
+      "timestampNs": 37501181221371,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 70,
+      "timestampNs": 37501181357204,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 71,
+      "timestampNs": 37501181492256,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 72,
+      "timestampNs": 37501181616266,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 73,
+      "timestampNs": 37501181748871,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 74,
+      "timestampNs": 37501181880746,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 75,
+      "timestampNs": 37501182012464,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 76,
+      "timestampNs": 37501182146787,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 77,
+      "timestampNs": 37501182285121,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 78,
+      "timestampNs": 37501182412881,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 79,
+      "timestampNs": 37501182559496,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 80,
+      "timestampNs": 37501182692360,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 81,
+      "timestampNs": 37501182818819,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 82,
+      "timestampNs": 37501182942621,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 83,
+      "timestampNs": 37501183086110,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 84,
+      "timestampNs": 37501183218766,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 85,
+      "timestampNs": 37501183343766,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 86,
+      "timestampNs": 37501183499964,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 87,
+      "timestampNs": 37501183643975,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 88,
+      "timestampNs": 37501183769339,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 89,
+      "timestampNs": 37501183903089,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 90,
+      "timestampNs": 37501184047256,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 91,
+      "timestampNs": 37501184206839,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 92,
+      "timestampNs": 37501184340173,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 93,
+      "timestampNs": 37501184467464,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 94,
+      "timestampNs": 37501184598923,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 95,
+      "timestampNs": 37501184753975,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 96,
+      "timestampNs": 37501184889756,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 97,
+      "timestampNs": 37501185012048,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 98,
+      "timestampNs": 37501185132464,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 99,
+      "timestampNs": 37501185257673,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 100,
+      "timestampNs": 37501185379912,
+      "status": "REJECTED",
+      "reason": "processing_queue_full"
+    },
+    {
+      "captureId": 1,
+      "timestampNs": 37501170284652,
+      "status": "CANCELLED",
+      "reason": "validation_reservation_released"
+    },
+    {
+      "captureId": 2,
+      "timestampNs": 37501170658089,
+      "status": "CANCELLED",
+      "reason": "validation_reservation_released"
+    },
+    {
+      "captureId": 3,
+      "timestampNs": 37501170788506,
+      "status": "CANCELLED",
+      "reason": "validation_reservation_released"
+    }
+  ]
+}
