@@ -22,6 +22,7 @@ class BnAutoExposureEngineTest {
         val gain = warm.sensitivityIso / 100.0
         return observation(warm.exposureTimeNs, signal, timestamp, 1_000_000).copy(
             iso = warm.sensitivityIso, noiseSlope = 1e-7 * gain, noiseOffset = 1e-11 * gain * gain,
+            quantizationVariance = 1.0 / (12.0 * 16383 * 16383),
             sensorLumaSamples = DoubleArray(3072) { signal * (0.8 + 0.15 * sin(it % 64 * 0.7) + 0.15 * cos(it / 64 * 0.9)) },
             sensorGradientX = DoubleArray(3072) { signal * 0.075 * cos(it % 64 * 0.7) },
             sensorGradientY = DoubleArray(3072) { signal * -0.075 * sin(it / 64 * 0.9) })
@@ -82,7 +83,7 @@ class BnAutoExposureEngineTest {
         repeat(120) { i ->
             d = e.observe("a", limits, textured(d, (i + 1L) * 33_000_000))
         }
-        assertTrue(d.targetExposureNs >= 540_000_000)
+        assertTrue(d.summary(), d.targetExposureNs >= 540_000_000)
         assertTrue(d.frameDurationNs >= d.targetExposureNs)
         assertTrue(d.frameDurationNs <= limits.maxFrameDurationNs)
     }
@@ -221,7 +222,7 @@ class BnAutoExposureEngineTest {
                 .copy(noiseSlope = 0.0, noiseOffset = 0.0))
         }
         assertTrue(d.targetExposureNs <= limits.fallbackHandheldNs)
-        assertEquals("NO_MEANINGFUL_PREDICTED_SNR_GAIN", d.limitingConstraint)
+        assertEquals(d.summary(), "NO_MEANINGFUL_PREDICTED_SNR_GAIN", d.limitingConstraint)
     }
     @Test fun diffuseColoredHighlightsConstrainTheBrightnessLift() {
         val e = BnAutoExposureEngine()
@@ -233,7 +234,7 @@ class BnAutoExposureEngineTest {
         val e = BnAutoExposureEngine()
         var d = e.current("a", limits)
         repeat(120) { i -> d = e.observe("a", limits, textured(d, (i + 1L) * 33_000_000)) }
-        assertTrue(d.targetExposureNs >= 540_000_000)
+        assertTrue(d.summary(), d.targetExposureNs >= 540_000_000)
         val missing = e.observe("a", limits, null)
         assertTrue(missing.targetExposureNs <= limits.fallbackHandheldNs)
         assertEquals(0f, missing.meteringConfidence)
@@ -254,10 +255,95 @@ class BnAutoExposureEngineTest {
         val a = sample(raw16, false); val b = sample(packed, true)
         assertEquals(a.p80, b.p80, 0.0)
         assertEquals(a.channelP98Maximum, b.channelP98Maximum, 0.0)
+        assertEquals(a.diffuseP80, b.diffuseP80, 0.0)
+        assertEquals(a.diffuseP98Maximum, b.diffuseP98Maximum, 0.0)
+        assertArrayEquals(a.regionMedians, b.regionMedians, 0.0)
+        assertEquals(a.pointSourceFraction, b.pointSourceFraction, 0.0)
         assertArrayEquals(a.sensorLumaSamples, b.sensorLumaSamples, 0.0)
         assertArrayEquals(a.sensorGradientX, b.sensorGradientX, 0.0)
         assertArrayEquals(a.sensorGradientY, b.sensorGradientY, 0.0)
         assertEquals(3.0 / 959, a.sensorGradientX!![0], 1e-12)
         assertEquals(7.0 / 959, a.sensorGradientY!![0], 1e-12)
+    }
+
+    private fun spatialScene(lamp: Boolean, broadWindow: Boolean = false): BnAutoObservation {
+        val width = 128; val height = 96
+        val raw = ByteBuffer.allocate(width * height * 2).order(ByteOrder.LITTLE_ENDIAN)
+        for (y in 0 until height) for (x in 0 until width) {
+            val bright = if (broadWindow) x >= 88 else lamp && x in 48..67 && y in 32..47
+            raw.putShort((if (bright) 1023 else 64 + 30 + (x + y) % 12).toShort())
+        }
+        return BnAutoRawMeter.sample(raw, width, height, width * 2, 2, false,
+            DoubleArray(4) { 64.0 }, 1023.0, 1, 10_000_000, 100, 1e-5, 1e-7)!!
+    }
+
+    @Test fun compactLampLargerThanOldTwoPercentTrimDoesNotDictateDiffuseExposure() {
+        val clear = spatialScene(false)
+        val lamp = spatialScene(true)
+        assertTrue(lamp.channelP98Maximum > 0.98)
+        assertTrue(lamp.pointSourceFraction in 0.02..0.05)
+        assertTrue(lamp.diffuseP98Maximum < 0.1)
+        val a = BnAutoExposureEngine().observe("a", limits, clear)
+        val b = BnAutoExposureEngine().observe("b", limits, lamp)
+        assertEquals(a.exposureProduct, b.exposureProduct, a.exposureProduct * 0.05)
+    }
+
+    @Test fun broadWindowAndColoredDiffuseClippingAreNeverExcludedAsPointSources() {
+        val window = spatialScene(true, broadWindow = true)
+        assertEquals(0.0, window.pointSourceFraction, 0.0)
+        assertEquals(1.0, window.diffuseP98Maximum, 0.0)
+        val d = BnAutoExposureEngine().observe("a", limits, window)
+        assertEquals("SENSOR_CLIPPING", d.limitingConstraint)
+        assertTrue(d.exposureProduct <= 5e8)
+    }
+
+    @Test fun intermediateShuttersAreComparedBeforeAFullLongExposureIsChosen() {
+        val e = BnAutoExposureEngine()
+        var d = e.current("a", limits)
+        var intermediate: BnAutoExposureDecision? = null
+        repeat(120) { i ->
+            d = e.observe("a", limits, textured(d, (i + 1L) * 33_000_000))
+            val ceiling = Regex("detailSafeCeilingNs=(\\d+)").find(d.reason)?.groupValues?.get(1)?.toLong()
+            if (intermediate == null && ceiling != null &&
+                d.targetExposureNs > limits.fallbackHandheldNs && d.targetExposureNs < ceiling * 0.9) intermediate = d
+        }
+        assertNotNull(d.summary(), intermediate)
+        d = intermediate!!
+        val ceiling = Regex("detailSafeCeilingNs=(\\d+)").find(d.reason)!!.groupValues[1].toLong()
+        assertTrue(d.summary(), d.targetExposureNs > limits.fallbackHandheldNs)
+        assertTrue(d.summary(), d.targetExposureNs < ceiling * 0.9)
+        assertTrue(d.reason.contains("candidateCount="))
+    }
+
+    @Test fun quantizationLimitedSceneDoesNotSpendLatencyForInsignificantExtraPhotons() {
+        val e = BnAutoExposureEngine()
+        var d = e.current("a", limits)
+        repeat(120) { i -> d = e.observe("a", limits, textured(d, (i + 1L) * 33_000_000)
+            .copy(quantizationVariance = 1.0 / (12 * 1023 * 1023))) }
+        assertTrue(d.summary(), d.targetExposureNs < 340_000_000)
+        assertTrue(d.targetExposureNs > limits.fallbackHandheldNs)
+    }
+
+    @Test fun sceneDiagnosticsDistinguishLowRadianceFromNormalIndoorLight() {
+        for ((signal, expected) in listOf(0.0001 to "NIGHT", 0.001 to "DIM_INTERIOR",
+            0.003 to "NORMAL", 0.4 to "BRIGHT")) {
+            val d = BnAutoExposureEngine().observe("a", limits, observation(p80 = signal))
+            assertTrue(d.summary(), d.reason.contains("sceneClass=$expected;"))
+        }
+    }
+
+    @Test fun lowKeyDistributionPreservesShadowsInsteadOfChasingTheirSnr() {
+        val normal = observation(p80 = 0.01).copy(diffuseP50 = 0.007, diffuseP80 = 0.01,
+            diffuseP98Maximum = 0.03, regionMedians = DoubleArray(12) { 0.007 })
+        val lowKey = normal.copy(p20 = 0.00005, shadowFraction = 0.6,
+            regionMedians = DoubleArray(12) { if (it < 3) 0.04 else 0.007 })
+        fun settle(o: BnAutoObservation): BnAutoExposureDecision {
+            val engine = BnAutoExposureEngine()
+            var d = engine.current("a", limits)
+            repeat(30) { i -> d = engine.observe("a", limits, o.copy(timestampNs = i + 1L)) }
+            return d
+        }
+        assertTrue(settle(lowKey).exposureProduct < settle(normal).exposureProduct)
+        assertTrue(settle(lowKey).reason.contains("sceneClass=BACKLIT"))
     }
 }

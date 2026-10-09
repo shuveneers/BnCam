@@ -4,6 +4,7 @@ import kotlin.math.abs
 import kotlin.math.log2
 import kotlin.math.pow
 import kotlin.math.sqrt
+import kotlin.math.ln
 
 data class BnAutoSensorLimits(
     val bounds: ExposureBounds,
@@ -45,12 +46,21 @@ data class BnAutoObservation(
     val sensorGradientX: DoubleArray? = null,
     val sensorGradientY: DoubleArray? = null,
     val channelP98Maximum: Double = Double.NaN,
-    val quantizationVariance: Double = 1.0 / (12 * 1023 * 1023)
+    val quantizationVariance: Double = 1.0 / (12 * 1023 * 1023),
+    val diffuseP50: Double = Double.NaN,
+    val diffuseP80: Double = Double.NaN,
+    val diffuseP98Maximum: Double = Double.NaN,
+    val regionMedians: DoubleArray? = null,
+    val pointSourceFraction: Double = 0.0,
+    val shadowFraction: Double = 0.0,
+    val channelSamples: Array<DoubleArray>? = null,
+    val pointSourceMask: BooleanArray? = null
 ) {
     fun valid(): Boolean = timestampNs > 0 && exposureNs > 0 && iso > 0 && sampleCount >= 128 &&
         listOf(p20, p80, p98, spatialHighlightFraction).all { it.isFinite() && it in 0.0..1.0 } &&
         p20 <= p80 && p80 <= p98 && channelClipFractions.size == 4 &&
-        channelClipFractions.all { it.isFinite() && it in 0.0..1.0 }
+        channelClipFractions.all { it.isFinite() && it in 0.0..1.0 } &&
+        quantizationVariance.isFinite() && quantizationVariance >= 0
 }
 
 data class BnAutoExposureDecision(
@@ -158,36 +168,45 @@ class BnAutoExposureEngine {
         // flow confidence alone is insufficient when the RAW texture is dominated by sensor noise.
         val stabilitySpan = if (state.stableSinceNs > 0) o.timestampNs - state.stableSinceNs else 0L
         val product = o.exposureNs.toDouble() * o.iso
-        // Scene key is radiance relative to an independent sensor integration, not a gray target.
-        // Dark radiance therefore keeps a lower target; a fixed median-to-gray loop is avoided.
-        val sceneKey = (o.p80 * 1_000_000_000.0 / product).coerceIn(0.000001, 4.0)
-        // Recorded normal/lamp scenes left >2 EV diffuse highlight headroom. The original 0.6
-        // coefficient unnecessarily spent that headroom while pushing shadows toward the noise
-        // floor. A 1.0 coefficient recovers 0.74 EV; the radiance dependence and dark-scene floor
-        // remain, so this is not a fixed gray target or a match-to-HAL correction.
-        val naturalUpperMid = sqrt(sceneKey).coerceIn(0.015, 0.65)
-        var desired = product * naturalUpperMid / o.p80.coerceAtLeast(1.0 / 65536)
         val noiseS = o.noiseSlope?.takeIf { it.isFinite() && it >= 0 }
         val noiseO = o.noiseOffset?.takeIf { it.isFinite() && it >= 0 }
-        if (noiseS != null && noiseO != null && o.p20 > 0) {
-            // Signal required for SNR=4 under this sensor's S*x+O model. Shadow benefit
-            // is bounded by scene atmosphere and relevant highlight headroom.
-            val snrSignal = (16 * noiseS + sqrt(256 * noiseS * noiseS + 64 * noiseO)) / 2
-            val shadowGain = (snrSignal / o.p20).coerceIn(1.0, 2.0)
-            desired = maxOf(desired, minOf(product * shadowGain,
-                product * naturalUpperMid * 1.2 / o.p80.coerceAtLeast(1.0 / 65536)))
-        }
+        val diffuse80 = o.diffuseP80.takeIf { it.isFinite() && it > 0 } ?: o.p80
+        val diffuse50 = o.diffuseP50.takeIf { it.isFinite() && it > 0 } ?: diffuse80
+        val diffuse98 = o.diffuseP98Maximum.takeIf { it.isFinite() && it > 0 }
+            ?: o.channelP98Maximum
+        val sceneKey = (diffuse80 * 1_000_000_000.0 / product).coerceIn(0.000001, 4.0)
+        val midNoise = if (noiseS != null && noiseO != null)
+            sqrt((noiseS * diffuse50 + noiseO + o.quantizationVariance) / 4) else null
+        val midSnr = midNoise?.takeIf { it > 0 }?.let { diffuse50 / it }
+        val confidence = midSnr?.let { (it / (it + 3)).coerceIn(0.2, 0.95) } ?: 0.7
+        val regions = o.regionMedians?.filter { it.isFinite() && it > 0 }.orEmpty()
+        val brightRegionFraction = if (regions.isNotEmpty())
+            regions.count { it > diffuse50 * 4 }.toDouble() / regions.size else 0.0
+        val contrastEv = log2((diffuse80 / maxOf(o.p20, midNoise ?: 0.0, 1.0 / 65536)).coerceAtLeast(1.0))
+        // A continuous distribution-aware radiance curve, never a display luma/gray target.
+        // Deep shadows receive no SNR-driven brightness lift. Broad backlight and shadow occupancy
+        // instead retain the scene's low-key atmosphere; compact lamps are metered separately.
+        val lowKeyWeight = o.shadowFraction.coerceIn(0.0, 1.0) *
+            ((contrastEv - 3) / 5).coerceIn(0.0, 1.0)
+        val naturalUpperMid = sqrt(sceneKey).coerceIn(0.015, 0.65) *
+            (1 - 0.12 * lowKeyWeight - 0.12 * brightRegionFraction)
+        var desired = product * naturalUpperMid / diffuse80.coerceAtLeast(1.0 / 65536)
         desired *= 2.0.pow(evBias.takeIf { it.isFinite() }?.coerceIn(-2f, 2f)?.toDouble() ?: 0.0)
-        // Protect the brightest CFA channel of diffuse scene content, including colored surfaces.
-        // The upper 2% is excluded so a small lamp cannot dictate the room's brightness.
-        if (o.channelP98Maximum.isFinite() && o.channelP98Maximum > 0) {
-            desired = minOf(desired, product * 0.85 / o.channelP98Maximum)
+        if (diffuse98.isFinite() && diffuse98 > 0) {
+            desired = minOf(desired, product * 0.85 / diffuse98)
         }
         val broadHighlights = o.spatialHighlightFraction >= 0.08
-        val clipping = o.channelClipFractions.maxOrNull() ?: 0.0
-        if (broadHighlights && o.p98 > 0) desired = minOf(desired, product * 0.90 / o.p98)
+        val diffuseClipping = projectedDiffuseClipping(o, 1.0)
+        val clipping = diffuseClipping ?: o.channelClipFractions.maxOrNull() ?: 0.0
         val urgentClip = clipping >= 0.025 && broadHighlights
         if (urgentClip) desired = minOf(desired, product * 0.5)
+        val sceneClass = when {
+            brightRegionFraction > 0.08 && contrastEv > 4 -> "BACKLIT"
+            naturalUpperMid < 0.025 -> "NIGHT"
+            naturalUpperMid < 0.045 -> "DIM_INTERIOR"
+            naturalUpperMid > 0.50 -> "BRIGHT"
+            else -> "NORMAL"
+        }
         val bounds = limits.physicalBounds
         var longDetailEvidence = "not_proven"
         val stabilityCeiling = if (stabilitySpan >= 750_000_000L && !holdMoving)
@@ -207,27 +226,71 @@ class BnAutoExposureEngine {
         val ceiling = minOf(bounds.maxExposureNs, cameraSafe,
             subjectCeiling ?: bounds.maxExposureNs).coerceAtLeast(bounds.minExposureNs)
         val errorEv = log2(desired / previous.exposureProduct)
-        val correction = if (abs(errorEv) < 0.08) 0.0 else errorEv.coerceIn(
-            if (urgentClip) -2.0 else -0.7, 0.5)
-        var allocation = requireNotNull(DefaultRawExposureAllocator.allocate(
-            previous.exposureProduct * 2.0.pow(correction), ceiling, bounds, flicker,
-            previousExposureNs = null, preferHeldFlickerShutter = false))
+        val deadbandEv = maxOf(0.08, midSnr?.takeIf { it > 0 }?.let {
+            log2(1 + 1 / it).coerceAtMost(0.25)
+        } ?: 0.08)
+        val correction = if (abs(errorEv) < deadbandEv) 0.0 else errorEv.coerceIn(
+            if (urgentClip) -2.0 else -0.7 * confidence, 0.5 * confidence)
+        val targetProduct = previous.exposureProduct * 2.0.pow(correction)
         val conservative = requireNotNull(DefaultRawExposureAllocator.allocate(
-            allocation.boundedExposureProduct, minOf(ceiling, limits.fallbackHandheldNs), bounds, flicker,
+            targetProduct, minOf(ceiling, limits.fallbackHandheldNs), bounds, flicker,
             preferHeldFlickerShutter = false))
         fun predictedSnr(candidate: DefaultRawExposureAllocation): Double? {
             if (noiseS == null || noiseO == null) return null
-            // Local gain-scaled S*x+O projection, not an invented sensor read-noise calibration.
-            // At equal exposure product: shot coefficient scales with gain, read variance with gain².
+            // Local gain-scaled noise projection; this is not an ISO read-noise calibration.
+            // Use textured scene-body signal rather than asking deep shadows to become visible.
             val gain = candidate.sensitivityIso.toDouble() / o.iso
-            val shadowSignal = (o.p20 * candidate.realizedExposureProduct / product).coerceAtLeast(1e-6)
-            return shadowSignal / sqrt(noiseS * gain * shadowSignal + noiseO * gain * gain + o.quantizationVariance)
+            val signal = (diffuse50 * candidate.realizedExposureProduct / product).coerceAtLeast(1e-6)
+            return signal / sqrt(noiseS * gain * signal + noiseO * gain * gain + o.quantizationVariance)
         }
         val snrShort = predictedSnr(conservative)
+        val candidates = linkedMapOf<Pair<Long, Int>, DefaultRawExposureAllocation>()
+        val attainableProduct = targetProduct.coerceIn(bounds.minExposureNs.toDouble() * bounds.minIso,
+            ceiling.toDouble() * bounds.maxIso)
+        fun addCandidate(candidateCeiling: Long) {
+            val candidate = DefaultRawExposureAllocator.allocate(targetProduct,
+                candidateCeiling.coerceIn(bounds.minExposureNs, ceiling), bounds, flicker,
+                preferHeldFlickerShutter = false) ?: return
+            // Flicker and sensor clamping occur BEFORE the quality comparison.
+            if (candidate.exposureTimeNs > ceiling || candidate.frameDurationNs > limits.maxFrameDurationNs) return
+            // A short candidate at maximum ISO may lose the requested light/brightness. Do not
+            // reward that product loss as if it were an equivalent exposure with less blur.
+            if (candidate.realizedExposureProduct < attainableProduct * 0.98) return
+            candidates[candidate.exposureTimeNs to candidate.sensitivityIso] = candidate
+        }
+        addCandidate(conservative.exposureTimeNs)
+        addCandidate(ceiling)
+        addCandidate(previous.targetExposureNs)
+        var step = conservative.exposureTimeNs.toDouble()
+        while (step < ceiling && candidates.size < 48) {
+            addCandidate(step.toLong())
+            step = maxOf(step + 1, step * 1.25)
+        }
+        val motionBound = minOf(cameraSafe, subjectCeiling ?: cameraSafe).coerceAtLeast(bounds.minExposureNs)
+        fun score(candidate: DefaultRawExposureAllocation): Double {
+            val snr = predictedSnr(candidate)
+            val gain = if (snr != null && snrShort != null && snrShort > 0) snr / snrShort else null
+            if (candidate.exposureTimeNs > limits.fallbackHandheldNs &&
+                (stabilityCeiling == null || gain == null || gain < 1.10)) return Double.NEGATIVE_INFINITY
+            val detailRisk = (candidate.exposureTimeNs.toDouble() / motionBound).pow(2)
+            val baseRisk = (conservative.exposureTimeNs.toDouble() / motionBound).pow(2)
+            val latency = maxOf(candidate.frameDurationNs, limits.minStreamFrameDurationNs).toDouble()
+            val baseLatency = maxOf(conservative.frameDurationNs, limits.minStreamFrameDurationNs).toDouble()
+            val candidateClip = projectedDiffuseClipping(o, candidate.realizedExposureProduct / product) ?: 0.0
+            val naturalError = abs(log2(candidate.realizedExposureProduct / targetProduct))
+            return ln(gain ?: 1.0) - 0.7 * (detailRisk - baseRisk) -
+                0.08 * ln(latency / baseLatency) - 12 * candidateClip - naturalError
+        }
+        val best = candidates.values.maxByOrNull(::score) ?: conservative
+        // A small utility difference is not worth ongoing shutter/ISO hunting. Unsafe previous
+        // shutters never enter this set; shortening for measured motion remains immediate.
+        val held = candidates.values.firstOrNull { it.exposureTimeNs == previous.targetExposureNs }
+            ?.takeIf { score(it).isFinite() && score(it) >= score(best) - 0.04 }
+        val allocation = held ?: best
         val snrLong = predictedSnr(allocation)
         val snrGain = if (snrShort != null && snrLong != null && snrShort > 0) snrLong / snrShort else null
-        val snrRejected = allocation.exposureTimeNs > limits.fallbackHandheldNs && (snrGain == null || snrGain < 1.10)
-        if (snrRejected) allocation = conservative
+        val snrRejected = stabilityCeiling != null && ceiling > limits.fallbackHandheldNs &&
+            candidates.values.none { it.exposureTimeNs > limits.fallbackHandheldNs && score(it).isFinite() }
         val frameDuration = maxOf(allocation.exposureTimeNs, limits.minStreamFrameDurationNs,
             allocation.frameDurationNs).coerceAtMost(limits.maxFrameDurationNs)
         val result = BnAutoExposureDecision(allocation.exposureTimeNs, allocation.sensitivityIso,
@@ -242,13 +305,28 @@ class BnAutoExposureEngine {
                 cameraCeiling == null && allocation.exposureTimeNs >= ceiling -> "LENS_STABILITY_FALLBACK"
                 allocation.sensitivityIso > limits.analogLimitIso -> "ABOVE_ANALOG_GAIN_LIMIT"
                 else -> allocation.limitingConstraint
-            }, if (noiseS != null && noiseO != null) 0.95f else 0.7f,
-            "sensor_radiance_key;bounded_feedback;photon_first;noiseModel=${noiseS != null && noiseO != null};motionEvidence=$motionEvidence;" +
+            }, confidence.toFloat(),
+            "natural_distribution;sceneClass=$sceneClass;contrastEv=$contrastEv;pointSources=${o.pointSourceFraction};" +
+                "candidateCount=${candidates.size};selectedUtility=${score(allocation)};held=${held != null};" +
+                "referenceExposureNs=${conservative.exposureTimeNs};referenceIso=${conservative.sensitivityIso};bounded_feedback;noiseModel=${noiseS != null && noiseO != null};motionEvidence=$motionEvidence;" +
                 "detailSafeCeilingNs=$stabilityCeiling;detailEvidence=$detailEvidence;" +
                 "stabilitySpanNs=$stabilitySpan;longDetailEvidence=$longDetailEvidence;" +
                 "predictedShadowSnrShort=$snrShort;predictedShadowSnrLong=$snrLong;predictedSnrGain=$snrGain")
         state.decision = result
         return result
+    }
+    private fun projectedDiffuseClipping(o: BnAutoObservation, ratio: Double): Double? {
+        val channels = o.channelSamples ?: return null
+        if (channels.size != 4 || channels.any { it.size != o.sampleCount }) return null
+        val mask = o.pointSourceMask?.takeIf { it.size == o.sampleCount }
+        var count = 0
+        val clipped = IntArray(4)
+        for (i in 0 until o.sampleCount) {
+            if (mask?.get(i) == true) continue
+            count++
+            for (channel in 0..3) if (channels[channel][i] * ratio >= 0.98) clipped[channel]++
+        }
+        return if (count > 0) clipped.max().toDouble() / count else null
     }
 }
 
