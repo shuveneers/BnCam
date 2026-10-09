@@ -890,6 +890,9 @@ fun CameraScreen(
             else -> "YUV"
         }
     }
+    val exposureControl by repository.exposureControlFlow.collectAsState(
+        initial = com.bncam.core.capture.SensorExposureMode.STANDARD_AUTO
+    )
     val quickSettingAssignments by repository.quickSettingsAssignmentsFlow.collectAsState(
         initial = ViewfinderQuickSettingIds.defaults
     )
@@ -1858,7 +1861,10 @@ fun CameraScreen(
                     .clickable(
                         interactionSource = remember { MutableInteractionSource() },
                         indication = null
-                    ) { quickSettingsExpanded = !quickSettingsExpanded }
+                    ) {
+                        quickSettingsExpanded = !quickSettingsExpanded
+                        if (com.bncam.BuildConfig.DEBUG) android.util.Log.d("BnCamQuickSettings", "expanded=$quickSettingsExpanded")
+                    }
             ) {
                 Canvas(modifier = Modifier.padding(7.dp).rotate(animatedUiRotation)) {
                     val color = if (quickSettingsExpanded) AccentPistachio else Color.White.copy(alpha = 0.9f)
@@ -1904,7 +1910,10 @@ fun CameraScreen(
                     x = 0,
                     y = (quickSettingsAnchorBottomPx + quickSettingsGapPx).coerceAtLeast(0)
                 ),
-                onDismissRequest = { quickSettingsExpanded = false },
+                onDismissRequest = {
+                    if (com.bncam.BuildConfig.DEBUG) android.util.Log.d("BnCamQuickSettings", "dismissed")
+                    quickSettingsExpanded = false
+                },
                 properties = PopupProperties(
                     focusable = true,
                     dismissOnBackPress = true,
@@ -1921,6 +1930,9 @@ fun CameraScreen(
                     geotagEnabled = geotagEnabled,
                     focusPeakingEnabled = focusPeak,
                     meteringMode = MeteringMode.fromSetting(meteringStyle),
+                    exposureControlLabel = if ((isoAssignmentActive && assignedIsoValue != null) ||
+                        (shutterAssignmentActive && assignedShutterNs != null)) "Manual" else exposureControl.label,
+                    onExposureControlToggle = { coroutineScope.launch { repository.toggleExposureControl() } },
                     histogramEnabled = showHistogram,
                     focusTrackingEnabled = focusTracking,
                     horizonLevelerEnabled = horizonLeveler,

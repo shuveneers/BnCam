@@ -41,6 +41,7 @@ import com.bncam.core.capture.OutputPolicy
 import com.bncam.core.capture.ViewfinderMode
 
 internal object ViewfinderQuickSettingIds {
+    const val AE_CONTROL = "ae_control"
     const val FLASH = "flash"
     const val TIMER = "timer"
     const val WATERMARK = "watermark"
@@ -66,7 +67,8 @@ internal object ViewfinderQuickSettingIds {
         HISTOGRAM,
         FOCUS_TRACK,
         HORIZON_LEVELER,
-        FACE_DETECTION
+        FACE_DETECTION,
+        AE_CONTROL
     )
 
     val defaults: List<String> = all.take(9)
@@ -101,6 +103,8 @@ internal fun ViewfinderQuickSettingsOverlay(
     geotagEnabled: Boolean,
     focusPeakingEnabled: Boolean,
     meteringMode: MeteringMode,
+    exposureControlLabel: String,
+    onExposureControlToggle: () -> Unit,
     histogramEnabled: Boolean,
     focusTrackingEnabled: Boolean,
     horizonLevelerEnabled: Boolean,
@@ -157,6 +161,7 @@ internal fun ViewfinderQuickSettingsOverlay(
     )
 
     fun labelForId(id: String): String = when (id) {
+        ViewfinderQuickSettingIds.AE_CONTROL -> "AE Control"
         ViewfinderQuickSettingIds.FLASH -> "Flash"
         ViewfinderQuickSettingIds.TIMER -> "Timer"
         ViewfinderQuickSettingIds.WATERMARK -> "Watermark"
@@ -173,6 +178,9 @@ internal fun ViewfinderQuickSettingsOverlay(
     }
 
     fun tileForId(id: String): QuickTileSpec = when (id) {
+        ViewfinderQuickSettingIds.AE_CONTROL -> QuickTileSpec(
+            "AE Control", exposureControlLabel, exposureControlLabel != "Standard Auto", onClick = onExposureControlToggle
+        )
         ViewfinderQuickSettingIds.FLASH -> QuickTileSpec(
             label = "Flash",
             value = flashMode,

@@ -111,6 +111,23 @@ class FrameRingBufferTest {
     }
 
     @Test
+    fun controllerSwitchExcludesOldWarmFramesWithoutInvalidatingAnExistingLease() {
+        val ring = FrameRingBuffer(capacity = 4)
+        ring.activateGeneration(1)
+        val old = addDirectCompleteFrame(ring, 1_000_000_000L, epoch = 100L)
+        old.frameVersion = 1L
+        val lease = ring.leaseFrame(old)!!
+        ring.setSelectionControlEpochFloor(1, 101L)
+        assertTrue(ring.latestCompleteFrameSnapshots(4).isEmpty())
+        assertNotNull(old.hardwareBuffer)
+        assertEquals(100L, old.requestProvenance!!.identity.controlRequestEpoch)
+        addDirectCompleteFrame(ring, 1_100_000_000L, epoch = 101L)
+        assertEquals(listOf(1_100_000_000L), ring.latestCompleteFrameSnapshots(4).map { it.timestampNs })
+        lease.close()
+        assertNotNull(old.hardwareBuffer)
+    }
+
+    @Test
     fun queriedFramesSurviveInspectionAndAreNotDestroyed() {
         val ring = FrameRingBuffer(capacity = 35)
         ring.activateGeneration(1)

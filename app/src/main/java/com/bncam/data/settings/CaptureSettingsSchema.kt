@@ -90,7 +90,7 @@ object CaptureSettingsSchema {
     private val multiOnly = setOf(CaptureMode.MULTI)
 
     val definitions: List<CaptureSettingDefinition> = listOf(
-        active(CaptureSettingKeys.SENSOR_EXPOSURE_MODE, "Exposure mode", CaptureSettingType.STRING, "STANDARD_AUTO", "STANDARD_AUTO|BN_AUTO|MANUAL", CaptureSettingVisibility.PRO),
+        superseded(CaptureSettingKeys.SENSOR_EXPOSURE_MODE, "Legacy profile exposure controller", CaptureSettingType.STRING, "global_exposure_control"),
         active(CaptureSettingKeys.FRAME_SOURCE, "Frame Source", CaptureSettingType.ENUM, "YUV", "YUV|RAW10|RAW_SENSOR", CaptureSettingVisibility.PRO, session = true),
         active(CaptureSettingKeys.CAPTURE_MODE, "Capture Mode", CaptureSettingType.ENUM, "SINGLE", "SINGLE|MULTI", CaptureSettingVisibility.PRO, session = true),
         active(CaptureSettingKeys.OUTPUT_POLICY, "Output Policy", CaptureSettingType.ENUM, "JPEG", "JPEG|JPEG_PLUS_RAW|RAW_ONLY", CaptureSettingVisibility.PRO),

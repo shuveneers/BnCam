@@ -32,11 +32,6 @@ fun ProfileCaptureExposureSettingsScreen(
     val repo = remember(context) { SettingsRepository(context) }
     val scope = rememberCoroutineScope()
 
-    val storedMode by repo.getProfileString(
-        profileId, CaptureSettingKeys.SENSOR_EXPOSURE_MODE, "STANDARD_AUTO"
-    ).collectAsStateWithLifecycle(initialValue = "STANDARD_AUTO")
-    val exposureMode = com.bncam.core.capture.SensorExposureMode.fromPersisted(storedMode)
-
     val storedExposureChoice by repo.getProfileString(
         profileId,
         CaptureSettingKeys.SHOT_BIAS_EXPOSURE,
@@ -67,18 +62,6 @@ fun ProfileCaptureExposureSettingsScreen(
     )
 
     SettingsTopicScaffold("Shot Bias", onNavigateBack) {
-        SettingsCard(title = "Exposure mode", description = "Bn Auto chooses physical RAW shutter and ISO. Manual uses your exposure controls.") {
-            ChoiceSettingRow(
-                title = "Exposure mode",
-                description = "Standard Auto is the default. Bn Auto is experimental and requires manual RAW sensor support.",
-                value = exposureMode.label,
-                options = com.bncam.core.capture.SensorExposureMode.entries.map { it.label },
-                onSelected = { selected -> scope.launch {
-                    repo.setProfileStringOverride(profileId, CaptureSettingKeys.SENSOR_EXPOSURE_MODE,
-                        com.bncam.core.capture.SensorExposureMode.fromPersisted(selected).name)
-                } }
-            )
-        }
         SettingsCard(
             title = "Exposure",
             description = "Controls how Camera2 distributes physical sensor exposure. Auto keeps normal AE; a fixed ISO or time keeps that variable preferred while the other compensates."
@@ -135,7 +118,6 @@ fun ProfileCaptureExposureSettingsScreen(
                 repo.clearProfileOverrideValues(
                     profileId,
                     listOf(
-                        ProfileSettingSpec(CaptureSettingKeys.SENSOR_EXPOSURE_MODE, ProfileSettingValueType.STRING),
                         ProfileSettingSpec(CaptureSettingKeys.SHOT_BIAS_EXPOSURE, ProfileSettingValueType.STRING),
                         ProfileSettingSpec(CaptureSettingKeys.SHOT_BIAS_MAX_FRAME_EXPOSURE, ProfileSettingValueType.STRING),
                         ProfileSettingSpec(CaptureSettingKeys.CAPTURE_EV_BIAS, ProfileSettingValueType.FLOAT),

@@ -1845,9 +1845,7 @@ class BnCameraManager(private val context: Context) {
                 shotBiasExposure = repo.getProfileString(
                     profileId, CaptureSettingKeys.SHOT_BIAS_EXPOSURE, "Auto"
                 ).first(),
-                exposureMode = repo.getProfileString(
-                    profileId, CaptureSettingKeys.SENSOR_EXPOSURE_MODE, "STANDARD_AUTO"
-                ).first(),
+                exposureMode = repo.exposureControlFlow.first().name,
                 maxFrameExposure = repo.getProfileString(
                     profileId, CaptureSettingKeys.SHOT_BIAS_MAX_FRAME_EXPOSURE, "Max exposure time"
                 ).first()
@@ -1857,24 +1855,13 @@ class BnCameraManager(private val context: Context) {
                 profileId != viewfinderProfileId
             ) return@launch
 
-            bnAutoEngine.reset()
-            bnAutoDecision = null
-            bnAutoLimits = null
-            bnAutoControlKey = null
-            if (loaded.exposureMode == com.bncam.core.capture.SensorExposureMode.MANUAL &&
-                requestedManualIso == null && requestedManualExposureNs == null) {
-                lastCaptureResult?.takeIf { lastCaptureResultGeneration == pipelineGeneration }?.let {
-                    requestedManualIso = it.get(CaptureResult.SENSOR_SENSITIVITY)
-                    requestedManualExposureNs = it.get(CaptureResult.SENSOR_EXPOSURE_TIME)
-                }
-            }
-            activeProfileExposurePreferences = loaded
+            activeProfileExposurePreferences = loaded.copy(exposureMode = globalExposureControl)
             activeProfileExposurePlan = null
             activeProfileExposurePlanGeneration = -1
             activeProfileExposureBounds = null
             clearProfileExposureAeBaseline()
             clearDefaultRawShutterPriorityState(resetMotion = false)
-            profileExposureAwaitingAeBaseline = loaded.requiresAeBaseline()
+            profileExposureAwaitingAeBaseline = activeProfileExposurePreferences.requiresAeBaseline()
             profileExposureBootstrapMinControlEpoch = if (profileExposureAwaitingAeBaseline) {
                 controlRequestEpochTracker.currentSubmittedEpoch() + 1L
             } else {
@@ -3261,7 +3248,10 @@ class BnCameraManager(private val context: Context) {
                     generation = request.generation,
                     expectedFormat = request.expectedFormat
                 )
-                if (bnAutoEnabled()) observeBnAutoRaw(image, metadata, request.generation)
+                if (bnAutoEnabled() && ringBuffer.selectionControlEpochAllows(
+                        request.generation, lease.pair.controlRequestEpoch)) {
+                    observeBnAutoRaw(image, metadata, request.generation)
+                }
                 val (focusRoi, focusCoordinateBounds) = resolveFocusAnalysisRegion(metadata)
                 val metrics = com.bncam.core.quality.FocusConfidenceEngine.evaluate(
                     image = image,
@@ -4025,6 +4015,45 @@ class BnCameraManager(private val context: Context) {
     @Volatile private var bnAutoLastObservationElapsedNs: Long = 0L
     @Volatile private var bnAutoRealizationSummary: String = "unobserved"
 
+    @Volatile private var globalExposureControl = com.bncam.core.capture.SensorExposureMode.STANDARD_AUTO
+    private var appliedExposureControl = com.bncam.core.capture.SensorExposureMode.STANDARD_AUTO
+
+    init {
+        sessionTransitionScope.launch {
+            SettingsRepository(context).exposureControlFlow.collect { mode ->
+                globalExposureControl = mode
+                enqueuePreviewControl("exposure_control", "GLOBAL_EXPOSURE_CONTROL:${mode.name}") {
+                    updatePreviewRepeatingRequest()
+                }
+            }
+        }
+    }
+
+    /** Runs on the existing serialized Camera2 request owner, including after a lens handover. */
+    private fun applyGlobalExposureControl() {
+        val mode = globalExposureControl
+        activeProfileExposurePreferences = activeProfileExposurePreferences.copy(exposureMode = mode)
+        if (mode == appliedExposureControl) return
+        appliedExposureControl = mode
+        bnAutoEngine.reset()
+        bnAutoDecision = null
+        bnAutoLimits = null
+        bnAutoControlKey = null
+        bnAutoLastObservationElapsedNs = 0L
+        bnAutoRealizationSummary = "unobserved"
+        activeProfileExposurePlan = null
+        activeProfileExposurePlanGeneration = -1
+        clearProfileExposureAeBaseline()
+        clearDefaultRawShutterPriorityState(resetMotion = false)
+        profileExposureAwaitingAeBaseline = activeProfileExposurePreferences.requiresAeBaseline()
+        profileExposureBootstrapMinControlEpoch = if (profileExposureAwaitingAeBaseline)
+            controlRequestEpochTracker.currentSubmittedEpoch() + 1L else -1L
+        // Preserve pairing and outstanding leases; only newly selected frames need fresh authority.
+        ringBuffer.setSelectionControlEpochFloor(pipelineGeneration,
+            controlRequestEpochTracker.currentSubmittedEpoch() + 1L)
+        Log.i(tag, "GLOBAL_EXPOSURE_CONTROL mode=${mode.name} generation=$pipelineGeneration")
+    }
+
     private fun bnAutoEnabled(): Boolean =
         activeProfileExposurePreferences.exposureMode == com.bncam.core.capture.SensorExposureMode.BN_AUTO &&
             requestedManualIso == null && requestedManualExposureNs == null &&
@@ -4441,11 +4470,11 @@ class BnCameraManager(private val context: Context) {
         activeLens: LensInfo,
         focusContext: FocusCaptureContext
     ): FrameRingBuffer.LeasedCandidate {
-        val device = cameraDevice ?: error("Bn Auto camera unavailable")
-        val session = captureSession ?: error("Bn Auto session unavailable")
-        val reader = imageReader ?: error("Bn Auto RAW reader unavailable")
+        val device = cameraDevice ?: error("BnC Auto camera unavailable")
+        val session = captureSession ?: error("BnC Auto session unavailable")
+        val reader = imageReader ?: error("BnC Auto RAW reader unavailable")
         val generation = pipelineGeneration
-        val identity = synchronized(pipelineLock) { activePipelineIdentity } ?: error("Bn Auto identity unavailable")
+        val identity = synchronized(pipelineLock) { activePipelineIdentity } ?: error("BnC Auto identity unavailable")
         check(bnAutoControlKey == "$generation:${identity.physicalCameraId ?: device.id}:$activeZslFormat")
         val chars = cameraManager.getCameraCharacteristics(device.id)
         val builder = createPipelineCaptureRequestBuilder(device, CameraDevice.TEMPLATE_STILL_CAPTURE)
@@ -4456,7 +4485,7 @@ class BnCameraManager(private val context: Context) {
             recipe.executionSettings.tonemapHint, recipe.executionSettings.antiBanding)
         applyMeteringPolicy(builder)
         applyLiveWhiteBalancePolicy(builder)
-        applyAuthoritativeFocusToStillBuilder(builder, currentCaptureRequest ?: error("Bn Auto preview request unavailable"), focusContext, "BN_AUTO_LONG_EXPOSURE")
+        applyAuthoritativeFocusToStillBuilder(builder, currentCaptureRequest ?: error("BnC Auto preview request unavailable"), focusContext, "BN_AUTO_LONG_EXPOSURE")
         setAePriorityModeOff(builder)
         builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
         builder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, 0)
@@ -4478,14 +4507,14 @@ class BnCameraManager(private val context: Context) {
         val callback = object : CameraCaptureSession.CaptureCallback() {
             override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
                 if (generation != pipelineGeneration) {
-                    completed.completeExceptionally(IllegalStateException("Bn Auto pipeline changed during still"))
+                    completed.completeExceptionally(IllegalStateException("BnC Auto pipeline changed during still"))
                     return
                 }
                 captureAttempts.captureResultReceived()
                 val snapshot = frameSensorMetadataSnapshot(result, generation, device.id)
                 val timestamp = snapshot?.sensorTimestampNs ?: result.get(CaptureResult.SENSOR_TIMESTAMP)
                 if (timestamp == null) {
-                    completed.completeExceptionally(IllegalStateException("Bn Auto still has no sensor timestamp"))
+                    completed.completeExceptionally(IllegalStateException("BnC Auto still has no sensor timestamp"))
                     return
                 }
                 ringBuffer.addMetadata(timestamp, result, generation,
@@ -4494,10 +4523,10 @@ class BnCameraManager(private val context: Context) {
                 completed.complete(timestamp)
             }
             override fun onCaptureFailed(session: CameraCaptureSession, request: CaptureRequest, failure: android.hardware.camera2.CaptureFailure) {
-                completed.completeExceptionally(IllegalStateException("Bn Auto RAW still failed: ${failure.reason}"))
+                completed.completeExceptionally(IllegalStateException("BnC Auto RAW still failed: ${failure.reason}"))
             }
             override fun onCaptureSequenceAborted(session: CameraCaptureSession, sequenceId: Int) {
-                completed.completeExceptionally(IllegalStateException("Bn Auto RAW still aborted"))
+                completed.completeExceptionally(IllegalStateException("BnC Auto RAW still aborted"))
             }
         }
         var lease: com.bncam.core.buffer.FrameLease? = null
@@ -4514,19 +4543,19 @@ class BnCameraManager(private val context: Context) {
             val timeoutMs = target.frameDurationNs / 1_000_000L + 4_000L
             val timestamp = withTimeout(timeoutMs) { completed.await() }
             lease = ringBuffer.awaitAndLeaseExactRequestFrame(timestamp, generation, epoch, activeZslFormat, 2500L)
-                ?: error("Bn Auto exact still RAW/metadata pair unavailable")
+                ?: error("BnC Auto exact still RAW/metadata pair unavailable")
             val frame = lease.pair
-            val metadata = frame.metadata ?: error("Bn Auto still metadata missing")
+            val metadata = frame.metadata ?: error("BnC Auto still metadata missing")
             val actual: CaptureResult = identity.physicalCameraId?.let { physicalCaptureResultOrNull(metadata, it) } ?: metadata
             val actualTime = actual.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 0L
             val actualIso = actual.get(CaptureResult.SENSOR_SENSITIVITY) ?: 0
             val actualFrame = actual.get(CaptureResult.SENSOR_FRAME_DURATION) ?: 0L
             check(actualFrame >= actualTime && actualFrame <= (bnAutoLimits?.maxFrameDurationNs ?: 0L)) {
-                "Bn Auto still frame duration outside physical bounds: $actualFrame"
+                "BnC Auto still frame duration outside physical bounds: $actualFrame"
             }
             check(kotlin.math.abs(actualTime - target.targetExposureNs) <= maxOf(100_000L, target.targetExposureNs / 50) &&
                 kotlin.math.abs(actualIso - target.targetISO) <= maxOf(1, target.targetISO / 50)) {
-                "Bn Auto still exposure not realized: requested=${target.summary()} actualNs=$actualTime actualIso=$actualIso"
+                "BnC Auto still exposure not realized: requested=${target.summary()} actualNs=$actualTime actualIso=$actualIso"
             }
             traceCaptureRuntime("BN_AUTO_LONG_EXPOSURE_EXACT generation=$generation epoch=$epoch timestamp=$timestamp ${target.summary()}")
             return FrameRingBuffer.LeasedCandidate(frame, lease, frame.frameVersion, frame.timestamp).also { lease = null }
@@ -4535,8 +4564,8 @@ class BnCameraManager(private val context: Context) {
             if (generation == pipelineGeneration && session === captureSession) {
                 ringBuffer.resizeBuffer(warmCapacity)
                 runCatching { updatePreviewRepeatingRequest() }.onFailure {
-                    _captureContractError.value = "Bn Auto preview restore failed: ${it.message}"
-                    Log.e(tag, "Bn Auto preview restore failed", it)
+                    _captureContractError.value = "BnC Auto preview restore failed: ${it.message}"
+                    Log.e(tag, "BnC Auto preview restore failed", it)
                 }
             }
         }
@@ -12925,25 +12954,19 @@ class BnCameraManager(private val context: Context) {
 
         suspend fun setDebugSensorExposureMode(mode: com.bncam.core.capture.SensorExposureMode, repo: SettingsRepository) {
             check(com.bncam.BuildConfig.DEBUG)
-            val profileId = viewfinderProfileId.takeUnless { it == "unknown" } ?: error("No active profile")
-            repo.setProfileStringOverride(profileId, CaptureSettingKeys.SENSOR_EXPOSURE_MODE, mode.name)
-            activeProfileExposurePreferences = activeProfileExposurePreferences.copy(exposureMode = mode)
-            bnAutoEngine.reset()
-            bnAutoDecision = null
-            bnAutoControlKey = null
-            if (mode != com.bncam.core.capture.SensorExposureMode.MANUAL) {
-                requestedManualIso = null
-                requestedManualExposureNs = null
-            } else if (requestedManualIso == null && requestedManualExposureNs == null) {
-                lastCaptureResult?.takeIf { lastCaptureResultGeneration == pipelineGeneration }?.let {
-                    requestedManualIso = it.get(CaptureResult.SENSOR_SENSITIVITY)
-                    requestedManualExposureNs = it.get(CaptureResult.SENSOR_EXPOSURE_TIME)
-                }
+            if (mode == com.bncam.core.capture.SensorExposureMode.MANUAL) {
+                // Debug Manual uses exactly the public dial path; it is never a global preference.
+                val result = lastCaptureResult?.takeIf { lastCaptureResultGeneration == pipelineGeneration }
+                    ?: error("No current sensor result for manual exposure")
+                setManualIsoAndShutter(result.get(CaptureResult.SENSOR_SENSITIVITY),
+                    result.get(CaptureResult.SENSOR_EXPOSURE_TIME), cameraDevice?.id ?: "unknown")
+            } else {
+                repo.setExposureControl(mode)
             }
-            enqueuePreviewControl("preview_policy", "DEBUG_SENSOR_EXPOSURE_MODE") { updatePreviewRepeatingRequest() }
         }
 
         fun setManualIsoAndShutter(iso: Int?, shutterSpeedNs: Long?, cameraId: String) {
+            val authorityChanged = iso != requestedManualIso || shutterSpeedNs != requestedManualExposureNs
             requestedManualIso = iso
             requestedManualExposureNs = shutterSpeedNs
             // Manual exposure owns the request while active. Returning to AUTO must reacquire a
@@ -12965,6 +12988,14 @@ class BnCameraManager(private val context: Context) {
             }
             Log.i(tag, "Exposure controls requested lens=$cameraId iso=${iso ?: "AUTO"} shutterNs=${shutterSpeedNs ?: "AUTO"}")
             enqueuePreviewControl("preview_policy", "SET_MANUAL_EXPOSURE:$cameraId") {
+                if (authorityChanged) {
+                    bnAutoEngine.reset()
+                    bnAutoDecision = null
+                    bnAutoControlKey = null
+                    bnAutoLastObservationElapsedNs = 0L
+                    ringBuffer.setSelectionControlEpochFloor(pipelineGeneration,
+                        controlRequestEpochTracker.currentSubmittedEpoch() + 1L)
+                }
                 updatePreviewRepeatingRequest()
             }
         }
@@ -13161,6 +13192,7 @@ class BnCameraManager(private val context: Context) {
         }
 
         private fun applyExposurePolicy(builder: CaptureRequest.Builder) {
+            applyGlobalExposureControl()
             val deviceId = cameraDevice?.id ?: return
             // Cadence is allowed to adapt to the exact stream, but Standard Auto exposure itself
             // has one owner on every lens and format: Camera2 AE.
@@ -13184,8 +13216,9 @@ class BnCameraManager(private val context: Context) {
                 sensorCharacteristics.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE) != null &&
                 sensorCharacteristics.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE) != null &&
                 sensorCharacteristics.get(CameraCharacteristics.SENSOR_INFO_MAX_FRAME_DURATION) != null
-            if (bnAutoEnabled() && !bnManualSupported) {
-                _captureContractError.value = "Bn Auto unavailable: sensor does not advertise manual RAW exposure control. Standard Auto is active."
+            val bnRequested = globalExposureControl == com.bncam.core.capture.SensorExposureMode.BN_AUTO && !explicitManual
+            if (bnRequested && (!bnManualSupported || !bnAutoEnabled())) {
+                _captureContractError.value = "BnC Auto unavailable for this sensor/format. Standard Auto is active; your BnC Auto preference is saved."
             }
             val authorityDecision = PhysicalSensorExposureAuthorityPolicy.resolve(
                 explicitManualSensorRequest = explicitManual,
@@ -13200,7 +13233,7 @@ class BnCameraManager(private val context: Context) {
                 val time = sensorCharacteristics.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
                 val maxFrame = sensorCharacteristics.get(CameraCharacteristics.SENSOR_INFO_MAX_FRAME_DURATION)
                 check(caps?.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR) == true &&
-                    iso != null && time != null && maxFrame != null) { "Bn Auto requires advertised manual sensor bounds" }
+                    iso != null && time != null && maxFrame != null) { "BnC Auto requires advertised manual sensor bounds" }
                 val profile = DynamicSensorProfile.fromCharacteristics(sensorCharacteristics)
                 val reader = imageReader
                 val streamMin = reader?.let {
@@ -18115,6 +18148,7 @@ class BnCameraManager(private val context: Context) {
                 latestDefaultRawPhotometricConvergence?.timeSinceLastMeaningfulSceneChangeNs,
             "defaultRawApi36PriorityAllowed" to defaultRawApi36AuthorityTracker.isAllowed(pipelineGeneration),
             "defaultRawApi36PriorityTrusted" to defaultRawApi36AuthorityTracker.isTrusted(pipelineGeneration),
+            "globalExposureControl" to globalExposureControl.name,
             "defaultRawFrameSelectionExposureConstraint" to
                 ringBuffer.selectionExposureConstraintSnapshot().summary(),
             "resolvedAntibandingMode" to activeResolvedAntibandingMode,

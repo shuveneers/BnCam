@@ -427,7 +427,20 @@ class FrameRingBuffer(private var capacity: Int = 35) {
         )
     }
 
+    @Volatile private var selectionControlEpochGeneration: Int = -1
+    @Volatile private var selectionControlEpochFloor: Long = 0L
+
+    @Synchronized
+    fun setSelectionControlEpochFloor(generationId: Int, minimumEpoch: Long) {
+        selectionControlEpochGeneration = generationId
+        selectionControlEpochFloor = minimumEpoch
+    }
+
+    fun selectionControlEpochAllows(generationId: Int, epoch: Long): Boolean =
+        generationId != selectionControlEpochGeneration || epoch >= selectionControlEpochFloor
+
     private fun selectionExposureAllows(pair: ZslFramePair, recordRejection: Boolean): Boolean {
+        if (!selectionControlEpochAllows(pair.generationId, pair.controlRequestEpoch)) return false
         val active = selectionExposureTargetNs > 0L &&
             selectionExposureConstraintGeneration == activeGeneration &&
             pair.generationId == selectionExposureConstraintGeneration &&

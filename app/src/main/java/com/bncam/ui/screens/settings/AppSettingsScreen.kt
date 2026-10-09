@@ -23,6 +23,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.bncam.data.settings.SettingsRepository
+import com.bncam.core.capture.SensorExposureMode
 import com.bncam.core.capture.OutputPolicy
 import com.bncam.core.capture.FrameCapacityPolicy
 import com.bncam.core.capture.FrameOrigin
@@ -46,6 +47,8 @@ fun AppSettingsScreen(
     val context = LocalContext.current
     val repository = remember { SettingsRepository(context) }
     val scope = rememberCoroutineScope()
+
+    val exposureControl by repository.exposureControlFlow.collectAsState(initial = SensorExposureMode.STANDARD_AUTO)
 
     val saveLocation by repository.saveLocationFlow.collectAsState(initial = "DCIM/BnCam")
     val outputPolicy by repository.outputPolicyFlow.collectAsState(initial = OutputPolicy.JPEG)
@@ -131,6 +134,14 @@ fun AppSettingsScreen(
                 .verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
+            SettingsCard(title = "Camera") {
+                SettingValueRow(
+                    title = "Exposure Control",
+                    description = "Global automatic exposure. Manual ISO or shutter controls take priority.",
+                    value = exposureControl.label,
+                    onClick = { scope.launch { repository.toggleExposureControl() } }
+                )
+            }
             SettingsCard(title = "File & Storage") {
                 SettingValueRow(
                     title = "Save location",

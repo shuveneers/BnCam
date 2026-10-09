@@ -1,11 +1,12 @@
 package com.bncam.core.capture
 
 enum class SensorExposureMode(val label: String) {
-    STANDARD_AUTO("Standard Auto"), BN_AUTO("Bn Auto"), MANUAL("Manual");
+    STANDARD_AUTO("Standard Auto"), BN_AUTO("BnC Auto"), MANUAL("Manual");
 
     companion object {
         fun fromPersisted(value: String?): SensorExposureMode =
-            entries.firstOrNull { it.name == value || it.label == value } ?: STANDARD_AUTO
+            entries.firstOrNull { it.name == value || it.label == value ||
+                (it == BN_AUTO && value == "Bn Auto") } ?: STANDARD_AUTO
     }
 }
 

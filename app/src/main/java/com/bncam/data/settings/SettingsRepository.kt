@@ -27,10 +27,18 @@ import com.bncam.data.profile.BncProfileCompatibility
 import com.bncam.data.profile.BncProfileDocument
 import com.bncam.data.profile.BncProfileMetadata
 import com.bncam.data.profile.BncTargetCapabilities
+import com.bncam.core.capture.SensorExposureMode
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.emitAll
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlin.math.roundToInt
+
+internal fun automaticExposureControl(value: String?): SensorExposureMode =
+    SensorExposureMode.fromPersisted(value).takeUnless { it == SensorExposureMode.MANUAL }
+        ?: SensorExposureMode.STANDARD_AUTO
 
 internal fun sanitizeDynamicIsoCoefficient(value: Float): Float {
     if (!value.isFinite()) return 0f
@@ -306,11 +314,12 @@ class SettingsRepository(private val context: Context) {
 
     private val activeLensIdKey = stringPreferencesKey("active_lens_id")
     private val activeProfileIdKey = stringPreferencesKey("active_profile_id")
+    private val exposureControlKey = stringPreferencesKey("global_exposure_control")
     private val quickSettingsAssignmentsKey = stringPreferencesKey("vf_quick_settings_assignments")
     private val supportedQuickSettingIds = listOf(
         "flash", "timer", "watermark", "output", "viewfinder", "geotag",
         "focus_peaking", "metering", "histogram", "focus_track",
-        "horizon_leveler", "face_detection"
+        "horizon_leveler", "face_detection", "ae_control"
     )
     private val defaultQuickSettingAssignments = supportedQuickSettingIds.take(9)
 
@@ -322,6 +331,29 @@ class SettingsRepository(private val context: Context) {
     private val logWarningsKey = booleanPreferencesKey("log_warnings")
     private val logPipelineDebugKey = booleanPreferencesKey("log_pipeline_debug")
     private val logVendorInjectionKey = booleanPreferencesKey("log_vendor_injection")
+
+    // Legacy per-profile controllers never acquire global authority. Initial migration is
+    // deliberately Standard Auto, including legacy Manual; explicit dial values are untouched.
+    val exposureControlFlow: Flow<SensorExposureMode> = flow {
+        context.dataStore.edit { preferences ->
+            if (preferences[exposureControlKey] == null) {
+                preferences[exposureControlKey] = SensorExposureMode.STANDARD_AUTO.name
+            }
+        }
+        emitAll(context.dataStore.data.map { preferences ->
+            automaticExposureControl(preferences[exposureControlKey])
+        }.distinctUntilChanged())
+    }
+
+    suspend fun setExposureControl(value: SensorExposureMode) {
+        require(value != SensorExposureMode.MANUAL) { "Manual exposure belongs to the ISO/shutter controls" }
+        context.dataStore.edit { it[exposureControlKey] = value.name }
+    }
+
+    suspend fun toggleExposureControl() = context.dataStore.edit { preferences ->
+        preferences[exposureControlKey] = if (automaticExposureControl(preferences[exposureControlKey]) == SensorExposureMode.BN_AUTO)
+            SensorExposureMode.STANDARD_AUTO.name else SensorExposureMode.BN_AUTO.name
+    }
 
     // --- GETTERS (Flows) ---
     val phoneAssistanceSensorsFlow: Flow<Boolean> = context.dataStore.data.map { it[phoneAssistanceSensorsKey] ?: false }
