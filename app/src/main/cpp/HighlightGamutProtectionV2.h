@@ -110,7 +110,7 @@ inline SensorColorConfidence resolveSensorColorConfidence(const Rgb& raw) noexce
     return out;
 }
 
-// Default single-shot RAW physical chroma uncertainty. Never reconstruct RAW samples.
+// Default single-shot RAW physical uncertainty. Never modify source RAW samples.
 // The sensor-normalized source uses its actual CFA black/white levels. Each sample
 // has a quintic shoulder; 8-bit confidence mirrors the GPU packed sideband exactly.
 constexpr float kDefaultRawConfidenceStart = 0.940f;
@@ -120,15 +120,16 @@ inline float defaultRawSampleLoss(float value) noexcept {
     return t*t*t*(t*(t*6.0f-15.0f)+10.0f);
 }
 inline float defaultRawCellConfidence(const std::array<float,4>& samples) noexcept {
-    float confidence=1.0f;
+    float confidence=0.0f;
     for(float value:samples){
         const float c=std::clamp(1.0f-defaultRawSampleLoss(value),0.0f,1.0f);
-        confidence *= float(std::lround(c*255.0f))/255.0f;
+        confidence += float(std::lround(c*255.0f))/255.0f;
     }
-    return confidence;
+    return confidence/4.0f;
 }
 // Positive cubic B-spline weights interpolate confidence only, with no Bayer-cell
-// ownership floor or RGB filtering. Canonical colour order is irrelevant to the product.
+// ownership floor or RGB filtering. Aggregate retained evidence is an average;
+// channel reconstruction separately retains the CFA colour ownership.
 inline std::array<float,4> defaultRawConfidenceWeights(float t) noexcept {
     const float a=1.0f-t;
     return {a*a*a/6.0f,(3.0f*t*t*t-6.0f*t*t+4.0f)/6.0f,

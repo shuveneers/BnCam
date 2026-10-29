@@ -340,7 +340,16 @@ class BnAutoExposureEngineTest {
         fun settle(o: BnAutoObservation): BnAutoExposureDecision {
             val engine = BnAutoExposureEngine()
             var d = engine.current("a", limits)
-            repeat(30) { i -> d = engine.observe("a", limits, o.copy(timestampNs = i + 1L)) }
+            repeat(30) { i ->
+                val warm = d.warmAllocation(limits, RawFlickerConstraint())
+                val ratio = warm.realizedExposureProduct / (o.exposureNs.toDouble() * o.iso)
+                d = engine.observe("a", limits, o.copy(timestampNs = i + 1L,
+                    exposureNs = warm.exposureTimeNs, iso = warm.sensitivityIso,
+                    p20 = o.p20 * ratio, p80 = o.p80 * ratio, p98 = o.p98 * ratio,
+                    diffuseP50 = o.diffuseP50 * ratio, diffuseP80 = o.diffuseP80 * ratio,
+                    diffuseP98Maximum = o.diffuseP98Maximum * ratio,
+                    regionMedians = o.regionMedians?.map { it * ratio }?.toDoubleArray()))
+            }
             return d
         }
         assertTrue(settle(lowKey).exposureProduct < settle(normal).exposureProduct)

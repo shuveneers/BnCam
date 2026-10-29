@@ -1,0 +1,8 @@
+﻿{
+    "hashes":  {
+                   "app/src/main/java/com/bncam/core/capture/RawFlickerStabilityTracker.kt":  "4077e3ea51b23f59f39d1f842d5c6263baa5540f84dd127a78e6a33ed1d88d05",
+                   "app/src/test/java/com/bncam/core/capture/RawFlickerStabilityTrackerTest.kt":  "28b30ec7e7d1acf374b41658e1cc1d431ee179253f63cdc42315f66bf3e94a8a"
+               },
+    "head":  "08b4d5b2b0a36ec039fc7696637817b540e4413d",
+    "id":  "phase1_delta01"
+}

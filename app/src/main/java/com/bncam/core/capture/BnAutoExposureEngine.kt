@@ -88,7 +88,11 @@ class BnAutoExposureEngine {
         var observation: BnAutoObservation? = null, var stableSinceNs: Long = 0L,
         var lastMovingNs: Long = 0L, var movingCameraCeilingNs: Long? = null,
         var movingSubjectCeilingNs: Long? = null, var stabilityAnchor: BnAutoObservation? = null,
-        var stabilitySecondaryAnchor: BnAutoObservation? = null)
+        var stabilitySecondaryAnchor: BnAutoObservation? = null,
+        var nonMotionSinceNs: Long = 0L,
+        var highlightRadianceCeiling: Double = 0.0,
+        var highlightSceneRadiance: Double = 0.0,
+        val recentSceneRadiance: java.util.ArrayDeque<Double> = java.util.ArrayDeque())
     private val states = linkedMapOf<String, State>()
 
     @Synchronized
@@ -114,13 +118,23 @@ class BnAutoExposureEngine {
         limits: BnAutoSensorLimits,
         observation: BnAutoObservation?,
         flicker: RawFlickerConstraint = RawFlickerConstraint(),
-        evBias: Float = 0f
+        evBias: Float = 0f,
+        committedDecision: BnAutoExposureDecision? = null,
+        continuousTransitions: Boolean = false,
+        observedFramePeriodNs: Long = limits.minStreamFrameDurationNs
     ): BnAutoExposureDecision {
-        val previous = current(key, limits)
+        current(key, limits)
         val state = states.getValue(key)
+        // The caller may suppress proposals to avoid Camera2 request churn. Never integrate
+        // those *unsubmitted* proposals as real feedback: the latest request is authoritative.
+        // The sensor observation itself remains the source of photometric and motion evidence.
+        if (committedDecision != null) state.decision = committedDecision
+        val previous = state.decision
         val o = observation
         if (o == null || !o.valid() || o.timestampNs <= state.lastTimestamp) {
             state.observation = null
+            state.nonMotionSinceNs = 0L
+            state.recentSceneRadiance.clear()
             state.stableSinceNs = 0L
             state.stabilityAnchor = null
             state.stabilitySecondaryAnchor = null
@@ -132,10 +146,18 @@ class BnAutoExposureEngine {
                 meteringConfidence = 0f, limitingConstraint = "MISSING_STABILITY_EVIDENCE",
                 reason = "missing_invalid_or_duplicate_sensor_observation").also { state.decision = it }
         }
+        val feedbackIntervalNs = if (state.lastTimestamp > 0L) o.timestampNs - state.lastTimestamp
+            else observedFramePeriodNs
         state.lastTimestamp = o.timestampNs
         val priorObservation = state.observation
         val motionEvidence = BnAutoMotionEvidence.evaluate(priorObservation, o)
         state.observation = o
+        // Consistent illumination pulses are not subject movement. They can support a
+        // conservative flicker-period preference, but not long tripod exposures.
+        state.nonMotionSinceNs = if (motionEvidence == BnAutoMotionEvidence.Status.STABLE ||
+            motionEvidence == BnAutoMotionEvidence.Status.LIGHT_MODULATION) {
+            state.nonMotionSinceNs.takeIf { it > 0L } ?: o.timestampNs
+        } else 0L
         if (motionEvidence == BnAutoMotionEvidence.Status.MOVING) {
             state.lastMovingNs = o.timestampNs
             state.movingCameraCeilingNs = o.cameraMotionCeilingNs.takeIf { o.cameraMotionConfidence >= 0.18f }
@@ -168,10 +190,36 @@ class BnAutoExposureEngine {
         // flow confidence alone is insufficient when the RAW texture is dominated by sensor noise.
         val stabilitySpan = if (state.stableSinceNs > 0) o.timestampNs - state.stableSinceNs else 0L
         val product = o.exposureNs.toDouble() * o.iso
+        // Median of physical scene radiance, not display brightness. A brief LED/PWM
+        // phase pulse must not immediately drive ISO/shutter in the opposite direction.
+        val measuredScene80 = o.diffuseP80.takeIf { it.isFinite() && it > 0 } ?: o.p80
+        val radiance = measuredScene80 / product
+        if (radiance.isFinite() && radiance > 0) {
+            val history = state.recentSceneRadiance.toList().sorted()
+            val baseline = history.getOrNull(history.size / 2)
+            val last = state.recentSceneRadiance.peekLast()
+            val sustainedStep = baseline != null && last != null &&
+                abs(log2(radiance / baseline)) > 0.60 &&
+                abs(log2(last / baseline)) > 0.60 &&
+                (radiance > baseline) == (last > baseline) && abs(log2(radiance / last)) < 0.25
+            if (sustainedStep || (o.channelClipFractions.maxOrNull() ?: 0.0) >= 0.025 &&
+                o.spatialHighlightFraction >= 0.08) state.recentSceneRadiance.clear()
+            state.recentSceneRadiance.addLast(radiance)
+            while (state.recentSceneRadiance.size > 6) state.recentSceneRadiance.removeFirst()
+        }
+        val sortedRadiance = state.recentSceneRadiance.toList().sorted()
+        // An odd median follows the majority phase of an alternating LED pulse and flips
+        // every sample. Use the central interval of an even window in log-radiance space.
+        // The sustained-step detector above retires this history after two agreeing changes.
+        val medianRadiance = if (sortedRadiance.size >= 3)
+            sqrt(sortedRadiance[(sortedRadiance.size - 1) / 2] * sortedRadiance[sortedRadiance.size / 2])
+            else radiance
         val noiseS = o.noiseSlope?.takeIf { it.isFinite() && it >= 0 }
         val noiseO = o.noiseOffset?.takeIf { it.isFinite() && it >= 0 }
-        val diffuse80 = o.diffuseP80.takeIf { it.isFinite() && it > 0 } ?: o.p80
-        val diffuse50 = o.diffuseP50.takeIf { it.isFinite() && it > 0 } ?: diffuse80
+        val diffuse80 = (medianRadiance * product).takeIf { it.isFinite() && it > 0 }
+            ?: measuredScene80
+        val diffuse50 = (o.diffuseP50.takeIf { it.isFinite() && it > 0 } ?: measuredScene80) *
+            (diffuse80 / measuredScene80.coerceAtLeast(1e-8))
         val diffuse98 = o.diffuseP98Maximum.takeIf { it.isFinite() && it > 0 }
             ?: o.channelP98Maximum
         val sceneKey = (diffuse80 * 1_000_000_000.0 / product).coerceIn(0.000001, 4.0)
@@ -199,7 +247,26 @@ class BnAutoExposureEngine {
         val diffuseClipping = projectedDiffuseClipping(o, 1.0)
         val clipping = diffuseClipping ?: o.channelClipFractions.maxOrNull() ?: 0.0
         val urgentClip = clipping >= 0.025 && broadHighlights
-        if (urgentClip) desired = minOf(desired, product * 0.5)
+        val highlight98 = o.channelP98Maximum.takeIf { it.isFinite() && it > 0 } ?: o.p98
+        val physicalHighlightRadiance = highlight98 / product
+        // Broad clipping is a physical radiance constraint, retained across a reduction.
+        // Otherwise a newly unclipped sky can become a "point source", remove the cap,
+        // and cause an endless half/double ISO cycle on a stationary scene.
+        if (state.highlightSceneRadiance > 0 &&
+            abs(log2(radiance / state.highlightSceneRadiance)) > 0.75) {
+            state.highlightRadianceCeiling = 0.0
+            state.highlightSceneRadiance = 0.0
+        }
+        if (urgentClip) {
+            state.highlightRadianceCeiling = maxOf(state.highlightRadianceCeiling, physicalHighlightRadiance)
+            state.highlightSceneRadiance = radiance
+            desired = minOf(desired, product * 0.5)
+        } else if (state.highlightRadianceCeiling > 0.0) {
+            // Once unclipped, recover the previously censored highlight radiance.
+            state.highlightRadianceCeiling = maxOf(state.highlightRadianceCeiling, physicalHighlightRadiance)
+        }
+        if (state.highlightRadianceCeiling > 0.0)
+            desired = minOf(desired, 0.85 / state.highlightRadianceCeiling)
         val sceneClass = when {
             brightRegionFraction > 0.08 && contrastEv > 4 -> "BACKLIT"
             naturalUpperMid < 0.025 -> "NIGHT"
@@ -214,6 +281,8 @@ class BnAutoExposureEngine {
                 ?.let { minOf(it, stabilitySpan / 2) }
             else null
         val suppressNoisyFlow = motionEvidence == BnAutoMotionEvidence.Status.NOISE_DOMINATED ||
+            // Coherent light modulation must not reuse false legacy luma-flow ceilings.
+            motionEvidence == BnAutoMotionEvidence.Status.LIGHT_MODULATION ||
             (motionEvidence == BnAutoMotionEvidence.Status.STABLE && adjacentStability != null)
         val cameraCeiling = if (holdMoving) state.movingCameraCeilingNs else stabilityCeiling ?:
             if (!suppressNoisyFlow && o.cameraMotionConfidence >= 0.18f) o.cameraMotionCeilingNs else null
@@ -223,15 +292,46 @@ class BnAutoExposureEngine {
         // observed full-resolution gradient bound, only shorten the lens handheld fallback.
         val cameraSafe = if (stabilityCeiling != null) cameraCeiling ?: limits.fallbackHandheldNs
             else minOf(adjacentStability ?: cameraCeiling ?: limits.fallbackHandheldNs, limits.fallbackHandheldNs)
-        val ceiling = minOf(bounds.maxExposureNs, cameraSafe,
+        val originalCeiling = minOf(bounds.maxExposureNs, cameraSafe,
             subjectCeiling ?: bounds.maxExposureNs).coerceAtLeast(bounds.minExposureNs)
-        val errorEv = log2(desired / previous.exposureProduct)
+        val ceiling = BnAutoFlickerSafetyPolicy.ceilingNs(
+            originalCeilingNs = originalCeiling,
+            lightPeriodNs = flicker.periodNs,
+            minStreamFrameDurationNs = limits.minStreamFrameDurationNs,
+            maxFrameDurationNs = limits.maxFrameDurationNs,
+            sustainedNonMotionNs = if (state.nonMotionSinceNs > 0L)
+                (o.timestampNs - state.nonMotionSinceNs).coerceAtLeast(0L) else 0L,
+            recentMotion = holdMoving || motionEvidence == BnAutoMotionEvidence.Status.MOVING,
+            measuredCameraCeilingNs = o.cameraMotionCeilingNs.takeIf {
+                motionEvidence != BnAutoMotionEvidence.Status.LIGHT_MODULATION && o.cameraMotionConfidence >= 0.18f
+            },
+            measuredSubjectCeilingNs = o.subjectMotionCeilingNs.takeIf {
+                motionEvidence != BnAutoMotionEvidence.Status.LIGHT_MODULATION && o.subjectMotionConfidence >= 0.18f
+            }
+        ).coerceAtMost(bounds.maxExposureNs)
+        // Corrections are bounded against the exposure that generated this RAW frame.
+        // A submitted target is not evidence that the HAL has realized that product.
+        val errorEv = log2(desired / product)
         val deadbandEv = maxOf(0.08, midSnr?.takeIf { it > 0 }?.let {
             log2(1 + 1 / it).coerceAtMost(0.25)
         } ?: 0.08)
+        // Fast on a proven scene step; conservative around the noise floor. All steps
+        // are measured in EV and stay bounded to prevent request/feedback oscillation.
+        val riseEv = if (errorEv >= 0.60) maxOf(0.75, 1.40 * confidence) else 0.75 * confidence
+        val fallEv = if (errorEv <= -0.60) -maxOf(0.90, 1.60 * confidence) else -1.0 * confidence
         val correction = if (abs(errorEv) < deadbandEv) 0.0 else errorEv.coerceIn(
-            if (urgentClip) -2.0 else -0.7 * confidence, 0.5 * confidence)
-        val targetProduct = previous.exposureProduct * 2.0.pow(correction)
+            if (urgentClip) -2.0 else fallEv, riseEv)
+        val previewMaximumProduct = limits.minStreamFrameDurationNs.toDouble() * bounds.maxIso
+        // Once warm preview is physically saturated, additional photons belong to the exact
+        // single still exposure. Do not repeatedly rebuild the same saturated preview request.
+        val targetProduct = if (product >= previewMaximumProduct * 0.98 && desired > product)
+            desired else if (continuousTransitions) {
+                // Filter noise at the physical endpoint, not by holding each intermediate ramp
+                // point. A 0.20 EV submission threshold would discard the small smooth steps.
+                val goal = if (abs(errorEv) < deadbandEv) previous.exposureProduct else desired
+                BnAutoExposureTrajectory.nextProduct(previous.exposureProduct, product, goal,
+                    feedbackIntervalNs, observedFramePeriodNs, confidence, urgentClip)
+            } else product * 2.0.pow(correction)
         val conservative = requireNotNull(DefaultRawExposureAllocator.allocate(
             targetProduct, minOf(ceiling, limits.fallbackHandheldNs), bounds, flicker,
             preferHeldFlickerShutter = false))
@@ -266,11 +366,18 @@ class BnAutoExposureEngine {
             addCandidate(step.toLong())
             step = maxOf(step + 1, step * 1.25)
         }
-        val motionBound = minOf(cameraSafe, subjectCeiling ?: cameraSafe).coerceAtLeast(bounds.minExposureNs)
+        // A validated complete light period is no longer penalized as if it violated the
+        // generic fallback shutter, but known camera/subject motion still limits it.
+        val scoreCameraBound = if (ceiling > originalCeiling) maxOf(cameraSafe, ceiling) else cameraSafe
+        val motionBound = minOf(scoreCameraBound, subjectCeiling ?: scoreCameraBound)
+            .coerceAtLeast(bounds.minExposureNs)
         fun score(candidate: DefaultRawExposureAllocation): Double {
             val snr = predictedSnr(candidate)
             val gain = if (snr != null && snrShort != null && snrShort > 0) snr / snrShort else null
-            if (candidate.exposureTimeNs > limits.fallbackHandheldNs &&
+            val validatedLightPeriod = ceiling > originalCeiling &&
+                candidate.exposureTimeNs <= (flicker.periodNs ?: 0L) &&
+                flicker.isExposureAligned(candidate.exposureTimeNs)
+            if (candidate.exposureTimeNs > limits.fallbackHandheldNs && !validatedLightPeriod &&
                 (stabilityCeiling == null || gain == null || gain < 1.10)) return Double.NEGATIVE_INFINITY
             val detailRisk = (candidate.exposureTimeNs.toDouble() / motionBound).pow(2)
             val baseRisk = (conservative.exposureTimeNs.toDouble() / motionBound).pow(2)
@@ -278,14 +385,37 @@ class BnAutoExposureEngine {
             val baseLatency = maxOf(conservative.frameDurationNs, limits.minStreamFrameDurationNs).toDouble()
             val candidateClip = projectedDiffuseClipping(o, candidate.realizedExposureProduct / product) ?: 0.0
             val naturalError = abs(log2(candidate.realizedExposureProduct / targetProduct))
+            // Exposure is a box integration filter: at a known modulation period, its
+            // residual sinusoidal response is |sin(pi*t/P)/(pi*t/P)|. Penalize that
+            // physical flicker response rather than an arbitrary aligned-shutter bonus.
+            val flickerResponse = flicker.periodNs?.let { period ->
+                val phase = Math.PI * candidate.exposureTimeNs / period
+                if (flicker.isExposureAligned(candidate.exposureTimeNs)) 0.0
+                else abs(kotlin.math.sin(phase) / phase)
+            } ?: 0.0
             return ln(gain ?: 1.0) - 0.7 * (detailRisk - baseRisk) -
-                0.08 * ln(latency / baseLatency) - 12 * candidateClip - naturalError
+                0.08 * ln(latency / baseLatency) - 12 * candidateClip - naturalError -
+                0.8 * flickerResponse * flickerResponse
         }
-        val best = candidates.values.maxByOrNull(::score) ?: conservative
+        // The safety policy has explicitly admitted ONE complete light period beyond the
+        // generic fallback. Do not defeat that authority with a generic short-shutter utility
+        // preference (a 6.25 ms compromise still pulses under 120 Hz illumination).
+        val acquiredPeriod = if (ceiling > originalCeiling) candidates.values.filter {
+            it.exposureTimeNs <= (flicker.periodNs ?: 0L) && flicker.isExposureAligned(it.exposureTimeNs) &&
+                score(it).isFinite()
+        }.maxByOrNull(::score) else null
+        val best = acquiredPeriod ?: candidates.values.maxByOrNull(::score) ?: conservative
         // A small utility difference is not worth ongoing shutter/ISO hunting. Unsafe previous
         // shutters never enter this set; shortening for measured motion remains immediate.
         val held = candidates.values.firstOrNull { it.exposureTimeNs == previous.targetExposureNs }
-            ?.takeIf { score(it).isFinite() && score(it) >= score(best) - 0.04 }
+            ?.takeIf {
+                // Shutter hysteresis must not retain a pulsing short shutter when a better,
+                // equally exposed complete light period has become motion-safe (notably 60 Hz).
+                val acquiringAlignedShutter = flicker.periodNs != null &&
+                    flicker.isExposureAligned(best.exposureTimeNs) && !flicker.isExposureAligned(it.exposureTimeNs)
+                !(acquiredPeriod != null && acquiringAlignedShutter) && score(it).isFinite() &&
+                    score(it) >= score(best) - if (acquiringAlignedShutter) 0.0 else 0.04
+            }
         val allocation = held ?: best
         val snrLong = predictedSnr(allocation)
         val snrGain = if (snrShort != null && snrLong != null && snrShort > 0) snrLong / snrShort else null
@@ -309,7 +439,7 @@ class BnAutoExposureEngine {
             "natural_distribution;sceneClass=$sceneClass;contrastEv=$contrastEv;pointSources=${o.pointSourceFraction};" +
                 "candidateCount=${candidates.size};selectedUtility=${score(allocation)};held=${held != null};" +
                 "referenceExposureNs=${conservative.exposureTimeNs};referenceIso=${conservative.sensitivityIso};bounded_feedback;noiseModel=${noiseS != null && noiseO != null};motionEvidence=$motionEvidence;" +
-                "detailSafeCeilingNs=$stabilityCeiling;detailEvidence=$detailEvidence;" +
+                "detailSafeCeilingNs=$stabilityCeiling;detailEvidence=$detailEvidence;flickerCeilingNs=$ceiling;originalCeilingNs=$originalCeiling;" +
                 "stabilitySpanNs=$stabilitySpan;longDetailEvidence=$longDetailEvidence;" +
                 "predictedShadowSnrShort=$snrShort;predictedShadowSnrLong=$snrLong;predictedSnrGain=$snrGain")
         state.decision = result
@@ -332,7 +462,8 @@ class BnAutoExposureEngine {
 
 /** Significance test in the physical RAW domain; camera/subject flow remains the motion estimator. */
 object BnAutoMotionEvidence {
-    enum class Status { UNAVAILABLE, MOVING, STABLE, NOISE_DOMINATED }
+    // LIGHT_MODULATION is neither motion nor proof of a stable scene.
+    enum class Status { UNAVAILABLE, MOVING, STABLE, NOISE_DOMINATED, LIGHT_MODULATION }
 
     /** Noise-weighted displacement bound in full sensor pixels, never compact-grid pixels.
      * Both axes and at least eight scene regions must contain significant local gradients.
@@ -400,6 +531,12 @@ object BnAutoMotionEvidence {
             current.timestampNs - prior.timestampNs !in 1..500_000_000L) return Status.UNAVAILABLE
         val ratio = (current.exposureNs.toDouble() * current.iso) / (prior.exposureNs.toDouble() * prior.iso)
         if (!ratio.isFinite() || ratio !in 0.25..4.0) return Status.UNAVAILABLE
+        // A coherent light pulse can change every RAW cell by >3 sigma without any motion.
+        // Never use such a pulse to grant longer exposures; also never place a motion hold on it.
+        if (RawIlluminationChangePolicy.consistentGlobalShift(
+                a, b, ratio, s0, o0, s1, o1,
+                prior.quantizationVariance, current.quantizationVariance
+            )) return Status.LIGHT_MODULATION
         var changed = 0
         var count = 0
         var sum = 0.0

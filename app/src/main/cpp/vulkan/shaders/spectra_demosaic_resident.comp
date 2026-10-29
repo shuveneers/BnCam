@@ -745,7 +745,7 @@ float highlightQ(vec2 pixel) {
     for(int j=0;j<4;++j)for(int i=0;i<4;++i){
         ivec2 p=clamp(at+ivec2(i-1,j-1),ivec2(0),size-1);
         vec4 c=unpackUnorm4x8(floatBitsToUint(inputMosaic[uint(p.y*size.x+p.x)]));
-        q+=wx[i]*wy[j]*(c.x*c.y*c.z*c.w);
+        q+=wx[i]*wy[j]*(c.x+c.y+c.z+c.w)*0.25;
     }
     return clamp(q,0.0,1.0);
 }
@@ -900,8 +900,17 @@ void writeResidualCandidate(uvec2 sampleGid, bool postColourDomain) {
     residualCandidates[base + 7u] = center.z;
 }
 
+#include "highlight_reconstruction.glsl"
+
 void main() {
     uvec2 gid = gl_GlobalInvocationID.xy;
+    if (pc.mode == 13u) {
+        if(gid.x>=pc.frameWidth || gid.y>=pc.frameHeight) return;
+        vec3 recovered=gradientHighlightAt(ivec2(gid));
+        uint at=(gid.y*pc.frameWidth+gid.x)*3u;
+        colorRgb[at]=recovered.r; colorRgb[at+1u]=recovered.g; colorRgb[at+2u]=recovered.b;
+        return;
+    }
     if (pc.mode == 4u) {
         writeResidualCandidate(gid, false); // POST_DEMOSAIC_RGB: outputRgb is authoritative.
         return;
@@ -1006,6 +1015,10 @@ void main() {
         float colorConfidence = sourceRawConfidence
                 ? sourceColorConfidence
                 : legacyDemosaicConfidence;
+        if(pc.padding4!=0u && pc.cfaEvidence1.x>1.5) {
+            vec3 q=highlightChannelReliability(ivec2(gid));
+            colorConfidence=max(min(q.r,q.g),max(min(q.r,q.b),min(q.g,q.b)));
+        }
 
         if (pc.padding4 != 0u && colorConfidence < 1.0) {
             atomicMax(colorTelemetry[17], floatBitsToUint(1.0-colorConfidence));
@@ -1032,6 +1045,10 @@ void main() {
             physicalNoisePressure(pc.padding0*localShapeVariance,ci.x) : 0.0;
         lumaStats1[localIndex].w=pc.cfaEvidence1.w>0.5 ?
             physicalNoisePressure(0.5*(pc.cfaEvidence0.y+pc.cfaEvidence0.z)*localShapeVariance,ci.x) : 0.0;
+        // Keep noise estimators and their diagnostics on their original domains.
+        // Recovery adds only the censored-channel delta from immutable demosaic RGB.
+        if(pc.padding4!=0u && pc.cfaEvidence1.x>1.5)
+            rawForWb+=vec3(colorRgb[index],colorRgb[index+1u],colorRgb[index+2u])-rawInput;
 
         // Counterfactual only: distinguishes WB-induced over-unity and old post-CCM magenta risk
         // from actual sensor-domain clipping. Neither condition is treated as lost sensor data.
@@ -1052,7 +1069,8 @@ void main() {
         // ClippingAwareHighlightColor: WB and the camera matrix operate normally. D124 feeds
         // the safety mix from generation-matched source-Bayer clipping provenance captured
         // before RAW-finalize lens/exposure mutations. The demosaiced ceiling detector above
-        // remains diagnostic/fallback only. This cannot change luminance or exposure.
+        // remains diagnostic/fallback only. Per-channel reconstruction above is a rendering
+        // estimate; the immutable Bayer source and saved DNG samples are preserved.
         vec3 signedCcm = legacySignedCcm;
         bool originalCcmExcursion = min(signedCcm.r, min(signedCcm.g, signedCcm.b)) < -1.0e-6;
         if (originalCcmExcursion) atomicAdd(colorTelemetry[4], 1u);

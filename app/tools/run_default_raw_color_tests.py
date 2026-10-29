@@ -35,6 +35,13 @@ run(clang,'--target=aarch64-linux-android29','-std=c++17','-O2','-UNDEBUG','-sta
     '-I',root/'app/src/main/cpp',root/'app/src/test/cpp/DefaultRawColorHighlightDeviceTest.cpp','-lvulkan','-o',exe)
 remote = '/data/local/tmp/bncam-default-raw-color-tests'
 run(adb,'shell','mkdir','-p',remote)
+for name in ['SoftHighlightToneTest','GradientHighlightRecoveryTest','DefaultRawSceneColorTest','RawCfaLevelMappingTest']:
+    unit=build/name
+    run(clang,'--target=aarch64-linux-android29','-std=c++17','-O2','-UNDEBUG','-static-libstdc++',
+        '-I',root/'app/src/main/cpp',root/'app/src/test/cpp'/(name+'.cpp'),'-o',unit)
+    run(adb,'push',unit,remote+'/'+name)
+    run(adb,'shell','chmod','755',remote+'/'+name)
+    run(adb,'shell',remote+'/'+name)
 for path in [exe, *build.glob('*.spv')]: run(adb,'push',path,remote+'/'+path.name)
 run(adb,'shell','chmod','755',remote+'/'+exe.name)
 run(adb,'shell',remote+'/'+exe.name,remote)

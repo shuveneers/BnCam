@@ -978,9 +978,9 @@ void recordDisplayAnalysis(uvec2 gid, vec3 displayRgb) {
 // cannot re-crush shadows after FLLF. It fades back in only near the shoulder to preserve the
 // established highlight compression/desaturation. True scene black remains 0; no hidden EV is added.
 vec3 pbrNeutralToneMapping(vec3 color) {
-    const float startCompression = 0.76;
+    const float startCompression = 0.60;
     const float desaturation = 0.15;
-    const float shoulderPrepStart = 0.60;
+    const float shoulderPrepStart = 0.44;
     color = max(color, vec3(0.0));
 
     float inputPeak = max(color.r, max(color.g, color.b));

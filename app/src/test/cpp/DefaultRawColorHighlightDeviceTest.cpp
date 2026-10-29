@@ -1,6 +1,8 @@
 // Runs the production compute shaders on an Android Vulkan device, with a CPU oracle.
 #include <vulkan/vulkan.h>
 #include "HighlightGamutProtectionV2.h"
+#include "SoftHighlightTone.h"
+#include "GradientHighlightRecovery.h"
 #include "DefaultRawColorPipeline.h"
 #include "ProfileColorManagement.h"
 #include "DefaultRawSceneEvidence.h"
@@ -56,36 +58,42 @@ struct Gpu {
 };
 struct Push { std::array<uint32_t,32> u{}; void f(int i,float x){std::memcpy(&u[i],&x,4);} };
 Rgb pbr(Rgb c) {
- for(int i=0;i<3;++i)c[i]=std::max(0.f,c[i]);float peak=std::max({c.r,c.g,c.b}),x=std::min({c.r,c.g,c.b});
- float off=(x<.08f?x-6.25f*x*x:.04f)*bncam::highlight::smoothstep(.60f,.76f,peak);for(int i=0;i<3;++i)c[i]-=off;
- peak=std::max({c.r,c.g,c.b});if(peak<.76f)return c;
- float np=1.f-.24f*.24f/(peak+.24f-.76f),g=1.f-1.f/(.15f*(peak-np)+1.f);
- for(int i=0;i<3;++i)c[i]=c[i]*(np/peak)*(1.f-g)+np*g;return c;
+ return bncam::tone::softHighlightTone(c);
 }
 float error(const std::vector<float>& a,const float* b){float e=0;for(size_t i=0;i<a.size();++i){assert(std::isfinite(b[i]));e=std::max(e,std::abs(a[i]-b[i]));}return e;}
 int main(int argc,char**argv){
+ std::cout.setf(std::ios::unitbuf);
  assert(argc==2);std::string dir=argv[1];Gpu gpu;std::array<Buffer,16> b;for(auto& v:b)v=gpu.buffer();
  auto& source=b[0];auto& finalized=b[1];auto& rgb=b[2];auto& color=b[3];auto& stats=b[4];auto& telemetry=b[5];auto& empty=b[6];auto& lut=b[7];auto& tone=b[8];
  float maxMapError=0,maxColorError=0,maxToneError=0;unsigned partialUnchanged=0,fullNeutral=0;
  for(int pattern=0;pattern<4;++pattern)for(int lens=0;lens<3;++lens)for(int format=0;format<2;++format){
-  float quantum=format?65535.f:1023.f;std::vector<float> cells(N/4),raw(N*3);
+  float quantum=format?65535.f:1023.f;std::vector<float> cells(N/4),raw(N*3);std::vector<Rgb> channels(N/4);
   for(unsigned y=0;y<H;y+=2)for(unsigned x=0;x<W;x+=2){
    // All clipping masks, a dense .96..1.0 ramp, coloured textures and one-green-only clipping.
    unsigned k=(y/2)*(W/2)+x/2;float v=.96f+.04f*float(k%32)/31.f;unsigned mask=k%16;
    std::array<float,4>s;for(int ch=0;ch<4;++ch)s[ch]=std::round(((mask&(1u<<ch))?v:(.15f+.04f*((k+ch)%8)))*quantum)/quantum;
    if(y>=H-8) s={1.f,1.f,1.f,1.f};
    source.p[y*W+x]=s[0];source.p[y*W+x+1]=s[1];source.p[(y+1)*W+x]=s[2];source.p[(y+1)*W+x+1]=s[3];cells[k]=bncam::highlight::defaultRawCellConfidence(s);
+   channels[k]=bncam::highlight::cellChannelReliability(s,pattern);
    for(unsigned dy=0;dy<2;++dy)for(unsigned dx=0;dx<2;++dx){unsigned p=((y+dy)*W+x+dx)*3;raw[p]=s[0];raw[p+1]=.5f*(s[1]+s[2]);raw[p+2]=s[3];}
   }
   Push fp;fp.u[0]=W;fp.u[1]=H;fp.u[2]=pattern;fp.u[6]=1;fp.f(14,2.f);fp.f(15,1.f);fp.f(16,1.f);fp.f(17,1.f);fp.u[27]=1;
   std::memset(telemetry.p,0,telemetry.bytes);gpu.run(dir+"/spectra_raw_finalize.comp.spv",{&source,&finalized,&empty,&telemetry,&empty},fp.u.data(),112);
-  for(unsigned i=0;i<N/4;++i){uint32_t bits;std::memcpy(&bits,finalized.p+N+i,4);float decoded=1.f;for(int ch=0;ch<4;++ch)decoded*=float((bits>>(ch*8))&255u)/255.f;maxMapError=std::max(maxMapError,std::abs(cells[i]-decoded));}assert(maxMapError<2e-6f);
+  for(unsigned i=0;i<N/4;++i){uint32_t bits;std::memcpy(&bits,finalized.p+N+i,4);float decoded=0.f;for(int ch=0;ch<4;++ch)decoded+=.25f*float((bits>>(ch*8))&255u)/255.f;maxMapError=std::max(maxMapError,std::abs(cells[i]-decoded));}assert(maxMapError<2e-6f);
   std::memcpy(rgb.p,raw.data(),N*3*4);std::memset(telemetry.p,0,telemetry.bytes);
-  Push cp;cp.u[0]=W;cp.u[1]=H;cp.u[3]=3;std::array<float,9> matrix{1.15f+.05f*lens,-.15f-.05f*lens,0.f,-.13f,1.07f,.06f,.01f,-.6f-.1f*lens,1.59f+.1f*lens};float wr=1.6f+.2f*lens,wb=1.3f+.15f*lens;cp.f(4,wr);cp.f(5,1);cp.f(6,wb);for(int i=0;i<9;++i)cp.f(8+i,matrix[i]);cp.u[23]=1;cp.f(28,1);
+  Push cp;cp.u[0]=W;cp.u[1]=H;cp.u[2]=pattern;cp.u[3]=13;std::array<float,9> matrix{1.15f+.05f*lens,-.15f-.05f*lens,0.f,-.13f,1.07f,.06f,.01f,-.6f-.1f*lens,1.59f+.1f*lens};float wr=1.6f+.2f*lens,wb=1.3f+.15f*lens;cp.f(4,wr);cp.f(5,1);cp.f(6,wb);for(int i=0;i<9;++i)cp.f(8+i,matrix[i]);cp.u[23]=1;cp.f(28,2);
+  const auto read=[&](int x,int y){unsigned p=(std::clamp(y,0,int(H)-1)*W+std::clamp(x,0,int(W)-1))*3;return Rgb{raw[p],raw[p+1],raw[p+2]};};
+  const auto cell=[&](int x,int y){return channels[std::clamp(y,0,int(H/2)-1)*(W/2)+std::clamp(x,0,int(W/2)-1)];};
+  const auto recover=[&](int x,int y){return bncam::highlight::reconstructHighlight(x,y,read(x,y),bncam::highlight::channelReliabilityAt(x,y,cell),Rgb{wr,1,wb},read,[&](int px,int py){return cell(std::clamp(px,0,int(W)-1)/2,std::clamp(py,0,int(H)-1)/2);});};
+  gpu.run(dir+"/spectra_demosaic_resident.comp.spv",{&finalized,&rgb,&color,&stats,&empty,&empty,&telemetry,&empty},cp.u.data(),128,N*4);
+  for(unsigned y=0;y<H;++y)for(unsigned x=0;x<W;++x){auto r=recover(x,y);unsigned p=(y*W+x)*3;for(int c=0;c<3;++c)assert(std::abs(r[c]-color.p[p+c])<5e-6f);}
+  cp.u[3]=3;
   gpu.run(dir+"/spectra_demosaic_resident.comp.spv",{&finalized,&rgb,&color,&stats,&empty,&empty,&telemetry,&empty},cp.u.data(),128,N*4);
   std::vector<float> expected(N*3);
-  for(unsigned y=0;y<H;++y)for(unsigned x=0;x<W;++x){unsigned p=(y*W+x)*3;float confidence=bncam::highlight::defaultRawConfidenceAt(x,y,[&](int cx,int cy){return cells[std::clamp(cy,0,int(H/2)-1)*(W/2)+std::clamp(cx,0,int(W/2)-1)];});
-   Rgb c=bncam::highlight::multiplyMatrix(matrix,{raw[p]*wr,raw[p+1],raw[p+2]*wb});bncam::highlight::SensorColorConfidence ev;ev.confidence=confidence;auto out=bncam::highlight::applyClippingAwareHighlightColor(c,ev);
+  for(unsigned y=0;y<H;++y)for(unsigned x=0;x<W;++x){unsigned p=(y*W+x)*3;float confidence=bncam::highlight::chromaticReliability(bncam::highlight::channelReliabilityAt(x,y,cell));
+   Rgb recovered=recover(x,y);Rgb gains{recovered.r*wr,recovered.g,recovered.b*wb};
+   Rgb c=bncam::highlight::multiplyMatrix(matrix,gains);
+   bncam::highlight::SensorColorConfidence ev;ev.confidence=confidence;auto out=bncam::highlight::applyClippingAwareHighlightColor(c,ev);
    if(confidence==1){assert(out.rgb.r==c.r&&out.rgb.g==c.g&&out.rgb.b==c.b);++partialUnchanged;}if(confidence==0){assert(std::abs(out.rgb.r-out.rgb.g)<1e-6);++fullNeutral;}
    for(int ch=0;ch<3;++ch)expected[p+ch]=out.rgb[ch];
   }
@@ -93,12 +101,12 @@ int main(int argc,char**argv){
   std::memcpy(tone.p,color.p,N*3*4);std::memset(telemetry.p,0,telemetry.bytes);for(int i=0;i<4096;++i){lut.p[2*i]=i/4095.f;lut.p[2*i+1]=1;}
   Push tp;tp.u[0]=W;tp.u[1]=H;tp.u[2]=3;tp.u[6]=1;tp.f(8,1);tp.f(9,-1);
   gpu.run(dir+"/spectra_tone_resident.comp.spv",{&color,&tone,&empty,&lut,&telemetry,&empty,&empty,&empty,&empty,&empty,&empty,&empty,&empty},tp.u.data(),120);
-  for(unsigned p=0;p<N*3;p+=3){Rgb c=pbr(bncam::color::mapSceneToKhronosInput({expected[p],expected[p+1],expected[p+2]}));bncamCompressToUnitGamutPreserveLuma(c.r,c.g,c.b);for(int ch=0;ch<3;++ch)expected[p+ch]=c[ch];}
+  for(unsigned p=0;p<N*3;p+=3){Rgb c=bncam::tone::softHighlightGamut(pbr(bncam::color::mapSceneToKhronosInput({expected[p],expected[p+1],expected[p+2]})));for(int ch=0;ch<3;++ch)expected[p+ch]=c[ch];}
   maxToneError=std::max(maxToneError,error(expected,tone.p));assert(maxToneError<1e-5f);
   std::cout<<"synthetic cfa="<<pattern<<" lens="<<lens<<" format="<<(format?"RAW_SENSOR":"RAW10")<<" pixels="<<N<<" passed\n";
  }
  // Trust intact coloured samples exactly; physical saturation loses chromaticity confidence.
- for(int i=0;i<=10000;++i){float v=.9f+.04f*i/10000.f;assert(bncam::highlight::defaultRawCellConfidence({v,.8f,.8f,v})==1.f);}assert(bncam::highlight::defaultRawCellConfidence({1.f,.8f,.8f,.8f})==0.f);
+ for(int i=0;i<=10000;++i){float v=.9f+.04f*i/10000.f;assert(bncam::highlight::defaultRawCellConfidence({v,.8f,.8f,v})==1.f);}assert(bncam::highlight::defaultRawCellConfidence({1.f,.8f,.8f,.8f})==.75f);
  float prevConfidence=1.f,prevY=-1.f;
  for(int i=0;i<=10000;++i){float v=.94f+.06f*i/10000.f;float confidence=bncam::highlight::defaultRawCellConfidence({v,v,v,v});assert(confidence<=prevConfidence+1e-6f);assert(prevConfidence-confidence<4.f/255.f+1e-6f);prevConfidence=confidence;}
  for(int i=0;i<=10000;++i){float v=.7f+3.3f*i/10000.f;float y=pbr({v,v,v}).r;assert(y>prevY);prevY=y;}

@@ -103,6 +103,18 @@ vec3 compressToUnitGamutPreserveLuma(vec3 rgb) {
     // outset components are compressed toward the same luminance instead of being
     // clipped independently (which rotates hue). In-gamut values remain untouched.
     if (any(isnan(rgb)) || any(isinf(rgb))) return vec3(0.0);
+    if(pc.rawJpegBaseVibrance<0.0) {
+        float y=lumaOf(rgb);
+        if(y<=0.0) return vec3(0.0);
+        if(y>=1.0) return vec3(1.0);
+        float high=max(rgb.r,max(rgb.g,rgb.b))-y;
+        float low=y-min(rgb.r,min(rgb.g,rgb.b));
+        float ratio=max(high/max(1e-8,1.0-y),low/max(1e-8,y));
+        if(ratio<=0.85) return rgb;
+        float t=ratio-0.85;
+        float mapped=0.85+0.15*t/(0.15+t);
+        return vec3(y)+(rgb-vec3(y))*(mapped/ratio);
+    }
     float y = lumaOf(rgb);
     if (!(y > 1.0e-8)) return vec3(0.0);
     if (y > 1.0) {
@@ -863,6 +875,37 @@ vec3 pbrNeutralToneMapping(vec3 color) {
     return mix(color, vec3(newPeak), g);
 }
 
+// Single-shot RAW: wider shoulder, preserving legacy Spectra/YUV arithmetic above.
+vec3 softHighlightTone(vec3 color) {
+    const float startCompression = 0.60;
+    color = max(color, vec3(0.0));
+    float inputPeak = max(color.r, max(color.g, color.b));
+    float x = min(color.r, min(color.g, color.b));
+    float offset = (x < 0.08 ? x - 6.25*x*x : 0.04) * smoothstep(0.44, 0.60, inputPeak);
+    color -= vec3(offset);
+    float peak = max(color.r, max(color.g, color.b));
+    if (peak < startCompression) return color;
+    const float transition=1.0, width=0.10, slope=0.12, white=2.4;
+    float join=transition+width, atJoin=0.8+width*(0.25+slope)*0.5;
+    float atWhite=atJoin+slope*(white-join), tail=max(0.0,peak-white), t=peak-transition;
+    float mapped=peak<transition ? 1.0-0.16/(peak-0.20)
+        : peak<join ? 0.8+0.25*t-(0.25-slope)*t*t/(2.0*width)
+        : peak<=white ? atJoin+slope*(peak-join)
+        : atWhite+(1.0-atWhite)*tail/(tail+(1.0-atWhite)/slope);
+    vec3 source=color;
+    color *= mapped / max(peak, 1.0e-8);
+    float g = 1.0 - 1.0/(0.15*(peak-mapped)+1.0);
+    color=mix(color,vec3(mapped),g);
+    float y=lumaOf(source), yt=y-transition, yTail=max(0.0,y-white);
+    float mappedY=y<startCompression ? y : y<transition ? 1.0-0.16/(y-0.20)
+        : y<join ? 0.8+0.25*yt-(0.25-slope)*yt*yt/(2.0*width)
+        : y<=white ? atJoin+slope*(y-join)
+        : atWhite+(1.0-atWhite)*yTail/(yTail+(1.0-atWhite)/slope);
+    float yg=1.0-1.0/(0.15*max(0.0,y-mappedY)+1.0);
+    vec3 lumaTone=mix(source*(mappedY/max(y,1e-8)),vec3(mappedY),yg);
+    return mix(color,lumaTone,smoothstep(1.0,1.2,peak));
+}
+
 vec3 applyToneLookLut(vec3 rgb) {
     float inputLuma = max(1.0e-6, lumaOf(rgb));
     float lutIdxF = clamp(inputLuma * 4095.0, 0.0, 4095.0);
@@ -900,7 +943,7 @@ void runTone(uvec2 gid) {
         rgb *= max(0.0, pc.exposureGain);
         vec3 preKhronos = rgb;
         if (pc.rawJpegBaseVibrance < 0.0) rgb = mapSceneToKhronosInput(rgb);
-        rgb = pbrNeutralToneMapping(rgb);
+        rgb = pc.rawJpegBaseVibrance < 0.0 ? softHighlightTone(rgb) : pbrNeutralToneMapping(rgb);
         if (pc.rawJpegBaseVibrance < 0.0 && max(preKhronos.r, max(preKhronos.g, preKhronos.b)) >= 0.8) {
             atomicAdd(telemetry[56], 1u);
             float compression = max(0.0, lumaOf(preKhronos) - lumaOf(rgb));

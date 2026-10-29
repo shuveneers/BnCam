@@ -1,0 +1,11 @@
+﻿{
+    "hashes":  {
+                   "app/src/test/java/com/bncam/core/capture/BnAutoPublishedTargetTest.kt":  "516fbf5f8894a680079fb0a648da1b4d05eb1c7978f91b30f8dea3e30da14b3d",
+                   "app/src/main/java/com/bncam/core/capture/BnAutoControlPacing.kt":  "d057a6ac7b4b0eb3c010d1915e5fac7f175a561f82c70f59007b7182957f66b6",
+                   "app/src/main/java/com/bncam/core/engine/BnCameraManager.kt":  "d01d203acc37cb0425000f9b7c9242b7b7e0e1a98f915e55e17a28e5528ffeda",
+                   "app/src/main/java/com/bncam/core/capture/BnAutoExposureEngine.kt":  "0314e31b3c07b79eac9426410549477019de238a556ffe88dacc67153e995cea",
+                   "app/src/test/java/com/bncam/core/capture/BnAutoControlPacingTest.kt":  "2d7bec8fcff1a3799e8d0f7b08d85cbe69107117bd019a3179556b0fa00496e4"
+               },
+    "head":  "08b4d5b2b0a36ec039fc7696637817b540e4413d",
+    "id":  "phase1_delta05"
+}

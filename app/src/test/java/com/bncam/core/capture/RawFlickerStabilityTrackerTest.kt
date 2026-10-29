@@ -45,28 +45,41 @@ class RawFlickerStabilityTrackerTest {
     }
 
     @Test
-    fun `unavailable statistic falls back to 50hz and real 60hz replaces it`() {
+    fun `missing statistics never claim 50hz or 60hz`() {
         val tracker = RawFlickerStabilityTracker(60L, 180L, 300L, 600L)
         tracker.observe(RawFlickerObservation.UNAVAILABLE, 100L)
-        val fallback = tracker.observe(RawFlickerObservation.UNAVAILABLE, 400L)
-        assertEquals(RawFlickerFrequency.HZ_50, fallback.stableFrequency)
-        assertTrue(fallback.fallbackActive)
-
-        tracker.observe(RawFlickerObservation.HZ_60, 450L)
-        val replaced = tracker.observe(RawFlickerObservation.HZ_60, 510L)
-        assertEquals(RawFlickerFrequency.HZ_60, replaced.stableFrequency)
-        assertFalse(replaced.fallbackActive)
+        val unknown = tracker.observe(RawFlickerObservation.UNAVAILABLE, 1_000L)
+        assertEquals(RawFlickerFrequency.NONE, unknown.stableFrequency)
+        assertFalse(unknown.fallbackActive)
+        assertTrue(unknown.source.contains("STATISTIC_UNAVAILABLE"))
+        tracker.observe(RawFlickerObservation.HZ_60, 1_100L)
+        val acquired = tracker.observe(RawFlickerObservation.HZ_60, 1_160L)
+        assertEquals(RawFlickerFrequency.HZ_60, acquired.stableFrequency)
+        assertFalse(acquired.fallbackActive)
     }
+
     @Test
-    fun `explicit none immediately clears synthetic fallback authority`() {
+    fun `temporary metadata gaps retain measured lock then expire`() {
         val tracker = RawFlickerStabilityTracker(60L, 180L, 300L, 600L)
-        tracker.observe(RawFlickerObservation.UNAVAILABLE, 100L)
-        val fallback = tracker.observe(RawFlickerObservation.UNAVAILABLE, 400L)
-        assertTrue(fallback.fallbackActive)
-
-        val cleared = tracker.observe(RawFlickerObservation.NONE_DETECTED, 450L)
-        assertEquals(RawFlickerFrequency.NONE, cleared.stableFrequency)
-        assertFalse(cleared.fallbackActive)
+        tracker.observe(RawFlickerObservation.HZ_60, 100L)
+        tracker.observe(RawFlickerObservation.HZ_60, 160L)
+        assertEquals(RawFlickerFrequency.HZ_60,
+            tracker.observe(RawFlickerObservation.UNAVAILABLE, 200L).stableFrequency)
+        assertEquals(RawFlickerFrequency.HZ_60,
+            tracker.observe(RawFlickerObservation.UNAVAILABLE, 700L).stableFrequency)
+        val expired = tracker.observe(RawFlickerObservation.UNAVAILABLE, 800L)
+        assertEquals(RawFlickerFrequency.NONE, expired.stableFrequency)
+        assertTrue(expired.source.contains("UNAVAILABLE"))
     }
 
+    @Test
+    fun `explicit none releases real evidence only after sustained absence`() {
+        val tracker = RawFlickerStabilityTracker(60L, 180L, 300L, 600L)
+        tracker.observe(RawFlickerObservation.HZ_50, 100L)
+        tracker.observe(RawFlickerObservation.HZ_50, 160L)
+        assertEquals(RawFlickerFrequency.HZ_50,
+            tracker.observe(RawFlickerObservation.NONE_DETECTED, 200L).stableFrequency)
+        assertEquals(RawFlickerFrequency.NONE,
+            tracker.observe(RawFlickerObservation.NONE_DETECTED, 800L).stableFrequency)
+    }
 }

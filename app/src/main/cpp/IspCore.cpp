@@ -28,6 +28,8 @@
 #include "RawCameraHueSatMapTelemetry.h"
 #include "RawCameraHueSatMapNoisePropagation.h"
 #include "HighlightGamutProtectionV2.h"
+#include "SoftHighlightTone.h"
+#include "GradientHighlightRecovery.h"
 #include "DefaultRawColorPipeline.h"
 #include "DefaultRawSceneEvidence.h"
 #include "Demosaic.h"
@@ -5576,11 +5578,13 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     };
 
     cv::Mat defaultRawSourceConfidence;
+    cv::Mat defaultRawChannelConfidence;
     std::uint64_t defaultRawCpuPartialClipPixels = 0u, defaultRawCpuFullClipPixels = 0u;
     float defaultRawCpuMinConfidence = 1.0f;
     const auto ensureDefaultRawSourceConfidence = [&]() {
         if (!neutralDefaultRaw || !defaultRawSourceConfidence.empty()) return;
         defaultRawSourceConfidence.create((rawHeight + 1) / 2, (rawWidth + 1) / 2, CV_32FC1);
+        defaultRawChannelConfidence.create((rawHeight + 1) / 2, (rawWidth + 1) / 2, CV_32FC3);
         const auto source = [&](int x, int y) {
             x = std::clamp(x, 0, rawWidth - 1);
             y = std::clamp(y, 0, rawHeight - 1);
@@ -5595,6 +5599,9 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             if (clipped > 0 && clipped < 4) defaultRawCpuPartialClipPixels += pixels;
             if (clipped == 4) defaultRawCpuFullClipPixels += pixels;
             defaultRawSourceConfidence.at<float>(y/2, x/2) = bncam::highlight::defaultRawCellConfidence(samples);
+            const auto channels=bncam::highlight::cellChannelReliability(samples,
+                    cfaPatternOrDefault(jpegRaw.info.effectiveCfaPattern));
+            defaultRawChannelConfidence.at<cv::Vec3f>(y/2,x/2)={channels.r,channels.g,channels.b};
         }
         for (int y = 0; y < rawHeight; ++y) for (int x = 0; x < rawWidth; ++x) {
             defaultRawCpuMinConfidence = std::min(defaultRawCpuMinConfidence,
@@ -5607,17 +5614,45 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     };
     const auto defaultRawConfidence = [&](int x, int y) {
         bncam::highlight::SensorColorConfidence evidence{};
-        evidence.confidence = bncam::highlight::defaultRawConfidenceAt(x, y, [&](int cx, int cy) {
-            return defaultRawSourceConfidence.at<float>(
-                    std::clamp(cy, 0, defaultRawSourceConfidence.rows-1),
-                    std::clamp(cx, 0, defaultRawSourceConfidence.cols-1));
-        });
+        evidence.confidence = bncam::highlight::chromaticReliability(
+            bncam::highlight::channelReliabilityAt(x,y,[&](int cx,int cy) {
+                const auto v=defaultRawChannelConfidence.at<cv::Vec3f>(
+                    std::clamp(cy,0,defaultRawChannelConfidence.rows-1),
+                    std::clamp(cx,0,defaultRawChannelConfidence.cols-1));
+                return bncam::highlight::Rgb{v[0],v[1],v[2]};
+            }));
         evidence.reduced = evidence.confidence < 1.0f - 1.0e-6f;
         evidence.zero = evidence.confidence <= 1.0e-6f;
         return evidence;
     };
     std::atomic<std::uint64_t> defaultRawCpuNeutralizedPixels{0u};
     std::atomic<std::uint64_t> defaultRawCpuConfidenceReducedPixels{0u};
+    const auto recoverDefaultRawImage = [&](cv::Mat& target,const cv::Mat& source,
+            const std::array<float,3>& gains) {
+        if(!neutralDefaultRaw || source.empty()) return;
+        ensureDefaultRawSourceConfidence();
+        const auto cell=[&](int x,int y) {
+            const auto v=defaultRawChannelConfidence.at<cv::Vec3f>(
+                std::clamp(y,0,defaultRawChannelConfidence.rows-1),
+                std::clamp(x,0,defaultRawChannelConfidence.cols-1));
+            return bncam::highlight::Rgb{v[0],v[1],v[2]};
+        };
+        const auto read=[&](int x,int y) {
+            const auto v=source.at<cv::Vec3f>(std::clamp(y,0,source.rows-1),std::clamp(x,0,source.cols-1));
+            return bncam::highlight::Rgb{v[0],v[1],v[2]};
+        };
+        cv::parallel_for_(cv::Range(0,target.rows),[&](const cv::Range& rows) {
+            for(int y=rows.start;y<rows.end;++y)for(int x=0;x<target.cols;++x) {
+                const auto input=read(x,y);
+                const auto q=bncam::highlight::channelReliabilityAt(x,y,cell);
+                const auto recovered=bncam::highlight::reconstructHighlight(x,y,input,q,
+                    {gains[0],gains[1],gains[2]},read,[&](int px,int py) {
+                        return cell(std::clamp(px,0,source.cols-1)/2,std::clamp(py,0,source.rows-1)/2);
+                    });
+                target.at<cv::Vec3f>(y,x)+=cv::Vec3f(recovered.r-input.r,recovered.g-input.g,recovered.b-input.b);
+            }
+        });
+    };
 
     const auto runCpuRawFinalize = [&]() {
         if (jpegRawCpuFinalized) return;
@@ -7030,7 +7065,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         }
         // Both residual owners read the same immutable demosaic. Chroma preserves
         // analysis-domain Y; its inverse colour transform need not preserve camera Y.
-        const cv::Mat physicalSource=(baselinePhysicalChroma.valid()||baselinePhysicalLuma.valid())
+        const cv::Mat physicalSource=(neutralDefaultRaw||baselinePhysicalChroma.valid()||baselinePhysicalLuma.valid())
                 ?linearRgb.clone():cv::Mat{};
         // Typed GPU failure recovery uses the same immutable-input chroma estimator once.
         if (baselinePhysicalChroma.valid()) {
@@ -7074,6 +7109,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             });
         }
         ensureDefaultRawSourceConfidence();
+        recoverDefaultRawImage(linearRgb,physicalSource,{wbRgb[0],wbRgb[1],wbRgb[2]});
         std::mutex colorStatsMutex;
         cv::parallel_for_(cv::Range(0, linearRgb.rows), [&](const cv::Range& range) {
             double localRawR = 0.0, localRawG = 0.0, localRawB = 0.0;
@@ -7300,9 +7336,11 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             return;
         }
 
-        // Failure-only reference path mirrors the GPU clipping-confidence owner. No neighbour
-        // reconstruction or extra full-frame clone is needed: confidence is derived from each
-        // immutable pre-WB pixel before that same pixel is overwritten with the protected result.
+        // Typed failure path uses an immutable demosaic snapshot for neighbour transport.
+        if(neutralDefaultRaw) {
+            const cv::Mat source=linearRgb.clone();
+            recoverDefaultRawImage(linearRgb,source,{wbRgb[0],wbRgb[1],wbRgb[2]});
+        }
         const std::array<float, 9> phase9Ccm{
                 ccm[0], ccm[1], ccm[2],
                 ccm[3], ccm[4], ccm[5],
@@ -7366,7 +7404,8 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                     }
                     const auto confidenceSafe =
                             bncam::highlight::applyClippingAwareHighlightColor(
-                                    signedCcm, colorConfidence);
+                                    signedCcm,
+                                    colorConfidence);
                     if (confidenceSafe.applied) {
                         colorConfidenceApplied.fetch_add(1u, std::memory_order_relaxed);
                     }
@@ -8330,7 +8369,11 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                     const auto displayInput = neutralDefaultRaw
                             ? bncam::color::mapSceneToKhronosInput({preKhronos[0],preKhronos[1],preKhronos[2]})
                             : bncam::highlight::Rgb{preKhronos[0],preKhronos[1],preKhronos[2]};
-                    const cv::Vec3f pbr = phase5PbrNeutralCpu({displayInput.r,displayInput.g,displayInput.b});
+                    const auto softPbr = neutralDefaultRaw
+                            ? bncam::tone::softHighlightTone(displayInput) : displayInput;
+                    const cv::Vec3f pbr = neutralDefaultRaw
+                            ? cv::Vec3f(softPbr.r,softPbr.g,softPbr.b)
+                            : phase5PbrNeutralCpu({displayInput.r,displayInput.g,displayInput.b});
                     if (neutralDefaultRaw && std::max({preKhronos[0],preKhronos[1],preKhronos[2]}) >= 0.8f) {
                         defaultRawCpuKhronosPixels.fetch_add(1u, std::memory_order_relaxed);
                         const float compression = std::max(0.0f, phase5LumaCpu(preKhronos)-phase5LumaCpu(pbr));
@@ -8373,7 +8416,10 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                     }
 
                     applyBncamProfileColorManagement(r, g, b, uiConfig, false);
-                    const cv::Vec3f mapped = phase5CompressUnitGamutCpu(cv::Vec3f(r, g, b));
+                    const auto softGamut=bncam::tone::softHighlightGamut({r,g,b});
+                    const cv::Vec3f mapped = neutralDefaultRaw
+                            ? cv::Vec3f(softGamut.r,softGamut.g,softGamut.b)
+                            : phase5CompressUnitGamutCpu(cv::Vec3f(r, g, b));
                     row[x] = mapped;
                 }
             }
@@ -10392,7 +10438,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; phase9CalibratedHueSatMapProfileBytes="
             << phase9ColorDebug.calibratedHueSatMapProfileBytes
             << "; phase9SourceRawConfidencePropagation="
-            << (neutralDefaultRaw ? "PER_CFA_QUINTIC_UNORM8_CUBIC_BSPLINE_444"
+            << (neutralDefaultRaw ? "PER_CHANNEL_QUINTIC_UNORM8_CUBIC_BSPLINE_SECOND_RELIABLE_CHROMA"
                                   : "2X2_BAYER_CELL_MIN_CONFIDENCE_PLUS_BOUNDED_3X3_DEMOSAIC_FOOTPRINT")
             << "; phase9LegacyDemosaicConfidenceRole=DIAGNOSTIC_AND_TYPED_CPU_FALLBACK_ONLY"
             << "; phase9SingleChannelSensorClipPixels=" << phase9ColorDebug.singleChannelSensorClipPixels
@@ -10402,10 +10448,14 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << phase9ColorDebug.partialColorConfidencePixels
             << "; phase9ColorConfidenceAppliedPixels="
             << phase9ColorDebug.colorConfidenceAppliedPixels
-            << "; phase9ColorConfidenceStart=0.960000"
-            << "; phase9ColorConfidenceZero=0.995000"
+            << "; phase9ColorConfidenceStart=" << (neutralDefaultRaw ? .94f : .96f)
+            << "; phase9ColorConfidenceZero=" << (neutralDefaultRaw ? 1.f : .995f)
             << "; phase9FullyClippedForcesZeroColorConfidence=true"
             << "; phase9HighlightColorPolicy=PRE_WB_CONFIDENCE_POST_CCM_NEUTRAL_LUMA_MIX"
+            << "; partialHighlightRadiancePolicy=" << (neutralDefaultRaw
+                    ? "PRE_WB_MULTISCALE_EDGE_AWARE_CHANNEL_GRADIENT_RECONSTRUCTION" : "DISABLED")
+            << "; rawHighlightShoulderStart=" << (neutralDefaultRaw ? 0.60f : 0.76f)
+            << "; rawHighlightDetailShoulder=" << (neutralDefaultRaw ? "C1_SLOPE_0_12_FROM_1_1_TO_2_4" : "LEGACY")
             << "; phase9WbAboveUnityWithoutSensorClipPixels="
             << phase9ColorDebug.wbAboveUnityWithoutSensorClipPixels
             << "; phase9WbOverUnityPreserved=true"

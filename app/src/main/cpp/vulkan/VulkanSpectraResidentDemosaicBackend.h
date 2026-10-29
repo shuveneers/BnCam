@@ -389,6 +389,7 @@ private:
     std::uint64_t sourceClipConfidenceDemosaicGeneration_ = 0u;
     std::uint32_t sourceClipConfidenceWidth_ = 0u;
     std::uint32_t sourceClipConfidenceHeight_ = 0u;
+    std::uint32_t sourceClipConfidenceCfaPattern_ = 0u;
     std::uint64_t residentColorGeneration_ = 0;
     bool residentColorValid_ = false;
     std::uint64_t allocationGeneration_ = 0;

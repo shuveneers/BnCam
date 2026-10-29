@@ -20,11 +20,10 @@ data class RawFlickerStabilitySnapshot(
 /**
  * Temporal authority for Camera2 STATISTICS_SCENE_FLICKER.
  *
- * - Real 50/60 Hz evidence needs a short hold before acquisition.
- * - Switching an established real lock needs stronger opposite evidence.
- * - One or a few NONE frames cannot tear a lock down; sustained NONE can.
- * - Only a genuinely unavailable statistic may fall back to 50 Hz. An explicit Camera2 NONE never
- *   fabricates a mains frequency. Real 60 Hz evidence replaces a 50 Hz fallback quickly.
+ * A missing statistic is not evidence for 50 Hz or 60 Hz. We can briefly retain a previously
+ * measured lock during metadata gaps, but never synthesize one from geographic assumptions.
+ * The third constructor parameter retains its historical name for source compatibility; it now
+ * represents a minimum age before a missing-statistic lock may be released, not a fallback timer.
  */
 class RawFlickerStabilityTracker(
     private val acquireHoldNs: Long = 60_000_000L,
@@ -33,7 +32,6 @@ class RawFlickerStabilityTracker(
     private val releaseHoldNs: Long = 600_000_000L
 ) {
     private var stableFrequency = RawFlickerFrequency.NONE
-    private var stableIsFallback = false
     private var candidateFrequency = RawFlickerFrequency.NONE
     private var candidateSinceNs = 0L
     private var unresolvedSinceNs = 0L
@@ -57,7 +55,6 @@ class RawFlickerStabilityTracker(
     @Synchronized
     fun reset(): RawFlickerStabilitySnapshot {
         stableFrequency = RawFlickerFrequency.NONE
-        stableIsFallback = false
         candidateFrequency = RawFlickerFrequency.NONE
         candidateSinceNs = 0L
         unresolvedSinceNs = 0L
@@ -72,7 +69,7 @@ class RawFlickerStabilityTracker(
     private fun observeFrequency(observed: RawFlickerFrequency, now: Long) {
         unresolvedSinceNs = 0L
         noFlickerSinceNs = 0L
-        if (stableFrequency == observed && !stableIsFallback) {
+        if (stableFrequency == observed) {
             clearCandidate()
             return
         }
@@ -81,14 +78,9 @@ class RawFlickerStabilityTracker(
             candidateSinceNs = now.coerceAtLeast(1L)
             return
         }
-        val requiredHold = if (stableFrequency == RawFlickerFrequency.NONE || stableIsFallback) {
-            acquireHoldNs
-        } else {
-            switchHoldNs
-        }
+        val requiredHold = if (stableFrequency == RawFlickerFrequency.NONE) acquireHoldNs else switchHoldNs
         if (elapsed(now, candidateSinceNs) >= requiredHold) {
             stableFrequency = observed
-            stableIsFallback = false
             clearCandidate()
         }
     }
@@ -97,30 +89,20 @@ class RawFlickerStabilityTracker(
         unresolvedSinceNs = 0L
         clearCandidate()
         if (noFlickerSinceNs == 0L) noFlickerSinceNs = now.coerceAtLeast(1L)
-        if (stableIsFallback) {
-            // A synthetic 50 Hz fallback has no authority once Camera2 explicitly reports NONE.
-            stableFrequency = RawFlickerFrequency.NONE
-            stableIsFallback = false
-            return
-        }
         if (stableFrequency != RawFlickerFrequency.NONE &&
             elapsed(now, noFlickerSinceNs) >= releaseHoldNs
-        ) {
-            stableFrequency = RawFlickerFrequency.NONE
-            stableIsFallback = false
-        }
+        ) stableFrequency = RawFlickerFrequency.NONE
     }
 
     private fun observeUnavailable(now: Long) {
         noFlickerSinceNs = 0L
         clearCandidate()
         if (unresolvedSinceNs == 0L) unresolvedSinceNs = now.coerceAtLeast(1L)
-        if (stableFrequency == RawFlickerFrequency.NONE &&
-            elapsed(now, unresolvedSinceNs) >= unavailableFallbackHoldNs
-        ) {
-            stableFrequency = RawFlickerFrequency.HZ_50
-            stableIsFallback = true
-        }
+        // Once metadata has remained unavailable, the last real frequency can no longer be
+        // asserted. Returning UNKNOWN is safer than applying the wrong raster indefinitely.
+        if (stableFrequency != RawFlickerFrequency.NONE &&
+            elapsed(now, unresolvedSinceNs) >= maxOf(unavailableFallbackHoldNs, releaseHoldNs)
+        ) stableFrequency = RawFlickerFrequency.NONE
     }
 
     private fun clearCandidate() {
@@ -130,7 +112,8 @@ class RawFlickerStabilityTracker(
 
     private fun snapshot(nowNs: Long): RawFlickerStabilitySnapshot {
         val source = when {
-            stableIsFallback -> "AUTO_FALLBACK_50HZ_STATISTIC_UNAVAILABLE"
+            unresolvedSinceNs > 0L && stableFrequency != RawFlickerFrequency.NONE ->
+                "AUTO_HELD_LAST_SCENE_FLICKER_${stableFrequency.name}_STATISTIC_UNAVAILABLE"
             stableFrequency == RawFlickerFrequency.HZ_50 -> "AUTO_STABLE_SCENE_FLICKER_50HZ"
             stableFrequency == RawFlickerFrequency.HZ_60 -> "AUTO_STABLE_SCENE_FLICKER_60HZ"
             candidateFrequency == RawFlickerFrequency.HZ_50 -> "AUTO_ACQUIRING_SCENE_FLICKER_50HZ"
@@ -145,7 +128,7 @@ class RawFlickerStabilityTracker(
             candidateAgeNs = if (candidateSinceNs > 0L) elapsed(nowNs, candidateSinceNs) else 0L,
             unresolvedAgeNs = if (unresolvedSinceNs > 0L) elapsed(nowNs, unresolvedSinceNs) else 0L,
             noFlickerAgeNs = if (noFlickerSinceNs > 0L) elapsed(nowNs, noFlickerSinceNs) else 0L,
-            fallbackActive = stableIsFallback,
+            fallbackActive = false,
             source = source
         )
     }

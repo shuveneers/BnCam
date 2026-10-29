@@ -1,0 +1,9 @@
+﻿{
+    "hashes":  {
+                   "app/src/main/java/com/bncam/core/capture/BnAutoControlPacing.kt":  "02d279f5e2c4d64c11a8ab1e1088768d513c5b0fc22d484e109836b40dff9364",
+                   "app/src/main/java/com/bncam/core/engine/BnCameraManager.kt":  "cf144bc138ffdbafef8925b18bd981d36b8da7851427bd2b85a421a548ba4a89",
+                   "app/src/test/java/com/bncam/core/capture/BnAutoControlPacingTest.kt":  "431647b2378c63644c85a5f12737af7a064abc5179b355f060f98d0eef552bc7"
+               },
+    "head":  "08b4d5b2b0a36ec039fc7696637817b540e4413d",
+    "id":  "phase1_delta06"
+}

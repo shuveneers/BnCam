@@ -946,6 +946,10 @@ class BnCameraManager(private val context: Context) {
             }
         }
     }
+    private val bnAutoAnalysisRequests = Channel<BufferFrameAnalysisRequest>(Channel.CONFLATED)
+    private val bnAutoFeedbackGate = com.bncam.core.capture.BnAutoFeedbackGate(continuousTrajectory = true)
+    @Volatile private var bnAutoTraceSummary = "unobserved"
+    private var bnAutoTraceLastLogNs = 0L
     private val focusAnalysisRequests = Channel<BufferFrameAnalysisRequest>(Channel.CONFLATED)
     private val yuvAnalysisRequests = Channel<YuvFrameAnalysisRequest>(Channel.CONFLATED)
     private var warmBufferWatchdogJob: Job? = null
@@ -1075,7 +1079,9 @@ class BnCameraManager(private val context: Context) {
                 }
                 pendingPreviewControls.values.toList().also { pendingPreviewControls.clear() }
             }
-            batch.forEach { command ->
+            // User focus/zoom/metering controls always run before optional BN_AUTO rebuilds.
+            // Preserve relative order for all other control owners.
+            batch.sortedBy { if (it.key == "bn_auto") 1 else 0 }.forEach { command ->
                 if (command.generation != pipelineGeneration ||
                     command.sessionEpoch != activeConfiguredSessionEpoch
                 ) {
@@ -1229,6 +1235,16 @@ class BnCameraManager(private val context: Context) {
     // One stabilized Camera2 flicker authority per active pipeline generation. The raw HAL
     // statistic is deliberately not allowed to rewrite shutter/FPS on a single-frame observation.
     private val rawFlickerStabilityTracker = RawFlickerStabilityTracker()
+
+    // BnC Auto sensor metering is intentionally independent from preview frame delivery.
+    private val bnAutoControlPacing = com.bncam.core.capture.BnAutoControlPacing(continuousTrajectory = true)
+    // CameraCharacteristics is immutable. Avoid CameraService IPC on every RAW meter sample.
+    private var bnAutoCharacteristicsKey: String? = null
+    private var bnAutoCharacteristics: CameraCharacteristics? = null
+    private var bnAutoLastRealizationLogNs: Long = 0L
+    private var bnAutoLastRequestAuditNs = 0L
+    private var bnAutoRequestIdentityKey: String? = null
+    private var bnAutoPhysicalRequestKeys: Set<CaptureRequest.Key<*>> = emptySet()
 
     @Volatile
     private var rawFlickerTrackerGeneration: Int = -1
@@ -1705,6 +1721,21 @@ class BnCameraManager(private val context: Context) {
     val ringBuffer = FrameRingBuffer(capacity = 50)
 
     init {
+        bufferAnalysisScope.launch {
+            for (request in bnAutoAnalysisRequests) {
+                if (!bnAutoEnabled() || request.generation != pipelineGeneration) continue
+                val lease = ringBuffer.leaseLatestCompleteFrameForBnAuto(
+                    request.generation, request.expectedFormat) ?: continue
+                try {
+                    val pair = lease.pair
+                    val image = pair.image ?: continue
+                    val metadata = pair.metadata ?: continue
+                    observeBnAutoRaw(image, metadata, request.generation, pair.controlRequestEpoch,
+                        pair.imageArrivalElapsedNs, pair.metadataArrivalElapsedNs,
+                        pair.sensorTimestampComparableToElapsedRealtime)
+                } finally { lease.release() }
+            }
+        }
         bufferAnalysisScope.launch {
             for (request in focusAnalysisRequests) {
                 processFocusConfidenceAnalysis(request)
@@ -3161,6 +3192,7 @@ class BnCameraManager(private val context: Context) {
         generation: Int,
         expectedFormat: Int
     ) {
+        if (bnAutoEnabled()) bnAutoAnalysisRequests.trySend(BufferFrameAnalysisRequest(generation, expectedFormat))
         focusAnalysisRequests.trySend(
             BufferFrameAnalysisRequest(
                 generation = generation,
@@ -3243,15 +3275,11 @@ class BnCameraManager(private val context: Context) {
             try {
                 val image = lease.pair.image ?: return
                 val metadata = lease.pair.metadata ?: return
-                handleDefaultRawWarmFrameMotion(
+                if (!bnAutoEnabled()) handleDefaultRawWarmFrameMotion(
                     image = image,
                     generation = request.generation,
                     expectedFormat = request.expectedFormat
                 )
-                if (bnAutoEnabled() && ringBuffer.selectionControlEpochAllows(
-                        request.generation, lease.pair.controlRequestEpoch)) {
-                    observeBnAutoRaw(image, metadata, request.generation)
-                }
                 val (focusRoi, focusCoordinateBounds) = resolveFocusAnalysisRegion(metadata)
                 val metrics = com.bncam.core.quality.FocusConfidenceEngine.evaluate(
                     image = image,
@@ -4301,6 +4329,11 @@ class BnCameraManager(private val context: Context) {
             nowNs = android.os.SystemClock.elapsedRealtimeNanos()
         )
         latestRawFlickerSnapshot = next
+        if (previous.source != next.source) {
+            Log.i(tag, "RAW_FLICKER_EVIDENCE generation=$generation observation=$observation " +
+                "resultOwner=$resultOwner source=${next.source} candidateAgeNs=${next.candidateAgeNs} " +
+                "unresolvedAgeNs=${next.unresolvedAgeNs} heldFrequency=${next.stableFrequency}")
+        }
 
         val authorityChanged = previous.stableFrequency != next.stableFrequency ||
             previous.fallbackActive != next.fallbackActive
@@ -4359,7 +4392,9 @@ class BnCameraManager(private val context: Context) {
     ) {
         latestDefaultRawMotion = measurement
         latestDefaultRawMotionGeneration = generation
-        if (!measurement.ready) return
+        // BnC Auto alone owns exposure submissions. The legacy motion observer only
+        // publishes evidence; rebuilding here duplicated every BN_AUTO update.
+        if (!measurement.ready || bnAutoEnabled()) return
 
         val strictest = listOfNotNull(
             measurement.cameraExposureCeilingNs,
@@ -4422,21 +4457,41 @@ class BnCameraManager(private val context: Context) {
         publishDefaultRawMotionMeasurement(measurement, generation)
     }
 
-    private fun observeBnAutoRaw(image: android.media.Image, metadata: TotalCaptureResult, generation: Int) {
+    private fun observeBnAutoRaw(image: android.media.Image, metadata: TotalCaptureResult, generation: Int,
+        requestEpoch: Long, rawReceivedNs: Long, resultReceivedNs: Long, sensorClockComparable: Boolean) {
+        val analysisStartedNs = android.os.SystemClock.elapsedRealtimeNanos()
         if (isCapturing || generation != pipelineGeneration || !bnAutoEnabled()) return
         val identity = synchronized(pipelineLock) { activePipelineIdentity } ?: return
         val sensorId = identity.physicalCameraId ?: identity.logicalCameraId
         val key = "$generation:$sensorId:$activeZslFormat"
         if (bnAutoControlKey != key) return
         val limits = bnAutoLimits ?: return
-        val chars = runCatching { cameraManager.getCameraCharacteristics(sensorId) }.getOrNull() ?: return
         val physical = identity.physicalCameraId?.let { physicalCaptureResultOrNull(metadata, it) }
-        val result: CaptureResult = physical ?: metadata
+        val result: CaptureResult = if (identity.physicalCameraId != null) physical ?: return else metadata
         // Exclude old HAL frames and metadata from a different physical exposure.
         if (result.get(CaptureResult.CONTROL_AE_MODE) != CaptureResult.CONTROL_AE_MODE_OFF) return
         if (result.get(CaptureResult.SENSOR_TIMESTAMP) != image.timestamp) return
+        // BnC Auto controller cadence follows the REAL physical sensor frame interval,
+        // not an arbitrary 150ms polling delay or the advisory AE_TARGET_FPS_RANGE.
+        bnAutoControlPacing.observeFrame(key, image.timestamp,
+            result.get(CaptureResult.SENSOR_FRAME_DURATION))
         val exposure = result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: return
         val iso = result.get(CaptureResult.SENSOR_SENSITIVITY) ?: return
+        if (!bnAutoFeedbackGate.admit(key, image.timestamp, requestEpoch, exposure, iso,
+                analysisStartedNs, bnAutoControlPacing.measuredFramePeriodNs(key) ?: limits.minStreamFrameDurationNs)) return
+        // Every frame acknowledges the requested sensor timing, but expensive RAW analysis
+        // stays cadence-bounded to keep tap-to-focus and camera controls responsive.
+        if (!bnAutoControlPacing.shouldMeter(key, image.timestamp)) return
+        val charsKey = "$generation:$sensorId"
+        val chars = if (bnAutoCharacteristicsKey == charsKey && bnAutoCharacteristics != null) {
+            bnAutoCharacteristics!!
+        } else {
+            runCatching { cameraManager.getCameraCharacteristics(sensorId) }.getOrNull()?.also {
+                bnAutoCharacteristicsKey = charsKey
+                bnAutoCharacteristics = it
+            } ?: return
+        }
+        handleDefaultRawWarmFrameMotion(image, generation, image.format)
         val plane = image.planes.firstOrNull() ?: return
         val sensorWhite = chars.get(CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL)?.toDouble() ?: return
         val raw10 = image.format == ImageFormat.RAW10
@@ -4453,15 +4508,87 @@ class BnCameraManager(private val context: Context) {
             raw10, blacks, if (raw10) 1023.0 else sensorWhite, image.timestamp, exposure, iso,
             noise?.map { it.first }?.average(), noise?.map { it.second }?.average(), motion
         ) ?: return
+        val meteredNs = android.os.SystemClock.elapsedRealtimeNanos()
         val previous = bnAutoDecision
-        val next = bnAutoEngine.observe(key, limits, observation, resolveDefaultRawFlickerConstraint(),
-            activeProfileExposurePreferences.captureEvBias + currentEvOffset)
+        val flickerConstraint = resolveDefaultRawFlickerConstraint()
+        val next = bnAutoEngine.observe(key, limits, observation, flickerConstraint,
+            activeProfileExposurePreferences.captureEvBias + currentEvOffset,
+            committedDecision = previous, continuousTransitions = true,
+            observedFramePeriodNs = bnAutoControlPacing.measuredFramePeriodNs(key) ?: limits.minStreamFrameDurationNs)
         if (generation != pipelineGeneration || key != bnAutoControlKey || !bnAutoEnabled()) return
-        bnAutoDecision = next
         bnAutoLastObservationElapsedNs = android.os.SystemClock.elapsedRealtimeNanos()
-        if (previous?.targetExposureNs != next.targetExposureNs || previous.targetISO != next.targetISO) {
-            enqueuePreviewControl("bn_auto", "BN_AUTO_SENSOR_OBSERVATION") { updatePreviewRepeatingRequest() }
+        // Keep the last *submitted* target authoritative until pacing accepts the candidate.
+        // This avoids rebuilding Camera2 repeating requests for each noisy RAW observation.
+        val decisionNs = android.os.SystemClock.elapsedRealtimeNanos()
+        val sensorDeliveryNs = if (sensorClockComparable) rawReceivedNs - image.timestamp else -1L
+        bnAutoTraceSummary = "sensorTimestampNs=${image.timestamp};epoch=$requestEpoch;" +
+            "rawReceivedNs=$rawReceivedNs;resultReceivedNs=$resultReceivedNs;meteredNs=$meteredNs;decisionNs=$decisionNs;" +
+            "sensorToRawNs=$sensorDeliveryNs;analysisQueueNs=${analysisStartedNs - maxOf(rawReceivedNs, resultReceivedNs)};" +
+            "rawAnalysisNs=${meteredNs - analysisStartedNs};controllerNs=${decisionNs - meteredNs};" +
+            "submissionToFeedbackNs=${bnAutoFeedbackGate.realizationLatencyNs};" +
+            "framePeriodNs=${bnAutoControlPacing.measuredFramePeriodNs(key)}"
+        if (decisionNs - bnAutoTraceLastLogNs >= 1_000_000_000L) {
+            bnAutoTraceLastLogNs = decisionNs
+            Log.i("BNCAM_BN_AUTO_LOOP", bnAutoTraceSummary)
         }
+        val warmRequest = next.warmAllocation(limits, flickerConstraint)
+        val previousWarm = previous?.warmAllocation(limits, flickerConstraint)
+        if ((previousWarm == null || bnAutoControlPacing.shouldSubmit(
+                key, image.timestamp, previousWarm.exposureTimeNs, previousWarm.sensitivityIso,
+                warmRequest.exposureTimeNs, warmRequest.sensitivityIso, next.limitingConstraint)) &&
+            bnAutoFeedbackGate.reserve(key, decisionNs)) {
+            bnAutoDecision = next
+            enqueuePreviewControl("bn_auto", "BN_AUTO_SENSOR_OBSERVATION") {
+                val controlStartedNs = android.os.SystemClock.elapsedRealtimeNanos()
+                try {
+                    if (generation == pipelineGeneration && key == bnAutoControlKey && bnAutoEnabled())
+                        updateBnAutoTrajectoryRequest()
+                } finally {
+                    if (bnAutoFeedbackGate.cancelQueued(key) && key == bnAutoControlKey &&
+                        bnAutoDecision === next) bnAutoDecision = previous
+                }
+                Log.d("BNCAM_BN_AUTO_LOOP", "event=CONTROL_DRAIN sensorTimestampNs=${image.timestamp} " +
+                    "queueNs=${controlStartedNs - decisionNs} rebuildNs=${android.os.SystemClock.elapsedRealtimeNanos() - controlStartedNs}")
+            }
+        } else {
+            // Keep still quality current even when preview allocation has reached its bounds.
+            if (previousWarm != null && warmRequest.exposureTimeNs == previousWarm.exposureTimeNs &&
+                warmRequest.sensitivityIso == previousWarm.sensitivityIso) bnAutoDecision = next
+        }
+    }
+
+    /** Exposure-only ticks reuse configured stream and user AF/AWB/OIS controls. */
+    private fun updateBnAutoTrajectoryRequest() {
+        if (isCapturing || !bnAutoEnabled()) return
+        val session = captureSession ?: return
+        val builder = currentCaptureRequest ?: return
+        val handler = backgroundHandler ?: return
+        val key = bnAutoControlKey ?: return
+        if (key != bnAutoRequestIdentityKey) return
+        val limits = bnAutoLimits ?: return
+        val target = bnAutoDecision ?: return
+        val identity = synchronized(pipelineLock) { activePipelineIdentity } ?: return
+        val sensorId = identity.physicalCameraId ?: identity.logicalCameraId
+        if (key != "$pipelineGeneration:$sensorId:$activeZslFormat") return
+        val warm = target.warmAllocation(limits, resolveDefaultRawFlickerConstraint())
+        val frame = maxOf(limits.minStreamFrameDurationNs, warm.frameDurationNs)
+            .coerceAtMost(limits.maxFrameDurationNs)
+        setAePriorityModeOff(builder)
+        builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
+        builder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, 0)
+        builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, warm.exposureTimeNs)
+        builder.set(CaptureRequest.SENSOR_SENSITIVITY, warm.sensitivityIso)
+        builder.set(CaptureRequest.SENSOR_FRAME_DURATION, frame)
+        if (sensorId != session.device.id) {
+            val keys = bnAutoPhysicalRequestKeys
+            if (CaptureRequest.CONTROL_AE_MODE in keys) builder.setPhysicalCameraKey(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF, sensorId)
+            if (CaptureRequest.SENSOR_EXPOSURE_TIME in keys) builder.setPhysicalCameraKey(CaptureRequest.SENSOR_EXPOSURE_TIME, warm.exposureTimeNs, sensorId)
+            if (CaptureRequest.SENSOR_SENSITIVITY in keys) builder.setPhysicalCameraKey(CaptureRequest.SENSOR_SENSITIVITY, warm.sensitivityIso, sensorId)
+            if (CaptureRequest.SENSOR_FRAME_DURATION in keys) builder.setPhysicalCameraKey(CaptureRequest.SENSOR_FRAME_DURATION, frame, sensorId)
+        }
+        updateDefaultRawFrameSelectionExposureConstraint(warm.exposureTimeNs, "BN_AUTO_SENSOR", warm.sensitivityIso)
+        lastExposurePlanSummary = "bnAuto=true;owner=BN_AUTO;physicalSensorId=$sensorId;" + target.summary()
+        submitRepeatingRequestWithProvenance(session, builder, captureCallback, handler, "BN_AUTO_TRAJECTORY")
     }
 
     private suspend fun acquireBnAutoLongExposure(
@@ -4575,7 +4702,8 @@ class BnCameraManager(private val context: Context) {
         if (!bnAutoEnabled() || generation != pipelineGeneration ||
             request.get(CaptureRequest.CONTROL_AE_MODE) != CaptureRequest.CONTROL_AE_MODE_OFF) return
         val physicalId = synchronized(pipelineLock) { activePipelineIdentity?.physicalCameraId }
-        val actual: CaptureResult = physicalId?.let { physicalCaptureResultOrNull(result, it) } ?: result
+        val actual: CaptureResult = if (physicalId != null)
+            physicalCaptureResultOrNull(result, physicalId) ?: return else result
         val truth = DefaultRawExposureRealizationEvaluator.evaluate(
             DefaultRawExposureRoute.MANUAL_FALLBACK, generation,
             controlRequestEpochTracker.resolveTag(request.tag, generation).provenance?.identity?.controlRequestEpoch ?: -1L,
@@ -4587,8 +4715,31 @@ class BnCameraManager(private val context: Context) {
         val actualFrame = actual.get(CaptureResult.SENSOR_FRAME_DURATION)
         val frameMatches = requestedFrame != null && actualFrame != null &&
             kotlin.math.abs(actualFrame - requestedFrame) <= maxOf(100_000L, requestedFrame / 50)
-        bnAutoRealizationSummary = truth.summary() + ";requestedFrameDurationNs=$requestedFrame;frameDurationMatches=$frameMatches"
-        Log.i("BNCAM_BN_AUTO", bnAutoRealizationSummary)
+        val flicker = resolveDefaultRawFlickerConstraint()
+        val lightPeriodNs = flicker.periodNs
+        val controllerMotionEvidence = bnAutoDecision?.reason
+            ?.substringAfter("motionEvidence=", "UNAVAILABLE")?.substringBefore(";")
+        val resultExposure = actual.get(CaptureResult.SENSOR_EXPOSURE_TIME)
+        val flickerRealization = when {
+            lightPeriodNs == null -> "FREQUENCY_UNRESOLVED_OR_OFF"
+            resultExposure == null -> "SENSOR_EXPOSURE_METADATA_MISSING"
+            flicker.isExposureAligned(resultExposure) -> "LIGHT_PERIOD_ALIGNED"
+            resultExposure < lightPeriodNs -> "SHORT_EXPOSURE_FLICKER_RISK"
+            else -> "LIGHT_PERIOD_MISMATCH"
+        }
+        bnAutoRealizationSummary = truth.summary() + ";requestedFrameDurationNs=$requestedFrame;" +
+            "frameDurationMatches=$frameMatches;flickerSource=${flicker.source};" +
+            "flickerPeriodNs=${flicker.periodNs};flickerRealization=$flickerRealization;" +
+            "actualExposureNs=$resultExposure;actualFrameDurationNs=$actualFrame;" +
+            "controllerMotionEvidence=$controllerMotionEvidence"
+        // The summary remains live, but logging every Camera2 completion can starve controls.
+        val logNowNs = android.os.SystemClock.elapsedRealtimeNanos()
+        if (logNowNs - bnAutoLastRealizationLogNs >= 500_000_000L ||
+            bnAutoLastRealizationLogNs == 0L) {
+            bnAutoLastRealizationLogNs = logNowNs
+            Log.i("BNCAM_BN_AUTO", bnAutoRealizationSummary +
+                ";realizationPacing=${bnAutoControlPacing.realizationStatus(bnAutoControlKey ?: "")}")
+        }
     }
 
     private fun needsProfileExposureStatistics(): Boolean =
@@ -5494,7 +5645,9 @@ class BnCameraManager(private val context: Context) {
         reason: String,
         pipelineGenerationAtSubmission: Int = pipelineGeneration
     ): SubmittedCameraRequest = synchronized(requestSubmissionLock) {
-        applyOptimalAeTargetFpsRange(builder, session.device.id)
+        val trajectoryTick = reason == "BN_AUTO_TRAJECTORY" && bnAutoEnabled()
+        // FPS capability negotiation already occurred when this exact stream was configured.
+        if (!trajectoryTick) applyOptimalAeTargetFpsRange(builder, session.device.id)
         enforceOpticalStabilizationBeforeSubmission(builder, reason)
         val prepared = prepareRequestProvenance(
             builder = builder,
@@ -5504,7 +5657,20 @@ class BnCameraManager(private val context: Context) {
         )
         builder.setTag(prepared.tag)
         val request = builder.build()
+        val submitStartedNs = android.os.SystemClock.elapsedRealtimeNanos()
         val sequenceId = session.setRepeatingRequest(request, callback, handler)
+        val submittedNs = android.os.SystemClock.elapsedRealtimeNanos()
+        if (bnAutoEnabled() && pipelineGenerationAtSubmission == pipelineGeneration &&
+            request.get(CaptureRequest.CONTROL_AE_MODE) == CaptureRequest.CONTROL_AE_MODE_OFF) {
+            val key = bnAutoControlKey
+            val exposure = request.get(CaptureRequest.SENSOR_EXPOSURE_TIME)
+            val iso = request.get(CaptureRequest.SENSOR_SENSITIVITY)
+            if (key != null && exposure != null && iso != null) {
+                bnAutoFeedbackGate.submitted(key, prepared.tag.controlRequestEpoch, submittedNs, exposure, iso)
+                Log.d("BNCAM_BN_AUTO_LOOP", "event=REQUEST_SUBMITTED epoch=${prepared.tag.controlRequestEpoch} " +
+                    "submittedNs=$submittedNs camera2SubmitNs=${submittedNs - submitStartedNs}")
+            }
+        }
         com.bncam.core.debug.AfGroundTruthTrace.recordSubmission(
             builder = builder,
             request = request,
@@ -5514,10 +5680,14 @@ class BnCameraManager(private val context: Context) {
         )
         val activeLogicalId = synchronized(pipelineLock) { activePipelineIdentity?.logicalCameraId } ?: session.device.id
         val activePhysicalId = synchronized(pipelineLock) { activePipelineIdentity?.physicalCameraId }
-        com.bncam.core.debug.HalParityAuditor.auditRepeatingRequest(activeLogicalId, activePhysicalId, request)
-        com.bncam.core.debug.AfParityAuditor.auditAfRequest(activeLogicalId, activePhysicalId, request, reasonTag = reason)
+        val auditRequest = !trajectoryTick || submittedNs - bnAutoLastRequestAuditNs >= 1_000_000_000L
+        if (auditRequest) {
+            if (trajectoryTick) bnAutoLastRequestAuditNs = submittedNs
+            com.bncam.core.debug.HalParityAuditor.auditRepeatingRequest(activeLogicalId, activePhysicalId, request)
+            com.bncam.core.debug.AfParityAuditor.auditAfRequest(activeLogicalId, activePhysicalId, request, reasonTag = reason)
+        }
         controlRequestEpochTracker.commit(prepared)
-        Log.i(
+        if (auditRequest) Log.i(
             "CameraRequestProvenance",
             "event=REQUEST_SUBMITTED type=REPEATING reason=$reason " +
                     "pipelineGeneration=${prepared.tag.pipelineGeneration} " +
@@ -12038,6 +12208,7 @@ class BnCameraManager(private val context: Context) {
         trackingTimeoutJob?.cancel()
         tapFocusTimeoutJob?.cancel()
         pointLockJob?.cancel()
+        bnAutoAnalysisRequests.close()
         focusAnalysisRequests.close()
         yuvAnalysisRequests.close()
 
@@ -13248,6 +13419,8 @@ class BnCameraManager(private val context: Context) {
                     else bnAutoEngine.current(key, limits)
                 bnAutoLimits = limits
                 bnAutoControlKey = key
+                bnAutoRequestIdentityKey = key
+                bnAutoPhysicalRequestKeys = deviceCharacteristics.availablePhysicalCameraRequestKeys.orEmpty().toSet()
                 bnAutoDecision = target
                 // Keep the producer warm; a longer desired integration is acquired as an exact still.
                 val warm = target.warmAllocation(limits, resolveDefaultRawFlickerConstraint())
@@ -18117,6 +18290,7 @@ class BnCameraManager(private val context: Context) {
             "measuredAeRegions" to result?.get(CaptureResult.CONTROL_AE_REGIONS)?.map { it.toString() },
             "bnAutoDecision" to bnAutoDecision?.summary(),
             "bnAutoRealization" to bnAutoRealizationSummary,
+            "bnAutoFeedbackLoop" to bnAutoTraceSummary,
             "bnAutoControlKey" to bnAutoControlKey,
             "defaultRawMotionTruth" to latestDefaultRawMotion?.summary(),
             "defaultRawExposureRealizationTruth" to latestDefaultRawExposureTruth?.summary(),

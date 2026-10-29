@@ -1,0 +1,22 @@
+﻿{
+    "hashes":  {
+                   "app/src/main/java/com/bncam/core/engine/BnCameraManager.kt":  "9bd4a1c129c9481fee29b19f680f8d1692479f66ef877822c4ae0a80cfa0fd88",
+                   "app/src/test/java/com/bncam/core/capture/BnAutoFlickerSafetyPolicyTest.kt":  "3b13661da8987b590b290d8eb712543d6eb081a83c59ff7ccc7c735bff8d25ef",
+                   "app/src/main/java/com/bncam/core/capture/BnAutoExposureEngine.kt":  "7c9d7165de6d999ce059fc60a4dbb36c8d90b05d6100ea09358101dfc48549c3",
+                   "app/src/main/java/com/bncam/core/capture/RawIlluminationChangePolicy.kt":  "e7020a8cb4dd417e36dfb2757910281b107fdc8506b07b30728868782f96fe36",
+                   "app/src/test/java/com/bncam/core/capture/BnAutoControlPacingTest.kt":  "8129332e07199f5cc73f9ac0514816eddcb8a12d274e1f2e5205af66bc99bf05",
+                   "app/src/main/java/com/bncam/core/capture/BnAutoControlPacing.kt":  "8457517b339a6d49bd938ff1efa4137dbba963ad5b86dc76747d071f703ed1f7",
+                   "app/src/main/java/com/bncam/core/capture/BnAutoFlickerSafetyPolicy.kt":  "1b7c11bf6b9e26307d5575902641837ecd5bb6810acf3c12afc9de86b31fedf9",
+                   "app/src/test/java/com/bncam/core/capture/RawIlluminationChangePolicyTest.kt":  "6095411b11fb66d79ab808a967173334c4f68c0ac71c1ec9a8dff89427deb033"
+               },
+    "before":  {
+                   "app/src/main/java/com/bncam/core/engine/BnCameraManager.kt":  "cf144bc138ffdbafef8925b18bd981d36b8da7851427bd2b85a421a548ba4a89",
+                   "app/src/main/java/com/bncam/core/capture/BnAutoExposureEngine.kt":  "0314e31b3c07b79eac9426410549477019de238a556ffe88dacc67153e995cea",
+                   "app/src/main/java/com/bncam/core/capture/RawIlluminationChangePolicy.kt":  "29dfc2e3679f8c95a1a3008f71ea8078ca3de2b0534b5b7c8cc23841a73cafbc",
+                   "app/src/test/java/com/bncam/core/capture/BnAutoControlPacingTest.kt":  "431647b2378c63644c85a5f12737af7a064abc5179b355f060f98d0eef552bc7",
+                   "app/src/main/java/com/bncam/core/capture/BnAutoControlPacing.kt":  "02d279f5e2c4d64c11a8ab1e1088768d513c5b0fc22d484e109836b40dff9364",
+                   "app/src/test/java/com/bncam/core/capture/RawIlluminationChangePolicyTest.kt":  "a912124f5da622b1813642657102226111041af02fa4f7bead9d026f02ff9cb4"
+               },
+    "head":  "08b4d5b2b0a36ec039fc7696637817b540e4413d",
+    "id":  "phase1_delta07"
+}

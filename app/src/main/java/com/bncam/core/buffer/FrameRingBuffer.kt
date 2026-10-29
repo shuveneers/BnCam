@@ -1646,6 +1646,19 @@ class FrameRingBuffer(private var capacity: Int = 35) {
         return leaseFrameInternal(pair, pair.frameVersion)
     }
 
+    /** BnC Auto consumes current physical truth independently of the ordered focus backlog. */
+    @Synchronized
+    fun leaseLatestCompleteFrameForBnAuto(generationId: Int, expectedFormat: Int): FrameLease? {
+        if (generationId != activeGeneration) return null
+        val pair = buffer.asSequence().filter {
+            it.generationId == generationId && it.format == expectedFormat &&
+                it.image != null && it.hardwareBuffer != null && it.metadata != null &&
+                !it.disposalRequested && hasCompleteProvenance(it) &&
+                selectionControlEpochAllows(generationId, it.controlRequestEpoch)
+        }.maxByOrNull { it.timestamp } ?: return null
+        return leaseFrameInternal(pair, pair.frameVersion)
+    }
+
     @Synchronized
     fun leaseNextCompleteFrameForFocusAnalysis(
         generationId: Int,

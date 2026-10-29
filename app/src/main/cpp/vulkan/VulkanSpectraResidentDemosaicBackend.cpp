@@ -282,6 +282,7 @@ void VulkanSpectraResidentDemosaicBackend::destroyLocked(VkDevice device) noexce
     sourceClipConfidenceDemosaicGeneration_ = 0u;
     sourceClipConfidenceWidth_ = 0u;
     sourceClipConfidenceHeight_ = 0u;
+    sourceClipConfidenceCfaPattern_ = 0u;
     residentColorValid_ = false;
 }
 
@@ -925,6 +926,7 @@ SpectraResidentDemosaicResult VulkanSpectraResidentDemosaicBackend::executeInter
     sourceClipConfidenceDemosaicGeneration_ = sourceClipMapAppended ? residentDemosaicGeneration_ : 0u;
     sourceClipConfidenceWidth_ = sourceClipMapAppended ? sourceClipWidth : 0u;
     sourceClipConfidenceHeight_ = sourceClipMapAppended ? sourceClipHeight : 0u;
+    sourceClipConfidenceCfaPattern_ = std::min(request.cfaPattern,3u);
     result.residentDemosaicGeneration = residentDemosaicGeneration_;
     const char* algorithmStatus = effectiveAlgorithm == SpectraGpuDemosaicAlgorithm::BILINEAR
             ? "BILINEAR"
@@ -1243,6 +1245,7 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
     push.frameWidth = request.frameWidth;
     push.frameHeight = request.frameHeight;
     push.mode = 3u;
+    push.cfaPattern = sourceClipConfidenceCfaPattern_;
     push.padding1 = request.neutralDefaultRaw ? 1u : 0u;
     push.wbR = request.wbRgb[0];
     push.wbG = request.wbRgb[1];
@@ -1255,7 +1258,7 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
     push.cfaEvidence0[1] = noise.rg;
     push.cfaEvidence0[2] = noise.bg;
     push.cfaEvidence0[3] = noise.cross;
-    push.cfaEvidence1[0] = sourceClipConfidenceReady ? 1.0f : 0.0f;
+    push.cfaEvidence1[0] = sourceClipConfidenceReady ? (request.neutralDefaultRaw ? 2.0f : 1.0f) : 0.0f;
     const bool physicalLumaReady=request.baselinePhysicalLuma.valid();
     push.padding0 = physicalLumaReady ? request.baselinePhysicalLuma.varianceY : 0.f;
     push.cfaEvidence1[1] = physicalLumaReady ? request.baselinePhysicalLuma.confidence : 0.f;
@@ -1272,6 +1275,21 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
     push.ccm[6] = request.colorMatrix[6];
     push.ccm[7] = request.colorMatrix[7];
     push.ccm[8] = request.colorMatrix[8];
+    if(request.neutralDefaultRaw && sourceClipConfidenceReady) {
+        push.mode=13u;
+        vkCmdPushConstants(commandBuffer_,pipelineLayout_,VK_SHADER_STAGE_COMPUTE_BIT,0u,sizeof(push),&push);
+        vkCmdDispatch(commandBuffer_,(request.frameWidth+15u)/16u,(request.frameHeight+15u)/16u,1u);
+        VkBufferMemoryBarrier recoveredReady{};
+        recoveredReady.sType=VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        recoveredReady.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;
+        recoveredReady.dstAccessMask=VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT;
+        recoveredReady.srcQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;
+        recoveredReady.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;
+        recoveredReady.buffer=rgbUpload_.buffer; recoveredReady.size=VK_WHOLE_SIZE;
+        vkCmdPipelineBarrier(commandBuffer_,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0u,0u,nullptr,1u,&recoveredReady,0u,nullptr);
+        push.mode=3u;
+    }
     vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0u, sizeof(push), &push);
     vkCmdDispatch(commandBuffer_, (request.frameWidth + 15u) / 16u, (request.frameHeight + 15u) / 16u, 1u);
     if (queryPool_ != VK_NULL_HANDLE) {
