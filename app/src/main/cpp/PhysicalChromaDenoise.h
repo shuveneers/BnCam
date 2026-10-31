@@ -7,6 +7,11 @@
 #include <cstddef>
 
 namespace bncam::chroma {
+#if defined(BNCAM_ENABLE_GPU_BENCHMARKS) && BNCAM_ENABLE_GPU_BENCHMARKS
+// Process/thread-local test harness only; absent from release builds and profiles.
+enum class DiagnosticMode { Production, Baseline04, Bypass };
+extern thread_local DiagnosticMode diagnosticMode;
+#endif
 // No Spectra/demosaic/ISO switch belongs in this contract. Covariance is already
 // propagated through the selected reconstruction and actual RAW exposure gains.
 struct Model {
@@ -15,6 +20,9 @@ struct Model {
     std::array<float,9> transform{1,0,0,0,1,0,0,0,1};
     std::array<float,9> inverse{1,0,0,0,1,0,0,0,1};
     bool colorDomain = false;
+    // Enabled only for Single Frame / Spectra OFF by the render owner.
+    bool adaptiveSpatialNoise = false;
+    bool protectCoherentDetail = false;
     bool valid() const {
         return std::isfinite(y) && std::isfinite(rg) && std::isfinite(bg) &&
                std::isfinite(cross) && y > 0 && rg > 0 && bg > 0 &&
@@ -59,10 +67,73 @@ inline bool finite(Pixel p) {
     return std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]);
 }
 struct Result { Pixel pixel; float hf=0, lf=0; };
+// Directional repeatability on the EXISTING 5x5 support. Five parallel
+// residuals fit at axial spacings 1/2; three fit at diagonal spacing 1.
+// Per whitened chroma component, mean^2/Var(mean) follows F(1,N-1)
+// under iid Gaussian noise. Upper .001/12 quantiles bound twelve tests'
+// nominal family false-alarm rate to 0.1% (Bonferroni). Spatially correlated
+// demosaic noise is tested separately; that nominal iid bound is not claimed
+// for reconstructed pixels. Protect each component separately so evidence
+// in R-G cannot disable suppression of unrelated B-G noise.
+inline std::array<float,2> coherentDetail(const std::array<std::array<float,2>,25>& patch,
+                                         const std::array<float,25>& variance,
+                                         const std::array<float,25>& luminance) {
+    std::array<float,2> protection{};float lumaProtection=0;
+    const int along[4]={5,1,6,4},across[4]={1,5,4,6};
+    for(int axis=0;axis<4;++axis) {
+        const int half=axis<2?2:1,count=2*half+1;
+        const float critical=axis<2?264.99796f:11998.5f;
+        for(int radius=1;radius<=(axis<2?2:1);++radius) {
+            std::array<float,3> mean{},scatter{};
+            int samples=0;
+            for(int k=-half;k<=half;++k) {
+                int c=12+k*along[axis],a=c-radius*across[axis],b=c+radius*across[axis];
+                float n=variance[c]+.25f*(variance[a]+variance[b]);
+                if(!(n>0)||!std::isfinite(n))return {};
+                ++samples;
+                for(int channel=0;channel<3;++channel) {
+                    float d=channel<2?(patch[c][channel]-.5f*(patch[a][channel]+patch[b][channel]))/std::sqrt(n):
+                            (luminance[c]-.5f*(luminance[a]+luminance[b]))/std::sqrt(n);
+                    float delta=d-mean[channel];mean[channel]+=delta/samples;
+                    scatter[channel]+=delta*(d-mean[channel]);
+                }
+            }
+            std::array<float,3> evidence{};
+            for(int channel=0;channel<3;++channel) {
+                float signal=mean[channel]*mean[channel];
+                float meanVariance=std::max(0.f,scatter[channel])/(count*(count-1));
+                evidence[channel]=signal>1e-10f?std::max(0.f,(signal-critical*meanVariance)/(signal+critical*meanVariance)):0;
+            }
+            // Coherent demosaic false colour can follow an achromatic line.
+            // Do not rescue chroma when the same stencil has coherent Y: that
+            // ambiguity needs CFA evidence rather than a chroma-only guess.
+            for(int channel=0;channel<2;++channel)
+                protection[channel]=std::max(protection[channel],evidence[channel]);
+            lumaProtection=std::max(lumaProtection,evidence[2]);
+            if(axis<2)for(int phase=0;phase<2;++phase) {
+                // Bayer reconstruction is 2x2-periodic. A luma feature can have
+                // different residuals on alternating rows/columns; test each
+                // parity too so that variation cannot hide coherent false colour.
+                float meanY=0,scatterY=0;int n=0;
+                for(int k=-2+phase;k<=2;k+=2) {
+                    int c=12+k*along[axis],a=c-radius*across[axis],b=c+radius*across[axis];
+                    float d=luminance[c]-.5f*(luminance[a]+luminance[b]);
+                    float delta=d-meanY;meanY+=delta/++n;scatterY+=delta*(d-meanY);
+                }
+                float signal=meanY*meanY,noise=std::max(0.f,scatterY)/(n*(n-1));
+                float threshold=n==3?11998.5f:58361000.f;
+                float e=signal>1e-10f?std::max(0.f,(signal-threshold*noise)/(signal+threshold*noise)):0;
+                lumaProtection=std::max(lumaProtection,e);
+            }
+        }
+    }
+    for(auto& value:protection)value*=1-lumaProtection;
+    return protection;
+}
 // read(x,y) is immutable POST_DEMOSAIC_LINEAR_RGB; shape(x,y) is the existing
 // local/mean physical sigma ratio (including LSC), or unity when unavailable.
 template<class Read, class Shape>
-Result filter(int x, int y, Model m, Read read, Shape shape) {
+Result filter(int x, int y, Model m, Read read, Shape shape, bool interior=true) {
     Pixel in = read(x,y);
     if (!m.valid() || !finite(in)) return {in};
     // A single estimator in the linearly transformed domain; return its correction
@@ -70,16 +141,27 @@ Result filter(int x, int y, Model m, Read read, Shape shape) {
     auto analyse=[&](int xx,int yy) {auto p=read(xx,yy);return opponent(m.colorDomain?transformPixel(m.transform,p):p);};
     Pixel p=analyse(x,y);
     float s=shape(x,y);s*=s;
+    if (!(s > 0) || !std::isfinite(s)) return {in};
     const float sr=std::sqrt(m.rg*s), sb=std::sqrt(m.bg*s);
     const float rho=std::clamp(m.cross/std::sqrt(m.rg*m.bg),-.99999f,.99999f);
     const float tail=std::sqrt(1-rho*rho);
     float sumR=0,sumB=0,rr=0,bb=0,rb=0,weight=0,weight2=0;
+    float noiseWeight=0,noiseWeight2=0;
+    std::array<std::array<float,2>,25> patch{};
+    std::array<float,25> patchVariance{},patchY{};
     for(int dy=-2;dy<=2;++dy) for(int dx=-2;dx<=2;++dx) {
-        auto q=analyse(x+dx,y+dy);if(!finite(q))continue;
+        auto q=analyse(x+dx,y+dy);
+        if(!finite(q)) {if(m.protectCoherentDetail&&interior)return {in};continue;}
         float ns=shape(x+dx,y+dy),dyv=q[0]-p[0];
+        if (!(ns > 0) || !std::isfinite(ns)) return {in};
         float w=std::exp(-dyv*dyv/(4*m.y*(s+ns*ns)));
         float u=(q[1]-p[1])/sr,v=((q[2]-p[2])/sb-rho*u)/tail;
+        if(m.protectCoherentDetail && interior) {
+            int i=(dy+2)*5+dx+2;patch[i]={u,v};patchVariance[i]=ns*ns/s;
+            patchY[i]=dyv/std::sqrt(m.y*s);
+        }
         sumR+=w*u;sumB+=w*v;rr+=w*u*u;bb+=w*v*v;rb+=w*u*v;weight+=w;weight2+=w*w;
+        noiseWeight+=w*ns*ns;noiseWeight2+=w*w*ns*ns;
     }
     if(!(weight>1.001f))return {in};
     float mr=sumR/weight,mb=sumB/weight;
@@ -87,6 +169,16 @@ Result filter(int x, int y, Model m, Read read, Shape shape) {
     float a=std::max(0.f,(rr/weight-mr*mr)*correction);
     float d=std::max(0.f,(bb/weight-mb*mb)*correction);
     float b=(rb/weight-mr*mb)*correction;
+    if (m.adaptiveSpatialNoise) {
+        // E[weighted sample variance] for unequal independent sample variances:
+        // (W sum(w_i v_i) - sum(w_i^2 v_i)) / (W^2 - sum(w_i^2)).
+        // The existing whitening divides by the centre variance s. Account for
+        // each neighbour's LSC variance before interpreting eigenvalues as SNR.
+        const float expected=(weight*noiseWeight-noiseWeight2)/
+                ((weight*weight-weight2)*s);
+        if (!(expected > 0) || !std::isfinite(expected)) return {in};
+        a/=expected;d/=expected;b/=expected;
+    }
     float gap=std::sqrt((a-d)*(a-d)+4*b*b);
     float lo=std::max(0.f,.5f*(a+d-gap)),hi=.5f*(a+d+gap);
     // Unit variance in whitened coordinates is noise. >=16 is coherent,
@@ -96,6 +188,10 @@ Result filter(int x, int y, Model m, Read read, Shape shape) {
     if(gap>1e-5f){float k=(sh-sl)/gap;dr+=k*((a-lo)*mr+b*mb);db+=k*(b*mr+(d-lo)*mb);}
     float v=.5f*(m.rg+m.bg)*s;
     float authority=std::min(.90f,v/(v+.01f*p[0]*p[0]));
+    if(m.protectCoherentDetail && interior) {
+        auto protection=coherentDetail(patch,patchVariance,patchY);
+        dr*=1-protection[0];db*=1-protection[1];
+    }
     if(authority<1e-6f)return {in};
     float cr=p[1]+authority*sr*dr,cb=p[2]+authority*sb*(rho*dr+tail*db);
     Pixel delta=rgb({0,cr-p[1],cb-p[2]});

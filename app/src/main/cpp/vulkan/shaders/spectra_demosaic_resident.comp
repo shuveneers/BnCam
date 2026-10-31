@@ -1043,7 +1043,7 @@ void main() {
         float localShapeVariance=localSigma*localSigma;
         lumaStats1[localIndex].z=pc.cfaEvidence1.y>0.0 ?
             physicalNoisePressure(pc.padding0*localShapeVariance,ci.x) : 0.0;
-        lumaStats1[localIndex].w=pc.cfaEvidence1.w>0.5 ?
+        lumaStats1[localIndex].w=pc.cfaEvidence1.w>0.0 ?
             physicalNoisePressure(0.5*(pc.cfaEvidence0.y+pc.cfaEvidence0.z)*localShapeVariance,ci.x) : 0.0;
         // Keep noise estimators and their diagnostics on their original domains.
         // Recovery adds only the censored-channel delta from immutable demosaic RGB.

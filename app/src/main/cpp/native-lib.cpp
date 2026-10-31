@@ -1,4 +1,6 @@
 #include "tests/PhysicalChromaValidation.h"
+#include "tests/ChromaDetailValidation.h"
+#include "tests/ChromaDemosaicCorrelationValidation.h"
 #include "tests/PhysicalLumaValidation.h"
 #include <jni.h>
 #include <cstdint>
@@ -4505,6 +4507,34 @@ Java_com_bncam_core_engine_ImageUtils_validatePhysicalChromaNative(JNIEnv* env,j
             return out;
         };
         report+="GPU\n"+test::run(gpu);
+        report+="DETAIL_CPU\n"+bncam::chroma::detailtest::run();
+        report+="DETAIL_GPU\n"+bncam::chroma::detailtest::run(gpu);
+        if(report.find("detailPassed=false")!=std::string::npos)throw std::runtime_error(report);
+        report+="CORRELATED_CPU\n"+bncam::chroma::detailtest::runDemosaicNoise();
+        report+="CORRELATED_GPU\n"+bncam::chroma::detailtest::runDemosaicNoise(gpu);
+        if(report.find("correlationPassed=false")!=std::string::npos)throw std::runtime_error(report);
+        report+="FALSE_COLOUR_CPU\n"+bncam::chroma::detailtest::runFalseColour();
+        report+="FALSE_COLOUR_GPU\n"+bncam::chroma::detailtest::runFalseColour(gpu);
+        if(report.find("falseColourPassed=false")!=std::string::npos)throw std::runtime_error(report);
+        report+="SPATIAL_CPU\n"+test::runSpatial();
+        auto spatialGpu=[&](const test::Image& input,Model model,const std::array<float,4>& map) {
+            bncam::vulkan::SpectraResidentColorTransformRequest r{};
+            r.frameWidth=test::W;r.frameHeight=test::H;r.rowStrideFloats=test::W*3;
+            r.rgbData=input[0].data();r.baselinePhysicalChroma=model;r.physicalChromaValidationOnly=true;
+            r.physicalSpatialSigma=map.data();r.physicalSpatialColumns=2;r.physicalSpatialRows=2;
+            auto result=bncam::vulkan::VulkanRuntime::instance().executeSpectraResidentAwbCcm(r);
+            if(!result.success||result.outputRgb.size()!=input.size()*3)throw std::runtime_error("spatial GPU readback");
+            test::Image out(input.size());std::memcpy(out.data(),result.outputRgb.data(),result.outputRgb.size()*sizeof(float));
+            auto reference=test::spatialReference(input,model,map);
+            for(size_t i=0;i<out.size();++i)for(int c=0;c<3;++c) {
+                double error=std::abs(out[i][c]-reference[i][c]);
+                maxParity=std::max(maxParity,error);
+                if(error>2e-6)throw std::runtime_error("spatial CPU/GPU parity");
+            }
+            return out;
+        };
+        report+="SPATIAL_GPU\n"+test::runSpatial(spatialGpu);
+        if(report.find("spatialPassed=false")!=std::string::npos)throw std::runtime_error(report);
         // Nonidentity WB/CCM: covariance transport and pixel transport must agree,
         // including signed/HDR input. Luma identity belongs to the analysis domain.
         {
@@ -4516,6 +4546,7 @@ Java_com_bncam_core_engine_ImageUtils_validatePhysicalChromaNative(JNIEnv* env,j
                     bncam::spectra2::diagonalCovariance(.00015,.00008,.0002));
             auto model=inColorDomain(fromNoiseState(n,true),n,transform,1.f);
             if(!model.colorDomain)throw std::runtime_error("WB_CCM model rejected");
+            model.protectCoherentDetail=true;model.adaptiveSpatialNoise=true;
             test::Image input(test::W*test::H);
             std::mt19937 rng(20261008);std::normal_distribution<float> normal(0,1);
             for(int y=0;y<test::H;++y)for(int x=0;x<test::W;++x) {
@@ -4576,20 +4607,26 @@ Java_com_bncam_core_engine_ImageUtils_validatePhysicalChromaNative(JNIEnv* env,j
         const int size=1024;
         std::vector<float> bench(size*size*3);
         for(size_t i=0;i<bench.size();++i) bench[i]=.1f+.015f*std::sin(float(i)*1.7f);
-        double enabledMs=0,identityMs=0;
-        for(int iteration=0;iteration<8;++iteration) for(int enabled=0;enabled<=1;++enabled) {
+        double enabledMs=0,identityMs=0,detailMs=0;
+        for(int iteration=0;iteration<8;++iteration) for(int enabled=0;enabled<=2;++enabled) {
             bncam::vulkan::SpectraResidentColorTransformRequest r{};
             r.frameWidth=size;r.frameHeight=size;r.rowStrideFloats=size*3;r.rgbData=bench.data();
             r.deferFullReadback=true;
             if(enabled) r.baselinePhysicalChroma={.000025f,.0004f,.0004f,0};
+            if(enabled)r.baselinePhysicalChroma.adaptiveSpatialNoise=true;
+            if(enabled==2)r.baselinePhysicalChroma.protectCoherentDetail=true;
             auto c=bncam::vulkan::VulkanRuntime::instance().executeSpectraResidentAwbCcm(r);
             if(!c.success) throw std::runtime_error("benchmark:"+c.failureReason);
-            if(iteration>=2) {if(enabled) enabledMs+=c.kernelMs;else identityMs+=c.kernelMs;}
+            if(iteration>=2) {if(enabled==2)detailMs+=c.kernelMs;else if(enabled) enabledMs+=c.kernelMs;else identityMs+=c.kernelMs;}
         }
         report+="gpuBenchmark1024 identityMs="+std::to_string(identityMs/6)+" chromaMs="+std::to_string(enabledMs/6)+
                 " deltaMs="+std::to_string((enabledMs-identityMs)/6)+"\n";
+        report+="gpuDetailBenchmark1024 baseline04Ms="+std::to_string(enabledMs/6)+" candidate05Ms="+
+                std::to_string(detailMs/6)+" deltaMs="+std::to_string((detailMs-enabledMs)/6)+"\n";
 
-        if(maxParity>2e-6) report+="allPassed=false CPU_GPU_PARITY\n";
+        report+="cpuGpuIdentityTolerance="+std::to_string(bncam::chroma::detailtest::kIdentityGpuTolerance)+
+                " criterion=less_than_1_over_32_UNORM8_sRGB_code_at_max_transfer_slope\n";
+        if(maxParity>bncam::chroma::detailtest::kIdentityGpuTolerance) report+="allPassed=false CPU_GPU_PARITY\n";
         return env->NewStringUTF(report.c_str());
     } catch(const std::exception& e) {
         std::string failure=std::string("allPassed=false ")+e.what();

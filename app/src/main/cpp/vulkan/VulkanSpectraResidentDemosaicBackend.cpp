@@ -256,6 +256,7 @@ void VulkanSpectraResidentDemosaicBackend::destroyLocked(VkDevice device) noexce
         if (fence_ != VK_NULL_HANDLE) vkDestroyFence(device, fence_, nullptr);
         if (descriptorPool_ != VK_NULL_HANDLE) vkDestroyDescriptorPool(device, descriptorPool_, nullptr);
         if (pipeline_ != VK_NULL_HANDLE) vkDestroyPipeline(device, pipeline_, nullptr);
+        if (coherentDetailPipeline_ != VK_NULL_HANDLE) vkDestroyPipeline(device, coherentDetailPipeline_, nullptr);
         if (shaderModule_ != VK_NULL_HANDLE) vkDestroyShaderModule(device, shaderModule_, nullptr);
         if (pipelineLayout_ != VK_NULL_HANDLE) vkDestroyPipelineLayout(device, pipelineLayout_, nullptr);
         if (descriptorSetLayout_ != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(device, descriptorSetLayout_, nullptr);
@@ -267,6 +268,7 @@ void VulkanSpectraResidentDemosaicBackend::destroyLocked(VkDevice device) noexce
     pipelineLayout_ = VK_NULL_HANDLE;
     shaderModule_ = VK_NULL_HANDLE;
     pipeline_ = VK_NULL_HANDLE;
+    coherentDetailPipeline_ = VK_NULL_HANDLE;
     descriptorPool_ = VK_NULL_HANDLE;
     descriptorSet_ = VK_NULL_HANDLE;
     commandBuffer_ = VK_NULL_HANDLE;
@@ -984,6 +986,24 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
         result.totalMs = elapsedMs(totalStart);
         return result;
     }
+    const bool coherentDetail=request.baselinePhysicalChroma.valid() &&
+            request.baselinePhysicalChroma.protectCoherentDetail;
+    if(coherentDetail && coherentDetailPipeline_==VK_NULL_HANDLE) {
+        // Same fused pass/ABI, specialized only for the requested detail route.
+        // The existing pipeline's default-false specialization removes all extra
+        // code/registers from demosaic, Spectra ON and multi-frame requests.
+        VkBool32 enabled=VK_TRUE;
+        VkSpecializationMapEntry entry{0u,0u,sizeof(enabled)};
+        VkSpecializationInfo specialization{1u,&entry,sizeof(enabled),&enabled};
+        VkComputePipelineCreateInfo info{};info.sType=VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        info.stage.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        info.stage.stage=VK_SHADER_STAGE_COMPUTE_BIT;info.stage.module=shaderModule_;
+        info.stage.pName="main";info.stage.pSpecializationInfo=&specialization;info.layout=pipelineLayout_;
+        if(VulkanPipelineCacheRegistry::createComputePipelines(device,1u,&info,nullptr,&coherentDetailPipeline_)!=VK_SUCCESS) {
+            result.status="GPU_COHERENT_DETAIL_PIPELINE_FAILED";
+            result.failureReason="coherent_detail_specialization_failed";return result;
+        }
+    }
     VmaAllocator allocator = allocatorOwner.handle();
     if (allocator == nullptr) {
         result.status = "GPU_COLOR_TRANSFORM_ALLOCATOR_UNAVAILABLE";
@@ -1238,7 +1258,8 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
         vkCmdResetQueryPool(commandBuffer_, queryPool_, 0u, 4u);
         vkCmdWriteTimestamp(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool_, 0u);
     }
-    vkCmdBindPipeline(commandBuffer_, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
+    vkCmdBindPipeline(commandBuffer_, VK_PIPELINE_BIND_POINT_COMPUTE,
+                      coherentDetail?coherentDetailPipeline_:pipeline_);
     vkCmdBindDescriptorSets(commandBuffer_, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_,
                             0u, 1u, &descriptorSet_, 0u, nullptr);
     PushConstants push{};
@@ -1264,6 +1285,10 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
     push.cfaEvidence1[1] = physicalLumaReady ? request.baselinePhysicalLuma.confidence : 0.f;
     push.cfaEvidence1[2] = request.physicalChromaValidationOnly ? 1.f : 0.f;
     push.cfaEvidence1[3] = physicalChromaReady ? 1.f : 0.f;
+    // Mode 3 does not use the residual sampling stride. Reuse it as an explicit
+    // heteroscedastic-statistics bit; no push-constant ABI or buffer change.
+    push.residualStride = (noise.adaptiveSpatialNoise ? 1u : 0u) |
+                          (noise.protectCoherentDetail ? 2u : 0u);
     push.ccm[9] = physicalShapeReady ? float(request.physicalSpatialColumns) : 0.f;
     push.ccm[10] = physicalShapeReady ? float(request.physicalSpatialRows) : 0.f;
     push.ccm[0] = request.colorMatrix[0];

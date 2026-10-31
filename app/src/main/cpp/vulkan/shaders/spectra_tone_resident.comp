@@ -810,35 +810,6 @@ vec3 applyLocalTone(uvec2 gid, vec3 exposedRgb) {
     return exposedRgb * exp2(appliedEv);
 }
 
-// DELTA 0207 — bounded broad-shadow placement.
-// FLLF keeps its coarse/DC base at identity. Device validation shows that in dark interiors its
-// nominal lift envelope can be high while the mean correction stays near zero. This stage owns
-// broad dark tonal placement without becoming global EV: RGB ratios are preserved, true black is
-// pinned, and authority fades to identity before mids/highlights.
-vec3 applyBroadShadowPlacement(vec3 color) {
-    // Reuse only the already-authoritative adaptive FLLF envelope. When FLLF is bypassed these
-    // telemetry-backed parameters are zero, so this stage is exact identity as well.
-    float localLift = clamp(fllfParam(10u, 0.0), 0.0, 1.35);
-    float localStrength = clamp(fllfParam(8u, 0.0), 0.0, 0.92);
-    // Broad placement supplements the signed local Laplacian correction. Keep
-    // its independent lift below one half-stop instead of washing dark regions
-    // toward grey with a second nearly one-stop shadow lift.
-    float maxLiftEv = clamp(0.36 * localLift + 0.10 * localStrength - 0.05, 0.0, 0.50);
-    if (maxLiftEv <= 1.0e-5) return color;
-    float y = max(0.0, lumaOf(color));
-    if (y <= 1.0e-8) return color;
-    // A rational black anchor avoids the narrow linear-Y gate's extra acutance.
-    // Its logarithmic gain slope is bounded by maxLiftEv*ln(2)/2; black stays
-    // pinned and the mapping approaches identity continuously at the origin.
-    float blackGuard = y * y / (y * y + 0.024 * 0.024);
-    // Fade over luminance stops rather than a short linear interval. The old
-    // fade could collapse relative contrast to 0.007 at the allowed lift limit.
-    // This C2 window and the lift bound keep relative contrast above 0.72.
-    float t = clamp(log2(y / 0.05) / 3.32192809489, 0.0, 1.0);
-    float shadowWindow = 1.0 - t*t*t*(t*(t*6.0 - 15.0) + 10.0);
-    return color * exp2(maxLiftEv * blackGuard * shadowWindow);
-}
-
 // Display entrance only: retain Y and the RGB opponent direction while reaching
 // Khronos' nonnegative Rec.709 input cone. HDR values above one remain untouched.
 vec3 mapSceneToKhronosInput(vec3 rgb) {
@@ -935,11 +906,10 @@ void runTone(uvec2 gid) {
     vec3 rgb = vec3(workingRgb[base + 0u], workingRgb[base + 1u], workingRgb[base + 2u]);
     if (pc.isRawBayer != 0u) {
         // RAW production order:
-        // calibrated scene-linear -> log2(Y) FLLF -> bounded broad-shadow placement ->
+        // calibrated scene-linear -> log2(Y) local FLLF ->
         // explicit profile Exposure -> shadow-neutral PBR Neutral -> explicit tonal ranges/curves ->
         // explicit profile colour -> one final gamut owner.
         if (pc.presenceReserved0 != 0u) rgb = applyFllfLocalExposure(gid, rgb);
-        rgb = applyBroadShadowPlacement(rgb);
         rgb *= max(0.0, pc.exposureGain);
         vec3 preKhronos = rgb;
         if (pc.rawJpegBaseVibrance < 0.0) rgb = mapSceneToKhronosInput(rgb);

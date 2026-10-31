@@ -21,6 +21,7 @@
 #include "SensorColorScienceV2.h"
 #include "RawCameraColorCharacterizationOwnership.h"
 #include "RawCameraAdaptiveColorAuthority.h"
+#include "NeutralRawHueSatAuthorityPolicy.h"
 #include "RawCameraColorProfileRegistry.h"
 #include "RawCameraColorProfileResolver.h"
 #include "RawCameraDngForwardTransform.h"
@@ -63,6 +64,10 @@
 #define ISP_LOG_TAG "BnCam_IspCore"
 #define ISP_LOGI(...) __android_log_print(ANDROID_LOG_INFO, ISP_LOG_TAG, __VA_ARGS__)
 #define ISP_LOGE(...) __android_log_print(ANDROID_LOG_ERROR, ISP_LOG_TAG, __VA_ARGS__)
+
+#if defined(BNCAM_ENABLE_GPU_BENCHMARKS) && BNCAM_ENABLE_GPU_BENCHMARKS
+namespace bncam::chroma { thread_local DiagnosticMode diagnosticMode=DiagnosticMode::Production; }
+#endif
 
 namespace {
 
@@ -6750,10 +6755,30 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                     calibratedHueSatMapAvailable && calibratedProfile != nullptr && calibratedProfile->valid(),
                     true
             });
-    const bool calibratedMatrixProfileActive = !preserveExactCamera2Pair && cameraCharacterizationPlan.calibratedMatrixApply;
-    const bool calibratedHueSatMapActive = !preserveExactCamera2Pair && cameraCharacterizationPlan.calibratedHueSatMapApply;
+    // Neutral RAW defaults to the exact Camera2 colour pair. A genuinely paired and validated
+    // DNG ForwardMatrix + HueSatMap may replace that CCM as ONE coherent characterization.
+    // Never attach a DNG HueSatMap to the unrelated Camera2 per-frame matrix.
+    const bncam::color::NeutralRawColorAuthorityInput neutralRawColorInput{
+            neutralDefaultRaw,
+            preserveExactCamera2Pair,
+            calibratedProfileConfiguredForCurrentRoute,
+            calibratedProfileResolution.ready,
+            calibratedProfile != nullptr && calibratedProfile->valid(),
+            calibratedForwardTransform.ready,
+            calibratedHueSatMapAvailable
+    };
+    const bool neutralRawCalibratedMatrixRequested =
+            bncam::color::useCalibratedDngMatrixForNeutralRaw(neutralRawColorInput);
+    const bool neutralRawPairedHueSatRequested =
+            bncam::color::usePairedDngHueSatForNeutralRaw(neutralRawColorInput);
+    const bool calibratedMatrixProfileActive =
+            (!preserveExactCamera2Pair || neutralRawCalibratedMatrixRequested) &&
+            cameraCharacterizationPlan.calibratedMatrixApply;
+    const bool calibratedHueSatMapActive =
+            (!preserveExactCamera2Pair || neutralRawPairedHueSatRequested) &&
+            cameraCharacterizationPlan.calibratedHueSatMapApply;
     const bncam::color::RawAdaptiveColorAuthorityPlan adaptiveColorAuthority =
-            preserveExactCamera2Pair ? bncam::color::exactCamera2Authority(activeColorMatrix) :
+            (preserveExactCamera2Pair && !neutralRawCalibratedMatrixRequested) ? bncam::color::exactCamera2Authority(activeColorMatrix) :
             bncam::color::resolveRawAdaptiveColorAuthority({
                     exactCamera2ColorPair,
                     calibratedMatrixProfileActive && calibratedForwardTransform.ready,
@@ -6871,6 +6896,16 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     baselinePhysicalChroma=bncam::chroma::inColorDomain(baselinePhysicalChroma,
             residualNoiseState.postDemosaic,chromaColorTransform,
             neuralPosteriorSeedApplied?1.f:meta.calibration.physicalFusionVarianceScale);
+    if (neutralDefaultRaw) {
+        baselinePhysicalChroma.adaptiveSpatialNoise = true;
+        baselinePhysicalChroma.protectCoherentDetail = true;
+#if defined(BNCAM_ENABLE_GPU_BENCHMARKS) && BNCAM_ENABLE_GPU_BENCHMARKS
+        if(bncam::chroma::diagnosticMode==bncam::chroma::DiagnosticMode::Baseline04)
+            baselinePhysicalChroma.protectCoherentDetail=false;
+        if(bncam::chroma::diagnosticMode==bncam::chroma::DiagnosticMode::Bypass)
+            baselinePhysicalChroma={};
+#endif
+    }
     // Downstream covariance stays a conservative pre-filter prediction: adaptive support is
     // data-dependent. Do not claim a measured posterior from a global colour-field variance.
     bncam::spectra2::NoiseState preWbNoiseState = residualNoiseState.postDemosaic;
@@ -7082,7 +7117,8 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                             g_spatialNoiseMap.tileSigma.data());
                 };
                 for(int y=rows.start;y<rows.end;++y) for(int x=0;x<source.cols;++x) {
-                    auto p=bncam::chroma::filter(x,y,baselinePhysicalChroma,read,shape).pixel;
+                    auto p=bncam::chroma::filter(x,y,baselinePhysicalChroma,read,shape,
+                            x>=2&&y>=2&&x<source.cols-2&&y<source.rows-2).pixel;
                     linearRgb.at<cv::Vec3f>(y,x)={p[0],p[1],p[2]};
                 }
             });
@@ -9803,7 +9839,9 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                             ? "PHASE2_CALIBRATED_DNG_FORWARD_MATRIX"
                             : "PHASE2_CHARACTERIZATION_FALLBACK_OR_NONE"))
             << "; rawColorDisplayHighlightChromaSafety=SOURCE_RAW_PHASE9_OWNER"
-            << "; phase5ColorPairOwner=" << (preserveExactCamera2Pair
+            << "; phase5ColorPairOwner=" << (neutralRawPairedHueSatRequested
+                    ? "DNG_FORWARD_MATRIX_PLUS_PAIRED_HUESATMAP" : neutralRawCalibratedMatrixRequested
+                    ? "DNG_FORWARD_MATRIX_CALIBRATED_WITH_CAMERA2_COHERENCE" : preserveExactCamera2Pair
                     ? "CAMERA2_EXACT_FRAME_PAIR_UNMODIFIED" : exactCamera2ColorPair
                     ? "CAMERA2_EXACT_FRAME_PAIR_WITH_BOUNDED_PHYSICAL_AWB"
                     : "RESOLVED_FALLBACK_OR_PROFILE")
@@ -10331,6 +10369,8 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; ColorWorkingSpace=" << phase2ColorWorkingSpace
             << "; CameraMatrixSource=" << phase2CameraMatrixSource
             << "; CameraMatrixInterpolated=" << (phase2CameraMatrixInterpolated ? "true" : "false")
+            << "; neutralRawCalibratedMatrixRequested=" << (neutralRawCalibratedMatrixRequested ? "true" : "false")
+            << "; neutralRawPairedHueSatRequested=" << (neutralRawPairedHueSatRequested ? "true" : "false")
             << "; HueSatMapAvailable=" << (hueSatMapTelemetry.available ? "true" : "false")
             << "; HueSatMapSource=" << hueSatMapTelemetry.source
             << "; HueSatMapDims="

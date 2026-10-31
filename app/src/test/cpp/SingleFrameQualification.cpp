@@ -1,5 +1,8 @@
 // Device-only measurement harness. No code from this executable is linked into the APK.
 #include "IspCore.h"
+#include "PhysicalChromaDenoise.h"
+#include "tests/ColorDetailStageValidation.h"
+#include "tests/ChromaDemosaicCorrelationValidation.h"
 #include "vulkan/VulkanRuntime.h"
 #include <android/thermal.h>
 #include <malloc.h>
@@ -128,6 +131,16 @@ int main(int argc,char**argv) {
     try {
         check(argc>=3,"usage: bncam_single_frame_qualification FIXTURE_DIR numerical|benchmark [measured=10]");
         const std::string root=argv[1], action=argv[2];
+        if(action=="detail-cpu") {
+            auto report=bncam::chroma::detailtest::run()+bncam::chroma::detailtest::runDemosaicNoise()+
+                    bncam::chroma::detailtest::runFalseColour();std::cout<<report;
+            return report.find("Passed=false")!=std::string::npos;
+        }
+        if(action=="colour-stages") {
+            auto& runtime=bncam::vulkan::VulkanRuntime::instance();runtime.initialize({});
+            auto report=bncam::chroma::detailtest::runStages(runtime,root);std::cout<<report;
+            runtime.shutdown();return report.find("stagePassed=true")==std::string::npos;
+        }
         int w,h,cfa,iso,format;float exposure,white,black[4],wb[4],matrix[9];
         std::ifstream cfg(root+"/fixture.txt");cfg>>w>>h>>cfa>>iso>>format>>exposure>>white;
         for(auto&v:black)cfg>>v;for(auto&v:wb)cfg>>v;for(auto&v:matrix)cfg>>v;
@@ -145,7 +158,14 @@ int main(int argc,char**argv) {
             cpuRegression();auto linear=normalizeRawForJpeg(raw.data(),info);check(linear.diagnostics.valid,"normalization");
             numerical(runtime,linear.mosaic,cfa,iso,root);runtime.shutdown();return 0;
         }
-        const bool replayOnly=action=="replay";
+        const bool replayOnly=action=="replay"||action=="detail-replay";
+        if(action=="detail-replay") {
+            check(argc>=4,"detail-replay requires production|baseline04|bypass");
+            const std::string mode=argv[3];
+            check(mode=="production"||mode=="baseline04"||mode=="bypass","unknown detail mode");
+            bncam::chroma::diagnosticMode=mode=="bypass"?bncam::chroma::DiagnosticMode::Bypass:
+                (mode=="baseline04"?bncam::chroma::DiagnosticMode::Baseline04:bncam::chroma::DiagnosticMode::Production);
+        }
         check(action=="benchmark"||replayOnly,"unknown action");
         const int measured=replayOnly?0:(argc>3?std::stoi(argv[3]):10);
         check(replayOnly||measured>=10,"minimum 10 measured samples");
@@ -211,5 +231,6 @@ int main(int argc,char**argv) {
             }
         }
         if(thermal)releaseThermal(thermal);runtime.shutdown();return 0;
-    } catch(const std::exception& e) { std::cerr<<"QUALIFICATION FAILED: "<<e.what()<<std::endl;return 1; }
+    } catch(const std::exception& e) { std::cerr<<"QUALIFICATION FAILED: "<<e.what()<<std::endl;
+        bncam::vulkan::VulkanRuntime::instance().shutdown();return 1; }
 }

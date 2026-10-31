@@ -16,7 +16,8 @@ inline Pixel at(const Image& a,int x,int y) {
 inline Image reference(const Image& in,Model m) {
     Image out(in.size());
     for(int y=0;y<H;++y) for(int x=0;x<W;++x)
-        out[y*W+x]=filter(x,y,m,[&](int xx,int yy){return at(in,xx,yy);},[](int,int){return 1.f;}).pixel;
+        out[y*W+x]=filter(x,y,m,[&](int xx,int yy){return at(in,xx,yy);},[](int,int){return 1.f;},
+                         x>=2&&y>=2&&x<W-2&&y<H-2).pixel;
     return out;
 }
 struct Metrics {
@@ -95,5 +96,35 @@ inline std::string run(Engine engine=reference) {
     pass &= !detailAccepted(1e-3,1,1,1) && !detailAccepted(0,1,.99,1) && !detailAccepted(0,1,1,.99);
     report<<"allPassed="<<(pass?"true":"false")<<'\n';
     return report.str();
+}
+using SpatialEngine=std::function<Image(const Image&,Model,const std::array<float,4>&)>;
+inline Image spatialReference(const Image& in,Model m,const std::array<float,4>& map) {
+    Image out(in.size());
+    auto shape=[&](int x,int y){return physical::spatialSigma(x,y,W,H,2,2,map.data());};
+    for(int y=0;y<H;++y)for(int x=0;x<W;++x)
+        out[y*W+x]=filter(x,y,m,[&](int xx,int yy){return at(in,xx,yy);},shape,
+                         x>=2&&y>=2&&x<W-2&&y<H-2).pixel;
+    return out;
+}
+inline std::string runSpatial(SpatialEngine engine=spatialReference) {
+    bool pass=true;std::ostringstream report;report<<std::setprecision(10);
+    for(unsigned seed=7123;seed<7127;++seed) {
+        const std::array<float,4> map{.25f,4.f,2.f,.5f};
+        Model m{.000025f,.0004f,.0004f,.00012f};m.adaptiveSpatialNoise=true;
+        Image in(W*H),truth(W*H);
+        std::mt19937 rng(seed);std::normal_distribution<float> normal(0,1);
+        for(int y=0;y<H;++y)for(int x=0;x<W;++x) {
+            float s=physical::spatialSigma(x,y,W,H,2,2,map.data());
+            float r=normal(rng),b=normal(rng);
+            truth[y*W+x]=rgb({.03f,.02f,-.01f});
+            in[y*W+x]=rgb({.03f,.02f+.02f*s*r,-.01f+.02f*s*(.3f*r+std::sqrt(.91f)*b)});
+        }
+        auto out=engine(in,m,map);auto v=metrics(in,out,truth);
+        bool ok=detailAccepted(v.max,1,v.edge,v.hf)&&v.ratio<.8;
+        for(auto p:out)ok &= finite(p);
+        pass &= ok;
+        report<<"heteroscedastic seed="<<seed<<" pass="<<ok<<" chromaMseRatio="<<v.ratio<<" maxLumaError="<<v.max<<'\n';
+    }
+    report<<"spatialPassed="<<(pass?"true":"false")<<'\n';return report.str();
 }
 }

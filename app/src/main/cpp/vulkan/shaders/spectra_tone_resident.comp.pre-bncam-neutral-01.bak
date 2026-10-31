@@ -1,0 +1,2127 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer InputRgb { float inputRgb[]; };
+layout(std430, binding = 1) buffer WorkingRgb { float workingRgb[]; };
+layout(std430, binding = 2) writeonly buffer CompactData { float compactData[]; };
+layout(std430, binding = 3) readonly buffer ToneLut { float toneLut[]; };
+layout(std430, binding = 4) buffer Telemetry { uint telemetry[]; };
+layout(std430, binding = 5) buffer UltraHdrLuma { float ultraHdrLuma[]; };
+layout(std430, binding = 6) buffer UltraHdrGainLog { float ultraHdrGainLog[]; };
+layout(std430, binding = 7) buffer UltraHdrGainmapPacked { uint ultraHdrGainmapPacked[]; };
+layout(std430, binding = 8) readonly buffer PortraitMask { float portraitMask[]; };
+layout(std430, binding = 9) buffer PortraitBlurRgb { float portraitBlurRgb[]; };
+layout(std430, binding = 10) buffer LocalToneBase { float localToneBase[]; };
+// Phase 5 packed scalar FLLF pyramids. Level 0 is half-resolution; higher levels are
+// concatenated. No RGB pyramid and no CPU roundtrip are used. Binding 12 keeps its historical
+// ABI name, but stores the reconstructed filtered log2-luminance pyramid (not an exposure field).
+layout(std430, binding = 11) buffer FllfGaussian { float fllfGaussian[]; };
+layout(std430, binding = 12) buffer FllfCorrection { float fllfCorrection[]; };
+
+layout(push_constant) uniform Params {
+    uint frameWidth;
+    uint frameHeight;
+    uint mode;          // 0 fused pre-tone chroma 4:4:4 + highlight recovery; 1 scene samples, 2 display grid, 3 tone/vibrance
+    uint sampleStep;
+    uint sampleCount;
+    uint displayOffsetFloats;
+    uint isRawBayer;
+    uint presenceReserved0;
+    float exposureGain;
+    float rawJpegBaseVibrance;
+    float profileSaturation;
+    float profileContrast;
+    float profileVibrance;
+    float presenceReserved1;
+    float shoulderStart;
+    float shoulderStrength;
+    uint ultraHdrSourceMapWidth;
+    uint ultraHdrSourceMapHeight;
+    uint ultraHdrOutputMapWidth;
+    uint ultraHdrOutputMapHeight;
+    uint ultraHdrPackedWordsPerRow;
+    uint outputRotationDegrees;
+    uint portraitEnabled;
+    uint portraitMaskWidth;
+    uint portraitMaskHeight;
+    uint portraitMaskRotationDegrees;
+    float portraitTargetLeft;
+    float portraitTargetTop;
+    float portraitTargetRight;
+    float portraitTargetBottom;
+} pc;
+
+
+// PHASE 9 / DELTA 0093 — 16x16 workgroup chroma predictor.
+// Each Vulkan workgroup is one immutable post-AWB/CCM tile. One lane fits a local
+// opponent-chroma-vs-luma model. DELTA 0093 no longer treats that observed tile spread
+// as the noise truth: the correction significance is whitened against the propagated
+// physical post-WB/CCM covariance. The tile model remains only a structure/prediction aid.
+shared vec4 phase9TileOpponent[256]; // Y, R-Y, B-Y, valid
+shared vec4 phase9TileModel0;        // meanY, varY, slopeRY, slopeBY
+shared vec4 phase9TileModel1;        // interceptRY, interceptBY, residualVarRY, residualVarBY
+shared vec4 phase9TileModel2;        // residualSigma, flatness, noisePressure, validCount
+
+float clampSceneLinear(float v) {
+    if (isnan(v) || isinf(v)) return 0.0;
+    return clamp(v, 0.0, 4.0);
+}
+
+vec3 inputAt(int x, int y) {
+    int sx = clamp(x, 0, int(pc.frameWidth) - 1);
+    int sy = clamp(y, 0, int(pc.frameHeight) - 1);
+    uint base = (uint(sy) * pc.frameWidth + uint(sx)) * 3u;
+    return vec3(inputRgb[base + 0u], inputRgb[base + 1u], inputRgb[base + 2u]);
+}
+
+vec3 workingAt(int x, int y) {
+    int sx = clamp(x, 0, int(pc.frameWidth) - 1);
+    int sy = clamp(y, 0, int(pc.frameHeight) - 1);
+    uint base = (uint(sy) * pc.frameWidth + uint(sx)) * 3u;
+    return vec3(workingRgb[base + 0u], workingRgb[base + 1u], workingRgb[base + 2u]);
+}
+
+void writeWorking(uvec2 gid, vec3 v) {
+    uint base = (gid.y * pc.frameWidth + gid.x) * 3u;
+    workingRgb[base + 0u] = v.r;
+    workingRgb[base + 1u] = v.g;
+    workingRgb[base + 2u] = v.b;
+}
+
+float lumaOf(vec3 v) {
+    return 0.2126 * v.r + 0.7152 * v.g + 0.0722 * v.b;
+}
+
+float smoothstepFast(float edge0, float invRange, float value) {
+    float u = clamp((value - edge0) * invRange, 0.0, 1.0);
+    return u * u * (3.0 - 2.0 * u);
+}
+
+vec3 compressToUnitGamutPreserveLuma(vec3 rgb) {
+    // One final output-gamut owner. Work from the signed RGB vector so negative
+    // outset components are compressed toward the same luminance instead of being
+    // clipped independently (which rotates hue). In-gamut values remain untouched.
+    if (any(isnan(rgb)) || any(isinf(rgb))) return vec3(0.0);
+    if(pc.rawJpegBaseVibrance<0.0) {
+        float y=lumaOf(rgb);
+        if(y<=0.0) return vec3(0.0);
+        if(y>=1.0) return vec3(1.0);
+        float high=max(rgb.r,max(rgb.g,rgb.b))-y;
+        float low=y-min(rgb.r,min(rgb.g,rgb.b));
+        float ratio=max(high/max(1e-8,1.0-y),low/max(1e-8,y));
+        if(ratio<=0.85) return rgb;
+        float t=ratio-0.85;
+        float mapped=0.85+0.15*t/(0.15+t);
+        return vec3(y)+(rgb-vec3(y))*(mapped/ratio);
+    }
+    float y = lumaOf(rgb);
+    if (!(y > 1.0e-8)) return vec3(0.0);
+    if (y > 1.0) {
+        rgb *= 1.0 / y;
+        y = 1.0;
+    }
+    float maximum = max(rgb.r, max(rgb.g, rgb.b));
+    float minimum = min(rgb.r, min(rgb.g, rgb.b));
+    if (maximum <= 1.0 && minimum >= 0.0) return rgb;
+
+    float positiveDeviation = max(0.0, maximum - y);
+    float negativeDeviation = max(0.0, y - minimum);
+    float authority = 1.0;
+    if (positiveDeviation > 1.0e-6) authority = min(authority, (1.0 - y) / positiveDeviation);
+    if (negativeDeviation > 1.0e-6) authority = min(authority, y / negativeDeviation);
+    authority = clamp(authority, 0.0, 1.0);
+    return clamp(vec3(y) + (rgb - vec3(y)) * authority, vec3(0.0), vec3(1.0));
+}
+
+float profileContrastCurve(float value, float signedControl) {
+    float v = clamp(value, 0.0, 1.0);
+    float factor = exp2(clamp(signedControl, -1.0, 1.0) * 0.75);
+    if (abs(factor - 1.0) < 1.0e-4) return v;
+    if (v < 0.5) return 0.5 * pow(max(0.0, 2.0 * v), factor);
+    return 1.0 - 0.5 * pow(max(0.0, 2.0 * (1.0 - v)), factor);
+}
+
+vec3 applyExplicitProfileToneContrast(vec3 rgb) {
+    float contrastControl = clamp(pc.profileContrast, -1.0, 1.0);
+    if (abs(contrastControl) < 1.0e-4) return rgb;
+    float y = max(0.0, lumaOf(rgb));
+    float mappedY = profileContrastCurve(y, contrastControl);
+    float scale = y > 1.0e-6 ? mappedY / y : 1.0;
+    return rgb * scale;
+}
+
+bool profileCreativeCarrierEncoded(float value) {
+    return value <= -1.5;
+}
+
+uint profileCreativePayload(float value) {
+    return uint(clamp(round(-value - 2.0), 0.0, 8388607.0));
+}
+
+float profileDecodeSigned8(uint code) {
+    int signedCode = int(code) - 128;
+    return signedCode >= 0
+            ? clamp(float(signedCode) / 127.0, 0.0, 1.0)
+            : clamp(float(signedCode) / 128.0, -1.0, 0.0);
+}
+
+float profileDecodedSaturation(float carrier) {
+    if (!profileCreativeCarrierEncoded(carrier)) return clamp(carrier, -1.0, 1.0);
+    return profileDecodeSigned8(profileCreativePayload(carrier) & 0xffu);
+}
+
+float profileDecodedPop(float carrier) {
+    if (!profileCreativeCarrierEncoded(carrier)) return 0.0;
+    return float((profileCreativePayload(carrier) >> 8u) & 0x7fu) / 127.0;
+}
+
+float profileDecodedColorRecovery(float carrier) {
+    if (!profileCreativeCarrierEncoded(carrier)) return 0.0;
+    return profileDecodeSigned8((profileCreativePayload(carrier) >> 15u) & 0xffu);
+}
+
+float profileColorRelativeSaturation(vec3 rgb) {
+    float maximum = max(rgb.r, max(rgb.g, rgb.b));
+    float minimum = min(rgb.r, min(rgb.g, rgb.b));
+    return clamp((maximum - minimum) / max(abs(maximum), 1.0e-4), 0.0, 1.0);
+}
+
+float profileColorChromaRange(vec3 rgb) {
+    return max(0.0, max(rgb.r, max(rgb.g, rgb.b)) - min(rgb.r, min(rgb.g, rgb.b)));
+}
+
+float profileColorLumaWindow(float y) {
+    return smoothstep(0.025, 0.12, y) * (1.0 - smoothstep(0.82, 0.98, y));
+}
+
+vec3 applyProfileColorRecovery(vec3 rgb, float signedControl) {
+    float control = clamp(signedControl, -1.0, 1.0);
+    if (abs(control) < 1.0e-4) return rgb;
+
+    float y = max(0.0, lumaOf(rgb));
+    float chroma = profileColorChromaRange(rgb);
+    float saturation = profileColorRelativeSaturation(rgb);
+    float evidence = smoothstep(0.012, 0.055, chroma);
+    float mutedHeadroom = 1.0 - smoothstep(0.40, 0.78, saturation);
+    float authority = control * evidence * mutedHeadroom * profileColorLumaWindow(y);
+    float stops = authority * (control >= 0.0 ? 0.48 : 0.36);
+    return vec3(y) + (rgb - vec3(y)) * exp2(stops);
+}
+
+float profilePopSourceLuma(int x, int y) {
+    return max(0.0, lumaOf(inputAt(x, y)));
+}
+
+vec3 applyProfilePop(vec3 rgb, float controlValue, ivec2 pixel) {
+    float control = clamp(controlValue, 0.0, 1.0);
+    // Exact neutral fast path: Pop=0 performs no neighbourhood reads.
+    if (control <= 1.0e-4) return rgb;
+
+    float shortSide = max(1.0, min(float(pc.frameWidth), float(pc.frameHeight)));
+    int nearRadius = int(clamp(floor(shortSide / 260.0 + 0.5), 3.0, 14.0));
+    int farRadius = int(clamp(floor(shortSide / 110.0 + 0.5), 8.0, 32.0));
+
+    float center = profilePopSourceLuma(pixel.x, pixel.y);
+    float n0 = profilePopSourceLuma(pixel.x, pixel.y - nearRadius);
+    float s0 = profilePopSourceLuma(pixel.x, pixel.y + nearRadius);
+    float w0 = profilePopSourceLuma(pixel.x - nearRadius, pixel.y);
+    float e0 = profilePopSourceLuma(pixel.x + nearRadius, pixel.y);
+    float n1 = profilePopSourceLuma(pixel.x, pixel.y - farRadius);
+    float s1 = profilePopSourceLuma(pixel.x, pixel.y + farRadius);
+    float w1 = profilePopSourceLuma(pixel.x - farRadius, pixel.y);
+    float e1 = profilePopSourceLuma(pixel.x + farRadius, pixel.y);
+
+    float nearBase = 0.25 * (n0 + s0 + w0 + e0);
+    float farBase = 0.25 * (n1 + s1 + w1 + e1);
+    float localBase = mix(farBase, nearBase, 0.62);
+    float evDetail = log2((center + 0.004) / (max(localBase, 0.0) + 0.004));
+
+    float localMin = min(center, min(min(n0, s0), min(w0, e0)));
+    localMin = min(localMin, min(min(n1, s1), min(w1, e1)));
+    float localMax = max(center, max(max(n0, s0), max(w0, e0)));
+    localMax = max(localMax, max(max(n1, s1), max(w1, e1)));
+    float localRange = max(0.0, localMax - localMin);
+    float structure = smoothstep(0.010, 0.075, localRange + 0.18 * abs(evDetail));
+    float scaleDrift = abs(nearBase - farBase);
+    float coherence = 1.0 - 0.55 * smoothstep(0.055, 0.22, scaleDrift);
+    float hardEdgeGuard = 1.0 - 0.72 * smoothstep(0.24, 0.62, localRange);
+
+    float y = max(0.0, lumaOf(rgb));
+    float shadowGuard = smoothstep(0.035, 0.13, y);
+    float highlightGuard = 1.0 - smoothstep(0.72, 0.965, y);
+    float toneWindow = shadowGuard * highlightGuard;
+    float noiseGuard = smoothstep(0.012, 0.050, localRange + 0.28 * center);
+    float authority = pow(control, 1.15) * structure * coherence * hardEdgeGuard *
+            toneWindow * noiseGuard;
+
+    float popEv = clamp(evDetail * 0.50 * authority, -0.18, 0.18);
+    float targetY = clamp(y * exp2(popEv), 0.0, 1.0);
+    float lumaScale = y > 1.0e-6 ? targetY / y : 1.0;
+    vec3 outRgb = rgb * clamp(lumaScale, 0.82, 1.22);
+
+    float outY = max(0.0, lumaOf(outRgb));
+    float chroma = profileColorChromaRange(outRgb);
+    float saturation = profileColorRelativeSaturation(outRgb);
+    float chromaEvidence = smoothstep(0.025, 0.12, chroma) *
+            (1.0 - smoothstep(0.62, 0.90, saturation));
+    float chromaGain = 1.0 + 0.055 * control * structure * toneWindow * chromaEvidence;
+    return vec3(outY) + (outRgb - vec3(outY)) * chromaGain;
+}
+
+vec3 applyProfileColor(vec3 rgb, ivec2 pixel) {
+    float y = max(0.0, lumaOf(rgb));
+    float saturation = profileColorRelativeSaturation(rgb);
+
+    // Default single-shot RAW opts out of automatic colour via the negative legacy carrier.
+    // Shared Spectra/merged RAW and YUV callers keep their existing behavior.
+    float toneLumaWeight = smoothstep(0.008, 0.07, y) * (1.0 - smoothstep(0.72, 0.98, y));
+    if (pc.isRawBayer != 0u && pc.rawJpegBaseVibrance >= 0.0) {
+        float saturationProtection = 1.0 - 0.45 * saturation;
+        float adaptiveSaturationBoost = 0.28 * toneLumaWeight * saturationProtection;
+        float adaptiveVibranceBoost = 0.14 * toneLumaWeight * (1.0 - 0.70 * saturation);
+        rgb = vec3(y) + (rgb - vec3(y)) *
+                (1.0 + adaptiveSaturationBoost + adaptiveVibranceBoost);
+    } else if (pc.isRawBayer == 0u) {
+        float midtoneWeight = smoothstep(0.04, 0.22, y) * (1.0 - smoothstep(0.68, 0.98, y));
+        float adaptiveVibranceLift = 0.125 * midtoneWeight * (1.0 - 0.65 * saturation);
+        rgb = vec3(y) + (rgb - vec3(y)) * (1.0 + adaptiveVibranceLift);
+    }
+
+    float saturationControl = profileDecodedSaturation(pc.profileSaturation);
+    float vibranceControl = clamp(pc.profileVibrance, -1.0, 1.0);
+    float colorRecoveryControl = profileDecodedColorRecovery(pc.profileSaturation);
+    float popControl = profileDecodedPop(pc.profileSaturation);
+
+    // Restore the exact pre-0208 RAW creative ordering/response: Vibrance then Saturation.
+    if (abs(vibranceControl) >= 1.0e-4) {
+        // Preserve the pre-0208 response exactly: protection is based on the original
+        // pre-automatic-boost saturation estimate, not a recomputed post-boost value.
+        float protection = clamp(1.0 - saturation, 0.0, 1.0);
+        float authority = vibranceControl >= 0.0
+                ? vibranceControl * (0.20 + 0.80 * protection)
+                : vibranceControl * (0.55 + 0.45 * protection);
+        rgb = vec3(y) + (rgb - vec3(y)) * exp2(authority * 0.90);
+    }
+    if (abs(saturationControl) >= 1.0e-4) {
+        rgb = vec3(y) + (rgb - vec3(y)) * exp2(saturationControl * 0.85);
+    }
+    if (abs(colorRecoveryControl) >= 1.0e-4) {
+        rgb = applyProfileColorRecovery(rgb, colorRecoveryControl);
+    }
+    if (popControl > 1.0e-4) {
+        rgb = applyProfilePop(rgb, popControl, pixel);
+    }
+    return compressToUnitGamutPreserveLuma(rgb);
+}
+
+// RAW zero-denoise baseline: mode 0 is only a resident hand-off that copies immutable
+// scene-linear RGB into workingRgb for downstream observers/tone. No denoise pixel owner exists.
+void runPreTonePreparation(uvec2 gid) {
+    if (gid.x >= pc.frameWidth || gid.y >= pc.frameHeight) return;
+    writeWorking(gid, inputAt(int(gid.x), int(gid.y)));
+}
+
+void writeSceneSample(uint sampleIndex) {
+    if (sampleIndex >= pc.sampleCount) return;
+    uint totalPixels = pc.frameWidth * pc.frameHeight;
+    uint pixelIndex = min(totalPixels - 1u, sampleIndex * max(1u, pc.sampleStep));
+    uint basePixel = pixelIndex * 3u;
+    uint base = sampleIndex * 3u;
+    compactData[base + 0u] = workingRgb[basePixel + 0u];
+    compactData[base + 1u] = workingRgb[basePixel + 1u];
+    compactData[base + 2u] = workingRgb[basePixel + 2u];
+}
+
+void writeDisplayCell(uvec2 gid) {
+    if (gid.x >= 32u || gid.y >= 24u) return;
+    uint gx = gid.x;
+    uint gy = gid.y;
+    int x0 = int(gx * pc.frameWidth / 32u);
+    int x1 = max(x0 + 1, int((gx + 1u) * pc.frameWidth / 32u));
+    int y0 = int(gy * pc.frameHeight / 24u);
+    int y1 = max(y0 + 1, int((gy + 1u) * pc.frameHeight / 24u));
+    float sum = 0.0;
+    for (int sy = 0; sy < 3; ++sy) {
+        int y = min(int(pc.frameHeight) - 1, y0 + (2 * sy + 1) * (y1 - y0) / 6);
+        for (int sx = 0; sx < 3; ++sx) {
+            int x = min(int(pc.frameWidth) - 1, x0 + (2 * sx + 1) * (x1 - x0) / 6);
+            sum += lumaOf(workingAt(x, y));
+        }
+    }
+    uint outIndex = pc.displayOffsetFloats + gy * 32u + gx;
+    compactData[outIndex] = sum / 9.0;
+}
+
+uint localToneMapWidth() { return (pc.frameWidth + 3u) / 4u; }
+uint localToneMapHeight() { return (pc.frameHeight + 3u) / 4u; }
+
+float telemetryFloat(uint index, float fallbackValue) {
+    float value = uintBitsToFloat(telemetry[index]);
+    return (isnan(value) || isinf(value)) ? fallbackValue : value;
+}
+
+// PHASE 10 / DELTA 0189 — true scene-referred Fast Local Laplacian reconstruction.
+//
+// The old implementation built a Gaussian pyramid but then propagated a sceneKey-driven EV
+// correction field. That made the coarsest level a hidden global exposure owner and did not
+// reconstruct remapped Laplacian coefficients. This path is now a genuine log2-luminance
+// Gaussian/Laplacian pyramid:
+//   G_l      = Gaussian log2(Y) level l
+//   L_l      = G_l - upsample(G_l+1)
+//   B_N      = broadGaussian(G_N)                (implicit final Gaussian / DC anchor)
+//   R_N      = B_N + remap(G_N - B_N)
+//   R_l      = upsample(R_l+1) + remap(L_l)
+//   delta_l  = R_l - G_l
+// Only signed local Laplacian bands are remapped. A constant/global offset has zero Laplacian
+// energy at every level, including the implicit broad base, so FLLF cannot create global EV.
+// Full-resolution RGB is changed only by one Ynew/Yold scalar ratio.
+//
+// Mode-specific push aliases used only by modes 10/11:
+// sampleStep=sourceOffset, sampleCount=destinationOffset, displayOffsetFloats=sourceWidth,
+// presenceReserved0=sourceHeight, ultraHdrSourceMapWidth=destinationWidth,
+// ultraHdrSourceMapHeight=destinationHeight.
+uint fllfSourceOffset() { return pc.sampleStep; }
+uint fllfDestinationOffset() { return pc.sampleCount; }
+uint fllfSourceWidth() { return max(1u, pc.displayOffsetFloats); }
+uint fllfSourceHeight() { return max(1u, pc.presenceReserved0); }
+uint fllfDestinationWidth() { return max(1u, pc.ultraHdrSourceMapWidth); }
+uint fllfDestinationHeight() { return max(1u, pc.ultraHdrSourceMapHeight); }
+
+float fllfSceneLogLumaAt(int x, int y) {
+    vec3 rgb = workingAt(x, y);
+    return log2(max(1.0e-6, lumaOf(rgb)));
+}
+
+float fllfParam(uint index, float fallbackValue) {
+    return telemetryFloat(index, fallbackValue);
+}
+
+float fllfGaussianAt(uint offset, uint width, uint height, int x, int y) {
+    int sx = clamp(x, 0, int(width) - 1);
+    int sy = clamp(y, 0, int(height) - 1);
+    return fllfGaussian[offset + uint(sy) * width + uint(sx)];
+}
+
+float fllfReconstructedAt(uint offset, uint width, uint height, int x, int y) {
+    int sx = clamp(x, 0, int(width) - 1);
+    int sy = clamp(y, 0, int(height) - 1);
+    return fllfCorrection[offset + uint(sy) * width + uint(sx)];
+}
+
+// Level 0 must be a real Gaussian reduction as well. The previous 2x2 box introduced a
+// different transfer function at the first octave and made the pyramid internally inconsistent.
+void buildFllfGaussianLevel0(uvec2 gid) {
+    uint dstW = fllfDestinationWidth();
+    uint dstH = fllfDestinationHeight();
+    if (gid.x >= dstW || gid.y >= dstH) return;
+    int cx = int(gid.x * 2u);
+    int cy = int(gid.y * 2u);
+    float sum = 0.0;
+    const float k[3] = float[3](1.0, 2.0, 1.0);
+    for (int j = -1; j <= 1; ++j) {
+        for (int i = -1; i <= 1; ++i) {
+            sum += k[i + 1] * k[j + 1] * fllfSceneLogLumaAt(cx + i, cy + j);
+        }
+    }
+    fllfGaussian[fllfDestinationOffset() + gid.y * dstW + gid.x] = sum * (1.0 / 16.0);
+}
+
+void buildFllfGaussianDownsample(uvec2 gid) {
+    uint srcW = fllfSourceWidth();
+    uint srcH = fllfSourceHeight();
+    uint dstW = fllfDestinationWidth();
+    uint dstH = fllfDestinationHeight();
+    if (gid.x >= dstW || gid.y >= dstH) return;
+    int cx = int(gid.x * 2u);
+    int cy = int(gid.y * 2u);
+    float sum = 0.0;
+    const float k[3] = float[3](1.0, 2.0, 1.0);
+    for (int j = -1; j <= 1; ++j) {
+        for (int i = -1; i <= 1; ++i) {
+            sum += k[i + 1] * k[j + 1] * fllfGaussianAt(
+                    fllfSourceOffset(), srcW, srcH, cx + i, cy + j);
+        }
+    }
+    fllfGaussian[fllfDestinationOffset() + gid.y * dstW + gid.x] = sum * (1.0 / 16.0);
+}
+
+void buildFllfGaussianNextLevel(uvec2 gid) {
+    buildFllfGaussianDownsample(gid);
+}
+
+float fllfBilinearGaussian(uint offset, uint width, uint height, vec2 p) {
+    ivec2 p0 = ivec2(floor(p));
+    vec2 f = fract(p);
+    float a = mix(fllfGaussianAt(offset, width, height, p0.x, p0.y),
+                  fllfGaussianAt(offset, width, height, p0.x + 1, p0.y), f.x);
+    float b = mix(fllfGaussianAt(offset, width, height, p0.x, p0.y + 1),
+                  fllfGaussianAt(offset, width, height, p0.x + 1, p0.y + 1), f.x);
+    return mix(a, b, f.y);
+}
+
+float fllfNodeDelta(uint offset, uint width, uint height, int x, int y) {
+    return fllfReconstructedAt(offset, width, height, x, y) -
+           fllfGaussianAt(offset, width, height, x, y);
+}
+
+// Joint upsampling is applied only to the accumulated tone delta, not to the original Gaussian
+// signal. This keeps the mathematical Gaussian/Laplacian decomposition intact while preventing a
+// correction from one side of a hard luminance edge from being interpolated onto the other side.
+float fllfJointDelta(
+        uint offset, uint width, uint height, vec2 p, float guideLog, float edgeStopEv) {
+    ivec2 p0 = ivec2(floor(p));
+    vec2 f = fract(p);
+    float spatial[4] = float[4](
+            (1.0 - f.x) * (1.0 - f.y),
+            f.x * (1.0 - f.y),
+            (1.0 - f.x) * f.y,
+            f.x * f.y);
+    ivec2 coord[4] = ivec2[4](
+            p0,
+            p0 + ivec2(1, 0),
+            p0 + ivec2(0, 1),
+            p0 + ivec2(1, 1));
+    float sigma = clamp(0.70 * edgeStopEv, 0.25, 0.65);
+    float inv2SigmaSq = 1.0 / max(2.0 * sigma * sigma, 1.0e-6);
+    float weighted = 0.0;
+    float weightSum = 0.0;
+    for (int i = 0; i < 4; ++i) {
+        float sampleLog = fllfGaussianAt(offset, width, height, coord[i].x, coord[i].y);
+        float d = sampleLog - guideLog;
+        float rangeW = exp(-d * d * inv2SigmaSq);
+        float w = spatial[i] * rangeW;
+        weighted += w * fllfNodeDelta(offset, width, height, coord[i].x, coord[i].y);
+        weightSum += w;
+    }
+    // Hard boundaries are allowed to reject every coarse contributor. Falling back to
+    // ordinary bilinear interpolation here would re-introduce exactly the cross-edge
+    // correction the range weights rejected. Zero delta is the safe/local identity.
+    return weightSum > 1.0e-6 ? weighted / weightSum : 0.0;
+}
+
+float fllfGaussianGradientEv(uint offset, uint width, uint height, int x, int y) {
+    float gx = 0.5 * (fllfGaussianAt(offset, width, height, x + 1, y) -
+                      fllfGaussianAt(offset, width, height, x - 1, y));
+    float gy = 0.5 * (fllfGaussianAt(offset, width, height, x, y + 1) -
+                      fllfGaussianAt(offset, width, height, x, y - 1));
+    return sqrt(max(0.0, gx * gx + gy * gy));
+}
+
+float fllfScalePixels(uint levelWidth, uint levelHeight) {
+    float sx = float(pc.frameWidth) / float(max(levelWidth, 1u));
+    float sy = float(pc.frameHeight) / float(max(levelHeight, 1u));
+    return max(1.0, 0.5 * (sx + sy));
+}
+
+// Remap one signed Laplacian coefficient. Negative coefficients represent a region darker than
+// its coarser surround; reducing their magnitude creates local lift. Positive coefficients create
+// local compression. The sign is never allowed to flip. Fine detail is nearly identity, medium /
+// broad spatial scales carry tone placement, and true spatial edges release back to identity.
+float fllfRemapBand(
+        float band, float fineLog, float gradientEv, uint levelWidth, uint levelHeight) {
+    float magnitude = abs(band);
+    float strength = clamp(fllfParam(8u, 0.0), 0.0, 0.92);
+    if (strength <= 1.0e-5 || magnitude <= 1.0e-6) return band;
+
+    float maxLiftEv = clamp(fllfParam(10u, 1.00), 0.0, 1.80);
+    float maxCompressEv = clamp(fllfParam(11u, 0.70), 0.0, 1.10);
+    float edgeStopEv = clamp(fllfParam(12u, 0.62), 0.40, 0.90);
+    float refinement = clamp(fllfParam(13u, 0.10), 0.0, 0.22);
+
+    float scalePx = fllfScalePixels(levelWidth, levelHeight);
+    float scaleStops = log2(max(scalePx, 1.0));
+    // Half-resolution level 0 intentionally carries almost no tone authority. Local tone ramps
+    // in from ~4 px and reaches full authority around 24-32 px, keeping texture/microcontrast out
+    // of the tone operator. Refinement can add a small amount of mid-scale participation only.
+    float scaleAuthority = smoothstep(1.65, 4.75, scaleStops);
+    scaleAuthority = clamp(scaleAuthority + refinement * 0.28 * smoothstep(1.25, 3.25, scaleStops),
+                           0.0, 1.0);
+
+    // Weak coefficients are detail/texture, not tone. Strong spatial edges are also preserved.
+    // Edge protection is driven by the spatial Gaussian gradient rather than band magnitude, so a
+    // broad dark or bright region can still be locally balanced without flattening hard borders.
+    float toneNeed = smoothstep(0.075, 0.34, magnitude);
+    float edge = smoothstep(0.52 * edgeStopEv, 1.18 * edgeStopEv, gradientEv);
+    // A confirmed hard edge is a strict local-tone ownership boundary. At full
+    // edge confidence the remap returns to identity instead of retaining 45% authority.
+    float edgeRelease = 1.0 - edge;
+
+    float localLuma = max(1.0e-6, exp2(fineLog));
+    float physicalSigmaY = max(0.0, fllfParam(19u, 0.0));
+    float scaleNoiseReduction = max(1.0, 0.72 * scalePx);
+    float sigmaYAtScale = physicalSigmaY / scaleNoiseReduction;
+    float localSnr = sigmaYAtScale > 1.0e-8 ? localLuma / sigmaYAtScale : 1.0e6;
+    float sigmaEvAtScale = sigmaYAtScale > 0.0
+            ? sigmaYAtScale / (max(localLuma, 1.0e-4) * 0.69314718056)
+            : 0.0;
+    float coherentBand = sigmaEvAtScale > 0.0
+            ? smoothstep(0.60 * sigmaEvAtScale, 2.20 * sigmaEvAtScale, magnitude)
+            : 1.0;
+
+    // Only a negative Laplacian band can create positive local lift. Noise/SNR guards therefore
+    // constrain that branch only; bright-region compression is safe and remains available.
+    float shadowLiftGate = band < 0.0
+            ? smoothstep(1.25, 3.75, localSnr) * mix(0.58, 1.0, coherentBand)
+            : 1.0;
+
+    float authority = clamp(strength * scaleAuthority * toneNeed * edgeRelease * shadowLiftGate,
+                            0.0, 0.94);
+    if (authority <= 1.0e-6) return band;
+
+    // Monotonic soft-knee compression of the Laplacian magnitude. It keeps coefficient sign and
+    // ordering intact; authority decides how far the coefficient moves toward the compressed
+    // target. A slightly stronger negative-band fraction gives shadows the intended local lift
+    // while PBR Neutral remains the sole final highlight/display shoulder owner.
+    float knee = mix(0.20, 0.34, clamp(scaleStops / 5.5, 0.0, 1.0));
+    float compressedMagnitude = knee * log(1.0 + magnitude / knee);
+    float targetMagnitude = mix(magnitude, compressedMagnitude, band < 0.0 ? 0.62 : 0.54);
+    float remappedMagnitude = mix(magnitude, targetMagnitude, authority);
+
+    float proposed = sign(band) * remappedMagnitude;
+    float delta = proposed - band;
+    delta = clamp(delta, -maxCompressEv, maxLiftEv);
+    float remapped = band + delta;
+    if (band > 0.0) remapped = max(0.0, remapped);
+    if (band < 0.0) remapped = min(0.0, remapped);
+    return remapped;
+}
+
+// The resident backend intentionally caps the stored pyramid at six levels. To keep broad local
+// tone from collapsing to only ~64-pixel structures, the coarsest stored Gaussian is decomposed
+// once more against an implicit 9x9 binomial Gaussian. This extends the local support without a
+// new buffer or CPU pass. The implicit broad base itself remains untouched, so DC/global exposure
+// is still an exact identity.
+float fllfBroadCoarseGaussian(uint offset, uint width, uint height, int x, int y) {
+    const float k[9] = float[9](1.0, 8.0, 28.0, 56.0, 70.0, 56.0, 28.0, 8.0, 1.0);
+    float centerLog = fllfGaussianAt(offset, width, height, x, y);
+    float edgeStopEv = clamp(fllfParam(12u, 0.62), 0.40, 0.90);
+    // Broad support must remain useful inside one tonal region, but a multi-stop object
+    // boundary may contribute essentially zero weight. There is deliberately no minimum
+    // range-weight floor: the centre sample itself guarantees a non-zero denominator.
+    float sigma = clamp(0.95 * edgeStopEv, 0.32, 0.72);
+    float inv2SigmaSq = 1.0 / max(2.0 * sigma * sigma, 1.0e-6);
+    float weighted = 0.0;
+    float weightSum = 0.0;
+    for (int j = -4; j <= 4; ++j) {
+        for (int i = -4; i <= 4; ++i) {
+            float sampleLog = fllfGaussianAt(offset, width, height, x + i, y + j);
+            float d = sampleLog - centerLog;
+            float rangeW = exp(-d * d * inv2SigmaSq);
+            float spatialW = k[i + 4] * k[j + 4];
+            float w = spatialW * rangeW;
+            weighted += sampleLog * w;
+            weightSum += w;
+        }
+    }
+    return weightSum > 1.0e-6 ? weighted / weightSum : centerLog;
+}
+
+void seedFllfCoarseCorrection(uvec2 gid) {
+    uint w = fllfDestinationWidth();
+    uint h = fllfDestinationHeight();
+    if (gid.x >= w || gid.y >= h) return;
+    uint offset = fllfDestinationOffset();
+    uint index = offset + gid.y * w + gid.x;
+    float coarseLog = fllfGaussian[index];
+    float broadBase = fllfBroadCoarseGaussian(offset, w, h, int(gid.x), int(gid.y));
+    float coarseBand = coarseLog - broadBase;
+    float gradientEv = fllfGaussianGradientEv(offset, w, h, int(gid.x), int(gid.y));
+    float remappedBand = fllfRemapBand(coarseBand, coarseLog, gradientEv, w, h);
+
+    // The broad base is an identity anchor. FLLF owns only local/multiscale
+    // redistribution: negative bands can still lift supported shadows and positive bands
+    // can still compress highlights, but no sceneKey-driven global/regional EV is hidden
+    // in the coarsest Gaussian. Global scene EV is a separate bounded authority.
+    fllfCorrection[index] = broadBase + remappedBand;
+}
+
+void seedFllfCorrection(uvec2 gid) {
+    seedFllfCoarseCorrection(gid);
+}
+
+void reconstructFllfCorrectionLevel(uvec2 gid) {
+    uint srcW = fllfSourceWidth();
+    uint srcH = fllfSourceHeight();
+    uint dstW = fllfDestinationWidth();
+    uint dstH = fllfDestinationHeight();
+    if (gid.x >= dstW || gid.y >= dstH) return;
+
+    vec2 coarseP = (vec2(gid) + vec2(0.5)) * vec2(srcW, srcH) /
+                   vec2(dstW, dstH) - vec2(0.5);
+    uint dstIndex = fllfDestinationOffset() + gid.y * dstW + gid.x;
+    float fineLog = fllfGaussian[dstIndex];
+    float coarseLog = fllfBilinearGaussian(fllfSourceOffset(), srcW, srcH, coarseP);
+    float laplacianBand = fineLog - coarseLog;
+
+    float edgeStopEv = clamp(fllfParam(12u, 0.62), 0.40, 0.90);
+    float coarseDelta = fllfJointDelta(
+            fllfSourceOffset(), srcW, srcH, coarseP, fineLog, edgeStopEv);
+    float gradientEv = fllfGaussianGradientEv(
+            fllfDestinationOffset(), dstW, dstH, int(gid.x), int(gid.y));
+    float remappedBand = fllfRemapBand(laplacianBand, fineLog, gradientEv, dstW, dstH);
+
+    // R_l = upsample(G_l+1) + accumulated coarse delta + remapped L_l.
+    // This is equivalent to upsample(R_l+1) + remapped L_l while joint-sampling only the
+    // correction delta, which avoids cross-edge tone leakage without changing the Gaussian base.
+    float reconstructedLog = coarseLog + coarseDelta + remappedBand;
+    fllfCorrection[dstIndex] = reconstructedLog;
+
+    float localDelta = remappedBand - laplacianBand;
+    if (gradientEv > 0.65 * edgeStopEv && abs(localDelta) < 0.25 * abs(laplacianBand)) {
+        atomicAdd(telemetry[15], 1u);
+    }
+}
+
+float sampleFllfFullResolutionCorrection(uvec2 gid) {
+    uint w = (pc.frameWidth + 1u) / 2u;
+    uint h = (pc.frameHeight + 1u) / 2u;
+    vec2 p = (vec2(gid) + vec2(0.5)) * 0.5 - vec2(0.5);
+    float guideLog = fllfSceneLogLumaAt(int(gid.x), int(gid.y));
+    float edgeStopEv = clamp(fllfParam(12u, 0.62), 0.40, 0.90);
+    float correctionEv = fllfJointDelta(0u, w, h, p, guideLog, edgeStopEv);
+
+    // Final cumulative ownership bounds. Per-level remapping can contribute at several spatial
+    // scales, but the sum can never exceed the policy's local lift/compression envelope.
+    float maxLiftEv = clamp(fllfParam(10u, 1.00), 0.0, 1.80);
+    float maxCompressEv = clamp(fllfParam(11u, 0.70), 0.0, 1.10);
+    correctionEv = clamp(correctionEv, -maxCompressEv, maxLiftEv);
+
+    // Do not turn unresolved sensor black/noise into visible grey. This gate is physical-SNR based
+    // only; there is deliberately no absolute rendered-black threshold and no sceneKey.
+    if (correctionEv > 0.0) {
+        float y = max(1.0e-6, exp2(guideLog));
+        float physicalSigmaY = max(0.0, fllfParam(19u, 0.0));
+        float snr = physicalSigmaY > 1.0e-8 ? y / physicalSigmaY : 1.0e6;
+        correctionEv *= smoothstep(0.65, 2.20, snr);
+    }
+    return correctionEv;
+}
+
+vec3 applyFllfLocalExposure(uvec2 gid, vec3 sceneRgb) {
+    float correctionEv = sampleFllfFullResolutionCorrection(gid);
+    if (abs(correctionEv) > 0.006) atomicAdd(telemetry[14], 1u);
+    if (((gid.x & 7u) == 0u) && ((gid.y & 7u) == 0u)) {
+        // Signed correction telemetry. Index 9 is no longer a sceneKey input after the DC/base
+        // ownership repair, so it becomes the positive-EV magnitude accumulator. Indices 45/47
+        // are reserved/zeroed transport slots. Index 16 counts negative samples; mean-absolute
+        // correction is rebuilt on CPU from the two signed magnitude sums. Sampling on an 8x8
+        // lattice keeps the uint32 accumulators safe even for very high-resolution sensors.
+        uint q = uint(round(min(0.999, abs(correctionEv)) * 1024.0));
+        if (correctionEv > 0.0) {
+            atomicAdd(telemetry[9], q);
+            atomicAdd(telemetry[47], 1u);
+        } else if (correctionEv < 0.0) {
+            atomicAdd(telemetry[45], q);
+            atomicAdd(telemetry[16], 1u);
+        }
+        atomicAdd(telemetry[18], 1u);
+    }
+    atomicMax(telemetry[17], floatBitsToUint(max(0.0, abs(correctionEv))));
+
+    // Strict luminance-ratio reconstruction, alpha = 1.0. FLLF changes Y only; the original RGB
+    // chromaticity is transported by one scalar Ynew/Yold multiplication.
+    float yOld = max(1.0e-6, lumaOf(sceneRgb));
+    float logYNew = log2(yOld) + correctionEv;
+    float yNew = max(1.0e-6, exp2(logYNew));
+    float ratio = yNew / yOld;
+    return sceneRgb * ratio;
+}
+
+const vec2 kLocalToneDirections[12] = vec2[12](
+    vec2(1.0, 0.0), vec2(-1.0, 0.0), vec2(0.0, 1.0), vec2(0.0, -1.0),
+    vec2(0.7071, 0.7071), vec2(-0.7071, 0.7071), vec2(0.7071, -0.7071), vec2(-0.7071, -0.7071),
+    vec2(0.9239, 0.3827), vec2(-0.3827, 0.9239), vec2(-0.9239, -0.3827), vec2(0.3827, -0.9239)
+);
+
+void buildLocalToneBase(uvec2 gid) {
+    uint mapWidth = localToneMapWidth();
+    uint mapHeight = localToneMapHeight();
+    if (gid.x >= mapWidth || gid.y >= mapHeight) return;
+
+    int centerX = min(int(pc.frameWidth) - 1, int(gid.x * 4u + 2u));
+    int centerY = min(int(pc.frameHeight) - 1, int(gid.y * 4u + 2u));
+    float centerLuma = max(1.0e-4, lumaOf(workingAt(centerX, centerY)) * pc.exposureGain);
+    float centerLog = log2(centerLuma + 0.003);
+    float weightedLog = centerLog * 2.25;
+    float weightSum = 2.25;
+
+    float minDim = max(1.0, min(float(pc.frameWidth), float(pc.frameHeight)));
+    float nearRadius = max(4.0, minDim / 240.0);
+    float farRadius = max(14.0, minDim / 68.0);
+    for (int i = 0; i < 12; ++i) {
+        float radius = i < 4 ? nearRadius : farRadius;
+        ivec2 offset = ivec2(round(kLocalToneDirections[i] * radius));
+        float neighborLuma = max(1.0e-4,
+                lumaOf(workingAt(centerX + offset.x, centerY + offset.y)) * pc.exposureGain);
+        float neighborLog = log2(neighborLuma + 0.003);
+        // Range weighting is the halo guard: an edge with a large luminance step contributes
+        // little to the local base even when it is spatially close.
+        float rangeWeight = exp(-1.55 * abs(neighborLog - centerLog));
+        float spatialWeight = i < 4 ? 0.78 : 0.46;
+        float weight = rangeWeight * spatialWeight;
+        weightedLog += neighborLog * weight;
+        weightSum += weight;
+    }
+    localToneBase[gid.y * mapWidth + gid.x] = max(0.0, exp2(weightedLog / max(weightSum, 1.0e-5)) - 0.003);
+}
+
+float localToneBaseAt(int x, int y) {
+    int mapWidth = int(localToneMapWidth());
+    int mapHeight = int(localToneMapHeight());
+    int sx = clamp(x, 0, mapWidth - 1);
+    int sy = clamp(y, 0, mapHeight - 1);
+    return localToneBase[uint(sy * mapWidth + sx)];
+}
+
+float sampleLocalToneBase(uvec2 gid) {
+    vec2 p = (vec2(gid) + vec2(0.5)) * 0.25 - vec2(0.5);
+    ivec2 p0 = ivec2(floor(p));
+    vec2 f = fract(p);
+    float b00 = localToneBaseAt(p0.x, p0.y);
+    float b10 = localToneBaseAt(p0.x + 1, p0.y);
+    float b01 = localToneBaseAt(p0.x, p0.y + 1);
+    float b11 = localToneBaseAt(p0.x + 1, p0.y + 1);
+    return mix(mix(b00, b10, f.x), mix(b01, b11, f.x), f.y);
+}
+
+vec3 applyLocalTone(uvec2 gid, vec3 exposedRgb) {
+    float strength = clamp(telemetryFloat(3u, 0.0), 0.0, 1.0);
+    if (strength <= 1.0e-4) return exposedRgb;
+    float sceneKey = clamp(telemetryFloat(4u, 0.155), 0.08, 0.20);
+    float maxLiftEv = clamp(telemetryFloat(5u, 0.25), 0.0, 1.5);
+    float maxCompressEv = clamp(telemetryFloat(6u, 0.15), 0.0, 1.0);
+    float centerLuma = max(1.0e-6, lumaOf(exposedRgb));
+    float localBase = max(0.006, sampleLocalToneBase(gid));
+    float requestedEv = clamp(log2(sceneKey / localBase), -maxCompressEv, maxLiftEv);
+
+    // Do not reveal black-level/noise texture as local brightness, and do not use positive local-tone
+    // gain to fight the global highlight shoulder. Negative local compression remains available
+    // for broad bright regions.
+    float deepBlackGuard = smoothstep(0.014, 0.055, centerLuma);
+    float positiveHighlightGuard = 1.0 - 0.88 * smoothstep(0.48, 0.90, centerLuma);
+    // Local tone should act only where the local base materially disagrees with the scene key. Without
+    // this need gate tiny positive/negative requests touched most of the frame and created haze.
+    float localNeedGate = smoothstep(0.045, 0.16, abs(requestedEv));
+    float authority = deepBlackGuard * localNeedGate *
+            (requestedEv > 0.0 ? positiveHighlightGuard : 1.0);
+    float appliedEv = requestedEv * strength * authority;
+    if (abs(appliedEv) > 0.01) atomicAdd(telemetry[7], 1u);
+    return exposedRgb * exp2(appliedEv);
+}
+
+// DELTA 0207 — bounded broad-shadow placement.
+// FLLF keeps its coarse/DC base at identity. Device validation shows that in dark interiors its
+// nominal lift envelope can be high while the mean correction stays near zero. This stage owns
+// broad dark tonal placement without becoming global EV: RGB ratios are preserved, true black is
+// pinned, and authority fades to identity before mids/highlights.
+vec3 applyBroadShadowPlacement(vec3 color) {
+    // Reuse only the already-authoritative adaptive FLLF envelope. When FLLF is bypassed these
+    // telemetry-backed parameters are zero, so this stage is exact identity as well.
+    float localLift = clamp(fllfParam(10u, 0.0), 0.0, 1.35);
+    float localStrength = clamp(fllfParam(8u, 0.0), 0.0, 0.92);
+    // Broad placement supplements the signed local Laplacian correction. Keep
+    // its independent lift below one half-stop instead of washing dark regions
+    // toward grey with a second nearly one-stop shadow lift.
+    float maxLiftEv = clamp(0.36 * localLift + 0.10 * localStrength - 0.05, 0.0, 0.50);
+    if (maxLiftEv <= 1.0e-5) return color;
+    float y = max(0.0, lumaOf(color));
+    if (y <= 1.0e-8) return color;
+    // A rational black anchor avoids the narrow linear-Y gate's extra acutance.
+    // Its logarithmic gain slope is bounded by maxLiftEv*ln(2)/2; black stays
+    // pinned and the mapping approaches identity continuously at the origin.
+    float blackGuard = y * y / (y * y + 0.024 * 0.024);
+    // Fade over luminance stops rather than a short linear interval. The old
+    // fade could collapse relative contrast to 0.007 at the allowed lift limit.
+    // This C2 window and the lift bound keep relative contrast above 0.72.
+    float t = clamp(log2(y / 0.05) / 3.32192809489, 0.0, 1.0);
+    float shadowWindow = 1.0 - t*t*t*(t*(t*6.0 - 15.0) + 10.0);
+    return color * exp2(maxLiftEv * blackGuard * shadowWindow);
+}
+
+// Display entrance only: retain Y and the RGB opponent direction while reaching
+// Khronos' nonnegative Rec.709 input cone. HDR values above one remain untouched.
+vec3 mapSceneToKhronosInput(vec3 rgb) {
+    if (any(isnan(rgb)) || any(isinf(rgb))) return vec3(0.0);
+    float minimum = min(rgb.r, min(rgb.g, rgb.b));
+    if (minimum >= 0.0) return rgb;
+    float y = lumaOf(rgb);
+    if (!(y > 1.0e-7)) return vec3(0.0);
+    float scale = clamp(y / max(y - minimum, 1.0e-8), 0.0, 1.0);
+    return max(vec3(y) + (rgb - vec3(y)) * scale, vec3(0.0));
+}
+
+// Shadow-neutral Khronos PBR Neutral display mapper.
+// The reference minimum-channel offset is retained as shoulder preparation, but no longer
+// re-crushes the entire shadow range. It fades in only as the highlight shoulder approaches.
+vec3 pbrNeutralToneMapping(vec3 color) {
+    const float startCompression = 0.76;
+    const float desaturation = 0.15;
+    const float shoulderPrepStart = 0.60;
+    color = max(color, vec3(0.0));
+
+    float inputPeak = max(color.r, max(color.g, color.b));
+    float x = min(color.r, min(color.g, color.b));
+    float canonicalOffset = x < 0.08 ? x - 6.25 * x * x : 0.04;
+    float shoulderPrepAuthority = smoothstep(shoulderPrepStart, startCompression, inputPeak);
+    color -= vec3(canonicalOffset * shoulderPrepAuthority);
+
+    float peak = max(color.r, max(color.g, color.b));
+    if (peak < startCompression) return color;
+    const float d = 1.0 - startCompression;
+    float newPeak = 1.0 - d * d / (peak + d - startCompression);
+    color *= newPeak / max(peak, 1.0e-8);
+    float g = 1.0 - 1.0 / (desaturation * (peak - newPeak) + 1.0);
+    return mix(color, vec3(newPeak), g);
+}
+
+// Single-shot RAW: wider shoulder, preserving legacy Spectra/YUV arithmetic above.
+vec3 softHighlightTone(vec3 color) {
+    const float startCompression = 0.60;
+    color = max(color, vec3(0.0));
+    float inputPeak = max(color.r, max(color.g, color.b));
+    float x = min(color.r, min(color.g, color.b));
+    float offset = (x < 0.08 ? x - 6.25*x*x : 0.04) * smoothstep(0.44, 0.60, inputPeak);
+    color -= vec3(offset);
+    float peak = max(color.r, max(color.g, color.b));
+    if (peak < startCompression) return color;
+    const float transition=1.0, width=0.10, slope=0.12, white=2.4;
+    float join=transition+width, atJoin=0.8+width*(0.25+slope)*0.5;
+    float atWhite=atJoin+slope*(white-join), tail=max(0.0,peak-white), t=peak-transition;
+    float mapped=peak<transition ? 1.0-0.16/(peak-0.20)
+        : peak<join ? 0.8+0.25*t-(0.25-slope)*t*t/(2.0*width)
+        : peak<=white ? atJoin+slope*(peak-join)
+        : atWhite+(1.0-atWhite)*tail/(tail+(1.0-atWhite)/slope);
+    vec3 source=color;
+    color *= mapped / max(peak, 1.0e-8);
+    float g = 1.0 - 1.0/(0.15*(peak-mapped)+1.0);
+    color=mix(color,vec3(mapped),g);
+    float y=lumaOf(source), yt=y-transition, yTail=max(0.0,y-white);
+    float mappedY=y<startCompression ? y : y<transition ? 1.0-0.16/(y-0.20)
+        : y<join ? 0.8+0.25*yt-(0.25-slope)*yt*yt/(2.0*width)
+        : y<=white ? atJoin+slope*(y-join)
+        : atWhite+(1.0-atWhite)*yTail/(yTail+(1.0-atWhite)/slope);
+    float yg=1.0-1.0/(0.15*max(0.0,y-mappedY)+1.0);
+    vec3 lumaTone=mix(source*(mappedY/max(y,1e-8)),vec3(mappedY),yg);
+    return mix(color,lumaTone,smoothstep(1.0,1.2,peak));
+}
+
+vec3 applyToneLookLut(vec3 rgb) {
+    float inputLuma = max(1.0e-6, lumaOf(rgb));
+    float lutIdxF = clamp(inputLuma * 4095.0, 0.0, 4095.0);
+    uint lutIdx = uint(lutIdxF);
+    float frac = lutIdxF - float(lutIdx);
+    uint nextIdx = min(4095u, lutIdx + 1u);
+    float curvedLuma = mix(
+            toneLut[lutIdx * 2u + 0u],
+            toneLut[nextIdx * 2u + 0u],
+            frac);
+    // Entry +1 is retained for capture diagnostics/legacy YUV use. RAW output uses the same
+    // luminance LUT that IspCore built from black/contrast/range controls + user curves.
+    float scale = curvedLuma / inputLuma;
+    // Phase 10: do not perform output-gamut compression inside the tone-look stage.
+    // applyProfileColor() is the single final display-gamut owner after optional explicit
+    // profile color controls, avoiding two consecutive output-gamut compressions.
+    return rgb * scale;
+}
+
+// Phase 9: the former RAW post-tone magenta/near-white neutralizer remains retired. Sensor
+// clipping is owned upstream in the source-RAW domain; no display-stage heuristic may infer it.
+// YUV retains its separate presentation heuristic because it has no RAW sensor-domain evidence.
+
+void runTone(uvec2 gid) {
+    if (gid.x >= pc.frameWidth || gid.y >= pc.frameHeight) return;
+    uint base = (gid.y * pc.frameWidth + gid.x) * 3u;
+    vec3 rgb = vec3(workingRgb[base + 0u], workingRgb[base + 1u], workingRgb[base + 2u]);
+    if (pc.isRawBayer != 0u) {
+        // RAW production order:
+        // calibrated scene-linear -> log2(Y) FLLF -> bounded broad-shadow placement ->
+        // explicit profile Exposure -> shadow-neutral PBR Neutral -> explicit tonal ranges/curves ->
+        // explicit profile colour -> one final gamut owner.
+        if (pc.presenceReserved0 != 0u) rgb = applyFllfLocalExposure(gid, rgb);
+        rgb = applyBroadShadowPlacement(rgb);
+        rgb *= max(0.0, pc.exposureGain);
+        vec3 preKhronos = rgb;
+        if (pc.rawJpegBaseVibrance < 0.0) rgb = mapSceneToKhronosInput(rgb);
+        rgb = pc.rawJpegBaseVibrance < 0.0 ? softHighlightTone(rgb) : pbrNeutralToneMapping(rgb);
+        if (pc.rawJpegBaseVibrance < 0.0 && max(preKhronos.r, max(preKhronos.g, preKhronos.b)) >= 0.8) {
+            atomicAdd(telemetry[56], 1u);
+            float compression = max(0.0, lumaOf(preKhronos) - lumaOf(rgb));
+            atomicMax(telemetry[57], floatBitsToUint(compression));
+        }
+        rgb = applyToneLookLut(rgb);
+        rgb = applyExplicitProfileToneContrast(rgb);
+        rgb = applyProfileColor(rgb, ivec2(gid));
+    } else {
+        rgb *= pc.exposureGain;
+        rgb = applyLocalTone(gid, rgb);
+        // YUV capture path (already ISP-tonemapped by HAL)
+        float preShoulderY = max(1.0e-6, lumaOf(rgb));
+        float maxRGB = max(rgb.r, max(rgb.g, rgb.b));
+        float minRGB = min(rgb.r, min(rgb.g, rgb.b));
+        bool nearWhiteClipped = preShoulderY > 0.82 && maxRGB > 0.95 && minRGB > 0.65;
+        bool magentaClip = rgb.r > 0.85 && rgb.b > 0.85 && rgb.g < min(rgb.r, rgb.b) - 0.10 && preShoulderY > 0.60;
+        bool neutralized = false;
+        if (nearWhiteClipped || magentaClip) {
+            float severity = clamp((maxRGB - 0.85) / 0.15, 0.0, 1.0);
+            float t = 0.5 + 0.45 * severity;
+            rgb = mix(rgb, vec3(preShoulderY), t);
+            neutralized = true;
+            atomicAdd(telemetry[1], 1u);
+        }
+
+        float postNeutralY = neutralized ? max(1.0e-6, lumaOf(rgb)) : preShoulderY;
+        float shoulderStart = clamp(pc.shoulderStart, 0.50, 0.85);
+        float shoulderStrength = clamp(pc.shoulderStrength, 0.50, 2.50);
+        float lookLuma = postNeutralY;
+        if (postNeutralY > shoulderStart) {
+            float headroom = 1.0 - shoulderStart;
+            float excess = postNeutralY - shoulderStart;
+            float mappedY = shoulderStart + headroom * excess /
+                    (excess + headroom * shoulderStrength);
+            rgb *= mappedY / postNeutralY;
+            lookLuma = mappedY;
+        }
+
+        float mappedMaximum = max(rgb.r, max(rgb.g, rgb.b));
+        if (mappedMaximum > 1.0) {
+            rgb *= 1.0 / mappedMaximum;
+            lookLuma = max(1.0e-6, lumaOf(rgb));
+        }
+
+        float lutIdxF = clamp(lookLuma * 4095.0, 0.0, 4095.0);
+        uint lutIdx = uint(lutIdxF);
+        float frac = lutIdxF - float(lutIdx);
+        uint nextIdx = min(4095u, lutIdx + 1u);
+        float curvedLuma = mix(toneLut[lutIdx * 2u + 0u], toneLut[nextIdx * 2u + 0u], frac);
+        float safeMidtoneGate = mix(toneLut[lutIdx * 2u + 1u], toneLut[nextIdx * 2u + 1u], frac);
+        rgb *= curvedLuma / max(lookLuma, 1.0e-6);
+
+        float finalLuma = curvedLuma;
+        float finalMax = max(rgb.r, max(rgb.g, rgb.b));
+        float finalMin = min(rgb.r, min(rgb.g, rgb.b));
+        float relativeChroma = (finalMax - finalMin) / max(finalMax, 0.02);
+        float requestedSaturationFactor = 1.0;
+        if (!neutralized) {
+            float shadowGate = smoothstepFast(0.08, 1.0 / (0.22 - 0.08), finalLuma);
+            float highlightGate = 1.0 - smoothstepFast(0.70, 1.0 / (0.90 - 0.70), finalLuma);
+            float colorGate = 1.0 - 0.40 * smoothstepFast(0.30, 1.0 / (0.70 - 0.30), relativeChroma);
+            requestedSaturationFactor = 1.0 + 0.05 * shadowGate * highlightGate * colorGate;
+        }
+        float positiveDeviation = max(0.0, finalMax - finalLuma);
+        float negativeDeviation = max(0.0, finalLuma - finalMin);
+        float highlightLimit = positiveDeviation > 1.0e-6 ? (1.0 - finalLuma) / positiveDeviation : requestedSaturationFactor;
+        float shadowLimit = negativeDeviation > 1.0e-6 ? finalLuma / negativeDeviation : requestedSaturationFactor;
+        float saturationFactor = max(1.0, min(requestedSaturationFactor, min(highlightLimit, shadowLimit)));
+        rgb = max(vec3(0.0), vec3(finalLuma) + (rgb - vec3(finalLuma)) * saturationFactor);
+        rgb = applyExplicitProfileToneContrast(rgb);
+        rgb = applyProfileColor(rgb, ivec2(gid));
+    }
+
+    workingRgb[base + 0u] = rgb.r;
+    workingRgb[base + 1u] = rgb.g;
+    workingRgb[base + 2u] = rgb.b;
+}
+
+
+
+vec2 portraitUprightUv(vec2 sourceUv) {
+    uint rotation = pc.portraitMaskRotationDegrees % 360u;
+    if (rotation == 90u) return vec2(1.0 - sourceUv.y, sourceUv.x);
+    if (rotation == 180u) return vec2(1.0 - sourceUv.x, 1.0 - sourceUv.y);
+    if (rotation == 270u) return vec2(sourceUv.y, 1.0 - sourceUv.x);
+    return sourceUv;
+}
+
+float portraitMaskRaw(vec2 sourceUv) {
+    if (pc.portraitEnabled == 0u || pc.portraitMaskWidth < 2u || pc.portraitMaskHeight < 2u) return 0.0;
+    vec2 uv = portraitUprightUv(clamp(sourceUv, vec2(0.0), vec2(1.0)));
+    vec2 boundsMin = vec2(pc.portraitTargetLeft, pc.portraitTargetTop);
+    vec2 boundsMax = vec2(pc.portraitTargetRight, pc.portraitTargetBottom);
+    vec2 span = max(boundsMax - boundsMin, vec2(1.0e-6));
+    vec2 local = (uv - boundsMin) / span;
+    if (local.x < 0.0 || local.x > 1.0 || local.y < 0.0 || local.y > 1.0) return 0.0;
+    vec2 p = clamp(local, vec2(0.0), vec2(1.0)) *
+            vec2(float(pc.portraitMaskWidth - 1u), float(pc.portraitMaskHeight - 1u));
+    uvec2 p0 = uvec2(floor(p));
+    uvec2 p1 = min(p0 + uvec2(1u), uvec2(pc.portraitMaskWidth - 1u, pc.portraitMaskHeight - 1u));
+    vec2 f = fract(p);
+    float m00 = portraitMask[p0.y * pc.portraitMaskWidth + p0.x];
+    float m10 = portraitMask[p0.y * pc.portraitMaskWidth + p1.x];
+    float m01 = portraitMask[p1.y * pc.portraitMaskWidth + p0.x];
+    float m11 = portraitMask[p1.y * pc.portraitMaskWidth + p1.x];
+    return clamp(mix(mix(m00, m10, f.x), mix(m01, m11, f.x), f.y), 0.0, 1.0);
+}
+
+float portraitAlpha(vec2 sourceUv) {
+    if (pc.portraitEnabled == 0u) return 0.0;
+    vec2 texel = vec2(1.25 / max(float(pc.frameWidth), 1.0),
+                      1.25 / max(float(pc.frameHeight), 1.0));
+    float c = portraitMaskRaw(sourceUv);
+    float sum = c * 2.0;
+    sum += portraitMaskRaw(sourceUv + vec2(texel.x, 0.0));
+    sum += portraitMaskRaw(sourceUv - vec2(texel.x, 0.0));
+    sum += portraitMaskRaw(sourceUv + vec2(0.0, texel.y));
+    sum += portraitMaskRaw(sourceUv - vec2(0.0, texel.y));
+    float refined = sum / 6.0;
+    float feathered = smoothstep(0.16, 0.70, refined);
+    float confidentCore = smoothstep(0.52, 0.90, c);
+    return clamp(max(feathered, confidentCore), 0.0, 1.0);
+}
+
+float portraitDistanceFromTarget(vec2 sourceUv) {
+    vec2 uv = portraitUprightUv(sourceUv);
+    vec2 lo = vec2(pc.portraitTargetLeft, pc.portraitTargetTop);
+    vec2 hi = vec2(pc.portraitTargetRight, pc.portraitTargetBottom);
+    vec2 d = max(max(lo - uv, uv - hi), vec2(0.0));
+    return length(d);
+}
+
+const vec2 kPortraitPoisson[12] = vec2[12](
+    vec2(-0.326, -0.406), vec2(-0.840, -0.074), vec2(-0.696, 0.457),
+    vec2(-0.203, 0.621), vec2(0.962, -0.195), vec2(0.473, -0.480),
+    vec2(0.519, 0.767), vec2(0.185, -0.893), vec2(0.507, 0.064),
+    vec2(0.896, 0.412), vec2(-0.322, -0.933), vec2(-0.792, -0.598)
+);
+
+void buildPortraitBlur(uvec2 gid) {
+    if (gid.x >= pc.frameWidth || gid.y >= pc.frameHeight) return;
+    vec2 uv = (vec2(gid) + vec2(0.5)) / vec2(pc.frameWidth, pc.frameHeight);
+    float alpha = portraitAlpha(uv);
+    vec3 original = workingAt(int(gid.x), int(gid.y));
+    uint outBase = (gid.y * pc.frameWidth + gid.x) * 3u;
+    if (alpha >= 0.985) {
+        portraitBlurRgb[outBase + 0u] = original.r;
+        portraitBlurRgb[outBase + 1u] = original.g;
+        portraitBlurRgb[outBase + 2u] = original.b;
+        return;
+    }
+    float minDim = max(1.0, min(float(pc.frameWidth), float(pc.frameHeight)));
+    float distanceGain = mix(0.58, 1.0, smoothstep(0.015, 0.22, portraitDistanceFromTarget(uv)));
+    float radiusPx = clamp(minDim * 0.0125 * distanceGain, 3.0, 30.0);
+    vec2 radiusUv = vec2(radiusPx / float(pc.frameWidth), radiusPx / float(pc.frameHeight));
+    vec3 sum = original * (1.0 - alpha) * 0.7;
+    float weightSum = (1.0 - alpha) * 0.7;
+    for (int i = 0; i < 12; ++i) {
+        vec2 sampleUv = clamp(uv + kPortraitPoisson[i] * radiusUv, vec2(0.0), vec2(1.0));
+        float sampleAlpha = portraitAlpha(sampleUv);
+        float backgroundWeight = 1.0 - smoothstep(0.22, 0.68, sampleAlpha);
+        ivec2 sp = ivec2(clamp(sampleUv * vec2(pc.frameWidth, pc.frameHeight),
+                               vec2(0.0), vec2(float(pc.frameWidth - 1u), float(pc.frameHeight - 1u))));
+        float radialWeight = 1.0 - 0.24 * length(kPortraitPoisson[i]);
+        float w = max(0.0, backgroundWeight * radialWeight);
+        sum += workingAt(sp.x, sp.y) * w;
+        weightSum += w;
+    }
+    vec3 blurred = weightSum > 1.0e-5 ? sum / weightSum : original;
+    portraitBlurRgb[outBase + 0u] = blurred.r;
+    portraitBlurRgb[outBase + 1u] = blurred.g;
+    portraitBlurRgb[outBase + 2u] = blurred.b;
+}
+
+void compositePortrait(uvec2 gid) {
+    if (gid.x >= pc.frameWidth || gid.y >= pc.frameHeight) return;
+    vec2 uv = (vec2(gid) + vec2(0.5)) / vec2(pc.frameWidth, pc.frameHeight);
+    float alpha = portraitAlpha(uv);
+    uint base = (gid.y * pc.frameWidth + gid.x) * 3u;
+    vec3 original = vec3(workingRgb[base + 0u], workingRgb[base + 1u], workingRgb[base + 2u]);
+    vec3 blurred = vec3(portraitBlurRgb[base + 0u], portraitBlurRgb[base + 1u], portraitBlurRgb[base + 2u]);
+    vec3 outRgb = mix(blurred, original, alpha);
+    workingRgb[base + 0u] = outRgb.r;
+    workingRgb[base + 1u] = outRgb.g;
+    workingRgb[base + 2u] = outRgb.b;
+}
+
+const float kUltraHdrOffset = 0.015625; // 1/64 per Android Ultra HDR guidance.
+const float kUltraHdrMaxLog2Boost = 4.0; // hard safety ceiling: 16x content boost.
+
+float ultraHdrAverageLumaFromWorking(uint mapX, uint mapY, bool applyExposure) {
+    uint x0 = mapX * 4u;
+    uint y0 = mapY * 4u;
+    float sum = 0.0;
+    uint count = 0u;
+    for (uint dy = 0u; dy < 4u; ++dy) {
+        uint y = y0 + dy;
+        if (y >= pc.frameHeight) break;
+        for (uint dx = 0u; dx < 4u; ++dx) {
+            uint x = x0 + dx;
+            if (x >= pc.frameWidth) break;
+            vec3 rgb = workingAt(int(x), int(y));
+            if (applyExposure) rgb *= pc.exposureGain;
+            sum += max(0.0, lumaOf(rgb));
+            count++;
+        }
+    }
+    return count > 0u ? sum / float(count) : 0.0;
+}
+
+void captureUltraHdrAuthority(uvec2 gid) {
+    if (gid.x >= pc.ultraHdrSourceMapWidth || gid.y >= pc.ultraHdrSourceMapHeight) return;
+    uint index = gid.y * pc.ultraHdrSourceMapWidth + gid.x;
+    ultraHdrLuma[index] = clamp(ultraHdrAverageLumaFromWorking(gid.x, gid.y, true), 0.0, 16.0);
+}
+
+void analyzeUltraHdrGain(uvec2 gid) {
+    if (gid.x >= pc.ultraHdrSourceMapWidth || gid.y >= pc.ultraHdrSourceMapHeight) return;
+    uint index = gid.y * pc.ultraHdrSourceMapWidth + gid.x;
+    float hdrY = max(0.0, ultraHdrLuma[index]);
+    float sdrY = clamp(ultraHdrAverageLumaFromWorking(gid.x, gid.y, false), 0.0, 1.0);
+    float gain = max(1.0, (hdrY + kUltraHdrOffset) / (sdrY + kUltraHdrOffset));
+    float logGain = clamp(log2(gain), 0.0, kUltraHdrMaxLog2Boost);
+    ultraHdrGainLog[index] = logGain;
+    atomicMax(telemetry[2], uint(round(logGain * 65536.0)));
+}
+
+uvec2 ultraHdrOutputToSource(uint x, uint y) {
+    uint rotation = pc.outputRotationDegrees % 360u;
+    if (rotation == 90u) {
+        return uvec2(y, pc.ultraHdrSourceMapHeight - 1u - x);
+    }
+    if (rotation == 180u) {
+        return uvec2(pc.ultraHdrSourceMapWidth - 1u - x,
+                     pc.ultraHdrSourceMapHeight - 1u - y);
+    }
+    if (rotation == 270u) {
+        return uvec2(pc.ultraHdrSourceMapWidth - 1u - y, x);
+    }
+    return uvec2(x, y);
+}
+
+
+// Phase 11 — scene-linear capture detail recovery.
+// A bounded one-step Van-Cittert inverse-PSF proposal is formed from immutable workingRgb and
+// written to the existing full-resolution scratch buffer (binding 9). A second pointwise pass
+// commits the proposal, so neighborhood reads never race in-place. The stage is luminance-only
+// in authority: RGB is scaled by one scalar to preserve hue/demosaic character.
+vec3 linearDetailScratchAt(int x, int y) {
+    int sx = clamp(x, 0, int(pc.frameWidth) - 1);
+    int sy = clamp(y, 0, int(pc.frameHeight) - 1);
+    uint base = (uint(sy) * pc.frameWidth + uint(sx)) * 3u;
+    return vec3(portraitBlurRgb[base + 0u], portraitBlurRgb[base + 1u], portraitBlurRgb[base + 2u]);
+}
+
+void writeLinearDetailScratch(uvec2 gid, vec3 v) {
+    uint base = (gid.y * pc.frameWidth + gid.x) * 3u;
+    portraitBlurRgb[base + 0u] = v.r;
+    portraitBlurRgb[base + 1u] = v.g;
+    portraitBlurRgb[base + 2u] = v.b;
+}
+
+float linearDetailLocalSigma(float luma) {
+    float sigmaRef = max(telemetryFloat(27u, 0.0), 1.0e-7);
+    float referenceSignal = max(telemetryFloat(28u, 0.10), 1.0e-4);
+    float shotFraction = clamp(telemetryFloat(29u, 0.5), 0.0, 1.0);
+    // S/O: read noise is signal-independent; shot noise scales with local signal. The pre-tone
+    // sigma was already propagated through WB+CCM on CPU, so only the S/O signal dependence is
+    // reconstructed locally here rather than re-applying WB/CCM gains a second time.
+    float signalRatio = clamp(max(luma, 0.0) / referenceSignal, 0.05, 16.0);
+    float varianceScale = (1.0 - shotFraction) + shotFraction * signalRatio;
+    return sigmaRef * sqrt(max(varianceScale, 0.05));
+}
+
+void proposeLinearDetailRecovery(uvec2 gid) {
+    if (gid.x >= pc.frameWidth || gid.y >= pc.frameHeight) return;
+    atomicAdd(telemetry[31], 1u);
+
+    int x = int(gid.x);
+    int y = int(gid.y);
+    vec3 centerRgb = workingAt(x, y);
+    float centerY = max(0.0, lumaOf(centerRgb));
+
+    float authority = clamp(telemetryFloat(20u, 0.0), 0.0, 0.62);
+    float radius = clamp(telemetryFloat(21u, 1.0), 0.50, 3.0);
+    float detailEmphasis = clamp(telemetryFloat(22u, 0.25), 0.0, 1.0);
+    float masking = clamp(telemetryFloat(23u, 0.0), 0.0, 1.0);
+    float minResidualSnr = max(0.5, telemetryFloat(24u, 1.5));
+    float minGradientSnr = max(0.4, telemetryFloat(25u, 1.0));
+    float hardHaloLimit = clamp(telemetryFloat(26u, 0.02), 0.004, 0.05);
+    float modelConfidence = clamp(telemetryFloat(30u, 0.0), 0.0, 1.0);
+
+    float l = lumaOf(workingAt(x - 1, y));
+    float r = lumaOf(workingAt(x + 1, y));
+    float u = lumaOf(workingAt(x, y - 1));
+    float d = lumaOf(workingAt(x, y + 1));
+    float ul = lumaOf(workingAt(x - 1, y - 1));
+    float ur = lumaOf(workingAt(x + 1, y - 1));
+    float dl = lumaOf(workingAt(x - 1, y + 1));
+    float dr = lumaOf(workingAt(x + 1, y + 1));
+
+    float radiusT = clamp((radius - 0.50) / 2.50, 0.0, 1.0);
+    // Compact symmetric PSF. Larger Radius transfers modest weight from centre to neighbours;
+    // no lens-identity constant or device branch is introduced.
+    float axialWeight = mix(0.085, 0.125, radiusT);
+    float diagonalWeight = mix(0.035, 0.060, radiusT);
+    float centerWeight = max(0.05, 1.0 - 4.0 * axialWeight - 4.0 * diagonalWeight);
+    float psfBlur = centerWeight * centerY + axialWeight * (l + r + u + d) +
+            diagonalWeight * (ul + ur + dl + dr);
+
+    // Optional broader optical-radius evidence. It does not become a second sharpening band;
+    // it only refines the single inverse-PSF residual when Radius asks for a wider capture PSF.
+    float broadCross = 0.25 * (lumaOf(workingAt(x - 2, y)) + lumaOf(workingAt(x + 2, y)) +
+                               lumaOf(workingAt(x, y - 2)) + lumaOf(workingAt(x, y + 2)));
+    float broadBlur = mix(psfBlur, 0.58 * psfBlur + 0.42 * broadCross, radiusT * 0.55);
+    float residual = centerY - broadBlur;
+
+    float gx = 0.5 * (r - l);
+    float gy = 0.5 * (d - u);
+    float gradient = sqrt(max(0.0, gx * gx + gy * gy));
+    float localSigma = linearDetailLocalSigma(centerY);
+    float residualSnr = abs(residual) / max(localSigma, 1.0e-7);
+    float gradientSnr = gradient / max(localSigma, 1.0e-7);
+
+    float noiseGate = smoothstep(minResidualSnr, minResidualSnr + 1.25, residualSnr);
+    float edgeGate = smoothstep(minGradientSnr, minGradientSnr + 1.50, gradientSnr);
+    float directionalCoherence = max(abs(gx), abs(gy)) / max(abs(gx) + abs(gy), 1.0e-6);
+    float coherenceGate = smoothstep(0.55, 0.88, directionalCoherence);
+    float maskingGate = mix(1.0, edgeGate, masking);
+    float localAuthority = authority * modelConfidence * noiseGate * edgeGate * coherenceGate * maskingGate;
+
+    if (edgeGate > 0.25 && noiseGate > 0.05) atomicAdd(telemetry[33], 1u);
+    if (noiseGate < 0.05) atomicAdd(telemetry[34], 1u);
+
+    float localMin = min(centerY, min(min(min(l, r), min(u, d)), min(min(ul, ur), min(dl, dr))));
+    float localMax = max(centerY, max(max(max(l, r), max(u, d)), max(max(ul, ur), max(dl, dr))));
+    float localRange = max(0.0, localMax - localMin);
+
+    // Detail control changes the inverse-PSF step, never the noise significance threshold.
+    // Back off only when the scene-linear working value approaches this backend's existing
+    // hard 4.0 storage headroom. This is a domain guard, not an ISO/device highlight heuristic.
+    float highlightHeadroomGate = smoothstep(0.02, 0.18, 4.0 - localMax);
+    float inverseStep = mix(0.82, 1.18, detailEmphasis);
+    float delta = residual * localAuthority * highlightHeadroomGate * inverseStep;
+
+    // Hard ringing/halo envelope: the proposal may move only a small fraction beyond observed
+    // local extrema, and never by more than the global scene-linear cap from policy.
+    float adaptiveHaloLimit = min(hardHaloLimit, 0.16 * localRange + 1.25 * localSigma);
+    float unclampedDelta = delta;
+    delta = clamp(delta, -adaptiveHaloLimit, adaptiveHaloLimit);
+    float proposedY = centerY + delta;
+    float minAllowed = max(0.0, localMin - adaptiveHaloLimit);
+    float maxAllowed = min(4.0, localMax + adaptiveHaloLimit);
+    proposedY = clamp(proposedY, minAllowed, maxAllowed);
+    delta = proposedY - centerY;
+    if (abs(delta - unclampedDelta) > 1.0e-7) atomicAdd(telemetry[35], 1u);
+
+    vec3 proposedRgb = centerRgb;
+    if (centerY > 1.0e-5) {
+        float scale = clamp(proposedY / centerY, 0.78, 1.22);
+        proposedRgb = centerRgb * scale;
+    }
+    proposedRgb = clamp(proposedRgb, vec3(0.0), vec3(4.0));
+    writeLinearDetailScratch(gid, proposedRgb);
+
+    float absCorrection = abs(delta);
+    if (absCorrection > 1.0e-7) atomicAdd(telemetry[32], 1u);
+    if (((gid.x & 3u) == 0u) && ((gid.y & 3u) == 0u)) {
+        atomicAdd(telemetry[36], uint(round(min(absCorrection, 0.999) * 65536.0)));
+        atomicAdd(telemetry[37], 1u);
+    }
+    atomicMax(telemetry[38], floatBitsToUint(absCorrection));
+}
+
+void commitLinearDetailRecovery(uvec2 gid) {
+    if (gid.x >= pc.frameWidth || gid.y >= pc.frameHeight) return;
+    writeWorking(gid, linearDetailScratchAt(int(gid.x), int(gid.y)));
+}
+
+// Phase 12 — standalone signed Global Sharpness.
+// Negative values use an edge-aware low-pass for real softness; positive values use bounded
+// multi-scale unsharp detail. Amount is the only user authority. Radius/Detail/Masking do not
+// participate. The stage runs after the scene-to-display transform and never owns exposure/tone.
+float perceptualDetailSigma() {
+    return max(telemetryFloat(43u, 0.0), 1.0e-7);
+}
+
+// Phase 4 glyph-stroke primitive. Text is detected structurally, not by semantic OCR: a
+// candidate must contain a narrow, polarity-reversing stroke with similar side plateaus.
+// Monotonic object edges fail the opposing-gradient test; random texture is suppressed by
+// symmetry, SNR and local glyph-topology evidence in proposePerceptualDetail().
+float glyphTripletEvidence(float a, float b, float c, float sigma) {
+    float leftStep = b - a;
+    float rightStep = c - b;
+    float residual = abs(b - 0.5 * (a + c));
+    float contrast = abs(leftStep) + abs(rightStep);
+    float residualGate = smoothstep(max(0.006, 1.35 * sigma),
+                                    max(0.030, 4.50 * sigma), residual);
+    float opposingEnergy = max(0.0, -(leftStep * rightStep));
+    float opposingGate = smoothstep(pow(max(0.004, 0.90 * sigma), 2.0),
+                                    pow(max(0.020, 3.40 * sigma), 2.0), opposingEnergy);
+    float sideAsymmetry = abs(a - c) / max(contrast, 1.25 * sigma);
+    float symmetryGate = 1.0 - smoothstep(0.34, 0.92, sideAsymmetry);
+    return residualGate * opposingGate * symmetryGate;
+}
+
+float pairedRidgeWidth2Evidence(float a, float b, float c, float d, float sigma) {
+    float core = 0.5 * (b + c);
+    float sides = 0.5 * (a + d);
+    float contrast = abs(core - sides);
+    float contrastGate = smoothstep(max(0.006, 1.35 * sigma),
+                                    max(0.030, 4.50 * sigma), contrast);
+    float coreMismatch = abs(b - c) / max(contrast, 1.25 * sigma);
+    float sideMismatch = abs(a - d) / max(contrast, 1.25 * sigma);
+    float coreGate = 1.0 - smoothstep(0.18, 0.72, coreMismatch);
+    float sideGate = 1.0 - smoothstep(0.24, 0.84, sideMismatch);
+    float opposingEnergy = max(0.0, -((b - a) * (d - c)));
+    float opposingGate = smoothstep(pow(max(0.004, 0.90 * sigma), 2.0),
+                                    pow(max(0.020, 3.40 * sigma), 2.0), opposingEnergy);
+    return contrastGate * coreGate * sideGate * opposingGate;
+}
+
+void proposePerceptualDetail(uvec2 gid) {
+    if (gid.x >= pc.frameWidth || gid.y >= pc.frameHeight) return;
+    atomicAdd(telemetry[48], 1u);
+
+    int x = int(gid.x);
+    int y = int(gid.y);
+    vec3 centerRgb = workingAt(x, y);
+    float centerY = clamp(lumaOf(centerRgb), 0.0, 1.0);
+    float amount = clamp(telemetryFloat(39u, 0.0), -1.0, 1.0);
+    float legibilityAuthority = clamp(telemetryFloat(40u, 0.0), -1.0, 1.0);
+    float detailAuthority = clamp(telemetryFloat(41u, 0.0), -1.0, 1.0);
+    float edgeAuthority = clamp(telemetryFloat(42u, 0.0), -1.0, 1.0);
+    float antiZipperAuthority = clamp(telemetryFloat(44u, 0.0), 0.0, 1.0);
+    if (abs(amount) <= 1.0e-6 && abs(legibilityAuthority) <= 1.0e-6 &&
+        abs(detailAuthority) <= 1.0e-6 && abs(edgeAuthority) <= 1.0e-6 && antiZipperAuthority <= 1.0e-6) {
+        writeLinearDetailScratch(gid, centerRgb);
+        return;
+    }
+
+    float l = lumaOf(workingAt(x - 1, y));
+    float r = lumaOf(workingAt(x + 1, y));
+    float u = lumaOf(workingAt(x, y - 1));
+    float d = lumaOf(workingAt(x, y + 1));
+    float ul = lumaOf(workingAt(x - 1, y - 1));
+    float ur = lumaOf(workingAt(x + 1, y - 1));
+    float dl = lumaOf(workingAt(x - 1, y + 1));
+    float dr = lumaOf(workingAt(x + 1, y + 1));
+    float l2 = lumaOf(workingAt(x - 2, y));
+    float r2 = lumaOf(workingAt(x + 2, y));
+    float u2 = lumaOf(workingAt(x, y - 2));
+    float d2 = lumaOf(workingAt(x, y + 2));
+    float l4 = lumaOf(workingAt(x - 4, y));
+    float r4 = lumaOf(workingAt(x + 4, y));
+    float u4 = lumaOf(workingAt(x, y - 4));
+    float d4 = lumaOf(workingAt(x, y + 4));
+
+    float crossMean = 0.25 * (l + r + u + d);
+    float boxMean = 0.125 * (l + r + u + d + ul + ur + dl + dr);
+    float farCross = 0.25 * (l2 + r2 + u2 + d2);
+    float localMin = min(centerY, min(min(min(l, r), min(u, d)), min(min(ul, ur), min(dl, dr))));
+    float localMax = max(centerY, max(max(max(l, r), max(u, d)), max(max(ul, ur), max(dl, dr))));
+    localMin = min(localMin, min(min(l2, r2), min(u2, d2)));
+    localMax = max(localMax, max(max(l2, r2), max(u2, d2)));
+    localMin = min(localMin, min(min(l4, r4), min(u4, d4)));
+    localMax = max(localMax, max(max(l4, r4), max(u4, d4)));
+    float localRange = max(0.0, localMax - localMin);
+    float sigma = max(perceptualDetailSigma(), 1.0 / 255.0);
+
+    // Phase 4 — text/glyph ownership mask. The detector looks for paired opposing edges
+    // at a small, approximately symmetric stroke width. Evidence is gathered at the centre
+    // and one sample to either side so the mask covers the stroke transition, not only its core.
+    float glyphX = max(glyphTripletEvidence(l, centerY, r, sigma),
+                       max(glyphTripletEvidence(l2, l, centerY, sigma),
+                           glyphTripletEvidence(centerY, r, r2, sigma)));
+    glyphX = max(glyphX, 0.92 * max(
+            pairedRidgeWidth2Evidence(l2, l, centerY, r, sigma),
+            pairedRidgeWidth2Evidence(l, centerY, r, r2, sigma)));
+    float glyphY = max(glyphTripletEvidence(u, centerY, d, sigma),
+                       max(glyphTripletEvidence(u2, u, centerY, sigma),
+                           glyphTripletEvidence(centerY, d, d2, sigma)));
+    glyphY = max(glyphY, 0.92 * max(
+            pairedRidgeWidth2Evidence(u2, u, centerY, d, sigma),
+            pairedRidgeWidth2Evidence(u, centerY, d, d2, sigma)));
+    float glyphDiagA = glyphTripletEvidence(ul, centerY, dr, sigma);
+    float glyphDiagB = glyphTripletEvidence(ur, centerY, dl, sigma);
+    float glyphPrimary = max(max(glyphX, glyphY), max(glyphDiagA, glyphDiagB));
+    float glyphSecondary = max(min(glyphX, glyphY),
+                               max(min(glyphX, max(glyphDiagA, glyphDiagB)),
+                                   min(glyphY, max(glyphDiagA, glyphDiagB))));
+
+    // Text tends to form compact multi-stroke glyphs rather than one indefinitely coherent
+    // contour. A straight-stroke fallback is retained, but at reduced confidence so hair/fences
+    // do not automatically become text. Broad monotonic edge persistence is an explicit reject.
+    float glyphComplexity = max(0.46 * glyphPrimary, sqrt(max(0.0, glyphPrimary * glyphSecondary)));
+    float centerGx = 0.5 * (r - l);
+    float centerGy = 0.5 * (d - u);
+    float centerGrad = sqrt(max(0.0, centerGx * centerGx + centerGy * centerGy));
+    float centerGx4 = 0.125 * (r4 - l4);
+    float centerGy4 = 0.125 * (d4 - u4);
+    float centerBroadGrad = sqrt(max(0.0, centerGx4 * centerGx4 + centerGy4 * centerGy4));
+    float monotonicPersistence = centerBroadGrad / max(centerGrad, 1.25 * sigma);
+    float broadMonotonicReject = smoothstep(0.34, 0.72, monotonicPersistence) *
+            smoothstep(max(0.010, 1.6 * sigma), max(0.042, 5.0 * sigma), centerGrad);
+    float glyphRangeGate = smoothstep(3.0, 7.0, localRange / sigma);
+    float glyphCrossMean = 0.25 * (l + r + u + d);
+    float glyphDiagMean = 0.25 * (ul + ur + dl + dr);
+    float glyphCrossOscillation = abs(centerY - glyphCrossMean);
+    float glyphDiagonalEchoRatio = abs(centerY - glyphDiagMean) /
+            max(glyphCrossOscillation, 1.25 * sigma);
+    float glyphAxisIsotropy = min(glyphX, glyphY) / max(max(glyphX, glyphY), 1.0e-6);
+    float glyphCheckerReject = smoothstep(max(0.006, 1.4 * sigma),
+                                          max(0.028, 4.5 * sigma), glyphCrossOscillation) *
+            (1.0 - smoothstep(0.12, 0.42, glyphDiagonalEchoRatio)) *
+            smoothstep(0.42, 0.82, glyphAxisIsotropy);
+    float glyphXFineOscillation = abs(centerY - 0.5 * (l + r));
+    float glyphYFineOscillation = abs(centerY - 0.5 * (u + d));
+    float glyphXEchoRatio = abs(centerY - 0.5 * (l2 + r2)) /
+            max(glyphXFineOscillation, 1.25 * sigma);
+    float glyphYEchoRatio = abs(centerY - 0.5 * (u2 + d2)) /
+            max(glyphYFineOscillation, 1.25 * sigma);
+    float glyphPeriod2Reject = max(
+            smoothstep(max(0.006, 1.4 * sigma), max(0.028, 4.5 * sigma), glyphXFineOscillation) *
+                    (1.0 - smoothstep(0.14, 0.48, glyphXEchoRatio)),
+            smoothstep(max(0.006, 1.4 * sigma), max(0.028, 4.5 * sigma), glyphYFineOscillation) *
+                    (1.0 - smoothstep(0.14, 0.48, glyphYEchoRatio)));
+    float glyphTextureReject = clamp(max(glyphCheckerReject, glyphPeriod2Reject), 0.0, 1.0);
+
+    // Precision-first text ownership: reject an isolated, indefinitely coherent one-pixel
+    // ridge even when its local cross-section looks glyph-like. This keeps hair, wire, scratches
+    // and similar line texture in Detail/Edge ownership. True glyph corners, junctions and
+    // finite strokes lose tangent continuity and therefore survive this reject.
+    float glyphSimilarityLow = max(0.004, 1.15 * sigma);
+    float glyphSimilarityHigh = max(0.020, 3.60 * sigma);
+    float simN = 1.0 - smoothstep(glyphSimilarityLow, glyphSimilarityHigh, abs(u - centerY));
+    float simS = 1.0 - smoothstep(glyphSimilarityLow, glyphSimilarityHigh, abs(d - centerY));
+    float simW = 1.0 - smoothstep(glyphSimilarityLow, glyphSimilarityHigh, abs(l - centerY));
+    float simE = 1.0 - smoothstep(glyphSimilarityLow, glyphSimilarityHigh, abs(r - centerY));
+    float simN2 = 1.0 - smoothstep(glyphSimilarityLow, glyphSimilarityHigh, abs(u2 - centerY));
+    float simS2 = 1.0 - smoothstep(glyphSimilarityLow, glyphSimilarityHigh, abs(d2 - centerY));
+    float simW2 = 1.0 - smoothstep(glyphSimilarityLow, glyphSimilarityHigh, abs(l2 - centerY));
+    float simE2 = 1.0 - smoothstep(glyphSimilarityLow, glyphSimilarityHigh, abs(r2 - centerY));
+    float simN4 = 1.0 - smoothstep(glyphSimilarityLow, glyphSimilarityHigh, abs(u4 - centerY));
+    float simS4 = 1.0 - smoothstep(glyphSimilarityLow, glyphSimilarityHigh, abs(d4 - centerY));
+    float simW4 = 1.0 - smoothstep(glyphSimilarityLow, glyphSimilarityHigh, abs(l4 - centerY));
+    float simE4 = 1.0 - smoothstep(glyphSimilarityLow, glyphSimilarityHigh, abs(r4 - centerY));
+
+    float verticalContinuity = (simN + simS + 0.78 * (simN2 + simS2) +
+                                0.52 * (simN4 + simS4)) / 4.60;
+    float horizontalContinuity = (simW + simE + 0.78 * (simW2 + simE2) +
+                                  0.52 * (simW4 + simE4)) / 4.60;
+    float verticalCrossContrast = smoothstep(max(0.008, 1.5 * sigma),
+                                             max(0.034, 4.8 * sigma),
+                                             0.5 * (abs(l - centerY) + abs(r - centerY)));
+    float horizontalCrossContrast = smoothstep(max(0.008, 1.5 * sigma),
+                                               max(0.034, 4.8 * sigma),
+                                               0.5 * (abs(u - centerY) + abs(d - centerY)));
+    float verticalImmediateRidge = sqrt(max(0.0, simN * simS));
+    float horizontalImmediateRidge = sqrt(max(0.0, simW * simE));
+    float verticalRidgeReject = max(
+            smoothstep(0.58, 0.84, verticalContinuity),
+            smoothstep(0.72, 0.95, verticalImmediateRidge)) *
+            verticalCrossContrast *
+            smoothstep(0.40, 0.78, glyphX);
+    float horizontalRidgeReject = max(
+            smoothstep(0.58, 0.84, horizontalContinuity),
+            smoothstep(0.72, 0.95, horizontalImmediateRidge)) *
+            horizontalCrossContrast *
+            smoothstep(0.40, 0.78, glyphY);
+
+    // Diagonal single-line ridges need only the already loaded +/-1 diagonal samples.
+    // A true diagonal ridge has two tangent samples close to the centre and the opposite
+    // diagonal strongly different; glyph junctions/corners do not preserve that topology.
+    float simUl = 1.0 - smoothstep(glyphSimilarityLow, glyphSimilarityHigh, abs(ul - centerY));
+    float simDr = 1.0 - smoothstep(glyphSimilarityLow, glyphSimilarityHigh, abs(dr - centerY));
+    float simUr = 1.0 - smoothstep(glyphSimilarityLow, glyphSimilarityHigh, abs(ur - centerY));
+    float simDl = 1.0 - smoothstep(glyphSimilarityLow, glyphSimilarityHigh, abs(dl - centerY));
+    float diagAContinuity = sqrt(max(0.0, simUl * simDr));
+    float diagBContinuity = sqrt(max(0.0, simUr * simDl));
+    float diagACrossContrast = smoothstep(max(0.008, 1.5 * sigma),
+                                          max(0.034, 4.8 * sigma),
+                                          0.5 * (abs(ur - centerY) + abs(dl - centerY)));
+    float diagBCrossContrast = smoothstep(max(0.008, 1.5 * sigma),
+                                          max(0.034, 4.8 * sigma),
+                                          0.5 * (abs(ul - centerY) + abs(dr - centerY)));
+    float diagonalRidgeReject = max(
+            smoothstep(0.70, 0.94, diagAContinuity) * diagACrossContrast,
+            smoothstep(0.70, 0.94, diagBContinuity) * diagBCrossContrast);
+    float isolatedLineReject = clamp(max(max(verticalRidgeReject, horizontalRidgeReject),
+                                         diagonalRidgeReject), 0.0, 1.0);
+
+    float textMask = smoothstep(0.26, 0.62, glyphComplexity * glyphRangeGate) *
+            (1.0 - 0.92 * clamp(broadMonotonicReject, 0.0, 1.0)) *
+            (1.0 - glyphTextureReject) *
+            (1.0 - isolatedLineReject);
+    textMask = clamp(textMask, 0.0, 1.0);
+    // Once a candidate has credible glyph topology, turn it into ownership rather than allowing
+    // Edge/Detail/Global to stack partially on the same letter pixels.
+    textMask = smoothstep(0.16, 0.48, textMask);
+    float nonTextMask = 1.0 - textMask;
+
+    // Natural micro-ridge/seam ownership for Detail. This intentionally uses the paired-edge
+    // evidence BEFORE isolated-line rejection: once true text is removed, long narrow ridges are
+    // exactly the class Detail should preserve/enhance (petal veins, fabric seams, hair, engraving,
+    // fine grooves). Broad monotonic object boundaries are still rejected by opposing-flank and
+    // broad-persistence evidence.
+    float microRidgeMask = smoothstep(0.20, 0.58, glyphPrimary * glyphRangeGate) *
+            (1.0 - 0.88 * clamp(broadMonotonicReject, 0.0, 1.0)) *
+            (1.0 - 0.92 * glyphTextureReject) * nonTextMask;
+    microRidgeMask = clamp(microRidgeMask, 0.0, 1.0);
+
+    // Legibility is the sole owner of detected text pixels. Negative values broaden/soften the
+    // glyph stroke residual; positive values compress/strengthen it without overshoot.
+    float legibilityY = centerY;
+    if (abs(legibilityAuthority) > 1.0e-6 && textMask > 1.0e-4) {
+        float glyphBase = 0.50 * crossMean + 0.30 * boxMean + 0.20 * farCross;
+        float glyphResidual = centerY - glyphBase;
+        float legibilityStrength = pow(abs(legibilityAuthority), 0.76) * textMask;
+        if (legibilityAuthority < 0.0) {
+            legibilityY = mix(centerY, glyphBase, 0.90 * legibilityStrength);
+        } else {
+            float rawGlyphDelta = glyphResidual * (0.50 + 1.35 * legibilityAuthority) * legibilityStrength;
+            float glyphCap = min(0.090, 0.010 + 0.30 * localRange);
+            legibilityY = clamp(centerY + clamp(rawGlyphDelta, -glyphCap, glyphCap), localMin, localMax);
+        }
+    }
+
+    // Phase 2 — standalone signed Edge radius/transition-width control.
+    // Edge is intentionally evaluated BEFORE Global Sharpness. It never consumes a generic
+    // high-pass/detail residual. A pixel must belong to a coherent contour that persists at
+    // 1/2/4-pixel scales. The detected cross-edge transition is then broadened (negative) or
+    // compressed (positive) by remapping only its normalized edge profile between side plateaus.
+    float edgeY = legibilityY;
+    if (abs(edgeAuthority) > 1.0e-6 && nonTextMask > 1.0e-4) {
+        float gx0 = 0.5 * (r - l);
+        float gy0 = 0.5 * (d - u);
+        float gradient = sqrt(max(0.0, gx0 * gx0 + gy0 * gy0));
+        float gx2 = 0.25 * (r2 - l2);
+        float gy2 = 0.25 * (d2 - u2);
+        float coarseGradient = sqrt(max(0.0, gx2 * gx2 + gy2 * gy2));
+        float gx4 = 0.125 * (r4 - l4);
+        float gy4 = 0.125 * (d4 - u4);
+        float broadGradient = sqrt(max(0.0, gx4 * gx4 + gy4 * gy4));
+        float gradientAlignment = clamp((gx0 * gx2 + gy0 * gy2) /
+                max(gradient * coarseGradient, 1.0e-8), -1.0, 1.0);
+        float broadAlignment = clamp((gx0 * gx4 + gy0 * gy4) /
+                max(gradient * broadGradient, 1.0e-8), -1.0, 1.0);
+        float scalePersistence = coarseGradient / max(gradient, 1.0e-6);
+        float broadPersistence = broadGradient / max(gradient, 1.0e-6);
+
+        // Structure tensor: coherent line/contour evidence only. Isotropic texture is rejected.
+        float gxn = 0.5 * (ur - ul);
+        float gyn = 0.5 * (centerY - u2);
+        float gxs = 0.5 * (dr - dl);
+        float gys = 0.5 * (d2 - centerY);
+        float gxw = 0.5 * (centerY - l2);
+        float gyw = 0.5 * (dl - ul);
+        float gxe = 0.5 * (r2 - centerY);
+        float gye = 0.5 * (dr - ur);
+        float jxx = gx0 * gx0 + 0.60 * (gxn * gxn + gxs * gxs + gxw * gxw + gxe * gxe);
+        float jyy = gy0 * gy0 + 0.60 * (gyn * gyn + gys * gys + gyw * gyw + gye * gye);
+        float jxy = gx0 * gy0 + 0.60 * (gxn * gyn + gxs * gys + gxw * gyw + gxe * gye);
+        float tensorEnergy = jxx + jyy;
+        float coherence = sqrt(max(0.0, (jxx - jyy) * (jxx - jyy) + 4.0 * jxy * jxy)) /
+                max(tensorEnergy, 1.0e-8);
+
+        float fineGradientGate = smoothstep(max(0.012, 1.90 * sigma),
+                                             max(0.045, 5.80 * sigma), gradient);
+        float coarseGradientGate = smoothstep(max(0.008, 1.35 * sigma),
+                                               max(0.030, 4.20 * sigma), coarseGradient);
+        float broadGradientGate = smoothstep(max(0.004, 1.00 * sigma),
+                                              max(0.016, 2.80 * sigma), broadGradient);
+        float coherenceGate = smoothstep(0.58, 0.90, coherence);
+        float alignmentGate = smoothstep(0.62, 0.94, gradientAlignment);
+        float broadAlignmentGate = smoothstep(0.55, 0.90, broadAlignment);
+        float persistenceGate = smoothstep(0.20, 0.48, scalePersistence);
+        float broadPersistenceGate = smoothstep(0.08, 0.22, broadPersistence);
+
+        // DELTA 0205 — strict step-edge ownership with texture-preserving reconstruction.
+        // Stabilize the normal with multi-scale gradients. Cardinal interpolation varies
+        // continuously with that normal and avoids diagonal mode switches between neighbours.
+        float stableGx = 0.58 * gx0 + 0.29 * gx2 + 0.13 * gx4;
+        float stableGy = 0.58 * gy0 + 0.29 * gy2 + 0.13 * gy4;
+        float ax = abs(stableGx);
+        float ay = abs(stableGy);
+        float axisSum = max(ax + ay, 1.0e-6);
+        float wx = ax / axisSum;
+        float wy = ay / axisSum;
+
+        float xMinus1 = stableGx >= 0.0 ? l : r;
+        float xPlus1 = stableGx >= 0.0 ? r : l;
+        float xMinus2 = stableGx >= 0.0 ? l2 : r2;
+        float xPlus2 = stableGx >= 0.0 ? r2 : l2;
+        float xMinus4 = stableGx >= 0.0 ? l4 : r4;
+        float xPlus4 = stableGx >= 0.0 ? r4 : l4;
+        float yMinus1 = stableGy >= 0.0 ? u : d;
+        float yPlus1 = stableGy >= 0.0 ? d : u;
+        float yMinus2 = stableGy >= 0.0 ? u2 : d2;
+        float yPlus2 = stableGy >= 0.0 ? d2 : u2;
+        float yMinus4 = stableGy >= 0.0 ? u4 : d4;
+        float yPlus4 = stableGy >= 0.0 ? d4 : u4;
+
+        float minus1 = wx * xMinus1 + wy * yMinus1;
+        float plus1 = wx * xPlus1 + wy * yPlus1;
+        float minus2 = wx * xMinus2 + wy * yMinus2;
+        float plus2 = wx * xPlus2 + wy * yPlus2;
+        float minus4 = wx * xMinus4 + wy * yMinus4;
+        float plus4 = wx * xPlus4 + wy * yPlus4;
+
+        // Smooth only along the tangent to estimate the structural edge base. The difference
+        // centerY-structuralCenter is local material texture and is intentionally preserved.
+        float tangent1 = 0.50 * (wx * (u + d) + wy * (l + r));
+        float tangent2 = 0.50 * (wx * (u2 + d2) + wy * (l2 + r2));
+        float structuralCenter = 0.72 * tangent1 + 0.28 * tangent2;
+        float textureResidual = centerY - structuralCenter;
+
+        float plateauMinus = 0.15 * minus1 + 0.35 * minus2 + 0.50 * minus4;
+        float plateauPlus = 0.15 * plus1 + 0.35 * plus2 + 0.50 * plus4;
+        float signedStep = plateauPlus - plateauMinus;
+        float stepHeight = abs(signedStep);
+
+        if (stepHeight > 1.0e-6) {
+            float lowPlateau = min(plateauMinus, plateauPlus);
+            float highPlateau = max(plateauMinus, plateauPlus);
+            float stepGate = smoothstep(max(0.014, 2.10 * sigma),
+                                        max(0.060, 7.00 * sigma), stepHeight);
+
+            // Object edges are monotonic across their normal. Direction reversals are zipper/
+            // checker/detail evidence and must never be owned by Edge.
+            float stepSign = signedStep >= 0.0 ? 1.0 : -1.0;
+            float reverseEnergy =
+                    max(0.0, -stepSign * (minus2 - minus4)) +
+                    max(0.0, -stepSign * (minus1 - minus2)) +
+                    max(0.0, -stepSign * (structuralCenter - minus1)) +
+                    max(0.0, -stepSign * (plus1 - structuralCenter)) +
+                    max(0.0, -stepSign * (plus2 - plus1)) +
+                    max(0.0, -stepSign * (plus4 - plus2));
+            float reverseRatio = reverseEnergy / max(stepHeight, 5.0 * sigma);
+            float monotonicGate = 1.0 - smoothstep(0.035, 0.18, reverseRatio);
+
+            // Texture and natural paired-edge seams are owned by Detail. This gate is the key
+            // protection against +Edge flattening the internal grain/structure of a surface.
+            float textureRatio = abs(textureResidual) / max(stepHeight, 4.0 * sigma);
+            float textureCleanGate = 1.0 - smoothstep(0.10, 0.30, textureRatio);
+            float tangentScaleRatio = abs(tangent1 - tangent2) / max(stepHeight, 4.0 * sigma);
+            float tangentScaleGate = 1.0 - smoothstep(0.12, 0.34, tangentScaleRatio);
+            float ridgeReject = 1.0 - 0.96 * microRidgeMask;
+
+            float structuralOwnershipGate = coarseGradientGate * broadGradientGate *
+                    coherenceGate * alignmentGate * broadAlignmentGate * persistenceGate *
+                    broadPersistenceGate * stepGate * monotonicGate * textureCleanGate *
+                    tangentScaleGate * ridgeReject * nonTextMask;
+            float sharpStructuralGate = fineGradientGate * structuralOwnershipGate;
+            // Softening must reach neighbouring transition pixels; coarse coherent support
+            // expands the radius while the ownership gates still reject texture and zippers.
+            float softStructuralGate = max(fineGradientGate, 0.72 * coarseGradientGate) *
+                    structuralOwnershipGate;
+            float radiusAuthority = pow(abs(edgeAuthority), 0.78);
+
+            if (edgeAuthority < 0.0) {
+                // Soften the structural edge base only. Surface texture is retained because the
+                // correction is a base delta added to legibilityY, not a blur of raw pixel values.
+                float narrowBase = 0.46 * structuralCenter +
+                        0.22 * (minus1 + plus1) +
+                        0.05 * (minus2 + plus2);
+                float broadBase = 0.28 * structuralCenter +
+                        0.23 * (minus1 + plus1) +
+                        0.11 * (minus2 + plus2) +
+                        0.02 * (minus4 + plus4);
+                float softBase = mix(narrowBase, broadBase, radiusAuthority);
+                softBase = clamp(softBase, lowPlateau, highPlateau);
+
+                float softDelta = softBase - structuralCenter;
+                float softDeltaCap = 0.18 * stepHeight;
+                softDelta = clamp(softDelta, -softDeltaCap, softDeltaCap);
+                float supportGradient = max(gradient, 1.30 * coarseGradient);
+                float supportGate = smoothstep(max(0.006, 1.05 * sigma),
+                                               max(0.028, 4.10 * sigma), supportGradient);
+                float softGate = softStructuralGate * supportGate;
+                edgeY = edgeY + softDelta * radiusAuthority * softGate;
+                edgeY = clamp(edgeY, 0.0, 1.0);
+            } else {
+                // Positive Edge changes only transition width. The texture residual is untouched.
+                float t = clamp((structuralCenter - plateauMinus) / signedStep, 0.0, 1.0);
+                float interior = min(t, 1.0 - t);
+                float transitionGate = smoothstep(0.025, 0.115, interior);
+                float profile = 2.0 * t - 1.0;
+                float gamma = mix(1.0, 0.52, radiusAuthority);
+                float remappedProfile = sign(profile) * pow(abs(profile), gamma);
+                float targetT = 0.5 + 0.5 * remappedProfile;
+                float targetBase = mix(plateauMinus, plateauPlus, targetT);
+                targetBase = clamp(targetBase, lowPlateau, highPlateau);
+
+                float sharpenDelta = targetBase - structuralCenter;
+                float sharpenDeltaCap = 0.18 * stepHeight;
+                sharpenDelta = clamp(sharpenDelta, -sharpenDeltaCap, sharpenDeltaCap);
+                float sharpGate = sharpStructuralGate * transitionGate;
+                edgeY = edgeY + sharpenDelta * radiusAuthority * sharpGate;
+                edgeY = clamp(edgeY, 0.0, 1.0);
+            }
+        }
+    }
+
+
+    // Phase 3 — standalone signed Detail. Detail owns microtexture only. A candidate must be
+    // significant relative to the measured display noise floor, yet fail the multi-scale
+    // persistence pattern of a structural contour. This explicitly separates hair/fabric/foliage
+    // scale residuals from Edge and from Global Sharpness.
+    float detailY = edgeY;
+    if (abs(detailAuthority) > 1.0e-6) {
+        float gxFine = 0.5 * (r - l);
+        float gyFine = 0.5 * (d - u);
+        float fineGradient = sqrt(max(0.0, gxFine * gxFine + gyFine * gyFine));
+        float gxCoarse = 0.25 * (r2 - l2);
+        float gyCoarse = 0.25 * (d2 - u2);
+        float coarseGradient = sqrt(max(0.0, gxCoarse * gxCoarse + gyCoarse * gyCoarse));
+        float gxBroad = 0.125 * (r4 - l4);
+        float gyBroad = 0.125 * (d4 - u4);
+        float broadGradient = sqrt(max(0.0, gxBroad * gxBroad + gyBroad * gyBroad));
+
+        float microBase = 0.56 * boxMean + 0.29 * crossMean + 0.15 * farCross;
+        float microResidual = edgeY - microBase;
+        float residualSnr = abs(microResidual) / sigma;
+        float rangeSnr = localRange / sigma;
+        float residualGate = smoothstep(1.55, 3.60, residualSnr);
+        float rangeGate = smoothstep(3.6, 8.5, rangeSnr);
+
+        float coarseAlignment = clamp((gxFine * gxCoarse + gyFine * gyCoarse) /
+                max(fineGradient * coarseGradient, 1.0e-8), -1.0, 1.0);
+        float broadAlignment = clamp((gxFine * gxBroad + gyFine * gyBroad) /
+                max(fineGradient * broadGradient, 1.0e-8), -1.0, 1.0);
+        float coarsePersistence = coarseGradient / max(fineGradient + abs(microResidual), 1.0e-6);
+        float broadPersistence = broadGradient / max(fineGradient + abs(microResidual), 1.0e-6);
+        float centerContour = smoothstep(0.55, 0.88, coarseAlignment) *
+                smoothstep(0.48, 0.82, broadAlignment) *
+                smoothstep(0.10, 0.24, coarsePersistence) *
+                smoothstep(0.035, 0.10, broadPersistence) *
+                smoothstep(max(0.008, 1.30 * sigma), max(0.032, 4.50 * sigma), fineGradient);
+        // Dilate structural-edge rejection into the transition neighbourhood. Pixels one or two
+        // samples off a strong contour can have little fine gradient but a large micro residual
+        // because the 2/4-pixel support sees across the edge. Coarse+broad aligned gradients catch
+        // that case without rejecting narrow texture whose response disappears at the broad scale.
+        float coarseBroadAlignment = clamp((gxCoarse * gxBroad + gyCoarse * gyBroad) /
+                max(coarseGradient * broadGradient, 1.0e-8), -1.0, 1.0);
+        float edgeProximity = smoothstep(0.58, 0.90, coarseBroadAlignment) *
+                smoothstep(max(0.006, 0.80 * sigma), max(0.025, 2.50 * sigma), coarseGradient) *
+                smoothstep(max(0.004, 0.60 * sigma), max(0.016, 1.80 * sigma), broadGradient);
+        float coherentContour = max(centerContour, edgeProximity);
+        float edgeReject = 1.0 - clamp(coherentContour, 0.0, 1.0);
+
+        // Very noisy display residuals are allowed to survive naturally, but positive Detail may
+        // not turn them into synthetic texture. Negative Detail still reduces only qualified
+        // microtexture and therefore never becomes a broad denoise/blur stage.
+        float positiveNoiseSafety = 1.0 - 0.72 * smoothstep(0.018, 0.055, sigma);
+        float baseTextureGate = residualGate * rangeGate * edgeReject * nonTextMask;
+
+        // Dedicated narrow crease/ridge class. A natural seam may remain directional across
+        // several pixels and would otherwise resemble a contour in the persistence test. Its
+        // paired opposing flanks distinguish it from a monotonic object boundary. Text has already
+        // been removed by Legibility ownership, so these ridges remain valid Detail candidates.
+        float seamResidual = max(abs(edgeY - crossMean), abs(edgeY - boxMean));
+        float seamSnrGate = smoothstep(1.30, 3.10, seamResidual / sigma);
+        float seamTextureGate = microRidgeMask * seamSnrGate * rangeGate * nonTextMask;
+        float textureGate = max(baseTextureGate, seamTextureGate);
+
+        // Do not boost period-2/Nyquist zipper structure. A true micro feature normally changes
+        // across scale; a demosaic/checker echo returns to the centre value two samples away.
+        // Negative Detail may still reduce this energy, but positive Detail never amplifies it.
+        float xFineOscillation = abs(edgeY - 0.5 * (l + r));
+        float yFineOscillation = abs(edgeY - 0.5 * (u + d));
+        float xEchoRatio = abs(edgeY - 0.5 * (l2 + r2)) / max(xFineOscillation, 1.0e-6);
+        float yEchoRatio = abs(edgeY - 0.5 * (u2 + d2)) / max(yFineOscillation, 1.0e-6);
+        float xNyquistEcho = smoothstep(max(0.006, 1.40 * sigma), max(0.025, 4.20 * sigma), xFineOscillation) *
+                (1.0 - smoothstep(0.16, 0.62, xEchoRatio));
+        float yNyquistEcho = smoothstep(max(0.006, 1.40 * sigma), max(0.025, 4.20 * sigma), yFineOscillation) *
+                (1.0 - smoothstep(0.16, 0.62, yEchoRatio));
+        float positiveTextureGate = textureGate * (1.0 - clamp(max(xNyquistEcho, yNyquistEcho), 0.0, 1.0));
+
+        float signedStrength = pow(abs(detailAuthority), 0.78);
+        if (detailAuthority > 0.0) {
+            float detailGain = (0.55 + 1.05 * detailAuthority) * signedStrength * positiveNoiseSafety;
+            float rawDetailDelta = microResidual * detailGain * positiveTextureGate;
+            float detailCap = min(0.080, 0.010 + 0.28 * localRange);
+            float detailDelta = clamp(rawDetailDelta, -detailCap, detailCap);
+            detailY = clamp(edgeY + detailDelta, localMin, localMax);
+            if (abs(detailDelta - rawDetailDelta) > 1.0e-7) atomicAdd(telemetry[52], 1u);
+        } else {
+            float reduceBlend = 0.90 * signedStrength * textureGate;
+            detailY = mix(edgeY, microBase, reduceBlend);
+        }
+        if (textureGate > 0.18) atomicAdd(telemetry[50], 1u);
+        if (residualGate < 0.05 || rangeGate < 0.05) atomicAdd(telemetry[51], 1u);
+    }
+
+    // Global Sharpness is the final creative sharpness owner. It sees Edge first and then Detail;
+    // Anti-zipper follows only as a repair guard. Global Sharpness does not redefine which pixels
+    // qualify as microtexture or structural edges.
+    float proposedY = detailY;
+    if (amount < 0.0) {
+        float softness = pow(clamp(-amount, 0.0, 1.0), 0.72);
+        float edgeSigma = mix(0.040, 0.115, softness);
+        float inv2EdgeSigmaSq = 1.0 / max(2.0 * edgeSigma * edgeSigma, 1.0e-6);
+        float centerWeight = mix(2.40, 0.65, softness);
+        float sum = detailY * centerWeight;
+        float weightSum = centerWeight;
+
+        float dv;
+        float wgt;
+        dv = l - detailY; wgt = 1.00 * exp(-dv * dv * inv2EdgeSigmaSq); sum += l * wgt; weightSum += wgt;
+        dv = r - detailY; wgt = 1.00 * exp(-dv * dv * inv2EdgeSigmaSq); sum += r * wgt; weightSum += wgt;
+        dv = u - detailY; wgt = 1.00 * exp(-dv * dv * inv2EdgeSigmaSq); sum += u * wgt; weightSum += wgt;
+        dv = d - detailY; wgt = 1.00 * exp(-dv * dv * inv2EdgeSigmaSq); sum += d * wgt; weightSum += wgt;
+        dv = ul - detailY; wgt = 0.72 * exp(-dv * dv * inv2EdgeSigmaSq); sum += ul * wgt; weightSum += wgt;
+        dv = ur - detailY; wgt = 0.72 * exp(-dv * dv * inv2EdgeSigmaSq); sum += ur * wgt; weightSum += wgt;
+        dv = dl - detailY; wgt = 0.72 * exp(-dv * dv * inv2EdgeSigmaSq); sum += dl * wgt; weightSum += wgt;
+        dv = dr - detailY; wgt = 0.72 * exp(-dv * dv * inv2EdgeSigmaSq); sum += dr * wgt; weightSum += wgt;
+        dv = l2 - detailY; wgt = 0.46 * exp(-dv * dv * inv2EdgeSigmaSq); sum += l2 * wgt; weightSum += wgt;
+        dv = r2 - detailY; wgt = 0.46 * exp(-dv * dv * inv2EdgeSigmaSq); sum += r2 * wgt; weightSum += wgt;
+        dv = u2 - detailY; wgt = 0.46 * exp(-dv * dv * inv2EdgeSigmaSq); sum += u2 * wgt; weightSum += wgt;
+        dv = d2 - detailY; wgt = 0.46 * exp(-dv * dv * inv2EdgeSigmaSq); sum += d2 * wgt; weightSum += wgt;
+
+        float softY = sum / max(weightSum, 1.0e-6);
+        float broadY = 0.46 * softY + 0.34 * boxMean + 0.20 * farCross;
+        float softBlend = 0.94 * pow(softness, 0.78);
+        proposedY = mix(detailY, broadY, softBlend);
+    } else if (amount > 0.0) {
+        float fineMean = 0.68 * crossMean + 0.32 * boxMean;
+        float mediumMean = 0.58 * boxMean + 0.42 * farCross;
+        float highPassFine = detailY - fineMean;
+        float highPassMedium = detailY - mediumMean;
+        float highPass = 0.74 * highPassFine + 0.26 * highPassMedium;
+
+        float gx = 0.5 * (r - l);
+        float gy = 0.5 * (d - u);
+        float gradient = sqrt(max(0.0, gx * gx + gy * gy));
+        float residualSnr = abs(highPass) / sigma;
+        float gradientSnr = gradient / sigma;
+        float residualGate = smoothstep(0.80, 2.00, residualSnr);
+        float edgeGate = smoothstep(0.70, 1.85, gradientSnr);
+        float rangeGate = smoothstep(0.004, 0.022, localRange);
+        float structureGate = max(rangeGate * 0.55, max(residualGate, edgeGate));
+
+        float sharpStrength = amount * (1.05 + 1.75 * amount);
+        float rawDelta = highPass * sharpStrength * structureGate;
+        float hardHalo = clamp(telemetryFloat(46u, 0.10), 0.025, 0.14);
+        float adaptiveHalo = min(hardHalo, 0.018 + 0.46 * localRange);
+        float delta = clamp(rawDelta, -adaptiveHalo, adaptiveHalo);
+        proposedY = clamp(detailY + delta,
+                          max(0.0, localMin - adaptiveHalo),
+                          min(1.0, localMax + adaptiveHalo));
+        if (abs(delta - rawDelta) > 1.0e-7) atomicAdd(telemetry[52], 1u);
+        if (structureGate > 0.20) atomicAdd(telemetry[50], 1u);
+        if (residualGate < 0.05 && edgeGate < 0.05) atomicAdd(telemetry[51], 1u);
+    }
+
+    // Global Sharpness is text-aware: detected glyph pixels remain owned exclusively by
+    // Legibility, so Edge/Detail/Global cannot stack on letters or symbols.
+    proposedY = mix(detailY, proposedY, nonTextMask);
+    proposedY = clamp(proposedY, 0.0, 1.0);
+
+    // DELTA 0207 — Anti-zipper is the FINAL sharpness artifact guard.
+    // It compares the completed Edge -> Detail -> Global result against the immutable pre-sharpen
+    // contour neighbourhood. Therefore it can repair zipper/halo reversals created by Edge itself,
+    // Detail, Global Sharpness, or their combination. Text and natural micro-ridges remain owned by
+    // Legibility/Detail and are explicitly excluded.
+    if (antiZipperAuthority > 1.0e-6 && nonTextMask > 1.0e-4) {
+        float gxFineZ = 0.5 * (r - l);
+        float gyFineZ = 0.5 * (d - u);
+        float gxCoarseZ = 0.25 * (r2 - l2);
+        float gyCoarseZ = 0.25 * (d2 - u2);
+        float gradFineZ = sqrt(max(0.0, gxFineZ * gxFineZ + gyFineZ * gyFineZ));
+        float gradCoarseZ = sqrt(max(0.0, gxCoarseZ * gxCoarseZ + gyCoarseZ * gyCoarseZ));
+        float alignZ = clamp((gxFineZ * gxCoarseZ + gyFineZ * gyCoarseZ) /
+                max(gradFineZ * gradCoarseZ, 1.0e-8), -1.0, 1.0);
+        float stableGxZ = 0.72 * gxFineZ + 0.28 * gxCoarseZ;
+        float stableGyZ = 0.72 * gyFineZ + 0.28 * gyCoarseZ;
+        float axZ = abs(stableGxZ);
+        float ayZ = abs(stableGyZ);
+        float axisSumZ = max(axZ + ayZ, 1.0e-6);
+        float wxZ = axZ / axisSumZ;
+        float wyZ = ayZ / axisSumZ;
+
+        float xm1Z = stableGxZ >= 0.0 ? l : r;
+        float xp1Z = stableGxZ >= 0.0 ? r : l;
+        float xm2Z = stableGxZ >= 0.0 ? l2 : r2;
+        float xp2Z = stableGxZ >= 0.0 ? r2 : l2;
+        float ym1Z = stableGyZ >= 0.0 ? u : d;
+        float yp1Z = stableGyZ >= 0.0 ? d : u;
+        float ym2Z = stableGyZ >= 0.0 ? u2 : d2;
+        float yp2Z = stableGyZ >= 0.0 ? d2 : u2;
+        float minus1Z = wxZ * xm1Z + wyZ * ym1Z;
+        float plus1Z = wxZ * xp1Z + wyZ * yp1Z;
+        float minus2Z = wxZ * xm2Z + wyZ * ym2Z;
+        float plus2Z = wxZ * xp2Z + wyZ * yp2Z;
+
+        float plateauMinusZ = 0.34 * minus1Z + 0.66 * minus2Z;
+        float plateauPlusZ = 0.34 * plus1Z + 0.66 * plus2Z;
+        float signedStepZ = plateauPlusZ - plateauMinusZ;
+        float stepHeightZ = abs(signedStepZ);
+        if (stepHeightZ > 1.0e-6) {
+            float stepSignZ = signedStepZ >= 0.0 ? 1.0 : -1.0;
+            float edgePersistZ = smoothstep(max(0.008, 1.35 * sigma), max(0.034, 4.4 * sigma), gradCoarseZ) *
+                    smoothstep(0.56, 0.90, alignZ) *
+                    smoothstep(max(0.012, 2.0 * sigma), max(0.050, 6.0 * sigma), stepHeightZ);
+            float ownershipZ = edgePersistZ * nonTextMask * (1.0 - 0.98 * microRidgeMask);
+
+            // Legitimate positive acutance is allowed before a sample is called a zipper. This is
+            // derived from the actual Edge and Global controls, so the guard cannot simply flatten
+            // a deliberately sharp contour. Negative controls soften inward and need little margin.
+            float positiveAcutanceZ = max(0.0, edgeAuthority) + 0.70 * max(0.0, amount);
+            float intendedExcursionZ = min(0.16 * stepHeightZ,
+                    0.020 * positiveAcutanceZ + 0.10 * stepHeightZ * positiveAcutanceZ);
+            float toleranceZ = max(0.75 * sigma, intendedExcursionZ);
+
+            float preViolationZ =
+                    max(0.0, -stepSignZ * (minus1Z - minus2Z)) +
+                    max(0.0, -stepSignZ * (centerY - minus1Z)) +
+                    max(0.0, -stepSignZ * (plus1Z - centerY)) +
+                    max(0.0, -stepSignZ * (plus2Z - plus1Z));
+            float postViolationZ =
+                    max(0.0, -stepSignZ * (minus1Z - minus2Z) - toleranceZ) +
+                    max(0.0, -stepSignZ * (proposedY - minus1Z) - toleranceZ) +
+                    max(0.0, -stepSignZ * (plus1Z - proposedY) - toleranceZ) +
+                    max(0.0, -stepSignZ * (plus2Z - plus1Z) - toleranceZ);
+
+            float plateauLoZ = min(plateauMinusZ, plateauPlusZ);
+            float plateauHiZ = max(plateauMinusZ, plateauPlusZ);
+            float overshootZ = max(0.0, plateauLoZ - proposedY - toleranceZ) +
+                    max(0.0, proposedY - plateauHiZ - toleranceZ);
+            float introducedViolationZ = max(0.0, postViolationZ - 0.35 * preViolationZ);
+            float zipperEnergyZ = max(introducedViolationZ, 1.35 * overshootZ);
+
+            float searchLowZ = mix(max(0.010, 3.2 * sigma), max(0.0035, 0.95 * sigma), antiZipperAuthority);
+            float searchHighZ = mix(max(0.036, 6.8 * sigma), max(0.013, 2.7 * sigma), antiZipperAuthority);
+            float zipperEvidenceZ = smoothstep(searchLowZ, searchHighZ, zipperEnergyZ) * ownershipZ;
+
+            if (zipperEvidenceZ > 1.0e-5) {
+                // Isotonic projection changes only the offending center. There is no blur kernel:
+                // side plateaus, surface texture, Detail ridges and glyphs remain untouched.
+                float corridorLoZ = min(minus1Z, plus1Z) - toleranceZ;
+                float corridorHiZ = max(minus1Z, plus1Z) + toleranceZ;
+                float reconstructedZ = clamp(proposedY, corridorLoZ, corridorHiZ);
+                reconstructedZ = clamp(reconstructedZ, plateauLoZ - toleranceZ, plateauHiZ + toleranceZ);
+                float repairZ = pow(antiZipperAuthority, 0.78) * zipperEvidenceZ;
+                proposedY = clamp(mix(proposedY, reconstructedZ, repairZ), 0.0, 1.0);
+            }
+        }
+    }
+    float delta = proposedY - centerY;
+    vec3 proposedRgb = centerRgb;
+    if (centerY > 1.0e-5) {
+        proposedRgb = centerRgb * clamp(proposedY / centerY, 0.30, 2.60);
+        proposedRgb = compressToUnitGamutPreserveLuma(proposedRgb);
+    } else if (proposedY > centerY) {
+        proposedRgb = vec3(proposedY);
+    }
+    writeLinearDetailScratch(gid, proposedRgb);
+
+    float absCorrection = abs(delta);
+    if (absCorrection > 1.0e-7) atomicAdd(telemetry[49], 1u);
+    if (((gid.x & 3u) == 0u) && ((gid.y & 3u) == 0u)) {
+        atomicAdd(telemetry[53], uint(round(min(absCorrection, 0.999) * 65536.0)));
+        atomicAdd(telemetry[54], 1u);
+    }
+    atomicMax(telemetry[55], floatBitsToUint(absCorrection));
+}
+
+void commitPerceptualDetail(uvec2 gid) {
+    if (gid.x >= pc.frameWidth || gid.y >= pc.frameHeight) return;
+    writeWorking(gid, linearDetailScratchAt(int(gid.x), int(gid.y)));
+}
+
+const uint kSrgbByteLutOffset = 8192u;
+
+uint quantizeSrgbByteExact(float value) {
+    float v = clamp(value, 0.0, 1.0);
+    uint index = uint(v * 4096.0 + 0.5);
+    return uint(clamp(toneLut[kSrgbByteLutOffset + index], 0.0, 255.0));
+}
+
+uvec2 bgrOutputToSource(uint x, uint y) {
+    uint rotation = pc.outputRotationDegrees % 360u;
+    if (rotation == 90u) return uvec2(y, pc.frameHeight - 1u - x);
+    if (rotation == 180u) return uvec2(pc.frameWidth - 1u - x, pc.frameHeight - 1u - y);
+    if (rotation == 270u) return uvec2(pc.frameWidth - 1u - y, x);
+    return uvec2(x, y);
+}
+
+void packBgr8Publication(uvec2 gid) {
+    if (gid.x >= pc.ultraHdrPackedWordsPerRow || gid.y >= pc.ultraHdrOutputMapHeight) return;
+    uint rowByteCount = pc.ultraHdrOutputMapWidth * 3u;
+    uint packed = 0u;
+    for (uint lane = 0u; lane < 4u; ++lane) {
+        uint byteOffset = gid.x * 4u + lane;
+        uint byteValue = 0u; // row padding is explicitly zeroed
+        if (byteOffset < rowByteCount) {
+            uint outX = byteOffset / 3u;
+            uint channel = byteOffset - outX * 3u;
+            uvec2 src = bgrOutputToSource(outX, gid.y);
+            if (src.x < pc.frameWidth && src.y < pc.frameHeight) {
+                vec3 rgb = workingAt(int(src.x), int(src.y));
+                float value = channel == 0u ? rgb.b : (channel == 1u ? rgb.g : rgb.r);
+                byteValue = quantizeSrgbByteExact(value);
+            }
+        }
+        packed |= (byteValue & 0xffu) << (lane * 8u);
+    }
+    uint outIndex = gid.y * pc.ultraHdrPackedWordsPerRow + gid.x;
+    ultraHdrGainmapPacked[outIndex] = packed;
+}
+
+void packUltraHdrGainmap(uvec2 gid) {
+    if (gid.x >= pc.ultraHdrPackedWordsPerRow || gid.y >= pc.ultraHdrOutputMapHeight) return;
+    float maxLogGain = max(float(telemetry[2]) / 65536.0, 1.0 / 65536.0);
+    uint packed = 0u;
+    for (uint lane = 0u; lane < 4u; ++lane) {
+        uint outX = gid.x * 4u + lane;
+        uint byteValue = 0u;
+        if (outX < pc.ultraHdrOutputMapWidth) {
+            uvec2 src = ultraHdrOutputToSource(outX, gid.y);
+            if (src.x < pc.ultraHdrSourceMapWidth && src.y < pc.ultraHdrSourceMapHeight) {
+                uint srcIndex = src.y * pc.ultraHdrSourceMapWidth + src.x;
+                float normalized = clamp(ultraHdrGainLog[srcIndex] / maxLogGain, 0.0, 1.0);
+                byteValue = uint(round(normalized * 255.0));
+            }
+        }
+        packed |= (byteValue & 0xffu) << (lane * 8u);
+    }
+    uint outIndex = pc.displayOffsetFloats + gid.y * pc.ultraHdrPackedWordsPerRow + gid.x;
+    ultraHdrGainmapPacked[outIndex] = packed;
+}
+
+void main() {
+    uvec2 gid = gl_GlobalInvocationID.xy;
+    if (pc.mode == 0u) {
+        // DELTA 0183: mode-0-only cooperative capture stripe origin. The host submits aligned
+        // 384-row pieces so the higher-priority RAW-preview queue gets scheduling boundaries
+        // during capture processing. ultraHdrSourceMapHeight is otherwise unused by mode 0;
+        // executeTone() uses a fresh push block, so Ultra HDR/FLLF ABI semantics stay unchanged.
+        gid.y += pc.ultraHdrSourceMapHeight;
+        runPreTonePreparation(gid);
+    } else if (pc.mode == 1u) {
+        if (gid.y == 0u) writeSceneSample(gid.x);
+    } else if (pc.mode == 2u) {
+        writeDisplayCell(gid);
+    } else if (pc.mode == 3u) {
+        runTone(gid);
+    } else if (pc.mode == 4u) {
+        captureUltraHdrAuthority(gid);
+    } else if (pc.mode == 5u) {
+        analyzeUltraHdrGain(gid);
+    } else if (pc.mode == 6u) {
+        packUltraHdrGainmap(gid);
+    } else if (pc.mode == 7u) {
+        buildPortraitBlur(gid);
+    } else if (pc.mode == 8u) {
+        compositePortrait(gid);
+    } else if (pc.mode == 9u) {
+        buildLocalToneBase(gid);
+    } else if (pc.mode == 10u) {
+        buildFllfGaussianLevel0(gid);
+    } else if (pc.mode == 11u) {
+        buildFllfGaussianDownsample(gid);
+    } else if (pc.mode == 12u) {
+        seedFllfCoarseCorrection(gid);
+    } else if (pc.mode == 13u) {
+        reconstructFllfCorrectionLevel(gid);
+    } else if (pc.mode == 14u) {
+        proposeLinearDetailRecovery(gid);
+    } else if (pc.mode == 15u) {
+        commitLinearDetailRecovery(gid);
+    } else if (pc.mode == 16u) {
+        proposePerceptualDetail(gid);
+    } else if (pc.mode == 17u) {
+        commitPerceptualDetail(gid);
+    } else if (pc.mode == 18u) {
+        packBgr8Publication(gid);
+    }
+}

@@ -1,0 +1,297 @@
+{
+  "interpretation": "Encoded-sRGB spatial proxies include texture and quantization; no ground truth for real scenes. Same RAW and same frozen controls within each pair. RAW10 fixture explicitly has no exported LSC map.",
+  "sources": {
+    "sensor": {
+      "0": {
+        "encodedRgbMseDifference": [
+          1.0244068562315078e-06,
+          7.371848482762289e-07,
+          3.036754378626938e-06
+        ],
+        "meanAbsLumaDifference": 0.00012648720801067671,
+        "maxAbsLumaDifference": 0.02243293983936312,
+        "clipFractionBefore": 0.0016760826110839844,
+        "clipFractionAfter": 0.0016791025797526042,
+        "roiRatios": {
+          "door_flat_candidate": {
+            "chromaHighpassRatioRG": 1.0019474029541016,
+            "chromaHighpassRatioBG": 1.001510739326477,
+            "lumaHighpassRatio": 0.9999033786007854
+          },
+          "wall_flat_candidate": {
+            "chromaHighpassRatioRG": 1.002547025680542,
+            "chromaHighpassRatioBG": 1.0012483596801758,
+            "lumaHighpassRatio": 0.9996324890223551
+          },
+          "screen_fine_structure": {
+            "chromaHighpassRatioRG": 1.000359058380127,
+            "chromaHighpassRatioBG": 1.0023199319839478,
+            "lumaHighpassRatio": 1.0000936413325785
+          },
+          "fabric_folds_candidate": {
+            "chromaHighpassRatioRG": 0.9979254603385925,
+            "chromaHighpassRatioBG": 1.0028125047683716,
+            "lumaHighpassRatio": 1.0002492818090472
+          }
+        },
+        "controlsAndRoute": {
+          "baseline04": {
+            "rawToneInputGain": "1",
+            "automaticGlobalSceneEv": "0",
+            "totalPostFllfExposureGain": "1",
+            "fllfStrength": "0.241845",
+            "CameraMatrixSource": "CAMERA2_EXACT_FRAME_COLOR_CORRECTION_TRANSFORM",
+            "rawIspWorkingSetEstimateBytes": "239075328",
+            "phase16DemosaicResolved": "AUTO_HYBRID",
+            "phase16DemosaicFallback": "false",
+            "vulkanToneUsedForOutput": "true",
+            "phase9GpuPrimary": "true"
+          },
+          "production": {
+            "rawToneInputGain": "1",
+            "automaticGlobalSceneEv": "0",
+            "totalPostFllfExposureGain": "1",
+            "fllfStrength": "0.241845",
+            "CameraMatrixSource": "CAMERA2_EXACT_FRAME_COLOR_CORRECTION_TRANSFORM",
+            "rawIspWorkingSetEstimateBytes": "239075328",
+            "phase16DemosaicResolved": "AUTO_HYBRID",
+            "phase16DemosaicFallback": "false",
+            "vulkanToneUsedForOutput": "true",
+            "phase9GpuPrimary": "true"
+          }
+        }
+      },
+      "1": {
+        "encodedRgbMseDifference": [
+          7.920698976704443e-07,
+          5.820545538881561e-07,
+          2.5171627839881694e-06
+        ],
+        "meanAbsLumaDifference": 9.917344857212891e-05,
+        "maxAbsLumaDifference": 0.01679215744584797,
+        "clipFractionBefore": 0.0016932487487792969,
+        "clipFractionAfter": 0.0016909440358479817,
+        "roiRatios": {
+          "door_flat_candidate": {
+            "chromaHighpassRatioRG": 1.0004431009292603,
+            "chromaHighpassRatioBG": 1.000240683555603,
+            "lumaHighpassRatio": 1.000261018530554
+          },
+          "wall_flat_candidate": {
+            "chromaHighpassRatioRG": 1.001352071762085,
+            "chromaHighpassRatioBG": 0.9994937181472778,
+            "lumaHighpassRatio": 1.000499141852671
+          },
+          "screen_fine_structure": {
+            "chromaHighpassRatioRG": 0.9999273419380188,
+            "chromaHighpassRatioBG": 1.0017632246017456,
+            "lumaHighpassRatio": 1.000121668764829
+          },
+          "fabric_folds_candidate": {
+            "chromaHighpassRatioRG": 1.0020067691802979,
+            "chromaHighpassRatioBG": 1.0009721517562866,
+            "lumaHighpassRatio": 0.9998831269898384
+          }
+        },
+        "controlsAndRoute": {
+          "baseline04": {
+            "rawToneInputGain": "1",
+            "automaticGlobalSceneEv": "0",
+            "totalPostFllfExposureGain": "1",
+            "fllfStrength": "0.241861",
+            "CameraMatrixSource": "CAMERA2_EXACT_FRAME_COLOR_CORRECTION_TRANSFORM",
+            "rawIspWorkingSetEstimateBytes": "239075328",
+            "phase16DemosaicResolved": "MALVAR_2004",
+            "phase16DemosaicFallback": "false",
+            "vulkanToneUsedForOutput": "true",
+            "phase9GpuPrimary": "true"
+          },
+          "production": {
+            "rawToneInputGain": "1",
+            "automaticGlobalSceneEv": "0",
+            "totalPostFllfExposureGain": "1",
+            "fllfStrength": "0.241861",
+            "CameraMatrixSource": "CAMERA2_EXACT_FRAME_COLOR_CORRECTION_TRANSFORM",
+            "rawIspWorkingSetEstimateBytes": "239075328",
+            "phase16DemosaicResolved": "MALVAR_2004",
+            "phase16DemosaicFallback": "false",
+            "vulkanToneUsedForOutput": "true",
+            "phase9GpuPrimary": "true"
+          }
+        }
+      },
+      "2": {
+        "encodedRgbMseDifference": [
+          2.9138909667381085e-06,
+          1.7670998886387679e-06,
+          5.372875875764294e-06
+        ],
+        "meanAbsLumaDifference": 0.0002987035278192997,
+        "maxAbsLumaDifference": 0.01960784210301935,
+        "clipFractionBefore": 0.001678784688313802,
+        "clipFractionAfter": 0.0016818841298421223,
+        "roiRatios": {
+          "door_flat_candidate": {
+            "chromaHighpassRatioRG": 1.004772663116455,
+            "chromaHighpassRatioBG": 1.0001364946365356,
+            "lumaHighpassRatio": 1.0005991568604768
+          },
+          "wall_flat_candidate": {
+            "chromaHighpassRatioRG": 1.0067895650863647,
+            "chromaHighpassRatioBG": 0.9997597932815552,
+            "lumaHighpassRatio": 1.0001139603382048
+          },
+          "screen_fine_structure": {
+            "chromaHighpassRatioRG": 1.000378966331482,
+            "chromaHighpassRatioBG": 1.0009949207305908,
+            "lumaHighpassRatio": 0.99994223618344
+          },
+          "fabric_folds_candidate": {
+            "chromaHighpassRatioRG": 1.021856427192688,
+            "chromaHighpassRatioBG": 0.9993172883987427,
+            "lumaHighpassRatio": 1.0002377734500179
+          }
+        },
+        "controlsAndRoute": {
+          "baseline04": {
+            "rawToneInputGain": "1",
+            "automaticGlobalSceneEv": "0",
+            "totalPostFllfExposureGain": "1",
+            "fllfStrength": "0.241644",
+            "CameraMatrixSource": "CAMERA2_EXACT_FRAME_COLOR_CORRECTION_TRANSFORM",
+            "rawIspWorkingSetEstimateBytes": "239075328",
+            "phase16DemosaicResolved": "AMAZE",
+            "phase16DemosaicFallback": "false",
+            "vulkanToneUsedForOutput": "true",
+            "phase9GpuPrimary": "true"
+          },
+          "production": {
+            "rawToneInputGain": "1",
+            "automaticGlobalSceneEv": "0",
+            "totalPostFllfExposureGain": "1",
+            "fllfStrength": "0.241644",
+            "CameraMatrixSource": "CAMERA2_EXACT_FRAME_COLOR_CORRECTION_TRANSFORM",
+            "rawIspWorkingSetEstimateBytes": "239075328",
+            "phase16DemosaicResolved": "AMAZE",
+            "phase16DemosaicFallback": "false",
+            "vulkanToneUsedForOutput": "true",
+            "phase9GpuPrimary": "true"
+          }
+        }
+      }
+    },
+    "raw10": {
+      "0": {
+        "encodedRgbMseDifference": [
+          1.4054566008780967e-06,
+          9.256080488739826e-07,
+          5.52358005734277e-06
+        ],
+        "meanAbsLumaDifference": 0.0001377095043181841,
+        "maxAbsLumaDifference": 0.0199411766141653,
+        "clipFractionBefore": 0.0,
+        "clipFractionAfter": 0.0,
+        "controlsAndRoute": {
+          "baseline04": {
+            "rawToneInputGain": "1",
+            "automaticGlobalSceneEv": "0",
+            "totalPostFllfExposureGain": "1",
+            "fllfStrength": "0.24",
+            "CameraMatrixSource": "CAMERA2_EXACT_FRAME_COLOR_CORRECTION_TRANSFORM",
+            "rawIspWorkingSetEstimateBytes": "238141440",
+            "phase16DemosaicResolved": "AUTO_HYBRID",
+            "phase16DemosaicFallback": "false",
+            "vulkanToneUsedForOutput": "true",
+            "phase9GpuPrimary": "true"
+          },
+          "production": {
+            "rawToneInputGain": "1",
+            "automaticGlobalSceneEv": "0",
+            "totalPostFllfExposureGain": "1",
+            "fllfStrength": "0.24",
+            "CameraMatrixSource": "CAMERA2_EXACT_FRAME_COLOR_CORRECTION_TRANSFORM",
+            "rawIspWorkingSetEstimateBytes": "238141440",
+            "phase16DemosaicResolved": "AUTO_HYBRID",
+            "phase16DemosaicFallback": "false",
+            "vulkanToneUsedForOutput": "true",
+            "phase9GpuPrimary": "true"
+          }
+        }
+      },
+      "1": {
+        "encodedRgbMseDifference": [
+          1.3206976063884213e-06,
+          8.939859981182963e-07,
+          5.533012426894857e-06
+        ],
+        "meanAbsLumaDifference": 0.00013394396249152043,
+        "maxAbsLumaDifference": 0.017930979323387136,
+        "clipFractionBefore": 0.0,
+        "clipFractionAfter": 0.0,
+        "controlsAndRoute": {
+          "baseline04": {
+            "rawToneInputGain": "1",
+            "automaticGlobalSceneEv": "0",
+            "totalPostFllfExposureGain": "1",
+            "fllfStrength": "0.24",
+            "CameraMatrixSource": "CAMERA2_EXACT_FRAME_COLOR_CORRECTION_TRANSFORM",
+            "rawIspWorkingSetEstimateBytes": "238141440",
+            "phase16DemosaicResolved": "MALVAR_2004",
+            "phase16DemosaicFallback": "false",
+            "vulkanToneUsedForOutput": "true",
+            "phase9GpuPrimary": "true"
+          },
+          "production": {
+            "rawToneInputGain": "1",
+            "automaticGlobalSceneEv": "0",
+            "totalPostFllfExposureGain": "1",
+            "fllfStrength": "0.24",
+            "CameraMatrixSource": "CAMERA2_EXACT_FRAME_COLOR_CORRECTION_TRANSFORM",
+            "rawIspWorkingSetEstimateBytes": "238141440",
+            "phase16DemosaicResolved": "MALVAR_2004",
+            "phase16DemosaicFallback": "false",
+            "vulkanToneUsedForOutput": "true",
+            "phase9GpuPrimary": "true"
+          }
+        }
+      },
+      "2": {
+        "encodedRgbMseDifference": [
+          8.761104254517704e-06,
+          4.20825836044969e-06,
+          1.7731128536979668e-05
+        ],
+        "meanAbsLumaDifference": 0.0005606540784231259,
+        "maxAbsLumaDifference": 0.025068235284928242,
+        "clipFractionBefore": 0.0,
+        "clipFractionAfter": 0.0,
+        "controlsAndRoute": {
+          "baseline04": {
+            "rawToneInputGain": "1",
+            "automaticGlobalSceneEv": "0",
+            "totalPostFllfExposureGain": "1",
+            "fllfStrength": "0.24",
+            "CameraMatrixSource": "CAMERA2_EXACT_FRAME_COLOR_CORRECTION_TRANSFORM",
+            "rawIspWorkingSetEstimateBytes": "238141440",
+            "phase16DemosaicResolved": "AMAZE",
+            "phase16DemosaicFallback": "false",
+            "vulkanToneUsedForOutput": "true",
+            "phase9GpuPrimary": "true"
+          },
+          "production": {
+            "rawToneInputGain": "1",
+            "automaticGlobalSceneEv": "0",
+            "totalPostFllfExposureGain": "1",
+            "fllfStrength": "0.24",
+            "CameraMatrixSource": "CAMERA2_EXACT_FRAME_COLOR_CORRECTION_TRANSFORM",
+            "rawIspWorkingSetEstimateBytes": "238141440",
+            "phase16DemosaicResolved": "AMAZE",
+            "phase16DemosaicFallback": "false",
+            "vulkanToneUsedForOutput": "true",
+            "phase9GpuPrimary": "true"
+          }
+        }
+      }
+    }
+  }
+}
