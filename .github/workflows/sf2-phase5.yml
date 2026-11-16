@@ -18,6 +18,8 @@ jobs:
           cmake --build build-sf2-native --parallel 2
       - name: Run frozen baseline and Guided Fine tests
         run: ctest --test-dir build-sf2-native --output-on-failure
+      - name: Show fine-versus-combined synthetic reference MSE
+        run: ./build-sf2-native/SingleFrameGuidedCoarseTest
       - name: Install Vulkan GLSL compiler
         run: |
           sudo apt-get update -qq
