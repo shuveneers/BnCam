@@ -46,6 +46,7 @@ int main(){
     double preEdge=0,plainEdge=0,gatedEdge=0;
     int hair=0,texture=0,flat=0,edge=0;
     double weighted=0;
+    std::vector<float> plainY(W*H,0.f),gatedY(W*H,0.f);
     for(int y=8;y<H-8;++y)for(int x=8;x<W-8;++x){
         const int i=y*W+x;
         const P post=input[i];
@@ -57,6 +58,8 @@ int main(){
         assert(gate.valid && gate.weight>=0.f && gate.weight<=1.f);
         const float before=py(post),raw=before+fineDelta+coarseDelta;
         const float safe=py(sf2::applyResidualConfidence(post,fineDelta,coarseDelta,gate));
+        plainY[i]=raw;
+        gatedY[i]=safe;
         const double errPre=(before-truth[i])*(before-truth[i]);
         const double errPlain=(raw-truth[i])*(raw-truth[i]);
         const double errSafe=(safe-truth[i])*(safe-truth[i]);
@@ -73,6 +76,38 @@ int main(){
     assert(hair>0&&texture>0&&edge>0&&flat>0);
     // The gate must be nontrivial, finite and independently selectable.
     assert(std::isfinite(weighted) && weighted>0.0);
+    // Compare coherent *contrast retention* as well as pixel MSE. More
+    // retained modulation can accompany slightly worse raw MSE on noisy lines;
+    // both metrics must be reported, never select just one favourable number.
+    auto hairContrast=[&](const std::vector<float>& image,int x){
+        double sum=0.;
+        for(int y=20;y<86;++y) {
+            const int i=y*W+x;
+            sum+=image[i]-.5*(image[i-1]+image[i+1]);
+        }
+        return sum/66.;
+    };
+    auto textileModulation=[&](const std::vector<float>& image){
+        double contrast=0.,count=0.;
+        for(int y=24;y<66;++y)for(int x=96;x<133;++x) {
+            const float sign=((x/2+y/3)&1)?1.f:-1.f;
+            contrast+=double(sign)*(image[y*W+x]-.10f);
+            count+=1.;
+        }
+        return contrast/count;
+    };
+    auto edgeContrast=[&](const std::vector<float>& image){
+        double sum=0;
+        for(int x=25;x<75;++x)
+            sum+=image[93*W+x]-image[92*W+x];
+        return sum/50.;
+    };
+    std::cout<<"actualCandidateDetailRetention"
+        <<" hair20="<<hairContrast(plainY,41)<<","<<hairContrast(gatedY,41)
+        <<" hair11="<<hairContrast(plainY,54)<<","<<hairContrast(gatedY,54)
+        <<" textile11="<<textileModulation(plainY)<<","<<textileModulation(gatedY)
+        <<" step140="<<edgeContrast(plainY)<<","<<edgeContrast(gatedY)
+        <<"\\n";
     std::cout<<"actualCandidateSynthetic"
         <<" hair="<<preHair<<","<<plainHair<<","<<gatedHair
         <<" textile="<<preTexture<<","<<plainTexture<<","<<gatedTexture
