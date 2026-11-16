@@ -26,6 +26,8 @@ object BenchmarkDebugReceiverController {
     const val ACTION_AF_GROUND_TRUTH_CONTROL = "com.bncam.AF_GROUND_TRUTH_CONTROL"
     // Opt-in, debug-only diagnostic; stores a local textual GPU/CPU parity report.
     const val ACTION_VALIDATE_SF2 = "com.bncam.VALIDATE_SF2"
+    // Avoid double capture: the legacy TRIGGER_CAPTURE action also has a manifest receiver.
+    const val ACTION_TRIGGER_SF2_CAPTURE = "com.bncam.TRIGGER_SF2_CAPTURE"
     @Volatile private var sf2QualificationRunning = false
 
     fun register(
@@ -163,6 +165,11 @@ object BenchmarkDebugReceiverController {
                             CameraEventBus.requestCapture("adb_dynamic")
                         }
                     }
+                    ACTION_TRIGGER_SF2_CAPTURE -> {
+                        activity.lifecycleScope.launch {
+                            CameraEventBus.requestCapture("sf2_qualification")
+                        }
+                    }
                     ACTION_VALIDATE_SF2 -> {
                         // Never run GPU qualification on the broadcast/UI thread.
                         if (!sf2QualificationRunning) {
@@ -207,6 +214,7 @@ object BenchmarkDebugReceiverController {
                 addAction(ACTION_TRIGGER_CAPTURE)
                 addAction(ACTION_AF_GROUND_TRUTH_CONTROL)
                 addAction(ACTION_VALIDATE_SF2)
+                addAction(ACTION_TRIGGER_SF2_CAPTURE)
             },
             ContextCompat.RECEIVER_EXPORTED
         )
