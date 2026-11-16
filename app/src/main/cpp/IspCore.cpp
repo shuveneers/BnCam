@@ -2,6 +2,7 @@
 #include "PhysicalLumaDenoise.h"
 #include "SingleFrameNoiseContext.h"
 #include "RawPoissonGaussianEstimator.h"
+#include "SingleFrameGuidedLuma.h"
 // BEGIN_PHYSICAL_MODEL_ONLY
 #include "PhysicalNoisePropagation.h"
 // END_PHYSICAL_MODEL_ONLY
@@ -6944,7 +6945,8 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     }
     // SF2: chroma-only is the unconditional product baseline. Legacy is debug-only.
     const auto singleFrameLumaStage = bncam::luma::selectedStage.load(std::memory_order_relaxed);
-    if (!bncam::luma::legacyAuthorized(singleFrameLumaStage)) baselinePhysicalLuma = {};
+    if (!bncam::luma::legacyAuthorized(singleFrameLumaStage) &&
+        singleFrameLumaStage != bncam::luma::Stage::GUIDED_V2) baselinePhysicalLuma = {};
     std::array<float,9> chromaColorTransform{};
     for(int r=0;r<3;++r)for(int c=0;c<3;++c)chromaColorTransform[r*3+c]=ccm[r*3+c]*wbRgb[c];
     baselinePhysicalChroma=bncam::chroma::inColorDomain(baselinePhysicalChroma,
@@ -7091,6 +7093,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         request.preWbCloudCorrectionReady = false;
         request.baselinePhysicalChroma = baselinePhysicalChroma;
         request.baselinePhysicalLuma = baselinePhysicalLuma;
+        request.lumaStage = singleFrameLumaStage;
         if (g_spatialNoiseMap.relativePhysicalShape) {
             request.physicalSpatialSigma = g_spatialNoiseMap.tileSigma.data();
             request.physicalSpatialColumns = g_spatialNoiseMap.gridWidth;
@@ -7192,8 +7195,11 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                 };
                 for(int y=rows.start;y<rows.end;++y) for(int x=0;x<source.cols;++x) {
                     auto current=linearRgb.at<cv::Vec3f>(y,x);
-                    auto p=bncam::luma::filter(x,y,baselinePhysicalLuma,
-                            bncam::luma::Pixel{current[0],current[1],current[2]},read,shape).pixel;
+                    auto p=(singleFrameLumaStage == bncam::luma::Stage::GUIDED_V2)
+                            ? bncam::sf2::guidedFine(x,y,baselinePhysicalLuma,
+                                    bncam::luma::Pixel{current[0],current[1],current[2]},read,shape,true).pixel
+                            : bncam::luma::filter(x,y,baselinePhysicalLuma,
+                                    bncam::luma::Pixel{current[0],current[1],current[2]},read,shape).pixel;
                     linearRgb.at<cv::Vec3f>(y,x)={p[0],p[1],p[2]};
                 }
             });
@@ -9566,7 +9572,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; spectraResidualAlignmentConfidence=" << residualNoiseState.alignmentConfidence
             << formatPropagationStateFields("spectraPreDemosaic", residualNoiseState.preDemosaic)
             << "; baselinePhysicalLuma={enabled=" << (baselinePhysicalLuma.valid()?"true":"false")
-            << ";stage=" << (singleFrameLumaStage==bncam::luma::Stage::OFF?"OFF":singleFrameLumaStage==bncam::luma::Stage::LEGACY_REFERENCE?"LEGACY_REFERENCE":"GUIDED_V2_NOT_YET_ACTIVE")
+            << ";stage=" << (singleFrameLumaStage==bncam::luma::Stage::OFF?"OFF":singleFrameLumaStage==bncam::luma::Stage::LEGACY_REFERENCE?"LEGACY_REFERENCE":"GUIDED_V2_FINE_DEBUG")
              << ";spectraIndependent=true;inputDomain=POST_PHYSICAL_CHROMA_LINEAR_RGB;noiseModel=PHYSICAL_SO_PROPAGATED"
             << ";status=" << (baselinePhysicalLuma.valid()?"PHYSICAL_LUMA_ACTIVE":
                 (singleFrameLumaStage==bncam::luma::Stage::OFF?"PHYSICAL_LUMA_STAGE_OFF":"PHYSICAL_LUMA_BYPASS_NO_VALID_NOISE_MODEL"))
