@@ -1106,6 +1106,26 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
         result.totalMs = elapsedMs(totalStart);
         return result;
     }
+    // SF2-D05: two quarter-size DEVICE_ONLY buffers, allocated only for
+    // explicit Fine+Coarse debug stage. OOM degrades to Fine (no GPU failure).
+    const std::uint32_t coarseWidth=(request.frameWidth+3u)/4u;
+    const std::uint32_t coarseHeight=(request.frameHeight+3u)/4u;
+    const std::uint64_t coarseCells=std::uint64_t(coarseWidth)*coarseHeight;
+    const bool coarseRequested=request.lumaStage==bncam::luma::Stage::GUIDED_V2_FINE_COARSE &&
+            request.baselinePhysicalLuma.valid() &&
+            request.frameWidth>=12u && request.frameHeight>=12u;
+    bool coarseReady=false;
+    if(coarseRequested) {
+        std::string coarseFailure;
+        coarseReady=ensureBufferLocked(allocator,coarseCells*4u*sizeof(float),0u,
+                      guidedCoarseInput_,reallocated,coarseFailure) &&
+                    ensureBufferLocked(allocator,coarseCells*sizeof(float),0u,
+                      guidedCoarseResidual_,reallocated,coarseFailure);
+    }
+    result.guidedCoarseWidth=coarseReady?coarseWidth:0u;
+    result.guidedCoarseHeight=coarseReady?coarseHeight:0u;
+    result.guidedCoarseResidentBytes=coarseReady
+            ? coarseCells*(4u*sizeof(float)+sizeof(float)) : 0u;
     result.persistentBufferReallocated = reallocated;
     result.persistentBufferReuseHit = !reallocated;
     result.persistentAllocationGeneration = allocationGeneration_;
@@ -1113,7 +1133,8 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
             deviceInput_.capacityBytes + deviceOutput_.capacityBytes + rgbUpload_.capacityBytes +
             colorStatistics_.capacityBytes + colorTelemetry_.capacityBytes +
             sourceClipConfidence_.capacityBytes + cloudCorrectionMap_.capacityBytes +
-            hueSatProfile_.capacityBytes + residualCandidates_.capacityBytes;
+            hueSatProfile_.capacityBytes + residualCandidates_.capacityBytes +
+            guidedCoarseInput_.capacityBytes + guidedCoarseResidual_.capacityBytes;
     result.phase9SourceRawConfidenceMapUsed = sourceClipConfidenceReady;
     result.phase9SourceRawConfidenceMapBytes = sourceClipConfidenceReady ? expectedClipBytes : 0u;
 
@@ -1287,6 +1308,8 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
     push.cfaEvidence1[0] = sourceClipConfidenceReady ? (request.neutralDefaultRaw ? 2.0f : 1.0f) : 0.0f;
     const bool physicalLumaReady=request.lumaStage!=bncam::luma::Stage::OFF &&
             request.baselinePhysicalLuma.valid();
+    const auto effectiveLumaStage=request.lumaStage==bncam::luma::Stage::GUIDED_V2_FINE_COARSE && !coarseReady
+            ? bncam::luma::Stage::GUIDED_V2 : request.lumaStage;
     push.padding0 = physicalLumaReady ? request.baselinePhysicalLuma.varianceY : 0.f;
     push.cfaEvidence1[1] = physicalLumaReady ? request.baselinePhysicalLuma.confidence : 0.f;
     push.cfaEvidence1[2] = request.physicalChromaValidationOnly ? 1.f : 0.f;
@@ -1295,7 +1318,7 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
     // heteroscedastic-statistics bit; no push-constant ABI or buffer change.
     push.residualStride = (noise.adaptiveSpatialNoise ? 1u : 0u) |
                           (noise.protectCoherentDetail ? 2u : 0u) |
-                          (physicalLumaReady ? (static_cast<std::uint32_t>(request.lumaStage)<<2u) : 0u);
+                          (physicalLumaReady ? (static_cast<std::uint32_t>(effectiveLumaStage)<<2u) : 0u);
     push.ccm[9] = physicalShapeReady ? float(request.physicalSpatialColumns) : 0.f;
     push.ccm[10] = physicalShapeReady ? float(request.physicalSpatialRows) : 0.f;
     push.ccm[0] = request.colorMatrix[0];
