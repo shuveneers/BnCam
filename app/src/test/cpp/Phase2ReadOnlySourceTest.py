@@ -1,5 +1,6 @@
 """SF2-D02 pixel-path isolation contract relative to the completed phase-1 release."""
 from pathlib import Path
+from Sf2ReadOnlyIspNormalization import strip_phase3_debug_isp
 import subprocess
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -10,15 +11,17 @@ actual = subprocess.check_output(
     cwd=ROOT, text=True).splitlines()
 expected = [
     "app/src/main/cpp/DemosaicNoiseCorrelation.h",
+    "app/src/main/cpp/IspCore.cpp",
+    "app/src/main/cpp/RawPoissonGaussianEstimator.h",
     "app/src/main/cpp/SingleFrameNoiseContext.h",
 ]
 assert actual == expected, f"Unexpected phase-2 main-cpp changes: {actual!r}"
 
 # Product output, demosaic implementation, chroma, Vulkan and stage selector are
-# untouched relative to phase 1; only read-only headers differ.
+# untouched relative to phase 1; only read-only phase-2 headers + phase-3 diagnostic observation differ.
 isp = maincpp + "/IspCore.cpp"
-assert (ROOT / isp).read_bytes() == subprocess.check_output(
-    ["git", "show", BASE + ":" + isp], cwd=ROOT)
+assert strip_phase3_debug_isp((ROOT / isp).read_text()) == subprocess.check_output(
+    ["git", "show", BASE + ":" + isp], cwd=ROOT).decode()
 
 model = (ROOT / maincpp / "DemosaicNoiseCorrelation.h").read_text()
 context = (ROOT / maincpp / "SingleFrameNoiseContext.h").read_text()
