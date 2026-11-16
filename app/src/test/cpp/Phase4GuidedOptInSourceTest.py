@@ -85,4 +85,9 @@ assert "Stage::OFF" in jni
 debug=live("app/src/debug/java/com/bncam/BenchmarkDebugReceiverController.kt")
 assert 'intent.hasExtra("physicalLumaStage")' in debug
 assert "setPhysicalLumaStageDebug" in debug
+kt=live("app/src/main/java/com/bncam/core/engine/ImageUtils.kt")
+for token in ("setPhysicalLumaStageDebug(0)", "setPhysicalLumaStageDebug(1)",
+              "setPhysicalLumaStageDebug(2)", '"off.jpg"', '"on.jpg"',
+              '"guided.jpg"', '"guided.txt"', "finally {"):
+    assert token in kt, f"Missing same-RAW A/B/C contract {token}"
 print("Phase-4 debug opt-in, exact OFF/legacy shader and ISP frozen, chroma unmodified")
