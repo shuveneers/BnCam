@@ -1,21 +1,21 @@
-# SF2 delta log — delivery chain
+# SF2 delta log — incremental delivery chain
 
-| ID | Status | Implementation and files | Verification / constraints | Commit |
-|---|---|---|---|---|
-| SF2-D00-01 | CODE COMPLETE | Pin main baseline and branch; `BASELINE.md` | Main at 2778264 | 29bf7cc9 |
-| SF2-D00-02 | DEVICE VALIDATION PENDING | Luma OFF default; debug-only legacy; `PhysicalLumaDenoise.h`, `IspCore.cpp` | Chroma files unmodified; phase-0 native CI succeeded | 29bf7cc9 |
-| SF2-D00-03 | DEVICE VALIDATION PENDING | Same-RAW debug A/B resets OFF; stage test | Phone JPEG comparison pending | 29bf7cc9 |
-| SF2-D00-04 | CODE COMPLETE | Rebased frozen identity fixture to main 2778264; phase-0 workflow | Native CI run 43834301957 success | ba509c90 |
-| SF2-D01-01 | CODE COMPLETE / DEVICE VALIDATION PENDING | Immutable `SingleFrameNoiseContext.h`: effective physical S/O, pre/post-demosaic predicted residual covariance, observation, confidence, spatial and fusion provenance. No second S/O resolver. | C++ contract validates invalid/missing S/O and confidence; same-domain measurement only. No device test. | 2cda83cc |
-| SF2-D01-02 | CODE COMPLETE / DEVICE VALIDATION PENDING | Native test `SingleFrameNoiseContextTest.cpp`, `CMakeLists.txt`, and `NOISE_CONTEXT_DOMAINS.md`. | Sensor S/O never re-gained; predicted covariance already includes existing LSC/exposure. Test explicitly checks one-time 2x gain produces 4x variance, context no added gain. | 895a1a16, cd0a5359, 2ef529ae |
-| SF2-D01-03 | CODE COMPLETE / DEVICE VALIDATION PENDING | `IspCore.cpp` read-only observation and diagnostic line; `SingleFrameNoiseContextSourceTest.py`; phase-1 workflow. | Source regression reconstructs phase-0 ISP source byte-identically after removing ONLY new read-only lines; no chroma or shader changes. Native CI run 43836499294: **11/11 passed**. Android Gradle/APK/device tests NOT run. | dca4d404, 3a89cac7, 4837cfa1, 6c57db10 |
+| ID | Status | Implementation | Evidence / limitations |
+|---|---|---|---|
+| SF2-D00-01 | CODE COMPLETE | Main SHA 2778264 pinned; separate release chain | Baseline |
+| SF2-D00-02/03/04 | CODE COMPLETE / PHONE PENDING | Chroma-only default, debug-only legacy luma, same-RAW A/B; frozen source and pixel contracts | Phase-0 native CI success 43834301957; no APK |
+| SF2-D01-01 | CODE COMPLETE / PHONE PENDING | Immutable `SingleFrameNoiseContext`, existing physical S/O and propagated residual states | Native tests; no second S/O resolver |
+| SF2-D01-02 | CODE COMPLETE / PHONE PENDING | `SingleFrameNoiseContextTest` and domain contract | One-time LSC/spatial gain and RAW sensor domain tested |
+| SF2-D01-03 | CODE COMPLETE / PHONE PENDING | `IspCore.cpp` diagnostic-only object construction; native source identity | Phase-1 11/11 native CI 43836979969 |
+| SF2-D02-01 | CODE COMPLETE / PHONE PENDING | `DemosaicNoiseCorrelation.h`: R/Gr/Gb/B fixed kernel impulse overlap, phase-averaged camera-linear Y correlations for Malvar/Bilinear at four offsets; explicit unknown AMaZE/Auto Hybrid/neural posterior | `DemosaicNoiseCorrelationTest` independently reconstructs impulse kernels and cross-checks existing fixed-RGB covariance; no spatial independence measured |
+| SF2-D02-02 | CODE COMPLETE / PHONE PENDING | Correlation attached to immutable `SingleFrameNoiseContext` with source provenance; diagnostics only show rho if proxy available | `SingleFrameDemosaicContextTest` verifies unknown values never published as rho=0 |
+| SF2-D02-03 | CODE COMPLETE / PHONE PENDING | `Phase2ReadOnlySourceTest.py` and phase-2 native workflow with changed-files artifact ZIP | CI **14/14 passed** at 43838446474, including phase-0/1 regression and source identity; no APK/device test |
 
-## Phase 1 release boundary
+## Exact release boundary
 
-Phase 1 is branched from completed phase 0. The further experimental code in `feature/single-frame-engine-v2` is not included in the delivery and cannot be described as a validated successor. Next phase to deliver: **SF2-D02-01 Malvar spatial noise correlation**.
-
-## Download model
-
-- Full project per phase: GitHub archive of `deliverables/sf2-phase1`.
-- Changes-only: GitHub compare patch `ba509c90...deliverables/sf2-phase1.patch`.
-- APK: **not available**. The native workflow tests C++ and a source contract; it is not an Android build.
+- Phase-1 base SHA: `ea7f4b45c41e5770cd8d3938bfd1133efc40aa65`.
+- Phase-2 release branch: `deliverables/sf2-phase2`.
+- Full project downloadable via the GitHub branch ZIP.
+- Changes-only ZIP downloadable as the `BnCam_SF2_F2_Delta` GitHub Actions artifact; its ZIP includes changed files and a reproducible `.patch` against phase 1.
+- The unrelated `feature/single-frame-engine-v2` experiment is not included.
+- **Next closed phase: SF2-D03 RAW Poisson–Gaussian diagnostics, read-only.** Not started on this release branch.
