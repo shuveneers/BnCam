@@ -4761,7 +4761,8 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_bncam_core_engine_ImageUtils_setPhysicalLumaStageDebug(JNIEnv*,jobject,jint stage) {
 #ifndef NDEBUG
     const auto selected = stage==1 ? bncam::luma::Stage::LEGACY_REFERENCE :
-            stage==2 ? bncam::luma::Stage::GUIDED_V2 : bncam::luma::Stage::OFF;
+            stage==2 ? bncam::luma::Stage::GUIDED_V2 :
+            stage==4 ? bncam::luma::Stage::GUIDED_V2_FINE_COARSE : bncam::luma::Stage::OFF;
     bncam::luma::selectedStage.store(selected, std::memory_order_relaxed);
 #else
     (void)stage;
