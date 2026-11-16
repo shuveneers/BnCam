@@ -58,6 +58,27 @@ def verify_capture(files: dict[str, bytes]) -> dict:
     bad_jpegs = [p for p in IMAGE_FILES if p in files and
                  not (files[p].startswith(b"\xff\xd8") and files[p].endswith(b"\xff\xd9"))]
     notes = files.get("qualification.txt", b"").decode("utf-8", errors="replace")
+    # The five filenames are NOT sufficient evidence that the requested
+    # native stage really executed on the resident GPU. Inspect each render's
+    # own native stats; never classify CPU fallback as a GPU-qualified photo.
+    expected_telemetry = {
+        "off.txt": ("OFF", False),
+        "on.txt": ("LEGACY_REFERENCE", True),
+        "guided.txt": ("GUIDED_V2_FINE_DEBUG", True),
+        "combined.txt": ("GUIDED_V2_FINE_COARSE_DEBUG", True),
+        "confidence.txt": ("GUIDED_V2_CONFIDENCE_DEBUG", True),
+        "off_repeat.txt": ("OFF", False),
+    }
+    gpu_route_checks = {}
+    for path, (stage, enabled) in expected_telemetry.items():
+        stats = files.get(path, b"").decode("utf-8", errors="replace")
+        gpu_route_checks[path] = (
+            f";stage={stage}" in stats and
+            (";gpuExecuted=true" in stats if enabled else
+             ";gpuExecuted=false" in stats) and
+            (";measurementStatus=GPU_MEASURED" in stats if enabled else True) and
+            (";confidenceGateApplied=true" in stats if path=="confidence.txt" else True)
+        )
     expected = {"off": 0, "legacy": 1, "fine": 2, "coarse": 4,
                 "confidence": 5, "offRepeat": 0}
     observed = re.findall(r"selectedStage\.(\w+)=(\d+);expected=(\d+)", notes)
@@ -71,6 +92,8 @@ def verify_capture(files: dict[str, bytes]) -> dict:
         "jpeg_markers_valid": not bad_jpegs and all(p in files for p in IMAGE_FILES),
         "bad_jpeg_markers": bad_jpegs,
         "six_debug_stage_checks_pass": matches,
+        "native_stage_and_gpu_route_checks_pass": all(gpu_route_checks.values()),
+        "native_route_checks_by_stage": gpu_route_checks,
         "off_repeat_jpeg_byte_identical": "offRepeatJpegBytesIdentical=true" in notes,
         "off_repeat_byte_identity_is_not_pixel_proof": True,
         "master_crc_present": ("rawMasterCrc32=" in notes and
@@ -219,7 +242,8 @@ def main() -> int:
         return 2
     if capture_state and not (capture_state["all_capture_files_present"] and
                               capture_state["jpeg_markers_valid"] and
-                              capture_state["six_debug_stage_checks_pass"]):
+                              capture_state["six_debug_stage_checks_pass"] and
+                              capture_state["native_stage_and_gpu_route_checks_pass"]):
         print("Same-RAW qualification INCOMPLETE. Inspect ZIP.", file=sys.stderr)
         return 3
     return 0
