@@ -14,7 +14,7 @@
 namespace bncam::sf2 {
 
 struct SingleFrameNoiseContext final {
-    // Camera2 effective S/O in normalized sensor Bayer domain, in R, Gr, Gb, B order.
+    // Capture-local effective S/O in normalized sensor Bayer domain, in R, Gr, Gb, B order.
     const std::array<double, 4> sensorS;
     const std::array<double, 4> sensorO;
     // These are EXISTING predicted residual states; neither is raw sensor variance.
@@ -93,7 +93,7 @@ struct SingleFrameNoiseContext final {
             observationReady ? measurement.robustVarianceY : 0.0,
             observationReady ? measurement.acceptedSampleCount : 0u,
             predictionReady ? demosaiced.confidence : 0.0,
-            soReady ? "EXISTING_CAMERA2_EFFECTIVE_SO" : "NO_VALID_PHYSICAL_SO",
+            soReady ? "EXISTING_EFFECTIVE_SO" : "NO_VALID_PHYSICAL_SO",
             finalized.stage + ":" + finalized.method,
             demosaiced.stage + ":" + demosaiced.method
         };
