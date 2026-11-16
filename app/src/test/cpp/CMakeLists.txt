@@ -21,6 +21,7 @@ foreach(header IN ITEMS PhysicalNoiseAuthority.h PhysicalChromaDenoise.h Physica
 endforeach()
 foreach(test IN ITEMS AdaptiveNoiseAuthorityTest PhysicalNoisePropagationTest PhysicalNoisePixelIdentityTest
         SingleFrameLumaStageContractTest SingleFrameNoiseContextTest
+        DemosaicNoiseCorrelationTest
         PhysicalChromaDenoiseTest PhysicalLumaDenoiseTest PhysicalNoiseNativeContractTest
         RawCfaLevelMappingTest)
     add_executable(${test} ${test}.cpp)
