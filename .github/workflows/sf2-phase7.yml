@@ -1,0 +1,104 @@
+name: SF2 phase-7 integration qualification — frozen native, shader, Android APK
+on:
+  push:
+    branches: [deliverables/sf2-phase7]
+  workflow_dispatch:
+permissions:
+  contents: read
+
+jobs:
+  native-qualification:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Re-run all 20 untouched phase-5 tests from frozen commit
+        run: |
+          git worktree add --detach "$RUNNER_TEMP/frozen-sf2-phase5" 701fcb0df6541d5ede0d0b451159934ae9a6928b
+          cmake -S "$RUNNER_TEMP/frozen-sf2-phase5/app/src/test/cpp" -B "$RUNNER_TEMP/build-sf2-frozen5" -DCMAKE_BUILD_TYPE=Release
+          cmake --build "$RUNNER_TEMP/build-sf2-frozen5" --parallel 2
+          ctest --test-dir "$RUNNER_TEMP/build-sf2-frozen5" --output-on-failure
+      - name: Re-run all 17 untouched phase-6 tests from frozen commit
+        run: |
+          git worktree add --detach "$RUNNER_TEMP/frozen-sf2-phase6" 793768e296721e1eeede16724cdba983834443bf
+          cmake -S "$RUNNER_TEMP/frozen-sf2-phase6/app/src/test/cpp" -B "$RUNNER_TEMP/build-sf2-frozen6" -DCMAKE_BUILD_TYPE=Release -DSF2_ISOLATED_PHASE6=ON
+          cmake --build "$RUNNER_TEMP/build-sf2-frozen6" --parallel 2
+          ctest --test-dir "$RUNNER_TEMP/build-sf2-frozen6" --output-on-failure
+      - name: Compile and run current phase-7 CPU and source contracts
+        run: |
+          cmake -S app/src/test/cpp -B build-sf2-phase7 -DCMAKE_BUILD_TYPE=Release -DSF2_ISOLATED_PHASE7=ON
+          cmake --build build-sf2-phase7 --parallel 2
+          ctest --test-dir build-sf2-phase7 --output-on-failure
+      - name: Test binary-safe device collector offline; no phone required
+        run: |
+          python3 -m unittest discover -s tests -p test_sf2_phase7_collect.py -v
+          python3 scripts/sf2_phase7_collect.py --help
+      - name: Install Vulkan GLSL compiler
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq glslc
+      - name: Compile actual resident Vulkan shader including stage 5 to SPIR-V
+        run: |
+          glslc --target-env=vulkan1.1 -O -I app/src/main/cpp/vulkan/shaders \
+            -o /tmp/sf2-phase7-resident.spv \
+            app/src/main/cpp/vulkan/shaders/spectra_demosaic_resident.comp
+          test -s /tmp/sf2-phase7-resident.spv
+      - name: Package exactly phase-7 changed files plus phase-6-relative binary patch
+        shell: bash
+        run: |
+          BASE=793768e296721e1eeede16724cdba983834443bf
+          mkdir -p phase7_delta_files
+          while IFS= read -r file; do
+            mkdir -p "phase7_delta_files/$(dirname "$file")"
+            cp -- "$file" "phase7_delta_files/$file"
+          done < <(git diff --name-only --diff-filter=ACMR "$BASE" HEAD)
+          git diff --binary "$BASE" HEAD > BnCam_SF2_F7_From_Phase6.patch
+          zip -qr BnCam_SF2_F7_Delta.zip phase7_delta_files BnCam_SF2_F7_From_Phase6.patch
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BnCam_SF2_F7_Delta
+          path: BnCam_SF2_F7_Delta.zip
+          if-no-files-found: error
+
+  android-debug-apk:
+    needs: native-qualification
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Configure Android SDK (known working phase-6 toolchain approach)
+        env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
+          ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+        run: |
+          set -euo pipefail
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          test -x "$SDKMANAGER"
+          printf 'sdk.dir=%s\n' "$ANDROID_HOME" > local.properties
+          "$SDKMANAGER" --install "platforms;android-36" "build-tools;36.0.0" "cmake;3.22.1" "ndk;27.2.12479018"
+      - name: Actually build complete arm64 debug APK incl. JNI and embedded Vulkan shaders
+        run: |
+          chmod +x ./gradlew
+          ./gradlew :app:assembleDebug --no-daemon --max-workers=2 --stacktrace
+      - name: Verify APK and native JNI qualification are packaged
+        run: |
+          set -euo pipefail
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          test -s "$APK"
+          unzip -l "$APK" | grep -F "lib/arm64-v8a/libbncam.so"
+          unzip -p "$APK" lib/arm64-v8a/libbncam.so > /tmp/sf2-phase7-libbncam.so
+          test -s /tmp/sf2-phase7-libbncam.so
+          nm -D /tmp/sf2-phase7-libbncam.so | grep -F "Java_com_bncam_core_engine_ImageUtils_validateSf2IntegrationNative"
+          nm -D /tmp/sf2-phase7-libbncam.so | grep -F "Java_com_bncam_core_engine_ImageUtils_getPhysicalLumaStageDebug"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BnCam_SF2_F7_Debug_APK
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
