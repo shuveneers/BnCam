@@ -102,12 +102,27 @@ int main(){
             sum+=image[93*W+x]-image[92*W+x];
         return sum/50.;
     };
+    // Actual phase-4/5 candidate regression: more TRUE deterministic
+    // hair/textile modulation must survive confidence protection; the
+    // MSE tradeoff is separately constrained, not hidden.
+    assert(std::abs(hairContrast(gatedY,41)-.020)
+           < .96*std::abs(hairContrast(plainY,41)-.020));
+    assert(std::abs(hairContrast(gatedY,54)-.011)
+           < .96*std::abs(hairContrast(plainY,54)-.011));
+    assert(std::abs(textileModulation(gatedY)-.011)
+           < .80*std::abs(textileModulation(plainY)-.011));
+    assert(std::abs(edgeContrast(gatedY)-.140)
+           < 1.10*std::abs(edgeContrast(plainY)-.140));
+    assert(gatedFlat <= 1.10*plainFlat);
+    assert(gatedHair <= 1.10*plainHair);
+    assert(gatedTexture <= 1.10*plainTexture);
+    assert(gatedEdge <= 1.10*plainEdge);
     std::cout<<"actualCandidateDetailRetention"
         <<" hair20="<<hairContrast(plainY,41)<<","<<hairContrast(gatedY,41)
         <<" hair11="<<hairContrast(plainY,54)<<","<<hairContrast(gatedY,54)
         <<" textile11="<<textileModulation(plainY)<<","<<textileModulation(gatedY)
         <<" step140="<<edgeContrast(plainY)<<","<<edgeContrast(gatedY)
-        <<"\\n";
+        <<"\n";
     std::cout<<"actualCandidateSynthetic"
         <<" hair="<<preHair<<","<<plainHair<<","<<gatedHair
         <<" textile="<<preTexture<<","<<plainTexture<<","<<gatedTexture
