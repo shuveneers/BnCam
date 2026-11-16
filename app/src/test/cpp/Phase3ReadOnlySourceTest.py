@@ -12,12 +12,16 @@ changed = subprocess.check_output(
     cwd=ROOT, text=True).splitlines()
 assert changed == [
     "app/src/main/cpp/IspCore.cpp",
+    "app/src/main/cpp/PhysicalLumaDenoise.h",
     "app/src/main/cpp/RawPoissonGaussianEstimator.h",
+    "app/src/main/cpp/SingleFrameGuidedCoarse.h",
     "app/src/main/cpp/SingleFrameGuidedLuma.h",
     "app/src/main/cpp/native-lib.cpp",
     "app/src/main/cpp/vulkan/VulkanSpectraResidentDemosaicBackend.cpp",
     "app/src/main/cpp/vulkan/VulkanSpectraResidentDemosaicBackend.h",
+    "app/src/main/cpp/vulkan/shaders/physical_luma_coarse.glsl",
     "app/src/main/cpp/vulkan/shaders/physical_luma_denoise.glsl",
+    "app/src/main/cpp/vulkan/shaders/spectra_demosaic_resident.comp",
 ], f"SF2-D03 changed protected production source: {changed}"
 
 path = CPP + "/IspCore.cpp"
