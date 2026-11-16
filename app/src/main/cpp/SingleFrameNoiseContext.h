@@ -3,6 +3,7 @@
 // This is NOT a second sensor noise resolver and may not change pixel processing.
 #include "RawSpatialNoiseCalibrationPolicy.h"
 #include "SpectraNoiseCalibration.h"
+#include "DemosaicNoiseCorrelation.h"
 
 #include <array>
 #include <cmath>
@@ -34,6 +35,8 @@ struct SingleFrameNoiseContext final {
     const double observedPostDemosaicY;
     const std::size_t observedSamples;
     const double predictionConfidence;
+    // Fixed-kernel-only spatial rho proxy. Unknown adaptive cases cannot be used as zero rho.
+    const DemosaicSpatialNoise demosaicSpatialNoise;
     const std::string sensorProvenance;
     const std::string postFinalizeProvenance;
     const std::string postDemosaicProvenance;
@@ -93,6 +96,8 @@ struct SingleFrameNoiseContext final {
             observationReady ? measurement.robustVarianceY : 0.0,
             observationReady ? measurement.acceptedSampleCount : 0u,
             predictionReady ? demosaiced.confidence : 0.0,
+            predictDemosaicSpatialNoise(finalized, demosaiced, demosaicModel,
+                                        hybrid, predictionReady, fusionAlreadyIncluded),
             soReady ? "EXISTING_EFFECTIVE_SO" : "NO_VALID_PHYSICAL_SO",
             finalized.stage + ":" + finalized.method,
             demosaiced.stage + ":" + demosaiced.method
@@ -138,7 +143,23 @@ inline std::string formatNoiseContextOnly(const SingleFrameNoiseContext& ctx) {
         << ";observedPostDemosaicY=" << ctx.observedPostDemosaicY
         << ";observedSamples=" << ctx.observedSamples
         << ";observationToPredictionY=" << ctx.observedToPredictedY()
-        << ";extraRawGainApplications=0;extraFusionGainApplications=0}";
+        << ";demosaicCorrelationStatus=" << ctx.demosaicSpatialNoise.status
+        << ";demosaicCorrelationMethod=" << ctx.demosaicSpatialNoise.method
+        << ";demosaicCorrelationKernelOnly=true"
+        << ";demosaicCorrelationMeasured=false"
+        << ";demosaicCorrelationInputIndependenceVerified=false"
+        << ";demosaicCorrelationProxyAvailable="
+        << (ctx.demosaicSpatialNoise.kernelProxyAvailable ? "true" : "false");
+    if (ctx.demosaicSpatialNoise.kernelProxyAvailable) {
+        out << ";demosaicRhoHorizontal=" << ctx.demosaicSpatialNoise.rhoHorizontal
+            << ";demosaicRhoVertical=" << ctx.demosaicSpatialNoise.rhoVertical
+            << ";demosaicRhoDiagonalDown=" << ctx.demosaicSpatialNoise.rhoDiagonalDown
+            << ";demosaicRhoDiagonalUp=" << ctx.demosaicSpatialNoise.rhoDiagonalUp
+            << ";demosaicFixedKernelVarianceY=" << ctx.demosaicSpatialNoise.kernelVarianceY;
+    } else {
+        out << ";demosaicCorrelationValues=UNAVAILABLE";
+    }
+    out << ";extraRawGainApplications=0;extraFusionGainApplications=0}";
     return out.str();
 }
 } // namespace bncam::sf2
