@@ -1,0 +1,36 @@
+name: SF2 phase-3 RAW Poisson-Gaussian diagnostic checks
+on:
+  push:
+    branches: [deliverables/sf2-phase3]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Compile C++17 native regression suite
+        run: |
+          cmake -S app/src/test/cpp -B build-sf2-native -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-sf2-native --parallel 2
+      - name: Run all native and frozen pixel-source contracts
+        run: ctest --test-dir build-sf2-native --output-on-failure
+      - name: Package phase-3 changed-files ZIP
+        shell: bash
+        run: |
+          BASE=9fba3da109825977630b2cf6cfa031c16dcba31f
+          mkdir -p phase3_delta_files
+          while IFS= read -r file; do
+            mkdir -p "phase3_delta_files/$(dirname "$file")"
+            cp -- "$file" "phase3_delta_files/$file"
+          done < <(git diff --name-only --diff-filter=ACMR "$BASE" HEAD)
+          git diff --binary "$BASE" HEAD > BnCam_SF2_F3_From_Phase2.patch
+          zip -qr BnCam_SF2_F3_Delta.zip phase3_delta_files BnCam_SF2_F3_From_Phase2.patch
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BnCam_SF2_F3_Delta
+          path: BnCam_SF2_F3_Delta.zip
+          if-no-files-found: error
