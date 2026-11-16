@@ -38,6 +38,13 @@
 | SF2-D06-06 | CODE COMPLETE / DEVICE VALIDATION PENDING | Native synthetic hare/weak-line/textile/edge/flat/invalid tests + daadwerkelijke fase-4/5 kandidaatcontrasten met exacte synthetische truth | Hair A .017633→.017868 (truth .020); hair B .009476→.009645 (truth .011); textile .010259→.010703 (truth .011). Flat MSE .036119→.038100: gedocumenteerde trade-off, geen apparaatclaim |
 | SF2-D06-07 | CODE COMPLETE / DEVICE VALIDATION PENDING | Phase-6 CI voert **20 originele fase-5-tests** op onveranderde SHA uit, plus **17 actuele fase-6-tests**, echt shader SPIR-V en changes-only ZIP | Android/phone quality acceptance pending; standalone release en `.patch` tegen vorige SHA |
 
+| SF2-D07-01 | CODE COMPLETE / DEVICE QUALIFICATION PENDING | `SingleFrameIntegrationQualification.h` deterministic 128×96 camera-linear CPU oracle for OFF, legacy, fine, coarse and confidence; pure C++ tests check gate contraction and opponent invariance | F7 current native CI, new qualification C++ test passed; no on-phone parity numbers |
+| SF2-D07-02 | CODE COMPLETE / DEVICE QUALIFICATION PENDING | `SingleFrameIntegrationJni.cpp` part of real Android libbncam.so; test-only `executeSpectraResidentAwbCcm` GPU readback compares 6 stage/proxy cases with CPU; OFF re-run checks stale GPU state | Android packaging and real GPU execution must both be proven separately |
+| SF2-D07-03 | CODE COMPLETE / DEVICE QUALIFICATION PENDING | Debug-only receiver `com.bncam.VALIDATE_SF2`, async report with Git SHA; unique `com.bncam.TRIGGER_SF2_CAPTURE` avoids duplicate manifest-triggered captures | Kotlin compiled only after successful Android APK job; dedicated on-device invocation still pending |
+| SF2-D07-04 | CODE COMPLETE / DEVICE QUALIFICATION PENDING | ImageUtils six same-RAW renders including `off_repeat.jpg`, separate stats, source CRC32, stage getter/revision manifest, OFF reset | Static source tests pass; JPEG byte identity is informational, not a pixel proof |
+| SF2-D07-05 | CODE COMPLETE / DEVICE QUALIFICATION PENDING | `scripts/sf2_phase7_collect.py`: Windows-compatible binary-safe adb private-file collector; fail-closed per-stage GPU telemetry checks and evidence ZIP | Five offline Python unit tests passed; user HONOR evidence still pending |
+| SF2-D07-06 | CODE COMPLETE / DEVICE QUALIFICATION PENDING | F7 workflow reruns frozen F5 20/20 and F6 17/17, current F7 18/18, collector 5/5, production GLSL SPIR-V, mandatory Android assembleDebug and JNI symbol check, changed-files delta | Offline native & Vulkan passed in F7 CI; phone GPU parity and photographic comparison not yet executed |
+
 ## Exact release boundary
 
 - Phase-1 base SHA: `ea7f4b45c41e5770cd8d3938bfd1133efc40aa65`.
