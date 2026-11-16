@@ -128,6 +128,8 @@ struct SpectraResidentColorTransformRequest {
     bool neutralDefaultRaw = false;
     bncam::chroma::Model baselinePhysicalChroma{};
     bncam::luma::Model baselinePhysicalLuma{};
+    // Explicit debug-selected stage; OFF if caller does not opt in.
+    bncam::luma::Stage lumaStage = bncam::luma::Stage::OFF;
     const float* physicalSpatialSigma = nullptr;
     std::uint32_t physicalSpatialColumns = 0, physicalSpatialRows = 0;
     // Explicit diagnostic only: return the pre-AWB stage for CPU/GPU verification.
