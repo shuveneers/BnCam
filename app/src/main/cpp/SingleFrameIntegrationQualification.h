@@ -59,7 +59,8 @@ inline std::vector<Pixel> cpuReference(const std::vector<Pixel>& input,
     if(combined && !coarse.valid)return {};
     std::vector<Pixel> out(input.size());
     for(int y=0;y<kHeight;++y)for(int x=0;x<kWidth;++x) {
-        const auto i=y*kWidth+x, post=input[i];
+        const auto i=y*kWidth+x;
+        const Pixel post=input[i];
         const auto fine=bncam::sf2::guidedFine(x,y,model,post,read,shape,true);
         Pixel p=stage==bncam::luma::Stage::LEGACY_REFERENCE
                 ? bncam::luma::filter(x,y,model,post,read,shape).pixel
