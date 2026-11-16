@@ -44,7 +44,8 @@ inline std::vector<Pixel> cpuReference(const std::vector<Pixel>& input,
                                        bncam::luma::Stage stage,
                                        bool kernelProxyAvailable=false) {
     if(input.size()!=static_cast<std::size_t>(kWidth*kHeight))return {};
-    if(!isEnabledStage(stage))return input;
+    if(stage==bncam::luma::Stage::OFF)return input;
+    if(!isEnabledStage(stage)&&stage!=bncam::luma::Stage::LEGACY_REFERENCE)return {};
     const auto model=noise();
     auto read=[&](int x,int y)->Pixel {
         return input[std::clamp(y,0,kHeight-1)*kWidth+std::clamp(x,0,kWidth-1)];
@@ -60,7 +61,9 @@ inline std::vector<Pixel> cpuReference(const std::vector<Pixel>& input,
     for(int y=0;y<kHeight;++y)for(int x=0;x<kWidth;++x) {
         const auto i=y*kWidth+x, post=input[i];
         const auto fine=bncam::sf2::guidedFine(x,y,model,post,read,shape,true);
-        Pixel p=fine.pixel;
+        Pixel p=stage==bncam::luma::Stage::LEGACY_REFERENCE
+                ? bncam::luma::filter(x,y,model,post,read,shape).pixel
+                : fine.pixel;
         if(combined) {
             const float coarseDelta=bncam::sf2::coarseAtPixel(coarse,x,y);
             if(stage==bncam::luma::Stage::GUIDED_V2_CONFIDENCE) {
