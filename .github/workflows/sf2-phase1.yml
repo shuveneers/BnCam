@@ -18,3 +18,19 @@ jobs:
           cmake --build build-sf2-native --parallel 2
       - name: Native regression
         run: ctest --test-dir build-sf2-native --output-on-failure
+      - name: Package phase-1 delta (changed files plus reproducible patch)
+        shell: bash
+        run: |
+          BASE=ba509c90f71c63e3493aecbdef5e7c8890ede870
+          mkdir -p phase1_delta_files
+          while IFS= read -r file; do
+            mkdir -p "phase1_delta_files/$(dirname "$file")"
+            cp -- "$file" "phase1_delta_files/$file"
+          done < <(git diff --name-only --diff-filter=ACMR "$BASE" HEAD)
+          git diff --binary "$BASE" HEAD > BnCam_SF2_F1_From_Phase0.patch
+          zip -qr BnCam_SF2_F1_Delta.zip phase1_delta_files BnCam_SF2_F1_From_Phase0.patch
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BnCam_SF2_F1_Delta
+          path: BnCam_SF2_F1_Delta.zip
+          if-no-files-found: error
