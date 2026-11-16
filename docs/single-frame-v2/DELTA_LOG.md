@@ -13,3 +13,4 @@
 | SF2-D02-03/04 | CODE COMPLETE (source), DEVICE VALIDATION PENDING | Hybrid without local weights UNKNOWN; compact covariance contract | Read-only telemetry | phase 2 commit |
 | SF2-D03-01/02 | CODE COMPLETE (diagnostic), DEVICE VALIDATION PENDING | CFA-aware tile rejection, normalized RAW Poisson-Gaussian S/O fit and confidence | Native synthetic test; no production override | phase 3 commit |
 | SF2-D03-03 | CODE COMPLETE (guard), DEVICE VALIDATION PENDING | Explicit physical S/O fallback; estimate cannot mutate source | No resident readback or production hook | phase 3 commit |
+| SF2-D04-01 | CODE COMPLETE (source), DEVICE VALIDATION PENDING | New 3x3 physical-noise regularized fine guided-luma CPU reference, additive RGB residual, coherent line guard, exact bypass | Native flat/colour/sanity test added | phase 4.1 commit |
