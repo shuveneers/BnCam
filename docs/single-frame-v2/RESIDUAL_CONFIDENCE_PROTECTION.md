@@ -8,10 +8,10 @@
 
 `SingleFrameResidualConfidence.h` is de CPU-referentie. `vulkan/shaders/physical_luma_confidence.glsl` bevat dezelfde berekeningen. Geen ML, nieuw noise-model, RAW-readback of extra devicebuffers.
 
-De gate evalueert vóór toepassing van de bestaande kandidaatcorrectie de volgende **verschillende** aanwijzingen:
+De gate evalueert vóór toepassing van de bestaande kandidaatcorrectie de volgende **verschillende** aanwijzingen. De eerste implementatie werd aangepast nadat metingen aantoonden dat de algemene demping te veel nuttige vlakruisreductie wegnam:
 
 1. **Physical noise**: de reeds gepropageerde post-demosaic Y-variantie met de bestaande relatieve ruimtelijke sigma-shape, slechts eenmaal toegepast. Bij ongeldige fysieke metadata: exacte bypass.
-2. **Demosaic-onzekerheid**: bij vaste Malvar/Bilinear-kernel is hoogstens een *berekende kernproxy* beschikbaar; ruimtelijke correlatie is niet gemeten. De heuristische bovengrens voor het gategewicht is daarom `0.92` (kernproxy) of `0.78` (onbekende adaptieve/neurale input). **Geen onbekende rho wordt ooit als nul gebruikt.**
+2. **Demosaic-onzekerheid**: bij vaste Malvar/Bilinear-kernel is hoogstens een *berekende kernproxy* beschikbaar; ruimtelijke correlatie is niet gemeten. De indicator voor demosaic-support is `0.92` (alleen kernproxy) of `0.78` (onbekende adaptieve/neurale correlatie). **Dit is geen globale dempingsfactor voor alle pixels.** Onzekerheid verhoogt uitsluitend de bescherming als de kandidaatcorrectie een coherente structuur lijkt weg te werken. Egale vlakken behouden daardoor hun nuttige denoising. Geen onbekende rho wordt ooit als nul gebruikt.
 3. **Local structure**: vier richtingen (horizontaal, verticaal, twee diagonalen) met elk drie parallelle tweedeverschilstencils. Een coherente dunne lijn geeft herhaalbaar signaal over de lijnrichting; willekeurige enkelpixelruis minder.
 4. **Edge consistency**: dezelfde georiënteerde drie parallelle stencils meten ook het consistente eerste verschil aan weerszijden. De gate beschermt hierdoor harde randen zonder uitsluitend een drempel op één gradient te gebruiken.
 5. **Residual significance**: een kandidaatcorrectie die onverwacht groot is ten opzichte van de bestaande fysieke Y-sigma wordt verder beperkt.
@@ -28,7 +28,7 @@ Youtput = YpostChroma + w(x,y) * (DeltaYfine + DeltaYcoarse)
 0 <= w(x,y) <= 1
 ```
 
-Het gewicht is een begrensd product van modelondersteuning, demosaic-onzekerheid, georiënteerde structuur/edge-coherentie, residual-significantie en overeenstemming tussen de twee niveaus. De afhankelijkheden zijn vloeiend in plaats van binair. Confidence uit de originele fysieke modellen is reeds verwerkt in de fine/coarse-correcties; alleen zwakke modelconfidence (onder 0,5) veroorzaakt extra begrenzing.
+Het gewicht is een begrensd product van modelondersteuning, **gericht risico dat de kandidaat een coherente structuur afvlakt**, residual-significantie en overeenstemming tussen fine/coarse. De selectieve risico-index vergelijkt het *teken* van de kandidaatcorrectie met het georiënteerde tweedeverschil en controleert herhaalbaarheid in drie parallelle stencils. Dit voorkomt de onjuiste aanname dat iedere gradient of ieder ruisig pixel extra bescherming nodig heeft. De afhankelijkheden zijn vloeiend in plaats van binair. Confidence uit de originele fysieke modellen is reeds verwerkt in de fine/coarse-correcties; alleen zwakke modelconfidence (onder 0,5) veroorzaakt extra begrenzing.
 
 De gate leest uitsluitend de **ongewijzigde demosaiced RGB-guide**. Hij past één neutrale scalaire Y-delta toe aan de post-chroma RGB-kanalen. Daarom blijven `R-G` en `B-G` gelijk; er is geen nieuwe kleur-, contrast-, tone-mapping- of sharpeningstap.
 
@@ -72,6 +72,24 @@ De native suite toetst:
 - Twee soorten synthetische detailtests: een *gecontroleerde kandidaatkorruptie* die de bijdrage van de gate zelf isoleert; én een aparte simulatie waarin de **echte fase-4-fine- en fase-5-coarse-referentie** eerst de kandidaten berekenen.
 - Bescherming van alle eerdere fasen door de **20 ongewijzigde fase-5-tests uit een Git worktree op de exacte oude commit** opnieuw uit te voeren. Daarnaast de huidige fase-6 native tests plus een strikte fingerprint/source-isolation-test.
 - Het werkelijke `spectra_demosaic_resident.comp` shaderbestand wordt inclusief de nieuwe confidence-code naar Vulkan 1.1 SPIR-V gecompileerd.
+
+### Reproduceerbare nuance: detailbehoud versus pixel-MSE
+
+De eerste, overal dempende gate verslechterde de MSE met de **echte fine/coarse-kandidaten** aanzienlijk. Deze versie is vervangen door een selectieve gate die alleen ingrijpt bij coherente structuur-eroderende correcties. In de huidige deterministische test met fysisch consistente Gaussische ruis en een exacte synthetische scene-target:
+
+| Waarheid/meetcriterium | Fine+Coarse zonder gate | Fine+Coarse met gate |
+|---|---:|---:|
+| Contrast haar A, doel 0.020 | 0.017633 | 0.017868 |
+| Contrast haar B, doel 0.011 | 0.009476 | 0.009645 |
+| Textielmodulatie, doel 0.011 | 0.010259 | 0.010703 |
+| Randcontrast, doel 0.140 | 0.141497 | 0.141538 |
+| Flat-region MSE | 0.036119 | 0.038100 |
+| Haar-region MSE | 0.007943 | 0.008050 |
+| Textiel-region MSE | 0.115049 | 0.121721 |
+
+**Interpretatie:** de gate behoudt meer van de echte synthetische haar- en textielmodulatie, maar geeft een klein deel van de pixel-MSE-winst van de ongegate denoiser terug. Het scherpe randcontrast wordt iets slechter (kleinere verslechtering dan 10% in de fout). Daarom vereist de regressietest **aantoonbaar verbeterd haar- en textielcontrast** én maximaal 10% MSE-regressie in de genoemde regio's. Dit zijn numerieke testafspraken, geen gekalibreerde visuele kwaliteitsgrenzen.
+
+Een tweede, expliciet gecontroleerde testcase met **opzettelijk te grote structuur-uitwissende kandidaatcorrecties** laat zien dat de gate dergelijke correcties kan beperken. Dit is een afzonderlijk bewijs voor de gate-logica, maar het mag niet worden verward met een gemeten voordeel op echte JPG's.
 
 **Acceptatiegrens:** Een lagere fout in synthetische structuursimulaties vormt nog geen bewijs voor haar/gras/textiel op het toestel. De confidence-gate blijft een *optionele debug-variant* zolang CPU/GPU-numerieke pariteit, geheugen, GPU-latency en echte HONOR RAW-JPEG vergelijkingen geen meerwaarde aantonen. Zelfs bij positieve synthetische tests kan hij op vlakke gebieden nuttige ruisreductie terugschroeven; vergelijk daarom ook altijd flat-noise en huidtextuur. Voer geen validatieclaim uit op basis van alleen source checks of SPIR-V compile.
 
