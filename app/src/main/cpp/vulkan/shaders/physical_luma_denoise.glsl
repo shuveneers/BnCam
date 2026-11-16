@@ -1,6 +1,7 @@
+// Phase-4 bounded Guided Fine remains debug-only; stage OFF by default.
 // CPU oracle: PhysicalLumaDenoise.h. Mode 3 only; evidence reads immutable
 // demosaic Y. Add the existing camera-RGB luma delta AFTER physical chroma.
-vec3 physicalLumaDenoise(ivec2 xy,vec3 postChroma,out vec3 telemetry) {
+vec3 physicalLegacyLumaDenoise(ivec2 xy,vec3 postChroma,out vec3 telemetry) {
     telemetry=vec3(0);
     if(pc.cfaEvidence1.y<=0.0 || !physicalChromaFinite(postChroma)) return postChroma;
     float center=opponentAtRgb(physicalChromaRead(xy)).x;
@@ -45,4 +46,66 @@ vec3 physicalLumaDenoise(ivec2 xy,vec3 postChroma,out vec3 telemetry) {
     }
     vec3 result=postChroma-vec3(correction);
     return physicalChromaFinite(result)?result:postChroma;
+}
+
+// SF2-D04: CPU oracle SingleFrameGuidedLuma.h, stage 2; immutable
+// demosaic evidence, bounded additive Y, original post-chroma opponents.
+vec3 physicalGuidedFine(ivec2 xy,vec3 postChroma,out vec3 telemetry,bool gate) {
+    telemetry=vec3(0);
+    if(pc.cfaEvidence1.y<=0.0||!physicalChromaFinite(postChroma))return postChroma;
+    float centre=opponentAtRgb(physicalChromaRead(xy)).x;
+    float ss=physicalChromaShape(xy),v=pc.padding0*ss*ss;
+    if(!(v>1.e-12)||isnan(v)||isinf(v)||isnan(centre)||isinf(centre))return postChroma;
+    float physical=pc.cfaEvidence1.y*v/(v+.001*centre*centre);
+    float total=0.0,sum=0.0,sum2=0.0,noise=0.0;
+    for(int dy=-1;dy<=1;++dy)for(int dx=-1;dx<=1;++dx) {
+        ivec2 pos=xy+ivec2(dx,dy);
+        vec3 p=physicalChromaRead(pos);
+        float sigma=physicalChromaShape(pos);
+        if(!physicalChromaFinite(p)||!(sigma>0.0)||isnan(sigma)||isinf(sigma))return postChroma;
+        float y=opponentAtRgb(p).x,diff=y-centre;
+        float w=exp(-diff*diff/(8.0*v+1.e-12))/(1.0+.4*float(dx*dx+dy*dy));
+        total+=w;sum+=w*y;sum2+=w*y*y;noise+=w*pc.padding0*sigma*sigma;
+    }
+    if(!(total>0.0)||isnan(total)||isinf(total))return postChroma;
+    float mean=sum/total,expected=noise/total;
+    float sceneVariance=max(0.0,sum2/total-mean*mean-.8*expected);
+    float wiener=v/(v+2.0*sceneVariance+1.e-12);
+    float structure=0.0;
+    if(gate)for(int axis=0;axis<2;++axis) {
+        float residualMean=0.0,meanNoise=0.0;
+        for(int k=-1;k<=1;++k) {
+            ivec2 p=xy+(axis==0?ivec2(0,k):ivec2(k,0));
+            ivec2 d=axis==0?ivec2(1,0):ivec2(0,1);
+            float a=opponentAtRgb(physicalChromaRead(p-d)).x;
+            float b=opponentAtRgb(physicalChromaRead(p+d)).x;
+            float c=opponentAtRgb(physicalChromaRead(p)).x;
+            float sa=physicalChromaShape(p-d),sb=physicalChromaShape(p+d),sc=physicalChromaShape(p);
+            if(any(isnan(vec3(a,b,c)))||any(isinf(vec3(a,b,c)))||
+               !(sa>0.0&&sb>0.0&&sc>0.0))return postChroma;
+            residualMean+=c-.5*(a+b);
+            meanNoise+=pc.padding0*(sc*sc+.25*(sa*sa+sb*sb));
+        }
+        residualMean/=3.0;
+        float meanVariance=meanNoise/9.0;
+        float evidence=max(0.0,residualMean*residualMean-meanVariance)/
+            (residualMean*residualMean+meanVariance+1.e-12);
+        structure=max(structure,evidence);
+    }
+    float authority=clamp(.78*physical*wiener*(gate?1.0-.98*structure:1.0),0.0,.78);
+    float correction=authority*(mean-centre);
+    vec3 result=postChroma+vec3(correction);
+    if(!physicalChromaFinite(result))return postChroma;
+    telemetry=vec3(authority,0.0,structure);
+    return result;
+}
+// Existing residualStride low bits are owned by physical chroma.
+// Mode-3 bits 2..4 carry an explicit luma stage: 0 OFF, 1 legacy, 2 Guided Fine.
+// Debug-only stage; no push-constant ABI changes and no extra GPU buffers.
+vec3 physicalLumaDenoise(ivec2 xy,vec3 postChroma,out vec3 telemetry) {
+    uint stage=(pc.residualStride>>2u)&7u;
+    telemetry=vec3(0);
+    if(stage==1u)return physicalLegacyLumaDenoise(xy,postChroma,telemetry);
+    if(stage==2u)return physicalGuidedFine(xy,postChroma,telemetry,true);
+    return postChroma;
 }
