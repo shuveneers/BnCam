@@ -15,28 +15,34 @@ def frozen(path):
         ["git","show",BASE+":"+path],cwd=ROOT).decode()
 def live(path):
     return (ROOT/path).read_text()
+def phase4(path):
+    return subprocess.check_output(
+        ["git","show","ccf3e96976ae90b2ce59bcf774a4c5fae803555d:"+path],
+        cwd=ROOT,text=True)
 
 changed=subprocess.check_output(
     ["git","diff","--name-only",BASE,"HEAD","--",CPP],
     cwd=ROOT,text=True).splitlines()
 assert changed==[
     CPP+"IspCore.cpp",
+    CPP+"PhysicalLumaDenoise.h",
+    CPP+"SingleFrameGuidedCoarse.h",
     CPP+"SingleFrameGuidedLuma.h",
     CPP+"native-lib.cpp",
     CPP+"vulkan/VulkanSpectraResidentDemosaicBackend.cpp",
     CPP+"vulkan/VulkanSpectraResidentDemosaicBackend.h",
+    CPP+"vulkan/shaders/physical_luma_coarse.glsl",
     CPP+"vulkan/shaders/physical_luma_denoise.glsl",
+    CPP+"vulkan/shaders/spectra_demosaic_resident.comp",
 ],f"Unexpected phase-4 native production change: {changed!r}"
 
 assert strip_phase4_opt_in_isp(live(CPP+"IspCore.cpp"))==frozen(CPP+"IspCore.cpp")
 for protected in (
     "PhysicalChromaDenoise.h",
-    "PhysicalLumaDenoise.h",
     "Demosaic.h",
     "SingleFrameNoiseContext.h",
     "RawPoissonGaussianEstimator.h",
     "vulkan/shaders/physical_chroma_denoise.glsl",
-    "vulkan/shaders/spectra_demosaic_resident.comp",
 ):
     assert live(CPP+protected)==frozen(CPP+protected),protected
 
@@ -54,7 +60,7 @@ assert "if(stage==1u)return physicalLegacyLumaDenoise(xy,postChroma,telemetry);"
 assert "return postChroma;" in shader
 assert "stage==3u" not in shader
 
-backend=live(CPP+"vulkan/VulkanSpectraResidentDemosaicBackend.cpp")
+backend=phase4(CPP+"vulkan/VulkanSpectraResidentDemosaicBackend.cpp")
 assert backend.count("request.lumaStage!=bncam::luma::Stage::OFF")==1
 assert backend.count("static_cast<std::uint32_t>(request.lumaStage)<<2u")==1
 before=backend.replace(
@@ -69,7 +75,7 @@ before=before.replace(
     "                          (noise.protectCoherentDetail ? 2u : 0u);")
 assert before==frozen(CPP+"vulkan/VulkanSpectraResidentDemosaicBackend.cpp")
 
-header=live(CPP+"vulkan/VulkanSpectraResidentDemosaicBackend.h")
+header=phase4(CPP+"vulkan/VulkanSpectraResidentDemosaicBackend.h")
 assert "lumaStage = bncam::luma::Stage::OFF;" in header
 header=header.replace(
     "    // Explicit debug-selected stage; OFF if caller does not opt in.\n"
