@@ -9,7 +9,7 @@
 | 2 demosaic noise | CODE COMPLETE / DEVICE VALIDATION PENDING | Malvar/Bilinear phase-averaged fixed-kernel correlation-only proxy; explicit unknown AMaZE/Auto Hybrid/neural-posterior; native CI **14/14 passed** (run 43838446474); HONOR/APK pending |
 | 3 RAW Poisson-Gaussian diagnostics | CODE COMPLETE / DEVICE VALIDATION PENDING | Optional CPU-RAW debug-only S/O-informed fit; no Vulkan readback, no S/O override; 16/16 native CI passed (43840240102); Android/phone tests pending |
 | 4 guided fine | CODE COMPLETE / DEVICE VALIDATION PENDING | CPU reference + debug-gated resident Vulkan shader, same-RAW OFF/legacy/guided comparison; native 18/18 and SPIR-V shader CI passed (43844425567); no Android APK/device validation |
-| 5 guided coarse | NOT STARTED | Unimplemented |
+| 5 guided coarse | CODE COMPLETE / DEVICE VALIDATION PENDING | Two compact ¼-resolution device-only Vulkan passes, CPU oracle, debug Fine+Coarse stage 4, four-way same-RAW JPEG comparison; 20/20 native tests and shader compile passed (43849336343); Android/phone validation pending |
 | 6 confidence gate | NOT STARTED IN DELIVERY CHAIN | Separate experimental work failed latest earlier CI; not promoted |
 | 7 integration | NOT STARTED | Requires phase sequencing and device tests |
 
@@ -33,3 +33,14 @@ Branch `deliverables/sf2-phase3`, based exactly on phase-2 SHA `9fba3da109825977
 - CPU and GLSL Guided Fine are implemented; 18 native regression tests and SPIR-V compilation passed. The test assertions verify a synthetic flat-field noise reduction and preservation of step/thin-line patterns, but **do not** constitute real-world photographic validation or an on-device CPU/GPU parity result.
 - Same immutable master RAW debug renders: `off.jpg`, `on.jpg`, `guided.jpg`, each with diagnostic text.
 - Android Gradle/NDK APK build, GPU runtime, performance, CPU/GPU numerical parity and HONOR Magic 8 Pro RAW photographic validation remain pending.
+
+
+## Phase 5 release
+
+- **Base:** final phase 4 commit `ccf3e96976ae90b2ce59bcf774a4c5fae803555d`.
+- **Branch:** `deliverables/sf2-phase5`. `main` remains unchanged.
+- **Implementation:** `ceil(W/4) × ceil(H/4)` binomial antialias/downsample; propagated independent-reference and Cauchy-upper-bound noise variance; bounded edge-aware coarse residual on separate device buffers; bilinear upsample, additive camera-linear RGB luminance correction after fine/chroma. Normal OFF/fine-only stages are preserved.
+- **Debug stage:** 4 = Guided V2 Fine+Coarse. Stages 0/1/2 still exist; release JNI refuses debug stage changes. Same RAW source creates `off.jpg`, `on.jpg`, `guided.jpg` and `combined.jpg`, each with a diagnostic text file.
+- **Verification:** 20/20 native tests and real GLSL→Vulkan SPIR-V compilation passed (CI run 43849336343), including source baseline tests from phases 0–4. This does not test actual device allocation, execution, CPU/GPU numerical parity or real photographs.
+- **Limitations:** Coarse noise independence is an *assumption*, not measured from spatially adaptive demosaicing. Its conservative authority remains experimental, and it can be disabled separately unless real photos demonstrate improvement over fine-only.
+- **Pending:** Android Gradle/NDK build, APK, HONOR Magic 8 Pro visual assessment, performance, CPU/GPU parity and memory evaluation.
