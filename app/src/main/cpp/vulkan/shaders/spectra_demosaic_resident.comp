@@ -840,6 +840,7 @@ vec3 opponentAtRgb(vec3 pixel) {
 
 #include "physical_chroma_denoise.glsl"
 #include "physical_luma_coarse.glsl"
+#include "physical_luma_confidence.glsl"
 #include "physical_luma_denoise.glsl"
 
 bool finiteBoundedRgb(vec3 pixel) {
