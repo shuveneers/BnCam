@@ -1,6 +1,7 @@
 #include "PhysicalChromaDenoise.h"
 #include "PhysicalLumaDenoise.h"
 #include "SingleFrameNoiseContext.h"
+#include "RawPoissonGaussianEstimator.h"
 // BEGIN_PHYSICAL_MODEL_ONLY
 #include "PhysicalNoisePropagation.h"
 // END_PHYSICAL_MODEL_ONLY
@@ -4896,6 +4897,35 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
 
     IspFrameMetadata workingMeta = meta;
 
+    // SF2-D03-02: debug-only, CPU-accessible PRE-LSC RAW diagnostic.
+    // Never create a CPU copy or force Vulkan readback on the resident route.
+    // The fit is strictly observational; existing physical effectiveS/O remain authoritative.
+    bncam::sf2::RawPoissonGaussianObservation sf2RawPoissonGaussian{};
+    if (!workingMeta.rawJpegDebugDumpsEnabled) {
+        sf2RawPoissonGaussian.status = "DEBUG_DISABLED";
+    } else if (!workingMeta.singleShotRaw) {
+        sf2RawPoissonGaussian.status = "SINGLE_EXPOSURE_REQUIRED";
+    } else if (residentEntry) {
+        sf2RawPoissonGaussian.status = "GPU_RESIDENT_NO_READBACK";
+    } else if (!hostInputValid) {
+        sf2RawPoissonGaussian.status = "NO_CPU_RAW";
+    } else {
+        sf2RawPoissonGaussian = bncam::sf2::estimateRawPoissonGaussian(
+                {workingRaw.mosaic.ptr<float>(0),
+                 workingRaw.mosaic.cols,
+                 workingRaw.mosaic.rows,
+                 static_cast<std::size_t>(workingRaw.mosaic.step1()),
+                 workingRaw.info.effectiveCfaPattern},
+                {workingMeta.calibration.effectiveS[0],
+                 workingMeta.calibration.effectiveS[1],
+                 workingMeta.calibration.effectiveS[2],
+                 workingMeta.calibration.effectiveS[3]},
+                {workingMeta.calibration.effectiveO[0],
+                 workingMeta.calibration.effectiveO[1],
+                 workingMeta.calibration.effectiveO[2],
+                 workingMeta.calibration.effectiveO[3]});
+    }
+
     // Temporal observation, independent S/O fitting and fusion weighting were already
     // resolved against aligned capture frames in DngMerger. The JPEG ISP consumes that
     // immutable post-fusion snapshot and never compares unrelated rendered frames.
@@ -9569,6 +9599,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                     !neuralPosteriorSeedApplied && !autoHybridUsedForOutput)
             // END_PHYSICAL_MODEL_ONLY
             << bncam::sf2::formatNoiseContextOnly(sf2NoiseContext)
+            << bncam::sf2::formatRawPoissonGaussianDiagnostic(sf2RawPoissonGaussian)
             << "; baselinePhysicalChroma={enabled=" << (baselinePhysicalChroma.valid()?"true":"false")
             << ";spectraIndependent=true;inputDomain=POST_DEMOSAIC_LINEAR_RGB;noiseModel=PHYSICAL_SO_PROPAGATED"
             << ";analysisDomain=" << (baselinePhysicalChroma.colorDomain?"WB_CCM_LINEAR_RGB":"CAMERA_LINEAR_RGB")
