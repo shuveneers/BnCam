@@ -7,8 +7,8 @@ find_package(Git REQUIRED)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 # Build an independent frozen reference from the requested commit, not a copy
 # of the current implementation. Any future pixel change must fail identity.
-set(BASELINE "8aee2d298bffb2daf9f1640e7ff654ab8c7a46bc")
-file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/baseline_8aee2d2")
+set(BASELINE "277826469978febf4e243b15363b8340840bd971")
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/baseline_2778264")
 foreach(header IN ITEMS PhysicalNoiseAuthority.h PhysicalChromaDenoise.h PhysicalLumaDenoise.h)
     execute_process(COMMAND "${GIT_EXECUTABLE}" show "${BASELINE}:app/src/main/cpp/${header}"
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" OUTPUT_VARIABLE reference
@@ -16,8 +16,8 @@ foreach(header IN ITEMS PhysicalNoiseAuthority.h PhysicalChromaDenoise.h Physica
     if(NOT status EQUAL 0)
         message(FATAL_ERROR "Cannot load frozen baseline ${header}")
     endif()
-    string(REPLACE "bncam::" "baseline8aee2d2::" reference "${reference}")
-    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/baseline_8aee2d2/${header}" "${reference}")
+    string(REPLACE "bncam::" "baseline2778264::" reference "${reference}")
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/baseline_2778264/${header}" "${reference}")
 endforeach()
 foreach(test IN ITEMS AdaptiveNoiseAuthorityTest PhysicalNoisePropagationTest PhysicalNoisePixelIdentityTest
         SingleFrameLumaStageContractTest

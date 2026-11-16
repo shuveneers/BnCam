@@ -1,0 +1,20 @@
+name: SF2 phase-0 native and source contracts
+on:
+  push:
+    branches: [deliverables/sf2-phase0]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Compile native tests
+        run: |
+          cmake -S app/src/test/cpp -B build-sf2-native -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-sf2-native --parallel 2
+      - name: Native regression
+        run: ctest --test-dir build-sf2-native --output-on-failure
