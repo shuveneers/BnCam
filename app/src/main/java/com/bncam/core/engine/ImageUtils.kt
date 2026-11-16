@@ -869,20 +869,28 @@ object ImageUtils {
         } }
         val abDirectory = physicalLumaAbDirectory.takeIf { BuildConfig.DEBUG }
         val jpegBytes = if (abDirectory != null) {
-            // Debug-only: render the SAME immutable master twice with identical metadata.
-            // No full-frame diagnostic readback or extra render exists in normal captures.
+            // Debug-only: three renders of the SAME immutable master with identical
+            // metadata: chroma-only OFF, legacy reference, Guided Fine. No extra
+            // render or full-frame diagnostic readback exists in normal captures.
             val dir = java.io.File(abDirectory, System.currentTimeMillis().toString()).apply { mkdirs() }
             try {
-                setPhysicalLumaDebugEnabled(false)
+                setPhysicalLumaStageDebug(0)
                 val off = renderOnce()
                 if (off != null) java.io.File(dir, "off.jpg").writeBytes(off)
                 java.io.File(dir, "off.txt").writeText(lastMasterIspStats())
-                setPhysicalLumaDebugEnabled(true)
-                val on = renderOnce()
-                if (on != null) java.io.File(dir, "on.jpg").writeBytes(on)
+                setPhysicalLumaStageDebug(1)
+                val legacy = renderOnce()
+                if (legacy != null) java.io.File(dir, "on.jpg").writeBytes(legacy)
                 java.io.File(dir, "on.txt").writeText(lastMasterIspStats())
-                on
-            } finally { setPhysicalLumaDebugEnabled(false) }
+                setPhysicalLumaStageDebug(2)
+                val guided = renderOnce()
+                if (guided != null) java.io.File(dir, "guided.jpg").writeBytes(guided)
+                java.io.File(dir, "guided.txt").writeText(lastMasterIspStats())
+                guided ?: legacy ?: off
+            } finally {
+                setPhysicalLumaStageDebug(0)
+                setPhysicalLumaDebugEnabled(false)
+            }
         } else renderOnce()
         if (masterFingerprint != null) {
             if (!RawMasterIntegrity.isUnchanged(
