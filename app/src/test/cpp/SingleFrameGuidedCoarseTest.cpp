@@ -95,8 +95,9 @@ int main(){
         }
         assert(differenceEnergy>1.e-10);
         assert(chromaError<3.e-6);
-        // Deliberately weak regression limit: real-photo benefit remains unproven.
-        assert(combinedError < 1.01*fineError);
+        // Require >1% incremental benefit on this deterministic controlled
+        // synthetic correlated-noise field. This is NOT real-photo validation.
+        assert(combinedError < 0.99*fineError);
     }
     // Genuine broad shadow step plus a fine textile pattern: protect
     // the step across the boundary, do not turn coarse into tone mapping.
