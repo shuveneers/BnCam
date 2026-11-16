@@ -51,7 +51,8 @@ ResidualConfidence residualConfidenceAt(
     if(!(variance>1.e-12f) || !std::isfinite(variance))return out;
     constexpr int dx[4]={1,0,1,1};
     constexpr int dy[4]={0,1,1,-1};
-    float coherence=0.f,edge=0.f;
+    float coherence=0.f,edge=0.f,eraseRisk=0.f;
+    const float delta=fineDelta+coarseDelta;
     for(int dir=0;dir<4;++dir) {
         float lineSum=0.f,edgeSum=0.f;
         float lineNoiseSum=0.f,edgeNoiseSum=0.f;
@@ -81,10 +82,21 @@ ResidualConfidence residualConfidenceAt(
         // independence, NOT measured demosaic correlation. Unknown correlation
         // is handled separately through conservative demosaicSupport.
         const float inv=1.f/3.f;
-        coherence=std::max(coherence,
-              boundedCoherentEvidence(lineSum*inv,lineNoiseSum*(inv*inv)));
-        edge=std::max(edge,
-              boundedCoherentEvidence(edgeSum*inv,edgeNoiseSum*(inv*inv)));
+        const float lineEvidence=boundedCoherentEvidence(
+                lineSum*inv,lineNoiseSum*(inv*inv));
+        const float edgeEvidence=boundedCoherentEvidence(
+                edgeSum*inv,edgeNoiseSum*(inv*inv));
+        coherence=std::max(coherence,lineEvidence);
+        edge=std::max(edge,edgeEvidence);
+        // Protect only when the proposed delta ACTUALLY opposes a coherent
+        // signed line/edge residual, rather than suppressing all noise detail.
+        const float opposition=std::max(0.f,-delta*(lineSum*inv));
+        const float signRisk=opposition/
+                (std::abs(delta*(lineSum*inv))+.05f*variance+1.e-12f);
+        const float signal=std::clamp(
+                (std::max(lineEvidence,.5f*edgeEvidence)-.42f)/.58f,0.f,1.f);
+        const float smooth=signal*signal*(3.f-2.f*signal);
+        eraseRisk=std::max(eraseRisk,smooth*signRisk);
     }
     out.structureEvidence=coherence;
     out.edgeEvidence=edge;
@@ -94,23 +106,25 @@ ResidualConfidence residualConfidenceAt(
     // don't re-multiply near-1 confidence as if it were independent evidence.
     const float physicalSupport=std::clamp(2.f*model.confidence,0.f,1.f);
 
-    const float delta=fineDelta+coarseDelta;
     const float normalized=std::abs(delta)/
               (1.6f*std::sqrt(variance)+1.e-12f);
-    const float beyond=std::max(0.f,normalized-1.f);
+    // Ordinary noise-scale corrections are *not* penalized. Large outliers
+    // (>approximately 2.8 sigma) are soft-limited.
+    const float beyond=std::max(0.f,normalized-1.75f);
     out.residualSupport=1.f/(1.f+.7f*beyond*beyond);
 
     const float opposition=std::max(0.f,-fineDelta*coarseDelta);
     const float support=std::abs(fineDelta*coarseDelta)+.10f*variance+1.e-12f;
-    // Continuous as either candidate approaches zero; conflicting scales
-    // reduce (never *increase*) application confidence.
-    out.levelAgreement=1.f-.50f*opposition/support;
+    out.levelAgreement=1.f-.15f*opposition/support;
 
+    // Unknown demosaic correlation increases the penalty ONLY when a
+    // coherent, signed detail-erasing candidate was detected. It must not
+    // globally suppress useful noise reduction in otherwise flat regions.
+    const float riskStrength=1.70f-out.demosaicSupport; // .78 proxy; .92 unknown
     const float structureSupport=std::clamp(
-        1.f-.94f*std::max(out.structureEvidence,out.edgeEvidence),.06f,1.f);
-    out.weight=std::clamp(physicalSupport*out.demosaicSupport*
-                         structureSupport*out.residualSupport*
-                         out.levelAgreement,0.f,1.f);
+                1.f-riskStrength*eraseRisk,.08f,1.f);
+    out.weight=std::clamp(physicalSupport*structureSupport*
+                         out.residualSupport*out.levelAgreement,0.f,1.f);
     if(!std::isfinite(out.weight))return ResidualConfidence{};
     out.valid=true;
     return out;
