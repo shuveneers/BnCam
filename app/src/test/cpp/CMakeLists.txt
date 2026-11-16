@@ -20,7 +20,7 @@ foreach(header IN ITEMS PhysicalNoiseAuthority.h PhysicalChromaDenoise.h Physica
     file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/baseline_2778264/${header}" "${reference}")
 endforeach()
 foreach(test IN ITEMS AdaptiveNoiseAuthorityTest PhysicalNoisePropagationTest PhysicalNoisePixelIdentityTest
-        SingleFrameLumaStageContractTest
+        SingleFrameLumaStageContractTest SingleFrameNoiseContextTest
         PhysicalChromaDenoiseTest PhysicalLumaDenoiseTest PhysicalNoiseNativeContractTest
         RawCfaLevelMappingTest)
     add_executable(${test} ${test}.cpp)
