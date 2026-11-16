@@ -1,11 +1,15 @@
 #pragma once
 #include "PhysicalChromaDenoise.h"
 #include <atomic>
+#include <cstdint>
 
 namespace bncam::luma {
 using Pixel = chroma::Pixel;
-// Debug process-local override; no saved profile setting or release UI control.
-inline std::atomic<bool> debugEnabled{true};
+// SF2: product baseline is OFF; legacy is only an explicit debug comparison.
+// Guided V2 is fail-closed until its own runtime is available.
+enum class Stage : std::uint32_t { OFF = 0, LEGACY_REFERENCE = 1, GUIDED_V2 = 2 };
+inline std::atomic<Stage> selectedStage{Stage::OFF};
+inline constexpr bool legacyAuthorized(Stage value) { return value == Stage::LEGACY_REFERENCE; }
 struct Model {
     float varianceY = 0, confidence = 0;
     bool valid() const {

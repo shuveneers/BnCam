@@ -4749,7 +4749,8 @@ Java_com_bncam_core_engine_ImageUtils_validatePhysicalLumaNative(JNIEnv* env,job
 extern "C" JNIEXPORT void JNICALL
 Java_com_bncam_core_engine_ImageUtils_setPhysicalLumaDebugEnabled(JNIEnv*,jobject,jboolean enabled) {
 #ifndef NDEBUG
-    bncam::luma::debugEnabled.store(enabled==JNI_TRUE);
+    bncam::luma::selectedStage.store(enabled==JNI_TRUE
+            ? bncam::luma::Stage::LEGACY_REFERENCE : bncam::luma::Stage::OFF);
 #endif
 }
 

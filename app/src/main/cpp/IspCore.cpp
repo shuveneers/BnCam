@@ -6890,7 +6890,9 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         baselinePhysicalChroma.bg *= fusionScale;
         baselinePhysicalChroma.cross *= fusionScale;
     }
-    if (!bncam::luma::debugEnabled.load()) baselinePhysicalLuma = {};
+    // SF2: chroma-only is the unconditional product baseline. Legacy is debug-only.
+    const auto singleFrameLumaStage = bncam::luma::selectedStage.load(std::memory_order_relaxed);
+    if (!bncam::luma::legacyAuthorized(singleFrameLumaStage)) baselinePhysicalLuma = {};
     std::array<float,9> chromaColorTransform{};
     for(int r=0;r<3;++r)for(int c=0;c<3;++c)chromaColorTransform[r*3+c]=ccm[r*3+c]*wbRgb[c];
     baselinePhysicalChroma=bncam::chroma::inColorDomain(baselinePhysicalChroma,
@@ -9512,9 +9514,10 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; spectraResidualAlignmentConfidence=" << residualNoiseState.alignmentConfidence
             << formatPropagationStateFields("spectraPreDemosaic", residualNoiseState.preDemosaic)
             << "; baselinePhysicalLuma={enabled=" << (baselinePhysicalLuma.valid()?"true":"false")
-            << ";spectraIndependent=true;inputDomain=POST_PHYSICAL_CHROMA_LINEAR_RGB;noiseModel=PHYSICAL_SO_PROPAGATED"
+            << ";stage=" << (singleFrameLumaStage==bncam::luma::Stage::OFF?"OFF":singleFrameLumaStage==bncam::luma::Stage::LEGACY_REFERENCE?"LEGACY_REFERENCE":"GUIDED_V2_NOT_YET_ACTIVE")
+             << ";spectraIndependent=true;inputDomain=POST_PHYSICAL_CHROMA_LINEAR_RGB;noiseModel=PHYSICAL_SO_PROPAGATED"
             << ";status=" << (baselinePhysicalLuma.valid()?"PHYSICAL_LUMA_ACTIVE":
-                (!bncam::luma::debugEnabled.load()?"PHYSICAL_LUMA_DEBUG_BYPASS":"PHYSICAL_LUMA_BYPASS_NO_VALID_NOISE_MODEL"))
+                (singleFrameLumaStage==bncam::luma::Stage::OFF?"PHYSICAL_LUMA_STAGE_OFF":"PHYSICAL_LUMA_BYPASS_NO_VALID_NOISE_MODEL"))
             << ";gpuExecuted=" << (vulkanColorTransform.baselinePhysicalLumaApplied?"true":"false")
             << ";predictedSigmaY=" << std::sqrt(baselinePhysicalLuma.varianceY)
             << ";modelConfidence=" << baselinePhysicalLuma.confidence

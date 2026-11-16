@@ -882,7 +882,7 @@ object ImageUtils {
                 if (on != null) java.io.File(dir, "on.jpg").writeBytes(on)
                 java.io.File(dir, "on.txt").writeText(lastMasterIspStats())
                 on
-            } finally { setPhysicalLumaDebugEnabled(true) }
+            } finally { setPhysicalLumaDebugEnabled(false) }
         } else renderOnce()
         if (masterFingerprint != null) {
             if (!RawMasterIntegrity.isUnchanged(

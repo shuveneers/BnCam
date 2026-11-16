@@ -22,7 +22,7 @@ class PhysicalLumaSourceContractTest {
             assertFalse(forbidden, model.contains(forbidden))
         val isp = source("main/cpp/IspCore.cpp")
         assertTrue(isp.contains("residualNoiseState.postDemosaic, physicalNoiseStatisticsActive"))
-        assertTrue(isp.contains("PHYSICAL_LUMA_BYPASS_NO_VALID_NOISE_MODEL"))
+        assertTrue(isp.contains("PHYSICAL_LUMA_STAGE_OFF"))
         assertTrue(isp.contains("if (!neuralPosteriorSeedApplied)"))
     }
     @Test fun fusionScaleCrossesJniSeparatelyFromFrozenSo() {
@@ -37,7 +37,9 @@ class PhysicalLumaSourceContractTest {
         val debug = source("debug/java/com/bncam/BenchmarkDebugReceiverController.kt")
         assertTrue(debug.contains("setPhysicalLumaDebugEnabled"))
         val native = source("main/cpp/native-lib.cpp")
-        assertTrue(native.contains("#ifndef NDEBUG\n    bncam::luma::debugEnabled.store"))
+        assertTrue(native.contains("#ifndef NDEBUG\n    bncam::luma::selectedStage.store"))
+        assertTrue(source("main/cpp/PhysicalLumaDenoise.h").contains("selectedStage{Stage::OFF}"))
+        assertTrue(source("main/java/com/bncam/core/engine/ImageUtils.kt").contains("finally { setPhysicalLumaDebugEnabled(false) }"))
         val shader = source("main/cpp/vulkan/shaders/physical_luma_denoise.glsl")
         assertTrue(shader.contains("postChroma-vec3(correction)"))
         assertFalse(shader.contains("clamp(result"))
