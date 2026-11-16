@@ -238,7 +238,8 @@ void VulkanSpectraResidentDemosaicBackend::destroyBuffersLocked() noexcept {
     if (allocator_ != nullptr) {
         for (PersistentBuffer* buffer : {&inputStaging_, &outputReadback_, &deviceInput_, &deviceOutput_,
                                          &rgbUpload_, &colorStatistics_, &colorTelemetry_, &sourceClipConfidence_,
-                                         &cloudCorrectionMap_, &hueSatProfile_, &residualCandidates_}) {
+                                         &cloudCorrectionMap_, &hueSatProfile_, &residualCandidates_,
+                                          &guidedCoarseInput_, &guidedCoarseResidual_}) {
             if (buffer->buffer != VK_NULL_HANDLE && buffer->allocation != nullptr) {
                 vmaDestroyBuffer(allocator_, buffer->buffer, buffer->allocation);
             }
@@ -313,8 +314,8 @@ bool VulkanSpectraResidentDemosaicBackend::initializeLocked(
         failureReason = "RESIDENT_DEMOSAIC_INITIALIZATION_INPUT_INVALID";
         return false;
     }
-    VkDescriptorSetLayoutBinding bindings[8]{};
-    for (std::uint32_t i = 0; i < 8u; ++i) {
+    VkDescriptorSetLayoutBinding bindings[10]{};
+    for (std::uint32_t i = 0; i < 10u; ++i) {
         bindings[i].binding = i;
         bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         bindings[i].descriptorCount = 1u;
@@ -322,7 +323,7 @@ bool VulkanSpectraResidentDemosaicBackend::initializeLocked(
     }
     VkDescriptorSetLayoutCreateInfo descriptorInfo{};
     descriptorInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    descriptorInfo.bindingCount = 8u;
+    descriptorInfo.bindingCount = 10u;
     descriptorInfo.pBindings = bindings;
     if (vkCreateDescriptorSetLayout(device, &descriptorInfo, nullptr, &descriptorSetLayout_) != VK_SUCCESS) {
         failureReason = "vkCreateDescriptorSetLayout_resident_demosaic_failed";
@@ -364,7 +365,7 @@ bool VulkanSpectraResidentDemosaicBackend::initializeLocked(
     }
     VkDescriptorPoolSize poolSize{};
     poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    poolSize.descriptorCount = 8u;
+    poolSize.descriptorCount = 10u;
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolInfo.maxSets = 1u;
@@ -415,7 +416,7 @@ bool VulkanSpectraResidentDemosaicBackend::initializeLocked(
 }
 
 void VulkanSpectraResidentDemosaicBackend::updateDescriptorSetLocked(VkDevice device, VkBuffer inputOverride, VkBuffer scratchOverride) noexcept {
-    VkDescriptorBufferInfo infos[8]{};
+    VkDescriptorBufferInfo infos[10]{};
     infos[0].buffer = inputOverride != VK_NULL_HANDLE ? inputOverride : deviceInput_.buffer;
     infos[1].buffer = deviceOutput_.buffer;
     // Binding 2 aliases output only for demosaic modes that do not need scratch. AMaZE/Auto Hybrid
@@ -427,9 +428,13 @@ void VulkanSpectraResidentDemosaicBackend::updateDescriptorSetLocked(VkDevice de
     infos[5].buffer = cloudCorrectionMap_.buffer;
     infos[6].buffer = colorTelemetry_.buffer;
     infos[7].buffer = hueSatProfile_.buffer != VK_NULL_HANDLE ? hueSatProfile_.buffer : colorTelemetry_.buffer;
+    // Binding 8/9 can safely alias a resident dummy outside stage-4; shader never
+    // accesses them for OFF, legacy, Guided Fine, demosaic or residual modes.
+    infos[8].buffer = guidedCoarseInput_.buffer != VK_NULL_HANDLE ? guidedCoarseInput_.buffer : colorTelemetry_.buffer;
+    infos[9].buffer = guidedCoarseResidual_.buffer != VK_NULL_HANDLE ? guidedCoarseResidual_.buffer : colorTelemetry_.buffer;
     for (auto& info : infos) info.range = VK_WHOLE_SIZE;
-    VkWriteDescriptorSet writes[8]{};
-    for (std::uint32_t i = 0; i < 8u; ++i) {
+    VkWriteDescriptorSet writes[10]{};
+    for (std::uint32_t i = 0; i < 10u; ++i) {
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].dstSet = descriptorSet_;
         writes[i].dstBinding = i;
@@ -437,7 +442,7 @@ void VulkanSpectraResidentDemosaicBackend::updateDescriptorSetLocked(VkDevice de
         writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         writes[i].pBufferInfo = &infos[i];
     }
-    vkUpdateDescriptorSets(device, 8u, writes, 0u, nullptr);
+    vkUpdateDescriptorSets(device, 10u, writes, 0u, nullptr);
     descriptorBindingsInitialized_ = true;
 }
 
