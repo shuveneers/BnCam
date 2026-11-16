@@ -22,6 +22,7 @@ endforeach()
 foreach(test IN ITEMS AdaptiveNoiseAuthorityTest PhysicalNoisePropagationTest PhysicalNoisePixelIdentityTest
         SingleFrameLumaStageContractTest SingleFrameNoiseContextTest
         DemosaicNoiseCorrelationTest SingleFrameDemosaicContextTest
+        RawPoissonGaussianEstimatorTest
         PhysicalChromaDenoiseTest PhysicalLumaDenoiseTest PhysicalNoiseNativeContractTest
         RawCfaLevelMappingTest)
     add_executable(${test} ${test}.cpp)
@@ -41,3 +42,6 @@ add_test(NAME SingleFrameNoiseContextSourceTest COMMAND "${Python3_EXECUTABLE}"
 
 add_test(NAME Phase2ReadOnlySourceTest COMMAND "${Python3_EXECUTABLE}"
     "${CMAKE_CURRENT_SOURCE_DIR}/Phase2ReadOnlySourceTest.py")
+
+add_test(NAME Phase3ReadOnlySourceTest COMMAND "${Python3_EXECUTABLE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/Phase3ReadOnlySourceTest.py")
