@@ -1,0 +1,59 @@
+name: SF2 phase-6 residual confidence protection
+on:
+  push:
+    branches: [deliverables/sf2-phase6]
+  workflow_dispatch:
+permissions:
+  contents: read
+
+jobs:
+  frozen-phase5-and-current-phase6:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Build/test immutable previous phase-5 HEAD (all original 20 regressions)
+        run: |
+          BASE=701fcb0df6541d5ede0d0b451159934ae9a6928b
+          git worktree add --detach "$RUNNER_TEMP/sf2-phase5-frozen" "$BASE"
+          cmake -S "$RUNNER_TEMP/sf2-phase5-frozen/app/src/test/cpp" \
+            -B "$RUNNER_TEMP/sf2-phase5-tests" -DCMAKE_BUILD_TYPE=Release
+          cmake --build "$RUNNER_TEMP/sf2-phase5-tests" --parallel 2
+          ctest --test-dir "$RUNNER_TEMP/sf2-phase5-tests" --output-on-failure
+      - name: Compile phase-6 CPU oracle and all prior native tests with assertions enabled
+        run: |
+          cmake -S app/src/test/cpp -B build-sf2-phase6 \
+            -DCMAKE_BUILD_TYPE=Release -DSF2_ISOLATED_PHASE6=ON
+          cmake --build build-sf2-phase6 --parallel 2
+      - name: Run current phase-6 native quality and protected-source contracts
+        run: ctest --test-dir build-sf2-phase6 --output-on-failure
+      - name: Print deterministic confidence-structure quality measurements
+        run: ./build-sf2-phase6/SingleFrameResidualConfidenceTest
+      - name: Install Vulkan GLSL compiler
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq glslc
+      - name: Compile production resident Vulkan shader to SPIR-V
+        run: |
+          glslc --target-env=vulkan1.1 -O \
+            -I app/src/main/cpp/vulkan/shaders \
+            -o /tmp/sf2-phase6-resident.spv \
+            app/src/main/cpp/vulkan/shaders/spectra_demosaic_resident.comp
+          test -s /tmp/sf2-phase6-resident.spv
+      - name: Package only phase-6 changed files with base-relative patch
+        shell: bash
+        run: |
+          BASE=701fcb0df6541d5ede0d0b451159934ae9a6928b
+          mkdir -p phase6_delta_files
+          while IFS= read -r file; do
+            mkdir -p "phase6_delta_files/$(dirname "$file")"
+            cp -- "$file" "phase6_delta_files/$file"
+          done < <(git diff --name-only --diff-filter=ACMR "$BASE" HEAD)
+          git diff --binary "$BASE" HEAD > BnCam_SF2_F6_From_Phase5.patch
+          zip -qr BnCam_SF2_F6_Delta.zip phase6_delta_files BnCam_SF2_F6_From_Phase5.patch
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BnCam_SF2_F6_Delta
+          path: BnCam_SF2_F6_Delta.zip
+          if-no-files-found: error
