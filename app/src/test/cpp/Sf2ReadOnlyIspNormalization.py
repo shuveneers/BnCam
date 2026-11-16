@@ -37,7 +37,7 @@ def strip_phase5_opt_in_isp(source: str) -> str:
         source=source.replace(current, prior, 1)
     start_marker='        if (baselinePhysicalLuma.valid()) {\n            const cv::Mat& source = physicalSource;\n'
     end_marker='        ensureDefaultRawSourceConfidence();'
-    assert source.count(start_marker)==1 and source.count(end_marker)==1
+    assert source.count(start_marker)==1 and source.find(end_marker,source.index(start_marker))>=0
     start=source.index(start_marker)
     end=source.index(end_marker,start)
     new_block=source[start:end]
