@@ -4,6 +4,7 @@
 #include "RawPoissonGaussianEstimator.h"
 #include "SingleFrameGuidedLuma.h"
 #include "SingleFrameGuidedCoarse.h"
+#include "SingleFrameResidualConfidence.h"
 // BEGIN_PHYSICAL_MODEL_ONLY
 #include "PhysicalNoisePropagation.h"
 // END_PHYSICAL_MODEL_ONLY
@@ -6948,7 +6949,8 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     const auto singleFrameLumaStage = bncam::luma::selectedStage.load(std::memory_order_relaxed);
     if (!bncam::luma::legacyAuthorized(singleFrameLumaStage) &&
         singleFrameLumaStage != bncam::luma::Stage::GUIDED_V2 &&
-        singleFrameLumaStage != bncam::luma::Stage::GUIDED_V2_FINE_COARSE) baselinePhysicalLuma = {};
+        singleFrameLumaStage != bncam::luma::Stage::GUIDED_V2_FINE_COARSE &&
+        singleFrameLumaStage != bncam::luma::Stage::GUIDED_V2_CONFIDENCE) baselinePhysicalLuma = {};
     std::array<float,9> chromaColorTransform{};
     for(int r=0;r<3;++r)for(int c=0;c<3;++c)chromaColorTransform[r*3+c]=ccm[r*3+c]*wbRgb[c];
     baselinePhysicalChroma=bncam::chroma::inColorDomain(baselinePhysicalChroma,
@@ -7096,6 +7098,8 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         request.baselinePhysicalChroma = baselinePhysicalChroma;
         request.baselinePhysicalLuma = baselinePhysicalLuma;
         request.lumaStage = singleFrameLumaStage;
+        // Only a fixed-kernel proxy; NEVER measured spatial covariance.
+        request.lumaDemosaicKernelProxyAvailable = sf2NoiseContext.demosaicSpatialNoise.kernelProxyAvailable;
         if (g_spatialNoiseMap.relativePhysicalShape) {
             request.physicalSpatialSigma = g_spatialNoiseMap.tileSigma.data();
             request.physicalSpatialColumns = g_spatialNoiseMap.gridWidth;
@@ -7196,7 +7200,8 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             };
             // Only the CPU failure path creates compact coarse statistics here.
             // A normal GPU-resident success never downloads the full RGB image.
-            const bool combined=singleFrameLumaStage == bncam::luma::Stage::GUIDED_V2_FINE_COARSE;
+            const bool gated=singleFrameLumaStage == bncam::luma::Stage::GUIDED_V2_CONFIDENCE;
+            const bool combined=singleFrameLumaStage == bncam::luma::Stage::GUIDED_V2_FINE_COARSE || gated;
             const auto coarse=combined
                     ? bncam::sf2::buildGuidedCoarse(source.cols,source.rows,
                             baselinePhysicalLuma,read,shape)
@@ -7210,8 +7215,19 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                             : bncam::sf2::guidedFine(x,y,baselinePhysicalLuma,
                                     post,read,shape,true).pixel;
                     if(combined && coarse.valid) {
-                        output=bncam::sf2::addCoarseResidual(output,
-                                bncam::sf2::coarseAtPixel(coarse,x,y));
+                        const float coarseDelta=bncam::sf2::coarseAtPixel(coarse,x,y);
+                        if(gated) {
+                            // SF2-D06: one confidence gate on exactly the same
+                            // fine+coarse candidate; immutable demosaic guide.
+                            const float fineDelta=output[0]-post[0];
+                            const auto evidence=bncam::sf2::residualConfidenceAt(
+                                    x,y,baselinePhysicalLuma,fineDelta,coarseDelta,
+                                    sf2NoiseContext.demosaicSpatialNoise.kernelProxyAvailable,read,shape);
+                            output=bncam::sf2::applyResidualConfidence(
+                                    post,fineDelta,coarseDelta,evidence);
+                        } else {
+                            output=bncam::sf2::addCoarseResidual(output,coarseDelta);
+                        }
                     }
                     linearRgb.at<cv::Vec3f>(y,x)={output[0],output[1],output[2]};
                 }
@@ -9585,11 +9601,15 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; spectraResidualAlignmentConfidence=" << residualNoiseState.alignmentConfidence
             << formatPropagationStateFields("spectraPreDemosaic", residualNoiseState.preDemosaic)
             << "; baselinePhysicalLuma={enabled=" << (baselinePhysicalLuma.valid()?"true":"false")
-            << ";stage=" << (singleFrameLumaStage==bncam::luma::Stage::OFF?"OFF":singleFrameLumaStage==bncam::luma::Stage::LEGACY_REFERENCE?"LEGACY_REFERENCE":(singleFrameLumaStage==bncam::luma::Stage::GUIDED_V2_FINE_COARSE?"GUIDED_V2_FINE_COARSE_DEBUG":"GUIDED_V2_FINE_DEBUG"))
+            << ";stage=" << (singleFrameLumaStage==bncam::luma::Stage::OFF?"OFF":singleFrameLumaStage==bncam::luma::Stage::LEGACY_REFERENCE?"LEGACY_REFERENCE":(singleFrameLumaStage==bncam::luma::Stage::GUIDED_V2_CONFIDENCE?"GUIDED_V2_CONFIDENCE_DEBUG":singleFrameLumaStage==bncam::luma::Stage::GUIDED_V2_FINE_COARSE?"GUIDED_V2_FINE_COARSE_DEBUG":"GUIDED_V2_FINE_DEBUG"))
              << ";spectraIndependent=true;inputDomain=POST_PHYSICAL_CHROMA_LINEAR_RGB;noiseModel=PHYSICAL_SO_PROPAGATED"
             << ";status=" << (baselinePhysicalLuma.valid()?"PHYSICAL_LUMA_ACTIVE":
                 (singleFrameLumaStage==bncam::luma::Stage::OFF?"PHYSICAL_LUMA_STAGE_OFF":"PHYSICAL_LUMA_BYPASS_NO_VALID_NOISE_MODEL"))
             << ";gpuExecuted=" << (vulkanColorTransform.baselinePhysicalLumaApplied?"true":"false")
+            << ";confidenceGateApplied=" << (vulkanColorTransform.guidedConfidenceGateApplied?"true":"false")
+            << ";confidenceGateModel=ORIENTED_COHERENCE_EDGE_RESIDUAL_LEVEL_AGREEMENT_HEURISTIC"
+            << ";confidenceDemosaicKernelProxyOnly=" << (vulkanColorTransform.guidedConfidenceDemosaicKernelProxyAvailable?"true":"false")
+            << ";confidenceDemosaicSpatialCorrelationMeasured=false"
             << ";predictedSigmaY=" << std::sqrt(baselinePhysicalLuma.varianceY)
             << ";modelConfidence=" << baselinePhysicalLuma.confidence
             << ";fusionVarianceScale=" << meta.calibration.physicalFusionVarianceScale
