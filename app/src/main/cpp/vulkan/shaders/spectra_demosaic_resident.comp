@@ -14,6 +14,9 @@ layout(std430, binding = 5) readonly buffer CloudCorrectionMap { vec4 cloudCorre
 layout(std430, binding = 6) buffer ColorTelemetry { uint colorTelemetry[]; };
 // Phase 2 trusted DNG camera profile. Header = 16 floats, then dense Data1 and optional Data2.
 layout(std430, binding = 7) readonly buffer HueSatProfile { float hueSatProfile[]; };
+// SF2-D05: optional GPU-resident quarter-size guided coarse buffers.
+layout(std430, binding = 8) buffer CoarseLuma { vec4 coarseLuma[]; };
+layout(std430, binding = 9) buffer CoarseDelta { float coarseDelta[]; };
 
 layout(push_constant) uniform Params {
     uint frameWidth;
@@ -836,6 +839,7 @@ vec3 opponentAtRgb(vec3 pixel) {
 }
 
 #include "physical_chroma_denoise.glsl"
+#include "physical_luma_coarse.glsl"
 #include "physical_luma_denoise.glsl"
 
 bool finiteBoundedRgb(vec3 pixel) {
@@ -904,6 +908,8 @@ void writeResidualCandidate(uvec2 sampleGid, bool postColourDomain) {
 
 void main() {
     uvec2 gid = gl_GlobalInvocationID.xy;
+    if (pc.mode == 14u) { coarseDownsampleAt(gid); return; }
+    if (pc.mode == 15u) { coarseFilterAt(gid); return; }
     if (pc.mode == 13u) {
         if(gid.x>=pc.frameWidth || gid.y>=pc.frameHeight) return;
         vec3 recovered=gradientHighlightAt(ivec2(gid));
