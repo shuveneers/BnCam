@@ -1,5 +1,6 @@
 #include "PhysicalChromaDenoise.h"
 #include "PhysicalLumaDenoise.h"
+#include "SingleFrameNoiseContext.h"
 // BEGIN_PHYSICAL_MODEL_ONLY
 #include "PhysicalNoisePropagation.h"
 // END_PHYSICAL_MODEL_ONLY
@@ -6425,6 +6426,27 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         residualNoiseState.postDemosaicCalibration = {};
     }
 
+    // SF2-D01-03: read-only snapshot of the already propagated physical evidence.
+    // Never feed this back into chroma/luma, RAW finalization, or Vulkan push constants.
+    const auto sf2NoiseContext = bncam::sf2::SingleFrameNoiseContext::observe(
+            {workingMeta.calibration.effectiveS[0],
+             workingMeta.calibration.effectiveS[1],
+             workingMeta.calibration.effectiveS[2],
+             workingMeta.calibration.effectiveS[3]},
+            {workingMeta.calibration.effectiveO[0],
+             workingMeta.calibration.effectiveO[1],
+             workingMeta.calibration.effectiveO[2],
+             workingMeta.calibration.effectiveO[3]},
+            residualNoiseState.preDemosaic,
+            residualNoiseState.postDemosaic,
+            residualNoiseState.measuredPostDemosaic,
+            resolvedDemosaicNoiseModel(demosaicResolution.algorithm),
+            autoHybridUsedForOutput,
+            physicalNoiseStatisticsActive,
+            g_spatialNoiseMap.relativePhysicalShape,
+            g_spatialNoiseMap.lensShadingSquaredIncluded,
+            neuralPosteriorSeedApplied);
+
     // Delta 18: explicit demosaic chroma-amplification audit. This intentionally reuses the
     // already-computed SPECTRA states/flat-region observation and therefore adds no extra image
     // scan or resident readback. The pre-demosaic side is modelled/predicted; the post-demosaic
@@ -9546,6 +9568,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                     meta.calibration.spectraProcessingMode == 0 &&
                     !neuralPosteriorSeedApplied && !autoHybridUsedForOutput)
             // END_PHYSICAL_MODEL_ONLY
+            << bncam::sf2::formatNoiseContextOnly(sf2NoiseContext)
             << "; baselinePhysicalChroma={enabled=" << (baselinePhysicalChroma.valid()?"true":"false")
             << ";spectraIndependent=true;inputDomain=POST_DEMOSAIC_LINEAR_RGB;noiseModel=PHYSICAL_SO_PROPAGATED"
             << ";analysisDomain=" << (baselinePhysicalChroma.colorDomain?"WB_CCM_LINEAR_RGB":"CAMERA_LINEAR_RGB")
