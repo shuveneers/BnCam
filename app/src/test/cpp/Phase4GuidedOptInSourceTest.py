@@ -44,9 +44,11 @@ shader=live(CPP+"vulkan/shaders/physical_luma_denoise.glsl")
 marker="// SF2-D04:"
 assert shader.count(marker)==1
 prefix=shader.split(marker)[0]
-assert prefix=="// Phase-4 bounded Guided Fine remains debug-only; stage OFF by default.\n"+\
-    frozen(CPP+"vulkan/shaders/physical_luma_denoise.glsl").replace(
-        "vec3 physicalLumaDenoise(", "vec3 physicalLegacyLumaDenoise(")
+expectedLegacy=(
+    "// Phase-4 bounded Guided Fine remains debug-only; stage OFF by default.\n"
+    + frozen(CPP+"vulkan/shaders/physical_luma_denoise.glsl").replace(
+        "vec3 physicalLumaDenoise(", "vec3 physicalLegacyLumaDenoise("))
+assert prefix.rstrip()==expectedLegacy.rstrip(), "Legacy kernel changed beyond wrapper"
 assert "if(stage==2u)return physicalGuidedFine(xy,postChroma,telemetry,true);" in shader
 assert "if(stage==1u)return physicalLegacyLumaDenoise(xy,postChroma,telemetry);" in shader
 assert "return postChroma;" in shader
