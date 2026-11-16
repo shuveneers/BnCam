@@ -1,0 +1,47 @@
+name: SF2 phase-5 Guided Fine+Coarse native and Vulkan shader checks
+on:
+  push:
+    branches: [deliverables/sf2-phase5]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-and-shader:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Compile C++17 native tests
+        run: |
+          cmake -S app/src/test/cpp -B build-sf2-native -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-sf2-native --parallel 2
+      - name: Run frozen baseline and Guided Fine tests
+        run: ctest --test-dir build-sf2-native --output-on-failure
+      - name: Install Vulkan GLSL compiler
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq glslc
+      - name: Compile production Vulkan demosaic and colour shader
+        run: |
+          glslc --target-env=vulkan1.1 -O \
+            -I app/src/main/cpp/vulkan/shaders \
+            -o /tmp/sf2-phase5-resident.spv \
+            app/src/main/cpp/vulkan/shaders/spectra_demosaic_resident.comp
+          test -s /tmp/sf2-phase5-resident.spv
+      - name: Package phase-5 changes-only delta
+        shell: bash
+        run: |
+          BASE=ccf3e96976ae90b2ce59bcf774a4c5fae803555d
+          mkdir -p phase5_delta_files
+          while IFS= read -r file; do
+            mkdir -p "phase5_delta_files/$(dirname "$file")"
+            cp -- "$file" "phase5_delta_files/$file"
+          done < <(git diff --name-only --diff-filter=ACMR "$BASE" HEAD)
+          git diff --binary "$BASE" HEAD > BnCam_SF2_F5_From_Phase4.patch
+          zip -qr BnCam_SF2_F5_Delta.zip phase5_delta_files BnCam_SF2_F5_From_Phase4.patch
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BnCam_SF2_F5_Delta
+          path: BnCam_SF2_F5_Delta.zip
+          if-no-files-found: error
