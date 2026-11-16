@@ -4756,13 +4756,14 @@ Java_com_bncam_core_engine_ImageUtils_setPhysicalLumaDebugEnabled(JNIEnv*,jobjec
 
 
 // SF2-D04: debug-build-only stage selector. Release remains OFF by default.
-// 0=OFF, 1=legacy parity reference, 2=Guided Fine. Invalid -> OFF.
+// 0=OFF, 1=legacy, 2=Guided Fine, 4=Fine+Coarse, 5=Gated. Invalid -> OFF.
 extern "C" JNIEXPORT void JNICALL
 Java_com_bncam_core_engine_ImageUtils_setPhysicalLumaStageDebug(JNIEnv*,jobject,jint stage) {
 #ifndef NDEBUG
     const auto selected = stage==1 ? bncam::luma::Stage::LEGACY_REFERENCE :
             stage==2 ? bncam::luma::Stage::GUIDED_V2 :
-            stage==4 ? bncam::luma::Stage::GUIDED_V2_FINE_COARSE : bncam::luma::Stage::OFF;
+            stage==4 ? bncam::luma::Stage::GUIDED_V2_FINE_COARSE :
+            stage==5 ? bncam::luma::Stage::GUIDED_V2_CONFIDENCE : bncam::luma::Stage::OFF;
     bncam::luma::selectedStage.store(selected, std::memory_order_relaxed);
 #else
     (void)stage;
