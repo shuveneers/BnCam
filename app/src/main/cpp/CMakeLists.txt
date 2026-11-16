@@ -547,6 +547,7 @@ include("${CMAKE_CURRENT_SOURCE_DIR}/vulkan/cmake/SpectraNeuralBackend.cmake")
 
 add_library(bncam SHARED
         native-lib.cpp
+        SingleFrameIntegrationJni.cpp
         RawPreview.cpp
         DngMerger.cpp
         RawDomain.cpp
