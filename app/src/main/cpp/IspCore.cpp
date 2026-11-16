@@ -3,6 +3,7 @@
 #include "SingleFrameNoiseContext.h"
 #include "RawPoissonGaussianEstimator.h"
 #include "SingleFrameGuidedLuma.h"
+#include "SingleFrameGuidedCoarse.h"
 // BEGIN_PHYSICAL_MODEL_ONLY
 #include "PhysicalNoisePropagation.h"
 // END_PHYSICAL_MODEL_ONLY
@@ -6946,7 +6947,8 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     // SF2: chroma-only is the unconditional product baseline. Legacy is debug-only.
     const auto singleFrameLumaStage = bncam::luma::selectedStage.load(std::memory_order_relaxed);
     if (!bncam::luma::legacyAuthorized(singleFrameLumaStage) &&
-        singleFrameLumaStage != bncam::luma::Stage::GUIDED_V2) baselinePhysicalLuma = {};
+        singleFrameLumaStage != bncam::luma::Stage::GUIDED_V2 &&
+        singleFrameLumaStage != bncam::luma::Stage::GUIDED_V2_FINE_COARSE) baselinePhysicalLuma = {};
     std::array<float,9> chromaColorTransform{};
     for(int r=0;r<3;++r)for(int c=0;c<3;++c)chromaColorTransform[r*3+c]=ccm[r*3+c]*wbRgb[c];
     baselinePhysicalChroma=bncam::chroma::inColorDomain(baselinePhysicalChroma,
@@ -7182,25 +7184,36 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         }
         if (baselinePhysicalLuma.valid()) {
             const cv::Mat& source = physicalSource;
+            auto read = [&](int x,int y) {
+                auto p=source.at<cv::Vec3f>(std::clamp(y,0,source.rows-1),std::clamp(x,0,source.cols-1));
+                return bncam::luma::Pixel{p[0],p[1],p[2]};
+            };
+            auto shape = [&](int x,int y) {
+                if (!g_spatialNoiseMap.relativePhysicalShape) return 1.f;
+                return bncam::physical::spatialSigma(x,y,source.cols,source.rows,
+                        g_spatialNoiseMap.gridWidth,g_spatialNoiseMap.gridHeight,
+                        g_spatialNoiseMap.tileSigma.data());
+            };
+            // Only the CPU failure path creates compact coarse statistics here.
+            // A normal GPU-resident success never downloads the full RGB image.
+            const bool combined=singleFrameLumaStage == bncam::luma::Stage::GUIDED_V2_FINE_COARSE;
+            const auto coarse=combined
+                    ? bncam::sf2::buildGuidedCoarse(source.cols,source.rows,
+                            baselinePhysicalLuma,read,shape)
+                    : bncam::sf2::CoarseLumaMap{};
             cv::parallel_for_(cv::Range(0, source.rows), [&](const cv::Range& rows) {
-                auto read = [&](int x,int y) {
-                    auto p=source.at<cv::Vec3f>(std::clamp(y,0,source.rows-1),std::clamp(x,0,source.cols-1));
-                    return bncam::luma::Pixel{p[0],p[1],p[2]};
-                };
-                auto shape = [&](int x,int y) {
-                    if (!g_spatialNoiseMap.relativePhysicalShape) return 1.f;
-                    return bncam::physical::spatialSigma(x,y,source.cols,source.rows,
-                            g_spatialNoiseMap.gridWidth,g_spatialNoiseMap.gridHeight,
-                            g_spatialNoiseMap.tileSigma.data());
-                };
                 for(int y=rows.start;y<rows.end;++y) for(int x=0;x<source.cols;++x) {
-                    auto current=linearRgb.at<cv::Vec3f>(y,x);
-                    auto p=(singleFrameLumaStage == bncam::luma::Stage::GUIDED_V2)
-                            ? bncam::sf2::guidedFine(x,y,baselinePhysicalLuma,
-                                    bncam::luma::Pixel{current[0],current[1],current[2]},read,shape,true).pixel
-                            : bncam::luma::filter(x,y,baselinePhysicalLuma,
-                                    bncam::luma::Pixel{current[0],current[1],current[2]},read,shape).pixel;
-                    linearRgb.at<cv::Vec3f>(y,x)={p[0],p[1],p[2]};
+                    const auto current=linearRgb.at<cv::Vec3f>(y,x);
+                    const bncam::luma::Pixel post{current[0],current[1],current[2]};
+                    auto output=singleFrameLumaStage==bncam::luma::Stage::LEGACY_REFERENCE
+                            ? bncam::luma::filter(x,y,baselinePhysicalLuma,post,read,shape).pixel
+                            : bncam::sf2::guidedFine(x,y,baselinePhysicalLuma,
+                                    post,read,shape,true).pixel;
+                    if(combined && coarse.valid) {
+                        output=bncam::sf2::addCoarseResidual(output,
+                                bncam::sf2::coarseAtPixel(coarse,x,y));
+                    }
+                    linearRgb.at<cv::Vec3f>(y,x)={output[0],output[1],output[2]};
                 }
             });
         }
@@ -9572,7 +9585,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; spectraResidualAlignmentConfidence=" << residualNoiseState.alignmentConfidence
             << formatPropagationStateFields("spectraPreDemosaic", residualNoiseState.preDemosaic)
             << "; baselinePhysicalLuma={enabled=" << (baselinePhysicalLuma.valid()?"true":"false")
-            << ";stage=" << (singleFrameLumaStage==bncam::luma::Stage::OFF?"OFF":singleFrameLumaStage==bncam::luma::Stage::LEGACY_REFERENCE?"LEGACY_REFERENCE":"GUIDED_V2_FINE_DEBUG")
+            << ";stage=" << (singleFrameLumaStage==bncam::luma::Stage::OFF?"OFF":singleFrameLumaStage==bncam::luma::Stage::LEGACY_REFERENCE?"LEGACY_REFERENCE":(singleFrameLumaStage==bncam::luma::Stage::GUIDED_V2_FINE_COARSE?"GUIDED_V2_FINE_COARSE_DEBUG":"GUIDED_V2_FINE_DEBUG"))
              << ";spectraIndependent=true;inputDomain=POST_PHYSICAL_CHROMA_LINEAR_RGB;noiseModel=PHYSICAL_SO_PROPAGATED"
             << ";status=" << (baselinePhysicalLuma.valid()?"PHYSICAL_LUMA_ACTIVE":
                 (singleFrameLumaStage==bncam::luma::Stage::OFF?"PHYSICAL_LUMA_STAGE_OFF":"PHYSICAL_LUMA_BYPASS_NO_VALID_NOISE_MODEL"))
