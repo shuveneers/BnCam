@@ -100,7 +100,7 @@ vec3 physicalGuidedFine(ivec2 xy,vec3 postChroma,out vec3 telemetry,bool gate) {
     return result;
 }
 // Mode-3 bits 2..4 carry stages: 0 OFF, 1 legacy, 2 Guided Fine,
-// 4 Guided Fine+Coarse. Coarse buffers are read ONLY when stage 4 is selected.
+// 4 Guided Fine+Coarse, 5 Guided Fine+Coarse with confidence.\n// Coarse buffers are read only for stages 4 and 5.
 // The fine kernel remains source-identical to phase 4.
 vec3 physicalLumaDenoise(ivec2 xy,vec3 postChroma,out vec3 telemetry) {
     uint stage=(pc.residualStride>>2u)&7u;
@@ -115,6 +115,23 @@ vec3 physicalLumaDenoise(ivec2 xy,vec3 postChroma,out vec3 telemetry) {
         if(!physicalChromaFinite(combined))return fine;
         telemetry=vec3(fineTelemetry.x,abs(coarse),fineTelemetry.z);
         return combined;
+    }
+    // SF2-D06: stage 5 computes the SAME fine+coarse candidate as stage 4,
+    // then applies one bounded confidence factor. No additional denoising,
+    // chroma modification, sharpening or second variance scale.
+    if(stage==5u) {
+        vec3 fineTelemetry;
+        vec3 fine=physicalGuidedFine(xy,postChroma,fineTelemetry,true);
+        float fineDelta=fine.r-postChroma.r;
+        float coarseDelta=coarseCorrectionAt(xy);
+        Sf2ConfidenceEvidence evidence=sf2ResidualConfidenceAt(xy,fineDelta,coarseDelta);
+        if(evidence.valid<0.5)return postChroma;
+        vec3 gated=postChroma+vec3(evidence.weight*(fineDelta+coarseDelta));
+        if(!physicalChromaFinite(gated))return postChroma;
+        telemetry=vec3(fineTelemetry.x*evidence.weight,
+                       abs(coarseDelta)*evidence.weight,
+                       max(evidence.coherence,evidence.edge));
+        return gated;
     }
     return postChroma;
 }
