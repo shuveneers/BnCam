@@ -42,13 +42,35 @@ class CollectorQualificationContract(unittest.TestCase):
             for name,value in (("off",0),("legacy",1),("fine",2),
                                ("coarse",4),("confidence",5),("offRepeat",0))
         )+"offRepeatJpegBytesIdentical=true\n"
-        files={name:(b"\xff\xd8dummy\xff\xd9" if name.endswith(".jpg")
-                     else notes.encode() if name=="qualification.txt" else b"stats")
-               for name in sf2.CAPTURE_FILES}
+        native_status = {
+            "off.txt": ("OFF", False),
+            "on.txt": ("LEGACY_REFERENCE", True),
+            "guided.txt": ("GUIDED_V2_FINE_DEBUG", True),
+            "combined.txt": ("GUIDED_V2_FINE_COARSE_DEBUG", True),
+            "confidence.txt": ("GUIDED_V2_CONFIDENCE_DEBUG", True),
+            "off_repeat.txt": ("OFF", False),
+        }
+        files={}
+        for name in sf2.CAPTURE_FILES:
+            if name.endswith(".jpg"):
+                files[name]=b"\xff\xd8dummy\xff\xd9"
+            elif name=="qualification.txt":
+                files[name]=notes.encode()
+            else:
+                stage, enabled=native_status[name]
+                files[name]=(f";stage={stage};gpuExecuted={'true' if enabled else 'false'}"
+                             + (";measurementStatus=GPU_MEASURED" if enabled else "")
+                             + (";confidenceGateApplied=true" if name=="confidence.txt" else "")
+                             ).encode()
         x=sf2.verify_capture(files)
         self.assertTrue(x["all_capture_files_present"])
         self.assertTrue(x["jpeg_markers_valid"])
         self.assertTrue(x["six_debug_stage_checks_pass"])
+        self.assertTrue(x["native_stage_and_gpu_route_checks_pass"])
+        files["confidence.txt"]=b";stage=GUIDED_V2_CONFIDENCE_DEBUG;gpuExecuted=false"
+        self.assertFalse(sf2.verify_capture(files)["native_stage_and_gpu_route_checks_pass"])
+        files["confidence.txt"]=(b";stage=GUIDED_V2_CONFIDENCE_DEBUG;gpuExecuted=true;"
+                                 b"measurementStatus=GPU_MEASURED;confidenceGateApplied=true")
         self.assertTrue(x["master_crc_present"])
         self.assertTrue(x["off_repeat_jpeg_byte_identical"])
         files["off_repeat.jpg"]=b"not a JPEG"
