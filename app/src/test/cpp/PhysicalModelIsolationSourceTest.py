@@ -32,5 +32,7 @@ assert "PHYSICAL_LUMA_STAGE_OFF" in isp
 native = (ROOT / "app/src/main/cpp/native-lib.cpp").read_text()
 assert "#ifndef NDEBUG\n    bncam::luma::selectedStage.store" in native
 kt = (ROOT / "app/src/main/java/com/bncam/core/engine/ImageUtils.kt").read_text()
-assert "finally { setPhysicalLumaDebugEnabled(false) }" in kt
+assert "setPhysicalLumaDebugEnabled(false)" in kt
+assert "setPhysicalLumaStageDebug(0)" in kt
+assert "finally {" in kt
 print("SF2 phase-0 chroma frozen; phase-4 shader/backend opt-in verified separately; default OFF")
