@@ -1111,7 +1111,8 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
     const std::uint32_t coarseWidth=(request.frameWidth+3u)/4u;
     const std::uint32_t coarseHeight=(request.frameHeight+3u)/4u;
     const std::uint64_t coarseCells=std::uint64_t(coarseWidth)*coarseHeight;
-    const bool coarseRequested=request.lumaStage==bncam::luma::Stage::GUIDED_V2_FINE_COARSE &&
+    const bool coarseRequested=(request.lumaStage==bncam::luma::Stage::GUIDED_V2_FINE_COARSE ||
+            request.lumaStage==bncam::luma::Stage::GUIDED_V2_CONFIDENCE) &&
             request.baselinePhysicalLuma.valid() &&
             request.frameWidth>=12u && request.frameHeight>=12u;
     bool coarseReady=false;
@@ -1308,7 +1309,10 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
     push.cfaEvidence1[0] = sourceClipConfidenceReady ? (request.neutralDefaultRaw ? 2.0f : 1.0f) : 0.0f;
     const bool physicalLumaReady=request.lumaStage!=bncam::luma::Stage::OFF &&
             request.baselinePhysicalLuma.valid();
-    const auto effectiveLumaStage=request.lumaStage==bncam::luma::Stage::GUIDED_V2_FINE_COARSE && !coarseReady
+    // A gated candidate requires a valid coarse candidate; if no device
+    // resources are available, fail closed to the proven fine-only stage.
+    const auto effectiveLumaStage=(request.lumaStage==bncam::luma::Stage::GUIDED_V2_FINE_COARSE ||
+                                  request.lumaStage==bncam::luma::Stage::GUIDED_V2_CONFIDENCE) && !coarseReady
             ? bncam::luma::Stage::GUIDED_V2 : request.lumaStage;
     push.padding0 = physicalLumaReady ? request.baselinePhysicalLuma.varianceY : 0.f;
     push.cfaEvidence1[1] = physicalLumaReady ? request.baselinePhysicalLuma.confidence : 0.f;
@@ -1318,7 +1322,9 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
     // heteroscedastic-statistics bit; no push-constant ABI or buffer change.
     push.residualStride = (noise.adaptiveSpatialNoise ? 1u : 0u) |
                           (noise.protectCoherentDetail ? 2u : 0u) |
-                          (physicalLumaReady ? (static_cast<std::uint32_t>(effectiveLumaStage)<<2u) : 0u);
+                          (physicalLumaReady ? (static_cast<std::uint32_t>(effectiveLumaStage)<<2u) : 0u) |
+                          (effectiveLumaStage==bncam::luma::Stage::GUIDED_V2_CONFIDENCE &&
+                           request.lumaDemosaicKernelProxyAvailable ? 32u : 0u);
     push.ccm[9] = physicalShapeReady ? float(request.physicalSpatialColumns) : 0.f;
     push.ccm[10] = physicalShapeReady ? float(request.physicalSpatialRows) : 0.f;
     push.ccm[0] = request.colorMatrix[0];
@@ -1524,6 +1530,10 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
     }
     result.baselinePhysicalLumaApplied=physicalLumaReady;
     result.guidedCoarseApplied=coarseReady;
+    result.guidedConfidenceGateApplied=coarseReady &&
+            effectiveLumaStage==bncam::luma::Stage::GUIDED_V2_CONFIDENCE;
+    result.guidedConfidenceDemosaicKernelProxyAvailable=result.guidedConfidenceGateApplied &&
+            request.lumaDemosaicKernelProxyAvailable;
     result.lumaHfAuthority=sums[24]*inversePixels;
     result.lumaMidAuthority=sums[25]*inversePixels;
     result.lumaStructure=sums[26]*inversePixels;
