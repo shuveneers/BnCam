@@ -869,31 +869,58 @@ object ImageUtils {
         } }
         val abDirectory = physicalLumaAbDirectory.takeIf { BuildConfig.DEBUG }
         val jpegBytes = if (abDirectory != null) {
-            // Debug-only: three renders of the SAME immutable master with identical
-            // metadata: chroma-only OFF, legacy reference, Guided Fine. No extra
-            // render or full-frame diagnostic readback exists in normal captures.
+            // SF2-D07 debug-only: five stages from the SAME immutable RAW16 master.
+            // Sixth OFF render detects residual stage/descriptor state contamination.
+            // JPEG byte identity is diagnostic; a mismatch alone is not proof of
+            // changed linear pixels (encoder metadata can differ).
             val dir = java.io.File(abDirectory, System.currentTimeMillis().toString()).apply { mkdirs() }
+            val stageEvidence = mutableListOf<String>()
+            val startNs = System.nanoTime()
             try {
+                fun checkStage(label: String, expected: Int) {
+                    val actual = getPhysicalLumaStageDebug()
+                    stageEvidence += "selectedStage.$label=$actual;expected=$expected"
+                }
                 setPhysicalLumaStageDebug(0)
+                checkStage("off", 0)
                 val off = renderOnce()
                 if (off != null) java.io.File(dir, "off.jpg").writeBytes(off)
                 java.io.File(dir, "off.txt").writeText(lastMasterIspStats())
                 setPhysicalLumaStageDebug(1)
+                checkStage("legacy", 1)
                 val legacy = renderOnce()
                 if (legacy != null) java.io.File(dir, "on.jpg").writeBytes(legacy)
                 java.io.File(dir, "on.txt").writeText(lastMasterIspStats())
                 setPhysicalLumaStageDebug(2)
+                checkStage("fine", 2)
                 val guided = renderOnce()
                 if (guided != null) java.io.File(dir, "guided.jpg").writeBytes(guided)
                 java.io.File(dir, "guided.txt").writeText(lastMasterIspStats())
                 setPhysicalLumaStageDebug(4)
+                checkStage("coarse", 4)
                 val combined = renderOnce()
                 if (combined != null) java.io.File(dir, "combined.jpg").writeBytes(combined)
                 java.io.File(dir, "combined.txt").writeText(lastMasterIspStats())
                 setPhysicalLumaStageDebug(5)
+                checkStage("confidence", 5)
                 val confidence = renderOnce()
                 if (confidence != null) java.io.File(dir, "confidence.jpg").writeBytes(confidence)
                 java.io.File(dir, "confidence.txt").writeText(lastMasterIspStats())
+                setPhysicalLumaStageDebug(0)
+                checkStage("offRepeat", 0)
+                val offRepeat = renderOnce()
+                if (offRepeat != null) java.io.File(dir, "off_repeat.jpg").writeBytes(offRepeat)
+                java.io.File(dir, "off_repeat.txt").writeText(lastMasterIspStats())
+                val exactJpegIdentity = off != null && offRepeat != null && off.contentEquals(offRepeat)
+                java.io.File(dir, "qualification.txt").writeText(
+                    "sf2QualificationVersion=1\n" +
+                    "buildSha=" + BuildConfig.GIT_REVISION + "\n" +
+                    "rawMasterCrc32=" + (masterFingerprint?.crc32 ?: "UNAVAILABLE") + "\n" +
+                    "offRepeatJpegBytesIdentical=" + exactJpegIdentity + "\n" +
+                    "jpegIdentityIsDiagnosticNotPixelProof=true\n" +
+                    "elapsedMs=" + ((System.nanoTime() - startNs) / 1_000_000L) + "\n" +
+                    stageEvidence.joinToString("\n") + "\n"
+                )
                 confidence ?: combined ?: guided ?: legacy ?: off
             } finally {
                 setPhysicalLumaStageDebug(0)
