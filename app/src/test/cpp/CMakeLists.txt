@@ -38,3 +38,6 @@ add_test(NAME PhysicalModelIsolationSourceTest COMMAND "${Python3_EXECUTABLE}"
     "${CMAKE_CURRENT_SOURCE_DIR}/PhysicalModelIsolationSourceTest.py")
 add_test(NAME SingleFrameNoiseContextSourceTest COMMAND "${Python3_EXECUTABLE}"
     "${CMAKE_CURRENT_SOURCE_DIR}/SingleFrameNoiseContextSourceTest.py")
+
+add_test(NAME Phase2ReadOnlySourceTest COMMAND "${Python3_EXECUTABLE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/Phase2ReadOnlySourceTest.py")
