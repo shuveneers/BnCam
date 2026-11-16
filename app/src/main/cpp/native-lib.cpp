@@ -4568,7 +4568,7 @@ Java_com_bncam_core_engine_ImageUtils_validatePhysicalChromaNative(JNIEnv* env,j
             }
             if(maxY>2e-6||parity>2e-6)throw std::runtime_error("WB_CCM luma/parity regression");
             report+="wbCcmCovarianceDomain maxY="+std::to_string(maxY)+" cpuGpuMax="+std::to_string(parity)+"\n";
-            r.baselinePhysicalLuma=bncam::luma::fromNoiseState(n,true);
+            r.baselinePhysicalLuma=bncam::luma::fromNoiseState(n,true);r.lumaStage=bncam::luma::Stage::LEGACY_REFERENCE;
             auto joint=bncam::vulkan::VulkanRuntime::instance().executeSpectraResidentAwbCcm(r);
             if(!joint.success||joint.outputRgb.size()!=input.size()*3)throw std::runtime_error("WB_CCM joint GPU unavailable");
             double jointParity=0;
@@ -4644,7 +4644,7 @@ Java_com_bncam_core_engine_ImageUtils_validatePhysicalLumaNative(JNIEnv* env,job
             bncam::vulkan::SpectraResidentColorTransformRequest r{};
             r.frameWidth=test::W; r.frameHeight=test::H;
             r.rowStrideFloats=test::W*3; r.rgbData=input[0].data();
-            r.baselinePhysicalLuma=model; r.physicalChromaValidationOnly=true;
+            r.baselinePhysicalLuma=model; r.lumaStage=bncam::luma::Stage::LEGACY_REFERENCE; r.physicalChromaValidationOnly=true;
             auto result=bncam::vulkan::VulkanRuntime::instance().executeSpectraResidentAwbCcm(r);
             if(!result.success) throw std::runtime_error(result.status+":"+result.failureReason);
             if(result.outputRgb.size()!=input.size()*3) throw std::runtime_error("GPU readback size");
@@ -4673,7 +4673,7 @@ Java_com_bncam_core_engine_ImageUtils_validatePhysicalLumaNative(JNIEnv* env,job
             }
             bncam::vulkan::SpectraResidentColorTransformRequest r{};
             r.frameWidth=test::W;r.frameHeight=test::H;r.rgbData=input[0].data();r.rowStrideFloats=test::W*3;
-            r.baselinePhysicalChroma=cm;r.baselinePhysicalLuma=lm;r.physicalChromaValidationOnly=true;
+            r.baselinePhysicalChroma=cm;r.baselinePhysicalLuma=lm;r.lumaStage=bncam::luma::Stage::LEGACY_REFERENCE;r.physicalChromaValidationOnly=true;
             r.physicalSpatialSigma=shapeMap;r.physicalSpatialColumns=2;r.physicalSpatialRows=2;
             auto c=bncam::vulkan::VulkanRuntime::instance().executeSpectraResidentAwbCcm(r);
             if(!c.success || c.outputRgb.size()!=input.size()*3)throw std::runtime_error("spatial parity dispatch");
@@ -4696,7 +4696,7 @@ Java_com_bncam_core_engine_ImageUtils_validatePhysicalLumaNative(JNIEnv* env,job
             cr.frameWidth=test::W;cr.frameHeight=test::H;
             cr.residentDemosaicGeneration=d.residentDemosaicGeneration;
             cr.baselinePhysicalChroma={.000025f,.0004f,.0004f,0};
-            cr.baselinePhysicalLuma={.000025f,1.f};
+            cr.baselinePhysicalLuma={.000025f,1.f};cr.lumaStage=bncam::luma::Stage::LEGACY_REFERENCE;
             cr.physicalChromaValidationOnly=true;
             auto c=bncam::vulkan::VulkanRuntime::instance().executeSpectraResidentAwbCcm(cr);
             if(!c.success || !c.residentInputUsed || !c.baselinePhysicalLumaApplied || c.lumaMaxRgError>1e-6 || c.lumaMaxBgError>1e-6)
@@ -4713,7 +4713,7 @@ Java_com_bncam_core_engine_ImageUtils_validatePhysicalLumaNative(JNIEnv* env,job
             r.frameWidth=size;r.frameHeight=size;r.rowStrideFloats=size*3;r.rgbData=bench.data();
             r.deferFullReadback=true;
             r.baselinePhysicalChroma={.000025f,.0004f,.0004f,0};
-            if(enabled) r.baselinePhysicalLuma={.000025f,1.f};
+            if(enabled){r.baselinePhysicalLuma={.000025f,1.f};r.lumaStage=bncam::luma::Stage::LEGACY_REFERENCE;}
             auto c=bncam::vulkan::VulkanRuntime::instance().executeSpectraResidentAwbCcm(r);
             if(!c.success) throw std::runtime_error("benchmark:"+c.failureReason);
             if(iteration>=2) {if(enabled) enabledMs+=c.kernelMs;else identityMs+=c.kernelMs;}
@@ -4729,7 +4729,7 @@ Java_com_bncam_core_engine_ImageUtils_validatePhysicalLumaNative(JNIEnv* env,job
                 bncam::vulkan::SpectraResidentColorTransformRequest r{};
                 r.frameWidth=w;r.frameHeight=h;r.rowStrideFloats=w*3;r.rgbData=pixels.data();r.deferFullReadback=true;
                 r.baselinePhysicalChroma={.000025f,.0004f,.0004f,0};
-                if(enabled)r.baselinePhysicalLuma={.000025f,1.f};
+                if(enabled){r.baselinePhysicalLuma={.000025f,1.f};r.lumaStage=bncam::luma::Stage::LEGACY_REFERENCE;}
                 auto c=bncam::vulkan::VulkanRuntime::instance().executeSpectraResidentAwbCcm(r);
                 if(!c.success)throw std::runtime_error("fullSizeBenchmark:"+c.failureReason);
                 if(iteration) {if(enabled){on+=c.kernelMs;wallOn+=c.totalMs;}else{off+=c.kernelMs;wallOff+=c.totalMs;}}
@@ -4754,6 +4754,17 @@ Java_com_bncam_core_engine_ImageUtils_setPhysicalLumaDebugEnabled(JNIEnv*,jobjec
 #endif
 }
 
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_bncam_core_engine_ImageUtils_setPhysicalLumaStageDebug(JNIEnv*,jobject,jint stage) {
+#ifndef NDEBUG
+    const auto selected = stage==1 ? bncam::luma::Stage::LEGACY_REFERENCE :
+            stage==2 ? bncam::luma::Stage::GUIDED_V2 : bncam::luma::Stage::OFF;
+    bncam::luma::selectedStage.store(selected);
+#else
+    (void)stage;
+#endif
+}
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_bncam_core_engine_ImageUtils_validateRawPreviewRecoveryNative(JNIEnv* env, jobject) {
