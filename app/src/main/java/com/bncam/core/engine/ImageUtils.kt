@@ -890,7 +890,11 @@ object ImageUtils {
                 val combined = renderOnce()
                 if (combined != null) java.io.File(dir, "combined.jpg").writeBytes(combined)
                 java.io.File(dir, "combined.txt").writeText(lastMasterIspStats())
-                combined ?: guided ?: legacy ?: off
+                setPhysicalLumaStageDebug(5)
+                val confidence = renderOnce()
+                if (confidence != null) java.io.File(dir, "confidence.jpg").writeBytes(confidence)
+                java.io.File(dir, "confidence.txt").writeText(lastMasterIspStats())
+                confidence ?: combined ?: guided ?: legacy ?: off
             } finally {
                 setPhysicalLumaStageDebug(0)
                 setPhysicalLumaDebugEnabled(false)
@@ -1483,7 +1487,7 @@ object ImageUtils {
     external fun validatePhysicalLumaNative(): String
     external fun validateRawPreviewRecoveryNative(): String
     external fun setPhysicalLumaDebugEnabled(enabled: Boolean)
-    // Debug build only. 0=OFF, 1=legacy reference, 2=Guided V2 Fine, 4=Fine+Coarse.
+    // Debug build only. 0=OFF, 1=legacy, 2=Fine, 4=Fine+Coarse, 5=Confidence.
     external fun setPhysicalLumaStageDebug(stage: Int)
 
     fun validateDemosaicImplementation(): String = validateDemosaicNative()
