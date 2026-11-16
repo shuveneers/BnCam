@@ -10,7 +10,7 @@
 | 3 RAW Poisson-Gaussian diagnostics | CODE COMPLETE / DEVICE VALIDATION PENDING | Optional CPU-RAW debug-only S/O-informed fit; no Vulkan readback, no S/O override; 16/16 native CI passed (43840240102); Android/phone tests pending |
 | 4 guided fine | CODE COMPLETE / DEVICE VALIDATION PENDING | CPU reference + debug-gated resident Vulkan shader, same-RAW OFF/legacy/guided comparison; native 18/18 and SPIR-V shader CI passed (43844425567); no Android APK/device validation |
 | 5 guided coarse | CODE COMPLETE / DEVICE VALIDATION PENDING | Two compact ¼-resolution device-only Vulkan passes, CPU oracle, debug Fine+Coarse stage 4, four-way same-RAW JPEG comparison; 20/20 native tests and shader compile passed (43849336343); Android/phone validation pending |
-| 6 confidence gate | NOT STARTED IN DELIVERY CHAIN | Separate experimental work failed latest earlier CI; not promoted |
+| 6 confidence gate | CODE COMPLETE / DEVICE VALIDATION PENDING | Deterministic orientation/residual/edge/fine-coarse confidence stage 5, CPU+GPU shader, same-RAW fifth debug JPEG; 20 frozen phase-5 tests + 17 current phase-6 tests and Vulkan SPIR-V CI passed; synthetic hair/textile contrast improves with modest MSE cost; HONOR/APK pending |
 | 7 integration | NOT STARTED | Requires phase sequencing and device tests |
 
 Phase 2 is based on **phase-1 HEAD** `ea7f4b45c41e5770cd8d3938bfd1133efc40aa65`. Only `DemosaicNoiseCorrelation.h` and `SingleFrameNoiseContext.h` differ under `app/src/main/cpp`.
@@ -44,3 +44,12 @@ Branch `deliverables/sf2-phase3`, based exactly on phase-2 SHA `9fba3da109825977
 - **Verification:** 20/20 native tests and real GLSL→Vulkan SPIR-V compilation passed (CI run 43849336343), including source baseline tests from phases 0–4. This does not test actual device allocation, execution, CPU/GPU numerical parity or real photographs.
 - **Limitations:** Coarse noise independence is an *assumption*, not measured from spatially adaptive demosaicing. Its conservative authority remains experimental, and it can be disabled separately unless real photos demonstrate improvement over fine-only.
 - **Pending:** Android Gradle/NDK build, APK, HONOR Magic 8 Pro visual assessment, performance, CPU/GPU parity and memory evaluation.
+
+## Phase 6 release
+
+- **Basis:** immutable phase-5 SHA `701fcb0df6541d5ede0d0b451159934ae9a6928b`; cumulative branch `deliverables/sf2-phase6`. Original `main` unchanged.
+- **Gate:** native oracle `SingleFrameResidualConfidence.h` + GLSL `physical_luma_confidence.glsl`; per-pixel weight `0..1` on exactly the existing Guided Fine+Coarse candidate. Extra bescherming wordt alleen toegepast als de kandidaat een coherente georiënteerde structuur in de guide lijkt af te vlakken. De demosaic-kerncorrelatie is hoogstens een **onafhankelijke-site kernelproxy**, geen gemeten volledige rho.
+- **Debugstage 5:** apart van OFF=0, legacy=1, fine-only=2 en fine+coarse=4. De bestaande identieke RAW-master-vergelijking maakt nu ook `confidence.jpg` met `confidence.txt`. Geen extra GPU-dispatch/SSBO/readback; debug alleen. Bij ontbrekende coarse buffer terugval naar fine-only.
+- **Regressies:** de 20 ongewijzigde native/source tests op exact fase-5 worden opnieuw uitgevoerd in een detached Git-worktree; daarnaast 17 fase-6/native source tests en echte Vulkan SPIR-V shadercompilatie. Alle C++ asserts zijn met `-UNDEBUG` actief.
+- **Kwaliteitsbewijs:** in de gecontroleerde synthetische testcase met echte fine/coarse-kandidaten stijgt de behouden contrastamplitude van haar/textiel richting de gespecificeerde ground truth. Pixel-MSE wordt iets slechter (vlak MSE 0.036119 → 0.038100, circa +5.5%). Deze trade-off is expliciet begrensd in regressies. Details: `RESIDUAL_CONFIDENCE_PROTECTION.md`.
+- **Geen productieactivatie:** de acceptatie voor HONOR Magic 8 Pro foto's, CPU/GPU numerieke pariteit, GPU-latency, geheugen en warmte staat nog open. Een best-effort APK-build wordt alleen als geslaagd gerapporteerd wanneer de Android CI daadwerkelijk een bestand publiceert.
