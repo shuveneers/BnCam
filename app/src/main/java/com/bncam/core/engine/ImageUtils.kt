@@ -1489,6 +1489,9 @@ object ImageUtils {
     external fun setPhysicalLumaDebugEnabled(enabled: Boolean)
     // Debug build only. 0=OFF, 1=legacy, 2=Fine, 4=Fine+Coarse, 5=Confidence.
     external fun setPhysicalLumaStageDebug(stage: Int)
+    // SF2-D07: debug-only GPU/CPU qualification, never executed in normal capture.
+    external fun validateSf2IntegrationNative(): String
+    external fun getPhysicalLumaStageDebug(): Int
 
     fun validateDemosaicImplementation(): String = validateDemosaicNative()
 
