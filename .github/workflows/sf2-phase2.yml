@@ -1,0 +1,36 @@
+name: SF2 phase-2 demosaic noise and pixel-isolation checks
+on:
+  push:
+    branches: [deliverables/sf2-phase2]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Build C++17 native regression tests
+        run: |
+          cmake -S app/src/test/cpp -B build-sf2-native -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-sf2-native --parallel 2
+      - name: Execute native regression tests
+        run: ctest --test-dir build-sf2-native --output-on-failure
+      - name: Package phase-2 changes-only delta
+        shell: bash
+        run: |
+          BASE=ea7f4b45c41e5770cd8d3938bfd1133efc40aa65
+          mkdir -p phase2_delta_files
+          while IFS= read -r file; do
+            mkdir -p "phase2_delta_files/$(dirname "$file")"
+            cp -- "$file" "phase2_delta_files/$file"
+          done < <(git diff --name-only --diff-filter=ACMR "$BASE" HEAD)
+          git diff --binary "$BASE" HEAD > BnCam_SF2_F2_From_Phase1.patch
+          zip -qr BnCam_SF2_F2_Delta.zip phase2_delta_files BnCam_SF2_F2_From_Phase1.patch
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BnCam_SF2_F2_Delta
+          path: BnCam_SF2_F2_Delta.zip
+          if-no-files-found: error
