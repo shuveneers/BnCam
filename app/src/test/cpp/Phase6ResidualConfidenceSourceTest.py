@@ -29,12 +29,12 @@ def fingerprint(source):
 source_sha={
     "app/src/main/cpp/IspCore.cpp":"c0fc5df8",
     "app/src/main/cpp/PhysicalLumaDenoise.h":"a390835d",
-    "app/src/main/cpp/SingleFrameResidualConfidence.h":"2300ad37",
+    "app/src/main/cpp/SingleFrameResidualConfidence.h":"4cc95ac8",
     "app/src/main/cpp/vulkan/VulkanSpectraResidentDemosaicBackend.cpp":"ae0db0f6",
     "app/src/main/cpp/vulkan/VulkanSpectraResidentDemosaicBackend.h":"d0d1415c",
     "app/src/main/cpp/vulkan/shaders/spectra_demosaic_resident.comp":"fb16cdb1",
     "app/src/main/cpp/vulkan/shaders/physical_luma_denoise.glsl":"00e95c35",
-    "app/src/main/cpp/vulkan/shaders/physical_luma_confidence.glsl":"2b192d13",
+    "app/src/main/cpp/vulkan/shaders/physical_luma_confidence.glsl":"c050146c",
     "app/src/main/cpp/native-lib.cpp":"ce84e478",
     "app/src/main/java/com/bncam/core/engine/ImageUtils.kt":"27574445",
 }
@@ -86,8 +86,9 @@ for native,glsl in (
     ("edgeSum*inv","edgeSum*inv"),
     ("model.varianceY*centerShape*centerShape","pc.padding0*local*local"),
     ("kernelProxyAvailable ? .92f : .78f","kernelProxyAvailable?0.92:0.78"),
-    ("1.f-.94f*", "1.0-.94*"),
+    ("1.f-riskStrength*eraseRisk", "1.0-riskStrength*eraseRisk"),
     ("opposition/support","opposition/support"),
+    ("lineEvidence,.5f*edgeEvidence","lineEvidence,.5*edgeEvidence"),
 ):
     assert native in model and glsl in shader, (
         f"Missing matching CPU/GPU evidence: {native} / {glsl}")
