@@ -1,12 +1,13 @@
 """SF2-D01: pixel-producing path remains byte-identical to phase 0."""
 from pathlib import Path
+from Sf2ReadOnlyIspNormalization import strip_phase3_debug_isp
 import subprocess
 
 ROOT = Path(__file__).resolve().parents[4]
 BASE = "ba509c90f71c63e3493aecbdef5e7c8890ede870"
 PATH = "app/src/main/cpp/IspCore.cpp"
 baseline = subprocess.check_output(["git", "show", BASE + ":" + PATH], cwd=ROOT).decode()
-actual = (ROOT / PATH).read_text()
+actual = strip_phase3_debug_isp((ROOT / PATH).read_text())
 
 include = '#include "SingleFrameNoiseContext.h"\n'
 assert actual.count(include) == 1
