@@ -76,10 +76,20 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-      - uses: android-actions/setup-android@v3
-      - name: Install required stable Android build tools
+      # GitHub ubuntu-latest already includes Android command-line tools.
+      # setup-android@v3 currently tries deprecated 'sdkmanager tools' and
+      # fails before Gradle starts. Use the runner's current sdkmanager.
+      - name: Configure preinstalled Android SDK and required components
+        env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
+          ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
         run: |
-          sdkmanager --install "platforms;android-36" "build-tools;36.0.0" "cmake;3.22.1" "ndk;27.2.12479018"
+          set -euo pipefail
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          test -x "$SDKMANAGER"
+          printf 'sdk.dir=%s\n' "$ANDROID_HOME" > local.properties
+          "$SDKMANAGER" --version
+          "$SDKMANAGER" --install "platforms;android-36" "build-tools;36.0.0" "cmake;3.22.1" "ndk;27.2.12479018"
       - name: Build phase-6 Android debug APK
         run: |
           chmod +x ./gradlew
