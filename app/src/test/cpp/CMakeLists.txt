@@ -23,6 +23,7 @@ foreach(test IN ITEMS AdaptiveNoiseAuthorityTest PhysicalNoisePropagationTest Ph
         SingleFrameLumaStageContractTest SingleFrameNoiseContextTest
         DemosaicNoiseCorrelationTest SingleFrameDemosaicContextTest
         RawPoissonGaussianEstimatorTest SingleFrameGuidedLumaTest SingleFrameGuidedCoarseTest
+        SingleFrameResidualConfidenceTest
         PhysicalChromaDenoiseTest PhysicalLumaDenoiseTest PhysicalNoiseNativeContractTest
         RawCfaLevelMappingTest)
     add_executable(${test} ${test}.cpp)
@@ -35,6 +36,8 @@ foreach(test IN ITEMS AdaptiveNoiseAuthorityTest PhysicalNoisePropagationTest Ph
     endif()
     add_test(NAME ${test} COMMAND ${test})
 endforeach()
+option(SF2_ISOLATED_PHASE6 "Run phase-6 current source gates; archived phase-5 source gates are tested separately in CI" OFF)
+if(NOT SF2_ISOLATED_PHASE6)
 add_test(NAME PhysicalModelIsolationSourceTest COMMAND "${Python3_EXECUTABLE}"
     "${CMAKE_CURRENT_SOURCE_DIR}/PhysicalModelIsolationSourceTest.py")
 add_test(NAME SingleFrameNoiseContextSourceTest COMMAND "${Python3_EXECUTABLE}"
@@ -51,3 +54,8 @@ add_test(NAME Phase4GuidedOptInSourceTest COMMAND "${Python3_EXECUTABLE}"
 
 add_test(NAME Phase5CoarseSourceGuardTest COMMAND "${Python3_EXECUTABLE}"
     "${CMAKE_CURRENT_SOURCE_DIR}/Phase5CoarseSourceGuardTest.py")
+
+else()
+    add_test(NAME Phase6ResidualConfidenceSourceTest COMMAND "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/Phase6ResidualConfidenceSourceTest.py")
+endif()
