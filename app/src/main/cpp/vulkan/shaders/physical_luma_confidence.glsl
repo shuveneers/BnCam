@@ -34,7 +34,8 @@ Sf2ConfidenceEvidence sf2ResidualConfidenceAt(
        isnan(variance)||isinf(variance))return outValue;
     const ivec2 d[4]=ivec2[4](ivec2(1,0),ivec2(0,1),
                               ivec2(1,1),ivec2(1,-1));
-    float structure=0.0,edge=0.0;
+    float structure=0.0,edge=0.0,eraseRisk=0.0;
+    float delta=fineDelta+coarseDelta;
     for(int dir=0;dir<4;++dir) {
         float lineSum=0.0,edgeSum=0.0,lineNoise=0.0,edgeNoise=0.0;
         ivec2 side=ivec2(-d[dir].y,d[dir].x);
@@ -66,23 +67,33 @@ Sf2ConfidenceEvidence sf2ResidualConfidenceAt(
             edgeNoise+=.25*(va+vb);
         }
         float inv=1.0/3.0;
-        structure=max(structure,sf2CoherentEvidence(lineSum*inv,lineNoise*inv*inv));
-        edge=max(edge,sf2CoherentEvidence(edgeSum*inv,edgeNoise*inv*inv));
+        float lineEvidence=sf2CoherentEvidence(lineSum*inv,lineNoise*inv*inv);
+        float edgeEvidence=sf2CoherentEvidence(edgeSum*inv,edgeNoise*inv*inv);
+        structure=max(structure,lineEvidence);
+        edge=max(edge,edgeEvidence);
+        // Apply protection only if the candidate opposes signed coherent
+        // structure; preserve good denoising on flat random noise.
+        float opposition=max(0.0,-delta*(lineSum*inv));
+        float signRisk=opposition/
+               (abs(delta*(lineSum*inv))+.05*variance+1.e-12);
+        float signal=clamp((max(lineEvidence,.5*edgeEvidence)-.42)/.58,0.0,1.0);
+        float smooth=signal*signal*(3.0-2.0*signal);
+        eraseRisk=max(eraseRisk,smooth*signRisk);
     }
     // One kernel-only proxy bit. It is NOT a measurement of total post-demosaic
     // correlation; unknown adaptive routes never gain fictitious rho=0.
     bool kernelProxyAvailable=(pc.residualStride & 32u)!=0u;
     float demosaicSupport=kernelProxyAvailable?0.92:0.78;
     float physicalSupport=clamp(2.0*confidence,0.0,1.0);
-    float delta=fineDelta+coarseDelta;
     float normalized=abs(delta)/(1.6*sqrt(variance)+1.e-12);
-    float beyond=max(0.0,normalized-1.0);
+    float beyond=max(0.0,normalized-1.75);
     float residualSupport=1.0/(1.0+.7*beyond*beyond);
     float opposition=max(0.0,-fineDelta*coarseDelta);
     float support=abs(fineDelta*coarseDelta)+.10*variance+1.e-12;
-    float levelAgreement=1.0-.50*opposition/support;
-    float structureSupport=clamp(1.0-.94*max(structure,edge),.06,1.0);
-    float weight=clamp(physicalSupport*demosaicSupport*structureSupport*
+    float levelAgreement=1.0-.15*opposition/support;
+    float riskStrength=1.70-demosaicSupport;
+    float structureSupport=clamp(1.0-riskStrength*eraseRisk,.08,1.0);
+    float weight=clamp(physicalSupport*structureSupport*
                        residualSupport*levelAgreement,0.0,1.0);
     if(isnan(weight)||isinf(weight))return outValue;
     return Sf2ConfidenceEvidence(weight,structure,edge,1.0);
