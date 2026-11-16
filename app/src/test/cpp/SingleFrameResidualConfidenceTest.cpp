@@ -47,7 +47,9 @@ int main(){
     // AMaZE/Auto Hybrid unknown spatial correlation does not become rho=0.
     const auto adaptive=sf2::residualConfidenceAt(45,48,model,-.004f,-.001f,false,read,shape);
     check(adaptive);
-    assert(adaptive.weight<flat.weight);
+    // An unknown demosaic should NOT globally attenuate useful denoising
+    // in flat fields: uncertainty only raises penalties on coherent risk.
+    assert(near(adaptive.weight,flat.weight));
     assert(adaptive.demosaicSupport==.78f);
 
     // Directional coherence on thin hair: neither a mere gradient threshold
@@ -57,6 +59,9 @@ int main(){
     const auto hair=sf2::residualConfidenceAt(80,64,model,-.012f,-.004f,true,read,shape);
     const auto hairBackground=sf2::residualConfidenceAt(57,64,model,-.012f,-.004f,true,read,shape);
     check(hair);check(hairBackground);
+    const auto adaptiveHair=sf2::residualConfidenceAt(80,64,model,-.012f,-.004f,false,read,shape);
+    check(adaptiveHair);
+    assert(adaptiveHair.weight<hair.weight);
     assert(hair.structureEvidence>hairBackground.structureEvidence+.25f);
     assert(hair.weight<hairBackground.weight*.75f);
     // A weak line at physical noise scale has reproducible but nonbinary
