@@ -2,6 +2,7 @@
 // SF2-D01: immutable, read-only description of the CURRENT physical noise path.
 // No second S/O resolver and no authority to mutate pixels or calibration.
 #include "SpectraNoiseCalibration.h"
+#include "DemosaicNoiseCorrelation.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -20,6 +21,7 @@ struct SingleFrameNoiseContext final {
     const bool relativeSpatialSigmaAvailable; // existing tile map owns the actual data
     const double observedPostDemosaicY;
     const std::size_t observedSamples;
+    const SpatialNoiseCorrelation correlation; // only exact fixed kernels are known
     const double modelConfidence; // prediction confidence, not estimator authority
     const std::string provenance;
 
@@ -49,6 +51,7 @@ struct SingleFrameNoiseContext final {
                 measurement.robustVarianceY>0 ? measurement.robustVarianceY : 0;
         return {s,o,finalized,demosaiced,model,hybrid,ready,spatialReady,
                 observation,measurement.acceptedSampleCount,
+                ready?predictSpatialCorrelation(finalized,demosaiced,model,hybrid):SpatialNoiseCorrelation{},
                 ready?demosaiced.confidence:0.0,
                 ready?"PHYSICAL_SO_EXISTING_POST_DEMOSAIC":"NO_VALID_PHYSICAL_NOISE"};
     }

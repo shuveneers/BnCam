@@ -9527,6 +9527,9 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
              << ";confidence=" << singleFrameNoiseContext.modelConfidence
              << ";observedToPredictedY=" << singleFrameNoiseContext.diagnosticObservedToPredictedY()
              << ";demosaicHybrid=" << (singleFrameNoiseContext.autoHybrid?"true":"false")
+             << ";spatialCorrelationKnown=" << (singleFrameNoiseContext.correlation.known?"true":"false")
+             << ";spatialRhoX=" << singleFrameNoiseContext.correlation.rhoHorizontal
+             << ";spatialRhoY=" << singleFrameNoiseContext.correlation.rhoVertical
              << ";spatialReady=" << (singleFrameNoiseContext.relativeSpatialSigmaAvailable?"true":"false") << "}"
              << "; baselinePhysicalLuma={enabled=" << (baselinePhysicalLuma.valid()?"true":"false")
             << ";stage=" << (singleFrameLumaStage==bncam::luma::Stage::OFF?"OFF":singleFrameLumaStage==bncam::luma::Stage::LEGACY_REFERENCE?"LEGACY_REFERENCE":"GUIDED_V2_NOT_YET_ACTIVE")

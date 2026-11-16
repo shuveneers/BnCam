@@ -8,3 +8,6 @@
 | SF2-D01-01 | CODE COMPLETE (source), DEVICE VALIDATION PENDING | Immutable S/O + pre/post-demosaic states + observational confidence; no new sensor owner | Native `SingleFrameNoiseContextTest` added, execution pending | phase 1 commit |
 | SF2-D01-02 | CODE COMPLETE (source), DEVICE VALIDATION PENDING | Existing propagation untouched, gain applied once | Read-only state; pixel identity pending build | phase 1 commit |
 | SF2-D01-03 | CODE COMPLETE (source), DEVICE VALIDATION PENDING | Context diagnostic in IspCore | Device/NDK tests pending | phase 1 commit |
+| SF2-D02-01 | CODE COMPLETE (source), DEVICE VALIDATION PENDING | Malvar fixed kernel phase-average spatial Y correlation | Deterministic kernel test added, not yet executed | phase 2 commit |
+| SF2-D02-02 | CODE COMPLETE (source), DEVICE VALIDATION PENDING | AMaZE adaptive returns UNKNOWN; no invented linear correlation | Explicit uncertainty guard | phase 2 commit |
+| SF2-D02-03/04 | CODE COMPLETE (source), DEVICE VALIDATION PENDING | Hybrid without local weights UNKNOWN; compact covariance contract | Read-only telemetry | phase 2 commit |
