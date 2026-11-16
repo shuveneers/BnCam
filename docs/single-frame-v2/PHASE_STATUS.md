@@ -3,7 +3,7 @@
 | Phase | Status | Notes |
 |---|---|---|
 | 0 chroma-only | DEVICE VALIDATION PENDING | Stage control source changed; compilation and phone test pending |
-| 1 noise context | NOT STARTED | Read-only |
+| 1 noise context | DEVICE VALIDATION PENDING | Immutable diagnostic observation; production filter remains identical |
 | 2 demosaic noise | NOT STARTED | Diagnostics |
 | 3 RAW estimator | NOT STARTED | Diagnostics |
 | 4 guided fine | NOT STARTED | Experimental |

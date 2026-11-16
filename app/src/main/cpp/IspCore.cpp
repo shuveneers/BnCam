@@ -2,6 +2,7 @@
 #include "PhysicalLumaDenoise.h"
 // BEGIN_PHYSICAL_MODEL_ONLY
 #include "PhysicalNoisePropagation.h"
+#include "SingleFrameNoiseContext.h"
 // END_PHYSICAL_MODEL_ONLY
 #include "ProfileColorManagement.h"
 #include "SrgbByteLut.h"
@@ -6876,6 +6877,15 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     const double ccmOnlyBlueOpponentDirectionalGain = wbRgb[2] > 1.0e-6f
             ? wbCcmBlueOpponentDirectionalGain / static_cast<double>(wbRgb[2]) : 1.0;
 
+    // SF2-D01: immutable observation only. The established noise resolver,
+    // post-demosaic prediction and physical chroma filter retain sole authority.
+    const auto singleFrameNoiseContext = bncam::sf2::SingleFrameNoiseContext::observe(
+            meta.calibration.effectiveS, meta.calibration.effectiveO,
+            residualNoiseState.preDemosaic, residualNoiseState.postDemosaic,
+            residualNoiseState.measuredPostDemosaic,
+            resolvedDemosaicNoiseModel(demosaicResolution.algorithm),
+            autoHybridUsedForOutput, meta.calibration.physicalNoiseModelAvailable(),
+            g_spatialNoiseMap.relativePhysicalShape);
     auto baselinePhysicalChroma = bncam::chroma::fromNoiseState(
             residualNoiseState.postDemosaic, physicalNoiseStatisticsActive);
     auto baselinePhysicalLuma = bncam::luma::fromNoiseState(
@@ -9513,7 +9523,12 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; spectraResidualMotionConfidence=" << residualNoiseState.motionConfidence
             << "; spectraResidualAlignmentConfidence=" << residualNoiseState.alignmentConfidence
             << formatPropagationStateFields("spectraPreDemosaic", residualNoiseState.preDemosaic)
-            << "; baselinePhysicalLuma={enabled=" << (baselinePhysicalLuma.valid()?"true":"false")
+            << "; singleFrameNoiseContext={readOnly=true;physicalReady=" << (singleFrameNoiseContext.physicalAvailable?"true":"false")
+             << ";confidence=" << singleFrameNoiseContext.modelConfidence
+             << ";observedToPredictedY=" << singleFrameNoiseContext.diagnosticObservedToPredictedY()
+             << ";demosaicHybrid=" << (singleFrameNoiseContext.autoHybrid?"true":"false")
+             << ";spatialReady=" << (singleFrameNoiseContext.relativeSpatialSigmaAvailable?"true":"false") << "}"
+             << "; baselinePhysicalLuma={enabled=" << (baselinePhysicalLuma.valid()?"true":"false")
             << ";stage=" << (singleFrameLumaStage==bncam::luma::Stage::OFF?"OFF":singleFrameLumaStage==bncam::luma::Stage::LEGACY_REFERENCE?"LEGACY_REFERENCE":"GUIDED_V2_NOT_YET_ACTIVE")
              << ";spectraIndependent=true;inputDomain=POST_PHYSICAL_CHROMA_LINEAR_RGB;noiseModel=PHYSICAL_SO_PROPAGATED"
             << ";status=" << (baselinePhysicalLuma.valid()?"PHYSICAL_LUMA_ACTIVE":
