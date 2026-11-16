@@ -176,6 +176,11 @@ struct SpectraResidentColorTransformRequest {
 
 struct SpectraResidentColorTransformResult {
     bool baselinePhysicalLumaApplied = false;
+    // SF2-D05: optional ¼-size, device-only two-stage coarse pass.
+    bool guidedCoarseApplied = false;
+    std::uint32_t guidedCoarseWidth = 0, guidedCoarseHeight = 0;
+    std::uint64_t guidedCoarseResidentBytes = 0;
+    float guidedCoarsePrepMs = 0.0f; // GPU timestamps pending device, no claim here
     double lumaHfAuthority=0,lumaMidAuthority=0,lumaStructure=0,lumaAffected=0;
     double lumaMaxRgError=0,lumaMaxBgError=0;
     double lumaNoisePressureMean=0,chromaNoisePressureMean=0;
@@ -384,6 +389,9 @@ private:
     // Six floats per sampled residual point; host-visible because the CPU only performs the
     // compact percentile/tile reduction, never another full-frame RGB scan.
     PersistentBuffer residualCandidates_;
+    // SF2-D05: two compact device-only buffers, allocated only when stage 4 is enabled.
+    PersistentBuffer guidedCoarseInput_;
+    PersistentBuffer guidedCoarseResidual_;
     std::uint64_t residentDemosaicGeneration_ = 0;
     std::uint32_t residentWidth_ = 0;
     std::uint32_t residentHeight_ = 0;
