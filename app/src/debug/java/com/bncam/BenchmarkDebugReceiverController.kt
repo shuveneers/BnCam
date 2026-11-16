@@ -24,6 +24,9 @@ object BenchmarkDebugReceiverController {
     const val ACTION_SET_CONFIG = "com.bncam.SET_BENCHMARK_CONFIG"
     const val ACTION_TRIGGER_CAPTURE = "com.bncam.TRIGGER_CAPTURE"
     const val ACTION_AF_GROUND_TRUTH_CONTROL = "com.bncam.AF_GROUND_TRUTH_CONTROL"
+    // Opt-in, debug-only diagnostic; stores a local textual GPU/CPU parity report.
+    const val ACTION_VALIDATE_SF2 = "com.bncam.VALIDATE_SF2"
+    @Volatile private var sf2QualificationRunning = false
 
     fun register(
         activity: MainActivity,
@@ -160,6 +163,39 @@ object BenchmarkDebugReceiverController {
                             CameraEventBus.requestCapture("adb_dynamic")
                         }
                     }
+                    ACTION_VALIDATE_SF2 -> {
+                        // Never run GPU qualification on the broadcast/UI thread.
+                        if (!sf2QualificationRunning) {
+                            sf2QualificationRunning = true
+                            activity.lifecycleScope.launch(kotlinx.coroutines.Dispatchers.Default) {
+                                val dir = java.io.File(activity.filesDir, "sf2_qualification")
+                                try {
+                                    dir.mkdirs()
+                                    val result = runCatching {
+                                        com.bncam.core.engine.ImageUtils.validateSf2IntegrationNative()
+                                    }.getOrElse { error ->
+                                        "sf2QualificationVersion=1;allPassed=false;reason=" +
+                                            error.javaClass.simpleName + ":" + (error.message ?: "unknown")
+                                    }
+                                    val report = "buildSha=" + BuildConfig.GIT_REVISION + "\n" +
+                                        "jniStageAfterTest=" +
+                                        com.bncam.core.engine.ImageUtils.getPhysicalLumaStageDebug() + "\n" +
+                                        result
+                                    java.io.File(dir, "report.txt").writeText(report)
+                                } catch (error: Throwable) {
+                                    runCatching {
+                                        dir.mkdirs()
+                                        java.io.File(dir, "report.txt").writeText(
+                                            "sf2QualificationVersion=1;allPassed=false;reason=" +
+                                                error.javaClass.simpleName
+                                        )
+                                    }
+                                } finally {
+                                    sf2QualificationRunning = false
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -170,6 +206,7 @@ object BenchmarkDebugReceiverController {
                 addAction(ACTION_SET_CONFIG)
                 addAction(ACTION_TRIGGER_CAPTURE)
                 addAction(ACTION_AF_GROUND_TRUTH_CONTROL)
+                addAction(ACTION_VALIDATE_SF2)
             },
             ContextCompat.RECEIVER_EXPORTED
         )
