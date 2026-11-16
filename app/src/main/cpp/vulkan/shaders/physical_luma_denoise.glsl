@@ -49,7 +49,7 @@ vec3 physicalLegacyLumaDenoise(ivec2 xy,vec3 postChroma,out vec3 telemetry) {
 
 // SF2-D04: CPU oracle SingleFrameGuidedLuma.h, stage 2; immutable
 // demosaic evidence, bounded additive Y, original post-chroma opponents.
-vec3 physicalGuidedFine(ivec2 xy,vec3 postChroma,out vec3 telemetry) {
+vec3 physicalGuidedFine(ivec2 xy,vec3 postChroma,out vec3 telemetry,bool gate) {
     telemetry=vec3(0);
     if(pc.cfaEvidence1.y<=0.0||!physicalChromaFinite(postChroma))return postChroma;
     float centre=opponentAtRgb(physicalChromaRead(xy)).x;
@@ -71,7 +71,7 @@ vec3 physicalGuidedFine(ivec2 xy,vec3 postChroma,out vec3 telemetry) {
     float sceneVariance=max(0.0,sum2/total-mean*mean-.8*expected);
     float wiener=v/(v+2.0*sceneVariance+1.e-12);
     float structure=0.0;
-    for(int axis=0;axis<2;++axis) {
+    if(gate)for(int axis=0;axis<2;++axis) {
         float residualMean=0.0,meanNoise=0.0;
         for(int k=-1;k<=1;++k) {
             ivec2 p=xy+(axis==0?ivec2(0,k):ivec2(k,0));
@@ -91,7 +91,7 @@ vec3 physicalGuidedFine(ivec2 xy,vec3 postChroma,out vec3 telemetry) {
             (residualMean*residualMean+meanVariance+1.e-12);
         structure=max(structure,evidence);
     }
-    float authority=clamp(.78*physical*wiener*(1.0-.98*structure),0.0,.78);
+    float authority=clamp(.78*physical*wiener*(gate?1.0-.98*structure:1.0),0.0,.78);
     float correction=authority*(mean-centre);
     vec3 result=postChroma+vec3(correction);
     if(!physicalChromaFinite(result))return postChroma;
@@ -104,6 +104,6 @@ vec3 physicalLumaDenoise(ivec2 xy,vec3 postChroma,out vec3 telemetry) {
     uint stage=(pc.residualStride>>2u)&7u;
     telemetry=vec3(0);
     if(stage==1u)return physicalLegacyLumaDenoise(xy,postChroma,telemetry);
-    if(stage==2u)return physicalGuidedFine(xy,postChroma,telemetry);
+    if(stage==2u||stage==3u)return physicalGuidedFine(xy,postChroma,telemetry,stage==2u);
     return postChroma;
 }

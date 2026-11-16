@@ -7,7 +7,8 @@ namespace bncam::luma {
 using Pixel = chroma::Pixel;
 // SF2: product baseline is OFF; legacy is only an explicit debug comparison.
 // Guided V2 is fail-closed until its own runtime is available.
-enum class Stage : std::uint32_t { OFF = 0, LEGACY_REFERENCE = 1, GUIDED_V2 = 2 };
+enum class Stage : std::uint32_t { OFF = 0, LEGACY_REFERENCE = 1, GUIDED_V2 = 2,
+                                   GUIDED_V2_UNGATED = 3 };
 inline std::atomic<Stage> selectedStage{Stage::OFF};
 inline constexpr bool legacyAuthorized(Stage value) { return value == Stage::LEGACY_REFERENCE; }
 struct Model {

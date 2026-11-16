@@ -8,5 +8,5 @@
 | 3 RAW estimator | DEVICE VALIDATION PENDING | Host RAW diagnostic only; synthetic validation required |
 | 4 guided fine | IN PROGRESS | CPU oracle added; Vulkan still gated off |
 | 5 guided coarse | NOT STARTED | Experimental |
-| 6 confidence gate | NOT STARTED | Experimental |
+| 6 confidence gate | IN PROGRESS | CPU/GLSL gated vs ungated; synthetic comparison pending |
 | 7 integration | NOT STARTED | Device test required |

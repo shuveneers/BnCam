@@ -7152,9 +7152,11 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                 };
                 for(int y=rows.start;y<rows.end;++y) for(int x=0;x<source.cols;++x) {
                     auto current=linearRgb.at<cv::Vec3f>(y,x);
-                    auto p = singleFrameLumaStage==bncam::luma::Stage::GUIDED_V2
+                    auto p = (singleFrameLumaStage==bncam::luma::Stage::GUIDED_V2 ||
+                              singleFrameLumaStage==bncam::luma::Stage::GUIDED_V2_UNGATED)
                             ? bncam::sf2::guidedFine(x,y,baselinePhysicalLuma,
-                                    bncam::luma::Pixel{current[0],current[1],current[2]},read,shape).pixel
+                                    bncam::luma::Pixel{current[0],current[1],current[2]},read,shape,
+                                    singleFrameLumaStage!=bncam::luma::Stage::GUIDED_V2_UNGATED).pixel
                             : bncam::luma::filter(x,y,baselinePhysicalLuma,
                                     bncam::luma::Pixel{current[0],current[1],current[2]},read,shape).pixel;
                     linearRgb.at<cv::Vec3f>(y,x)={p[0],p[1],p[2]};
@@ -9537,7 +9539,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
              << ";spatialRhoY=" << singleFrameNoiseContext.correlation.rhoVertical
              << ";spatialReady=" << (singleFrameNoiseContext.relativeSpatialSigmaAvailable?"true":"false") << "}"
              << "; baselinePhysicalLuma={enabled=" << (baselinePhysicalLuma.valid()?"true":"false")
-            << ";stage=" << (singleFrameLumaStage==bncam::luma::Stage::OFF?"OFF":singleFrameLumaStage==bncam::luma::Stage::LEGACY_REFERENCE?"LEGACY_REFERENCE":"GUIDED_V2")
+            << ";stage=" << (singleFrameLumaStage==bncam::luma::Stage::OFF?"OFF":singleFrameLumaStage==bncam::luma::Stage::LEGACY_REFERENCE?"LEGACY_REFERENCE":singleFrameLumaStage==bncam::luma::Stage::GUIDED_V2_UNGATED?"GUIDED_V2_UNGATED":"GUIDED_V2")
              << ";spectraIndependent=true;inputDomain=POST_PHYSICAL_CHROMA_LINEAR_RGB;noiseModel=PHYSICAL_SO_PROPAGATED"
             << ";status=" << (baselinePhysicalLuma.valid()?"PHYSICAL_LUMA_ACTIVE":
                 (singleFrameLumaStage==bncam::luma::Stage::OFF?"PHYSICAL_LUMA_STAGE_OFF":"PHYSICAL_LUMA_BYPASS_NO_VALID_NOISE_MODEL"))

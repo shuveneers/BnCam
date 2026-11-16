@@ -5,6 +5,7 @@ int main() {
     assert(selectedStage.load() == Stage::OFF);
     assert(!legacyAuthorized(Stage::OFF));
     assert(!legacyAuthorized(Stage::GUIDED_V2));
+    assert(!legacyAuthorized(Stage::GUIDED_V2_UNGATED));
     assert(legacyAuthorized(Stage::LEGACY_REFERENCE));
     selectedStage.store(Stage::LEGACY_REFERENCE);
     assert(legacyAuthorized(selectedStage.load()));
