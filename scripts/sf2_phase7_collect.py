@@ -161,7 +161,7 @@ def main() -> int:
             device.broadcast("com.bncam.SET_BENCHMARK_CONFIG",
                              "--ez", "physicalLumaAb", "true",
                              "--ei", "physicalLumaStage", "0")
-            device.broadcast("com.bncam.TRIGGER_CAPTURE")
+            device.broadcast("com.bncam.TRIGGER_SF2_CAPTURE")
         deadline = time.monotonic() + args.timeout
         folder = None
         while time.monotonic() < deadline:
