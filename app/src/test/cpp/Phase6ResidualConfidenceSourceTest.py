@@ -34,7 +34,7 @@ source_sha={
     "app/src/main/cpp/vulkan/VulkanSpectraResidentDemosaicBackend.h":"d0d1415c",
     "app/src/main/cpp/vulkan/shaders/spectra_demosaic_resident.comp":"fb16cdb1",
     "app/src/main/cpp/vulkan/shaders/physical_luma_denoise.glsl":"00e95c35",
-    "app/src/main/cpp/vulkan/shaders/physical_luma_confidence.glsl":"c050146c",
+    "app/src/main/cpp/vulkan/shaders/physical_luma_confidence.glsl":"c9fffa76",
     "app/src/main/cpp/native-lib.cpp":"ce84e478",
     "app/src/main/java/com/bncam/core/engine/ImageUtils.kt":"27574445",
 }
