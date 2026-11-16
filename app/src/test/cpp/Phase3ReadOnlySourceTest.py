@@ -13,6 +13,7 @@ changed = subprocess.check_output(
 assert changed == [
     "app/src/main/cpp/IspCore.cpp",
     "app/src/main/cpp/RawPoissonGaussianEstimator.h",
+    "app/src/main/cpp/SingleFrameGuidedLuma.h",
 ], f"SF2-D03 changed protected production source: {changed}"
 
 path = CPP + "/IspCore.cpp"
@@ -20,7 +21,7 @@ frozen = subprocess.check_output(
     ["git", "show", BASE + ":" + path], cwd=ROOT).decode()
 actual = (ROOT / path).read_text()
 assert strip_phase3_debug_isp(actual) == frozen, (
-    "IspCore differs from phase-2 frozen pixel path outside read-only debug additions")
+    "IspCore differs from phase-2 frozen OFF/legacy path outside explicit debug-only additions")
 
 estimator = (ROOT / CPP / "RawPoissonGaussianEstimator.h").read_text()
 for token in (
@@ -39,4 +40,4 @@ for token in (
 assert "VulkanRuntime" not in estimator
 assert "android/" not in estimator
 assert "#include <opencv" not in estimator
-print("SF2 phase-3 read-only: no changes to demosaic, chroma, GPU or ISP pixel path")
+print("SF2 phase-3/4 source: OFF and legacy ISP unchanged after stripping explicit debug-only hooks")
