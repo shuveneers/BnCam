@@ -221,7 +221,7 @@ inline std::string formatRawPoissonGaussianDiagnostic(
        <<";appliedToPixels=false;overridesPhysicalModel=false"
        <<";inputWasReadBackFromGpu=false"
        <<";domain=PRE_LSC_NORMALIZED_BAYER"
-       <<";method=SAMPLED_16X16_CFA_SITE_VARIANCE_FIT_OEM_SO_GUIDED"
+       <<";method=SAMPLED_16X16_CFA_SITE_VARIANCE_FIT_EXISTING_SO_GUIDED"
        <<";scannedTiles="<<fit.scannedTiles
        <<";acceptedTiles=[";
     for (std::size_t i=0;i<4;++i)out<<(i?",":"")<<fit.acceptedTiles[i];
