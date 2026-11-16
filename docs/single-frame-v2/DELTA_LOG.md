@@ -15,6 +15,13 @@
 | SF2-D03-02 | CODE COMPLETE / DEVICE VALIDATION PENDING | `IspCore.cpp` reads existing CPU RAW only when debug enabled and single-frame; normal resident GPU skips without readback | Phase-0/1/2 source regression preserved; no APK |
 | SF2-D03-03 | CODE COMPLETE / DEVICE VALIDATION PENDING | C++ tests, phase-3 source contract and GitHub ZIP packaging | 16/16 native CI succeeded at run 43840240102; no real RAW/phone calibration |
 
+| SF2-D04-01 | CODE COMPLETE / DEVICE VALIDATION PENDING | `SingleFrameGuidedLuma.h` full-res bounded 3×3 guided fine CPU oracle; additive scalar RGB residual, local physical noise, coherent-line gate, strict bypass | Synthetic native flat noise/detail/chroma tests passed; device pending |
+| SF2-D04-02 | CODE COMPLETE / DEVICE VALIDATION PENDING | `physical_luma_denoise.glsl` Guided Fine; legacy GLSL body preserved exactly | Actual Vulkan `spectra_demosaic_resident.comp` SPIR-V compile in GitHub CI; GPU pixel parity pending |
+| SF2-D04-03 | CODE COMPLETE / DEVICE VALIDATION PENDING | Vulkan color transform request carries explicit OFF/legacy/guided stage via existing mode-3 push bits; no ABI/readback changes | Native source isolation plus GLSL compile; no device GPU run |
+| SF2-D04-04 | CODE COMPLETE / DEVICE VALIDATION PENDING | `IspCore.cpp` routes explicit debug Guided Fine through resident Vulkan and CPU fallback, retaining OFF as normal default and legacy reference | Frozen OFF/legacy ISP source identity test passed; no full Android build |
+| SF2-D04-05 | CODE COMPLETE / DEVICE VALIDATION PENDING | Debug JNI/Kotlin stage control and same-RAW three-JPEG quality comparison (`off.jpg`, `on.jpg`, `guided.jpg`) | Source contracts check explicit stage and guaranteed reset; photo assessment pending |
+| SF2-D04-06 | CODE COMPLETE / DEVICE VALIDATION PENDING | Phase-4 synthetic test, protected-source tests, native and GLSL CI, changes-only ZIP | **18/18 native tests and SPIR-V compile passed** in run 43844425567; no APK/phone |
+
 ## Exact release boundary
 
 - Phase-1 base SHA: `ea7f4b45c41e5770cd8d3938bfd1133efc40aa65`.
@@ -23,4 +30,5 @@
 - Full project downloadable via the GitHub branch ZIP.
 - Changes-only ZIP downloadable as the `BnCam_SF2_F2_Delta` GitHub Actions artifact; its ZIP includes changed files and a reproducible `.patch` against phase 1.
 - The unrelated `feature/single-frame-engine-v2` experiment is not included.
-- **Next closed phase: SF2-D04 Guided Luma Fine.** Not started on phase 3.
+- Phase-4 branch: `deliverables/sf2-phase4`; phase-3 base SHA: `76e98fbf09ba6905323b0356293118c8f6892381`.
+- **Next closed phase: SF2-D05 Guided Luma Coarse.** Not started on phase 4.
