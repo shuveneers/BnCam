@@ -29,6 +29,15 @@
 | SF2-D05-05 | CODE COMPLETE / DEVICE VALIDATION PENDING | Debug JNI/Kotlin stage 4 and same-RAW four-way `off.jpg`, `on.jpg`, `guided.jpg`, `combined.jpg`; reset stage OFF in `finally` | Strict source guard and native tests; APK/device test pending |
 | SF2-D05-06 | CODE COMPLETE / DEVICE VALIDATION PENDING | `SingleFrameGuidedCoarseTest.cpp`, `Phase5CoarseSourceGuardTest.py`, CMake, CI and delta ZIP | **20/20 native tests and production Vulkan SPIR-V compile succeeded**; synthetic controlled MSE fine-only 0.281483 vs fine+coarse 0.268113 (about 4.75% reduction). Actual photo benefit unproven |
 
+
+| SF2-D06-01 | CODE COMPLETE / DEVICE VALIDATION PENDING | `SingleFrameResidualConfidence.h`: deterministisch scalar gategewicht 0..1 op bestaande fine+coarse residual; physical noise, kernelproxy-onzekerheid, coherente tweedeverschillen, randconsistentie, residual-significantie en fine/coarse-oppositie | Echte native oracle gebruikt geen extra S/O/ISO-gain, geen tone/sharp/chroma; 0..1/bypass tests |
+| SF2-D06-02 | CODE COMPLETE / DEVICE VALIDATION PENDING | `physical_luma_confidence.glsl` gebruikt identieke formules binnen de bestaande kleurshader; push bit 5 transporteert alleen kernelproxy-provenance | Production shader naar Vulkan1.1 SPIR-V gecompileerd; GPU device-pariteit nog onbekend |
+| SF2-D06-03 | CODE COMPLETE / DEVICE VALIDATION PENDING | Expliciete debugstage `GUIDED_V2_CONFIDENCE=5`, hergebruik van twee compacte coarse-SSBOs, geen nieuw ABI, dispatch of full readback | OFF/legacy/fine-only/fine+coarse behouden; bij coarse alloc fail terug naar fine-only |
+| SF2-D06-04 | CODE COMPLETE / DEVICE VALIDATION PENDING | CPU fallback gebruikt bestaande immutable guide en dezelfde kandidaat, met eenmalige gated neutrale RGB-Y correctie; geen dubbele chroma-filter | Broncode-inventaris/pinning, oude fase-5-worktree tests |
+| SF2-D06-05 | CODE COMPLETE / DEVICE VALIDATION PENDING | Debug JNI/Kotlin vijfde identieke RAW-JPEG (`confidence.jpg`) en diagnose; reset naar OFF in `finally` | Native/source contract; echte Android runtime/APK pending |
+| SF2-D06-06 | CODE COMPLETE / DEVICE VALIDATION PENDING | Native synthetic hare/weak-line/textile/edge/flat/invalid tests + daadwerkelijke fase-4/5 kandidaatcontrasten met exacte synthetische truth | Hair A .017633→.017868 (truth .020); hair B .009476→.009645 (truth .011); textile .010259→.010703 (truth .011). Flat MSE .036119→.038100: gedocumenteerde trade-off, geen apparaatclaim |
+| SF2-D06-07 | CODE COMPLETE / DEVICE VALIDATION PENDING | Phase-6 CI voert **20 originele fase-5-tests** op onveranderde SHA uit, plus **17 actuele fase-6-tests**, echt shader SPIR-V en changes-only ZIP | Android/phone quality acceptance pending; standalone release en `.patch` tegen vorige SHA |
+
 ## Exact release boundary
 
 - Phase-1 base SHA: `ea7f4b45c41e5770cd8d3938bfd1133efc40aa65`.
@@ -39,4 +48,5 @@
 - The unrelated `feature/single-frame-engine-v2` experiment is not included.
 - Phase-4 branch: `deliverables/sf2-phase4`; phase-3 base SHA: `76e98fbf09ba6905323b0356293118c8f6892381`.
 - Phase-5 branch: `deliverables/sf2-phase5`; frozen phase-4 base SHA: `ccf3e96976ae90b2ce59bcf774a4c5fae803555d`.
-- **Next closed phase: SF2-D06 Residual Confidence Protection.** Not started on phase 5.
+- Phase-6 branch: `deliverables/sf2-phase6`; exact phase-5 base SHA: `701fcb0df6541d5ede0d0b451159934ae9a6928b`.
+- **Next closed phase: SF2-D07 Complete Pipeline Integration.** Not started on phase 6.
