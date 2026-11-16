@@ -99,13 +99,22 @@ vec3 physicalGuidedFine(ivec2 xy,vec3 postChroma,out vec3 telemetry,bool gate) {
     telemetry=vec3(authority,0.0,structure);
     return result;
 }
-// Existing residualStride low bits are owned by physical chroma.
-// Mode-3 bits 2..4 carry an explicit luma stage: 0 OFF, 1 legacy, 2 Guided Fine.
-// Debug-only stage; no push-constant ABI changes and no extra GPU buffers.
+// Mode-3 bits 2..4 carry stages: 0 OFF, 1 legacy, 2 Guided Fine,
+// 4 Guided Fine+Coarse. Coarse buffers are read ONLY when stage 4 is selected.
+// The fine kernel remains source-identical to phase 4.
 vec3 physicalLumaDenoise(ivec2 xy,vec3 postChroma,out vec3 telemetry) {
     uint stage=(pc.residualStride>>2u)&7u;
     telemetry=vec3(0);
     if(stage==1u)return physicalLegacyLumaDenoise(xy,postChroma,telemetry);
     if(stage==2u)return physicalGuidedFine(xy,postChroma,telemetry,true);
+    if(stage==4u) {
+        vec3 fineTelemetry;
+        vec3 fine=physicalGuidedFine(xy,postChroma,fineTelemetry,true);
+        float coarse=coarseCorrectionAt(xy);
+        vec3 combined=fine+vec3(coarse);
+        if(!physicalChromaFinite(combined))return fine;
+        telemetry=vec3(fineTelemetry.x,abs(coarse),fineTelemetry.z);
+        return combined;
+    }
     return postChroma;
 }
