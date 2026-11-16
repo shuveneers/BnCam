@@ -130,6 +130,9 @@ struct SpectraResidentColorTransformRequest {
     bncam::luma::Model baselinePhysicalLuma{};
     // Explicit debug-selected stage; OFF if caller does not opt in.
     bncam::luma::Stage lumaStage = bncam::luma::Stage::OFF;
+    // Fixed-kernel demosaic rho PROXY ONLY, never a measured spatial covariance.
+    // Unknown adaptive/learned paths pass false and receive a lower gate cap.
+    bool lumaDemosaicKernelProxyAvailable = false;
     const float* physicalSpatialSigma = nullptr;
     std::uint32_t physicalSpatialColumns = 0, physicalSpatialRows = 0;
     // Explicit diagnostic only: return the pre-AWB stage for CPU/GPU verification.
@@ -178,6 +181,8 @@ struct SpectraResidentColorTransformResult {
     bool baselinePhysicalLumaApplied = false;
     // SF2-D05: optional ¼-size, device-only two-stage coarse pass.
     bool guidedCoarseApplied = false;
+    bool guidedConfidenceGateApplied = false;
+    bool guidedConfidenceDemosaicKernelProxyAvailable = false;
     std::uint32_t guidedCoarseWidth = 0, guidedCoarseHeight = 0;
     std::uint64_t guidedCoarseResidentBytes = 0;
     float guidedCoarsePrepMs = 0.0f; // GPU timestamps pending device, no claim here
