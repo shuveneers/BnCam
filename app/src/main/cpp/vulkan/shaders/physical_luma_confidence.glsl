@@ -77,8 +77,8 @@ Sf2ConfidenceEvidence sf2ResidualConfidenceAt(
         float signRisk=opposition/
                (abs(delta*(lineSum*inv))+.05*variance+1.e-12);
         float signal=clamp((max(lineEvidence,.5*edgeEvidence)-.42)/.58,0.0,1.0);
-        float smooth=signal*signal*(3.0-2.0*signal);
-        eraseRisk=max(eraseRisk,smooth*signRisk);
+        float smoothEvidence=signal*signal*(3.0-2.0*signal);
+        eraseRisk=max(eraseRisk,smoothEvidence*signRisk);
     }
     // One kernel-only proxy bit. It is NOT a measurement of total post-demosaic
     // correlation; unknown adaptive routes never gain fictitious rho=0.
