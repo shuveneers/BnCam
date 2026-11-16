@@ -14,6 +14,10 @@ assert changed == [
     "app/src/main/cpp/IspCore.cpp",
     "app/src/main/cpp/RawPoissonGaussianEstimator.h",
     "app/src/main/cpp/SingleFrameGuidedLuma.h",
+    "app/src/main/cpp/native-lib.cpp",
+    "app/src/main/cpp/vulkan/VulkanSpectraResidentDemosaicBackend.cpp",
+    "app/src/main/cpp/vulkan/VulkanSpectraResidentDemosaicBackend.h",
+    "app/src/main/cpp/vulkan/shaders/physical_luma_denoise.glsl",
 ], f"SF2-D03 changed protected production source: {changed}"
 
 path = CPP + "/IspCore.cpp"
