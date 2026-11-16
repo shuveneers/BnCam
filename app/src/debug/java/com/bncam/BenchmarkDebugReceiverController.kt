@@ -48,6 +48,10 @@ object BenchmarkDebugReceiverController {
                         }
                     }
                     ACTION_SET_CONFIG -> {
+                        if (intent.hasExtra("physicalLumaStage")) {
+                            com.bncam.core.engine.ImageUtils.setPhysicalLumaStageDebug(
+                                intent.getIntExtra("physicalLumaStage", 0))
+                        }
                         if (intent.hasExtra("physicalLuma")) {
                             com.bncam.core.engine.ImageUtils.setPhysicalLumaDebugEnabled(intent.getBooleanExtra("physicalLuma", true))
                         }
