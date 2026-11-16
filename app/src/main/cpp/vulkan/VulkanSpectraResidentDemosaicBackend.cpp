@@ -1280,7 +1280,8 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
     push.cfaEvidence0[2] = noise.bg;
     push.cfaEvidence0[3] = noise.cross;
     push.cfaEvidence1[0] = sourceClipConfidenceReady ? (request.neutralDefaultRaw ? 2.0f : 1.0f) : 0.0f;
-    const bool physicalLumaReady=request.baselinePhysicalLuma.valid();
+    const bool physicalLumaReady=request.lumaStage!=bncam::luma::Stage::OFF &&
+            request.baselinePhysicalLuma.valid();
     push.padding0 = physicalLumaReady ? request.baselinePhysicalLuma.varianceY : 0.f;
     push.cfaEvidence1[1] = physicalLumaReady ? request.baselinePhysicalLuma.confidence : 0.f;
     push.cfaEvidence1[2] = request.physicalChromaValidationOnly ? 1.f : 0.f;
@@ -1288,7 +1289,8 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
     // Mode 3 does not use the residual sampling stride. Reuse it as an explicit
     // heteroscedastic-statistics bit; no push-constant ABI or buffer change.
     push.residualStride = (noise.adaptiveSpatialNoise ? 1u : 0u) |
-                          (noise.protectCoherentDetail ? 2u : 0u);
+                          (noise.protectCoherentDetail ? 2u : 0u) |
+                          (physicalLumaReady ? (static_cast<std::uint32_t>(request.lumaStage)<<2u) : 0u);
     push.ccm[9] = physicalShapeReady ? float(request.physicalSpatialColumns) : 0.f;
     push.ccm[10] = physicalShapeReady ? float(request.physicalSpatialRows) : 0.f;
     push.ccm[0] = request.colorMatrix[0];
