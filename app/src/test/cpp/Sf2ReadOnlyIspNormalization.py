@@ -18,12 +18,12 @@ def fnv32(source: str) -> str:
     return format(h, "08x")
 
 def strip_phase5_opt_in_isp(source: str) -> str:
-    include = '#include "SingleFrameGuidedCoarse.h"\\n'
+    include = '#include "SingleFrameGuidedCoarse.h"\n'
     assert source.count(include)==1, "Missing/duplicate SF2-D05 include"
     source=source.replace(include, "", 1)
     edits=[
         (
-            '        singleFrameLumaStage != bncam::luma::Stage::GUIDED_V2 &&\\n'
+            '        singleFrameLumaStage != bncam::luma::Stage::GUIDED_V2 &&\n'
             '        singleFrameLumaStage != bncam::luma::Stage::GUIDED_V2_FINE_COARSE) baselinePhysicalLuma = {};',
             '        singleFrameLumaStage != bncam::luma::Stage::GUIDED_V2) baselinePhysicalLuma = {};'
         ),
@@ -35,7 +35,7 @@ def strip_phase5_opt_in_isp(source: str) -> str:
     for current, prior in edits:
         assert source.count(current)==1, "Missing/duplicate SF2-D05 runtime opt-in"
         source=source.replace(current, prior, 1)
-    start_marker='        if (baselinePhysicalLuma.valid()) {\\n            const cv::Mat& source = physicalSource;\\n'
+    start_marker='        if (baselinePhysicalLuma.valid()) {\n            const cv::Mat& source = physicalSource;\n'
     end_marker='        ensureDefaultRawSourceConfidence();'
     assert source.count(start_marker)==1 and source.count(end_marker)==1
     start=source.index(start_marker)
