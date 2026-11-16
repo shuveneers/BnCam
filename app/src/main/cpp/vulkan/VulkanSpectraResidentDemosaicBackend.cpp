@@ -1330,6 +1330,31 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
     push.ccm[6] = request.colorMatrix[6];
     push.ccm[7] = request.colorMatrix[7];
     push.ccm[8] = request.colorMatrix[8];
+    // SF2-D05: compact GPU-only coarse passes precede the normal colour stage.
+    // Barriers enforce downsample->filter and filter->full-res reconstruction.
+    if(coarseReady) {
+        const auto coarseBarrier=[&](VkBuffer buffer) {
+            VkBufferMemoryBarrier b{};
+            b.sType=VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            b.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;
+            b.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;
+            b.srcQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;
+            b.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;
+            b.buffer=buffer;
+            b.size=VK_WHOLE_SIZE;
+            vkCmdPipelineBarrier(commandBuffer_,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0u,0u,nullptr,1u,&b,0u,nullptr);
+        };
+        push.mode=14u; // antialiased RAW-demosaic Y, 1/4 W × 1/4 H
+        vkCmdPushConstants(commandBuffer_,pipelineLayout_,VK_SHADER_STAGE_COMPUTE_BIT,0u,sizeof(push),&push);
+        vkCmdDispatch(commandBuffer_,(coarseWidth+15u)/16u,(coarseHeight+15u)/16u,1u);
+        coarseBarrier(guidedCoarseInput_.buffer);
+        push.mode=15u; // bounded coarse bandpass
+        vkCmdPushConstants(commandBuffer_,pipelineLayout_,VK_SHADER_STAGE_COMPUTE_BIT,0u,sizeof(push),&push);
+        vkCmdDispatch(commandBuffer_,(coarseWidth+15u)/16u,(coarseHeight+15u)/16u,1u);
+        coarseBarrier(guidedCoarseResidual_.buffer);
+        push.mode=3u;
+    }
     if(request.neutralDefaultRaw && sourceClipConfidenceReady) {
         push.mode=13u;
         vkCmdPushConstants(commandBuffer_,pipelineLayout_,VK_SHADER_STAGE_COMPUTE_BIT,0u,sizeof(push),&push);
@@ -1498,6 +1523,7 @@ SpectraResidentColorTransformResult VulkanSpectraResidentDemosaicBackend::execut
         result.ccmMean[c] = sums[6 + c] * inversePixels;
     }
     result.baselinePhysicalLumaApplied=physicalLumaReady;
+    result.guidedCoarseApplied=coarseReady;
     result.lumaHfAuthority=sums[24]*inversePixels;
     result.lumaMidAuthority=sums[25]*inversePixels;
     result.lumaStructure=sums[26]*inversePixels;
