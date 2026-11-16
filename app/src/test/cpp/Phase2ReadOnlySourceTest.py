@@ -15,6 +15,10 @@ expected = [
     "app/src/main/cpp/RawPoissonGaussianEstimator.h",
     "app/src/main/cpp/SingleFrameGuidedLuma.h",
     "app/src/main/cpp/SingleFrameNoiseContext.h",
+    "app/src/main/cpp/native-lib.cpp",
+    "app/src/main/cpp/vulkan/VulkanSpectraResidentDemosaicBackend.cpp",
+    "app/src/main/cpp/vulkan/VulkanSpectraResidentDemosaicBackend.h",
+    "app/src/main/cpp/vulkan/shaders/physical_luma_denoise.glsl",
 ]
 assert actual == expected, f"Unexpected phase-2 main-cpp changes: {actual!r}"
 
