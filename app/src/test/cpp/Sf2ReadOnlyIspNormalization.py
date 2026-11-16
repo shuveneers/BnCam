@@ -1,3 +1,55 @@
+"""Phase-5 source normalizer: allow ONLY the explicit debug-only coarse hook.
+
+The selected block is fingerprinted byte-for-byte (FNV32), and the actual
+phase-4 CPU block is loaded from the immutable phase-4 commit. This does not
+weaken the frozen phase-0 through phase-4 source regressions.
+"""
+import subprocess
+from pathlib import Path
+
+_PHASE5_BASE = "ccf3e96976ae90b2ce59bcf774a4c5fae803555d"
+_PHASE5_ROOT = Path(__file__).resolve().parents[4]
+_PHASE5_ISP = "app/src/main/cpp/IspCore.cpp"
+
+def fnv32(source: str) -> str:
+    h = 2166136261
+    for byte in source.encode("utf-8"):
+        h = ((h ^ byte)*16777619) & 0xffffffff
+    return format(h, "08x")
+
+def strip_phase5_opt_in_isp(source: str) -> str:
+    include = '#include "SingleFrameGuidedCoarse.h"\\n'
+    assert source.count(include)==1, "Missing/duplicate SF2-D05 include"
+    source=source.replace(include, "", 1)
+    edits=[
+        (
+            '        singleFrameLumaStage != bncam::luma::Stage::GUIDED_V2 &&\\n'
+            '        singleFrameLumaStage != bncam::luma::Stage::GUIDED_V2_FINE_COARSE) baselinePhysicalLuma = {};',
+            '        singleFrameLumaStage != bncam::luma::Stage::GUIDED_V2) baselinePhysicalLuma = {};'
+        ),
+        (
+            '(singleFrameLumaStage==bncam::luma::Stage::GUIDED_V2_FINE_COARSE?"GUIDED_V2_FINE_COARSE_DEBUG":"GUIDED_V2_FINE_DEBUG")',
+            '"GUIDED_V2_FINE_DEBUG"'
+        ),
+    ]
+    for current, prior in edits:
+        assert source.count(current)==1, "Missing/duplicate SF2-D05 runtime opt-in"
+        source=source.replace(current, prior, 1)
+    start_marker='        if (baselinePhysicalLuma.valid()) {\\n            const cv::Mat& source = physicalSource;\\n'
+    end_marker='        ensureDefaultRawSourceConfidence();'
+    assert source.count(start_marker)==1 and source.count(end_marker)==1
+    start=source.index(start_marker)
+    end=source.index(end_marker,start)
+    new_block=source[start:end]
+    assert fnv32(new_block)=="adcb27df", "CPU fine/coarse code changed outside approved delta"
+    frozen=subprocess.check_output(
+        ["git","show",_PHASE5_BASE+":"+_PHASE5_ISP],
+        cwd=_PHASE5_ROOT,text=True)
+    before=frozen.index(start_marker)
+    after=frozen.index(end_marker,before)
+    source=source[:start]+frozen[before:after]+source[end:]
+    return source
+
 """Strict debug-only phase-3/4 source normalization for frozen pixel guards.
 
 Phase 4 deliberately implements a new debug-selected pixel path. Source
@@ -6,6 +58,7 @@ it does NOT prove GUIDED output is byte-identical to the old pipeline.
 """
 
 def strip_phase4_opt_in_isp(source: str) -> str:
+    source = strip_phase5_opt_in_isp(source)
     include = '#include "SingleFrameGuidedLuma.h"\n'
     assert source.count(include) == 1
     source = source.replace(include, "", 1)
