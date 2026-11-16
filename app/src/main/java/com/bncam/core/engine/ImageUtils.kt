@@ -1471,6 +1471,8 @@ object ImageUtils {
     external fun validatePhysicalLumaNative(): String
     external fun validateRawPreviewRecoveryNative(): String
     external fun setPhysicalLumaDebugEnabled(enabled: Boolean)
+    // Debug build only. 0=OFF, 1=legacy reference, 2=Guided V2 Fine.
+    external fun setPhysicalLumaStageDebug(stage: Int)
 
     fun validateDemosaicImplementation(): String = validateDemosaicNative()
 
