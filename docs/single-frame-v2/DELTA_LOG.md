@@ -22,6 +22,13 @@
 | SF2-D04-05 | CODE COMPLETE / DEVICE VALIDATION PENDING | Debug JNI/Kotlin stage control and same-RAW three-JPEG quality comparison (`off.jpg`, `on.jpg`, `guided.jpg`) | Source contracts check explicit stage and guaranteed reset; photo assessment pending |
 | SF2-D04-06 | CODE COMPLETE / DEVICE VALIDATION PENDING | Phase-4 synthetic test, protected-source tests, native and GLSL CI, changes-only ZIP | **18/18 native tests and SPIR-V compile passed** in run 43844425567; no APK/phone |
 
+| SF2-D05-01 | CODE COMPLETE / DEVICE VALIDATION PENDING | `SingleFrameGuidedCoarse.h` CPU oracle: quarter-resolution antialiased 4×4 binomial Y, independent-reference variance and Cauchy upper bound, 3×3 gated coarse bandpass, bilinear upsample, exact bypass | Deterministic synthetic noise/shadow/textile/seams plus invalid-model tests |
+| SF2-D05-02 | CODE COMPLETE / DEVICE VALIDATION PENDING | `physical_luma_coarse.glsl`: modes 14/15 and quarter-size Y/variance+residual buffers on bindings 8/9. Stage 4 combines the frozen Guided Fine and new coarse additive Y delta | Actual production Vulkan resident GLSL compiled to SPIR-V; GPU numerical parity pending |
+| SF2-D05-03 | CODE COMPLETE / DEVICE VALIDATION PENDING | Vulkan backend: two persistent device-only compact buffers, explicit compute barriers, 128-byte push ABI retained, fine-only fallback on coarse allocation failure | Source guard and GLSL compile passed; no phone benchmark or extra normal readback |
+| SF2-D05-04 | CODE COMPLETE / DEVICE VALIDATION PENDING | `IspCore.cpp` CPU fallback builds coarse only from the existing immutable post-demosaic guide; fine-only remains selectable | Frozen phases 0–4 source regressions maintained, fine kernel and chroma unchanged |
+| SF2-D05-05 | CODE COMPLETE / DEVICE VALIDATION PENDING | Debug JNI/Kotlin stage 4 and same-RAW four-way `off.jpg`, `on.jpg`, `guided.jpg`, `combined.jpg`; reset stage OFF in `finally` | Strict source guard and native tests; APK/device test pending |
+| SF2-D05-06 | CODE COMPLETE / DEVICE VALIDATION PENDING | `SingleFrameGuidedCoarseTest.cpp`, `Phase5CoarseSourceGuardTest.py`, CMake, CI and delta ZIP | **20/20 native tests and production Vulkan SPIR-V compile succeeded**; synthetic controlled MSE fine-only 0.281483 vs fine+coarse 0.268113 (about 4.75% reduction). Actual photo benefit unproven |
+
 ## Exact release boundary
 
 - Phase-1 base SHA: `ea7f4b45c41e5770cd8d3938bfd1133efc40aa65`.
@@ -31,4 +38,5 @@
 - Changes-only ZIP downloadable as the `BnCam_SF2_F2_Delta` GitHub Actions artifact; its ZIP includes changed files and a reproducible `.patch` against phase 1.
 - The unrelated `feature/single-frame-engine-v2` experiment is not included.
 - Phase-4 branch: `deliverables/sf2-phase4`; phase-3 base SHA: `76e98fbf09ba6905323b0356293118c8f6892381`.
-- **Next closed phase: SF2-D05 Guided Luma Coarse.** Not started on phase 4.
+- Phase-5 branch: `deliverables/sf2-phase5`; frozen phase-4 base SHA: `ccf3e96976ae90b2ce59bcf774a4c5fae803555d`.
+- **Next closed phase: SF2-D06 Residual Confidence Protection.** Not started on phase 5.
