@@ -56,13 +56,11 @@ def pick_newest_dir(listing: str) -> str | None:
 def verify_capture(files: dict[str, bytes]) -> dict:
     missing = sorted(set(CAPTURE_FILES).difference(files))
     bad_jpegs = [p for p in IMAGE_FILES if p in files and
-                 not (files[p].startswith(b"\\xff\\xd8") and files[p].endswith(b"\\xff\\xd9"))]
+                 not (files[p].startswith(b"\xff\xd8") and files[p].endswith(b"\xff\xd9"))]
     notes = files.get("qualification.txt", b"").decode("utf-8", errors="replace")
-    stage_values = dict(re.findall(
-        r"selectedStage\\.(\\w+)=(\\d+);expected=(\\d+)", notes)) if False else {}
     expected = {"off": 0, "legacy": 1, "fine": 2, "coarse": 4,
                 "confidence": 5, "offRepeat": 0}
-    observed = re.findall(r"selectedStage\\.(\\w+)=(\\d+);expected=(\\d+)", notes)
+    observed = re.findall(r"selectedStage\.(\w+)=(\d+);expected=(\d+)", notes)
     matches = len(observed) == len(expected) and all(
         name in expected and int(actual) == expected[name] == int(requested)
         for name, actual, requested in observed
