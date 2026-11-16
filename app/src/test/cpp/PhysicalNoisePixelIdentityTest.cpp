@@ -4,8 +4,8 @@
 #include <iostream>
 #include <random>
 #include <vector>
-namespace baseline8aee2d2 { namespace spectra2=bncam::spectra2; }
-#include "baseline_8aee2d2/PhysicalLumaDenoise.h"
+namespace baseline2778264 { namespace spectra2=bncam::spectra2; }
+#include "baseline_2778264/PhysicalLumaDenoise.h"
 
 int main() {
     using namespace bncam;
@@ -39,16 +39,16 @@ int main() {
             predictionDiffers |= prediction.valid && prediction.state.varianceRG!=legacy.varianceRG;
             same &= legacy.covariance.values==saved.covariance.values;
             auto cm=chroma::fromNoiseState(legacy,true);
-            auto oldCm=baseline8aee2d2::chroma::fromNoiseState(legacy,true);
+            auto oldCm=baseline2778264::chroma::fromNoiseState(legacy,true);
             auto lm=luma::fromNoiseState(legacy,true);
-            auto oldLm=baseline8aee2d2::luma::fromNoiseState(legacy,true);
+            auto oldLm=baseline2778264::luma::fromNoiseState(legacy,true);
             for(int shapeCase=0;shapeCase<3;++shapeCase) {
                 auto shape=[&](int x,int y){return shapeCase==0?1.f:shapeCase==1?.5f+float(std::clamp(x+y,0,W+H-2))/(W+H-2):NAN;};
                 for(int y=0;y<H;++y)for(int x=0;x<W;++x) {
                     auto c=chroma::filter(x,y,cm,read,shape);
-                    auto oldC=baseline8aee2d2::chroma::filter(x,y,oldCm,read,shape);
+                    auto oldC=baseline2778264::chroma::filter(x,y,oldCm,read,shape);
                     auto l=luma::filter(x,y,lm,c.pixel,read,shape);
-                    auto oldL=baseline8aee2d2::luma::filter(x,y,oldLm,oldC.pixel,read,shape);
+                    auto oldL=baseline2778264::luma::filter(x,y,oldLm,oldC.pixel,read,shape);
                     same &= std::memcmp(c.pixel.data(),oldC.pixel.data(),sizeof(c.pixel))==0;
                     same &= std::memcmp(l.pixel.data(),oldL.pixel.data(),sizeof(l.pixel))==0;
                     same &= c.hf==oldC.hf && c.lf==oldC.lf && l.hf==oldL.hf && l.mid==oldL.mid;

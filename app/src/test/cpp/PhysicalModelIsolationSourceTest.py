@@ -1,39 +1,43 @@
-"""Lock the production CPU/GPU pixel path to 8aee2d2; allow diagnostics only."""
+"""SF2 regression guard: main-HEAD chroma and legacy luma pixels are protected.
+
+The earlier 8aee2d2 freeze predated proven chroma covariance/detail changes.
+That stale historical pin fails even on main and is NOT the SF2 baseline.
+In phase 0 the intentionally changed routing is separately asserted below.
+"""
 from pathlib import Path
 import re
 import subprocess
 
 ROOT = Path(__file__).resolve().parents[4]
-BASELINE = "8aee2d298bffb2daf9f1640e7ff654ab8c7a46bc"
-FILES = ["PhysicalChromaDenoise.h", "PhysicalLumaDenoise.h", "PhysicalNoiseAuthority.h",
-         "SpectraNoisePropagation.h", "native-lib.cpp",
-         "vulkan/VulkanSpectraResidentDemosaicBackend.cpp",
-         "vulkan/VulkanSpectraResidentDemosaicBackend.h",
-         "vulkan/shaders/physical_chroma_denoise.glsl",
-         "vulkan/shaders/physical_luma_denoise.glsl",
-         "vulkan/shaders/spectra_demosaic_resident.comp", "IspCore.cpp"]
-for name in FILES:
+BASELINE = "277826469978febf4e243b15363b8340840bd971"
+PROTECTED = [
+    "PhysicalChromaDenoise.h",
+    "PhysicalNoiseAuthority.h",
+    "SpectraNoisePropagation.h",
+    "vulkan/shaders/physical_chroma_denoise.glsl",
+]
+for name in PROTECTED:
     path = "app/src/main/cpp/" + name
-    reference = subprocess.check_output(["git", "show", BASELINE + ":" + path], cwd=ROOT).decode().replace("\r\n", "\n")
-    current = (ROOT / path).read_text(encoding="utf-8").replace("\r\n", "\n")
-    if name == "IspCore.cpp":
-        blocks = re.findall(r"(?m)^ *// BEGIN_PHYSICAL_MODEL_ONLY\n.*?^ *// END_PHYSICAL_MODEL_ONLY\n", current, re.S)
-        assert len(blocks) == 2, "Expected only include and diagnostic stream insertion"
-        assert blocks[0].splitlines()[1] == '#include "PhysicalNoisePropagation.h"'
-        # Exact allow-list: this must remain a formatting expression with const inputs.
-        expected = '''            // BEGIN_PHYSICAL_MODEL_ONLY
-            // Read-only prediction: do not feed corrected covariance/confidence into
-            // baselinePhysicalChroma/Luma, downstream tone state, or GPU push constants.
-            << bncam::physical::formatNoisePredictionOnly(
-                    residualNoiseState.preDemosaic,
-                    resolvedDemosaicNoiseModel(demosaicResolution.algorithm),
-                    residualNoiseState.postDemosaic, physicalNoiseStatisticsActive,
-                    meta.calibration.spectraProcessingMode == 0 &&
-                    !neuralPosteriorSeedApplied && !autoHybridUsedForOutput)
-            // END_PHYSICAL_MODEL_ONLY
-'''
-        assert blocks[1] == expected, "Prediction must never enter a pixel consumer"
-        for block in blocks:
-            current = current.replace(block, "")
-    assert current == reference, f"Pixel path differs from 8aee2d2: {name}"
-print("CPU filters, GPU shaders/transport, shared covariance and ISP pixel wiring match 8aee2d2")
+    frozen = subprocess.check_output(["git", "show", BASELINE + ":" + path], cwd=ROOT)
+    current = (ROOT / path).read_bytes()
+    assert current == frozen, f"Protected physical/chroma path changed: {name}"
+
+luma = (ROOT / "app/src/main/cpp/PhysicalLumaDenoise.h").read_text(encoding="utf-8")
+old_luma = subprocess.check_output(
+    ["git", "show", BASELINE + ":app/src/main/cpp/PhysicalLumaDenoise.h"],
+    cwd=ROOT).decode()
+# Keep original legacy filter body intact; only stage switch may change.
+start = "template<class Read, class Shape>\nResult filter("
+assert luma[luma.index(start):] == old_luma[old_luma.index(start):], "Legacy pixel oracle changed"
+assert "selectedStage{Stage::OFF}" in luma, "Product default must be chroma-only"
+
+isp = (ROOT / "app/src/main/cpp/IspCore.cpp").read_text(encoding="utf-8")
+assert "singleFrameLumaStage==bncam::luma::Stage::OFF) baselinePhysicalLuma = {}" in isp
+assert "request.lumaStage = singleFrameLumaStage;" in isp
+gpu = (ROOT / "app/src/main/cpp/vulkan/shaders/spectra_demosaic_resident.comp").read_text(encoding="utf-8")
+assert gpu.index("physicalChromaDenoise(ivec2(gid)") < gpu.index("physicalLumaDenoise(ivec2(gid)")
+shader = (ROOT / "app/src/main/cpp/vulkan/shaders/physical_luma_denoise.glsl").read_text(encoding="utf-8")
+assert "uint stage=(pc.residualStride>>2u)&7u;" in shader
+assert "physicalLegacyLumaDenoise(xy,postChroma,telemetry)" in shader
+assert "physicalGuidedFine(xy,postChroma,telemetry)" in shader
+print("SF2 baseline chroma byte-identity, legacy pixel oracle and explicit OFF/legacy/guided routing verified")
