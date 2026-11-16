@@ -48,7 +48,7 @@ The CPU failsafe uses `buildGuidedCoarse` only after a CPU image is already avai
 
 ## D05.5 — Quality controls and limitations
 
-`SingleFrameGuidedCoarseTest.cpp` tests antialias/variance propagation, checkerboard rejection, constant DC identity, natural gradients/shadows, strong step edges, textile-like alternating patterns, compact-grid interpolation, bounded noise correction, corrupted input and missing physical models. The synthetic noisy field compares **fine-only** with **fine+coarse**, and confirms the coarse path applies a measurable additional correction without exceeding a conservative MSE-regression tolerance. These tests do not establish device photographic superiority.
+`SingleFrameGuidedCoarseTest.cpp` tests antialias/variance propagation, checkerboard rejection, constant DC identity, natural gradients/shadows, strong step edges, textile-like alternating patterns, compact-grid interpolation, bounded noise correction, corrupted input and missing physical models. The synthetic noisy field compares **fine-only** with **fine+coarse**, and now requires **more than 1% lower synthetic MSE** for Fine+Coarse than Fine-only on the fixed low-frequency correlated-noise scene. The observed CI values were **0.281483 (Fine-only) vs 0.268113 (Fine+Coarse)**, approximately **4.75% lower**. These tests do not establish device photographic superiority.
 
 Native regression source guards additionally fingerprint every changed production file and reconstruct the original phase-0–4 ISP source when only reviewed debug stage 5 additions are removed. The phase-4 fine kernel and existing physical chroma implementation are frozen against the previous release.
 
