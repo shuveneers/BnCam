@@ -10,8 +10,15 @@ PROTECTED = [
     "PhysicalNoiseAuthority.h",
     "SpectraNoisePropagation.h",
     "vulkan/shaders/physical_chroma_denoise.glsl",
-    "vulkan/shaders/spectra_demosaic_resident.comp",
 ]
+# Phase-5 changes the resident shader only for explicit coarse modes 14/15.
+# The separate phase-5 whole-source fingerprint guard protects that edit.
+resident=(ROOT / "app/src/main/cpp/vulkan/shaders/spectra_demosaic_resident.comp").read_text()
+h=2166136261
+for ch in resident:
+    h=((h^ord(ch))*16777619)&0xffffffff
+assert f"{h:08x}"=="b713eb0a", "Resident shader changed beyond reviewed coarse delta"
+
 for name in PROTECTED:
     path = "app/src/main/cpp/" + name
     expected = subprocess.check_output(["git", "show", BASE + ":" + path], cwd=ROOT)
