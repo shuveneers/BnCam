@@ -13,12 +13,13 @@ expected = [
     "app/src/main/cpp/DemosaicNoiseCorrelation.h",
     "app/src/main/cpp/IspCore.cpp",
     "app/src/main/cpp/RawPoissonGaussianEstimator.h",
+    "app/src/main/cpp/SingleFrameGuidedLuma.h",
     "app/src/main/cpp/SingleFrameNoiseContext.h",
 ]
 assert actual == expected, f"Unexpected phase-2 main-cpp changes: {actual!r}"
 
-# Product output, demosaic implementation, chroma, Vulkan and stage selector are
-# untouched relative to phase 1; only read-only phase-2 headers + phase-3 diagnostic observation differ.
+# OFF/legacy pixel path must be identical after removing precisely the phase-4
+# opt-in Guided Fine stage and the phase-3 read-only RAW observation.
 isp = maincpp + "/IspCore.cpp"
 assert strip_phase3_debug_isp((ROOT / isp).read_text()) == subprocess.check_output(
     ["git", "show", BASE + ":" + isp], cwd=ROOT).decode()
@@ -33,4 +34,4 @@ assert "NEURAL_POSTERIOR_INPUT_SPATIAL_CORRELATION_UNKNOWN" in model
 assert 'demosaicCorrelationValues=UNAVAILABLE' in context
 assert 'predictDemosaicSpatialNoise(' in context
 assert 'appliedToPixels=false' in context
-print("SF2 phase-2 unchanged ISP pixels: only read-only context and correlation headers differ")
+print("SF2 phase-2/3/4 frozen OFF+legacy ISP matched after opt-in stripping")
