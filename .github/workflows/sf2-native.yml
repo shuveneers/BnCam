@@ -1,0 +1,21 @@
+name: SF2 Native Contract Tests
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [feature/single-frame-engine-v2]
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Build native deterministic tests
+        run: |
+          cmake -S app/src/test/cpp -B build-sf2-native -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-sf2-native --parallel 2
+      - name: Run native tests
+        run: ctest --test-dir build-sf2-native --output-on-failure
