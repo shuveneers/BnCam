@@ -43,6 +43,7 @@ object Routes {
     const val CONFIG = "config"
     const val WATERMARK = "watermark"
     const val INFO = "info"
+    const val DEVELOPER_SETTINGS = "developer_settings"
     const val LENS_LIST = "lens_list"
     const val LENS_DETAIL = "lens_detail/{lensId}"
     const val LENS_NOISE_MODEL = "lens_detail/{lensId}/noise_model"
@@ -511,7 +512,8 @@ fun AppNavigation() {
                     onNavigateToLensSettings = { navController.navigate(Routes.LENS_LIST) },
                     onNavigateToConfigSettings = { navController.navigate(Routes.CONFIG) },
                     onNavigateToWatermarkSettings = { navController.navigate(Routes.WATERMARK) },
-                    onNavigateToInfo = { navController.navigate(Routes.INFO) }
+                    onNavigateToInfo = { navController.navigate(Routes.INFO) },
+                    onNavigateToDeveloperSettings = { navController.navigate(Routes.DEVELOPER_SETTINGS) }
                 )
             }
 
@@ -532,6 +534,16 @@ fun AppNavigation() {
             }
             composable(Routes.WATERMARK) { WatermarkScreen { navController.popBackStack() } }
             composable(Routes.INFO) { InfoScreen { navController.popBackStack() } }
+            composable(Routes.DEVELOPER_SETTINGS) {
+                val frameSource by settingsRepo.getProfileFrameSourceFlow(activeProfile.id)
+                    .collectAsStateWithLifecycle(initialValue = "YUV")
+                DeveloperSettingsScreen(
+                    activeFrameSource = frameSource,
+                    singleFrame = activeProfile.captureStrategy == com.bncam.core.engine.CaptureStrategy.SINGLE_FRAME_ZSL,
+                    onNavigateBack = { navController.popBackStack() },
+                    onOpenCamera = { navController.popBackStack(Routes.CAMERA, inclusive = false) }
+                )
+            }
 
             // Beheer van geconfigureerde vendor tags
             composable(Routes.VENDOR_TAG_MANAGEMENT) {
