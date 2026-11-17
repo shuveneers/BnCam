@@ -1,0 +1,58 @@
+name: SF2 phase-7.1 developer UI and installable APK
+on:
+  push:
+    branches: [deliverables/sf2-phase7-ui]
+  workflow_dispatch:
+permissions:
+  contents: read
+
+jobs:
+  device-ui-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Source regression for developer controls
+        run: python3 -m unittest discover -s tests -p test_sf2_phase71_ui.py -v
+      - name: Validate frozen phase-7 native suite
+        run: |
+          cmake -S app/src/test/cpp -B build-sf2-phase71 -DCMAKE_BUILD_TYPE=Release -DSF2_ISOLATED_PHASE7=ON
+          cmake --build build-sf2-phase71 --parallel 2
+          ctest --test-dir build-sf2-phase71 --output-on-failure
+      - name: Configure Android SDK
+        env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
+          ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+        run: |
+          set -euo pipefail
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          test -x "$SDKMANAGER"
+          printf 'sdk.dir=%s\n' "$ANDROID_HOME" > local.properties
+          "$SDKMANAGER" --install "platforms;android-36" "build-tools;36.0.0" "cmake;3.22.1" "ndk;27.2.12479018"
+      - name: Build actual Android debug APK
+        run: |
+          chmod +x ./gradlew
+          ./gradlew :app:assembleDebug --no-daemon --max-workers=2 --stacktrace
+      - name: Verify APK and native qualification JNI
+        run: |
+          set -euo pipefail
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          test -s "$APK"
+          unzip -t "$APK" > /tmp/sf2_apk_zipcheck.txt
+          unzip -l "$APK" | grep -F "lib/arm64-v8a/libbncam.so"
+          unzip -p "$APK" lib/arm64-v8a/libbncam.so > /tmp/sf2-libbncam.so
+          nm -D /tmp/sf2-libbncam.so | grep -F "Java_com_bncam_core_engine_ImageUtils_validateSf2IntegrationNative"
+          nm -D /tmp/sf2-libbncam.so | grep -F "Java_com_bncam_core_engine_ImageUtils_getPhysicalLumaStageDebug"
+          sha256sum "$APK"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BnCam_SF2_F7_1_Developer_Settings_APK
+          path: app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 90
+          if-no-files-found: error
