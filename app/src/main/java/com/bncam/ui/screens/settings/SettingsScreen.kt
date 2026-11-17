@@ -17,6 +17,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.bncam.BuildConfig
 
 @Composable
 fun SettingsScreen(
@@ -28,7 +29,8 @@ fun SettingsScreen(
     onNavigateToLensSettings: () -> Unit,
     onNavigateToConfigSettings: () -> Unit,
     onNavigateToWatermarkSettings: () -> Unit,
-    onNavigateToInfo: () -> Unit
+    onNavigateToInfo: () -> Unit,
+    onNavigateToDeveloperSettings: () -> Unit
 ) {
     val scrollState = rememberScrollState()
 
@@ -68,7 +70,7 @@ fun SettingsScreen(
         // ==========================================
         SettingsCard(
             title = "Camera setup",
-            description = "App behavior, preview behavior, lens id behavior and developer lab."
+            description = "App behavior, preview behavior, and lens configuration."
         ) {
             SettingsSubsectionItem(
                 title = "App Settings",
@@ -118,6 +120,13 @@ fun SettingsScreen(
                 description = "Settings summary library and info.",
                 onClick = onNavigateToInfo
             )
+            if (BuildConfig.DEBUG) {
+                SettingsSubsectionItem(
+                    title = "Developer settings",
+                    description = "Single-frame reconstruction, comparison and GPU qualification.",
+                    onClick = onNavigateToDeveloperSettings
+                )
+            }
         }
     }
 }
