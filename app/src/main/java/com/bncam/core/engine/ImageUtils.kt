@@ -869,8 +869,8 @@ object ImageUtils {
         } }
         val abDirectory = physicalLumaAbDirectory.takeIf { BuildConfig.DEBUG }
         val jpegBytes = if (abDirectory != null) {
-            // SF2-D07 debug-only: five stages from the SAME immutable RAW16 master.
-            // Sixth OFF render detects residual stage/descriptor state contamination.
+            // SF2-D08 debug-only: six stages from the SAME immutable RAW16 master.
+            // Seventh OFF render detects residual stage/descriptor state contamination.
             // JPEG byte identity is diagnostic; a mismatch alone is not proof of
             // changed linear pixels (encoder metadata can differ).
             val dir = java.io.File(abDirectory, System.currentTimeMillis().toString()).apply { mkdirs() }
@@ -896,6 +896,12 @@ object ImageUtils {
                 val guided = renderOnce()
                 if (guided != null) java.io.File(dir, "guided.jpg").writeBytes(guided)
                 java.io.File(dir, "guided.txt").writeText(lastMasterIspStats())
+                // SF2-D08: bounded Balanced Fine, isolated from the frozen stage 2.
+                setPhysicalLumaStageDebug(3)
+                checkStage("balanced", 3)
+                val balanced = renderOnce()
+                if (balanced != null) java.io.File(dir, "balanced.jpg").writeBytes(balanced)
+                java.io.File(dir, "balanced.txt").writeText(lastMasterIspStats())
                 setPhysicalLumaStageDebug(4)
                 checkStage("coarse", 4)
                 val combined = renderOnce()

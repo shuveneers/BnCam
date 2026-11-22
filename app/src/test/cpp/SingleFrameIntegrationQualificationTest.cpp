@@ -14,12 +14,13 @@ int main() {
     assert(off==input);
     const auto legacy=q::cpuReference(input,Stage::LEGACY_REFERENCE);
     const auto fine=q::cpuReference(input,Stage::GUIDED_V2);
+    const auto balanced=q::cpuReference(input,Stage::GUIDED_V2_BALANCED);
     const auto combined=q::cpuReference(input,Stage::GUIDED_V2_FINE_COARSE);
     const auto unknown=q::cpuReference(input,Stage::GUIDED_V2_CONFIDENCE,false);
     const auto proxy=q::cpuReference(input,Stage::GUIDED_V2_CONFIDENCE,true);
     const auto bogus=q::cpuReference(input,static_cast<Stage>(99));
     assert(bogus.empty());
-    for(const auto& image:{legacy,fine,combined,unknown,proxy}){
+    for(const auto& image:{legacy,fine,balanced,combined,unknown,proxy}){
         assert(image.size()==input.size());
         for(std::size_t i=0;i<image.size();++i) {
             assert(bncam::chroma::finite(image[i]));

@@ -46,6 +46,7 @@ private val sf2Modes = listOf(
     Sf2Mode(0, "OFF · chroma baseline", "Original single-frame product path.", "off.jpg"),
     Sf2Mode(1, "Legacy luminance", "Previous luminance reference.", "on.jpg"),
     Sf2Mode(2, "Guided Fine", "Fine-scale guided luminance reconstruction.", "guided.jpg"),
+    Sf2Mode(3, "Guided Fine Balanced", "Adaptive flat-noise gain and texture protection (experimental).", "balanced.jpg"),
     Sf2Mode(4, "Guided Fine + Coarse", "Adds low-frequency luminance smoothing.", "combined.jpg"),
     Sf2Mode(5, "Fine + Coarse + Confidence", "Protects supported directional details.", "confidence.jpg")
 )
@@ -77,8 +78,8 @@ private object Sf2Session {
 }
 
 private fun isQualified(report: String): Boolean =
-    report.lineSequence().count { it.startsWith("stage=") } == 6 &&
-        report.contains("testedStages=6;") && report.contains("allPassed=true") &&
+    report.lineSequence().count { it.startsWith("stage=") } == 7 &&
+        report.contains("testedStages=7;") && report.contains("allPassed=true") &&
         !report.contains("allPassed=false")
 
 private fun latestCompletedSf2Folder(parent: File, priorName: String? = null): File? =
@@ -91,7 +92,7 @@ private fun File.readTextIfExists(): String? = runCatching {
     if (isFile) readText() else null
 }.getOrNull()
 
-/** Decode a bounded preview only; a six-image 12MP grid must not exhaust heap memory. */
+/** Decode a bounded preview only; a seven-image 12MP grid must not exhaust heap memory. */
 @Composable
 private fun Sf2Photo(file: File, modifier: Modifier = Modifier, maxDimension: Int = 900) {
     val bitmap by produceState<androidx.compose.ui.graphics.ImageBitmap?>(
@@ -257,8 +258,8 @@ fun DeveloperSettingsScreen(
                 .background(sf2Card).padding(16.dp)) {
                 Text("COMPARE ALL · SAME RAW", color = sf2Accent,
                     fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                Text("Generates OFF, Legacy, Fine, Fine + Coarse, Confidence and OFF repeat " +
-                    "from one immutable RAW master. No six separate camera exposures.",
+                Text("Generates OFF, Legacy, Fine, Balanced, Fine + Coarse, Confidence and OFF repeat " +
+                    "from one immutable RAW master. No seven separate camera exposures.",
                     color = Color.LightGray, fontSize = 13.sp,
                     modifier = Modifier.padding(vertical = 10.dp))
                 Text("Current input: $activeFrameSource · " +
@@ -286,7 +287,7 @@ fun DeveloperSettingsScreen(
                                 }
                                 parent.mkdirs()
                                 ImageUtils.physicalLumaAbDirectory = parent.absolutePath
-                                // The six-render code selects every stage itself.
+                                // The seven-render code selects every stage itself.
                                 ImageUtils.setPhysicalLumaStageDebug(0)
                                 ImageUtils.setPhysicalLumaDebugEnabled(false)
                                 CameraEventBus.requestCapture("sf2_developer_compare")
@@ -298,7 +299,7 @@ fun DeveloperSettingsScreen(
                                         delay(500)
                                     }
                                     found
-                                } ?: error("Timed out waiting for the six-render set.")
+                                } ?: error("Timed out waiting for the seven-render set.")
                                 val missing = sf2GalleryFiles.filter { !File(folder, it).isFile }
                                 if (missing.isNotEmpty()) error("Missing images: " + missing.joinToString())
                                 Sf2Session.captureFolder = folder
@@ -311,7 +312,7 @@ fun DeveloperSettingsScreen(
                             }
                         }
                     }
-                ) { Text("Capture & compare all six", color = Color.Black) }
+                ) { Text("Capture & compare all seven", color = Color.Black) }
                 if (Sf2Session.running) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         CircularProgressIndicator(color = sf2Accent, modifier = Modifier.size(20.dp),
@@ -326,7 +327,7 @@ fun DeveloperSettingsScreen(
                 .background(sf2Card).padding(16.dp)) {
                 Text("GPU / CPU QUALIFICATION", color = sf2Accent,
                     fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                Text("Runs the six synthetic GPU cases and validates numerical parity. " +
+                Text("Runs the seven synthetic GPU cases and validates numerical parity. " +
                     "This does not prove photographic quality.",
                     color = Color.LightGray, fontSize = 13.sp,
                     modifier = Modifier.padding(vertical = 10.dp))
@@ -354,7 +355,7 @@ fun DeveloperSettingsScreen(
                     }) { Text("Run GPU/CPU validation", color = sf2Accent) }
                 Sf2Session.qualificationReport?.let { report ->
                     val pass = isQualified(report)
-                    Text(if (pass) "PASS · 6 GPU cases" else "FAIL · inspect report",
+                    Text(if (pass) "PASS · 7 GPU cases" else "FAIL · inspect report",
                         color = if (pass) sf2Accent else Color(0xFFFFB6A8),
                         fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 8.dp))
                     Text(report, color = Color.LightGray, fontSize = 11.sp,
@@ -373,7 +374,7 @@ fun DeveloperSettingsScreen(
                     Text("LAST COMPARISON", color = sf2Accent,
                         fontSize = 12.sp, fontWeight = FontWeight.Bold)
                     Text("Tap any thumbnail for a larger preview. " +
-                        "The six JPEG files are private until exported.",
+                        "The seven JPEG files are private until exported.",
                         color = Color.Gray, fontSize = 12.sp,
                         modifier = Modifier.padding(vertical = 10.dp))
                     sf2GalleryFiles.chunked(2).forEach { row ->
@@ -436,7 +437,7 @@ fun DeveloperSettingsScreen(
                             }
                         }
                     }, colors = ButtonDefaults.buttonColors(containerColor = sf2Accent)) {
-                        Text("Export six JPEGs to gallery", color = Color.Black)
+                        Text("Export seven JPEGs to gallery", color = Color.Black)
                     }
                     exportResult?.let { Text(it, color = Color.LightGray, fontSize = 12.sp) }
                     val qualification = File(folder, "qualification.txt").readTextIfExists()

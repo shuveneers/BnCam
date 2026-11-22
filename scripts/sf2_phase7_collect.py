@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SF2 phase-7: collect on-device GPU parity and same-RAW five-stage evidence.
+"""SF2 phase-8: collect on-device GPU parity and same-RAW six-stage evidence.
 
 Runs on Windows/macOS/Linux with Python 3 and adb in PATH. No external Python
 packages, root, image uploading, or production switches. Only debug app access.
@@ -20,7 +20,7 @@ from pathlib import Path
 PACKAGE = "com.bncam"
 CAPTURE_FILES = (
     "off.jpg", "off.txt", "on.jpg", "on.txt",
-    "guided.jpg", "guided.txt", "combined.jpg", "combined.txt",
+    "guided.jpg", "guided.txt", "balanced.jpg", "balanced.txt", "combined.jpg", "combined.txt",
     "confidence.jpg", "confidence.txt", "off_repeat.jpg", "off_repeat.txt",
     "qualification.txt",
 )
@@ -31,11 +31,11 @@ def classify_qualifier(report: str) -> dict:
     """Fail closed: absence of explicit pass is NOT success."""
     lines = report.splitlines()
     stages = [line for line in lines if line.startswith("stage=")]
-    completed = any("testedStages=6;" in line and "allPassed=true" in line
+    completed = any("testedStages=7;" in line and "allPassed=true" in line
                     for line in lines)
     failed = "allPassed=false" in report
     return {
-        "gpu_cpu_parity_pass": completed and not failed and len(stages) == 6,
+        "gpu_cpu_parity_pass": completed and not failed and len(stages) == 7,
         "device_stage_records": len(stages),
         "reported_failure": failed,
         "build_sha": next((x.split("=", 1)[1] for x in lines
@@ -65,6 +65,7 @@ def verify_capture(files: dict[str, bytes]) -> dict:
         "off.txt": ("OFF", False),
         "on.txt": ("LEGACY_REFERENCE", True),
         "guided.txt": ("GUIDED_V2_FINE_DEBUG", True),
+        "balanced.txt": ("GUIDED_V2_BALANCED_DEBUG", True),
         "combined.txt": ("GUIDED_V2_FINE_COARSE_DEBUG", True),
         "confidence.txt": ("GUIDED_V2_CONFIDENCE_DEBUG", True),
         "off_repeat.txt": ("OFF", False),
@@ -79,7 +80,7 @@ def verify_capture(files: dict[str, bytes]) -> dict:
             (";measurementStatus=GPU_MEASURED" in stats if enabled else True) and
             (";confidenceGateApplied=true" in stats if path=="confidence.txt" else True)
         )
-    expected = {"off": 0, "legacy": 1, "fine": 2, "coarse": 4,
+    expected = {"off": 0, "legacy": 1, "fine": 2, "balanced": 3, "coarse": 4,
                 "confidence": 5, "offRepeat": 0}
     observed = re.findall(r"selectedStage\.(\w+)=(\d+);expected=(\d+)", notes)
     matches = len(observed) == len(expected) and all(
@@ -91,7 +92,7 @@ def verify_capture(files: dict[str, bytes]) -> dict:
         "missing": missing,
         "jpeg_markers_valid": not bad_jpegs and all(p in files for p in IMAGE_FILES),
         "bad_jpeg_markers": bad_jpegs,
-        "six_debug_stage_checks_pass": matches,
+        "seven_debug_stage_checks_pass": matches,
         "native_stage_and_gpu_route_checks_pass": all(gpu_route_checks.values()),
         "native_route_checks_by_stage": gpu_route_checks,
         "off_repeat_jpeg_byte_identical": "offRepeatJpegBytesIdentical=true" in notes,
@@ -150,7 +151,7 @@ def main() -> int:
     parser.add_argument("--serial", default=None, help="adb device serial (optional)")
     parser.add_argument("--output", type=Path, default=Path("sf2_phase7_device_evidence.zip"))
     parser.add_argument("--capture", action="store_true",
-                        help="Opt in to camera capture + six debug RAW renders; defaults to GPU parity only")
+                        help="Opt in to camera capture + seven debug RAW renders; defaults to GPU parity only")
     parser.add_argument("--collect-latest", action="store_true",
                         help="Collect last completed same-RAW set without triggering a new capture")
     parser.add_argument("--timeout", type=int, default=180, help="Seconds to await device diagnostics")
@@ -199,7 +200,7 @@ def main() -> int:
                     pass
             time.sleep(2)
         if not folder:
-            raise RuntimeError("No complete on-device six-render RAW set found in time")
+            raise RuntimeError("No complete on-device seven-render RAW set found in time")
         capture_files: dict[str, bytes] = {}
         for name in CAPTURE_FILES:
             try:
@@ -209,8 +210,8 @@ def main() -> int:
                 pass
         capture_state = verify_capture(capture_files)
         capture_state["folder"] = folder
-        print("Six-render stage verification:",
-              capture_state["six_debug_stage_checks_pass"])
+        print("Seven-render stage verification:",
+              capture_state["seven_debug_stage_checks_pass"])
         # Do not keep a capture diagnostics flag permanently enabled.
         if args.capture:
             device.broadcast("com.bncam.SET_BENCHMARK_CONFIG",
@@ -218,13 +219,13 @@ def main() -> int:
                              "--ei", "physicalLumaStage", "0")
 
     manifest = {
-        "schema": "sf2_phase7_device_evidence_v1",
+        "schema": "sf2_phase8_device_evidence_v1",
         "collected_utc": datetime.now(timezone.utc).isoformat(),
         "package": PACKAGE,
         "native_synthetic_gpu_cpu_qualification": parity,
         "same_raw_qualification": capture_state,
         "claims": {
-            "gpu_cpu_parity": "Valid only if report says allPassed=true for all six tested stage/proxy cases",
+            "gpu_cpu_parity": "Valid only if report says allPassed=true for all seven tested stage/proxy cases",
             "real_scene_quality": "NOT_ESTABLISHED_BY_PARITY_OR_JPEG_MARKERS",
             "phone_latency_thermal": "NOT_ESTABLISHED_BY_SYNTHETIC_FIXTURE",
             "off_jpeg_bytes": "Byte identity is informational; not equivalent to RGB pixel proof",
@@ -242,7 +243,7 @@ def main() -> int:
         return 2
     if capture_state and not (capture_state["all_capture_files_present"] and
                               capture_state["jpeg_markers_valid"] and
-                              capture_state["six_debug_stage_checks_pass"] and
+                              capture_state["seven_debug_stage_checks_pass"] and
                               capture_state["native_stage_and_gpu_route_checks_pass"]):
         print("Same-RAW qualification INCOMPLETE. Inspect ZIP.", file=sys.stderr)
         return 3
