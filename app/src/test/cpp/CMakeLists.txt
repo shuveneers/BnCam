@@ -24,7 +24,7 @@ foreach(test IN ITEMS AdaptiveNoiseAuthorityTest PhysicalNoisePropagationTest Ph
         DemosaicNoiseCorrelationTest SingleFrameDemosaicContextTest
         RawPoissonGaussianEstimatorTest SingleFrameGuidedLumaTest SingleFrameGuidedCoarseTest
         SingleFrameResidualConfidenceTest SingleFrameResidualCandidateQualityTest
-        SingleFrameIntegrationQualificationTest SingleFrameGuidedBalancedTest
+        SingleFrameIntegrationQualificationTest SingleFrameGuidedBalancedTest SingleFrameBalancedDefaultContractTest
         PhysicalChromaDenoiseTest PhysicalLumaDenoiseTest PhysicalNoiseNativeContractTest
         RawCfaLevelMappingTest)
     add_executable(${test} ${test}.cpp)
