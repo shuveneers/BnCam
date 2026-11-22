@@ -1,0 +1,95 @@
+name: SF2-D08 Balanced Fine — native, Vulkan and Android APK
+on:
+  push:
+    branches: [deliverables/sf2-phase8-balanced]
+  workflow_dispatch:
+permissions:
+  contents: read
+
+jobs:
+  qualify-and-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Run untouched phase-7.1 native suite from its frozen SHA
+        run: |
+          git worktree add --detach "$RUNNER_TEMP/frozen-sf2-f71" 445f2694260e6c83a9b71496ba49c20703439b55
+          cmake -S "$RUNNER_TEMP/frozen-sf2-f71/app/src/test/cpp" -B "$RUNNER_TEMP/build-frozen-sf2-f71" -DCMAKE_BUILD_TYPE=Release -DSF2_ISOLATED_PHASE7=ON
+          cmake --build "$RUNNER_TEMP/build-frozen-sf2-f71" --parallel 2
+          ctest --test-dir "$RUNNER_TEMP/build-frozen-sf2-f71" --output-on-failure
+      - name: Compile and run current D08 CPU quality and source tests
+        run: |
+          cmake -S app/src/test/cpp -B build-sf2-d08 -DCMAKE_BUILD_TYPE=Release -DSF2_ISOLATED_PHASE8=ON
+          cmake --build build-sf2-d08 --parallel 2
+          ctest --test-dir build-sf2-d08 --output-on-failure
+          ctest --test-dir build-sf2-d08 --output-on-failure -R SingleFrameGuidedBalancedTest -V
+      - name: Run fail-closed ADB collector and developer UI offline contracts
+        run: |
+          python3 -m unittest discover -s tests -p 'test_sf2_phase7_collect.py' -v
+          python3 -m unittest discover -s tests -p 'test_sf2_phase71_ui.py' -v
+          python3 scripts/sf2_phase7_collect.py --help
+      - name: Compile actual resident Vulkan shader to SPIR-V
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq glslc
+          glslc --target-env=vulkan1.1 -O -I app/src/main/cpp/vulkan/shaders -o /tmp/sf2-d08-resident.spv app/src/main/cpp/vulkan/shaders/spectra_demosaic_resident.comp
+          test -s /tmp/sf2-d08-resident.spv
+      - name: Configure Android SDK for full debug build
+        env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
+          ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+        run: |
+          set -euo pipefail
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          test -x "$SDKMANAGER"
+          printf 'sdk.dir=%s\n' "$ANDROID_HOME" > local.properties
+          "$SDKMANAGER" --install "platforms;android-36" "build-tools;36.0.0" "cmake;3.22.1" "ndk;27.2.12479018"
+      - name: Build actual arm64 Android debug APK
+        run: |
+          chmod +x ./gradlew
+          ./gradlew :app:assembleDebug --no-daemon --max-workers=2 --stacktrace
+      - name: Verify built APK, native library and qualification JNI
+        run: |
+          set -euo pipefail
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          test -s "$APK"
+          unzip -t "$APK" > /tmp/sf2_d08_zipcheck.txt
+          unzip -l "$APK" | grep -F 'lib/arm64-v8a/libbncam.so'
+          unzip -p "$APK" lib/arm64-v8a/libbncam.so > /tmp/sf2-d08-libbncam.so
+          nm -D /tmp/sf2-d08-libbncam.so | grep -F 'Java_com_bncam_core_engine_ImageUtils_validateSf2IntegrationNative'
+          nm -D /tmp/sf2-d08-libbncam.so | grep -F 'Java_com_bncam_core_engine_ImageUtils_getPhysicalLumaStageDebug'
+          strings /tmp/sf2-d08-libbncam.so | grep -F 'GUIDED_V2_BALANCED_DEBUG'
+          sha256sum "$APK" | tee BnCam_SF2_D08_APK_SHA256.txt
+      - name: Package strictly delta changes relative to phase 7.1
+        run: |
+          set -euo pipefail
+          BASE=445f2694260e6c83a9b71496ba49c20703439b55
+          mkdir -p sf2_d08_delta_files
+          while IFS= read -r path; do
+            mkdir -p "sf2_d08_delta_files/$(dirname "$path")"
+            cp -- "$path" "sf2_d08_delta_files/$path"
+          done < <(git diff --name-only --diff-filter=ACMR "$BASE" HEAD)
+          git diff --binary "$BASE" HEAD > BnCam_SF2_D08_From_F7_1.patch
+          zip -qr BnCam_SF2_D08_Delta.zip sf2_d08_delta_files BnCam_SF2_D08_From_F7_1.patch BnCam_SF2_D08_APK_SHA256.txt
+          test -s BnCam_SF2_D08_Delta.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BnCam_SF2_D08_Balanced_Debug_APK
+          path: |
+            app/build/outputs/apk/debug/app-debug.apk
+            BnCam_SF2_D08_APK_SHA256.txt
+          retention-days: 90
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BnCam_SF2_D08_Delta
+          path: BnCam_SF2_D08_Delta.zip
+          retention-days: 90
+          if-no-files-found: error
