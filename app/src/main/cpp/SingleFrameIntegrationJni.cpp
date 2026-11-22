@@ -31,10 +31,11 @@ Java_com_bncam_core_engine_ImageUtils_validateSf2IntegrationNative(JNIEnv* env,j
         float maxDifference=0.f;
         float maxOpponentError=0.f;
         int stageCount=0;
-        const std::array<std::pair<Stage,bool>,6> matrix{{
+        const std::array<std::pair<Stage,bool>,7> matrix{{
             {Stage::OFF,false},
             {Stage::LEGACY_REFERENCE,false},
             {Stage::GUIDED_V2,false},
+            {Stage::GUIDED_V2_BALANCED,false},
             {Stage::GUIDED_V2_FINE_COARSE,false},
             {Stage::GUIDED_V2_CONFIDENCE,false},
             {Stage::GUIDED_V2_CONFIDENCE,true}

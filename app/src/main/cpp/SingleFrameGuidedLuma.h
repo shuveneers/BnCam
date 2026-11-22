@@ -18,7 +18,7 @@ struct GuidedResult {
 };
 template<class Read,class Shape>
 GuidedResult guidedFine(int x,int y,bncam::luma::Model m,Pixel postChroma,
-                        Read read,Shape shape,bool gate=true) {
+                        Read read,Shape shape,bool gate=true,bool balanced=false) {
     if(!m.valid()||!bncam::chroma::finite(postChroma))return {postChroma};
     const auto centreRgb=read(x,y);
     if(!bncam::chroma::finite(centreRgb))return {postChroma};
@@ -66,7 +66,12 @@ GuidedResult guidedFine(int x,int y,bncam::luma::Model m,Pixel postChroma,
         structure=std::max(structure,evidence);
     }
     const float gateFactor=gate?1.f-.98f*structure:1.f;
-    const float authority=std::clamp(.78f*physical*wiener*gateFactor,0.f,.78f);
+    // SF2-D08: conditional, dimensionless Balanced gain on the existing correction.
+    // No extra pass, no new sigma estimate, and the absolute .78 cap is preserved.
+    const float textureRisk=balanced ? std::max(structure,
+        std::clamp(sceneVariance/(sceneVariance+expected+1.e-12f),0.f,1.f)) : 0.f;
+    const float balancedGain=balanced ? 1.18f-0.30f*textureRisk : 1.f;
+    const float authority=std::clamp(.78f*physical*wiener*gateFactor*balancedGain,0.f,.78f);
     const float correction=authority*(mean-centre);
     const Pixel result{postChroma[0]+correction,postChroma[1]+correction,
                        postChroma[2]+correction};

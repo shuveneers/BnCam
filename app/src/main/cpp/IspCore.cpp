@@ -6949,6 +6949,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
     const auto singleFrameLumaStage = bncam::luma::selectedStage.load(std::memory_order_relaxed);
     if (!bncam::luma::legacyAuthorized(singleFrameLumaStage) &&
         singleFrameLumaStage != bncam::luma::Stage::GUIDED_V2 &&
+        singleFrameLumaStage != bncam::luma::Stage::GUIDED_V2_BALANCED &&
         singleFrameLumaStage != bncam::luma::Stage::GUIDED_V2_FINE_COARSE &&
         singleFrameLumaStage != bncam::luma::Stage::GUIDED_V2_CONFIDENCE) baselinePhysicalLuma = {};
     std::array<float,9> chromaColorTransform{};
@@ -7213,7 +7214,8 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                     auto output=singleFrameLumaStage==bncam::luma::Stage::LEGACY_REFERENCE
                             ? bncam::luma::filter(x,y,baselinePhysicalLuma,post,read,shape).pixel
                             : bncam::sf2::guidedFine(x,y,baselinePhysicalLuma,
-                                    post,read,shape,true).pixel;
+                                    post,read,shape,true,
+                                     singleFrameLumaStage==bncam::luma::Stage::GUIDED_V2_BALANCED).pixel;
                     if(combined && coarse.valid) {
                         const float coarseDelta=bncam::sf2::coarseAtPixel(coarse,x,y);
                         if(gated) {
@@ -9601,7 +9603,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; spectraResidualAlignmentConfidence=" << residualNoiseState.alignmentConfidence
             << formatPropagationStateFields("spectraPreDemosaic", residualNoiseState.preDemosaic)
             << "; baselinePhysicalLuma={enabled=" << (baselinePhysicalLuma.valid()?"true":"false")
-            << ";stage=" << (singleFrameLumaStage==bncam::luma::Stage::OFF?"OFF":singleFrameLumaStage==bncam::luma::Stage::LEGACY_REFERENCE?"LEGACY_REFERENCE":(singleFrameLumaStage==bncam::luma::Stage::GUIDED_V2_CONFIDENCE?"GUIDED_V2_CONFIDENCE_DEBUG":singleFrameLumaStage==bncam::luma::Stage::GUIDED_V2_FINE_COARSE?"GUIDED_V2_FINE_COARSE_DEBUG":"GUIDED_V2_FINE_DEBUG"))
+            << ";stage=" << (singleFrameLumaStage==bncam::luma::Stage::OFF?"OFF":singleFrameLumaStage==bncam::luma::Stage::LEGACY_REFERENCE?"LEGACY_REFERENCE":(singleFrameLumaStage==bncam::luma::Stage::GUIDED_V2_CONFIDENCE?"GUIDED_V2_CONFIDENCE_DEBUG":singleFrameLumaStage==bncam::luma::Stage::GUIDED_V2_FINE_COARSE?"GUIDED_V2_FINE_COARSE_DEBUG":singleFrameLumaStage==bncam::luma::Stage::GUIDED_V2_BALANCED?"GUIDED_V2_BALANCED_DEBUG":"GUIDED_V2_FINE_DEBUG"))
              << ";spectraIndependent=true;inputDomain=POST_PHYSICAL_CHROMA_LINEAR_RGB;noiseModel=PHYSICAL_SO_PROPAGATED"
             << ";status=" << (baselinePhysicalLuma.valid()?"PHYSICAL_LUMA_ACTIVE":
                 (singleFrameLumaStage==bncam::luma::Stage::OFF?"PHYSICAL_LUMA_STAGE_OFF":"PHYSICAL_LUMA_BYPASS_NO_VALID_NOISE_MODEL"))

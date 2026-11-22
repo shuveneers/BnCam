@@ -34,6 +34,7 @@ inline std::vector<Pixel> fixture() {
 inline bncam::luma::Model noise() { return {.000064f,.9f}; }
 inline bool isEnabledStage(bncam::luma::Stage stage) {
     return stage==bncam::luma::Stage::GUIDED_V2 ||
+           stage==bncam::luma::Stage::GUIDED_V2_BALANCED ||
            stage==bncam::luma::Stage::GUIDED_V2_FINE_COARSE ||
            stage==bncam::luma::Stage::GUIDED_V2_CONFIDENCE;
 }
@@ -61,7 +62,8 @@ inline std::vector<Pixel> cpuReference(const std::vector<Pixel>& input,
     for(int y=0;y<kHeight;++y)for(int x=0;x<kWidth;++x) {
         const auto i=y*kWidth+x;
         const Pixel post=input[i];
-        const auto fine=bncam::sf2::guidedFine(x,y,model,post,read,shape,true);
+        const auto fine=bncam::sf2::guidedFine(x,y,model,post,read,shape,true,
+                            stage==bncam::luma::Stage::GUIDED_V2_BALANCED);
         Pixel p=stage==bncam::luma::Stage::LEGACY_REFERENCE
                 ? bncam::luma::filter(x,y,model,post,read,shape).pixel
                 : fine.pixel;

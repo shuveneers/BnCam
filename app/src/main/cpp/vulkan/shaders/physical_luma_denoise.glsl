@@ -50,7 +50,7 @@ vec3 physicalLegacyLumaDenoise(ivec2 xy,vec3 postChroma,out vec3 telemetry) {
 
 // SF2-D04: CPU oracle SingleFrameGuidedLuma.h, stage 2; immutable
 // demosaic evidence, bounded additive Y, original post-chroma opponents.
-vec3 physicalGuidedFine(ivec2 xy,vec3 postChroma,out vec3 telemetry,bool gate) {
+vec3 physicalGuidedFine(ivec2 xy,vec3 postChroma,out vec3 telemetry,bool gate,bool balanced) {
     telemetry=vec3(0);
     if(pc.cfaEvidence1.y<=0.0||!physicalChromaFinite(postChroma))return postChroma;
     float centre=opponentAtRgb(physicalChromaRead(xy)).x;
@@ -92,7 +92,11 @@ vec3 physicalGuidedFine(ivec2 xy,vec3 postChroma,out vec3 telemetry,bool gate) {
             (residualMean*residualMean+meanVariance+1.e-12);
         structure=max(structure,evidence);
     }
-    float authority=clamp(.78*physical*wiener*(gate?1.0-.98*structure:1.0),0.0,.78);
+    // SF2-D08 mirrors the CPU gain without altering the physical variance.
+    float textureRisk=balanced ? max(structure,
+        clamp(sceneVariance/(sceneVariance+expected+1.e-12),0.0,1.0)) : 0.0;
+    float balancedGain=balanced ? 1.18-0.30*textureRisk : 1.0;
+    float authority=clamp(.78*physical*wiener*(gate?1.0-.98*structure:1.0)*balancedGain,0.0,.78);
     float correction=authority*(mean-centre);
     vec3 result=postChroma+vec3(correction);
     if(!physicalChromaFinite(result))return postChroma;
@@ -106,10 +110,11 @@ vec3 physicalLumaDenoise(ivec2 xy,vec3 postChroma,out vec3 telemetry) {
     uint stage=(pc.residualStride>>2u)&7u;
     telemetry=vec3(0);
     if(stage==1u)return physicalLegacyLumaDenoise(xy,postChroma,telemetry);
-    if(stage==2u)return physicalGuidedFine(xy,postChroma,telemetry,true);
+    if(stage==2u)return physicalGuidedFine(xy,postChroma,telemetry,true,false);
+    if(stage==3u)return physicalGuidedFine(xy,postChroma,telemetry,true,true);
     if(stage==4u) {
         vec3 fineTelemetry;
-        vec3 fine=physicalGuidedFine(xy,postChroma,fineTelemetry,true);
+        vec3 fine=physicalGuidedFine(xy,postChroma,fineTelemetry,true,false);
         float coarse=coarseCorrectionAt(xy);
         vec3 combined=fine+vec3(coarse);
         if(!physicalChromaFinite(combined))return fine;
@@ -121,7 +126,7 @@ vec3 physicalLumaDenoise(ivec2 xy,vec3 postChroma,out vec3 telemetry) {
     // chroma modification, sharpening or second variance scale.
     if(stage==5u) {
         vec3 fineTelemetry;
-        vec3 fine=physicalGuidedFine(xy,postChroma,fineTelemetry,true);
+        vec3 fine=physicalGuidedFine(xy,postChroma,fineTelemetry,true,false);
         float fineDelta=fine.r-postChroma.r;
         float coarseDelta=coarseCorrectionAt(xy);
         Sf2ConfidenceEvidence evidence=sf2ResidualConfidenceAt(xy,fineDelta,coarseDelta);

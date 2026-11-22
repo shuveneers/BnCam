@@ -4762,6 +4762,7 @@ Java_com_bncam_core_engine_ImageUtils_setPhysicalLumaStageDebug(JNIEnv*,jobject,
 #ifndef NDEBUG
     const auto selected = stage==1 ? bncam::luma::Stage::LEGACY_REFERENCE :
             stage==2 ? bncam::luma::Stage::GUIDED_V2 :
+            stage==3 ? bncam::luma::Stage::GUIDED_V2_BALANCED :
             stage==4 ? bncam::luma::Stage::GUIDED_V2_FINE_COARSE :
             stage==5 ? bncam::luma::Stage::GUIDED_V2_CONFIDENCE : bncam::luma::Stage::OFF;
     bncam::luma::selectedStage.store(selected, std::memory_order_relaxed);
