@@ -40,7 +40,8 @@ endforeach()
 option(SF2_ISOLATED_PHASE6 "Run phase-6 current source gates; archived phase-5 source gates are tested separately in CI" OFF)
 option(SF2_ISOLATED_PHASE7 "Run current phase-7 source contracts; frozen phases are built separately in CI" OFF)
 option(SF2_ISOLATED_PHASE8 "Run phase-8 source contracts against frozen phase-7 UI base" OFF)
-if(NOT SF2_ISOLATED_PHASE6 AND NOT SF2_ISOLATED_PHASE7 AND NOT SF2_ISOLATED_PHASE8)
+option(SF2_ISOLATED_PHASE9 "Run Balanced product promotion source contracts" OFF)
+if(NOT SF2_ISOLATED_PHASE6 AND NOT SF2_ISOLATED_PHASE7 AND NOT SF2_ISOLATED_PHASE8 AND NOT SF2_ISOLATED_PHASE9)
 add_test(NAME PhysicalModelIsolationSourceTest COMMAND "${Python3_EXECUTABLE}"
     "${CMAKE_CURRENT_SOURCE_DIR}/PhysicalModelIsolationSourceTest.py")
 add_test(NAME SingleFrameNoiseContextSourceTest COMMAND "${Python3_EXECUTABLE}"
@@ -58,6 +59,9 @@ add_test(NAME Phase4GuidedOptInSourceTest COMMAND "${Python3_EXECUTABLE}"
 add_test(NAME Phase5CoarseSourceGuardTest COMMAND "${Python3_EXECUTABLE}"
     "${CMAKE_CURRENT_SOURCE_DIR}/Phase5CoarseSourceGuardTest.py")
 
+elseif(SF2_ISOLATED_PHASE9)
+    add_test(NAME Phase9DefaultSourceTest COMMAND "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/Phase9DefaultSourceTest.py")
 elseif(SF2_ISOLATED_PHASE8)
     add_test(NAME Phase8BalancedSourceTest COMMAND "${Python3_EXECUTABLE}"
         "${CMAKE_CURRENT_SOURCE_DIR}/Phase8BalancedSourceTest.py")

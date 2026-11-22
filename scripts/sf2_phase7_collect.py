@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SF2 phase-8: collect on-device GPU parity and same-RAW six-stage evidence.
+"""SF2 phase-9: collect on-device GPU parity and same-RAW OFF/Balanced evidence.
 
 Runs on Windows/macOS/Linux with Python 3 and adb in PATH. No external Python
 packages, root, image uploading, or production switches. Only debug app access.
@@ -19,10 +19,8 @@ from pathlib import Path
 
 PACKAGE = "com.bncam"
 CAPTURE_FILES = (
-    "off.jpg", "off.txt", "on.jpg", "on.txt",
-    "guided.jpg", "guided.txt", "balanced.jpg", "balanced.txt", "combined.jpg", "combined.txt",
-    "confidence.jpg", "confidence.txt", "off_repeat.jpg", "off_repeat.txt",
-    "qualification.txt",
+    "off.jpg", "off.txt", "balanced.jpg", "balanced.txt",
+    "off_repeat.jpg", "off_repeat.txt", "qualification.txt",
 )
 IMAGE_FILES = tuple(name for name in CAPTURE_FILES if name.endswith(".jpg"))
 
@@ -58,16 +56,12 @@ def verify_capture(files: dict[str, bytes]) -> dict:
     bad_jpegs = [p for p in IMAGE_FILES if p in files and
                  not (files[p].startswith(b"\xff\xd8") and files[p].endswith(b"\xff\xd9"))]
     notes = files.get("qualification.txt", b"").decode("utf-8", errors="replace")
-    # The five filenames are NOT sufficient evidence that the requested
+    # The filenames alone are NOT sufficient evidence that the requested
     # native stage really executed on the resident GPU. Inspect each render's
     # own native stats; never classify CPU fallback as a GPU-qualified photo.
     expected_telemetry = {
         "off.txt": ("OFF", False),
-        "on.txt": ("LEGACY_REFERENCE", True),
-        "guided.txt": ("GUIDED_V2_FINE_DEBUG", True),
-        "balanced.txt": ("GUIDED_V2_BALANCED_DEBUG", True),
-        "combined.txt": ("GUIDED_V2_FINE_COARSE_DEBUG", True),
-        "confidence.txt": ("GUIDED_V2_CONFIDENCE_DEBUG", True),
+        "balanced.txt": ("GUIDED_V2_BALANCED_DEFAULT", True),
         "off_repeat.txt": ("OFF", False),
     }
     gpu_route_checks = {}
@@ -77,11 +71,9 @@ def verify_capture(files: dict[str, bytes]) -> dict:
             f";stage={stage}" in stats and
             (";gpuExecuted=true" in stats if enabled else
              ";gpuExecuted=false" in stats) and
-            (";measurementStatus=GPU_MEASURED" in stats if enabled else True) and
-            (";confidenceGateApplied=true" in stats if path=="confidence.txt" else True)
+            (";measurementStatus=GPU_MEASURED" in stats if enabled else True)
         )
-    expected = {"off": 0, "legacy": 1, "fine": 2, "balanced": 3, "coarse": 4,
-                "confidence": 5, "offRepeat": 0}
+    expected = {"off": 0, "balanced": 3, "offRepeat": 0}
     observed = re.findall(r"selectedStage\.(\w+)=(\d+);expected=(\d+)", notes)
     matches = len(observed) == len(expected) and all(
         name in expected and int(actual) == expected[name] == int(requested)
@@ -92,7 +84,7 @@ def verify_capture(files: dict[str, bytes]) -> dict:
         "missing": missing,
         "jpeg_markers_valid": not bad_jpegs and all(p in files for p in IMAGE_FILES),
         "bad_jpeg_markers": bad_jpegs,
-        "seven_debug_stage_checks_pass": matches,
+        "three_debug_stage_checks_pass": matches,
         "native_stage_and_gpu_route_checks_pass": all(gpu_route_checks.values()),
         "native_route_checks_by_stage": gpu_route_checks,
         "off_repeat_jpeg_byte_identical": "offRepeatJpegBytesIdentical=true" in notes,
@@ -149,9 +141,9 @@ def wait_file(device: Adb, relative: str, max_seconds: int) -> bytes:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--serial", default=None, help="adb device serial (optional)")
-    parser.add_argument("--output", type=Path, default=Path("sf2_phase7_device_evidence.zip"))
+    parser.add_argument("--output", type=Path, default=Path("sf2_phase9_device_evidence.zip"))
     parser.add_argument("--capture", action="store_true",
-                        help="Opt in to camera capture + seven debug RAW renders; defaults to GPU parity only")
+                        help="Opt in to camera capture + three same-RAW QA renders; defaults to GPU parity only")
     parser.add_argument("--collect-latest", action="store_true",
                         help="Collect last completed same-RAW set without triggering a new capture")
     parser.add_argument("--timeout", type=int, default=180, help="Seconds to await device diagnostics")
@@ -184,7 +176,7 @@ def main() -> int:
         if args.capture:
             device.broadcast("com.bncam.SET_BENCHMARK_CONFIG",
                              "--ez", "physicalLumaAb", "true",
-                             "--ei", "physicalLumaStage", "0")
+                             "--ez", "clearPhysicalLumaOverride", "true")
             device.broadcast("com.bncam.TRIGGER_SF2_CAPTURE")
         deadline = time.monotonic() + args.timeout
         folder = None
@@ -200,7 +192,7 @@ def main() -> int:
                     pass
             time.sleep(2)
         if not folder:
-            raise RuntimeError("No complete on-device seven-render RAW set found in time")
+            raise RuntimeError("No complete on-device three-render RAW set found in time")
         capture_files: dict[str, bytes] = {}
         for name in CAPTURE_FILES:
             try:
@@ -210,16 +202,16 @@ def main() -> int:
                 pass
         capture_state = verify_capture(capture_files)
         capture_state["folder"] = folder
-        print("Seven-render stage verification:",
-              capture_state["seven_debug_stage_checks_pass"])
+        print("Three-render stage verification:",
+              capture_state["three_debug_stage_checks_pass"])
         # Do not keep a capture diagnostics flag permanently enabled.
         if args.capture:
             device.broadcast("com.bncam.SET_BENCHMARK_CONFIG",
                              "--ez", "physicalLumaAb", "false",
-                             "--ei", "physicalLumaStage", "0")
+                             "--ez", "clearPhysicalLumaOverride", "true")
 
     manifest = {
-        "schema": "sf2_phase8_device_evidence_v1",
+        "schema": "sf2_phase9_device_evidence_v1",
         "collected_utc": datetime.now(timezone.utc).isoformat(),
         "package": PACKAGE,
         "native_synthetic_gpu_cpu_qualification": parity,
@@ -235,7 +227,7 @@ def main() -> int:
     with zipfile.ZipFile(args.output, "w", zipfile.ZIP_DEFLATED) as bundle:
         for name, data in files.items():
             bundle.writestr(name, data)
-        bundle.writestr("sf2_phase7_manifest.json",
+        bundle.writestr("sf2_phase9_manifest.json",
                         json.dumps(manifest, indent=2, ensure_ascii=False))
     print(f"Evidence ZIP: {args.output.resolve()}")
     if not parity["gpu_cpu_parity_pass"]:
@@ -243,7 +235,7 @@ def main() -> int:
         return 2
     if capture_state and not (capture_state["all_capture_files_present"] and
                               capture_state["jpeg_markers_valid"] and
-                              capture_state["seven_debug_stage_checks_pass"] and
+                              capture_state["three_debug_stage_checks_pass"] and
                               capture_state["native_stage_and_gpu_route_checks_pass"]):
         print("Same-RAW qualification INCOMPLETE. Inspect ZIP.", file=sys.stderr)
         return 3
