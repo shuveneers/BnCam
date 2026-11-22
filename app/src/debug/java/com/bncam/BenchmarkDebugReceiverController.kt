@@ -9,6 +9,7 @@ import androidx.lifecycle.lifecycleScope
 import com.bncam.core.capture.OutputPolicy
 import com.bncam.core.debug.BenchmarkWriter
 import com.bncam.core.debug.AfGroundTruthTrace
+import com.bncam.core.debug.Sf2PerformanceReplay
 import com.bncam.core.engine.CaptureStrategy
 import com.bncam.core.quality.DemosaicMode
 import com.bncam.data.settings.ProfileIspKeys
@@ -169,6 +170,14 @@ object BenchmarkDebugReceiverController {
                         }
                     }
                     ACTION_TRIGGER_SF2_CAPTURE -> {
+                        intent.getStringExtra("performanceId")?.let { id ->
+                            val runs = intent.getIntExtra("runs", 10)
+                            if (!id.matches(Regex("[A-Za-z0-9_-]{1,64}")) || runs !in 10..20) return
+                            val directory = java.io.File(activity.filesDir, "sf2_performance/$id")
+                            if (!directory.mkdirs()) return
+                            val power = activity.getSystemService(android.os.PowerManager::class.java)
+                            Sf2PerformanceReplay.request(Sf2PerformanceReplay.Request(id, directory, runs, power))
+                        }
                         activity.lifecycleScope.launch {
                             CameraEventBus.requestCapture("sf2_qualification")
                         }

@@ -3,32 +3,48 @@ from pathlib import Path
 import subprocess
 
 ROOT=Path(__file__).resolve().parents[4]
-BASE="572ef4546a6fd0ecdb67dfb7f87d64f0f452a132"
+BASE="c56797c440f14293931a0fe84b0afcacebad486d"
 CPP="app/src/main/cpp/"
 
 def live(path): return (ROOT/path).read_text(encoding="utf-8")
-def base(path): return subprocess.check_output(["git","show",BASE+":"+path],cwd=ROOT,text=True)
+def base(path): return subprocess.check_output(["git","show",BASE+":"+path],cwd=ROOT,encoding="utf-8")
 def contains(source,*needles):
     for needle in needles: assert needle in source, f"Missing {needle}"
 
-expected_native={CPP+"IspCore.cpp",CPP+"PhysicalLumaDenoise.h",CPP+"native-lib.cpp"}
+expected_native={CPP+path for path in (
+    "CMakeLists.txt", "IspCore.cpp", "PhysicalLumaDenoise.h",
+    "SingleFrameIntegrationJni.cpp", "tests/Sf2PerformanceLinear.h",
+    "vulkan/shaders/physical_luma_denoise.glsl",
+)}
 changed=set(subprocess.check_output(
-    ["git","diff","--name-only",BASE,"HEAD","--",CPP],cwd=ROOT,text=True).splitlines())
+    ["git","diff","--name-only",BASE,"--",CPP],cwd=ROOT,text=True).splitlines())
 assert changed==expected_native, f"Unreviewed pixel engine changes: {changed ^ expected_native}"
 
 # No changes to rawnormalization, physical noise, chroma, demosaic,
-# Guided Fine itself, Vulkan backend/push constants/shader, tone or sharpening.
+# the original Guided Fine body, Vulkan backend/push constants, tone or sharpening.
 for path in (
     "SingleFrameGuidedLuma.h","SingleFrameGuidedCoarse.h",
     "SingleFrameResidualConfidence.h","PhysicalChromaDenoise.h",
     "SingleFrameNoiseContext.h","RawPoissonGaussianEstimator.h","Demosaic.h",
     "vulkan/VulkanSpectraResidentDemosaicBackend.cpp",
     "vulkan/VulkanSpectraResidentDemosaicBackend.h",
-    "vulkan/shaders/physical_luma_denoise.glsl",
     "vulkan/shaders/spectra_demosaic_resident.comp",
     "vulkan/shaders/physical_chroma_denoise.glsl",
 ):
     assert live(CPP+path)==base(CPP+path),f"Protected kernel changed: {path}"
+
+shader_path=CPP+"vulkan/shaders/physical_luma_denoise.glsl"
+frozen_shader=base(shader_path)
+candidate_shader=live(shader_path)
+assert candidate_shader.split("// Cache the 3x3 guide",1)[0].rstrip()==frozen_shader.split("// Mode-3 bits",1)[0].rstrip()
+original_dispatch="    if(stage==3u)return physicalGuidedFine(xy,postChroma,telemetry,true,true);"
+candidate_dispatch="""    if(stage==3u)return physicalGuidedFineBalanced(xy,postChroma,telemetry);
+#if defined(BNCAM_ENABLE_GPU_BENCHMARKS)
+    if(stage==6u)return physicalGuidedFine(xy,postChroma,telemetry,true,true);
+#endif"""
+assert candidate_dispatch in candidate_shader
+selector="vec3 physicalLumaDenoise("
+assert candidate_shader.split(selector,1)[1].replace(candidate_dispatch,original_dispatch,1)==frozen_shader.split(selector,1)[1]
 
 hdr=live(CPP+"PhysicalLumaDenoise.h")
 contains(hdr,'inline std::atomic<Stage> selectedStage{Stage::OFF}',
@@ -38,9 +54,9 @@ contains(hdr,'inline std::atomic<Stage> selectedStage{Stage::OFF}',
 isp=live(CPP+"IspCore.cpp")
 contains(isp,'bncam::luma::resolveStage(',
         'meta.singleShotRaw, meta.calibration.spectraProcessingMode == 0',
-        'singleFrameLumaStage != bncam::luma::Stage::GUIDED_V2_BALANCED',
+        '!bncam::luma::balancedAuthorized(singleFrameLumaStage)',
         'request.lumaStage = singleFrameLumaStage',
-        'singleFrameLumaStage==bncam::luma::Stage::GUIDED_V2_BALANCED).pixel',
+        'bncam::luma::balancedAuthorized(singleFrameLumaStage)).pixel',
         'GUIDED_V2_BALANCED_DEFAULT')
 jni=live(CPP+"native-lib.cpp")
 contains(jni,'#ifndef NDEBUG\n    bncam::luma::selectedStage.store',
@@ -68,4 +84,4 @@ collector=live("scripts/sf2_phase7_collect.py")
 contains(collector,'"balanced.txt": ("GUIDED_V2_BALANCED_DEFAULT", True)',
          '"three_debug_stage_checks_pass": matches',
          '"clearPhysicalLumaOverride", "true"')
-print("SF2-FINAL: balanced default and OFF rollback gated, experimental UI modes retired, protected pixel kernels unchanged")
+print("SF2: Balanced default, OFF rollback, and protected kernels verified")

@@ -57,6 +57,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include "tests/Sf2PerformanceLinear.h"
 #include <mutex>
 #include <initializer_list>
 #include <limits>
@@ -6952,7 +6953,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             meta.singleShotRaw, meta.calibration.spectraProcessingMode == 0);
     if (!bncam::luma::legacyAuthorized(singleFrameLumaStage) &&
         singleFrameLumaStage != bncam::luma::Stage::GUIDED_V2 &&
-        singleFrameLumaStage != bncam::luma::Stage::GUIDED_V2_BALANCED &&
+        !bncam::luma::balancedAuthorized(singleFrameLumaStage) &&
         singleFrameLumaStage != bncam::luma::Stage::GUIDED_V2_FINE_COARSE &&
         singleFrameLumaStage != bncam::luma::Stage::GUIDED_V2_CONFIDENCE) baselinePhysicalLuma = {};
     std::array<float,9> chromaColorTransform{};
@@ -7097,6 +7098,12 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         // 8H-J: do not materialize the ~150 MB post-CCM RGB on the CPU. The resident
         // scene observer consumes this generation directly and only returns compact samples.
         request.deferFullReadback = true;
+#ifndef NDEBUG
+        if (bncam::luma::benchmarkReadLinear) {
+            request.deferFullReadback = false;
+            request.physicalChromaValidationOnly = true;
+        }
+#endif
         request.wbRgb = {wbRgb[0], wbRgb[1], wbRgb[2]};
         request.preWbCloudCorrectionReady = false;
         request.baselinePhysicalChroma = baselinePhysicalChroma;
@@ -7137,6 +7144,10 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             vulkanColorTransform.residentColorGeneration != 0u;
     bool cpuColorTransformApplied = false;
     if (vulkanColorTransform.success) {
+#ifndef NDEBUG
+        if (bncam::luma::benchmarkReadLinear && vulkanColorTransform.baselinePhysicalLumaApplied)
+            bncam::luma::recordBenchmarkLinear(singleFrameLumaStage, vulkanColorTransform.outputRgb);
+#endif
         const double total = static_cast<double>(expectedColorPixels);
         rawRSum = vulkanColorTransform.rawMean[0] * total;
         rawGSum = vulkanColorTransform.rawMean[1] * total;
@@ -7218,7 +7229,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
                             ? bncam::luma::filter(x,y,baselinePhysicalLuma,post,read,shape).pixel
                             : bncam::sf2::guidedFine(x,y,baselinePhysicalLuma,
                                     post,read,shape,true,
-                                     singleFrameLumaStage==bncam::luma::Stage::GUIDED_V2_BALANCED).pixel;
+                                    bncam::luma::balancedAuthorized(singleFrameLumaStage)).pixel;
                     if(combined && coarse.valid) {
                         const float coarseDelta=bncam::sf2::coarseAtPixel(coarse,x,y);
                         if(gated) {
@@ -9606,7 +9617,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; spectraResidualAlignmentConfidence=" << residualNoiseState.alignmentConfidence
             << formatPropagationStateFields("spectraPreDemosaic", residualNoiseState.preDemosaic)
             << "; baselinePhysicalLuma={enabled=" << (baselinePhysicalLuma.valid()?"true":"false")
-            << ";stage=" << (singleFrameLumaStage==bncam::luma::Stage::OFF?"OFF":singleFrameLumaStage==bncam::luma::Stage::LEGACY_REFERENCE?"LEGACY_REFERENCE":(singleFrameLumaStage==bncam::luma::Stage::GUIDED_V2_CONFIDENCE?"GUIDED_V2_CONFIDENCE_DEBUG":singleFrameLumaStage==bncam::luma::Stage::GUIDED_V2_FINE_COARSE?"GUIDED_V2_FINE_COARSE_DEBUG":singleFrameLumaStage==bncam::luma::Stage::GUIDED_V2_BALANCED?"GUIDED_V2_BALANCED_DEFAULT":"GUIDED_V2_FINE_DEBUG"))
+            << ";stage=" << (singleFrameLumaStage==bncam::luma::Stage::OFF?"OFF":singleFrameLumaStage==bncam::luma::Stage::LEGACY_REFERENCE?"LEGACY_REFERENCE":(singleFrameLumaStage==bncam::luma::Stage::GUIDED_V2_CONFIDENCE?"GUIDED_V2_CONFIDENCE_DEBUG":singleFrameLumaStage==bncam::luma::Stage::GUIDED_V2_FINE_COARSE?"GUIDED_V2_FINE_COARSE_DEBUG":singleFrameLumaStage==bncam::luma::Stage::GUIDED_V2_BALANCED?"GUIDED_V2_BALANCED_DEFAULT":singleFrameLumaStage==bncam::luma::Stage::GUIDED_V2_BALANCED_REFERENCE?"GUIDED_V2_BALANCED_REFERENCE":"GUIDED_V2_FINE_DEBUG"))
              << ";spectraIndependent=true;inputDomain=POST_PHYSICAL_CHROMA_LINEAR_RGB;noiseModel=PHYSICAL_SO_PROPAGATED"
             << ";status=" << (baselinePhysicalLuma.valid()?"PHYSICAL_LUMA_ACTIVE":
                 (singleFrameLumaStage==bncam::luma::Stage::OFF?"PHYSICAL_LUMA_STAGE_OFF":"PHYSICAL_LUMA_BYPASS_NO_VALID_NOISE_MODEL"))

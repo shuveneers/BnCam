@@ -516,11 +516,15 @@ endif()
 # fallback pending the planned RCD/AMAZE migration.
 set(BNCAM_RESIDENT_DEMOSAIC_SPV "${BNCAM_GENERATED_SHADER_DIR}/spectra_demosaic_resident.spv")
 set(BNCAM_RESIDENT_DEMOSAIC_HEADER "${BNCAM_GENERATED_SHADER_DIR}/SpectraResidentDemosaicSpirv.h")
+if(BNCAM_ENABLE_GPU_BENCHMARKS)
+    set(BNCAM_RESIDENT_DEMOSAIC_DEFINES "-DBNCAM_ENABLE_GPU_BENCHMARKS=1")
+endif()
 if(BNCAM_GLSLC)
     add_custom_command(
             OUTPUT "${BNCAM_RESIDENT_DEMOSAIC_HEADER}"
             COMMAND "${CMAKE_COMMAND}" -E make_directory "${BNCAM_GENERATED_SHADER_DIR}"
             COMMAND "${BNCAM_GLSLC}" --target-env=vulkan1.1 -O
+                    ${BNCAM_RESIDENT_DEMOSAIC_DEFINES}
                     "${CMAKE_CURRENT_SOURCE_DIR}/vulkan/shaders/spectra_demosaic_resident.comp"
                     -o "${BNCAM_RESIDENT_DEMOSAIC_SPV}"
             COMMAND "${CMAKE_COMMAND}"

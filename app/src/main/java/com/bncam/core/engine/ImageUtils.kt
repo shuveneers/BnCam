@@ -733,7 +733,8 @@ object ImageUtils {
         return masterFrame.nativeRaw16Buffer.withDirectBuffer { raw16DirectBuffer ->
             // Full-payload CRC verification scans the complete RAW16 array twice. Keep it available
             // for explicit developer dump/integrity sessions, but not on every debug shot.
-            val masterFingerprint = if (BuildConfig.DEBUG && (rawJpegDebugDumpsEnabled || physicalLumaAbDirectory != null)) {
+            val sf2Benchmark = com.bncam.core.debug.Sf2PerformanceReplay.takeRequest()
+            val masterFingerprint = if (BuildConfig.DEBUG && (rawJpegDebugDumpsEnabled || physicalLumaAbDirectory != null || sf2Benchmark != null)) {
                 RawMasterIntegrity.fingerprint(raw16DirectBuffer, masterFrame.raw16ByteCount)
             } else {
                 null
@@ -867,6 +868,11 @@ object ImageUtils {
                 portraitMaskRotationDegrees = portraitMaskArtifact?.rotationDegrees ?: 0
             )
         } }
+        if (sf2Benchmark != null && masterFingerprint != null) {
+            com.bncam.core.debug.Sf2PerformanceReplay.run(
+                sf2Benchmark, masterFrame, masterFingerprint.crc32.toString(), renderOnce
+            )
+        }
         val abDirectory = physicalLumaAbDirectory.takeIf { BuildConfig.DEBUG }
         val jpegBytes = if (abDirectory != null) {
             // SF2-FINAL: compare product Balanced against the exact same RAW
@@ -1500,6 +1506,8 @@ object ImageUtils {
     external fun setPhysicalLumaDebugEnabled(enabled: Boolean)
     // Debug-only native overrides; no override means product Balanced for single-shot RAW.
     external fun setPhysicalLumaStageDebug(stage: Int)
+    external fun setSf2BenchmarkStageNative(stage: Int, readLinear: Boolean = false)
+    external fun getSf2BenchmarkLinearReportNative(): String
     external fun clearPhysicalLumaDebugOverride()
     // SF2-D07: debug-only GPU/CPU qualification, never executed in normal capture.
     external fun validateSf2IntegrationNative(): String

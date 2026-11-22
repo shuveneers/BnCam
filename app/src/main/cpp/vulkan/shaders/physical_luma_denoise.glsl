@@ -103,15 +103,104 @@ vec3 physicalGuidedFine(ivec2 xy,vec3 postChroma,out vec3 telemetry,bool gate,bo
     telemetry=vec3(authority,0.0,structure);
     return result;
 }
+
+// Cache the 3x3 guide for the regression and both directional structure tests.
+// A zero shape marks invalid RGB and keeps the regression's fail-closed checks.
+vec2 physicalGuidedSample(ivec2 pos) {
+    vec3 rgb=physicalChromaRead(pos);
+    return vec2(opponentAtRgb(rgb).x,physicalChromaFinite(rgb)?physicalChromaShape(pos):0.0);
+}
+
+bool physicalGuidedRowValid(vec3 y,vec3 sigma) {
+    return !any(isnan(y)) && !any(isinf(y)) &&
+        all(greaterThan(sigma,vec3(0.0))) && !any(isinf(sigma));
+}
+
+void physicalGuidedMoment(inout vec4 moments,vec2 sampleValue,float centre,
+                          float rangeDenominator,float spatialDenominator) {
+    float y=sampleValue.x,sigma=sampleValue.y,diff=y-centre;
+    float w=exp(-diff*diff/rangeDenominator)/spatialDenominator;
+    moments+=vec4(w,w*y,w*y*y,w*pc.padding0*sigma*sigma);
+}
+
+float physicalGuidedStructure(vec3 a,vec3 c,vec3 b,vec3 sa,vec3 sc,vec3 sb) {
+    vec3 residuals=c-.5*(a+b);
+    vec3 noise=pc.padding0*(sc*sc+.25*(sa*sa+sb*sb));
+    float residualMean=(residuals.x+residuals.y+residuals.z)/3.0;
+    float meanVariance=(noise.x+noise.y+noise.z)/9.0;
+    float power=residualMean*residualMean;
+    return max(0.0,power-meanVariance)/(power+meanVariance+1.e-12);
+}
+
+vec3 physicalGuidedFineBalanced(ivec2 xy,vec3 postChroma,out vec3 telemetry) {
+    telemetry=vec3(0);
+    if(pc.cfaEvidence1.y<=0.0||!physicalChromaFinite(postChroma))return postChroma;
+
+    vec2 centreSample=physicalGuidedSample(xy);
+    float centre=centreSample.x,ss=centreSample.y,v=pc.padding0*ss*ss;
+    if(!(v>1.e-12)||isinf(v)||isnan(centre)||isinf(centre))return postChroma;
+    float rangeDenominator=8.0*v+1.e-12;
+    vec4 moments=vec4(0.0);
+
+    vec2 tl=physicalGuidedSample(xy+ivec2(-1,-1));
+    vec2 tc=physicalGuidedSample(xy+ivec2(0,-1));
+    vec2 tr=physicalGuidedSample(xy+ivec2(1,-1));
+    vec3 topY=vec3(tl.x,tc.x,tr.x),topSigma=vec3(tl.y,tc.y,tr.y);
+    if(!physicalGuidedRowValid(topY,topSigma))return postChroma;
+    physicalGuidedMoment(moments,tl,centre,rangeDenominator,1.8);
+    physicalGuidedMoment(moments,tc,centre,rangeDenominator,1.4);
+    physicalGuidedMoment(moments,tr,centre,rangeDenominator,1.8);
+
+    vec2 ml=physicalGuidedSample(xy+ivec2(-1,0));
+    vec2 mr=physicalGuidedSample(xy+ivec2(1,0));
+    vec3 midY=vec3(ml.x,centre,mr.x),midSigma=vec3(ml.y,ss,mr.y);
+    if(!physicalGuidedRowValid(midY,midSigma))return postChroma;
+    physicalGuidedMoment(moments,ml,centre,rangeDenominator,1.4);
+    // The centre's bilateral and spatial weights are exactly 1.
+    moments+=vec4(1.0,centre,centre*centre,v);
+    physicalGuidedMoment(moments,mr,centre,rangeDenominator,1.4);
+
+    vec2 bl=physicalGuidedSample(xy+ivec2(-1,1));
+    vec2 bc=physicalGuidedSample(xy+ivec2(0,1));
+    vec2 br=physicalGuidedSample(xy+ivec2(1,1));
+    vec3 botY=vec3(bl.x,bc.x,br.x),botSigma=vec3(bl.y,bc.y,br.y);
+    if(!physicalGuidedRowValid(botY,botSigma))return postChroma;
+    physicalGuidedMoment(moments,bl,centre,rangeDenominator,1.8);
+    physicalGuidedMoment(moments,bc,centre,rangeDenominator,1.4);
+    physicalGuidedMoment(moments,br,centre,rangeDenominator,1.8);
+
+    float total=moments.x;
+    if(!(total>0.0)||isinf(total))return postChroma;
+    float mean=moments.y/total,expected=moments.w/total;
+    float sceneVariance=max(0.0,moments.z/total-mean*mean-.8*expected);
+    float horizontal=physicalGuidedStructure(
+        vec3(tl.x,ml.x,bl.x),vec3(tc.x,centre,bc.x),vec3(tr.x,mr.x,br.x),
+        vec3(tl.y,ml.y,bl.y),vec3(tc.y,ss,bc.y),vec3(tr.y,mr.y,br.y));
+    float vertical=physicalGuidedStructure(topY,midY,botY,topSigma,midSigma,botSigma);
+    float structure=max(horizontal,vertical);
+    float physical=pc.cfaEvidence1.y*v/(v+.001*centre*centre);
+    float wiener=v/(v+2.0*sceneVariance+1.e-12);
+    float textureRisk=max(structure,clamp(sceneVariance/(sceneVariance+expected+1.e-12),0.0,1.0));
+    float balancedGain=1.18-0.30*textureRisk;
+    float authority=clamp(.78*physical*wiener*(1.0-.98*structure)*balancedGain,0.0,.78);
+    vec3 result=postChroma+vec3(authority*(mean-centre));
+    if(!physicalChromaFinite(result))return postChroma;
+    telemetry=vec3(authority,0.0,structure);
+    return result;
+}
+
 // Mode-3 bits 2..4 carry stages: 0 OFF, 1 legacy, 2 Guided Fine,
-// 4 Guided Fine+Coarse, 5 Guided Fine+Coarse with confidence.\n// Coarse buffers are read only for stages 4 and 5.
-// The fine kernel remains source-identical to phase 4.
+// 3 Guided Fine Balanced, 4 Guided Fine+Coarse, 5 Guided Fine+Coarse with confidence.
+// Coarse buffers are read only for stages 4 and 5.
 vec3 physicalLumaDenoise(ivec2 xy,vec3 postChroma,out vec3 telemetry) {
     uint stage=(pc.residualStride>>2u)&7u;
     telemetry=vec3(0);
     if(stage==1u)return physicalLegacyLumaDenoise(xy,postChroma,telemetry);
     if(stage==2u)return physicalGuidedFine(xy,postChroma,telemetry,true,false);
-    if(stage==3u)return physicalGuidedFine(xy,postChroma,telemetry,true,true);
+    if(stage==3u)return physicalGuidedFineBalanced(xy,postChroma,telemetry);
+#if defined(BNCAM_ENABLE_GPU_BENCHMARKS)
+    if(stage==6u)return physicalGuidedFine(xy,postChroma,telemetry,true,true);
+#endif
     if(stage==4u) {
         vec3 fineTelemetry;
         vec3 fine=physicalGuidedFine(xy,postChroma,fineTelemetry,true,false);

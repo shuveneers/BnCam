@@ -10,18 +10,29 @@ using Pixel = chroma::Pixel;
 // are archived for debug GPU regression and reproducible rollback only.
 enum class Stage : std::uint32_t { OFF = 0, LEGACY_REFERENCE = 1, GUIDED_V2 = 2, GUIDED_V2_BALANCED = 3,
                                    GUIDED_V2_FINE_COARSE = 4,
-                                   GUIDED_V2_CONFIDENCE = 5 };
+                                   GUIDED_V2_CONFIDENCE = 5, GUIDED_V2_BALANCED_REFERENCE = 6 };
 // Diagnostic stage is separate from the product default: old debug tooling cannot
 // silently replace the standard rendering path until an explicit override.
 inline std::atomic<Stage> selectedStage{Stage::OFF};
 inline std::atomic<bool> debugStageOverrideActive{false};
+#ifndef NDEBUG
+// A synchronous debug replay can select a stage without changing the camera's
+// global override or a concurrent render on another thread.
+inline thread_local int benchmarkStage = -1;
+#endif
 inline Stage resolveStage(bool singleShotRaw, bool spectraOff) {
     if (!singleShotRaw || !spectraOff) return Stage::OFF;
+#ifndef NDEBUG
+    if (benchmarkStage >= 0) return static_cast<Stage>(benchmarkStage);
+#endif
     if (debugStageOverrideActive.load(std::memory_order_relaxed))
         return selectedStage.load(std::memory_order_relaxed);
     return Stage::GUIDED_V2_BALANCED;
 }
 inline constexpr bool legacyAuthorized(Stage value) { return value == Stage::LEGACY_REFERENCE; }
+inline constexpr bool balancedAuthorized(Stage value) {
+    return value == Stage::GUIDED_V2_BALANCED || value == Stage::GUIDED_V2_BALANCED_REFERENCE;
+}
 struct Model {
     float varianceY = 0, confidence = 0;
     bool valid() const {

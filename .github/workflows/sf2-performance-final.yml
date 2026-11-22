@@ -1,0 +1,81 @@
+name: SF2 performance APK
+on:
+  push:
+    branches: [deliverables/sf2-performance-final]
+  workflow_dispatch:
+permissions:
+  contents: read
+
+jobs:
+  qualify-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Run frozen baseline and candidate native suites
+        run: |
+          set -euo pipefail
+          git worktree add --detach "$RUNNER_TEMP/sf2-reference" c56797c440f14293931a0fe84b0afcacebad486d
+          for tree in "$RUNNER_TEMP/sf2-reference" "$GITHUB_WORKSPACE"; do
+            build="$RUNNER_TEMP/$(basename "$tree")-native"
+            cmake -S "$tree/app/src/test/cpp" -B "$build" -DCMAKE_BUILD_TYPE=Release -DSF2_ISOLATED_PHASE9=ON
+            cmake --build "$build" --parallel 2
+            ctest --test-dir "$build" --output-on-failure
+          done
+          python3 -m unittest discover -s tests -p test_sf2_phase7_collect.py -v
+          python3 -m unittest discover -s tests -p test_sf2_phase9_default.py -v
+      - name: Validate debug and production Vulkan SPIR-V
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq glslc spirv-tools
+          shaders=app/src/main/cpp/vulkan/shaders
+          for variant in production benchmark; do
+            defines=()
+            if [[ "$variant" == benchmark ]]; then defines=(-DBNCAM_ENABLE_GPU_BENCHMARKS=1); fi
+            glslc --target-env=vulkan1.1 -O "${defines[@]}" "$shaders/spectra_demosaic_resident.comp" -o "$RUNNER_TEMP/$variant.spv"
+            spirv-val --target-env vulkan1.1 "$RUNNER_TEMP/$variant.spv"
+          done
+      - name: Assemble Android debug APK
+        run: |
+          set -euo pipefail
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install \
+            "platforms;android-36" "platforms;android-36.1" "build-tools;36.0.0" "cmake;3.22.1" "ndk;28.2.13676358"
+          chmod +x ./gradlew
+          ./gradlew :app:assembleDebug --no-daemon --max-workers=2 --stacktrace
+      - name: Verify APK signing, JNI and exact embedded shader
+        run: |
+          set -euo pipefail
+          apk=app/build/outputs/apk/debug/app-debug.apk
+          unzip -tq "$apk"
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify "$apk"
+          unzip -p "$apk" lib/arm64-v8a/libbncam.so > "$RUNNER_TEMP/libbncam.so"
+          nm -D "$RUNNER_TEMP/libbncam.so" > "$RUNNER_TEMP/native-symbols.txt"
+          grep -F Java_com_bncam_core_engine_ImageUtils_validateSf2IntegrationNative "$RUNNER_TEMP/native-symbols.txt"
+          grep -F Java_com_bncam_core_engine_ImageUtils_setSf2BenchmarkStageNative "$RUNNER_TEMP/native-symbols.txt"
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          shaders = list(Path("app/.cxx/Debug").glob("*/arm64-v8a/**/spectra_demosaic_resident.spv"))
+          assert len(shaders) == 1, shaders
+          shader = shaders[0].read_bytes()
+          assert shader[:4] == bytes.fromhex("03022307")
+          library = Path(os.environ["RUNNER_TEMP"], "libbncam.so").read_bytes()
+          assert shader in library, "Built resident shader missing from packaged JNI library"
+          PY
+          sha256sum "$apk" | tee BnCam_SF2_PERFORMANCE_SHA256.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BnCam_SF2_Performance_APK
+          path: |
+            app/build/outputs/apk/debug/app-debug.apk
+            BnCam_SF2_PERFORMANCE_SHA256.txt
+          retention-days: 90
+          if-no-files-found: error
