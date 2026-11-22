@@ -53,6 +53,9 @@ object BenchmarkDebugReceiverController {
                         }
                     }
                     ACTION_SET_CONFIG -> {
+                        if (intent.getBooleanExtra("clearPhysicalLumaOverride", false)) {
+                            com.bncam.core.engine.ImageUtils.clearPhysicalLumaDebugOverride()
+                        }
                         if (intent.hasExtra("physicalLumaStage")) {
                             com.bncam.core.engine.ImageUtils.setPhysicalLumaStageDebug(
                                 intent.getIntExtra("physicalLumaStage", 0))

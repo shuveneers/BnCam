@@ -36,28 +36,16 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.launch
 
 /**
- * A deliberately debug-only, session-local control surface.
- * Fresh process startup always keeps experimental luma reconstruction OFF.
- * The production camera's processing and phase-7 kernels are not modified.
+ * Debug-only QA control for the product candidate.
+ * Balanced is enabled for eligible RAW shots on fresh process launch;
+ * this UI offers only a safe OFF rollback and same-RAW product comparison.
  */
-private data class Sf2Mode(val stage: Int, val title: String, val description: String, val fileName: String)
-
-private val sf2Modes = listOf(
-    Sf2Mode(0, "OFF · chroma baseline", "Original single-frame product path.", "off.jpg"),
-    Sf2Mode(1, "Legacy luminance", "Previous luminance reference.", "on.jpg"),
-    Sf2Mode(2, "Guided Fine", "Fine-scale guided luminance reconstruction.", "guided.jpg"),
-    Sf2Mode(3, "Guided Fine Balanced", "Adaptive flat-noise gain and texture protection (experimental).", "balanced.jpg"),
-    Sf2Mode(4, "Guided Fine + Coarse", "Adds low-frequency luminance smoothing.", "combined.jpg"),
-    Sf2Mode(5, "Fine + Coarse + Confidence", "Protects supported directional details.", "confidence.jpg")
-)
-private val sf2GalleryFiles = sf2Modes.map { it.fileName } + "off_repeat.jpg"
+private val sf2GalleryFiles = listOf("off.jpg", "balanced.jpg", "off_repeat.jpg")
 private val sf2Accent = Color(0xFFB2D3A8)
 private val sf2Card = Color(0xFF1E1E1E)
 
-/** Keeps the chosen stage while navigating back to the live camera; never persists it to disk. */
 private object Sf2Session {
-    var enabled by mutableStateOf(false)
-    var selectedStage by mutableIntStateOf(0)
+    var balancedEnabled by mutableStateOf(true)
     var running by mutableStateOf(false)
     var qualificationReport by mutableStateOf<String?>(null)
     var captureFolder by mutableStateOf<File?>(null)
@@ -65,15 +53,11 @@ private object Sf2Session {
 
     fun apply() {
         if (!BuildConfig.DEBUG) return
-        val active = if (enabled) selectedStage else 0
-        ImageUtils.setPhysicalLumaDebugEnabled(active != 0)
-        ImageUtils.setPhysicalLumaStageDebug(active)
-    }
-
-    fun reset() {
-        enabled = false
-        selectedStage = 0
-        apply()
+        if (balancedEnabled) {
+            ImageUtils.clearPhysicalLumaDebugOverride()
+        } else {
+            ImageUtils.setPhysicalLumaStageDebug(0)
+        }
     }
 }
 
@@ -163,7 +147,7 @@ fun DeveloperSettingsScreen(
     val scope = rememberCoroutineScope()
     var enlarged by remember { mutableStateOf<File?>(null) }
     var selectedLeft by remember { mutableStateOf("off.jpg") }
-    var selectedRight by remember { mutableStateOf("confidence.jpg") }
+    var selectedRight by remember { mutableStateOf("balanced.jpg") }
     var exportResult by remember { mutableStateOf<String?>(null) }
     val eligible = (activeFrameSource == "RAW10" || activeFrameSource == "RAW_SENSOR") && singleFrame
 
@@ -205,61 +189,37 @@ fun DeveloperSettingsScreen(
                 .background(sf2Card).padding(16.dp)) {
                 Text("SINGLE-FRAME RECONSTRUCTION", color = sf2Accent,
                     fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                Text("Experimental luminance modes are session-only. OFF remains the default.",
+                Text("Balanced is the default for single-shot RAW with Spectra OFF. " +
+                    "Invalid physical noise data safely bypasses luminance. " +
+                    "Other experimental methods are retired from the camera controls.",
                     color = Color.LightGray, fontSize = 13.sp,
                     modifier = Modifier.padding(vertical = 10.dp))
                 Row(verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier.fillMaxWidth()) {
-                    Text("Enable experimental luminance", color = Color.White,
+                    Text("Guided Fine Balanced (default)", color = Color.White,
                         modifier = Modifier.weight(1f), fontSize = 15.sp)
-                    Switch(checked = Sf2Session.enabled, enabled = !Sf2Session.running,
-                        onCheckedChange = { state ->
-                            Sf2Session.enabled = state
+                    Switch(checked = Sf2Session.balancedEnabled, enabled = !Sf2Session.running,
+                        onCheckedChange = { enabled ->
+                            Sf2Session.balancedEnabled = enabled
                             Sf2Session.apply()
                         })
                 }
-                sf2Modes.forEach { mode ->
-                    Row(
-                        Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
-                            .clickable(enabled = !Sf2Session.running) {
-                                Sf2Session.selectedStage = mode.stage
-                                Sf2Session.apply()
-                            }.padding(vertical = 9.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        RadioButton(selected = Sf2Session.selectedStage == mode.stage,
-                            enabled = !Sf2Session.running,
-                            onClick = {
-                                Sf2Session.selectedStage = mode.stage
-                                Sf2Session.apply()
-                            },
-                            colors = RadioButtonDefaults.colors(selectedColor = sf2Accent))
-                        Column(Modifier.weight(1f)) {
-                            Text(mode.title, color = Color.White, fontSize = 15.sp)
-                            Text(mode.description, color = Color.Gray, fontSize = 12.sp)
-                        }
-                    }
-                }
-                val active = if (Sf2Session.enabled) Sf2Session.selectedStage else 0
-                Text("Active stage: $active ${if (active == 0) "(baseline)" else "(experimental)"}",
-                    color = sf2Accent, fontSize = 13.sp)
+                Text(if (Sf2Session.balancedEnabled) "Active: Balanced (eligible RAW captures)"
+                     else "Active: OFF (developer rollback)",
+                     color = sf2Accent, fontSize = 13.sp)
                 Spacer(Modifier.height(8.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedButton(onClick = { Sf2Session.reset() },
-                        enabled = !Sf2Session.running) { Text("Reset to OFF", color = sf2Accent) }
-                    Button(onClick = onOpenCamera, enabled = !Sf2Session.running,
-                        colors = ButtonDefaults.buttonColors(containerColor = sf2Accent)) {
-                        Text("Open camera", color = Color.Black)
-                    }
+                Button(onClick = onOpenCamera, enabled = !Sf2Session.running,
+                    colors = ButtonDefaults.buttonColors(containerColor = sf2Accent)) {
+                    Text("Open camera", color = Color.Black)
                 }
             }
 
             Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp))
                 .background(sf2Card).padding(16.dp)) {
-                Text("COMPARE ALL · SAME RAW", color = sf2Accent,
+                Text("COMPARE OFF / BALANCED · SAME RAW", color = sf2Accent,
                     fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                Text("Generates OFF, Legacy, Fine, Balanced, Fine + Coarse, Confidence and OFF repeat " +
-                    "from one immutable RAW master. No seven separate camera exposures.",
+                Text("Generates OFF, Balanced and OFF repeat from the same immutable RAW master. " +
+                    "One sensor exposure; OFF-repeat detects stale GPU state.",
                     color = Color.LightGray, fontSize = 13.sp,
                     modifier = Modifier.padding(vertical = 10.dp))
                 Text("Current input: $activeFrameSource · " +
@@ -287,9 +247,8 @@ fun DeveloperSettingsScreen(
                                 }
                                 parent.mkdirs()
                                 ImageUtils.physicalLumaAbDirectory = parent.absolutePath
-                                // The seven-render code selects every stage itself.
+                                // The three-render sequence selects its own stages.
                                 ImageUtils.setPhysicalLumaStageDebug(0)
-                                ImageUtils.setPhysicalLumaDebugEnabled(false)
                                 CameraEventBus.requestCapture("sf2_developer_compare")
                                 val folder = withContext(Dispatchers.IO) {
                                     var found: File? = null
@@ -299,7 +258,7 @@ fun DeveloperSettingsScreen(
                                         delay(500)
                                     }
                                     found
-                                } ?: error("Timed out waiting for the seven-render set.")
+                                } ?: error("Timed out waiting for the three-render set.")
                                 val missing = sf2GalleryFiles.filter { !File(folder, it).isFile }
                                 if (missing.isNotEmpty()) error("Missing images: " + missing.joinToString())
                                 Sf2Session.captureFolder = folder
@@ -312,7 +271,7 @@ fun DeveloperSettingsScreen(
                             }
                         }
                     }
-                ) { Text("Capture & compare all seven", color = Color.Black) }
+                ) { Text("Capture OFF / Balanced", color = Color.Black) }
                 if (Sf2Session.running) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         CircularProgressIndicator(color = sf2Accent, modifier = Modifier.size(20.dp),
@@ -374,7 +333,7 @@ fun DeveloperSettingsScreen(
                     Text("LAST COMPARISON", color = sf2Accent,
                         fontSize = 12.sp, fontWeight = FontWeight.Bold)
                     Text("Tap any thumbnail for a larger preview. " +
-                        "The seven JPEG files are private until exported.",
+                        "The three JPEG files are private until exported.",
                         color = Color.Gray, fontSize = 12.sp,
                         modifier = Modifier.padding(vertical = 10.dp))
                     sf2GalleryFiles.chunked(2).forEach { row ->
@@ -437,7 +396,7 @@ fun DeveloperSettingsScreen(
                             }
                         }
                     }, colors = ButtonDefaults.buttonColors(containerColor = sf2Accent)) {
-                        Text("Export seven JPEGs to gallery", color = Color.Black)
+                        Text("Export three JPEGs to gallery", color = Color.Black)
                     }
                     exportResult?.let { Text(it, color = Color.LightGray, fontSize = 12.sp) }
                     val qualification = File(folder, "qualification.txt").readTextIfExists()
@@ -448,8 +407,8 @@ fun DeveloperSettingsScreen(
                     }
                 }
             }
-            Text("Debug build only · default processing unchanged · " +
-                "experimental stages are not production-qualified.",
+            Text("Debug build · Balanced selected by default for eligible single-shot RAW. " +
+                "Use the switch for immediate OFF rollback.",
                 color = Color.Gray, fontSize = 11.sp,
                 modifier = Modifier.padding(bottom = 24.dp))
         }

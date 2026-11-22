@@ -4746,11 +4746,15 @@ Java_com_bncam_core_engine_ImageUtils_validatePhysicalLumaNative(JNIEnv* env,job
     }
 }
 
+// Legacy JNI name retained for backward compatible developer commands.
+// TRUE now selects Balanced; FALSE explicitly overrides the product to OFF.
 extern "C" JNIEXPORT void JNICALL
 Java_com_bncam_core_engine_ImageUtils_setPhysicalLumaDebugEnabled(JNIEnv*,jobject,jboolean enabled) {
 #ifndef NDEBUG
     bncam::luma::selectedStage.store(enabled==JNI_TRUE
-            ? bncam::luma::Stage::LEGACY_REFERENCE : bncam::luma::Stage::OFF);
+            ? bncam::luma::Stage::GUIDED_V2_BALANCED : bncam::luma::Stage::OFF,
+            std::memory_order_relaxed);
+    bncam::luma::debugStageOverrideActive.store(true,std::memory_order_relaxed);
 #endif
 }
 
@@ -4766,8 +4770,18 @@ Java_com_bncam_core_engine_ImageUtils_setPhysicalLumaStageDebug(JNIEnv*,jobject,
             stage==4 ? bncam::luma::Stage::GUIDED_V2_FINE_COARSE :
             stage==5 ? bncam::luma::Stage::GUIDED_V2_CONFIDENCE : bncam::luma::Stage::OFF;
     bncam::luma::selectedStage.store(selected, std::memory_order_relaxed);
+    bncam::luma::debugStageOverrideActive.store(true,std::memory_order_relaxed);
 #else
     (void)stage;
+#endif
+}
+
+// Clearing a debug session restores the selected product default, not OFF.
+extern "C" JNIEXPORT void JNICALL
+Java_com_bncam_core_engine_ImageUtils_clearPhysicalLumaDebugOverride(JNIEnv*,jobject) {
+#ifndef NDEBUG
+    bncam::luma::selectedStage.store(bncam::luma::Stage::OFF,std::memory_order_relaxed);
+    bncam::luma::debugStageOverrideActive.store(false,std::memory_order_relaxed);
 #endif
 }
 

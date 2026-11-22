@@ -5,12 +5,22 @@
 
 namespace bncam::luma {
 using Pixel = chroma::Pixel;
-// SF2: product baseline is OFF; legacy is only an explicit debug comparison.
-// Guided V2 is fail-closed until its own runtime is available.
+// SF2-FINAL: Balanced is the single-shot RAW / Spectra OFF product candidate.
+// Off remains the non-RAW, multi-frame and invalid-model fallback. Other stages
+// are archived for debug GPU regression and reproducible rollback only.
 enum class Stage : std::uint32_t { OFF = 0, LEGACY_REFERENCE = 1, GUIDED_V2 = 2, GUIDED_V2_BALANCED = 3,
                                    GUIDED_V2_FINE_COARSE = 4,
                                    GUIDED_V2_CONFIDENCE = 5 };
+// Diagnostic stage is separate from the product default: old debug tooling cannot
+// silently replace the standard rendering path until an explicit override.
 inline std::atomic<Stage> selectedStage{Stage::OFF};
+inline std::atomic<bool> debugStageOverrideActive{false};
+inline Stage resolveStage(bool singleShotRaw, bool spectraOff) {
+    if (!singleShotRaw || !spectraOff) return Stage::OFF;
+    if (debugStageOverrideActive.load(std::memory_order_relaxed))
+        return selectedStage.load(std::memory_order_relaxed);
+    return Stage::GUIDED_V2_BALANCED;
+}
 inline constexpr bool legacyAuthorized(Stage value) { return value == Stage::LEGACY_REFERENCE; }
 struct Model {
     float varianceY = 0, confidence = 0;

@@ -6945,8 +6945,11 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
         baselinePhysicalChroma.bg *= fusionScale;
         baselinePhysicalChroma.cross *= fusionScale;
     }
-    // SF2: chroma-only is the unconditional product baseline. Legacy is debug-only.
-    const auto singleFrameLumaStage = bncam::luma::selectedStage.load(std::memory_order_relaxed);
+    // SF2-FINAL: default Balanced is authorized ONLY for a genuine single-shot
+    // RAW capture with Spectra OFF. Multi-frame, Spectra ON and invalid physical
+    // noise contexts fail closed to chroma-only, with no new pixel owner.
+    const auto singleFrameLumaStage = bncam::luma::resolveStage(
+            meta.singleShotRaw, meta.calibration.spectraProcessingMode == 0);
     if (!bncam::luma::legacyAuthorized(singleFrameLumaStage) &&
         singleFrameLumaStage != bncam::luma::Stage::GUIDED_V2 &&
         singleFrameLumaStage != bncam::luma::Stage::GUIDED_V2_BALANCED &&
@@ -9603,7 +9606,7 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             << "; spectraResidualAlignmentConfidence=" << residualNoiseState.alignmentConfidence
             << formatPropagationStateFields("spectraPreDemosaic", residualNoiseState.preDemosaic)
             << "; baselinePhysicalLuma={enabled=" << (baselinePhysicalLuma.valid()?"true":"false")
-            << ";stage=" << (singleFrameLumaStage==bncam::luma::Stage::OFF?"OFF":singleFrameLumaStage==bncam::luma::Stage::LEGACY_REFERENCE?"LEGACY_REFERENCE":(singleFrameLumaStage==bncam::luma::Stage::GUIDED_V2_CONFIDENCE?"GUIDED_V2_CONFIDENCE_DEBUG":singleFrameLumaStage==bncam::luma::Stage::GUIDED_V2_FINE_COARSE?"GUIDED_V2_FINE_COARSE_DEBUG":singleFrameLumaStage==bncam::luma::Stage::GUIDED_V2_BALANCED?"GUIDED_V2_BALANCED_DEBUG":"GUIDED_V2_FINE_DEBUG"))
+            << ";stage=" << (singleFrameLumaStage==bncam::luma::Stage::OFF?"OFF":singleFrameLumaStage==bncam::luma::Stage::LEGACY_REFERENCE?"LEGACY_REFERENCE":(singleFrameLumaStage==bncam::luma::Stage::GUIDED_V2_CONFIDENCE?"GUIDED_V2_CONFIDENCE_DEBUG":singleFrameLumaStage==bncam::luma::Stage::GUIDED_V2_FINE_COARSE?"GUIDED_V2_FINE_COARSE_DEBUG":singleFrameLumaStage==bncam::luma::Stage::GUIDED_V2_BALANCED?"GUIDED_V2_BALANCED_DEFAULT":"GUIDED_V2_FINE_DEBUG"))
              << ";spectraIndependent=true;inputDomain=POST_PHYSICAL_CHROMA_LINEAR_RGB;noiseModel=PHYSICAL_SO_PROPAGATED"
             << ";status=" << (baselinePhysicalLuma.valid()?"PHYSICAL_LUMA_ACTIVE":
                 (singleFrameLumaStage==bncam::luma::Stage::OFF?"PHYSICAL_LUMA_STAGE_OFF":"PHYSICAL_LUMA_BYPASS_NO_VALID_NOISE_MODEL"))

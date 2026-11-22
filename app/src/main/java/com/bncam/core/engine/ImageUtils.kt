@@ -869,10 +869,9 @@ object ImageUtils {
         } }
         val abDirectory = physicalLumaAbDirectory.takeIf { BuildConfig.DEBUG }
         val jpegBytes = if (abDirectory != null) {
-            // SF2-D08 debug-only: six stages from the SAME immutable RAW16 master.
-            // Seventh OFF render detects residual stage/descriptor state contamination.
-            // JPEG byte identity is diagnostic; a mismatch alone is not proof of
-            // changed linear pixels (encoder metadata can differ).
+            // SF2-FINAL: compare product Balanced against the exact same RAW
+            // with chroma-only OFF before and after it. Retain deterministic
+            // stage evidence, RAW CRC and resident-GPU telemetry.
             val dir = java.io.File(abDirectory, System.currentTimeMillis().toString()).apply { mkdirs() }
             val stageEvidence = mutableListOf<String>()
             val startNs = System.nanoTime()
@@ -886,32 +885,11 @@ object ImageUtils {
                 val off = renderOnce()
                 if (off != null) java.io.File(dir, "off.jpg").writeBytes(off)
                 java.io.File(dir, "off.txt").writeText(lastMasterIspStats())
-                setPhysicalLumaStageDebug(1)
-                checkStage("legacy", 1)
-                val legacy = renderOnce()
-                if (legacy != null) java.io.File(dir, "on.jpg").writeBytes(legacy)
-                java.io.File(dir, "on.txt").writeText(lastMasterIspStats())
-                setPhysicalLumaStageDebug(2)
-                checkStage("fine", 2)
-                val guided = renderOnce()
-                if (guided != null) java.io.File(dir, "guided.jpg").writeBytes(guided)
-                java.io.File(dir, "guided.txt").writeText(lastMasterIspStats())
-                // SF2-D08: bounded Balanced Fine, isolated from the frozen stage 2.
                 setPhysicalLumaStageDebug(3)
                 checkStage("balanced", 3)
                 val balanced = renderOnce()
                 if (balanced != null) java.io.File(dir, "balanced.jpg").writeBytes(balanced)
                 java.io.File(dir, "balanced.txt").writeText(lastMasterIspStats())
-                setPhysicalLumaStageDebug(4)
-                checkStage("coarse", 4)
-                val combined = renderOnce()
-                if (combined != null) java.io.File(dir, "combined.jpg").writeBytes(combined)
-                java.io.File(dir, "combined.txt").writeText(lastMasterIspStats())
-                setPhysicalLumaStageDebug(5)
-                checkStage("confidence", 5)
-                val confidence = renderOnce()
-                if (confidence != null) java.io.File(dir, "confidence.jpg").writeBytes(confidence)
-                java.io.File(dir, "confidence.txt").writeText(lastMasterIspStats())
                 setPhysicalLumaStageDebug(0)
                 checkStage("offRepeat", 0)
                 val offRepeat = renderOnce()
@@ -919,7 +897,7 @@ object ImageUtils {
                 java.io.File(dir, "off_repeat.txt").writeText(lastMasterIspStats())
                 val exactJpegIdentity = off != null && offRepeat != null && off.contentEquals(offRepeat)
                 java.io.File(dir, "qualification.txt").writeText(
-                    "sf2QualificationVersion=1\n" +
+                    "sf2QualificationVersion=2\n" +
                     "buildSha=" + BuildConfig.GIT_REVISION + "\n" +
                     "rawMasterCrc32=" + (masterFingerprint?.crc32 ?: "UNAVAILABLE") + "\n" +
                     "offRepeatJpegBytesIdentical=" + exactJpegIdentity + "\n" +
@@ -927,10 +905,10 @@ object ImageUtils {
                     "elapsedMs=" + ((System.nanoTime() - startNs) / 1_000_000L) + "\n" +
                     stageEvidence.joinToString("\n") + "\n"
                 )
-                confidence ?: combined ?: guided ?: legacy ?: off
+                // Compare All's saved JPEG must be Balanced, not Confidence.
+                balanced ?: off
             } finally {
-                setPhysicalLumaStageDebug(0)
-                setPhysicalLumaDebugEnabled(false)
+                clearPhysicalLumaDebugOverride()
             }
         } else renderOnce()
         if (masterFingerprint != null) {
@@ -1520,8 +1498,9 @@ object ImageUtils {
     external fun validatePhysicalLumaNative(): String
     external fun validateRawPreviewRecoveryNative(): String
     external fun setPhysicalLumaDebugEnabled(enabled: Boolean)
-    // Debug build only. 0=OFF, 1=legacy, 2=Fine, 4=Fine+Coarse, 5=Confidence.
+    // Debug-only native overrides; no override means product Balanced for single-shot RAW.
     external fun setPhysicalLumaStageDebug(stage: Int)
+    external fun clearPhysicalLumaDebugOverride()
     // SF2-D07: debug-only GPU/CPU qualification, never executed in normal capture.
     external fun validateSf2IntegrationNative(): String
     external fun getPhysicalLumaStageDebug(): Int
