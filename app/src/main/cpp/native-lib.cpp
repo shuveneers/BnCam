@@ -944,6 +944,7 @@ struct YuvEncodeTiming {
     float yuvIspGpuExecutionWallMs = 0.0f;
     float yuvIspGpuSyncMs = 0.0f;
     float yuvIspPublicationReadbackMs = 0.0f;
+    bool yuvIspMappedBgrReadback = false;
     bool yuvIspResidentLumaConsumed = false;
     std::uint64_t yuvIspResidentLumaGeneration = 0u;
     bool yuvUltraHdrRequested = false;
@@ -1191,7 +1192,8 @@ bool encodeNv21ToJpeg(
         const NativeRenderQualityConfig& qualityConfig,
         std::vector<uint8_t>& jpegOut,
         YuvEncodeTiming* timingOut,
-        std::uint64_t residentLumaGeneration
+        std::uint64_t residentLumaGeneration,
+        bool singleFrame
 ) {
     if (nv21Ptr == nullptr || width == 0u || height == 0u || nv21Length == 0u) return false;
 
@@ -1251,6 +1253,7 @@ bool encodeNv21ToJpeg(
     // resident exposure-normalized authority. Single-frame 8-bit YUV is intentionally SDR.
     request.ultraHdrGainmapRequested = qualityConfig.ultraHdrGainmapEnabled &&
             residentLumaGeneration != 0u;
+    request.useMappedBgrReadback = singleFrame;
     request.width = width;
     request.height = height;
     request.rotationDegrees = static_cast<std::uint32_t>(normalizeRotationDegrees(rotationDegrees));
@@ -1314,9 +1317,11 @@ bool encodeNv21ToJpeg(
 
     const bool residentLumaSatisfied = residentLumaGeneration == 0u ||
             (gpu.residentLumaConsumed && gpu.residentLumaGeneration == residentLumaGeneration);
+    const bool mappedBgr = gpu.mappedBgr24 != nullptr && gpu.mappedBgrLease.owns_lock();
+    const std::size_t bgrBytes = mappedBgr ? gpu.mappedBgr24Bytes : gpu.bgr24.size();
     const bool gpuOutputValid = gpu.success && residentLumaSatisfied &&
             gpu.outputWidth > 0u && gpu.outputHeight > 0u &&
-            gpu.bgr24.size() == static_cast<std::size_t>(gpu.outputWidth) * gpu.outputHeight * 3u;
+            bgrBytes == static_cast<std::size_t>(gpu.outputWidth) * gpu.outputHeight * 3u;
     const std::string fallbackReason = gpu.success && !gpuOutputValid
             ? (residentLumaSatisfied
                     ? "VULKAN_YUV_SINGLE_FRAME_OUTPUT_INVALID"
@@ -1338,6 +1343,7 @@ bool encodeNv21ToJpeg(
         timingOut->yuvIspGpuExecutionWallMs = gpu.gpuExecutionWallMs;
         timingOut->yuvIspGpuSyncMs = gpu.gpuSynchronizationMs;
         timingOut->yuvIspPublicationReadbackMs = gpu.publicationReadbackMs;
+        timingOut->yuvIspMappedBgrReadback = mappedBgr;
         timingOut->yuvIspResidentLumaConsumed = gpu.residentLumaConsumed;
         timingOut->yuvIspResidentLumaGeneration = gpu.residentLumaGeneration;
         timingOut->yuvUltraHdrRequested = request.ultraHdrGainmapRequested;
@@ -1365,11 +1371,12 @@ bool encodeNv21ToJpeg(
                 static_cast<int>(gpu.outputHeight),
                 static_cast<int>(gpu.outputWidth),
                 CV_8UC3,
-                gpu.bgr24.data());
+                mappedBgr ? const_cast<std::uint8_t*>(gpu.mappedBgr24) : gpu.bgr24.data());
         const NativeRenderQualityConfig resolvedQuality = IspCore::resolveForYuv(qualityConfig);
         const std::vector<int> params = bncam::jpeg444EncodingParameters(resolvedQuality.jpegQuality);
         const auto encodeStart = NativeClock::now();
         const bool ok = cv::imencode(".jpg", bgrMat, jpegOut, params);
+        if (mappedBgr) gpu.mappedBgrLease.unlock();
         if (ok && gpu.ultraHdrGainmapGenerated && gpu.ultraHdrMeaningfulHeadroom &&
             !gpu.ultraHdrGainmapBytes.empty()) {
             UltraHdrGainmapArtifact artifact{};
@@ -1402,6 +1409,8 @@ bool encodeNv21ToJpeg(
         }
         return ok;
     }
+
+    if (mappedBgr) gpu.mappedBgrLease.unlock();
 
     // Portrait is a Vulkan-owned image effect. Never route a requested Portrait render through
     // the legacy CPU/OpenCV image-processing failsafe; that would violate both effect truth and
@@ -2529,7 +2538,8 @@ Java_com_bncam_core_engine_ImageUtils_processNativeYuv(
                             yuvQuality,
                             jpegBuf,
                             &encodeTiming,
-                            0u
+                            0u,
+                            true
                     );
                     yuvAnchorOutputCopyEliminated = true;
                 }
@@ -2766,7 +2776,8 @@ Java_com_bncam_core_engine_ImageUtils_processNativeYuv(
                         yuvQuality,
                         jpegBuf,
                         &encodeTiming,
-                        yuvResidentLumaGeneration)) {
+                        yuvResidentLumaGeneration,
+                        hwBuffers.size() == 1u)) {
                 LOGE("YUV JPEG publication failed");
             }
         }
@@ -2816,6 +2827,7 @@ Java_com_bncam_core_engine_ImageUtils_processNativeYuv(
           << ";yuvSingleFrameGpuExecutionWallMs=" << nativeFmtMs(encodeTiming.yuvIspGpuExecutionWallMs)
           << ";yuvSingleFrameGpuSyncMs=" << nativeFmtMs(encodeTiming.yuvIspGpuSyncMs)
           << ";yuvSingleFramePublicationReadbackMs=" << nativeFmtMs(encodeTiming.yuvIspPublicationReadbackMs)
+          << ";yuvSingleFrameMappedBgrReadback=" << (encodeTiming.yuvIspMappedBgrReadback ? "true" : "false")
           << ";yuvColorContract=" << encodeTiming.yuvColorContract
           << ";yuvResidualNoiseModelAvailable=" << (encodeTiming.yuvResidualNoiseModelAvailable ? "true" : "false")
           << ";yuvResidualLumaSamples=" << encodeTiming.yuvResidualLumaSamples

@@ -396,7 +396,7 @@ YuvSingleFrameIspResult VulkanYuvSingleFrameBackend::execute(
             : 0u;
 
     const auto mutexWaitStart = Clock::now();
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
     out.backendMutexWaitMs = elapsedMs(mutexWaitStart);
     allocator_ = allocatorOwner.handle();
     if (allocator_ == nullptr) {
@@ -740,6 +740,12 @@ YuvSingleFrameIspResult VulkanYuvSingleFrameBackend::execute(
         vkCmdCopyBuffer(command, gainmapDevice_.buffer, gainmapReadback_.buffer, 1u, &gainmapCopy);
     }
 
+    VkMemoryBarrier readbackBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    readbackBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    readbackBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                         0u, 1u, &readbackBarrier, 0u, nullptr, 0u, nullptr);
+
     if (vkEndCommandBuffer(command) != VK_SUCCESS) {
         out.failureReason = "YUV_SINGLE_FRAME_COMMAND_END_FAILED";
         freeCommand();
@@ -782,8 +788,15 @@ YuvSingleFrameIspResult VulkanYuvSingleFrameBackend::execute(
 
     const auto readbackStart = Clock::now();
     vmaInvalidateAllocation(allocator_, outputReadback_.allocation, 0u, paddedOutputBytes);
-    out.bgr24.resize(static_cast<std::size_t>(bgrBytes));
-    std::memcpy(out.bgr24.data(), outputReadback_.mapped, static_cast<std::size_t>(bgrBytes));
+    VkMemoryPropertyFlags readbackMemory = 0u;
+    vmaGetAllocationMemoryProperties(allocator_, outputReadback_.allocation, &readbackMemory);
+    if (request.useMappedBgrReadback && (readbackMemory & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0u) {
+        out.mappedBgr24 = static_cast<const std::uint8_t*>(outputReadback_.mapped);
+        out.mappedBgr24Bytes = static_cast<std::size_t>(bgrBytes);
+    } else {
+        out.bgr24.resize(static_cast<std::size_t>(bgrBytes));
+        std::memcpy(out.bgr24.data(), outputReadback_.mapped, static_cast<std::size_t>(bgrBytes));
+    }
 
     vmaInvalidateAllocation(allocator_, ultraHdrTelemetry_.allocation, 0u, telemetryBytes);
     const auto* telemetry = static_cast<const std::uint32_t*>(ultraHdrTelemetry_.mapped);
@@ -840,6 +853,9 @@ YuvSingleFrameIspResult VulkanYuvSingleFrameBackend::execute(
     out.backend = "VULKAN_YUV_SINGLE_FRAME_ISP_PHASE13_RESIDUAL";
     out.failureReason = "none";
     out.success = true;
+    if (out.mappedBgr24 != nullptr) {
+        out.mappedBgrLease = std::move(lock);
+    }
     return out;
 #endif
 }

@@ -16,6 +16,7 @@ namespace bncam::vulkan {
 struct YuvSingleFrameIspRequest {
     const std::uint8_t* nv21 = nullptr;
     std::size_t nv21Bytes = 0u;
+    bool useMappedBgrReadback = false;
     // Phase 13 opaque residency token. Runtime resolves this under the submission lock.
     std::uint64_t residentLumaGeneration = 0u;
     // Runtime-internal Phase-13 handoff. When set, Y comes from this resident device buffer
@@ -70,6 +71,11 @@ struct YuvSingleFrameIspResult {
     std::uint32_t outputWidth = 0u;
     std::uint32_t outputHeight = 0u;
     std::vector<std::uint8_t> bgr24;
+    // Consumed synchronously on the submitting thread. The lease pins the mapped buffer
+    // against another capture or runtime teardown until JPEG encoding stops reading it.
+    const std::uint8_t* mappedBgr24 = nullptr;
+    std::size_t mappedBgr24Bytes = 0u;
+    std::unique_lock<std::mutex> mappedBgrLease;
     std::uint64_t fullFrameCpuUploadBytes = 0u;
     std::uint64_t fullFrameGpuReadbackBytes = 0u;
     bool residentLumaConsumed = false;
