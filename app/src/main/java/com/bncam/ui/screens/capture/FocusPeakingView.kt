@@ -900,7 +900,12 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
                         phase0DispatchingYuvFrame = false
                     }
                     phase0PendingDisplayCommit
-                        ?.takeIf { it.source == ViewfinderEffectiveSource.YUV.name }
+                        ?.takeIf {
+                            it.source == ViewfinderEffectiveSource.YUV.name &&
+                                BnCameraManager.activeInstance?.isConfiguredViewfinderLensGeneration(
+                                    it.lensId, it.generation
+                                ) == true
+                        }
                         ?.let { accepted ->
                             Phase0PerformanceTrace.targetSensorFrameReceived(
                                 lensId = accepted.lensId,
@@ -1171,11 +1176,15 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
         val committedGeneration = lastDrawnGeneration
         val committedSensorTimestampNs = lastDrawnSensorTimestampNs
         val phase0PendingCommit = phase0PendingDisplayCommit
-        // Source + generation are display identity. diagnosticLensId is observational and can
-        // legitimately lag one UI update during a serialized lens handover.
+        // The UI lens label can change while the previous texture is still live. Require a
+        // fresh frame from the configured generation before accepting the new lens display.
         val phase0TargetAuthorityAccepted = phase0PendingCommit != null &&
             phase0PendingCommit.source == committedSource &&
-            phase0PendingCommit.generation == committedGeneration
+            phase0PendingCommit.generation == committedGeneration &&
+            (if (useRaw) uploadedRawFrame != null else phase0YuvFrameUpdatedThisDraw) &&
+            BnCameraManager.activeInstance?.isConfiguredViewfinderLensGeneration(
+                committedLensId, committedGeneration
+            ) == true
         val phase0NewFrameCommitted = if (useRaw) {
             uploadedRawFrame != null
         } else {
@@ -1195,6 +1204,10 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
                 // the first UI-vsync after GL submit as an explicitly-labelled presentation proxy.
                 postOnAnimation {
                     val presentationNs = SystemClock.elapsedRealtimeNanos()
+                    val targetStillConfigured = phase0TargetAuthorityAccepted &&
+                        BnCameraManager.activeInstance?.isConfiguredViewfinderLensGeneration(
+                            committedLensId, committedGeneration
+                        ) == true
                     Phase0PerformanceTrace.viewfinderFramePresented(
                         lensId = committedLensId,
                         source = committedSource,
@@ -1202,7 +1215,7 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
                         sensorTimestampNs = committedSensorTimestampNs,
                         presentationTimestampNs = presentationNs,
                         presentationSignal = "NEXT_UI_VSYNC_AFTER_GL_SUBMIT_PROXY",
-                        targetAuthorityAccepted = phase0TargetAuthorityAccepted
+                        targetAuthorityAccepted = targetStillConfigured
                     )
                     ViewfinderStartupGate.signalFirstPresentation(
                         source = committedSource,
@@ -1211,7 +1224,7 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
                         presentationTimestampNs = presentationNs,
                         signal = "NEXT_UI_VSYNC_AFTER_GL_SUBMIT_PROXY"
                     )
-                    if (phase0TargetAuthorityAccepted) {
+                    if (targetStillConfigured) {
                         BnCameraManager.activeInstance?.reportViewfinderFramePresented(
                             source = ViewfinderEffectiveSource.YUV,
                             generation = committedGeneration,
@@ -1429,6 +1442,10 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
         presented.forEach { event ->
             val pending = event.pending
             val presentTimeNs = event.presentTimeNs
+            val targetStillConfigured = pending.targetAuthorityAccepted &&
+                BnCameraManager.activeInstance?.isConfiguredViewfinderLensGeneration(
+                    pending.lensId, pending.generation
+                ) == true
             RawPreviewFrameLifecycleRegistry.presented(
                 pending.generation,
                 pending.sensorTimestampNs,
@@ -1450,7 +1467,7 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
                 sensorTimestampNs = pending.sensorTimestampNs,
                 presentationTimestampNs = presentTimeNs,
                 presentationSignal = "EGL_DISPLAY_PRESENT_TIME",
-                targetAuthorityAccepted = pending.targetAuthorityAccepted
+                targetAuthorityAccepted = targetStillConfigured
             )
             ViewfinderStartupGate.signalFirstPresentation(
                 source = pending.source.name,
@@ -1469,13 +1486,18 @@ class FocusPeakingView(context: Context) : GLSurfaceView(context), GLSurfaceView
                 presentationSignal = "EGL_DISPLAY_PRESENT_TIME",
                 producerKind = pending.producerKind
             )
-            if (pending.targetAuthorityAccepted) {
+            if (targetStillConfigured) {
                 post {
-                    onTargetFramePresented?.invoke(
-                        pending.lensId,
-                        pending.source.name,
-                        pending.generation
-                    )
+                    if (BnCameraManager.activeInstance?.isConfiguredViewfinderLensGeneration(
+                            pending.lensId, pending.generation
+                        ) == true
+                    ) {
+                        onTargetFramePresented?.invoke(
+                            pending.lensId,
+                            pending.source.name,
+                            pending.generation
+                        )
+                    }
                 }
             }
         }

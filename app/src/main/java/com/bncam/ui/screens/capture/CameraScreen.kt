@@ -90,6 +90,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -97,11 +98,9 @@ import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Rect as ComposeRect
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
-import androidx.compose.ui.graphics.PathFillType
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.graphics.graphicsLayer
@@ -143,6 +142,8 @@ import com.bncam.data.settings.ViewfinderSliderAssignment
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.async
 import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.Locale
@@ -3095,7 +3096,6 @@ fun CameraPreview(
     }
 
     val repository = remember { SettingsRepository(context) }
-    val latestActiveProfile = rememberUpdatedState(activeProfile)
     val livePreviewTuning by ViewfinderLiveTuning.state.collectAsState()
     val liveWbDisplayCompensation by bnCameraManager.liveWhiteBalanceDisplayCompensation.collectAsState()
     val viewfinderRebuildVisualState by bnCameraManager.viewfinderRebuildVisualState.collectAsState()
@@ -3104,65 +3104,40 @@ fun CameraPreview(
         animationSpec = tween(durationMillis = if (viewfinderRebuildVisualState.active) 70 else 120),
         label = "viewfinderProducerRebuildBlackTransition"
     )
-    val lensTransitionProgress = remember { Animatable(0f) }
-    val lensTransitionScope = rememberCoroutineScope()
+    val lensTransitionProgress = remember(cameraId) { Animatable(0f) }
+    val lensTransitionCover = remember(cameraId) { Animatable(1f) }
+    val presentedTargetFrame = remember(cameraId) { CompletableDeferred<Pair<String, Int>>() }
+    val handoverZoomSettled = rememberUpdatedState(lensHandoverZoomSettled)
     var previousComposedLensId by remember { mutableStateOf<String?>(null) }
-    var transitioningToLensId by remember { mutableStateOf<String?>(null) }
+    var lensTransitionFinished by remember(cameraId) { mutableStateOf(false) }
+    val showLensTransition = previousComposedLensId != null && !lensTransitionFinished
 
     LaunchedEffect(cameraId) {
         val previousLensId = previousComposedLensId
+        if (previousLensId == null) lensTransitionFinished = true
         previousComposedLensId = cameraId
-        if (previousLensId != null && previousLensId != cameraId) {
-            transitioningToLensId = cameraId
-            Log.i(
-                "BnCamPreviewDiag",
-                "event=LENS_TRANSITION_VISUAL_BEGIN fromLensId=$previousLensId targetLensId=$cameraId"
-            )
-            lensTransitionProgress.snapTo(0f)
-            lensTransitionProgress.animateTo(
-                targetValue = 1f,
-                animationSpec = tween(durationMillis = 190)
-            )
-            // Presentation normally ends the transition in under one second. This guard is visual
-            // only: it cannot mark a switch successful and prevents a camera failure from leaving
-            // the viewfinder permanently shaded.
-            delay(1_800L)
-            if (transitioningToLensId == cameraId) {
-                transitioningToLensId = null
-                Log.w(
-                    "BnCamPreviewDiag",
-                    "event=LENS_TRANSITION_VISUAL_END targetLensId=$cameraId reason=visual_timeout"
-                )
-                lensTransitionProgress.animateTo(
-                    targetValue = 0f,
-                    animationSpec = tween(durationMillis = 240)
-                )
-            }
-        }
+        if (previousLensId == null || previousLensId == cameraId) return@LaunchedEffect
+
+        Log.i("BnCamPreviewDiag",
+            "event=LENS_TRANSITION_VISUAL_BEGIN fromLensId=$previousLensId targetLensId=$cameraId")
+        // Complete the same motion on every lens switch. An early target frame can arrive
+        // under the opaque cover; a slow target holds the last animation frame until ready.
+        lensTransitionProgress.animateTo(
+            targetValue = 1f,
+            animationSpec = tween(durationMillis = 230)
+        )
+        Log.i("BnCamPreviewDiag", "event=LENS_TRANSITION_VISUAL_PEAK targetLensId=$cameraId")
+        val (source, generation) = presentedTargetFrame.await()
+        snapshotFlow { handoverZoomSettled.value }.first { it }
+        lensTransitionCover.animateTo(0f, animationSpec = tween(durationMillis = 70))
+        lensTransitionFinished = true
+        Log.i("BnCamPreviewDiag",
+            "event=LENS_TRANSITION_VISUAL_END targetLensId=$cameraId source=$source " +
+                "generation=$generation reason=target_frame_presented")
     }
 
-    fun finishLensTransitionOnPresentedFrame(lensId: String, source: String, generation: Int) {
-        if (transitioningToLensId != lensId) return
-        if (!lensHandoverZoomSettled) {
-            Log.d(
-                "BnCamPreviewDiag",
-                "event=LENS_TRANSITION_VISUAL_HOLD targetLensId=$lensId source=$source " +
-                    "generation=$generation reason=handover_zoom_pending"
-            )
-            return
-        }
-        transitioningToLensId = null
-        Log.i(
-            "BnCamPreviewDiag",
-            "event=LENS_TRANSITION_VISUAL_END targetLensId=$lensId source=$source " +
-                "generation=$generation reason=target_frame_presented"
-        )
-        lensTransitionScope.launch {
-            lensTransitionProgress.animateTo(
-                targetValue = 0f,
-                animationSpec = tween(durationMillis = 240)
-            )
-        }
+    fun recordTargetFramePresented(lensId: String, source: String, generation: Int) {
+        if (lensId == cameraId) presentedTargetFrame.complete(source to generation)
     }
 
     // UI reset identity is deliberately only the producer buffer source. Settings/profile
@@ -3180,7 +3155,12 @@ fun CameraPreview(
 
     val mirrorFront by repository.mirrorFrontPreviewFlow.collectAsState(initial = true)
     val viewfinderStream by repository.viewfinderStreamFlow.collectAsState(initial = ViewfinderStream.YUV)
-    val preferredFormat by repository.getProfileFrameSourceFlow(activeProfile.id).collectAsState(initial = null)
+    val profileFrameSources = remember(activeProfile.id) {
+        repository.getProfileFrameSourceFlow(activeProfile.id)
+    }
+    val preferredFormat by key(activeProfile.id) {
+        profileFrameSources.collectAsState(initial = null)
+    }
     // Keep the existing display host alive while the next lens route is resolved. Resetting this
     // state to null on every cameraId change removed the entire GLSurfaceView for one composition
     // and guaranteed a black transition before Camera2 handover even started.
@@ -3268,7 +3248,7 @@ fun CameraPreview(
                                 bnCameraManager.reportYuvViewfinderFrameAvailable(sensorTimestampNs)
                             }
                             this.onTargetFramePresented = { lensId, source, generation ->
-                                finishLensTransitionOnPresentedFrame(lensId, source, generation)
+                                recordTargetFramePresented(lensId, source, generation)
                             }
                         }
                     },
@@ -3297,7 +3277,7 @@ fun CameraPreview(
                         // mirror the same user zoom in the RAW-only texture-coordinate path.
                         view.setRawDisplayZoom(digitalZoom())
                         view.onTargetFramePresented = { lensId, source, generation ->
-                            finishLensTransitionOnPresentedFrame(lensId, source, generation)
+                            recordTargetFramePresented(lensId, source, generation)
                         }
                         view.setLiveColorTuning(
                             saturationOffset = livePreviewTuning.saturationOffset,
@@ -3327,51 +3307,30 @@ fun CameraPreview(
                 )
             }
 
-            val irisProgress = lensTransitionProgress.value
-            if (irisProgress > 0.001f) {
-                Canvas(
-                    modifier = Modifier.fillMaxSize()
-                ) {
-                    // A real iris wipe visibly separates the retained old frame from the first
-                    // authoritative target frame. At progress 0 the aperture is larger than the
-                    // viewport; at progress 1 only a deliberate centre window remains.
-                    val openRadius = kotlin.math.hypot(size.width, size.height) * 0.56f
-                    val closedRadius = size.minDimension * 0.25f
-                    val apertureRadius = openRadius + (closedRadius - openRadius) * irisProgress
-                    val irisMask = Path().apply {
-                        fillType = PathFillType.EvenOdd
-                        addRect(ComposeRect(0f, 0f, size.width, size.height))
-                        addOval(
-                            ComposeRect(
-                                center.x - apertureRadius,
-                                center.y - apertureRadius,
-                                center.x + apertureRadius,
-                                center.y + apertureRadius
-                            )
-                        )
-                    }
-                    drawPath(
-                        path = irisMask,
-                        color = Color.Black.copy(alpha = 0.42f)
-                    )
-                    drawCircle(
-                        color = AccentPistachio.copy(alpha = 0.30f * irisProgress),
-                        radius = apertureRadius,
+            if (showLensTransition) {
+                Canvas(modifier = Modifier.fillMaxSize().graphicsLayer { alpha = lensTransitionCover.value }) {
+                    val progress = lensTransitionProgress.value
+                    val apertureRadius = size.minDimension * (0.34f - 0.19f * progress)
+                    drawRect(brush = Brush.radialGradient(
+                        colors = listOf(Color(0xFF26302A), Color(0xFF111514)),
                         center = center,
-                        style = Stroke(width = 2.dp.toPx())
+                        radius = size.maxDimension * 0.62f
+                    ))
+                    drawCircle(
+                        color = AccentPistachio.copy(alpha = 0.19f),
+                        radius = apertureRadius,
+                        style = Stroke(width = 1.dp.toPx())
                     )
-                    repeat(6) { bladeIndex ->
-                        rotate(
-                            degrees = bladeIndex * 60f + irisProgress * 22f,
-                            pivot = center
-                        ) {
-                            drawLine(
-                                color = AccentPistachio.copy(alpha = 0.18f * irisProgress),
-                                start = Offset(center.x, center.y - apertureRadius * 0.91f),
-                                end = Offset(center.x, center.y - apertureRadius * 1.04f),
-                                strokeWidth = 2.dp.toPx()
-                            )
-                        }
+                    repeat(6) { blade ->
+                        drawArc(
+                            color = AccentPistachio.copy(alpha = 0.62f),
+                            startAngle = blade * 60f - 90f + progress * 80f,
+                            sweepAngle = 36f - 8f * progress,
+                            useCenter = false,
+                            topLeft = Offset(center.x - apertureRadius, center.y - apertureRadius),
+                            size = androidx.compose.ui.geometry.Size(apertureRadius * 2f, apertureRadius * 2f),
+                            style = Stroke(width = 2.dp.toPx(), cap = androidx.compose.ui.graphics.StrokeCap.Round)
+                        )
                     }
                 }
             }
@@ -3533,15 +3492,13 @@ fun CameraPreview(
                 Log.e("BnCamPreviewDiag", "Failed to configure preview Surface for lens=$cameraId", e)
             }
 
-            // Use pre-collected Compose state to start reattaching immediately without
-            // suspending DataStore disk IO during the navigation entrance animation.
+            // Resolve the target profile's format before opening a producer. Collecting it
+            // concurrently with the transition must not start a temporary YUV or prior RAW route
+            // and then require a second session for the actual format.
             val startupProfileId = activeProfile.id
             val isStartupProfileDisabled = DefaultIspProfile.isDisabledProfileId(startupProfileId)
-            // Frame-source state is asynchronous. Until DataStore resolves the profile-owned
-            // value, bootstrap with the repository's canonical frame-source default rather than a
-            // capture-strategy enum name. pipelineUiKey() canonicalizes both sides, so the later
-            // null -> YUV emission cannot masquerade as a physical buffer transition.
-            val initialFormat = if (isStartupProfileDisabled) "YUV" else (preferredFormat ?: "YUV")
+            val initialFormat = if (isStartupProfileDisabled) "YUV"
+                else preferredFormat ?: profileFrameSources.first()
             val pipelineReady = withContext(kotlinx.coroutines.Dispatchers.IO) {
                 val warmReattached = bnCameraManager.reattachPreviewToWarmPipeline(
                     cameraId = cameraId,

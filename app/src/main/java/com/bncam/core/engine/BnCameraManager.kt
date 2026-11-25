@@ -2304,6 +2304,12 @@ class BnCameraManager(private val context: Context) {
         return true
     }
 
+    internal fun isConfiguredViewfinderLensGeneration(lensId: String, generation: Int): Boolean =
+        synchronized(pipelineLock) {
+            activePipelineIdentity?.selectedLensId == lensId &&
+                pipelineGeneration == generation && sessionConfiguredGeneration == generation
+        }
+
     /**
      * Final viewfinder authority is granted only from presentation truth.
      *
