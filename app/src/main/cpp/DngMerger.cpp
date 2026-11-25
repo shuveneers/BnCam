@@ -1954,7 +1954,7 @@ jobject mergeRawToDngRaw16Internal(
                 std::chrono::duration_cast<std::chrono::microseconds>(
                         DngClock::now().time_since_epoch()).count()) & 0x7fffffffffffffffull);
 
-        const auto gpu = bncam::vulkan::VulkanRuntime::instance().executeRawCaptureCanonicalize(request);
+        auto gpu = bncam::vulkan::VulkanRuntime::instance().executeRawCaptureCanonicalize(request);
         if (gpu.success && gpu.width == static_cast<uint32_t>(sourceCropWidth) &&
             gpu.height == static_cast<uint32_t>(sourceCropHeight) &&
             gpu.outputRaw16.size() == static_cast<size_t>(sourceCropWidth) * static_cast<size_t>(sourceCropHeight)) {
