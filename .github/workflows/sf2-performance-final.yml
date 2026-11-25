@@ -1,7 +1,7 @@
 name: SF2 performance APK
 on:
   push:
-    branches: [deliverables/sf2-performance-final]
+    branches: [deliverables/sf2-performance-final, deliverables/fast-capture-pipeline]
   workflow_dispatch:
 permissions:
   contents: read
