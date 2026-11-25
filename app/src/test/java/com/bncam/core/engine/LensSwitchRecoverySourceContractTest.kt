@@ -71,16 +71,27 @@ class LensSwitchRecoverySourceContractTest {
             appRoot(),
             "src/main/java/com/bncam/ui/screens/capture/FocusPeakingView.kt"
         ).readText()
+        val manager = File(
+            appRoot(),
+            "src/main/java/com/bncam/core/engine/BnCameraManager.kt"
+        ).readText()
+        val reveal = cameraScreen.substringAfter("val lensTransitionProgress =")
+            .substringBefore("fun recordTargetFramePresented")
 
         assertTrue(focusView.contains("var onTargetFramePresented:"))
-        assertTrue(focusView.contains("if (phase0TargetAuthorityAccepted)"))
-        assertTrue(focusView.contains("if (pending.targetAuthorityAccepted)"))
-        assertTrue(cameraScreen.contains("if (transitioningToLensId != lensId) return"))
-        assertTrue(cameraScreen.contains("lensTransitionProgress.animateTo("))
-        assertTrue(cameraScreen.contains("delay(1_800L)"))
-        assertTrue(cameraScreen.contains("reason=target_frame_presented"))
-        assertTrue(cameraScreen.contains("PathFillType.EvenOdd"))
-        assertTrue(cameraScreen.contains("repeat(6) { bladeIndex"))
-        assertFalse(cameraScreen.contains("val transitionScale ="))
+        assertTrue(focusView.contains("targetAuthorityAccepted = targetStillConfigured"))
+        assertTrue(focusView.contains("if (useRaw) uploadedRawFrame != null else phase0YuvFrameUpdatedThisDraw"))
+        assertTrue(manager.contains("activePipelineIdentity?.selectedLensId == lensId"))
+        assertTrue(manager.contains("pipelineGeneration == generation && sessionConfiguredGeneration == generation"))
+        assertTrue(cameraScreen.contains("if (lensId == cameraId) presentedTargetFrame.complete"))
+        assertTrue(cameraScreen.contains("if (showLensTransition)"))
+        assertTrue(cameraScreen.contains("drawRect(brush = Brush.radialGradient("))
+
+        val motion = reveal.indexOf("lensTransitionProgress.animateTo(")
+        val confirmedFrame = reveal.indexOf("presentedTargetFrame.await()")
+        val fade = reveal.indexOf("lensTransitionCover.animateTo(")
+        assertTrue(motion >= 0 && confirmedFrame > motion && fade > confirmedFrame)
+        assertTrue(reveal.contains("tween(durationMillis = 230)"))
+        assertTrue(reveal.contains("reason=target_frame_presented"))
     }
 }
