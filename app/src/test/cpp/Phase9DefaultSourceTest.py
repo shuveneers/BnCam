@@ -4,6 +4,7 @@ import subprocess
 
 ROOT=Path(__file__).resolve().parents[4]
 BASE="c56797c440f14293931a0fe84b0afcacebad486d"
+FAST_CAPTURE_BASE="4a92510314260ba42224cfa8aac9497d45ebbae7"
 CPP="app/src/main/cpp/"
 
 def live(path): return (ROOT/path).read_text(encoding="utf-8")
@@ -16,9 +17,30 @@ expected_native={CPP+path for path in (
     "SingleFrameIntegrationJni.cpp", "tests/Sf2PerformanceLinear.h",
     "vulkan/shaders/physical_luma_denoise.glsl",
 )}
-changed=set(subprocess.check_output(
-    ["git","diff","--name-only",BASE,"--",CPP],cwd=ROOT,text=True).splitlines())
-assert changed==expected_native, f"Unreviewed pixel engine changes: {changed ^ expected_native}"
+fast_capture_native={CPP+path for path in (
+    "DngMerger.cpp", "native-lib.cpp",
+    "vulkan/VulkanYuvSingleFrameBackend.cpp", "vulkan/VulkanYuvSingleFrameBackend.h",
+)}
+
+def changed_native(reference):
+    return set(subprocess.check_output(
+        ["git","diff","--name-only",reference,"--",CPP],cwd=ROOT,text=True).splitlines())
+
+changed=changed_native(BASE)
+expected=expected_native | fast_capture_native
+assert changed==expected, f"Unreviewed pixel engine changes: {changed ^ expected}"
+fast_capture_changed=changed_native(FAST_CAPTURE_BASE)
+assert fast_capture_changed==fast_capture_native, (
+    f"Unreviewed changes from the qualified performance base: {fast_capture_changed ^ fast_capture_native}"
+)
+raw_owner=CPP+"DngMerger.cpp"
+frozen_raw_owner=subprocess.check_output(
+    ["git","show",FAST_CAPTURE_BASE+":"+raw_owner],cwd=ROOT,encoding="utf-8")
+assert live(raw_owner)==frozen_raw_owner.replace(
+    "const auto gpu = bncam::vulkan::VulkanRuntime::instance().executeRawCaptureCanonicalize(request);",
+    "auto gpu = bncam::vulkan::VulkanRuntime::instance().executeRawCaptureCanonicalize(request);",
+    1,
+), "Fast capture may only change the RAW16 ownership handoff"
 
 # No changes to rawnormalization, physical noise, chroma, demosaic,
 # the original Guided Fine body, Vulkan backend/push constants, tone or sharpening.
