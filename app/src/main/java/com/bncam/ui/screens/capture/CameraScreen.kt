@@ -3124,12 +3124,12 @@ fun CameraPreview(
         // under the opaque cover; a slow target holds the last animation frame until ready.
         lensTransitionProgress.animateTo(
             targetValue = 1f,
-            animationSpec = tween(durationMillis = 230)
+            animationSpec = tween(durationMillis = 170)
         )
         Log.i("BnCamPreviewDiag", "event=LENS_TRANSITION_VISUAL_PEAK targetLensId=$cameraId")
         val (source, generation) = presentedTargetFrame.await()
         snapshotFlow { handoverZoomSettled.value }.first { it }
-        lensTransitionCover.animateTo(0f, animationSpec = tween(durationMillis = 70))
+        lensTransitionCover.animateTo(0f, animationSpec = tween(durationMillis = 60))
         lensTransitionFinished = true
         Log.i("BnCamPreviewDiag",
             "event=LENS_TRANSITION_VISUAL_END targetLensId=$cameraId source=$source " +

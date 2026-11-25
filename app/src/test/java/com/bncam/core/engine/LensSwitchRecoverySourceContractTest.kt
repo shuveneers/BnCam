@@ -91,7 +91,7 @@ class LensSwitchRecoverySourceContractTest {
         val confirmedFrame = reveal.indexOf("presentedTargetFrame.await()")
         val fade = reveal.indexOf("lensTransitionCover.animateTo(")
         assertTrue(motion >= 0 && confirmedFrame > motion && fade > confirmedFrame)
-        assertTrue(reveal.contains("tween(durationMillis = 230)"))
+        assertTrue(reveal.contains("tween(durationMillis = 170)"))
         assertTrue(reveal.contains("reason=target_frame_presented"))
     }
 }
