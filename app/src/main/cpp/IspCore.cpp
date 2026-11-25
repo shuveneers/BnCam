@@ -8356,7 +8356,8 @@ std::vector<uint8_t> IspCore::renderRawBaselineJpeg(
             {perceptualDetailPhysicalNoiseAvailable,
              phase12DisplayLumaSigma,
              static_cast<float>(std::clamp(
-                     residualNoiseState.postTone.confidence, 0.0, 1.0))});
+                     residualNoiseState.postTone.confidence, 0.0, 1.0))},
+            meta.singleShotRaw);
     if (perceptualDetailPlan.enabled) {
         residualNoiseState.postTone = bncam::spectra2::propagateOpponentGains(
                 residualNoiseState.postTone,

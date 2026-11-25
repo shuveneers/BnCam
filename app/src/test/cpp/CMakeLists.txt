@@ -26,7 +26,7 @@ foreach(test IN ITEMS AdaptiveNoiseAuthorityTest PhysicalNoisePropagationTest Ph
         SingleFrameResidualConfidenceTest SingleFrameResidualCandidateQualityTest
         SingleFrameIntegrationQualificationTest SingleFrameGuidedBalancedTest SingleFrameBalancedDefaultContractTest
         PhysicalChromaDenoiseTest PhysicalLumaDenoiseTest PhysicalNoiseNativeContractTest
-        RawCfaLevelMappingTest)
+        RawCfaLevelMappingTest SingleFrameJpegDetailTest)
     add_executable(${test} ${test}.cpp)
     target_include_directories(${test} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../../main/cpp")
     # Assertions remain enabled in release test builds.
@@ -37,6 +37,7 @@ foreach(test IN ITEMS AdaptiveNoiseAuthorityTest PhysicalNoisePropagationTest Ph
     endif()
     add_test(NAME ${test} COMMAND ${test})
 endforeach()
+target_compile_definitions(SingleFrameJpegDetailTest PRIVATE BNCAM_ENABLE_GPU_BENCHMARKS=1)
 option(SF2_ISOLATED_PHASE6 "Run phase-6 current source gates; archived phase-5 source gates are tested separately in CI" OFF)
 option(SF2_ISOLATED_PHASE7 "Run current phase-7 source contracts; frozen phases are built separately in CI" OFF)
 option(SF2_ISOLATED_PHASE8 "Run phase-8 source contracts against frozen phase-7 UI base" OFF)

@@ -39,6 +39,10 @@ inline float finiteOr(float value, float fallback) noexcept {
     return std::isfinite(value) ? value : fallback;
 }
 
+#if defined(BNCAM_ENABLE_GPU_BENCHMARKS) && BNCAM_ENABLE_GPU_BENCHMARKS
+inline thread_local bool replayOriginalSingleFrameDetail = false;
+#endif
+
 /**
  * Phase 12 profile-owned perceptual detail/output sharpening.
  *
@@ -52,15 +56,31 @@ inline float finiteOr(float value, float fallback) noexcept {
  * guard after the creative sharpness owners and never scales Global Sharpness.
  * Physical noise is only an internal safety hint.
  */
-inline Plan resolve(Controls controls, NoiseEvidence noise) noexcept {
+inline Plan resolve(Controls controls, NoiseEvidence noise, bool singleShotRaw = false) noexcept {
     controls.amount = std::clamp(finiteOr(controls.amount, 0.0f), -1.0f, 1.0f);
     const float packedDetailLegibility = controls.detail;
     controls.detail = bncam::profile_microdetail_transport::decodeDetail(packedDetailLegibility);
     controls.radius = bncam::profile_microdetail_transport::decodeLegibility(packedDetailLegibility);
-    const float packedEdgeZipper = finiteOr(controls.masking, 0.0f);
-    const float edgeAuthority = bncam::profile_edge_zipper_transport::decodeEdge(packedEdgeZipper);
+    float packedEdgeZipper = finiteOr(controls.masking, 0.0f);
+    float edgeAuthority = bncam::profile_edge_zipper_transport::decodeEdge(packedEdgeZipper);
     const float antiZipperAuthority = bncam::profile_edge_zipper_transport::decodeAntiZipper(packedEdgeZipper);
     noise.displayLumaSigma = std::max(0.0f, finiteOr(noise.displayLumaSigma, 0.0f));
+
+    bool refine = singleShotRaw;
+#if defined(BNCAM_ENABLE_GPU_BENCHMARKS) && BNCAM_ENABLE_GPU_BENCHMARKS
+    refine = refine && !replayOriginalSingleFrameDetail;
+#endif
+    if (refine) {
+        constexpr float kPositiveSharpnessScale = 0.92f;
+        constexpr float kPositiveMicrodetailScale = 0.94f;
+        if (controls.amount > 0.0f) controls.amount *= kPositiveSharpnessScale;
+        if (controls.detail > 0.0f) controls.detail *= kPositiveMicrodetailScale;
+        if (edgeAuthority > 0.0f) {
+            packedEdgeZipper = bncam::profile_edge_zipper_transport::encodePair(
+                    edgeAuthority * kPositiveSharpnessScale, antiZipperAuthority);
+            edgeAuthority = bncam::profile_edge_zipper_transport::decodeEdge(packedEdgeZipper);
+        }
+    }
 
     Plan out{};
     if (std::abs(controls.amount) <= 1.0e-4f && std::abs(controls.radius) <= 1.0e-4f &&

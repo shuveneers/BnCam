@@ -5,6 +5,7 @@ import subprocess
 ROOT=Path(__file__).resolve().parents[4]
 BASE="c56797c440f14293931a0fe84b0afcacebad486d"
 FAST_CAPTURE_BASE="4a92510314260ba42224cfa8aac9497d45ebbae7"
+JPEG_REFINEMENT_BASE="02b870fe6dbebdf94d6cf230e11c85466b52d358"
 CPP="app/src/main/cpp/"
 
 def live(path): return (ROOT/path).read_text(encoding="utf-8")
@@ -21,17 +22,25 @@ fast_capture_native={CPP+path for path in (
     "DngMerger.cpp", "native-lib.cpp",
     "vulkan/VulkanYuvSingleFrameBackend.cpp", "vulkan/VulkanYuvSingleFrameBackend.h",
 )}
+jpeg_refinement_native={CPP+path for path in (
+    "IspCore.cpp", "PerceptualDetailPolicy.h", "SingleFrameIntegrationJni.cpp",
+)}
 
 def changed_native(reference):
     return set(subprocess.check_output(
         ["git","diff","--name-only",reference,"--",CPP],cwd=ROOT,text=True).splitlines())
 
 changed=changed_native(BASE)
-expected=expected_native | fast_capture_native
+expected=expected_native | fast_capture_native | jpeg_refinement_native
 assert changed==expected, f"Unreviewed pixel engine changes: {changed ^ expected}"
 fast_capture_changed=changed_native(FAST_CAPTURE_BASE)
-assert fast_capture_changed==fast_capture_native, (
-    f"Unreviewed changes from the qualified performance base: {fast_capture_changed ^ fast_capture_native}"
+expected_after_performance=fast_capture_native | jpeg_refinement_native
+assert fast_capture_changed==expected_after_performance, (
+    f"Unreviewed changes from the qualified performance base: {fast_capture_changed ^ expected_after_performance}"
+)
+jpeg_refinement_changed=changed_native(JPEG_REFINEMENT_BASE)
+assert jpeg_refinement_changed==jpeg_refinement_native, (
+    f"Unreviewed JPEG refinement changes: {jpeg_refinement_changed ^ jpeg_refinement_native}"
 )
 raw_owner=CPP+"DngMerger.cpp"
 frozen_raw_owner=subprocess.check_output(
@@ -43,7 +52,7 @@ assert live(raw_owner)==frozen_raw_owner.replace(
 ), "Fast capture may only change the RAW16 ownership handoff"
 
 # No changes to rawnormalization, physical noise, chroma, demosaic,
-# the original Guided Fine body, Vulkan backend/push constants, tone or sharpening.
+# the original Guided Fine body, Vulkan backend/push constants or tone shaders.
 for path in (
     "SingleFrameGuidedLuma.h","SingleFrameGuidedCoarse.h",
     "SingleFrameResidualConfidence.h","PhysicalChromaDenoise.h",
@@ -51,6 +60,7 @@ for path in (
     "vulkan/VulkanSpectraResidentDemosaicBackend.cpp",
     "vulkan/VulkanSpectraResidentDemosaicBackend.h",
     "vulkan/shaders/spectra_demosaic_resident.comp",
+    "vulkan/shaders/spectra_tone_resident.comp",
     "vulkan/shaders/physical_chroma_denoise.glsl",
 ):
     assert live(CPP+path)==base(CPP+path),f"Protected kernel changed: {path}"

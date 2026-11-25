@@ -66,7 +66,12 @@ class DebugTestReceiver : BroadcastReceiver() {
                 val scene = intent.getStringExtra("quality_scene")
                 val role = intent.getStringExtra("quality_lens_role") ?: "UNDECLARED"
                 QualityCaptureReplay.request = scene?.takeIf { it.matches(Regex("[A-Za-z0-9_-]{1,64}")) }
-                    ?.let { QualityCaptureReplay.Request(it, role, intent.getIntExtra("quality_repetition", 1)) }
+                    ?.let {
+                        QualityCaptureReplay.Request(
+                            it, role, intent.getIntExtra("quality_repetition", 1),
+                            detailRefinement = intent.getBooleanExtra("quality_detail_refinement", false)
+                        )
+                    }
             }
             val pendingResult = goAsync()
             kotlinx.coroutines.runBlocking(Dispatchers.IO) {

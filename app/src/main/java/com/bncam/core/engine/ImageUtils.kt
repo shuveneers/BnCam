@@ -1523,6 +1523,9 @@ object ImageUtils {
     // Debug-only native overrides; no override means product Balanced for single-shot RAW.
     external fun setPhysicalLumaStageDebug(stage: Int)
     external fun setSf2BenchmarkStageNative(stage: Int, readLinear: Boolean = false)
+    internal fun setOriginalSingleFrameDetailForReplay(useOriginal: Boolean) =
+        setOriginalSingleFrameDetailForReplayNative(useOriginal)
+    private external fun setOriginalSingleFrameDetailForReplayNative(useOriginal: Boolean)
     external fun getSf2BenchmarkLinearReportNative(): String
     external fun clearPhysicalLumaDebugOverride()
     // SF2-D07: debug-only GPU/CPU qualification, never executed in normal capture.

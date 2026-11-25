@@ -1,6 +1,7 @@
 // SF2-D07: opt-in on-device Vulkan-vs-CPU integration qualification.
 // Not part of any capture pipeline. Only explicitly called from debug receiver.
 #include "SingleFrameIntegrationQualification.h"
+#include "PerceptualDetailPolicy.h"
 #include "tests/Sf2PerformanceLinear.h"
 #include "vulkan/VulkanRuntime.h"
 #include <jni.h>
@@ -13,6 +14,14 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#if defined(BNCAM_ENABLE_GPU_BENCHMARKS) && BNCAM_ENABLE_GPU_BENCHMARKS
+extern "C" JNIEXPORT void JNICALL
+Java_com_bncam_core_engine_ImageUtils_setOriginalSingleFrameDetailForReplayNative(
+        JNIEnv*, jobject, jboolean useOriginal) {
+    bncam::perceptual_detail::replayOriginalSingleFrameDetail = useOriginal == JNI_TRUE;
+}
+#endif
 
 #ifndef NDEBUG
 namespace bncam::luma {

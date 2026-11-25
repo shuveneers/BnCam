@@ -19,7 +19,10 @@ import java.util.UUID
  * The ordinary production render follows this diagnostic work and owns its own native stats.
  */
 object QualityCaptureReplay {
-    data class Request(val scene: String, val lensRole: String, val repetition: Int)
+    data class Request(
+        val scene: String, val lensRole: String, val repetition: Int,
+        val detailRefinement: Boolean = false
+    )
     @Volatile var request: Request? = null
     fun snapshot(): Request? = request.takeIf { BuildConfig.DEBUG }
 
@@ -30,6 +33,10 @@ object QualityCaptureReplay {
         val dir = File(context.filesDir, "quality/${UUID.randomUUID()}").apply { mkdirs() }
         val metadata = JSONObject(QualificationEvidence.raw(input, recipe, focus, ev))
         val rawSha = metadata.getString("rawSha256")
+        if (request.detailRefinement) {
+            exportDetailRefinement(dir, input, config, rotation, portrait, metadata)
+            return dir.relativeTo(context.filesDir).path.replace('\\', '/')
+        }
         FileOutputStream(File(dir, "raw.bin")).use { stream ->
             input.nativeRaw16Buffer.withDirectBuffer { buffer ->
                 val view = buffer.asReadOnlyBuffer().apply { clear(); limit(input.raw16ByteCount) }
@@ -88,5 +95,46 @@ object QualityCaptureReplay {
         }
         File(dir, "manifest.json").writeText(manifest.toString(2))
         return dir.relativeTo(context.filesDir).path.replace('\\', '/')
+    }
+
+    private fun exportDetailRefinement(
+        dir: File, input: Raw16RenderInput, config: RenderQualityConfig,
+        rotation: Int, portrait: PortraitCaptureContext, metadata: JSONObject
+    ) {
+        // Exercise all three positive controls with the same moderate strengths in both renders.
+        val detail = config.profileDetailTuning.copy(amount = 0.45f, detail = 0.40f, edge = 0.35f)
+        val comparison = config.copy(profileDetailTuning = detail)
+        val outputs = JSONObject()
+        val hashes = mutableMapOf<String, String>()
+
+        try {
+            for (variant in listOf("baseline", "refined", "refined", "baseline")) {
+                ImageUtils.setOriginalSingleFrameDetailForReplay(variant == "baseline")
+                val start = android.os.SystemClock.elapsedRealtimeNanos()
+                val result = checkNotNull(ImageUtils.renderJpegFromRaw16InputWithUltraHdrSafe(
+                    input, comparison, rotation, portrait
+                )) { "JPEG detail replay failed: $variant" }
+                val durationMs = (android.os.SystemClock.elapsedRealtimeNanos() - start) / 1_000_000.0
+                val sha = QualificationEvidence.sha256(result.jpegBytes)
+                val previous = hashes.putIfAbsent(variant, sha)
+                if (previous == null) {
+                    File(dir, "$variant.jpg").writeBytes(result.jpegBytes)
+                    outputs.put(variant, JSONObject().put("sha256", sha).put("firstRenderMs", durationMs)
+                        .put("nativeStats", ImageUtils.lastMasterIspStats()))
+                } else {
+                    check(sha == previous) { "JPEG detail replay was nondeterministic: $variant" }
+                    outputs.getJSONObject(variant).put("secondRenderMs", durationMs)
+                }
+            }
+        } finally {
+            ImageUtils.setOriginalSingleFrameDetailForReplay(false)
+        }
+        File(dir, "manifest.json").writeText(JSONObject()
+            .put("gitRevision", BuildConfig.GIT_REVISION).put("cameraId", input.lensId)
+            .put("frameSource", config.frameSourceLabel).put("rawSha256", metadata.getString("rawSha256"))
+            .put("iso", metadata.get("effectiveIso")).put("exposureNs", metadata.get("effectiveExposureNs"))
+            .put("positiveControls", JSONObject().put("sharpness", detail.amount)
+                .put("detail", detail.detail).put("edge", detail.edge))
+            .put("outputs", outputs).toString(2))
     }
 }
