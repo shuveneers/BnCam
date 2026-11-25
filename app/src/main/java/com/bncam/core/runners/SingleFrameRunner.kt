@@ -1636,6 +1636,7 @@ class SingleFrameRunner(
 
         val selectedFrameTimestampNs = anchorFrame.timestamp
         val selectedFrameGeneration = anchorFrame.generationId
+        performanceTracker.setMetric("selectedFrameTimestampNs", selectedFrameTimestampNs)
         val selectedDeltaMs = if (sensorTimestampComparableToElapsedRealtime) {
             (anchorFrame.timestamp - userShutterTimestampNs) / 1_000_000.0
         } else {
@@ -1671,6 +1672,8 @@ class SingleFrameRunner(
             return@withContext com.bncam.core.output.CaptureSubmissionResult.Rejected("anchor_buffer_null")
         }
         captureStageListener.sourceImageAcquired()
+        performanceTracker.setMetric("shutterToSelectedFrameReadyMs",
+            (android.os.SystemClock.elapsedRealtimeNanos() - shutterTimestampNs) / 1_000_000.0)
         val captureMetadata: TotalCaptureResult? = anchorFrame.metadata
         val isRawFrameSource =
             activeZslFormat == ImageFormat.RAW10 ||
@@ -2414,6 +2417,7 @@ class SingleFrameRunner(
             suspend (CaptureStageListener, CaptureProcessingQueue.Reservation?) -> Boolean =
             { stageListener, processingWork ->
             withContext(ispDispatcher) {
+            performanceTracker.setMetric("processingWorkId", processingWork?.workId)
             var finalProcessingFailure: Throwable? = null
             var finalJpegBytes: ByteArray? = null
             var ultraHdrGainmapArtifact: ImageUtils.UltraHdrGainmapArtifact? = null
@@ -3165,6 +3169,10 @@ class SingleFrameRunner(
                     val jpegPublishedNs = android.os.SystemClock.elapsedRealtimeNanos()
                     performanceTracker.setMetric("jpegExifWrittenInMediaStore", wrotePendingJpeg)
                     performanceTracker.setMetric("shutterToJpegPublishedMs", (jpegPublishedNs - shutterTimestampNs) / 1_000_000.0)
+                    if (!plan.outputPolicy.producesRaw) {
+                        performanceTracker.setMetric("shutterToAllPublishedMs",
+                            (jpegPublishedNs - shutterTimestampNs) / 1_000_000.0)
+                    }
                     mediaStoreWriteTimeMs = (jpegPublishedNs - mediaStoreWriteStartedNs) / 1_000_000.0
                     performanceTracker.recordDuration("jpeg_mediastore_write", mediaStoreWriteTimeMs)
                     processingWork?.recordJpegPublication(jpegPublicUri.toString())
@@ -3191,7 +3199,7 @@ class SingleFrameRunner(
             val saveTimeMs = System.currentTimeMillis() - saveStartMs
             performanceTracker.mark("jpeg_save")
 
-            val raw16ForDngSave = if (plan.outputPolicy.producesRaw) {
+            val raw16ForDngSave = if (plan.outputPolicy.producesRaw) try {
                 singleRawFrame?.let { rawInput ->
                     val rawMaterializeStartedNs = android.os.SystemClock.elapsedRealtimeNanos()
                     rawInput.materializeRaw16ForDng().also { bytes ->
@@ -3203,6 +3211,10 @@ class SingleFrameRunner(
                         performanceTracker.setMetric("raw16ManagedHeapMaterializationBytes", bytes.size)
                     }
                 }
+            } catch (failure: Exception) {
+                dngFailureReason = "RAW16 preparation failed: " + (failure.message ?: failure.javaClass.simpleName)
+                Log.e(tag, dngFailureReason, failure)
+                null
             } else null
             var dngPublicUri: Uri? = null
             if (plan.outputPolicy.producesRaw && raw16ForDngSave != null && raw16ForDngSave.isNotEmpty() && rawAuthorityCaptureResult != null) {
@@ -3221,9 +3233,15 @@ class SingleFrameRunner(
                     rawDomainContract = singleRawFrame?.rawFrameInfo,
                     calibration = singleRawFrame?.finalCalibration
                 )
+                val dngWriteEndedNs = android.os.SystemClock.elapsedRealtimeNanos()
                 dngPublicUri = dngSaveResult.first
                 dngBytesSize = dngSaveResult.second.toInt().coerceAtLeast(raw16ForDngSave.size)
-                dngWriteTimeMs = (android.os.SystemClock.elapsedRealtimeNanos() - dngWriteStartedNs) / 1_000_000L
+                dngWriteTimeMs = (dngWriteEndedNs - dngWriteStartedNs) / 1_000_000L
+                if (dngPublicUri != null) {
+                    val dngElapsedMs = (dngWriteEndedNs - shutterTimestampNs) / 1_000_000.0
+                    performanceTracker.setMetric("shutterToDngPublishedMs", dngElapsedMs)
+                    if (jpegPublished) performanceTracker.setMetric("shutterToAllPublishedMs", dngElapsedMs)
+                }
                 if (dngPublicUri == null) {
                     dngFailureReason = "DngCreator or MediaStore publication failed"
                     Log.e(
@@ -3244,7 +3262,7 @@ class SingleFrameRunner(
                     }
                 }
             } else if (plan.outputPolicy.producesRaw) {
-                dngFailureReason = "Native buffer returned null or empty"
+                if (dngFailureReason == "none") dngFailureReason = "Native buffer returned null or empty"
                 if (enableShotLogger) shotLogger.recordWarning("DNG Export", "DNG export failed: $dngFailureReason", "WARN")
             }
             performanceTracker.mark("dng_write")
@@ -3258,14 +3276,6 @@ class SingleFrameRunner(
             val totalProcessingTimeMs = System.currentTimeMillis() - startTimeMs
             performanceTracker.mark("complete")
             val dngPublished = dngPublicUri != null
-            if (dngPublished) {
-                performanceTracker.setMetric("shutterToDngPublishedMs",
-                    (android.os.SystemClock.elapsedRealtimeNanos() - shutterTimestampNs) / 1_000_000.0)
-            }
-            if (jpegPublished && (!plan.outputPolicy.producesRaw || dngPublished)) {
-                performanceTracker.setMetric("shutterToAllPublishedMs",
-                    (android.os.SystemClock.elapsedRealtimeNanos() - shutterTimestampNs) / 1_000_000.0)
-            }
             val publicationSnapshot = com.bncam.core.output.PublicationPolicyResolver.resolveStrings(
                 outputPolicy = plan.outputPolicy,
                 jpegSucceeded = jpegPublished,
@@ -4268,6 +4278,19 @@ class SingleFrameRunner(
         }
         val yuvSubmitted = CaptureProcessingQueue.submit(context, yuvReservation) { work ->
             try {
+                val preview = com.bncam.ui.screens.capture.TemporaryPreviewCapture
+                ImageUtils.createSelectedYuvPreview(
+                    buffer = anchorBuffer,
+                    edge = preview.PREVIEW_EDGE_PX,
+                    rotationDegrees = finalJpegRotation,
+                    quality = preview.EXISTING_PREVIEW_QUALITY
+                )?.let { jpeg ->
+                    preview.writeSelectedPreview(context, jpeg)?.let { path ->
+                        CaptureProcessingQueue.attachSelectedFramePreview(
+                            work.workId, path, selectedFrameTimestampNs
+                        )
+                    }
+                }
                 val saveAccepted = processAndQueueOutput(
                     CaptureStageListener.NONE,
                     work

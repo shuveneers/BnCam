@@ -1636,12 +1636,18 @@ fun CameraScreen(
                                 snapshot.state != CaptureWorkState.PUBLISHED &&
                                     snapshot.state != CaptureWorkState.FAILED
                             }
-                        if (submittedWork != null) {
-                            if (shutterPreviewPath != null) {
+                        if (shutterPreviewPath != null) {
+                            val attached = submittedWork?.let {
                                 CaptureProcessingQueue.attachTemporaryPreview(
-                                    workId = submittedWork.workId,
+                                    workId = it.workId,
                                     path = shutterPreviewPath
                                 )
+                            } ?: false
+                            if (!attached) {
+                                if (immediateShutterPreviewPath == shutterPreviewPath) {
+                                    immediateShutterPreviewPath = null
+                                }
+                                runCatching { java.io.File(shutterPreviewPath).delete() }
                             }
                         }
                     }
@@ -1698,7 +1704,9 @@ fun CameraScreen(
 // ==========================================
     LaunchedEffect(Unit) {
         CaptureProcessingQueue.events.collect { work ->
-            if (work.state == CaptureWorkState.PUBLISHED) {
+            if (work.state == CaptureWorkState.PUBLISHED ||
+                (work.state == CaptureWorkState.SAVING && work.jpegUri != null)
+            ) {
                 // An older RAW job completing must never overwrite the shutter preview belonging
                 // to a newer shot. JPEG is the preferred final thumbnail; DNG-only gets a decoded
                 // MediaStore thumbnail after publication is complete.

@@ -425,6 +425,22 @@ object ImageUtils {
         }
     }
 
+    internal fun createSelectedYuvPreview(
+        buffer: HardwareBuffer,
+        edge: Int,
+        rotationDegrees: Int,
+        quality: Int
+    ): ByteArray? = try {
+        createSelectedYuvPreviewNative(buffer, edge, rotationDegrees, quality)
+    } catch (failure: UnsatisfiedLinkError) {
+        Log.w("ImageUtils", "Selected YUV preview is unavailable", failure)
+        null
+    }
+
+    private external fun createSelectedYuvPreviewNative(
+        buffer: HardwareBuffer, edge: Int, rotationDegrees: Int, quality: Int
+    ): ByteArray?
+
     fun processNativeYuvSafe(
         buffers: Array<HardwareBuffer>,
         qualityConfig: RenderQualityConfig?,

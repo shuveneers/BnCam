@@ -2322,6 +2322,65 @@ Java_com_bncam_core_engine_ImageUtils_analyzeYuvExposureStatisticsNative(
     return output;
 }
 
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_com_bncam_core_engine_ImageUtils_createSelectedYuvPreviewNative(
+        JNIEnv* env, jobject, jobject hardwareBuffer, jint edge, jint rotation, jint quality) {
+    if (hardwareBuffer == nullptr || edge < 2 || edge > 256 || (edge & 1) != 0) return nullptr;
+    auto* buffer = AHardwareBuffer_fromHardwareBuffer(env, hardwareBuffer);
+    if (buffer == nullptr) return nullptr;
+    AHardwareBuffer_Desc desc{};
+    AHardwareBuffer_describe(buffer, &desc);
+    const auto size = std::min(desc.width, desc.height) & ~1u;
+    if (size < static_cast<std::uint32_t>(edge) || desc.layers != 1u) return nullptr;
+    const auto left = ((desc.width - size) / 2u) & ~1u;
+    const auto top = ((desc.height - size) / 2u) & ~1u;
+
+    try {
+        std::vector<std::uint8_t> nv21(static_cast<std::size_t>(edge) * edge * 3u / 2u);
+        AHardwareBuffer_Planes planes{};
+        if (AHardwareBuffer_lockPlanes(buffer, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN,
+                                       -1, nullptr, &planes) != 0) return nullptr;
+        const bool valid = planes.planeCount >= 3u &&
+                planes.planes[0].data && planes.planes[1].data && planes.planes[2].data &&
+                planes.planes[0].pixelStride && planes.planes[1].pixelStride && planes.planes[2].pixelStride &&
+                planes.planes[0].rowStride && planes.planes[1].rowStride && planes.planes[2].rowStride;
+        if (valid) {
+            std::size_t index = 0;
+            for (int y = 0; y < edge; ++y) {
+                for (int x = 0; x < edge; ++x) {
+                    nv21[index++] = readPlaneByte(planes.planes[0], top + y * size / edge,
+                                                  left + x * size / edge);
+                }
+            }
+            for (int y = 0; y < edge; y += 2) {
+                for (int x = 0; x < edge; x += 2) {
+                    const auto chromaY = (top + y * size / edge) / 2u;
+                    const auto chromaX = (left + x * size / edge) / 2u;
+                    nv21[index++] = readPlaneByte(planes.planes[2], chromaY, chromaX);
+                    nv21[index++] = readPlaneByte(planes.planes[1], chromaY, chromaX);
+                }
+            }
+        }
+        AHardwareBuffer_unlock(buffer, nullptr);
+        if (!valid) return nullptr;
+
+        cv::Mat bgr;
+        convertNv21JfifFullToBgr(cv::Mat(edge + edge / 2, edge, CV_8UC1, nv21.data()), bgr);
+        rotateMatInPlace(bgr, rotation);
+        std::vector<std::uint8_t> jpeg;
+        if (!cv::imencode(".jpg", bgr, jpeg, {cv::IMWRITE_JPEG_QUALITY, quality})) return nullptr;
+        auto result = env->NewByteArray(static_cast<jsize>(jpeg.size()));
+        if (result != nullptr) {
+            env->SetByteArrayRegion(result, 0, static_cast<jsize>(jpeg.size()),
+                                    reinterpret_cast<const jbyte*>(jpeg.data()));
+        }
+        return result;
+    } catch (const std::exception& failure) {
+        LOGW("Selected YUV preview skipped: %s", failure.what());
+        return nullptr;
+    }
+}
+
 extern "C"
 JNIEXPORT jbyteArray JNICALL
 Java_com_bncam_core_engine_ImageUtils_processNativeYuv(

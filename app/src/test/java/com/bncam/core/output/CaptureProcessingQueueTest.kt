@@ -67,6 +67,29 @@ class CaptureProcessingQueueTest {
         )
     }
 
+    @Test
+    fun jpegPublicationKeepsWorkSavingUntilDngFinishes() {
+        val tracker = CaptureWorkStateTracker(clockNs = { 1L })
+        val work = tracker.begin("SingleRawSensor", captureStartedNs = 20L)
+        tracker.transition(work.workId, CaptureWorkState.PROCESSING)
+        tracker.transition(work.workId, CaptureWorkState.SAVING)
+        val jpegUri = "content://image/1"
+        val saving = requireNotNull(tracker.recordJpegPublication(work.workId, jpegUri))
+        assertEquals(CaptureWorkState.SAVING, saving.state)
+        assertEquals(jpegUri, saving.thumbnailUri)
+        assertEquals(null, saving.publicationResult)
+        assertEquals(null, tracker.recordJpegPublication(work.workId, "content://image/other"))
+
+        val partial = StringPublicationOutputs(
+            jpegUri = jpegUri, thumbnailUri = jpegUri,
+            publicationResult = CapturePublicationResult.PARTIAL_SUCCESS,
+            reason = "DNG write failed"
+        )
+        val terminal = tracker.transition(work.workId, CaptureWorkState.PUBLISHED, publishedOutputs = partial)
+        assertEquals(CapturePublicationResult.PARTIAL_SUCCESS, terminal?.publicationResult)
+        assertEquals(jpegUri, terminal?.thumbnailUri)
+    }
+
     @Test(expected = IllegalArgumentException::class)
     fun invalidLifecycleTransitionIsRejected() {
         var nowNs = 1L

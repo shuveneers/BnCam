@@ -24,11 +24,13 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
@@ -43,6 +45,7 @@ import com.bncam.core.debug.Phase0PerformanceTrace
 import com.bncam.core.output.CaptureWorkSnapshot
 import com.bncam.core.output.CaptureWorkState
 import kotlinx.coroutines.delay
+import java.util.concurrent.atomic.AtomicBoolean
 
 internal data class CaptureFeedbackModel(
     val busy: Boolean,
@@ -77,6 +80,23 @@ internal fun CaptureThumbnailFeedback(
         immediateShutterPreviewPath = immediateShutterPreviewPath,
         immediateShutterStartedNs = immediateShutterStartedNs
     )
+    val previewKind = latestSnapshot?.let { snapshot ->
+        when {
+            snapshot.selectedFramePreviewPath == thumbnailModel -> "SELECTED_FRAME_YUV_PREVIEW"
+            snapshot.jpegUri == thumbnailModel || snapshot.thumbnailUri == thumbnailModel ->
+                "PUBLISHED_THUMBNAIL_URI"
+            publishedCaptureStartedNs == snapshot.captureStartedNs && thumbnailModel == publishedModel ->
+                if (snapshot.dngUri != null) "DNG_DERIVED_THUMBNAIL_JPEG" else "PUBLISHED_OUTPUT_URI"
+            snapshot.temporaryPreviewPath == thumbnailModel ||
+                (immediateShutterStartedNs == snapshot.captureStartedNs && immediateShutterPreviewPath == thumbnailModel) ->
+                "TEMPORARY_VIEWFINDER_JPEG"
+            else -> null
+        }
+    }
+    var thumbnailLoaded by remember(thumbnailModel) { mutableStateOf(false) }
+    val presentationRecorded = remember(latestSnapshot?.workId, thumbnailModel) { AtomicBoolean(false) }
+    val provisional = previewKind == "SELECTED_FRAME_YUV_PREVIEW" ||
+        previewKind == "TEMPORARY_VIEWFINDER_JPEG" || thumbnailModel == immediateShutterPreviewPath
 
     var pulseTarget by remember { mutableFloatStateOf(1f) }
     var lastAnimatedPublishedSequence by remember {
@@ -128,33 +148,27 @@ internal fun CaptureThumbnailFeedback(
                     CircleShape
                 )
                 .clip(CircleShape)
-                .clickable(enabled = publishedModel != null, onClick = onOpenPublished)
+                .clickable(enabled = !provisional && publishedModel != null, onClick = onOpenPublished)
         ) {
             Box(contentAlignment = Alignment.Center, modifier = Modifier.fillMaxSize()) {
                 AsyncImage(
                     model = thumbnailModel,
-                    contentDescription = "Latest capture",
-                    onSuccess = {
-                        latestSnapshot?.let { snapshot ->
-                            Phase0PerformanceTrace.thumbnailUiPresented(
-                                workId = snapshot.workId,
-                                modelKind = when {
-                                    immediateShutterPreviewPath != null &&
-                                        thumbnailModel == immediateShutterPreviewPath ->
-                                        "TEMPORARY_VIEWFINDER_JPEG"
-                                    publishedCaptureStartedNs == snapshot.captureStartedNs &&
-                                        snapshot.jpegUri == null && snapshot.dngUri != null &&
-                                        thumbnailModel == publishedModel ->
-                                        "DNG_DERIVED_THUMBNAIL_JPEG"
-                                    snapshot.thumbnailUri != null -> "PUBLISHED_THUMBNAIL_URI"
-                                    snapshot.publishedUri != null -> "PUBLISHED_OUTPUT_URI"
-                                    else -> "FALLBACK_MODEL"
-                                }
-                            )
-                        }
+                    contentDescription = when {
+                        previewKind == "SELECTED_FRAME_YUV_PREVIEW" -> "Selected capture frame preview"
+                        previewKind == "TEMPORARY_VIEWFINDER_JPEG" ||
+                            thumbnailModel == immediateShutterPreviewPath -> "Viewfinder preview"
+                        else -> "Latest capture"
                     },
+                    onSuccess = { thumbnailLoaded = true },
                     contentScale = ContentScale.Crop,
-                    modifier = Modifier.fillMaxSize()
+                    modifier = Modifier.fillMaxSize().drawWithContent {
+                        drawContent()
+                        if (thumbnailLoaded && latestSnapshot != null && previewKind != null &&
+                            presentationRecorded.compareAndSet(false, true)
+                        ) {
+                            Phase0PerformanceTrace.thumbnailUiPresented(latestSnapshot.workId, previewKind)
+                        }
+                    }
                 )
 
                 if (feedback.busy) {
@@ -191,7 +205,7 @@ internal fun resolveCaptureThumbnailModel(
 ): Any {
     val snapshotStartedNs = latestSnapshot?.captureStartedNs ?: Long.MIN_VALUE
     val publishedJpeg = latestSnapshot
-        ?.takeIf { it.state == CaptureWorkState.PUBLISHED }
+        ?.takeIf { it.state == CaptureWorkState.PUBLISHED || it.state == CaptureWorkState.SAVING }
         ?.let { it.jpegUri ?: it.thumbnailUri }
 
     return when {
@@ -203,7 +217,8 @@ internal fun resolveCaptureThumbnailModel(
         // DNG-only publication installs a bitmap decoded from that DNG asynchronously.
         latestSnapshot?.state == CaptureWorkState.PUBLISHED &&
             publishedCaptureStartedNs == snapshotStartedNs && publishedModel != null -> publishedModel
-        // Keep the exact shutter frame visible while this same shot is being processed/published.
+        latestSnapshot?.selectedFramePreviewPath != null -> latestSnapshot.selectedFramePreviewPath
+        // Keep the approximate viewfinder snapshot visible until the selected frame is available.
         immediateShutterPreviewPath != null && immediateShutterStartedNs == snapshotStartedNs ->
             immediateShutterPreviewPath
         latestSnapshot?.temporaryPreviewPath != null -> latestSnapshot.temporaryPreviewPath

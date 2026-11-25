@@ -13,6 +13,7 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
+import java.io.OutputStream
 import kotlin.coroutines.resume
 
 object TemporaryPreviewCapture {
@@ -49,6 +50,20 @@ object TemporaryPreviewCapture {
         context: Context,
         bitmap: Bitmap,
         phase0TraceToken: Long? = null
+    ): String? = writePreviewFile(context, phase0TraceToken) {
+        bitmap.compress(Bitmap.CompressFormat.JPEG, EXISTING_PREVIEW_QUALITY, it)
+    }
+
+    internal suspend fun writeSelectedPreview(context: Context, jpeg: ByteArray): String? =
+        writePreviewFile(context, null) { output ->
+            output.write(jpeg)
+            jpeg.isNotEmpty()
+        }
+
+    private suspend fun writePreviewFile(
+        context: Context,
+        phase0TraceToken: Long?,
+        writeJpeg: (OutputStream) -> Boolean
     ): String? = withContext(Dispatchers.IO) {
         val file = try {
             File.createTempFile("thumb_", ".jpg", context.cacheDir)
@@ -61,13 +76,7 @@ object TemporaryPreviewCapture {
             Phase0PerformanceTrace.previewPersistStarted(it, file.absolutePath)
         }
         try {
-            val compressed = file.outputStream().buffered().use { output ->
-                bitmap.compress(
-                    Bitmap.CompressFormat.JPEG,
-                    EXISTING_PREVIEW_QUALITY,
-                    output
-                )
-            }
+            val compressed = file.outputStream().buffered().use(writeJpeg)
 
             if (!compressed || !file.exists() || file.length() <= 0L) {
                 file.delete()

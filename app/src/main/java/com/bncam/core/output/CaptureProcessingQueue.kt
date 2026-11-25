@@ -44,7 +44,9 @@ data class CaptureWorkSnapshot(
     val dngUri: String? = null,
     val thumbnailUri: String? = null,
     val publicationResult: CapturePublicationResult? = null,
-    val publicationWarnings: List<CaptureWarning> = emptyList()
+    val publicationWarnings: List<CaptureWarning> = emptyList(),
+    val selectedFramePreviewPath: String? = null,
+    val selectedFrameTimestampNs: Long? = null
 )
 
 internal class BoundedCaptureWorkAdmission(private val maximumInFlight: Int) {
@@ -140,11 +142,14 @@ internal class CaptureWorkStateTracker(
             CaptureWorkState.FAILED -> 0.00f
         }
         val finalProgress = (progressOverride ?: baseProgress).coerceAtLeast(current.progress)
+        val terminal = state == CaptureWorkState.PUBLISHED || state == CaptureWorkState.FAILED
 
         val updated = current.copy(
             state = state,
             progress = finalProgress,
             stateChangedNs = clockNs(),
+            temporaryPreviewPath = if (terminal) null else current.temporaryPreviewPath,
+            selectedFramePreviewPath = if (terminal) null else current.selectedFramePreviewPath,
             failureReason = if (state == CaptureWorkState.FAILED) {
                 publishedOutputs?.reason ?: failureReason ?: "unspecified_failure"
             } else {
@@ -160,8 +165,8 @@ internal class CaptureWorkStateTracker(
         snapshots[workId] = updated
 
         // Delete temporary preview file on terminal state
-        if (state == CaptureWorkState.PUBLISHED || state == CaptureWorkState.FAILED) {
-            current.temporaryPreviewPath?.let { path ->
+        if (terminal) {
+            listOfNotNull(current.temporaryPreviewPath, current.selectedFramePreviewPath).forEach { path ->
                 try {
                     val file = File(path)
                     if (file.exists()) file.delete()
@@ -216,6 +221,15 @@ internal class CaptureWorkStateTracker(
             temporaryPreviewPath = path,
             stateChangedNs = clockNs()
         )
+        snapshots[workId] = updated
+        return updated
+    }
+
+    @Synchronized
+    fun attachSelectedFramePreview(workId: Long, path: String, frameTimestampNs: Long): CaptureWorkSnapshot? {
+        val current = snapshots[workId] ?: return null
+        if (current.state != CaptureWorkState.PROCESSING || current.selectedFramePreviewPath != null) return null
+        val updated = current.copy(selectedFramePreviewPath = path, selectedFrameTimestampNs = frameTimestampNs)
         snapshots[workId] = updated
         return updated
     }
@@ -436,6 +450,16 @@ object CaptureProcessingQueue {
         emitStateUpdates()
         mutableSharedEvents.tryEmit(updated)
         return true
+    }
+
+    internal fun attachSelectedFramePreview(workId: Long, path: String, frameTimestampNs: Long) {
+        val updated = tracker.attachSelectedFramePreview(workId, path, frameTimestampNs)
+        if (updated == null) {
+            runCatching { File(path).delete() }
+            return
+        }
+        Phase0PerformanceTrace.bindSelectedFramePreview(workId, frameTimestampNs)
+        emitStateUpdates()
     }
 
     fun inFlightCount(): Int = admission.count()

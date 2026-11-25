@@ -64,7 +64,7 @@ object Phase0PerformanceTrace {
         val captureStartedNs: Long,
         val events: LinkedHashMap<String, Long> = linkedMapOf("shutter" to captureStartedNs),
         val details: LinkedHashMap<String, String> = LinkedHashMap(),
-        var reported: Boolean = false
+        val presentedKinds: MutableSet<String> = mutableSetOf()
     )
 
     private data class PreviewTokenTrace(
@@ -298,6 +298,10 @@ object Phase0PerformanceTrace {
         if (captureStartedNs <= 0L) return
         synchronized(lock) {
             thumbnailTraces.putIfAbsent(workId, ThumbnailTrace(workId, route, captureStartedNs))
+            if (thumbnailTraces.size > 64) {
+                val oldestWork = thumbnailTraces.keys.first()
+                thumbnailTraces.remove(oldestWork)
+            }
         }
     }
 
@@ -346,6 +350,14 @@ object Phase0PerformanceTrace {
         }
     }
 
+    fun bindSelectedFramePreview(workId: Long, frameTimestampNs: Long) {
+        synchronized(lock) {
+            val trace = thumbnailTraces[workId] ?: return
+            trace.details["selectedFrameTimestampNs"] = frameTimestampNs.toString()
+            trace.events["selected_frame_preview_ready"] = SystemClock.elapsedRealtimeNanos()
+        }
+    }
+
     fun thumbnailUiPresented(
         workId: Long,
         modelKind: String,
@@ -353,13 +365,10 @@ object Phase0PerformanceTrace {
     ) {
         val report = synchronized(lock) {
             val trace = thumbnailTraces[workId] ?: return
-            if (trace.reported) return
-            trace.events.putIfAbsent("thumbnail_ui_presented", timestampNs)
-            trace.details["modelKind"] = modelKind
-            trace.reported = true
-            val json = traceToJson("THUMBNAIL", workId, trace.events, trace.details + mapOf("route" to trace.route))
-            thumbnailTraces.remove(workId)
-            json
+            if (!trace.presentedKinds.add(modelKind)) return
+            val events = trace.events + ("thumbnail_ui_presented" to timestampNs)
+            val details = trace.details + mapOf("route" to trace.route, "modelKind" to modelKind)
+            traceToJson("THUMBNAIL", workId, events, details)
         }
         persist("PHASE 0 THUMBNAIL TIMELINE", report)
     }
