@@ -2717,6 +2717,10 @@ class SingleFrameRunner(
             }
 
             val jpegBytesAvailable = finalJpegBytes?.isNotEmpty() == true
+            if (jpegBytesAvailable) {
+                performanceTracker.setMetric("shutterToJpegReadyMs",
+                    (android.os.SystemClock.elapsedRealtimeNanos() - shutterTimestampNs) / 1_000_000.0)
+            }
             val jpegPublicUri = if (jpegBytesAvailable) {
                 reservedJpegUri
                     ?: preInsertImageToMediaStore(jpegFilename, saveLocation, "image/jpeg")
@@ -2891,6 +2895,7 @@ class SingleFrameRunner(
                 return@withContext false
             }
 
+            var jpegPublished = false
             val saveBlock: suspend () -> Unit = {
             try {
             // Exif writing and saving to pre-inserted Uri
@@ -2911,28 +2916,21 @@ class SingleFrameRunner(
                 }
             }
 
-            var saveSucceeded = false
-            var mediaStorePendingCleared = Build.VERSION.SDK_INT < Build.VERSION_CODES.Q
             var gpsAdded = false
             var exifTimeMs = 0.0
             var mediaStoreWriteTimeMs = 0.0
             var jpegSaveFailure: Throwable? = null
 
-            fun writeAndPublishJpeg(bytes: ByteArray): Boolean {
-                val output = context.contentResolver.openOutputStream(jpegPublicUri) ?: return false
-                output.use { it.write(bytes) }
+            fun publishPendingJpeg() {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     val contentValues = ContentValues().apply {
                         put(MediaStore.MediaColumns.IS_PENDING, 0)
                     }
-                    mediaStorePendingCleared = context.contentResolver.update(
-                        jpegPublicUri,
-                        contentValues,
-                        null,
-                        null
-                    ) > 0
+                    check(context.contentResolver.update(jpegPublicUri, contentValues, null, null) > 0) {
+                        "JPEG bytes were written but MediaStore pending state was not cleared"
+                    }
                 }
-                return mediaStorePendingCleared
+                jpegPublished = true
             }
 
             if (bytesToSave != null && bytesToSave.isNotEmpty()) {
@@ -3003,124 +3001,151 @@ class SingleFrameRunner(
                     val watermarkedBytes = WatermarkEngine.applyWatermark(context, bytesToSave, extendedWmConfig)
 
                     val exifStartedNs = android.os.SystemClock.elapsedRealtimeNanos()
-                    val tempFile = java.io.File(context.cacheDir, "exif_temp.jpg")
-                    tempFile.writeBytes(watermarkedBytes)
-                    val exif = androidx.exifinterface.media.ExifInterface(tempFile.absolutePath)
+                    fun writeExif(exif: ExifInterface) {
+                        exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_MAKE, Build.MANUFACTURER)
+                        exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_MODEL, Build.MODEL)
+                        exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_SOFTWARE, "BnCam Pro")
 
-                    exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_MAKE, Build.MANUFACTURER)
-                    exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_MODEL, Build.MODEL)
-                    exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_SOFTWARE, "BnCam Pro")
+                        val exifDate = SimpleDateFormat("yyyy:MM:dd HH:mm:ss", Locale.US).format(Date(startTimeMs))
+                        exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_DATETIME, exifDate)
+                        exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_DATETIME_ORIGINAL, exifDate)
+                        exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_DATETIME_DIGITIZED, exifDate)
 
-                    val exifDate = SimpleDateFormat("yyyy:MM:dd HH:mm:ss", Locale.US).format(Date(startTimeMs))
-                    exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_DATETIME, exifDate)
-                    exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_DATETIME_ORIGINAL, exifDate)
-                    exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_DATETIME_DIGITIZED, exifDate)
+                        var customInfo = "App Info: BnCam"
 
-                    var customInfo = "App Info: BnCam"
-
-                    if (exifExtraData) {
-                        customInfo += " | CameraID: ${activeLens.id} | Frame Count: 1 | Mode: $displayMode"
-                    }
-
-                    if (exifSaveSignature && wmSignature.isNotBlank()) {
-                        customInfo += " | Author: $wmSignature"
-                        exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_ARTIST, wmSignature)
-                        exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_COPYRIGHT, wmSignature)
-                    }
-
-                    exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_IMAGE_DESCRIPTION, customInfo)
-                    exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_USER_COMMENT, customInfo)
-
-                    captureMetadata?.let { meta ->
-                        fun rationalFromDouble(value: Double, denominator: Int = 1000): String {
-                            val numerator = (value * denominator).toInt().coerceAtLeast(0)
-                            return "$numerator/$denominator"
+                        if (exifExtraData) {
+                            customInfo += " | CameraID: ${activeLens.id} | Frame Count: 1 | Mode: $displayMode"
                         }
 
-                        fun apexShutterSpeedValue(exposureTimeSeconds: Double): String {
-                            val apex = -kotlin.math.ln(exposureTimeSeconds) / kotlin.math.ln(2.0)
-                            return rationalFromDouble(apex, 1000)
+                        if (exifSaveSignature && wmSignature.isNotBlank()) {
+                            customInfo += " | Author: $wmSignature"
+                            exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_ARTIST, wmSignature)
+                            exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_COPYRIGHT, wmSignature)
                         }
 
-                        val metaIsoVal = meta.get(CaptureResult.SENSOR_SENSITIVITY)
-                        if (metaIsoVal != null && metaIsoVal > 0) {
-                            exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_PHOTOGRAPHIC_SENSITIVITY, metaIsoVal.toString())
-                            @Suppress("DEPRECATION")
-                            exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_ISO_SPEED_RATINGS, metaIsoVal.toString())
-                        }
+                        exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_IMAGE_DESCRIPTION, customInfo)
+                        exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_USER_COMMENT, customInfo)
 
-                        val metaExpTimeNs = meta.get(CaptureResult.SENSOR_EXPOSURE_TIME)
-                        if (metaExpTimeNs != null && metaExpTimeNs > 0L) {
-                            val expTimeSec = metaExpTimeNs / 1_000_000_000.0
-                            val exposureString = if (expTimeSec < 1.0) {
-                                val denominator = kotlin.math.round(1.0 / expTimeSec).toInt()
-                                "1/$denominator"
-                            } else {
-                                String.format(Locale.US, "%.2f", expTimeSec)
+                        captureMetadata?.let { meta ->
+                            fun rationalFromDouble(value: Double, denominator: Int = 1000): String {
+                                val numerator = (value * denominator).toInt().coerceAtLeast(0)
+                                return "$numerator/$denominator"
                             }
-                            exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_EXPOSURE_TIME, exposureString)
-                            exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_SHUTTER_SPEED_VALUE, apexShutterSpeedValue(expTimeSec))
-                        }
 
-                        val metaFocalLength = meta.get(CaptureResult.LENS_FOCAL_LENGTH)
-                        if (metaFocalLength != null && metaFocalLength > 0f) {
-                            exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_FOCAL_LENGTH, rationalFromDouble(metaFocalLength.toDouble(), 1000))
-                            try {
-                                val sensorSize = chars.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
-                                if (sensorSize != null && sensorSize.width > 0f && sensorSize.height > 0f) {
-                                    val sensorDiag = kotlin.math.sqrt((sensorSize.width * sensorSize.width + sensorSize.height * sensorSize.height).toDouble())
-                                    val fullFrameDiag = 43.266
-                                    val cropFactor = fullFrameDiag / sensorDiag
-                                    val focal35mm = (metaFocalLength * cropFactor).toInt().coerceAtLeast(1)
-                                    exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_FOCAL_LENGTH_IN_35MM_FILM, focal35mm.toString())
+                            fun apexShutterSpeedValue(exposureTimeSeconds: Double): String {
+                                val apex = -kotlin.math.ln(exposureTimeSeconds) / kotlin.math.ln(2.0)
+                                return rationalFromDouble(apex, 1000)
+                            }
+
+                            val metaIsoVal = meta.get(CaptureResult.SENSOR_SENSITIVITY)
+                            if (metaIsoVal != null && metaIsoVal > 0) {
+                                exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_PHOTOGRAPHIC_SENSITIVITY, metaIsoVal.toString())
+                                @Suppress("DEPRECATION")
+                                exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_ISO_SPEED_RATINGS, metaIsoVal.toString())
+                            }
+
+                            val metaExpTimeNs = meta.get(CaptureResult.SENSOR_EXPOSURE_TIME)
+                            if (metaExpTimeNs != null && metaExpTimeNs > 0L) {
+                                val expTimeSec = metaExpTimeNs / 1_000_000_000.0
+                                val exposureString = if (expTimeSec < 1.0) {
+                                    val denominator = kotlin.math.round(1.0 / expTimeSec).toInt()
+                                    "1/$denominator"
+                                } else {
+                                    String.format(Locale.US, "%.2f", expTimeSec)
                                 }
-                            } catch (e: Exception) {
-                                Log.w(tag, "Could not calculate 35mm equivalent", e)
+                                exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_EXPOSURE_TIME, exposureString)
+                                exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_SHUTTER_SPEED_VALUE, apexShutterSpeedValue(expTimeSec))
+                            }
+
+                            val metaFocalLength = meta.get(CaptureResult.LENS_FOCAL_LENGTH)
+                            if (metaFocalLength != null && metaFocalLength > 0f) {
+                                exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_FOCAL_LENGTH, rationalFromDouble(metaFocalLength.toDouble(), 1000))
+                                try {
+                                    val sensorSize = chars.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
+                                    if (sensorSize != null && sensorSize.width > 0f && sensorSize.height > 0f) {
+                                        val sensorDiag = kotlin.math.sqrt((sensorSize.width * sensorSize.width + sensorSize.height * sensorSize.height).toDouble())
+                                        val fullFrameDiag = 43.266
+                                        val cropFactor = fullFrameDiag / sensorDiag
+                                        val focal35mm = (metaFocalLength * cropFactor).toInt().coerceAtLeast(1)
+                                        exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_FOCAL_LENGTH_IN_35MM_FILM, focal35mm.toString())
+                                    }
+                                } catch (e: Exception) {
+                                    Log.w(tag, "Could not calculate 35mm equivalent", e)
+                                }
+                            }
+
+                            val metaAperture = meta.get(CaptureResult.LENS_APERTURE)
+                            if (metaAperture != null && metaAperture > 0f) {
+                                exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_F_NUMBER, metaAperture.toString())
+                                exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_APERTURE_VALUE, rationalFromDouble(metaAperture.toDouble(), 100))
+                            }
+
+                            val flashState = meta.get(CaptureResult.FLASH_STATE)
+                            if (flashState != null) {
+                                val flashFired = if (flashState == CaptureResult.FLASH_STATE_FIRED) "1" else "0"
+                                exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_FLASH, flashFired)
                             }
                         }
 
-                        val metaAperture = meta.get(CaptureResult.LENS_APERTURE)
-                        if (metaAperture != null && metaAperture > 0f) {
-                            exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_F_NUMBER, metaAperture.toString())
-                            exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_APERTURE_VALUE, rationalFromDouble(metaAperture.toDouble(), 100))
+                        if (saveLocationData) {
+                            LocationUtils.getLastKnownLocation(context)?.let { loc ->
+                                exif.setGpsInfo(loc)
+                                gpsAdded = true
+                            }
                         }
-
-                        val flashState = meta.get(CaptureResult.FLASH_STATE)
-                        if (flashState != null) {
-                            val flashFired = if (flashState == CaptureResult.FLASH_STATE_FIRED) "1" else "0"
-                            exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_FLASH, flashFired)
-                        }
+                        exif.saveAttributes()
                     }
 
-                    if (saveLocationData) {
-                        LocationUtils.getLastKnownLocation(context)?.let { loc ->
-                            exif.setGpsInfo(loc)
-                            gpsAdded = true
+                    val needsGainmapPackaging =
+                        renderQualityConfig.ultraHdrGainmapEnabled && ultraHdrGainmapArtifact != null
+                    val wrotePendingJpeg = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && !needsGainmapPackaging) {
+                        try {
+                            val descriptor = context.contentResolver.openFileDescriptor(jpegPublicUri, "rwt")
+                                ?: throw java.io.IOException("Unable to open pending JPEG")
+                            android.os.ParcelFileDescriptor.AutoCloseOutputStream(descriptor).use { output ->
+                                output.write(watermarkedBytes)
+                                output.channel.position(0)
+                                writeExif(ExifInterface(descriptor.fileDescriptor))
+                            }
+                            true
+                        } catch (failure: java.io.IOException) {
+                            Log.w(tag, "Pending JPEG does not support direct EXIF writing; using cache file", failure)
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                    val finalBytesWithExif = if (wrotePendingJpeg) null else {
+                        val tempFile = java.io.File.createTempFile("exif_", ".jpg", context.cacheDir)
+                        try {
+                            tempFile.writeBytes(watermarkedBytes)
+                            writeExif(ExifInterface(tempFile))
+                            tempFile.readBytes()
+                        } finally {
+                            tempFile.delete()
                         }
                     }
-
-                    exif.saveAttributes()
-                    val finalBytesWithExif = tempFile.readBytes()
-                    tempFile.delete()
                     exifTimeMs = (android.os.SystemClock.elapsedRealtimeNanos() - exifStartedNs) / 1_000_000.0
                     performanceTracker.recordDuration("jpeg_exif_and_watermark", exifTimeMs)
 
-                    val finalPublicationBytes = if (renderQualityConfig.ultraHdrGainmapEnabled && ultraHdrGainmapArtifact != null) {
+                    val finalPublicationBytes = if (needsGainmapPackaging) {
+                        val gainmap = requireNotNull(ultraHdrGainmapArtifact)
+                        val sdrJpeg = requireNotNull(finalBytesWithExif)
                         val packageStartedNs = android.os.SystemClock.elapsedRealtimeNanos()
-                        val packaged = ImageUtils.packageUltraHdrJpegSafe(finalBytesWithExif, ultraHdrGainmapArtifact!!)
+                        val packaged = ImageUtils.packageUltraHdrJpegSafe(sdrJpeg, gainmap)
                         performanceTracker.recordDuration(
                             "ultra_hdr_container_package",
                             (android.os.SystemClock.elapsedRealtimeNanos() - packageStartedNs) / 1_000_000.0
                         )
                         if (packaged != null && packaged.isNotEmpty()) {
                             performanceTracker.setMetric("ultraHdrPackaged", true)
-                            performanceTracker.setMetric("ultraHdrGainmapMaxBoost", ultraHdrGainmapArtifact!!.maxContentBoost)
-                            Log.i(tag, "Ultra HDR packaged from GPU gainmap: ${ultraHdrGainmapArtifact!!.width}x${ultraHdrGainmapArtifact!!.height} maxBoost=${ultraHdrGainmapArtifact!!.maxContentBoost}")
+                            performanceTracker.setMetric("ultraHdrGainmapMaxBoost", gainmap.maxContentBoost)
+                            Log.i(tag, "Ultra HDR packaged from GPU gainmap: ${gainmap.width}x${gainmap.height} maxBoost=${gainmap.maxContentBoost}")
                             packaged
                         } else {
                             performanceTracker.setMetric("ultraHdrPackaged", false)
                             Log.w(tag, "Ultra HDR requested but final container packaging failed; publishing original SDR JPEG")
-                            finalBytesWithExif
+                            sdrJpeg
                         }
                     } else {
                         if (renderQualityConfig.ultraHdrGainmapEnabled && isRawFrameSource) {
@@ -3131,12 +3156,18 @@ class SingleFrameRunner(
                     }
 
                     val mediaStoreWriteStartedNs = android.os.SystemClock.elapsedRealtimeNanos()
-                    if (!writeAndPublishJpeg(finalPublicationBytes)) {
-                        throw IllegalStateException("JPEG bytes were written but MediaStore pending state was not cleared")
+                    if (finalPublicationBytes != null) {
+                        val output = context.contentResolver.openOutputStream(jpegPublicUri, "wt")
+                            ?: throw java.io.IOException("Unable to open pending JPEG")
+                        output.use { it.write(finalPublicationBytes) }
                     }
-                    mediaStoreWriteTimeMs = (android.os.SystemClock.elapsedRealtimeNanos() - mediaStoreWriteStartedNs) / 1_000_000.0
+                    publishPendingJpeg()
+                    val jpegPublishedNs = android.os.SystemClock.elapsedRealtimeNanos()
+                    performanceTracker.setMetric("jpegExifWrittenInMediaStore", wrotePendingJpeg)
+                    performanceTracker.setMetric("shutterToJpegPublishedMs", (jpegPublishedNs - shutterTimestampNs) / 1_000_000.0)
+                    mediaStoreWriteTimeMs = (jpegPublishedNs - mediaStoreWriteStartedNs) / 1_000_000.0
                     performanceTracker.recordDuration("jpeg_mediastore_write", mediaStoreWriteTimeMs)
-                    saveSucceeded = true
+                    processingWork?.recordJpegPublication(jpegPublicUri.toString())
 
                 } catch (e: Exception) {
                     try { context.contentResolver.delete(jpegPublicUri, null, null) } catch (cleanupError: Exception) {
@@ -3226,8 +3257,15 @@ class SingleFrameRunner(
 
             val totalProcessingTimeMs = System.currentTimeMillis() - startTimeMs
             performanceTracker.mark("complete")
-            val jpegPublished = saveSucceeded && mediaStorePendingCleared
             val dngPublished = dngPublicUri != null
+            if (dngPublished) {
+                performanceTracker.setMetric("shutterToDngPublishedMs",
+                    (android.os.SystemClock.elapsedRealtimeNanos() - shutterTimestampNs) / 1_000_000.0)
+            }
+            if (jpegPublished && (!plan.outputPolicy.producesRaw || dngPublished)) {
+                performanceTracker.setMetric("shutterToAllPublishedMs",
+                    (android.os.SystemClock.elapsedRealtimeNanos() - shutterTimestampNs) / 1_000_000.0)
+            }
             val publicationSnapshot = com.bncam.core.output.PublicationPolicyResolver.resolveStrings(
                 outputPolicy = plan.outputPolicy,
                 jpegSucceeded = jpegPublished,
@@ -3556,7 +3594,7 @@ class SingleFrameRunner(
                 shotLogger.recordPipelineEvent("Thumbnail / URI Lifecycle", "jpegSaveSucceededBeforeUriReturn", "false")
                 shotLogger.recordPipelineEvent("Thumbnail / URI Lifecycle", "mediaStorePendingClearedBeforeUriReturn", "false")
                 shotLogger.recordPipelineEvent("Thumbnail / URI Lifecycle", "returnedUriWasPending", "true")
-                shotLogger.recordPipelineEvent("Thumbnail / URI Lifecycle", "thumbnailUpdateUri", if (saveSucceeded && mediaStorePendingCleared) jpegPublicUri.toString() else "none")
+                shotLogger.recordPipelineEvent("Thumbnail / URI Lifecycle", "thumbnailUpdateUri", if (jpegPublished) jpegPublicUri.toString() else "none")
                 shotLogger.recordPipelineEvent("Thumbnail / URI Lifecycle", "thumbnailUpdateSource", "asynchronous_publication")
                 shotLogger.recordPipelineEvent("Thumbnail / URI Lifecycle", "captureExecuteReturnedAfterRenderMs", totalProcessingTimeMs.toString())
                 shotLogger.recordPipelineEvent("Thumbnail / URI Lifecycle", "detachedIspLaunchUsed", isRawFrameSource.toString())
@@ -3667,7 +3705,7 @@ class SingleFrameRunner(
                     framesAccepted = 1,
                     framesMerged = 1,
                     framesRejected = framesRejected,
-                    captureSucceeded = saveSucceeded,
+                    captureSucceeded = jpegPublished,
                     requestedMode = activeProfile.captureStrategy.name,
                     resolvedRoute = when (activeZslFormat) {
                         ImageFormat.RAW_SENSOR -> "CAMERA2_RAW_SENSOR_WARM_BUFFER_SINGLE_FRAME"
@@ -3740,7 +3778,7 @@ class SingleFrameRunner(
                     renderTimeMs = renderTimeMs,
                     jpegCompressionTimeMs = jpegEncodeMs.toDoubleOrNull()?.toLong() ?: 0L,
                     saveTimeMs = saveTimeMs,
-                    failureReason = finalProcessingFailure?.let { "${it.javaClass.simpleName}: ${it.message}" } ?: if (!saveSucceeded) "Output save failed or JPEG bytes unavailable" else "none",
+                    failureReason = finalProcessingFailure?.let { "${it.javaClass.simpleName}: ${it.message}" } ?: if (!jpegPublished) "Output save failed or JPEG bytes unavailable" else "none",
                     meteringStyle = meteringStyle,
                     evOffset = evOffset,
                     aeRegionsRequested = formatAeRegions(selectedRequestedAeRegions),
@@ -4068,7 +4106,9 @@ class SingleFrameRunner(
                         exception = it
                     )
                 }
-                runCatching { context.contentResolver.delete(jpegPublicUri, null, null) }
+                if (!jpegPublished) {
+                    runCatching { context.contentResolver.delete(jpegPublicUri, null, null) }
+                }
                 performanceTracker.persistJsonLine(
                     context = context,
                     status = "FAILED",

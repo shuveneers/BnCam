@@ -176,6 +176,15 @@ internal class CaptureWorkStateTracker(
     }
 
     @Synchronized
+    fun recordJpegPublication(workId: Long, jpegUri: String): CaptureWorkSnapshot? {
+        val current = snapshots[workId] ?: return null
+        if (current.state != CaptureWorkState.SAVING || current.jpegUri != null) return null
+        val updated = current.copy(jpegUri = jpegUri, thumbnailUri = jpegUri)
+        snapshots[workId] = updated
+        return updated
+    }
+
+    @Synchronized
     fun updateProgress(workId: Long, progress: Float): CaptureWorkSnapshot? {
         val current = snapshots[workId] ?: return null
         if (current.state != CaptureWorkState.PROCESSING) return current
@@ -471,6 +480,12 @@ object CaptureProcessingQueue {
 
         fun markSaving() {
             transition(CaptureWorkState.SAVING)
+        }
+
+        fun recordJpegPublication(jpegUri: String) {
+            val updated = tracker.recordJpegPublication(workId, jpegUri) ?: return
+            emitStateUpdates()
+            mutableSharedEvents.tryEmit(updated)
         }
 
         fun markPublished(outputs: StringPublicationOutputs) {
