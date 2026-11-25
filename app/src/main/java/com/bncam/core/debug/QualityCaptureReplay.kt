@@ -1,6 +1,7 @@
 package com.bncam.core.debug
 
 import android.content.Context
+import android.util.Log
 import com.bncam.BuildConfig
 import com.bncam.core.capture.CaptureRecipe
 import com.bncam.core.capture.PortraitCaptureContext
@@ -13,6 +14,7 @@ import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
 import java.util.UUID
+import java.util.concurrent.CancellationException
 
 /** Debug measurement only. Call synchronously on the existing ISP dispatcher while RAW is owned.
  * No settings writes, materialization for DNG, public media, or changes to production controls.
@@ -28,15 +30,22 @@ object QualityCaptureReplay {
 
     fun export(context: Context, request: Request, input: Raw16RenderInput,
                config: RenderQualityConfig, recipe: CaptureRecipe, focus: Any, ev: Float,
-               rotation: Int, portrait: PortraitCaptureContext, captureId: Long?): String {
+               rotation: Int, portrait: PortraitCaptureContext, captureId: Long?): String? {
         check(BuildConfig.DEBUG)
+        if (request.detailRefinement) {
+            return runOptionalDetailRefinementReplay(
+                onFailure = { Log.w("QualityCaptureReplay", "Optional JPEG comparison unavailable", it) }
+            ) {
+                val dir = File(context.filesDir, "quality/" + UUID.randomUUID())
+                check(dir.mkdirs()) { "Unable to create JPEG comparison directory" }
+                val metadata = JSONObject(QualificationEvidence.raw(input, recipe, focus, ev))
+                exportDetailRefinement(dir, input, config, rotation, portrait, metadata)
+                dir.relativeTo(context.filesDir).path.replace('\\', '/')
+            }
+        }
         val dir = File(context.filesDir, "quality/${UUID.randomUUID()}").apply { mkdirs() }
         val metadata = JSONObject(QualificationEvidence.raw(input, recipe, focus, ev))
         val rawSha = metadata.getString("rawSha256")
-        if (request.detailRefinement) {
-            exportDetailRefinement(dir, input, config, rotation, portrait, metadata)
-            return dir.relativeTo(context.filesDir).path.replace('\\', '/')
-        }
         FileOutputStream(File(dir, "raw.bin")).use { stream ->
             input.nativeRaw16Buffer.withDirectBuffer { buffer ->
                 val view = buffer.asReadOnlyBuffer().apply { clear(); limit(input.raw16ByteCount) }
@@ -137,4 +146,15 @@ object QualityCaptureReplay {
                 .put("detail", detail.detail).put("edge", detail.edge))
             .put("outputs", outputs).toString(2))
     }
+}
+
+internal inline fun <T> runOptionalDetailRefinementReplay(
+    onFailure: (Throwable) -> Unit,
+    replay: () -> T
+): T? = runCatching(replay).getOrElse { failure ->
+    if (failure is CancellationException || (failure !is Exception && failure !is LinkageError)) {
+        throw failure
+    }
+    onFailure(failure)
+    null
 }
